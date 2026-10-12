@@ -11,7 +11,7 @@
 //!
 //! `[forge].remote` is the one field that is a *fallback*, not an override:
 //! which remote a review resolves against is decided by the review's own
-//! `base_branch` first — see [`resolve_remote_name`] for the full four-step
+//! `upstream` first — see [`resolve_remote_name`] for the full four-step
 //! precedence — so a repo with a fork plus an upstream opens each review's PR
 //! against whichever host that review is actually based on (RAL-282).
 //!
@@ -51,6 +51,8 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
+
+use ralphus_core::schema::UpstreamRef;
 
 use crate::config::ForgeConfig;
 use crate::forge_pool;
@@ -4399,46 +4401,41 @@ fn extract_glab_token(text: &str) -> Option<String> {
     (!token.is_empty()).then_some(token)
 }
 
-/// Resolve which git remote a review's own `base_branch` designates (RAL-190,
-/// extended by RAL-282 to also honor a bare branch's own `@{u}` upstream) —
-/// the single shared precedence used both to pick which forge host a PR is
-/// submitted against ([`resolve_remote`]) and which remote PR-branch
-/// pushes/pulls target (`pr.rs`):
+/// Resolve which git remote a review's `upstream` designates -- the single
+/// shared precedence used both to pick which forge host a PR is submitted
+/// against ([`resolve_remote`]) and which remote PR-branch pushes/pulls
+/// target (`pr.rs`):
 ///
-/// 1. `base_branch` in `<remote>/<branch>` form, where `<remote>` names a
-///    real configured remote (e.g. `"origin/main"`, `"alt/beta"`) -> that
-///    remote.
-/// 2. Else `base_branch` names a bare local branch with its own `@{u}`
-///    upstream tracking configured -> that upstream's remote.
+/// 1. A named `upstream.remote` (anything but `.`) -> that remote.
+/// 2. Else `upstream.branch` is a local branch with its own tracking
+///    configured (`branch.<name>.remote`) -> that remote.
 /// 3. `[forge].remote` config, if set.
 /// 4. `"origin"`.
 ///
-/// `[forge].remote` never wins over what `base_branch` itself resolves to —
+/// `[forge].remote` never wins over what the upstream itself resolves to --
 /// it is a fallback only, consulted when neither of the above resolves.
 #[must_use]
-pub(crate) fn resolve_remote_name(root: &Path, base_branch: &str, cfg: &ForgeConfig) -> String {
-    resolve_remote_name_excluding(root, base_branch, cfg, None)
+pub(crate) fn resolve_remote_name(
+    root: &Path,
+    upstream: &UpstreamRef,
+    cfg: &ForgeConfig,
+) -> String {
+    resolve_remote_name_excluding(root, upstream, cfg, None)
 }
 
 /// Like [`resolve_remote_name`], but steps 1-2 never resolve to `exclude`
 /// (RAL-338): used when computing the *parent's* remote for a fork-mode
-/// review, so a stray `@{upstream}` or `<remote>/<branch>`-form `base_branch`
-/// that happens to point at the project's registered fork remote can't be
-/// mistaken for the parent's remote. Every existing (non-fork) call site
-/// keeps calling [`resolve_remote_name`] unchanged, which passes `None` here
-/// and is therefore byte-identical to before this exclusion existed.
+/// review, so an upstream that points at the project's registered fork
+/// remote can't be mistaken for the parent's remote.
 #[must_use]
 pub(crate) fn resolve_remote_name_excluding(
     root: &Path,
-    base_branch: &str,
+    upstream: &UpstreamRef,
     cfg: &ForgeConfig,
     exclude: Option<&str>,
 ) -> String {
-    remote_from_base_branch(root, base_branch)
+    named_upstream_remote(root, upstream)
         .filter(|r| Some(r.as_str()) != exclude)
-        .or_else(|| {
-            remote_from_branch_upstream(root, base_branch).filter(|r| Some(r.as_str()) != exclude)
-        })
         .unwrap_or_else(|| default_remote_name(cfg))
 }
 
@@ -4577,13 +4574,13 @@ fn ensure_remote_for_url(root: &Path, preferred_name: &str, url: &str) -> Result
 #[must_use]
 pub(crate) fn resolve_parent_remote_name(
     root: &Path,
-    base_branch: &str,
+    upstream: &UpstreamRef,
     cfg: &ForgeConfig,
     clone_url: Option<&str>,
     exclude: Option<&str>,
 ) -> String {
     if let Some(url) = clone_url.map(str::trim).filter(|s| !s.is_empty()) {
-        if let Some(named) = remote_from_base_branch(root, base_branch) {
+        if let Some(named) = named_upstream_remote(root, upstream) {
             if Some(named.as_str()) != exclude {
                 if let Some(target) = parse_remote_url(url) {
                     if remote_url_is(root, &named, &target).unwrap_or(false) {
@@ -4602,10 +4599,10 @@ pub(crate) fn resolve_parent_remote_name(
                     }
                 }
             }
-            Err(_) => return resolve_remote_name_excluding(root, base_branch, cfg, exclude),
+            Err(_) => return resolve_remote_name_excluding(root, upstream, cfg, exclude),
         }
     }
-    resolve_remote_name_excluding(root, base_branch, cfg, exclude)
+    resolve_remote_name_excluding(root, upstream, cfg, exclude)
 }
 
 /// A resolved routing target for one fork-aware PR/MR operation (RAL-338):
@@ -5099,70 +5096,40 @@ pub(crate) fn default_remote_name(cfg: &ForgeConfig) -> String {
     cfg.remote.clone().unwrap_or_else(|| "origin".to_string())
 }
 
-/// Step 1 of [`resolve_remote_name`]: `base_branch` written in
-/// `<remote>/<branch>` form and that leading segment names a real configured
-/// remote. Returns `None` when `base_branch` has no `/` at all, or its
-/// leading segment isn't a real remote (so it's read as a literal branch name
-/// that happens to contain a slash, e.g. a personal `colin/main`).
-fn remote_from_base_branch(root: &Path, base_branch: &str) -> Option<String> {
-    let (candidate, _) = base_branch.split_once('/')?;
-    crate::guardian_merge::git(root, &["remote", "get-url", candidate]).ok()?;
-    Some(candidate.to_string())
-}
-
-/// Step 2 of [`resolve_remote_name`]: `base_branch` read as a bare local
-/// branch name, resolved via its own `@{u}` upstream tracking — not the
-/// current checkout's `@{u}` (a bare `@{u}` reflects whatever happens to be
-/// checked out in the shared guardian repo at call time, not the review's own
-/// base branch). Returns `None` when the branch doesn't exist locally or has
-/// no upstream configured.
-///
-/// An empty `base_branch` returns `None` without shelling out: `format!`ing it
-/// into the rev-parse argument would leave a bare `@{u}`, i.e. exactly the
-/// current-checkout reading this function exists to avoid.
-fn remote_from_branch_upstream(root: &Path, base_branch: &str) -> Option<String> {
-    if base_branch.trim().is_empty() {
+/// The remote `upstream` designates on its own: its named remote, or -- for a
+/// local base (`.`) -- the remote that local branch is configured to track
+/// (`branch.<name>.remote`, read from git config rather than rendered by
+/// `rev-parse @{u}`). `None` when neither applies. A tracking remote of `.`
+/// (a branch tracking another local branch) is no remote.
+fn named_upstream_remote(root: &Path, upstream: &UpstreamRef) -> Option<String> {
+    if !upstream.is_local() {
+        return Some(upstream.remote.clone());
+    }
+    if upstream.branch.trim().is_empty() {
         return None;
     }
-    let upstream = crate::guardian_merge::git(
-        root,
-        &[
-            "rev-parse",
-            "--abbrev-ref",
-            "--symbolic-full-name",
-            &format!("{base_branch}@{{u}}"),
-        ],
-    )
-    .ok()?;
-    let upstream = upstream.trim();
-    // At least one real git version/config returns `remotes/<remote>/<branch>`
-    // here instead of the documented `<remote>/<branch>` for `--abbrev-ref`
-    // on a remote-tracking ref -- confirmed against this repo's own `staging`
-    // branch, whose `@{u}` abbreviates to `remotes/alt/staging`, not
-    // `alt/staging`. Strip that literal leading path segment before
-    // splitting, or the naive split below reads the fixed word "remotes"
-    // itself as the remote name (this is exactly what broke PR submission
-    // for a bare, unprefixed review `upstream`/`base_branch`).
-    let upstream = upstream.strip_prefix("remotes/").unwrap_or(upstream);
-    let (remote, _branch) = upstream.split_once('/')?;
-    Some(remote.to_string())
+    let key = format!("branch.{}.remote", upstream.branch);
+    let out = crate::guardian_merge::git(root, &["config", "--get", &key]).ok()?;
+    let remote = out.trim();
+    (!remote.is_empty() && remote != ralphus_core::schema::LOCAL_UPSTREAM_REMOTE)
+        .then(|| remote.to_string())
 }
 
 /// Resolve the effective forge client for a git repository at `root`,
 /// combining the layered [`ForgeConfig`] (explicit overrides) with
 /// autodetection from `git remote get-url <remote>` (host → kind, path →
 /// repo). The remote itself is resolved via [`resolve_remote_name`], keyed
-/// off the review's own `base_branch` rather than `[forge].remote` directly
+/// off the review's own `upstream` rather than `[forge].remote` directly
 /// (RAL-282). Fails only when the remote can't be read/parsed or no forge
 /// kind can be determined — a missing token is not an error here (see
 /// [`ForgeClient::require_token`]). Logs the resolved kind/repo/api_base (or
 /// the failure reason) via `rlog!`.
 pub fn resolve_remote(
     root: &Path,
-    base_branch: &str,
+    upstream: &UpstreamRef,
     cfg: &ForgeConfig,
 ) -> Result<ForgeClient, String> {
-    let remote_name = resolve_remote_name(root, base_branch, cfg);
+    let remote_name = resolve_remote_name(root, upstream, cfg);
     resolve_remote_for(root, &remote_name, cfg)
 }
 
@@ -5269,6 +5236,19 @@ pub(crate) fn resolve_remote_with_store(
         let guard = store.lock();
         stored_token_for_identity(&guard, identity, host)
     })
+}
+
+/// Store-aware [`resolve_remote`]: derives the remote from `upstream`, then
+/// resolves as [`resolve_remote_with_store`].
+pub(crate) fn resolve_remote_for_base_with_store(
+    store: &crate::store_lock::StoreHandle,
+    root: &Path,
+    upstream: &UpstreamRef,
+    cfg: &ForgeConfig,
+    identity: Option<&str>,
+) -> Result<ForgeClient, String> {
+    let remote_name = resolve_remote_name(root, upstream, cfg);
+    resolve_remote_with_store(store, root, &remote_name, cfg, identity)
 }
 
 /// Like [`resolve_remote_for`], but resolves the API token from

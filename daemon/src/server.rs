@@ -2773,12 +2773,18 @@ fn validate_remote_reviews_are_declarative(
                 .review
                 .iter()
                 .find(|r| r.id.as_deref() == Some(review_id))
-                .and_then(|r| r.upstream.as_deref())
-                .map(str::trim)
-                .filter(|b| !b.is_empty());
+                .filter(|r| {
+                    r.upstream_remote
+                        .as_deref()
+                        .is_some_and(|v| !v.trim().is_empty())
+                        && r.upstream_branch
+                            .as_deref()
+                            .is_some_and(|v| !v.trim().is_empty())
+                })
+                .map(|_| ());
             if declared.is_none() {
                 return Err(format!(
-                    "review \"{review_id}\" is fed by cell \"{sid}\" running on machine                      \"{machine_label}\", so its upstream branch cannot be read from that worktree's                      git upstream — this daemon cannot see another machine's filesystem. Declare it                      explicitly: [[review]] upstream = \"main\"."
+                    "review \"{review_id}\" is fed by cell \"{sid}\" running on machine                      \"{machine_label}\", so its upstream branch cannot be read from that worktree's                      git upstream — this daemon cannot see another machine's filesystem. Declare it                      explicitly: [[review]] upstream_remote = \".\" upstream_branch = \"main\"."
                 ));
             }
         }
@@ -15881,7 +15887,7 @@ fn guardian_unlink_prs(daemon: &Daemon, id: &str) -> Reply {
         match crate::pr::forge_client_for_stack(
             &daemon.store_handle(),
             root,
-            &guardian.base_branch,
+            &guardian.upstream(),
             &forge_cfg,
             guardian.owner.as_deref(),
         ) {
@@ -16213,7 +16219,7 @@ fn pr_comments(daemon: &Daemon, pr_id: &str) -> Reply {
     let client = match crate::pr::forge_client_for_pr(
         &daemon.store_handle(),
         root,
-        &guardian.base_branch,
+        &guardian.upstream(),
         &forge_cfg,
         &pr.repo,
         guardian.owner.as_deref(),
@@ -16383,7 +16389,7 @@ fn pr_refresh_ci(daemon: &Daemon, pr_id: &str) -> Reply {
     let Some(client) = crate::pr::forge_client_for_pr(
         &daemon.store_handle(),
         root,
-        &guardian.base_branch,
+        &guardian.upstream(),
         &forge_cfg,
         &pr.repo,
         guardian.owner.as_deref(),

@@ -1786,6 +1786,58 @@ impl Store {
     /// Log the outcome of a one-shot migration that only runs when its guard
     /// detects an older database shape. `rows` is the affected-row count where
     /// the statement reports one (`0` for DDL).
+    /// RAL-628: fill `upstream_remote`/`upstream_branch` on rows written
+    /// before the pair existed, splitting their combined string against the
+    /// remotes configured in the row's repository
+    /// ([`crate::legacy_upstream::split_legacy_base`]). Idempotent: only rows
+    /// with a NULL pair are touched.
+    fn backfill_upstream_pairs(&self) {
+        let guardians: Vec<(String, String, String)> = self
+            .conn
+            .prepare(
+                "SELECT id, base_branch, git_root FROM guardians WHERE upstream_remote IS NULL",
+            )
+            .and_then(|mut stmt| {
+                stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+                    .collect::<std::result::Result<Vec<_>, _>>()
+            })
+            .unwrap_or_default();
+        for (id, combined, git_root) in guardians {
+            let pair =
+                crate::legacy_upstream::split_legacy_base(&combined, std::path::Path::new(&git_root));
+            self.note_migration(
+                "RAL-628 guardian upstream pair",
+                self.conn.execute(
+                    "UPDATE guardians SET upstream_remote=?, upstream_branch=? WHERE id=?",
+                    rusqlite::params![pair.remote, pair.branch, id],
+                ),
+            );
+        }
+        let pooled: Vec<(i64, String, String)> = self
+            .conn
+            .prepare(
+                "SELECT t.id, t.upstream, COALESCE(p.path, t.project)
+                 FROM triage_pool_cells t LEFT JOIN projects p ON p.name = t.project
+                 WHERE t.upstream_remote IS NULL",
+            )
+            .and_then(|mut stmt| {
+                stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+                    .collect::<std::result::Result<Vec<_>, _>>()
+            })
+            .unwrap_or_default();
+        for (id, combined, root) in pooled {
+            let pair =
+                crate::legacy_upstream::split_legacy_base(&combined, std::path::Path::new(&root));
+            self.note_migration(
+                "RAL-628 triage pool upstream pair",
+                self.conn.execute(
+                    "UPDATE triage_pool_cells SET upstream_remote=?, upstream_branch=? WHERE id=?",
+                    rusqlite::params![pair.remote, pair.branch, id],
+                ),
+            );
+        }
+    }
+
     fn note_migration(&self, name: &str, outcome: rusqlite::Result<usize>) {
         match outcome {
             Ok(rows) => crate::cartographer::Note::new("store")
@@ -4412,9 +4464,18 @@ impl Store {
             // worktree exhausting its attempts can no longer stop automatic
             // rebuild for the review's other worktrees.
             "ALTER TABLE guardians ADD COLUMN base_shift_rebuild_attempts_by_project TEXT",
+            // RAL-628: a review's base and a pooled Triage cell's upstream are
+            // an explicit (remote, branch) pair; `.` is the local remote.
+            // `guardians.base_branch` / `triage_pool_cells.upstream` remain as
+            // the joined display string.
+            "ALTER TABLE guardians ADD COLUMN upstream_remote TEXT",
+            "ALTER TABLE guardians ADD COLUMN upstream_branch TEXT",
+            "ALTER TABLE triage_pool_cells ADD COLUMN upstream_remote TEXT",
+            "ALTER TABLE triage_pool_cells ADD COLUMN upstream_branch TEXT",
         ] {
             self.run_idempotent_migration(stmt);
         }
+        self.backfill_upstream_pairs();
         // RAL-479: the review status literal "approved" was renamed to
         // "merged" -- it always meant the linked PR/MR had merged, never
         // that a human had approved it. Remap every already-persisted row

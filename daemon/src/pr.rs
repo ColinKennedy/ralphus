@@ -46,6 +46,7 @@ use std::sync::{Arc, LazyLock, Mutex};
 use opentelemetry::trace::{SpanKind, Status};
 use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Serialize};
+use ralphus_core::schema::UpstreamRef;
 
 use crate::guardian::{BranchView, GuardianView, MergeStatus};
 use crate::guardian_merge::{self, git};
@@ -1988,23 +1989,6 @@ fn sanitize_branch_name(name: &str) -> String {
     }
 }
 
-/// Strip a `<remote>/` prefix from a base-branch string like `origin/main`, so
-/// the forge PR base is a plain branch name (`main`).
-fn strip_remote_prefix(branch: &str, remote: &str) -> String {
-    branch
-        .strip_prefix(&format!("{remote}/"))
-        .unwrap_or(branch)
-        .to_string()
-}
-
-fn qualify_forge_base(current_base: &str, remote: &str, forge_base: &str) -> String {
-    if current_base.starts_with(&format!("{remote}/")) {
-        format!("{remote}/{forge_base}")
-    } else {
-        forge_base.to_string()
-    }
-}
-
 /// The remote tip a [`guard_against_clobber`] check approved overwriting --
 /// the lease [`push_ref`] force-pushes against.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2583,7 +2567,7 @@ fn synthesize_pr_text(
     // "unique to this branch"). `qualify_ambiguous_ref` is the same
     // consolidated fix `guardian_merge::resolve_base` already uses for this
     // ambiguity class.
-    let qualified_base = guardian_merge::qualify_ambiguous_ref(&root, &guardian.base_branch);
+    let qualified_base = guardian_merge::qualify_upstream_ref(&root, &guardian.upstream());
     let base_sha = match git(&root, &["rev-parse", &qualified_base]) {
         Ok(s) => s.trim().to_string(),
         Err(_) => {
@@ -3168,26 +3152,6 @@ impl PrRepoRouting {
     }
 }
 
-/// The remote name to strip/qualify a guardian's `base_branch` against when
-/// comparing or writing it relative to a forge PR's bare base ref -- the
-/// same fork-excluded [`PrRepoRouting::parent_remote_name`]
-/// [`detect_forge_reorder`] itself compares against, kept as a named entry
-/// point so [`check_and_apply_forge_reorder`]'s apply step can't drift back
-/// to a plain, non-excluding resolution (RAL-273/RAL-338: that mismatch let a
-/// project whose registered fork shares `base_branch`'s own remote name loop
-/// `merging`<->`in_review` forever, since the "fix" kept re-qualifying with
-/// the excluded remote and writing back the exact value the next detection
-/// pass would flag as drifted again).
-fn forge_parent_remote_name(
-    store: &crate::store_lock::StoreHandle,
-    root: &Path,
-    base_branch: &str,
-    forge_cfg: &crate::config::ForgeConfig,
-    owner: Option<&str>,
-) -> String {
-    resolve_pr_repo_routing(store, root, base_branch, forge_cfg, owner).parent_remote_name
-}
-
 /// Resolve [`PrRepoRouting`] for `guardian`'s project (by `guardian.git_root`
 /// unless the caller has a more specific `root`/project path for a
 /// multi-project branch, e.g. [`check_pr_merges`]'s per-branch resolution).
@@ -3202,12 +3166,12 @@ fn forge_parent_remote_name(
 pub fn forge_client_for_pr(
     store: &crate::store_lock::StoreHandle,
     root: &Path,
-    base_branch: &str,
+    upstream: &UpstreamRef,
     forge_cfg: &crate::config::ForgeConfig,
     repo: &str,
     owner: Option<&str>,
 ) -> Option<crate::forge::ForgeClient> {
-    resolve_pr_repo_routing(store, root, base_branch, forge_cfg, owner)
+    resolve_pr_repo_routing(store, root, upstream, forge_cfg, owner)
         .client_for(repo)
         .cloned()
 }
@@ -3285,13 +3249,13 @@ pub(crate) fn project_clone_url_for_root(
 fn resolve_pr_repo_routing(
     store: &crate::store_lock::StoreHandle,
     root: &Path,
-    base_branch: &str,
+    upstream: &UpstreamRef,
     forge_cfg: &crate::config::ForgeConfig,
     owner: Option<&str>,
 ) -> PrRepoRouting {
     let key = (
         root.to_path_buf(),
-        base_branch.to_string(),
+        upstream.clone(),
         format!("{forge_cfg:?}"),
         owner.map(str::to_string),
     );
@@ -3301,7 +3265,7 @@ fn resolve_pr_repo_routing(
             return routing.clone();
         }
     }
-    let routing = resolve_pr_repo_routing_uncached(store, root, base_branch, forge_cfg, owner);
+    let routing = resolve_pr_repo_routing_uncached(store, root, upstream, forge_cfg, owner);
     let mut cache = routing_cache().lock();
     cache.retain(|_, (at, _)| now.duration_since(*at) < ROUTING_CACHE_TTL);
     cache.insert(key, (now, routing.clone()));
@@ -3318,7 +3282,7 @@ const ROUTING_CACHE_TTL: std::time::Duration = if cfg!(test) {
     std::time::Duration::from_secs(15)
 };
 
-type RoutingCacheKey = (std::path::PathBuf, String, String, Option<String>);
+type RoutingCacheKey = (std::path::PathBuf, UpstreamRef, String, Option<String>);
 
 fn routing_cache()
 -> &'static parking_lot::Mutex<HashMap<RoutingCacheKey, (std::time::Instant, PrRepoRouting)>> {
@@ -3338,7 +3302,7 @@ pub(crate) fn invalidate_pr_routing_cache() {
 fn resolve_pr_repo_routing_uncached(
     store: &crate::store_lock::StoreHandle,
     root: &Path,
-    base_branch: &str,
+    upstream: &UpstreamRef,
     forge_cfg: &crate::config::ForgeConfig,
     owner: Option<&str>,
 ) -> PrRepoRouting {
@@ -3358,7 +3322,7 @@ fn resolve_pr_repo_routing_uncached(
     let Some(fork) = fork else {
         let parent_remote_name = crate::forge::resolve_parent_remote_name(
             root,
-            base_branch,
+            upstream,
             forge_cfg,
             clone_url.as_deref(),
             None,
@@ -3379,7 +3343,7 @@ fn resolve_pr_repo_routing_uncached(
     };
     let parent_remote_name = crate::forge::resolve_parent_remote_name(
         root,
-        base_branch,
+        upstream,
         forge_cfg,
         clone_url.as_deref(),
         Some(&fork.remote_name),
@@ -3581,15 +3545,7 @@ fn resync_pr_bases_inner(
     }
     let root = PathBuf::from(&guardian.git_root);
     let forge_cfg = crate::config::resolve_forge(&root);
-    let clone_url = project_clone_url(store, guardian.project.as_deref());
-    let remote_name = crate::forge::resolve_parent_remote_name(
-        &root,
-        &guardian.base_branch,
-        &forge_cfg,
-        clone_url.as_deref(),
-        None,
-    );
-    let base_branch_name = strip_remote_prefix(&guardian.base_branch, &remote_name);
+    let base_branch_name = guardian.upstream_branch.clone();
 
     let prs = store
         .lock()
@@ -3604,13 +3560,13 @@ fn resync_pr_bases_inner(
     let routing = resolve_pr_repo_routing(
         store,
         &root,
-        &guardian.base_branch,
+        &guardian.upstream(),
         &forge_cfg,
         guardian.owner.as_deref(),
     );
     let (parent_client, fork_client) = (routing.parent_client, routing.fork_client);
     let resolved_client_err = if parent_client.is_none() && fork_client.is_none() {
-        crate::forge::resolve_remote(&root, &guardian.base_branch, &forge_cfg).err()
+        crate::forge::resolve_remote(&root, &guardian.upstream(), &forge_cfg).err()
     } else {
         None
     };
@@ -4033,7 +3989,7 @@ pub fn reconcile_ci_deferral(
     let routing = resolve_pr_repo_routing(
         store,
         &root,
-        &guardian.base_branch,
+        &guardian.upstream(),
         &forge_cfg,
         guardian.owner.as_deref(),
     );
@@ -4423,7 +4379,7 @@ pub fn check_pr_merges(store: &crate::store_lock::StoreHandle, id: &str) -> bool
         let routing = resolve_pr_repo_routing(
             store,
             &root,
-            &guardian.base_branch,
+            &guardian.upstream(),
             &forge_cfg,
             guardian.owner.as_deref(),
         );
@@ -4571,12 +4527,12 @@ fn maybe_promote_fork_root(
     let clone_url = project_clone_url(store, guardian.project.as_deref());
     let parent_remote_name = crate::forge::resolve_parent_remote_name(
         &root,
-        &guardian.base_branch,
+        &guardian.upstream(),
         &forge_cfg,
         clone_url.as_deref(),
         Some(&routing.fork.remote_name),
     );
-    let base_branch_name = strip_remote_prefix(&guardian.base_branch, &parent_remote_name);
+    let base_branch_name = guardian.upstream_branch.clone();
     // The cross-repository root is the only PR whose base is the guardian's
     // own base branch directly -- every other branch chains onto a preceding
     // alias (see `fork_aware_route`, which both submission and this function
@@ -5647,7 +5603,7 @@ pub fn sync_open_pr_branches(store: &crate::store_lock::StoreHandle, id: &str) {
     let routing = resolve_pr_repo_routing(
         store,
         &root,
-        &guardian.base_branch,
+        &guardian.upstream(),
         &forge_cfg,
         guardian.owner.as_deref(),
     );
@@ -5963,11 +5919,11 @@ pub fn detect_forge_reorder(
     let routing = resolve_pr_repo_routing(
         store,
         &root,
-        &guardian.base_branch,
+        &guardian.upstream(),
         &forge_cfg,
         guardian.owner.as_deref(),
     );
-    let base_branch_name = strip_remote_prefix(&guardian.base_branch, &routing.parent_remote_name);
+    let base_branch_name = guardian.upstream_branch.clone();
 
     let prs = store
         .lock()
@@ -6212,7 +6168,7 @@ pub fn check_and_apply_forge_reorder(
         drift.base_changed,
         drift.order_changed
     );
-    let (root, base_branch, forge_cfg, owner) = {
+    let current_base = {
         let guardian = match store.lock().get_guardian(id) {
             Ok(g) => g,
             Err(e) => {
@@ -6223,13 +6179,9 @@ pub fn check_and_apply_forge_reorder(
                 return false;
             }
         };
-        let root = PathBuf::from(&guardian.git_root);
-        let forge_cfg = crate::config::resolve_forge(&root);
-        (root, guardian.base_branch, forge_cfg, guardian.owner)
+        guardian.upstream()
     };
-    let remote_name =
-        forge_parent_remote_name(store, &root, &base_branch, &forge_cfg, owner.as_deref());
-    let local_base = qualify_forge_base(&base_branch, &remote_name, &drift.base);
+    let local_base = UpstreamRef::new(current_base.remote, &drift.base);
     {
         let mut guard = store.lock();
         let base_applied = if drift.base_changed {
@@ -6456,11 +6408,11 @@ pub fn poll_pr_base_drift(
     let routing = resolve_pr_repo_routing(
         store,
         &root,
-        &guardian.base_branch,
+        &guardian.upstream(),
         &forge_cfg,
         guardian.owner.as_deref(),
     );
-    let base_branch_name = strip_remote_prefix(&guardian.base_branch, &routing.parent_remote_name);
+    let base_branch_name = guardian.upstream_branch.clone();
 
     let prs = store
         .lock()
@@ -6770,7 +6722,7 @@ fn refresh_pr_forge_cache_for_guardian(store: &crate::store_lock::StoreHandle, i
         resolve_pr_repo_routing(
             store,
             &root,
-            &guardian.base_branch,
+            &guardian.upstream(),
             &forge_cfg,
             guardian.owner.as_deref(),
         )
@@ -6800,7 +6752,7 @@ fn refresh_pr_forge_cache_for_guardian(store: &crate::store_lock::StoreHandle, i
     let routing = resolve_pr_repo_routing(
         store,
         &root,
-        &guardian.base_branch,
+        &guardian.upstream(),
         &forge_cfg,
         guardian.owner.as_deref(),
     );
@@ -7210,7 +7162,7 @@ fn resolve_fork_routing(
     let clone_url = project_clone_url(store, Some(project_name.as_str()));
     let parent_remote_name = crate::forge::resolve_parent_remote_name(
         root,
-        &guardian.base_branch,
+        &guardian.upstream(),
         forge_cfg,
         clone_url.as_deref(),
         Some(&fork.remote_name),
@@ -7429,7 +7381,7 @@ pub(crate) fn refresh_dual_root_upstream_branch(
     guardian_id: &str,
     git_root: &str,
     owner: Option<&str>,
-    base_branch: &str,
+    upstream: &UpstreamRef,
 ) {
     let branch = match store.lock().guardian_dual_root_stack_branch(guardian_id) {
         Ok(Some(branch)) => branch,
@@ -7469,12 +7421,12 @@ pub(crate) fn refresh_dual_root_upstream_branch(
     let clone_url = project_clone_url(store, Some(project_name.as_str()));
     let parent_remote_name = crate::forge::resolve_parent_remote_name(
         &root,
-        base_branch,
+        upstream,
         &forge_cfg,
         clone_url.as_deref(),
         Some(&fork.remote_name),
     );
-    let base_branch_name = strip_remote_prefix(base_branch, &parent_remote_name);
+    let base_branch_name = upstream.branch.clone();
     match crate::project_forks::sync_review_upstream_branch(
         &root,
         &parent_remote_name,
@@ -9493,12 +9445,12 @@ fn auto_submit_terminal_branches(
     let clone_url = project_clone_url(store, guardian.project.as_deref());
     let parent_remote_name = crate::forge::resolve_parent_remote_name(
         &root,
-        &guardian.base_branch,
+        &guardian.upstream(),
         &forge_cfg,
         clone_url.as_deref(),
         fork_remote_exclude,
     );
-    let base_branch_name = strip_remote_prefix(&guardian.base_branch, &parent_remote_name);
+    let base_branch_name = guardian.upstream_branch.clone();
     // RAL-<new>: dual-root-PR mode's "stack" PR targets the review's own
     // transient fork-side upstream branch, force-pushed to the parent's base
     // tip once per submission call (not per branch -- which branch is
@@ -10093,12 +10045,12 @@ fn submit_pull_requests_inner(
     let clone_url = project_clone_url(store, guardian.project.as_deref());
     let parent_remote_name = crate::forge::resolve_parent_remote_name(
         &root,
-        &guardian.base_branch,
+        &guardian.upstream(),
         &forge_cfg,
         clone_url.as_deref(),
         fork_remote_exclude,
     );
-    let base_branch_name = strip_remote_prefix(&guardian.base_branch, &parent_remote_name);
+    let base_branch_name = guardian.upstream_branch.clone();
     // RAL-<new>: dual-root-PR mode's "stack" PR targets the review's own
     // transient fork-side upstream branch, force-pushed to the parent's base
     // tip once per submission call (not per branch -- which branch is
@@ -10742,7 +10694,7 @@ fn fetch_remote_pr_tip(
     let routing = resolve_pr_repo_routing(
         store,
         &root,
-        &guardian.base_branch,
+        &guardian.upstream(),
         &forge_cfg,
         guardian.owner.as_deref(),
     );
@@ -11039,7 +10991,7 @@ pub fn pull_pr_commits(
     let routing = resolve_pr_repo_routing(
         store,
         &root,
-        &guardian.base_branch,
+        &guardian.upstream(),
         &forge_cfg,
         guardian.owner.as_deref(),
     );
@@ -11408,7 +11360,7 @@ fn action_pr_feedback_inner(
     let routing = resolve_pr_repo_routing(
         store,
         &root,
-        &guardian.base_branch,
+        &guardian.upstream(),
         &forge_cfg,
         guardian.owner.as_deref(),
     );
@@ -16371,9 +16323,7 @@ mod tests {
         // Apply it through the exact same helper `check_and_apply_forge_reorder`'s
         // apply block calls, so this test breaks if that call site ever
         // drifts back to a plain, non-excluding remote resolution.
-        let forge_cfg = crate::config::resolve_forge(&root_dir);
-        let remote_name = forge_parent_remote_name(&store, &root_dir, "alt/main", &forge_cfg, None);
-        let local_base = qualify_forge_base("alt/main", &remote_name, &drift.base);
+        let local_base = UpstreamRef::new("alt", &drift.base);
         assert!(
             store
                 .lock()

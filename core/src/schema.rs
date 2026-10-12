@@ -507,36 +507,35 @@ pub fn parse_upstream_task_ref(upstream: &str) -> Option<&str> {
 
 /// Scheme prefix for a placeholder cell `cwd` that names a branch to
 /// materialize a fresh (or reused) worktree for, e.g.
-/// `"ralphus:new-worktree/RAL-100-feature?upstream=main"` (RAL-100). Rather
+/// `"ralphus:new-worktree/RAL-100-feature?upstream_remote=origin&upstream_branch=main"`
+/// (RAL-100). Rather
 /// than a real filesystem path, this names a branch; the owning task's
 /// `project` field (REQUIRED whenever any of its cells uses this placeholder)
 /// names which project registered via `ralphus project git` to materialize it
-/// under. The trailing `?upstream=<upstream>` is REQUIRED (see
-/// [`parse_worktree_placeholder_upstream`]) so ralphus always knows what the
-/// branch tracks, rather than guessing from whatever `HEAD` happens to be at
-/// materialization time. The value may be a literal branch name (`main`,
-/// `origin/main`) or one of the reserved sentinels [`WORKTREE_UPSTREAM_DEFAULT`]
-/// / [`WORKTREE_UPSTREAM_CURRENT_BRANCH`], which the daemon expands against
-/// the project before materialization. The daemon resolves that project,
+/// under. The trailing `?upstream_remote=<remote>&upstream_branch=<branch>` is
+/// REQUIRED (see [`parse_worktree_placeholder_upstream`]) so ralphus always
+/// knows what the branch tracks, rather than guessing from whatever `HEAD` happens
+/// to be at materialization time. The remote is a remote name or `.` (a local
+/// branch); the branch is literal text (slashes included) or the reserved
+/// sentinel [`WORKTREE_UPSTREAM_DEFAULT`], which the daemon expands by querying the
+/// remote before materialization. The daemon resolves that project,
 /// materializes (or reuses) a git worktree for the branch under
 /// `.git/.ralphus_worktrees/<branch>`, and rewrites the cell's `cwd` to that
 /// real path before the cell runs.
 pub const WORKTREE_PLACEHOLDER_PREFIX: &str = "ralphus:new-worktree/";
 
-/// Parse a cell `cwd` as a `ralphus:new-worktree/<branch>[?upstream=<upstream>]`
+/// Parse a cell `cwd` as a `ralphus:new-worktree/<branch>[?upstream_remote=..&upstream_branch=..]`
 /// placeholder (RAL-100). Returns the branch name when non-empty; `None` for a
 /// plain filesystem path or a malformed placeholder-shaped string (empty
 /// branch). A real absolute path never starts with the literal
 /// `ralphus:new-worktree/` prefix, so this is unambiguous. The project to
 /// materialize the branch under is NOT embedded here -- it comes from the
 /// owning task's `project` field (see [`crate::validate`]). The parser does no
-/// further segmentation beyond the optional `?upstream=...` query suffix (see
+/// further segmentation beyond the optional `?upstream_remote=...&upstream_branch=...` query suffix (see
 /// [`parse_worktree_placeholder_upstream`]): everything else after the
 /// prefix, slashes included, is returned as one literal branch name. A value
 /// like `ralphus:new-worktree/origin/feature/x` therefore parses as the
-/// branch name `origin/feature/x`; any later interpretation of that shape as
-/// "maybe a remote-tracking branch" happens in daemon-side worktree
-/// materialization, not here.
+/// branch name `origin/feature/x`.
 #[must_use]
 pub fn parse_worktree_placeholder(cwd: &str) -> Option<&str> {
     let rest = cwd.strip_prefix(WORKTREE_PLACEHOLDER_PREFIX)?;
@@ -547,14 +546,142 @@ pub fn parse_worktree_placeholder(cwd: &str) -> Option<&str> {
     Some(branch)
 }
 
-/// Parse the `?upstream=<upstream>` query suffix off a
-/// `ralphus:new-worktree/<branch>?upstream=<upstream>` placeholder. Returns
-/// `None` when the placeholder has no query suffix, an empty `upstream=`
-/// value, or any other malformed/unrecognized query -- callers that require
-/// an explicit upstream (submit-time validation in [`crate::validate`], and
-/// the daemon's own defensive re-check at worktree-resolution time) treat
-/// `None` as "no upstream given" and report it themselves; this function does
-/// no error reporting of its own.
+/// The remote literal meaning "a local branch": git's own `branch.<b>.remote`
+/// convention for a branch that tracks another local branch.
+pub const LOCAL_UPSTREAM_REMOTE: &str = ".";
+
+/// The explicit upstream a worktree placeholder (or a `[[review]]` block)
+/// declares: a remote name plus a branch on it. The branch is literal text, so
+/// a name containing `/` (`release/1.2`) is never confused with a
+/// remote-qualified one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct WorktreeUpstream<'a> {
+    /// Remote name, or [`LOCAL_UPSTREAM_REMOTE`] for a local branch.
+    pub remote: &'a str,
+    /// Branch on that remote (or the local branch when the remote is `.`),
+    /// or one of the branch-half sentinels.
+    pub branch: &'a str,
+}
+
+/// The joined `<remote>/<branch>` display form of an upstream pair (just
+/// `<branch>` for the local remote `.`). Display and key material only; the
+/// pair itself is the source of truth.
+#[must_use]
+pub fn join_upstream(remote: &str, branch: &str) -> String {
+    if remote == LOCAL_UPSTREAM_REMOTE {
+        branch.to_string()
+    } else {
+        format!("{remote}/{branch}")
+    }
+}
+
+/// An owned upstream: a remote (or [`LOCAL_UPSTREAM_REMOTE`] for a local
+/// branch) plus a literal branch on it. Never split from or joined into a
+/// single string except for display.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
+pub struct UpstreamRef {
+    /// Remote name, or `.` for a local branch.
+    pub remote: String,
+    /// Branch on that remote (the local branch when the remote is `.`).
+    pub branch: String,
+}
+
+impl UpstreamRef {
+    /// Build a pair from its two halves.
+    #[must_use]
+    pub fn new(remote: impl Into<String>, branch: impl Into<String>) -> Self {
+        Self {
+            remote: remote.into(),
+            branch: branch.into(),
+        }
+    }
+
+    /// A local-branch upstream (remote `.`).
+    #[must_use]
+    pub fn local(branch: impl Into<String>) -> Self {
+        Self::new(LOCAL_UPSTREAM_REMOTE, branch)
+    }
+
+    /// Does this name a local branch rather than a remote's?
+    #[must_use]
+    pub fn is_local(&self) -> bool {
+        self.remote == LOCAL_UPSTREAM_REMOTE
+    }
+
+    /// The full ref this pair names: `refs/heads/<branch>` for a local base,
+    /// else `refs/remotes/<remote>/<branch>`.
+    #[must_use]
+    pub fn tracking_ref(&self) -> String {
+        if self.is_local() {
+            format!("refs/heads/{}", self.branch)
+        } else {
+            format!("refs/remotes/{}/{}", self.remote, self.branch)
+        }
+    }
+
+    /// The joined display string (see [`join_upstream`]).
+    #[must_use]
+    pub fn joined(&self) -> String {
+        join_upstream(&self.remote, &self.branch)
+    }
+}
+
+/// A bare string names a local branch -- the whole string is the branch,
+/// never split. Spell out [`UpstreamRef::new`] for a remote's branch.
+impl From<&str> for UpstreamRef {
+    fn from(branch: &str) -> Self {
+        Self::local(branch)
+    }
+}
+
+impl From<&UpstreamRef> for UpstreamRef {
+    fn from(upstream: &UpstreamRef) -> Self {
+        upstream.clone()
+    }
+}
+
+impl From<&String> for UpstreamRef {
+    fn from(branch: &String) -> Self {
+        Self::local(branch.as_str())
+    }
+}
+
+impl From<String> for UpstreamRef {
+    fn from(branch: String) -> Self {
+        Self::local(branch)
+    }
+}
+
+impl std::fmt::Display for UpstreamRef {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.joined())
+    }
+}
+
+/// Is `remote` an acceptable upstream remote value: `[A-Za-z0-9._-]+`
+/// (which includes the local-branch literal `.`)?
+#[must_use]
+pub fn is_valid_upstream_remote(remote: &str) -> bool {
+    !remote.is_empty()
+        && remote
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+}
+
+/// Query key carrying the upstream remote on a worktree placeholder.
+pub const UPSTREAM_REMOTE_PARAM: &str = "upstream_remote";
+/// Query key carrying the upstream branch on a worktree placeholder.
+pub const UPSTREAM_BRANCH_PARAM: &str = "upstream_branch";
+
+/// Parse the `upstream_remote=<remote>&upstream_branch=<branch>` query suffix
+/// off a `ralphus:new-worktree/<branch>?...` placeholder. The two keys are
+/// both required and accepted in either order. Returns `None` when the
+/// placeholder has no query suffix, either value is missing or empty, or the
+/// remote is not a valid remote name -- callers that require an explicit
+/// upstream (submit-time validation in [`crate::validate`], and the daemon's
+/// own defensive re-check at worktree-resolution time) treat `None` as "no
+/// upstream given" and report it themselves; this function does no error
+/// reporting of its own.
 ///
 /// `?` is never valid inside a git branch name (`git check-ref-format`
 /// rejects it), so splitting the placeholder on the first `?` unambiguously
@@ -566,22 +693,38 @@ pub fn parse_worktree_placeholder(cwd: &str) -> Option<&str> {
 /// remote-tracking branch. It is unrelated to a cell's own top-level
 /// `upstream = "<<task:...>>"` field ([`CellDef::upstream`]), which rebases
 /// this cell's branch onto another task/cell's tip immediately before the
-/// cell runs -- a content operation, not a tracking-configuration one. It is
-/// also unrelated to a `[[review]]` block's own `upstream` field
-/// ([`ReviewDef::upstream`]), which declares the branch a review's stack
-/// rebases onto rather than a worktree tracking target. A cell can set both
-/// of the cell-level fields: the `cwd` placeholder's `?upstream=` for
-/// tracking, and its own `upstream` field for a pre-run rebase.
+/// cell runs -- a content operation, not a tracking-configuration one.
 #[must_use]
-pub fn parse_worktree_placeholder_upstream(cwd: &str) -> Option<&str> {
+pub fn parse_worktree_placeholder_upstream(cwd: &str) -> Option<WorktreeUpstream<'_>> {
     let rest = cwd.strip_prefix(WORKTREE_PLACEHOLDER_PREFIX)?;
     let (_, query) = rest.split_once('?')?;
-    let value = query.strip_prefix("upstream=")?;
-    let value = value.split_once('&').map_or(value, |(value, _)| value);
-    if value.is_empty() {
+    let mut remote = None;
+    let mut branch = None;
+    for parameter in query.split('&') {
+        match parameter.split_once('=') {
+            Some((UPSTREAM_REMOTE_PARAM, value)) => remote = remote.or(Some(value)),
+            Some((UPSTREAM_BRANCH_PARAM, value)) => branch = branch.or(Some(value)),
+            _ => {}
+        }
+    }
+    let (remote, branch) = (remote?, branch?);
+    if branch.is_empty() || !is_valid_upstream_remote(remote) {
         return None;
     }
-    Some(value)
+    Some(WorktreeUpstream { remote, branch })
+}
+
+/// Does `cwd`'s placeholder query use the removed combined `?upstream_remote=.&upstream_branch=<value>`
+/// form?
+#[must_use]
+pub fn worktree_placeholder_has_combined_upstream(cwd: &str) -> bool {
+    cwd.strip_prefix(WORKTREE_PLACEHOLDER_PREFIX)
+        .and_then(|rest| rest.split_once('?'))
+        .is_some_and(|(_, query)| {
+            query
+                .split('&')
+                .any(|p| p.split_once('=').is_some_and(|(k, _)| k == "upstream"))
+        })
 }
 
 /// A worktree placeholder embedded as text in a review preparation/action
@@ -591,8 +734,8 @@ pub fn parse_worktree_placeholder_upstream(cwd: &str) -> Option<&str> {
 pub struct WorktreeTextRef<'a> {
     /// Branch text declared by the placeholder.
     pub branch: &'a str,
-    /// Tracking upstream declared by the placeholder.
-    pub upstream: &'a str,
+    /// Tracking upstream (remote and branch) declared by the placeholder.
+    pub upstream: WorktreeUpstream<'a>,
     /// Optional transform applied to [`Self::branch`] during interpolation.
     pub text_fn: Option<TextFn>,
 }
@@ -600,20 +743,27 @@ pub struct WorktreeTextRef<'a> {
 /// Why a text-embedded worktree placeholder is invalid.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WorktreeTextRefError<'a> {
-    /// The placeholder omitted its required worktree upstream.
+    /// The placeholder omitted its required worktree upstream branch.
     MissingUpstream,
+    /// The placeholder omitted its required worktree upstream remote.
+    MissingUpstreamRemote,
+    /// The `upstream_remote` value is not a valid remote name.
+    InvalidUpstreamRemote(&'a str),
+    /// The placeholder used the removed combined `upstream` query parameter.
+    CombinedUpstream,
     /// One query parameter occurred more than once.
     DuplicateParameter(&'a str),
-    /// The placeholder named a query parameter other than `upstream` or `text`.
+    /// The placeholder named a query parameter other than `upstream_remote`, `upstream_branch` or `text`.
     UnknownParameter(&'a str),
     /// The `text` query could not be parsed as a registered text transform.
     InvalidTextQuery(LinkedFieldQueryError<'a>),
 }
 
-/// Parse a `ralphus:new-worktree/<branch>?upstream=<upstream>[&text=<fn>({})]`
+/// Parse a
+/// `ralphus:new-worktree/<branch>?upstream_remote=<remote>&upstream_branch=<branch>[&text=<fn>({})]`
 /// marker used as text interpolation in review preparation/action fields.
 ///
-/// A non-worktree marker returns `Ok(None)`. The `upstream` parameter remains
+/// A non-worktree marker returns `Ok(None)`. Both upstream parameters remain
 /// mandatory so the marker has the same unambiguous branch declaration as a
 /// cell worktree placeholder. `text` defaults to the declared branch itself.
 pub fn parse_worktree_text_ref(
@@ -628,21 +778,38 @@ pub fn parse_worktree_text_ref(
     if branch.is_empty() {
         return Err(WorktreeTextRefError::MissingUpstream);
     }
-    let mut upstream = None;
+    let mut remote = None;
+    let mut upstream_branch = None;
     let mut text_fn = None;
     for parameter in query.split('&') {
         let Some((name, value)) = parameter.split_once('=') else {
             return Err(WorktreeTextRefError::UnknownParameter(parameter));
         };
         match name {
-            "upstream" => {
-                if upstream.replace(value).is_some() {
-                    return Err(WorktreeTextRefError::DuplicateParameter("upstream"));
+            UPSTREAM_REMOTE_PARAM => {
+                if remote.replace(value).is_some() {
+                    return Err(WorktreeTextRefError::DuplicateParameter(
+                        UPSTREAM_REMOTE_PARAM,
+                    ));
+                }
+                if value.is_empty() {
+                    return Err(WorktreeTextRefError::MissingUpstreamRemote);
+                }
+                if !is_valid_upstream_remote(value) {
+                    return Err(WorktreeTextRefError::InvalidUpstreamRemote(value));
+                }
+            }
+            UPSTREAM_BRANCH_PARAM => {
+                if upstream_branch.replace(value).is_some() {
+                    return Err(WorktreeTextRefError::DuplicateParameter(
+                        UPSTREAM_BRANCH_PARAM,
+                    ));
                 }
                 if value.is_empty() {
                     return Err(WorktreeTextRefError::MissingUpstream);
                 }
             }
+            "upstream" => return Err(WorktreeTextRefError::CombinedUpstream),
             "text" => {
                 if text_fn.is_some() {
                     return Err(WorktreeTextRefError::DuplicateParameter("text"));
@@ -655,12 +822,18 @@ pub fn parse_worktree_text_ref(
             _ => return Err(WorktreeTextRefError::UnknownParameter(name)),
         }
     }
-    let Some(upstream) = upstream else {
+    let Some(remote) = remote else {
+        return Err(WorktreeTextRefError::MissingUpstreamRemote);
+    };
+    let Some(upstream_branch) = upstream_branch else {
         return Err(WorktreeTextRefError::MissingUpstream);
     };
     Ok(Some(WorktreeTextRef {
         branch,
-        upstream,
+        upstream: WorktreeUpstream {
+            remote,
+            branch: upstream_branch,
+        },
         text_fn,
     }))
 }
@@ -669,8 +842,8 @@ pub fn parse_worktree_text_ref(
 /// `body_start`, or `None` when the run is unterminated.
 ///
 /// Nested `<<...>>` pairs inside the body are matched and skipped, so
-/// `<<ralphus:new-worktree/feat?upstream=<<default>>>>` yields a body of
-/// `ralphus:new-worktree/feat?upstream=<<default>>` rather than stopping at
+/// `<<ralphus:new-worktree/feat?upstream_branch=<<default>>>>` yields a body of
+/// `ralphus:new-worktree/feat?upstream_branch=<<default>>` rather than stopping at
 /// the inner sentinel's `>>`. When the body contains a `<<` that is never
 /// balanced, the scan falls back to the first `>>` so that a lone stray `<<`
 /// inside otherwise-literal text still terminates the placeholder where it
@@ -710,7 +883,7 @@ pub fn placeholder_close(text: &str, body_start: usize) -> Option<usize> {
 ///
 /// Unterminated `<<...` runs are ignored and left to callers as literal text.
 /// The returned slices exclude the surrounding `<<` / `>>` delimiters, and a
-/// nested `<<...>>` (e.g. a `?upstream=<<default>>` sentinel inside a wrapped
+/// nested `<<...>>` (e.g. a `?upstream_branch=<<default>>` sentinel inside a wrapped
 /// worktree marker) stays part of the outer body -- see [`placeholder_close`].
 #[must_use]
 pub fn text_placeholders(text: &str) -> Vec<&str> {
@@ -1105,7 +1278,7 @@ impl TextFn {
 /// see [`parse_linked_field_query`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LinkedFieldQueryError<'a> {
-    /// The query wasn't `text=...` at all (e.g. a stray `?upstream=main` --
+    /// The query wasn't `text=...` at all (e.g. a stray `?upstream_remote=.&upstream_branch=main` --
     /// that query belongs to a worktree placeholder, not a linked field).
     UnknownParam,
     /// `?text=` with nothing after the `=`.
@@ -1146,29 +1319,28 @@ pub fn parse_text_fn_expression(expr: &str) -> Result<TextFn, LinkedFieldQueryEr
     TextFn::by_name(name).ok_or(LinkedFieldQueryError::UnknownFunction(name))
 }
 
-/// Reserved `?upstream=` sentinel value meaning "the repository's default
-/// branch" — expanded daemon-side against the project root (see
-/// `ralphus_daemon::worktrees::resolve_upstream`). Authored as
-/// `?upstream=<<default>>`. The recommended choice: it names a stable,
-/// well-defined tracking target without the caller needing to know the
-/// branch name up front.
+/// Reserved `upstream_branch` sentinel meaning "the named remote's default
+/// branch" -- expanded daemon-side by querying the remote at worktree
+/// materialization (see `ralphus_daemon::worktrees::resolve_upstream`). Authored
+/// as `upstream_branch=<<default>>`. Allowed only as the branch half.
 pub const WORKTREE_UPSTREAM_DEFAULT: &str = "<<default>>";
 
-/// Reserved `?upstream=` sentinel value meaning "whatever branch the project
-/// currently has checked out in its registered root/primary worktree" —
-/// expanded daemon-side (see `ralphus_daemon::worktrees::resolve_upstream`).
-/// Authored as `?upstream=<<current_branch>>`. Flagged in the tutor as
-/// riskier than `<<default>>`: the checked-out branch can silently change
-/// between runs, so the tracking target is not stable across submissions.
+/// Reserved `upstream_branch` sentinel meaning "whatever branch the project
+/// currently has checked out in its registered root/primary worktree" -- the
+/// daemon resolves it to remote `.` plus that local branch (see
+/// `ralphus_daemon::worktrees::resolve_upstream`). Authored as
+/// `upstream_branch=<<current_branch>>`. Flagged in the tutor as riskier than
+/// `<<default>>`: the checked-out branch can silently change between runs, so
+/// the tracking target is not stable across submissions.
 pub const WORKTREE_UPSTREAM_CURRENT_BRANCH: &str = "<<current_branch>>";
 
-/// The recognized reserved `?upstream=` sentinels, in alphabetical order
+/// The recognized reserved `upstream_branch` sentinels, in alphabetical order
 /// (used to build the actionable "choose one of these" message at submit-time
 /// validation in [`crate::validate`]).
 pub const WORKTREE_UPSTREAM_SENTINELS: [&str; 2] =
     [WORKTREE_UPSTREAM_CURRENT_BRANCH, WORKTREE_UPSTREAM_DEFAULT];
 
-/// Is `upstream` one of the reserved `?upstream=` sentinels
+/// Is `upstream` one of the reserved `upstream_branch` sentinels
 /// ([`WORKTREE_UPSTREAM_DEFAULT`] / [`WORKTREE_UPSTREAM_CURRENT_BRANCH`])?
 /// Callers use this to reject any other `<<...>>` value — a typo or an
 /// unsupported sentinel — at validation time, so it fails fast at submit
@@ -1806,7 +1978,7 @@ pub fn resolve_cell_proof_maximum_tool_output_tokens(
 /// Cells opt in by declaring `review = "<<review:<id>>>"`. When several cells resolve
 /// to the same project they collapse into one guardian; across N projects the
 /// daemon materialises N guardians and disambiguates their names. The base branch
-/// is always resolved from each worktree's tracking upstream at submit time.
+/// is always resolved from each worktree's tracking config at submit time.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ReviewDef {
     /// Human-readable review id (also the default label). May be a
@@ -1830,20 +2002,25 @@ pub struct ReviewDef {
     /// default).
     #[serde(default)]
     pub model: Option<String>,
-    /// The branch this review's stack rebases onto, declared rather than
-    /// discovered (RAL-185).
+    /// The remote of the branch this review's stack rebases onto, declared
+    /// rather than discovered (RAL-185): a remote name, or `.` for a local
+    /// branch. Set together with [`Self::upstream_branch`].
     ///
-    /// A local review normally infers its upstream from each contributing
-    /// worktree's git upstream. That read only works on the machine holding
-    /// the worktree, so a review fed by a **remote** cell must state its
-    /// upstream here — the daemon has no way to look it up across machines,
-    /// and guessing the project's default branch would silently produce a
-    /// review against the wrong upstream.
+    /// A local review normally reads its upstream from each contributing
+    /// worktree's `branch.<b>.remote` / `branch.<b>.merge` config. That read
+    /// only works on the machine holding the worktree, so a review fed by a
+    /// **remote** cell must state its upstream here — the daemon has no way
+    /// to look it up across machines, and guessing the project's default
+    /// branch would silently produce a review against the wrong upstream.
     ///
-    /// Optional for an all-local review, where inference still applies and
-    /// this simply overrides it.
+    /// Optional for an all-local review, where the worktree's tracking config
+    /// still applies and this simply overrides it.
     #[serde(default)]
-    pub upstream: Option<String>,
+    pub upstream_remote: Option<String>,
+    /// The branch (on [`Self::upstream_remote`]) this review's stack rebases
+    /// onto. Literal text: a name containing `/` stays one branch name.
+    #[serde(default)]
+    pub upstream_branch: Option<String>,
     /// The machine this review's worktrees and merge live on (RAL-185),
     /// written `scheme:uri`. Independent of any task's machine — a review may
     /// run somewhere none of its contributing tasks did. Unset inherits the
@@ -3428,12 +3605,14 @@ mod tests {
     #[test]
     fn worktree_placeholder_strips_the_upstream_query_from_the_branch() {
         assert_eq!(
-            parse_worktree_placeholder("ralphus:new-worktree/feat?upstream=main"),
+            parse_worktree_placeholder(
+                "ralphus:new-worktree/feat?upstream_remote=.&upstream_branch=main"
+            ),
             Some("feat")
         );
         assert_eq!(
             parse_worktree_placeholder(
-                "ralphus:new-worktree/origin/feature/x?upstream=origin/blah"
+                "ralphus:new-worktree/origin/feature/x?upstream_remote=origin&upstream_branch=blah"
             ),
             Some("origin/feature/x")
         );
@@ -3442,19 +3621,43 @@ mod tests {
     #[test]
     fn worktree_placeholder_upstream_parses() {
         assert_eq!(
-            parse_worktree_placeholder_upstream("ralphus:new-worktree/feat?upstream=main"),
-            Some("main")
+            parse_worktree_placeholder_upstream(
+                "ralphus:new-worktree/feat?upstream_remote=.&upstream_branch=main"
+            ),
+            Some(WorktreeUpstream {
+                remote: ".",
+                branch: "main"
+            })
         );
         assert_eq!(
             parse_worktree_placeholder_upstream(
-                "ralphus:new-worktree/origin/feature/x?upstream=origin/blah"
+                "ralphus:new-worktree/origin/feature/x?upstream_branch=release/1.2&upstream_remote=alt"
             ),
-            Some("origin/blah")
+            Some(WorktreeUpstream {
+                remote: "alt",
+                branch: "release/1.2"
+            })
         );
-        assert_eq!(
-            parse_worktree_placeholder_upstream("ralphus:new-worktree/foo?upstream=bar"),
-            Some("bar")
-        );
+    }
+
+    #[test]
+    fn worktree_placeholder_upstream_needs_both_keys_and_a_valid_remote() {
+        for cwd in [
+            "ralphus:new-worktree/feat?upstream_branch=main",
+            "ralphus:new-worktree/feat?upstream_remote=origin",
+            "ralphus:new-worktree/feat?upstream_remote=&upstream_branch=main",
+            "ralphus:new-worktree/feat?upstream_remote=origin&upstream_branch=",
+            "ralphus:new-worktree/feat?upstream_remote=a/b&upstream_branch=main",
+            "ralphus:new-worktree/feat?upstream=origin/main",
+        ] {
+            assert_eq!(parse_worktree_placeholder_upstream(cwd), None, "{cwd}");
+        }
+        assert!(worktree_placeholder_has_combined_upstream(
+            "ralphus:new-worktree/feat?upstream=origin/main"
+        ));
+        assert!(!worktree_placeholder_has_combined_upstream(
+            "ralphus:new-worktree/feat?upstream_remote=origin&upstream_branch=main"
+        ));
     }
 
     #[test]
@@ -3464,7 +3667,9 @@ mod tests {
             None
         );
         assert_eq!(
-            parse_worktree_placeholder_upstream("ralphus:new-worktree/feat?upstream="),
+            parse_worktree_placeholder_upstream(
+                "ralphus:new-worktree/feat?upstream_remote=.&upstream_branch="
+            ),
             None
         );
         assert_eq!(
@@ -3481,8 +3686,10 @@ mod tests {
     #[test]
     fn text_placeholders_extracts_embedded_marker_bodies() {
         assert_eq!(
-            text_placeholders("prefix <<ralphus:new-worktree/feat?upstream=main>> suffix"),
-            vec!["ralphus:new-worktree/feat?upstream=main"]
+            text_placeholders(
+                "prefix <<ralphus:new-worktree/feat?upstream_remote=.&upstream_branch=main>> suffix"
+            ),
+            vec!["ralphus:new-worktree/feat?upstream_remote=.&upstream_branch=main"]
         );
         assert_eq!(text_placeholders("<<one>><<two>>"), vec!["one", "two"]);
         assert!(text_placeholders("<<unterminated").is_empty());
@@ -3491,18 +3698,21 @@ mod tests {
     #[test]
     fn worktree_text_ref_supports_branch_basename_interpolation() {
         let reference = parse_worktree_text_ref(
-            "ralphus:new-worktree/RAL-999-add_widget?upstream=main&text=basename({})",
+            "ralphus:new-worktree/RAL-999-add_widget?upstream_remote=.&upstream_branch=main&text=basename({})",
         )
         .unwrap()
         .unwrap();
         assert_eq!(reference.branch, "RAL-999-add_widget");
-        assert_eq!(reference.upstream, "main");
+        assert_eq!(reference.upstream.remote, ".");
+        assert_eq!(reference.upstream.branch, "main");
         assert_eq!(
             reference.text_fn.unwrap().apply(reference.branch),
             "RAL-999-add_widget"
         );
         assert!(matches!(
-            parse_worktree_text_ref("ralphus:new-worktree/a?upstream=main&bad=value"),
+            parse_worktree_text_ref(
+                "ralphus:new-worktree/a?upstream_remote=.&upstream_branch=main&bad=value"
+            ),
             Err(WorktreeTextRefError::UnknownParameter("bad"))
         ));
     }
@@ -3510,7 +3720,7 @@ mod tests {
     #[test]
     fn replace_text_placeholders_preserves_unknown_markers() {
         let replaced = replace_text_placeholders(
-            "a <<ralphus:new-worktree/feature?upstream=main>> b <<other>>",
+            "a <<ralphus:new-worktree/feature?upstream_remote=.&upstream_branch=main>> b <<other>>",
             |body| {
                 Ok::<_, ()>(
                     parse_worktree_text_ref(body)
@@ -3526,15 +3736,17 @@ mod tests {
     #[test]
     fn text_placeholders_keeps_a_nested_sentinel_inside_the_outer_body() {
         assert_eq!(
-            text_placeholders("<<ralphus:new-worktree/feat?upstream=<<default>>>>"),
-            vec!["ralphus:new-worktree/feat?upstream=<<default>>"]
+            text_placeholders(
+                "<<ralphus:new-worktree/feat?upstream_remote=origin&upstream_branch=<<default>>>>"
+            ),
+            vec!["ralphus:new-worktree/feat?upstream_remote=origin&upstream_branch=<<default>>"]
         );
         assert_eq!(
             text_placeholders(
-                "a <<ralphus:new-worktree/feat?upstream=<<current_branch>>>> b <<task:x>> c"
+                "a <<ralphus:new-worktree/feat?upstream_remote=.&upstream_branch=<<current_branch>>>> b <<task:x>> c"
             ),
             vec![
-                "ralphus:new-worktree/feat?upstream=<<current_branch>>",
+                "ralphus:new-worktree/feat?upstream_remote=.&upstream_branch=<<current_branch>>",
                 "task:x"
             ]
         );
@@ -3546,29 +3758,35 @@ mod tests {
 
     #[test]
     fn first_worktree_placeholder_in_text_finds_a_nested_sentinel_form() {
-        let wrapped = "<<ralphus:new-worktree/feat?upstream=<<default>>>>";
+        let wrapped =
+            "<<ralphus:new-worktree/feat?upstream_remote=origin&upstream_branch=<<default>>>>";
         assert_eq!(
             first_worktree_placeholder_in_text(wrapped),
-            Some("ralphus:new-worktree/feat?upstream=<<default>>")
+            Some("ralphus:new-worktree/feat?upstream_remote=origin&upstream_branch=<<default>>")
         );
         assert_eq!(
             first_worktree_placeholder_in_text(wrapped)
                 .and_then(parse_worktree_placeholder_upstream),
-            Some(WORKTREE_UPSTREAM_DEFAULT)
+            Some(WorktreeUpstream {
+                remote: "origin",
+                branch: WORKTREE_UPSTREAM_DEFAULT
+            })
         );
     }
 
     #[test]
     fn first_worktree_placeholder_in_text_finds_bare_and_wrapped_forms() {
         assert_eq!(
-            first_worktree_placeholder_in_text("ralphus:new-worktree/feat?upstream=main"),
-            Some("ralphus:new-worktree/feat?upstream=main")
+            first_worktree_placeholder_in_text(
+                "ralphus:new-worktree/feat?upstream_remote=.&upstream_branch=main"
+            ),
+            Some("ralphus:new-worktree/feat?upstream_remote=.&upstream_branch=main")
         );
         assert_eq!(
             first_worktree_placeholder_in_text(
-                "<<ralphus:new-worktree/feat?upstream=main>>/more/text"
+                "<<ralphus:new-worktree/feat?upstream_remote=.&upstream_branch=main>>/more/text"
             ),
-            Some("ralphus:new-worktree/feat?upstream=main")
+            Some("ralphus:new-worktree/feat?upstream_remote=.&upstream_branch=main")
         );
         assert_eq!(first_worktree_placeholder_in_text("<<unknown>>"), None);
     }
@@ -3578,14 +3796,22 @@ mod tests {
         // Both reserved sentinels parse as ordinary upstream values and are
         // recognized as such.
         assert_eq!(
-            parse_worktree_placeholder_upstream("ralphus:new-worktree/feat?upstream=<<default>>"),
-            Some("<<default>>")
+            parse_worktree_placeholder_upstream(
+                "ralphus:new-worktree/feat?upstream_remote=origin&upstream_branch=<<default>>"
+            ),
+            Some(WorktreeUpstream {
+                remote: "origin",
+                branch: "<<default>>"
+            })
         );
         assert_eq!(
             parse_worktree_placeholder_upstream(
-                "ralphus:new-worktree/feat?upstream=<<current_branch>>"
+                "ralphus:new-worktree/feat?upstream_remote=.&upstream_branch=<<current_branch>>"
             ),
-            Some("<<current_branch>>")
+            Some(WorktreeUpstream {
+                remote: ".",
+                branch: "<<current_branch>>"
+            })
         );
         assert!(is_worktree_upstream_sentinel("<<default>>"));
         assert!(is_worktree_upstream_sentinel("<<current_branch>>"));
@@ -3867,7 +4093,7 @@ mod tests {
     #[test]
     fn parse_linked_field_ignores_non_matching_scheme() {
         assert_eq!(
-            parse_linked_field("ralphus:new-worktree/foo?upstream=main"),
+            parse_linked_field("ralphus:new-worktree/foo?upstream_remote=.&upstream_branch=main"),
             None
         );
         assert_eq!(parse_linked_field("plain text"), None);

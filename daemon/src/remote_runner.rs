@@ -130,15 +130,15 @@ pub struct WorkspaceSource {
     /// Branch (or equivalent named revision) to check out, when meaningful.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub branch: Option<String>,
-    /// The already-resolved (RAL-100/RAL-258: no `?upstream=<<sentinel>>` or
-    /// literal `<remote>/<branch>` ambiguity left) reference `branch` should
-    /// be created from/track, when meaningful. Mirrors what
-    /// `worktrees::ensure_worktree`'s own `upstream` parameter carries for a
-    /// local worktree (RAL-355 Phase 4) -- until this was added, a
-    /// `provision` request had no way to say what a brand-new remote branch
-    /// should be based on at all.
+    /// The remote half of the already-resolved (no `<<sentinel>>` left)
+    /// upstream `branch` should be created from/track, when meaningful.
+    /// `.` names a local base. Mirrors what `worktrees::ensure_worktree`'s own
+    /// `upstream` parameter carries for a local worktree (RAL-355 Phase 4).
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub upstream: Option<String>,
+    pub upstream_remote: Option<String>,
+    /// The branch half of the resolved upstream, on `upstream_remote`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub upstream_branch: Option<String>,
 }
 
 /// The payload sent to a provider's file verbs (`read-file`, `write-file`,

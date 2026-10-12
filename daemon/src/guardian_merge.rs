@@ -31,6 +31,7 @@ use std::sync::{Arc, LazyLock, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard}
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
+use ralphus_core::schema::UpstreamRef;
 use crate::cancel::{CancelToken, Cancellations};
 use crate::guardian::{
     CheckInput, CheckInputType, FeedbackActionStatus, GuardianCheck, GuardianStatus, MergeStatus,
@@ -907,15 +908,20 @@ pub(crate) fn push_feedback_branch(
             explicit_remote_branch.unwrap_or(local_branch).to_string(),
         )
     } else {
-        match wt.git(&["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"]) {
-            Ok(upstream) => {
-                let upstream = upstream.trim();
-                match upstream.split_once('/') {
-                    Some((remote, branch)) => (remote.to_string(), branch.to_string()),
-                    None => (upstream.to_string(), local_branch.to_string()),
-                }
+        let tracked = |suffix: &str| {
+            wt.git(&["config", "--get", &format!("branch.{local_branch}.{suffix}")])
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+        };
+        match tracked("remote").filter(|r| r != ralphus_core::schema::LOCAL_UPSTREAM_REMOTE) {
+            Some(remote) => {
+                let branch = tracked("merge")
+                    .map(|m| m.strip_prefix("refs/heads/").unwrap_or(&m).to_string())
+                    .unwrap_or_else(|| local_branch.to_string());
+                (remote, branch)
             }
-            Err(_) => {
+            None => {
                 let remote = wt
                     .git(&["config", "remote.pushDefault"])
                     .ok()
@@ -4199,7 +4205,7 @@ pub(crate) fn restack_from_position<F: Fn(GuardianStatus, Option<&str>)>(
     id: &str,
     root: &Workspace,
     wt_base: &Workspace,
-    base_branch: &str,
+    base_branch: &UpstreamRef,
     from_position: i64,
     set_status: &F,
     cancel: &CancelToken,
@@ -4273,7 +4279,7 @@ pub(crate) fn restack_from_position<F: Fn(GuardianStatus, Option<&str>)>(
         Err(e) => {
             set_status(
                 GuardianStatus::MergeFailed,
-                Some(&format!("base branch '{base_branch}': {e}")),
+                Some(&format!("base branch '{}': {e}", base_branch.joined())),
             );
             return;
         }
@@ -6497,7 +6503,7 @@ fn staged_merge_pass(
     let mut base_shas: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     for proj in &project_order {
         let root = Workspace::for_guardian(store, id, PathBuf::from(&proj));
-        match resolve_base(&root, &guardian.base_branch) {
+        match resolve_base(&root, &guardian.upstream()) {
             Ok(sha) => {
                 base_shas.insert(proj.clone(), sha);
             }
@@ -6906,7 +6912,7 @@ fn finish_staged_merge<F: Fn(GuardianStatus, Option<&str>)>(
         let base_sha = match guardian.base_commits.get(proj) {
             Some(sha) => sha.clone(),
             None => {
-                let sha = match resolve_base(&root, &guardian.base_branch) {
+                let sha = match resolve_base(&root, &guardian.upstream()) {
                     Ok(s) => s,
                     Err(e) => {
                         set_status(
@@ -7001,7 +7007,7 @@ pub fn run_merge_cancellable(
     // belongs to on the way down.
     let ws_root = Workspace::for_guardian(store, id, &guardian.git_root);
     let num = id.replace("guardian-", "");
-    let base = guardian.base_branch.clone();
+    let base = guardian.upstream();
     crate::rlog!(
         INFO,
         "ralphus [guardian] review {id} merge executing base={base:?} branches={}",
@@ -8453,7 +8459,7 @@ fn run_feedback_pass(
     }
     let _git_operation =
         git_review_operation_guard(Path::new(&guardian.git_root), guardian.machine.as_deref());
-    let base = guardian.base_branch.clone();
+    let base = guardian.upstream();
     let Some(branch) = guardian.branches.iter().find(|b| b.id == branch_id) else {
         fail_message();
         return FeedbackOutcome::default();
@@ -9783,7 +9789,7 @@ pub fn pull_pr_commits(
                 id,
                 &root,
                 &wt_base,
-                &guardian.base_branch,
+                &guardian.upstream(),
                 position,
                 &set_status,
                 &CancelToken::never(),
@@ -10595,7 +10601,7 @@ pub(crate) fn restack_stack_from(
         id,
         &git_root,
         &wt_base,
-        &guardian.base_branch,
+        &guardian.upstream(),
         from_position,
         &set_status,
         cancel,
@@ -10875,7 +10881,7 @@ fn guardian_base_already_has_every_branch(
             .map(|proj| {
                 scope.spawn(move || {
                     let root = Workspace::for_guardian(store, id, Path::new(proj));
-                    match resolve_base(&root, &guardian.base_branch) {
+                    match resolve_base(&root, &guardian.upstream()) {
                         Ok(sha) => project_already_in_base(&root, guardian, proj, &sha),
                         Err(_) => false,
                     }
@@ -11008,7 +11014,7 @@ fn detect_base_shift(
         std::collections::BTreeMap::new();
     for proj in &guardian.projects {
         let root = Workspace::for_guardian(store, id, Path::new(proj));
-        let current = match resolve_base(&root, &guardian.base_branch) {
+        let current = match resolve_base(&root, &guardian.upstream()) {
             Ok(s) => s,
             Err(_) => {
                 fully_landed = false;
@@ -12321,7 +12327,7 @@ fn post_merge_jobs_inner(
         .get(&proj_str)
         .cloned()
         .unwrap_or_else(|| {
-            resolve_base(&combined_ws, &guardian.base_branch).unwrap_or_else(|_| tip.clone())
+            resolve_base(&combined_ws, &guardian.upstream()).unwrap_or_else(|_| tip.clone())
         });
 
     // Manual checks: regenerate only when there is nothing to regenerate, or
@@ -13848,12 +13854,12 @@ fn fetch_branch_for_remote_cell(
     // than the one the review targets is how a stale/absent branch slips through.
     let base_branch = review
         .as_ref()
-        .map(|g| g.base_branch.as_str())
-        .unwrap_or_default();
+        .map(crate::guardian::GuardianView::upstream)
+        .unwrap_or_else(|| UpstreamRef::local(""));
     let clone_url = crate::pr::project_clone_url_for_root(store, root);
     let remote = crate::forge::resolve_parent_remote_name(
         root,
-        base_branch,
+        &base_branch,
         &crate::config::resolve_forge(root),
         clone_url.as_deref(),
         None,
@@ -15360,7 +15366,7 @@ pub fn list_base_branches(git_root: &str, base_branch: &str) -> Vec<String> {
 #[derive(Debug, Clone)]
 pub(crate) struct GuardianBaseFetchInfo {
     pub status: String,
-    pub base_branch: String,
+    pub base_branch: UpstreamRef,
     pub projects: Vec<String>,
     pub git_root: String,
     pub machine: Option<String>,
@@ -15381,7 +15387,7 @@ pub(crate) struct GuardianBaseFetchInfo {
 pub(crate) struct BaseFetchTarget {
     pub root: PathBuf,
     pub machine: Option<String>,
-    pub base_branch: String,
+    pub base_branch: UpstreamRef,
 }
 
 /// Collect the deduped set of base-branch fetch targets across every
@@ -15477,20 +15483,29 @@ fn fetch_base_branch(
     let ws = Workspace::on(&target.root, target.machine.as_deref()).with_store(Arc::clone(store));
     let base = &target.base_branch;
 
-    if let Some((remote, branch)) = base.split_once('/') {
+    if !base.is_local() {
+        let (remote, branch) = (&base.remote, &base.branch);
         if ws.git(&["remote", "get-url", remote]).is_ok() {
             let refspec = format!("+refs/heads/{branch}:refs/remotes/{remote}/{branch}");
             return ws
                 .git(&["fetch", "--no-write-fetch-head", remote, &refspec])
                 .map(|_| ());
         }
+        return Ok(());
     }
-    if let Ok(upstream) = ws.git(&["rev-parse", "--abbrev-ref", &format!("{base}@{{upstream}}")]) {
-        let upstream = upstream.trim();
-        if let Some((remote, branch)) = upstream.split_once('/') {
-            let refspec = format!("+refs/heads/{branch}:refs/heads/{base}");
+    let branch = &base.branch;
+    let tracked = |key: &str| {
+        ws.git(&["config", "--get", &format!("branch.{branch}.{key}")])
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+    };
+    if let (Some(remote), Some(merge)) = (tracked("remote"), tracked("merge")) {
+        if remote != ralphus_core::schema::LOCAL_UPSTREAM_REMOTE {
+            let upstream_branch = merge.strip_prefix("refs/heads/").unwrap_or(&merge);
+            let refspec = format!("+refs/heads/{upstream_branch}:refs/heads/{branch}");
             return ws
-                .git(&["fetch", "--no-write-fetch-head", remote, &refspec])
+                .git(&["fetch", "--no-write-fetch-head", &remote, &refspec])
                 .map(|_| ());
         }
     }
@@ -15532,7 +15547,7 @@ pub fn poll_base_branch_freshness_once(store: &crate::store_lock::StoreHandle) {
             "{}|{}|{}",
             target.root.display(),
             target.machine.as_deref().unwrap_or(""),
-            target.base_branch
+            target.base_branch.joined()
         );
         let Some(claim) = InFlightClaim::acquire(&BASE_FETCH_IN_FLIGHT, &key) else {
             continue;
@@ -15548,7 +15563,7 @@ pub fn poll_base_branch_freshness_once(store: &crate::store_lock::StoreHandle) {
                     crate::rlog!(
                         DEBUG,
                         "ralphus [guardian] base-branch freshness fetch skipped for {} ({}): {e}",
-                        target.base_branch,
+                        target.base_branch.joined(),
                         target.root.display()
                     );
                     crate::poller_health::PollOutcome::Unhealthy { error: e.clone() }
@@ -15563,7 +15578,7 @@ pub fn poll_base_branch_freshness_once(store: &crate::store_lock::StoreHandle) {
                         &guard,
                         "base-branch freshness fetch skipped",
                         serde_json::json!({
-                            "base_branch": target.base_branch,
+                            "base_branch": target.base_branch.joined(),
                             "git_root": target.root,
                             "error": e.to_string(),
                         }),
@@ -15606,55 +15621,33 @@ pub fn poll_base_branch_freshness_once(store: &crate::store_lock::StoreHandle) {
     }
 }
 
-/// Resolve a bare short ref name to the fully-qualified ref git should treat
-/// it as, when that short name is ambiguous between a local branch and a
-/// remote-tracking ref of the same spelling (e.g. `alt/staging` matching both
-/// `refs/heads/alt/staging` and `refs/remotes/alt/staging`). Git's own
-/// unqualified resolution prefers `refs/heads/*` in that case and only warns
-/// on stderr -- callers that hand a bare name straight to `rev-parse`/
-/// `worktree add` silently get whichever the local branch happens to be,
-/// even when that branch is stale or unrelated (a literal local branch
-/// someone created that happens to share a remote's `<remote>/<branch>`
-/// spelling shadows the real remote-tracking ref forever, since nothing
-/// updates a plain local branch on fetch).
-///
-/// The single, consolidated implementation of that preference order --
-/// **a remote-tracking match wins over a same-named local branch** -- used by
-/// every place in the daemon that resolves a possibly-ambiguous branch name
-/// to a ref or commit: [`resolve_base`] (a guardian's `base_branch`),
-/// `crate::worktrees`'s worktree materialization
-/// (`qualify_upstream_ref`'s prior home) and explicit-upstream config, and
-/// `crate::reviews::set_worktree_commit_baseline`'s baseline marker. Falls
-/// back to `name` unchanged when neither namespace has a match (a SHA, a
-/// tag, or an already-unambiguous ref) -- git resolves those exactly as
-/// before.
-pub(crate) fn qualify_ambiguous_ref(root: &Path, name: &str) -> String {
-    if name.contains('/') {
-        let remote_ref = format!("refs/remotes/{name}");
-        if git(root, &["rev-parse", "--verify", &remote_ref]).is_ok() {
-            return remote_ref;
-        }
+/// The ref git should resolve for `upstream`: a remote's base is always its
+/// remote-tracking ref (`refs/remotes/<remote>/<branch>`), so a same-named
+/// local branch can never shadow it; a local base is `refs/heads/<branch>`
+/// when that branch exists and the bare name otherwise (a SHA, a tag, or an
+/// already-unambiguous ref). Used by every place in the daemon that resolves
+/// a base to a ref or commit: [`resolve_base`], `crate::worktrees`'s
+/// worktree materialization and `crate::reviews::set_worktree_commit_baseline`.
+pub(crate) fn qualify_upstream_ref(root: &Path, upstream: &UpstreamRef) -> String {
+    if !upstream.is_local() {
+        return upstream.tracking_ref();
     }
-    let local_ref = format!("refs/heads/{name}");
+    let local_ref = upstream.tracking_ref();
     if git(root, &["rev-parse", "--verify", &local_ref]).is_ok() {
         return local_ref;
     }
-    name.to_string()
+    upstream.branch.clone()
 }
 
-/// Resolve `base_branch` (a branch name — mutable, may be local or a remote
-/// tracking ref) to the immutable commit it currently points at, so a single
-/// build snapshots one base and a later shift is detectable. Returns the short-ish
-/// full SHA, or an error if the ref does not resolve.
-///
-/// Qualifies `base_branch` via [`qualify_ambiguous_ref`] first so a
-/// same-named local branch can never shadow the real remote-tracking ref --
-/// see that function's doc for why an unqualified `rev-parse` is unsafe here.
+/// Resolve `upstream` (a branch on a remote, or a local branch) to the
+/// immutable commit it currently points at, so a single build snapshots one
+/// base and a later shift is detectable. Returns the full SHA, or an error if
+/// the ref does not resolve.
 pub(crate) fn resolve_base(
     root: &Workspace,
-    base_branch: &str,
+    upstream: &UpstreamRef,
 ) -> std::result::Result<String, String> {
-    let qualified = qualify_ambiguous_ref(root.root(), base_branch);
+    let qualified = qualify_upstream_ref(root.root(), upstream);
     let spec = format!("{qualified}^{{commit}}");
     Ok(root
         .git(&["rev-parse", "--verify", &spec])?
@@ -17527,6 +17520,14 @@ fn error_body(code: &str, message: &str) -> String {
 mod tests {
     use super::*;
     use crate::runner::RunnerResult;
+
+    /// A `remote/branch` test spelling as the pair; a bare name is local.
+    fn split_test_ref(spelling: &str) -> UpstreamRef {
+        match spelling.split_once('/') {
+            Some((remote, branch)) => UpstreamRef::new(remote, branch),
+            None => UpstreamRef::local(spelling),
+        }
+    }
     use std::sync::atomic::{AtomicU32, Ordering};
 
     #[test]
@@ -17921,7 +17922,7 @@ mod tests {
     ) -> GuardianBaseFetchInfo {
         GuardianBaseFetchInfo {
             status: status.to_string(),
-            base_branch: base_branch.to_string(),
+            base_branch: split_test_ref(base_branch),
             projects: projects.iter().map(|s| s.to_string()).collect(),
             git_root: projects.first().unwrap_or(&"/repo").to_string(),
             machine: machine.map(str::to_string),

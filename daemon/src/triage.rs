@@ -28,7 +28,7 @@ use std::path::Path;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
 
-use ralphus_core::schema::TaskFile;
+use ralphus_core::schema::{TaskFile, UpstreamRef};
 use ralphus_core::validate::{ErrorKind, ValidationError};
 
 use crate::store::{Result as StoreResult, Store, now_ms};
@@ -88,7 +88,7 @@ pub struct TriagePoolCellRow {
     pub task_idx: i64,
     pub idx: i64,
     pub branch: String,
-    pub upstream: String,
+    pub upstream: UpstreamRef,
 }
 
 /// One cell that has opted into Triage and is not yet linked to an actual
@@ -885,12 +885,23 @@ impl Store {
         task_idx: i64,
         idx: i64,
         branch: &str,
-        upstream: &str,
+        upstream: &UpstreamRef,
     ) -> StoreResult<()> {
         self.conn.execute(
-            "INSERT INTO triage_pool_cells(project, triage_type, squad_id, task_idx, idx, branch, upstream, created_at_ms)
-             VALUES(?,?,?,?,?,?,?,?)",
-            params![project, triage_type, squad_id, task_idx, idx, branch, upstream, now_ms()],
+            "INSERT INTO triage_pool_cells(project, triage_type, squad_id, task_idx, idx, branch, upstream, upstream_remote, upstream_branch, created_at_ms)
+             VALUES(?,?,?,?,?,?,?,?,?,?)",
+            params![
+                project,
+                triage_type,
+                squad_id,
+                task_idx,
+                idx,
+                branch,
+                upstream.joined(),
+                upstream.remote,
+                upstream.branch,
+                now_ms()
+            ],
         )?;
         Ok(())
     }
@@ -903,7 +914,7 @@ impl Store {
     /// Propagates any SQLite failure.
     pub fn all_pooled_cells(&self) -> StoreResult<Vec<(String, String, TriagePoolCellRow)>> {
         let mut stmt = self.conn.prepare(
-            "SELECT project, triage_type, squad_id, task_idx, idx, branch, upstream FROM triage_pool_cells",
+            "SELECT project, triage_type, squad_id, task_idx, idx, branch, upstream_remote, upstream_branch FROM triage_pool_cells",
         )?;
         let rows = stmt
             .query_map([], |r| {
@@ -915,7 +926,10 @@ impl Store {
                         task_idx: r.get(3)?,
                         idx: r.get(4)?,
                         branch: r.get(5)?,
-                        upstream: r.get(6)?,
+                        upstream: UpstreamRef::new(
+                            r.get::<_, String>(6)?,
+                            r.get::<_, String>(7)?,
+                        ),
                     },
                 ))
             })?
@@ -987,7 +1001,7 @@ impl Store {
         triage_type: &str,
     ) -> StoreResult<Vec<TriagePoolCellRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT squad_id, task_idx, idx, branch, upstream FROM triage_pool_cells
+            "SELECT squad_id, task_idx, idx, branch, upstream_remote, upstream_branch FROM triage_pool_cells
              WHERE project=? AND triage_type=?",
         )?;
         let rows = stmt
@@ -997,7 +1011,7 @@ impl Store {
                     task_idx: r.get(1)?,
                     idx: r.get(2)?,
                     branch: r.get(3)?,
-                    upstream: r.get(4)?,
+                    upstream: UpstreamRef::new(r.get::<_, String>(4)?, r.get::<_, String>(5)?),
                 })
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;

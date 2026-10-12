@@ -38,7 +38,9 @@ struct WorkspaceSource {
     #[serde(default)]
     branch: Option<String>,
     #[serde(default)]
-    upstream: Option<String>,
+    upstream_remote: Option<String>,
+    #[serde(default)]
+    upstream_branch: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -85,10 +87,10 @@ pub fn run(uri: &str, request_json: &str, config: &EffectiveConfig) -> Result<St
         .ok_or_else(|| "provision request is missing the worktree branch to create".to_string())?;
     let upstream = req
         .source
-        .upstream
+        .upstream_branch
         .filter(|s| !s.trim().is_empty())
         .ok_or_else(|| {
-            "provision request is missing the upstream/base reference to create the branch from"
+            "provision request is missing the upstream branch to create the branch from"
                 .to_string()
         })?;
     let remote_root = req.remote_root.filter(|s| !s.trim().is_empty()).ok_or_else(|| {
@@ -204,21 +206,6 @@ struct BuildScriptArgs<'a> {
     upstream: &'a str,
 }
 
-/// Normalize a resolved upstream reference into the branch name the fresh
-/// remote clone's `origin` remote should fetch/track. The daemon's own
-/// `resolve_upstream` can hand back either a bare branch name (`"main"`) or
-/// an already-`<remote>/<branch>` form (`"origin/main"`) naming *its own*
-/// local checkout's remote alias -- which is not necessarily called
-/// `origin` there, but this provider's fresh clone always names its remote
-/// `origin` (`git clone --origin origin`), so only the branch half of a
-/// slash-qualified upstream is meaningful here.
-fn upstream_branch_name(upstream: &str) -> &str {
-    match upstream.split_once('/') {
-        Some((_, branch)) if !branch.is_empty() => branch,
-        _ => upstream,
-    }
-}
-
 /// Build the POSIX `sh` script run on the remote host to provision one
 /// worktree. Every caller-supplied value is quoted with
 /// [`shell_quote_single`] before interpolation -- see the module doc.
@@ -233,7 +220,7 @@ fn build_provision_script(args: BuildScriptArgs<'_>) -> String {
     let url_q = shell_quote_single(args.url);
     let branch_q = shell_quote_single(args.branch);
     let origin_ref_q =
-        shell_quote_single(&format!("origin/{}", upstream_branch_name(args.upstream)));
+        shell_quote_single(&format!("origin/{}", args.upstream));
     let local_branch_ref_q = shell_quote_single(&format!("refs/heads/{}", args.branch));
     // Cloned into a staging directory and `mv`'d into place only once the
     // whole clone succeeds, so an interrupted connection (or a killed
@@ -310,13 +297,6 @@ mod tests {
     }
 
     #[test]
-    fn upstream_branch_name_strips_a_remote_alias_prefix() {
-        assert_eq!(upstream_branch_name("origin/main"), "main");
-        assert_eq!(upstream_branch_name("main"), "main");
-        assert_eq!(upstream_branch_name("some/nested/branch"), "nested/branch");
-    }
-
-    #[test]
     fn redact_url_from_error_text_scrubs_an_inline_password() {
         let url = "https://user:hunter2@example.invalid/team/proj.git";
         let error_text = format!("fatal: could not read from '{url}': Authentication failed");
@@ -384,8 +364,8 @@ mod tests {
     }
 
     #[test]
-    fn build_provision_script_uses_origin_as_the_remote_name_regardless_of_upstream_form() {
-        let bare = build_provision_script(args(
+    fn build_provision_script_tracks_the_upstream_branch_on_origin() {
+        let script = build_provision_script(args(
             "/r/p",
             "/r/p/repository",
             "/r/p/worktrees",
@@ -395,26 +375,10 @@ mod tests {
             "proj",
             "https://example.invalid/x.git",
             "feat",
-            "main",
+            "release/1.2",
         ));
-        assert!(bare.contains("'origin/main'"), "{bare}");
-
-        let qualified = build_provision_script(args(
-            "/r/p",
-            "/r/p/repository",
-            "/r/p/worktrees",
-            "/r/p/worktrees/w",
-            "/r/p/.provision.lock",
-            "/r/p/metadata.json",
-            "proj",
-            "https://example.invalid/x.git",
-            "feat",
-            "upstream/main",
-        ));
-        // The daemon-local remote alias name ("upstream") is discarded; this
-        // provider's fresh clone's remote is always called "origin".
-        assert!(qualified.contains("'origin/main'"), "{qualified}");
-        assert!(!qualified.contains("upstream/main"), "{qualified}");
+        // This provider's fresh clone's remote is always called "origin".
+        assert!(script.contains("'origin/release/1.2'"), "{script}");
     }
 
     #[test]

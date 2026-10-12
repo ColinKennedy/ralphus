@@ -898,7 +898,7 @@ pub fn check_fork_network_health(
     let forge_cfg = crate::config::resolve_forge(root);
     let parent_remote_name = crate::forge::resolve_parent_remote_name(
         root,
-        "", // no review base-branch context at health-check time
+        &ralphus_core::schema::UpstreamRef::local(""), // no review base-branch context at health-check time
         &forge_cfg,
         clone_url,
         Some(&fork.remote_name),

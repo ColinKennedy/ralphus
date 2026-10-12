@@ -294,7 +294,8 @@ pub const REVIEW_KEYS: &[&str] = &[
     "agent",
     "model",
     "machine",
-    "upstream",
+    "upstream_remote",
+    "upstream_branch",
     "action",
     "prepare",
     "maximum_budget_usd",
@@ -1253,39 +1254,54 @@ fn validate_cells(
                     {
                         has_placeholder = true;
                         let line = ctx.key_line(header, "cwd");
-                        match crate::schema::parse_worktree_placeholder_upstream(placeholder) {
-                            None => ctx.error(
+                        if crate::schema::worktree_placeholder_has_combined_upstream(placeholder) {
+                            ctx.error(
                                 &format!("{path}.cwd"),
-                                ErrorKind::MissingRequired,
-                                "a \"ralphus:new-worktree/<branch>\" placeholder cwd requires \
-                                 an explicit \"?upstream=<upstream>\" suffix, e.g. \
-                                 \"ralphus:new-worktree/<branch>?upstream=main\" (or the \
-                                 \"?upstream=<<default>>\" sentinel), so ralphus knows what \
-                                 the branch tracks instead of guessing from HEAD",
+                                ErrorKind::InvalidValue,
+                                COMBINED_UPSTREAM_PLACEHOLDER_MESSAGE,
                                 line,
-                            ),
-                            // A `<<...>>` value is only ever a reserved sentinel:
-                            // any other one is a typo or an unsupported sentinel,
-                            // and must fail fast here (before it ever reaches the
-                            // daemon) with the valid options spelled out.
-                            Some(upstream) if upstream.starts_with("<<") => {
-                                if !crate::schema::is_worktree_upstream_sentinel(upstream) {
-                                    let options =
-                                        crate::schema::WORKTREE_UPSTREAM_SENTINELS.join(", ");
-                                    ctx.error(
-                                        &format!("{path}.cwd"),
-                                        ErrorKind::InvalidValue,
-                                        format!(
-                                            "\"?upstream={upstream}\" is not a supported \
-                                             sentinel. Choose one of {options} (alphabetical) \
-                                             or use an existing branch name as the literal \
-                                             tracking target, e.g. \"?upstream=main\""
-                                        ),
-                                        line,
-                                    );
+                            );
+                        } else {
+                            match crate::schema::parse_worktree_placeholder_upstream(placeholder) {
+                                None => ctx.error(
+                                    &format!("{path}.cwd"),
+                                    ErrorKind::MissingRequired,
+                                    "a \"ralphus:new-worktree/<branch>\" placeholder cwd requires \
+                                     an explicit upstream remote and branch, e.g. \
+                                     \"ralphus:new-worktree/<branch>?upstream_remote=origin&\
+                                     upstream_branch=main\" (or \"upstream_branch=<<default>>\" \
+                                     for the remote's default branch, or \"upstream_remote=.\" \
+                                     for a local branch), so ralphus knows what the branch \
+                                     tracks instead of guessing from HEAD",
+                                    line,
+                                ),
+                                // A `<<...>>` branch is only ever a reserved sentinel:
+                                // any other one is a typo or an unsupported sentinel,
+                                // and must fail fast here (before it ever reaches the
+                                // daemon) with the valid options spelled out.
+                                Some(upstream) if upstream.branch.starts_with("<<") => {
+                                    if !crate::schema::is_worktree_upstream_sentinel(
+                                        upstream.branch,
+                                    ) {
+                                        let options =
+                                            crate::schema::WORKTREE_UPSTREAM_SENTINELS.join(", ");
+                                        ctx.error(
+                                            &format!("{path}.cwd"),
+                                            ErrorKind::InvalidValue,
+                                            format!(
+                                                "\"upstream_branch={}\" is not a supported \
+                                                 sentinel. Choose one of {options} \
+                                                 (alphabetical) or use an existing branch name \
+                                                 as the literal tracking target, e.g. \
+                                                 \"upstream_branch=main\"",
+                                                upstream.branch
+                                            ),
+                                            line,
+                                        );
+                                    }
                                 }
+                                Some(_) => {}
                             }
-                            Some(_) => {}
                         }
                     }
                 }
@@ -2351,7 +2367,7 @@ fn validate_review_blocks(value: Option<&toml::Value>, ctx: &mut Ctx) {
         check_type(ctx, table, "name", Ty::Str, &rpath, header);
         check_type(ctx, table, "agent", Ty::Str, &rpath, header);
         check_type(ctx, table, "model", Ty::Str, &rpath, header);
-        check_type(ctx, table, "upstream", Ty::Str, &rpath, header);
+        check_review_upstream(ctx, table, &rpath, header);
         check_machine(ctx, table, &rpath, header);
         check_type(ctx, table, "maximum_budget_usd", Ty::Float, &rpath, header);
         check_positive_number(ctx, table, "maximum_budget_usd", &rpath, header);
@@ -3072,6 +3088,71 @@ fn check_preparation_environment(ctx: &mut Ctx, step: &toml::Table, path: &str) 
     }
 }
 
+/// Error text for the removed combined `?upstream_remote=.&upstream_branch=<value>` placeholder query.
+const COMBINED_UPSTREAM_PLACEHOLDER_MESSAGE: &str = "the combined \"?upstream_remote=.&upstream_branch=<value>\" query is \
+     no longer supported; give the remote and branch separately, e.g. \
+     \"?upstream_remote=alt&upstream_branch=staging\" (\"upstream_remote=.\" names a local \
+     branch, \"upstream_branch=<<default>>\" the remote's default branch)";
+
+/// Validate a `[[review]]` block's `upstream_remote` / `upstream_branch` pair:
+/// both strings, both non-empty, set together, the remote matching
+/// `[A-Za-z0-9._-]+` (`.` is a local branch). Existence is the daemon's check.
+fn check_review_upstream(ctx: &mut Ctx, table: &toml::Table, path: &str, header: Option<u32>) {
+    if table.contains_key("upstream") {
+        let line = ctx.key_line(header, "upstream");
+        ctx.error(
+            &format!("{path}.upstream"),
+            ErrorKind::InvalidValue,
+            "'upstream' is no longer a [[review]] key; give the remote and branch separately, \
+             e.g. upstream_remote = \"alt\" and upstream_branch = \"staging\" \
+             (upstream_remote = \".\" names a local branch)",
+            line,
+        );
+    }
+    check_type(ctx, table, "upstream_remote", Ty::Str, path, header);
+    check_type(ctx, table, "upstream_branch", Ty::Str, path, header);
+    let remote = table.get("upstream_remote").and_then(toml::Value::as_str);
+    let branch = table.get("upstream_branch").and_then(toml::Value::as_str);
+    if let Some(remote) = remote {
+        if !crate::schema::is_valid_upstream_remote(remote) {
+            let line = ctx.key_line(header, "upstream_remote");
+            ctx.error(
+                &format!("{path}.upstream_remote"),
+                ErrorKind::InvalidValue,
+                format!(
+                    "'upstream_remote' \"{remote}\" must be non-empty and match [A-Za-z0-9._-]+ \
+                     (use \".\" for a local branch)"
+                ),
+                line,
+            );
+        }
+    }
+    if branch.is_some_and(|b| b.trim().is_empty()) {
+        let line = ctx.key_line(header, "upstream_branch");
+        ctx.error(
+            &format!("{path}.upstream_branch"),
+            ErrorKind::InvalidValue,
+            "'upstream_branch' must not be empty",
+            line,
+        );
+    }
+    let has_remote = table.contains_key("upstream_remote");
+    let has_branch = table.contains_key("upstream_branch");
+    if has_remote != has_branch {
+        let missing = if has_remote {
+            "upstream_branch"
+        } else {
+            "upstream_remote"
+        };
+        ctx.error(
+            path,
+            ErrorKind::MissingRequired,
+            format!("'upstream_remote' and 'upstream_branch' must be set together; '{missing}' is missing"),
+            header,
+        );
+    }
+}
+
 /// Reject malformed worktree text placeholders in review preparation/action
 /// fields before a build can reach a shell with an unintended literal path.
 fn check_worktree_text_placeholders(ctx: &mut Ctx, path: &str, raw: &str) {
@@ -3081,8 +3162,23 @@ fn check_worktree_text_placeholders(ctx: &mut Ctx, path: &str, raw: &str) {
         use crate::schema::{LinkedFieldQueryError as QueryError, WorktreeTextRefError};
         let detail = match error {
             WorktreeTextRefError::MissingUpstream => {
-                "worktree text placeholders require '?upstream=<upstream>'"
+                "worktree text placeholders require 'upstream_branch=<branch>'"
             }
+            WorktreeTextRefError::MissingUpstreamRemote => {
+                "worktree text placeholders require 'upstream_remote=<remote>'"
+            }
+            WorktreeTextRefError::InvalidUpstreamRemote(remote) => {
+                return ctx.error(
+                    path,
+                    ErrorKind::InvalidValue,
+                    format!(
+                        "worktree text placeholder upstream_remote \"{remote}\" must match \
+                         [A-Za-z0-9._-]+ (use \".\" for a local branch)"
+                    ),
+                    None,
+                );
+            }
+            WorktreeTextRefError::CombinedUpstream => COMBINED_UPSTREAM_PLACEHOLDER_MESSAGE,
             WorktreeTextRefError::DuplicateParameter(name) => {
                 return ctx.error(
                     path,
@@ -3097,7 +3193,7 @@ fn check_worktree_text_placeholders(ctx: &mut Ctx, path: &str, raw: &str) {
                     ErrorKind::InvalidValue,
                     format!(
                         "worktree text placeholder has unknown query parameter \"{name}\"; \
-                         use 'upstream' and optional 'text=basename({{}})'"
+                         use 'upstream_remote', 'upstream_branch' and optional 'text=basename({{}})'"
                     ),
                     None,
                 );
@@ -4425,7 +4521,7 @@ shell=\"bash\"
     fn placeholder_cwd_accepts_reserved_upstream_sentinels() {
         for upstream in ["<<default>>", "<<current_branch>>"] {
             let src = format!(
-                "[[task]]\nname=\"t\"\nproject=\"my-project\"\n[[task.cell]]\ncwd=\"ralphus:new-worktree/feat?upstream={upstream}\"\nprompt=\"p\"\n"
+                "[[task]]\nname=\"t\"\nproject=\"my-project\"\n[[task.cell]]\ncwd=\"ralphus:new-worktree/feat?upstream_remote=.&upstream_branch={upstream}\"\nprompt=\"p\"\n"
             );
             let r = validate_toml(&src);
             assert!(
@@ -4438,8 +4534,72 @@ shell=\"bash\"
     }
 
     #[test]
+    fn combined_placeholder_upstream_is_rejected_with_the_new_form() {
+        let src = "[[task]]
+name=\"t\"
+project=\"p\"
+[[task.cell]]
+cwd=\"<<ralphus:new-worktree/feat?upstream=alt/staging>>\"
+prompt=\"p\"
+";
+        let r = validate_toml(src);
+        assert!(
+            r.errors.iter().any(|e| e
+                .message
+                .contains("upstream_remote=alt&upstream_branch=staging")),
+            "{:?}",
+            r.errors
+        );
+    }
+
+    #[test]
+    fn review_upstream_pair_is_validated() {
+        let base = "[[task]]
+name=\"t\"
+[[task.cell]]
+cwd=\"/r\"
+prompt=\"p\"
+review=\"<<review:r>>\"
+[[review]]
+id=\"r\"
+";
+        let ok = validate_toml(&format!(
+            "{base}upstream_remote=\"alt\"
+upstream_branch=\"release/1.2\"
+"
+        ));
+        assert!(ok.errors.is_empty(), "{:?}", ok.errors);
+        let local = validate_toml(&format!(
+            "{base}upstream_remote=\".\"
+upstream_branch=\"main\"
+"
+        ));
+        assert!(local.errors.is_empty(), "{:?}", local.errors);
+        for bad in [
+            "upstream=\"alt/staging\"
+",
+            "upstream_remote=\"alt\"
+",
+            "upstream_branch=\"main\"
+",
+            "upstream_remote=\"a/b\"
+upstream_branch=\"main\"
+",
+            "upstream_remote=\"\"
+upstream_branch=\"main\"
+",
+            "upstream_remote=\"alt\"
+upstream_branch=\"\"
+",
+        ] {
+            let r = validate_toml(&format!("{base}{bad}"));
+            assert!(!r.errors.is_empty(), "{bad} must be rejected");
+        }
+    }
+
+    #[test]
     fn placeholder_cwd_rejects_an_unknown_sentinel_with_an_actionable_message() {
-        let src = "[[task]]\nname=\"t\"\nproject=\"my-project\"\n[[task.cell]]\ncwd=\"<<ralphus:new-worktree/feat?upstream=<<wat>>>>\"\nprompt=\"p\"\n";
+        let src = "[[task]]\nname=\"t\"\nproject=\"my-project\"\n[[task.cell]]\ncwd=\"<<ralphus:new-worktree/feat?upstream_remote=origin&upstream_branch=<<wat>>>>\"\nprompt=\"p\"\n";
         let r = validate_toml(src);
         let e = r
             .errors
@@ -4451,7 +4611,7 @@ shell=\"bash\"
             e.message.contains("not a supported sentinel")
                 && e.message.contains("<<current_branch>>")
                 && e.message.contains("<<default>>")
-                && e.message.contains("?upstream=main"),
+                && e.message.contains("upstream_branch=main"),
             "{}",
             e.message
         );
@@ -5504,7 +5664,7 @@ project = "ralphus"
 
     [[task.cell]]
     id = "bar"
-    cwd = "<<ralphus:new-worktree/DEV-1234-some_ticket?upstream=main>>"
+    cwd = "<<ralphus:new-worktree/DEV-1234-some_ticket?upstream_remote=.&upstream_branch=main>>"
     prompt = "hello"
     environment = { ENV_VAR_WORTREE = "<<ralphus:linked-field/./cwd>>" }
 
@@ -5546,7 +5706,7 @@ name = "t"
 project = "ralphus"
 
     [[task.cell]]
-    cwd = "<<ralphus:new-worktree/RAL-1234-add_payment_system?upstream=main>>"
+    cwd = "<<ralphus:new-worktree/RAL-1234-add_payment_system?upstream_remote=.&upstream_branch=main>>"
     environment = { FOO = "<<ralphus:linked-field/./cwd?text=basename({})>>" }
     prompt = "hello"
 "#;
@@ -5621,7 +5781,7 @@ project = "ralphus"
 
     #[test]
     fn environment_link_to_cwd_is_valid() {
-        let src = "[[task]]\nname=\"t\"\nproject=\"p\"\n[[task.cell]]\ncwd=\"<<ralphus:new-worktree/RAL-460?upstream=main>>\"\nprompt=\"p\"\nenvironment={WT=\"<<ralphus:linked-field/./cwd>>\"}\n";
+        let src = "[[task]]\nname=\"t\"\nproject=\"p\"\n[[task.cell]]\ncwd=\"<<ralphus:new-worktree/RAL-460?upstream_remote=.&upstream_branch=main>>\"\nprompt=\"p\"\nenvironment={WT=\"<<ralphus:linked-field/./cwd>>\"}\n";
         let r = validate_toml(src);
         assert!(r.is_ok(), "{:?}", r.errors);
     }
@@ -5630,7 +5790,7 @@ project = "ralphus"
     fn environment_link_to_cwd_with_trailing_literal_text_is_valid() {
         // Trailing literal text after the closing ">>" -- the same embedding
         // rule a worktree placeholder already uses, not a "?suffix=" query.
-        let src = "[[task]]\nname=\"t\"\nproject=\"p\"\n[[task.cell]]\ncwd=\"<<ralphus:new-worktree/RAL-460?upstream=main>>\"\nprompt=\"p\"\nenvironment={LOGS=\"<<ralphus:linked-field/./cwd>>/logs\"}\n";
+        let src = "[[task]]\nname=\"t\"\nproject=\"p\"\n[[task.cell]]\ncwd=\"<<ralphus:new-worktree/RAL-460?upstream_remote=.&upstream_branch=main>>\"\nprompt=\"p\"\nenvironment={LOGS=\"<<ralphus:linked-field/./cwd>>/logs\"}\n";
         let r = validate_toml(src);
         assert!(r.is_ok(), "{:?}", r.errors);
     }
@@ -5757,7 +5917,7 @@ project = "ralphus"
 
     #[test]
     fn environment_chained_link_to_environment_key_is_valid() {
-        let src = "[[task]]\nname=\"t\"\nproject=\"p\"\n[[task.cell]]\ncwd=\"<<ralphus:new-worktree/RAL-460?upstream=main>>\"\nprompt=\"p\"\nenvironment={BASE=\"<<ralphus:linked-field/./cwd>>\", SUB=\"<<ralphus:linked-field/./environment.BASE>>/sub\"}\n";
+        let src = "[[task]]\nname=\"t\"\nproject=\"p\"\n[[task.cell]]\ncwd=\"<<ralphus:new-worktree/RAL-460?upstream_remote=.&upstream_branch=main>>\"\nprompt=\"p\"\nenvironment={BASE=\"<<ralphus:linked-field/./cwd>>\", SUB=\"<<ralphus:linked-field/./environment.BASE>>/sub\"}\n";
         let r = validate_toml(src);
         assert!(r.is_ok(), "{:?}", r.errors);
     }
@@ -5766,7 +5926,7 @@ project = "ralphus"
     fn environment_link_to_a_parent_cwd_from_a_proof_step_is_valid() {
         // A cell-scoped proof step links directly to its owning cell's own
         // `cwd` -- `cwd` (unlike `environment.<key>`) may cross a `..`.
-        let src = "[[task]]\nname=\"t\"\nproject=\"p\"\n[[task.cell]]\ncwd=\"<<ralphus:new-worktree/RAL-460?upstream=main>>\"\nprompt=\"p\"\n[[task.cell.proof]]\ncommand=\"true\"\nmode=\"raw\"\nenvironment={SUB=\"<<ralphus:linked-field/../cwd>>/logs\"}\n";
+        let src = "[[task]]\nname=\"t\"\nproject=\"p\"\n[[task.cell]]\ncwd=\"<<ralphus:new-worktree/RAL-460?upstream_remote=.&upstream_branch=main>>\"\nprompt=\"p\"\n[[task.cell.proof]]\ncommand=\"true\"\nmode=\"raw\"\nenvironment={SUB=\"<<ralphus:linked-field/../cwd>>/logs\"}\n";
         let r = validate_toml(src);
         assert!(r.is_ok(), "{:?}", r.errors);
     }
@@ -5780,7 +5940,7 @@ project = "ralphus"
         // and `id` don't have this problem; `environment.<key>` must stay
         // same-table (see `environment_link_to_a_parent_cwd_from_a_proof_step_is_valid`
         // for the `cwd` case this restriction doesn't apply to).
-        let src = "[[task]]\nname=\"t\"\nproject=\"p\"\n[[task.cell]]\ncwd=\"<<ralphus:new-worktree/RAL-460?upstream=main>>\"\nprompt=\"p\"\nenvironment={BASE=\"<<ralphus:linked-field/./cwd>>\"}\n[[task.cell.proof]]\ncommand=\"true\"\nenvironment={SUB=\"<<ralphus:linked-field/../environment.BASE>>/logs\"}\n";
+        let src = "[[task]]\nname=\"t\"\nproject=\"p\"\n[[task.cell]]\ncwd=\"<<ralphus:new-worktree/RAL-460?upstream_remote=.&upstream_branch=main>>\"\nprompt=\"p\"\nenvironment={BASE=\"<<ralphus:linked-field/./cwd>>\"}\n[[task.cell.proof]]\ncommand=\"true\"\nenvironment={SUB=\"<<ralphus:linked-field/../environment.BASE>>/logs\"}\n";
         let r = validate_toml(src);
         assert!(
             r.errors
@@ -6715,7 +6875,7 @@ target_arch = "x86_64"
 
     #[test]
     fn review_action_preparation_command_group_environment_and_worktree_text_are_valid() {
-        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nreview=\"<<review:r>>\"\n[[review]]\nid=\"r\"\n[[review.action]]\nlabel=\"Run\"\ncommand=\"/share/<<ralphus:new-worktree/RAL-999-add_widget?upstream=main&text=basename({})>>/demo\"\n[[review.action.prepare]]\ncommand=[\"cmake -S . -B build\",\"cmake --build build\"]\nenvironment={ BUILD_ROOT=\"/share/<<ralphus:new-worktree/RAL-999-add_widget?upstream=main&text=basename({})>>\" }\n";
+        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nreview=\"<<review:r>>\"\n[[review]]\nid=\"r\"\n[[review.action]]\nlabel=\"Run\"\ncommand=\"/share/<<ralphus:new-worktree/RAL-999-add_widget?upstream_remote=.&upstream_branch=main&text=basename({})>>/demo\"\n[[review.action.prepare]]\ncommand=[\"cmake -S . -B build\",\"cmake --build build\"]\nenvironment={ BUILD_ROOT=\"/share/<<ralphus:new-worktree/RAL-999-add_widget?upstream_remote=.&upstream_branch=main&text=basename({})>>\" }\n";
         let result = validate_toml(src);
         assert!(result.is_ok(), "{:?}", result.errors);
     }
@@ -6736,7 +6896,7 @@ label = "Run shared build"
 command = "run"
 [review.action.shared_store]
 store = "review-artifacts"
-path = "reviews/<<ralphus:new-worktree/RAL-999-add_widget?upstream=main&text=basename({})>>/demo"
+path = "reviews/<<ralphus:new-worktree/RAL-999-add_widget?upstream_remote=.&upstream_branch=main&text=basename({})>>/demo"
 [review.action.lifecycle]
 build_root_policy = "prepare_managed"
 before_reset_command = ["./stop-demo"]
@@ -6809,7 +6969,7 @@ timeout = "soon"
             result
                 .errors
                 .iter()
-                .any(|error| error.message.contains("require '?upstream")),
+                .any(|error| error.message.contains("require 'upstream")),
             "{:?}",
             result.errors
         );
@@ -7379,13 +7539,14 @@ placement = "copy"
 
     #[test]
     fn bare_unwrapped_placeholder_cwd_is_rejected() {
-        let src = "[[task]]\nname=\"t\"\nproject=\"my-project\"\n[[task.cell]]\ncwd=\"ralphus:new-worktree/feat?upstream=main\"\nprompt=\"p\"\n";
+        let src = "[[task]]\nname=\"t\"\nproject=\"my-project\"\n[[task.cell]]\ncwd=\"ralphus:new-worktree/feat?upstream_remote=.&upstream_branch=main\"\nprompt=\"p\"\n";
         let r = validate_toml(src);
         assert!(
             r.errors.iter().any(|e| e.kind == ErrorKind::InvalidValue
                 && e.message.contains("must be wrapped in \"<<...>>\"")
-                && e.message
-                    .contains("<<ralphus:new-worktree/feat?upstream=main>>")),
+                && e.message.contains(
+                    "<<ralphus:new-worktree/feat?upstream_remote=.&upstream_branch=main>>"
+                )),
             "{:?}",
             r.errors
         );
@@ -7397,7 +7558,7 @@ placement = "copy"
         // "uses a placeholder" for the task-level `project` requirement -- an
         // author fixing the wrap error shouldn't then hit a second,
         // out-of-order surprise about `project`.
-        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"ralphus:new-worktree/feat?upstream=main\"\nprompt=\"p\"\n";
+        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"ralphus:new-worktree/feat?upstream_remote=.&upstream_branch=main\"\nprompt=\"p\"\n";
         let r = validate_toml(src);
         assert!(
             r.errors.iter().any(|e| e.kind == ErrorKind::MissingRequired
@@ -7410,7 +7571,7 @@ placement = "copy"
 
     #[test]
     fn placeholder_cwd_with_project_is_valid() {
-        let src = "[[task]]\nname=\"t\"\nproject=\"my-project\"\n[[task.cell]]\ncwd=\"<<ralphus:new-worktree/feat?upstream=main>>\"\nprompt=\"p\"\n";
+        let src = "[[task]]\nname=\"t\"\nproject=\"my-project\"\n[[task.cell]]\ncwd=\"<<ralphus:new-worktree/feat?upstream_remote=.&upstream_branch=main>>\"\nprompt=\"p\"\n";
         let r = validate_toml(src);
         assert!(r.is_ok(), "{:?}", r.errors);
     }
@@ -7424,7 +7585,7 @@ placement = "copy"
 
     #[test]
     fn placeholder_cwd_without_project_is_rejected() {
-        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"<<ralphus:new-worktree/feat?upstream=main>>\"\nprompt=\"p\"\n";
+        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"<<ralphus:new-worktree/feat?upstream_remote=.&upstream_branch=main>>\"\nprompt=\"p\"\n";
         let r = validate_toml(src);
         assert!(
             r.errors.iter().any(|e| e.kind == ErrorKind::MissingRequired
@@ -7622,7 +7783,7 @@ placement = "copy"
 
     #[test]
     fn placeholder_cwd_with_empty_upstream_value_is_rejected() {
-        let src = "[[task]]\nname=\"t\"\nproject=\"my-project\"\n[[task.cell]]\ncwd=\"<<ralphus:new-worktree/feat?upstream=>>\"\nprompt=\"p\"\n";
+        let src = "[[task]]\nname=\"t\"\nproject=\"my-project\"\n[[task.cell]]\ncwd=\"<<ralphus:new-worktree/feat?upstream_remote=.&upstream_branch=>>\"\nprompt=\"p\"\n";
         let r = validate_toml(src);
         assert!(
             r.errors
@@ -7635,14 +7796,14 @@ placement = "copy"
 
     #[test]
     fn placeholder_cwd_with_remote_qualified_upstream_is_valid() {
-        let src = "[[task]]\nname=\"t\"\nproject=\"my-project\"\n[[task.cell]]\ncwd=\"<<ralphus:new-worktree/origin/feature/x?upstream=origin/blah>>\"\nprompt=\"p\"\n";
+        let src = "[[task]]\nname=\"t\"\nproject=\"my-project\"\n[[task.cell]]\ncwd=\"<<ralphus:new-worktree/origin/feature/x?upstream_remote=origin&upstream_branch=blah>>\"\nprompt=\"p\"\n";
         let r = validate_toml(src);
         assert!(r.is_ok(), "{:?}", r.errors);
     }
 
     #[test]
     fn wrapped_placeholder_cwd_with_project_is_valid() {
-        let src = "[[task]]\nname=\"t\"\nproject=\"my-project\"\n[[task.cell]]\ncwd=\"<<ralphus:new-worktree/feat?upstream=main>>/more/text\"\nprompt=\"p\"\n";
+        let src = "[[task]]\nname=\"t\"\nproject=\"my-project\"\n[[task.cell]]\ncwd=\"<<ralphus:new-worktree/feat?upstream_remote=.&upstream_branch=main>>/more/text\"\nprompt=\"p\"\n";
         let r = validate_toml(src);
         assert!(r.is_ok(), "{:?}", r.errors);
     }
@@ -7651,7 +7812,7 @@ placement = "copy"
     fn wrapped_placeholder_cwd_with_a_nested_upstream_sentinel_is_valid() {
         for sentinel in crate::schema::WORKTREE_UPSTREAM_SENTINELS {
             let src = format!(
-                "[[task]]\nname=\"t\"\nproject=\"my-project\"\n[[task.cell]]\ncwd=\"<<ralphus:new-worktree/feat?upstream={sentinel}>>\"\nprompt=\"p\"\n"
+                "[[task]]\nname=\"t\"\nproject=\"my-project\"\n[[task.cell]]\ncwd=\"<<ralphus:new-worktree/feat?upstream_remote=.&upstream_branch={sentinel}>>\"\nprompt=\"p\"\n"
             );
             let r = validate_toml(&src);
             assert!(r.is_ok(), "{sentinel}: {:?}", r.errors);
@@ -7660,7 +7821,7 @@ placement = "copy"
 
     #[test]
     fn wrapped_placeholder_cwd_with_a_nested_bogus_sentinel_is_rejected() {
-        let src = "[[task]]\nname=\"t\"\nproject=\"my-project\"\n[[task.cell]]\ncwd=\"<<ralphus:new-worktree/feat?upstream=<<wat>>>>\"\nprompt=\"p\"\n";
+        let src = "[[task]]\nname=\"t\"\nproject=\"my-project\"\n[[task.cell]]\ncwd=\"<<ralphus:new-worktree/feat?upstream_remote=origin&upstream_branch=<<wat>>>>\"\nprompt=\"p\"\n";
         let r = validate_toml(src);
         assert!(
             r.errors.iter().any(|e| e.kind == ErrorKind::InvalidValue

@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 
 use opentelemetry::Context;
 
-use ralphus_core::schema::{ReviewActionDef, ReviewDef, TaskFile, review_link_key};
+use ralphus_core::schema::{ReviewActionDef, ReviewDef, TaskFile, UpstreamRef, review_link_key};
 
 use crate::guardian::{CheckInput, GuardianCheck};
 use crate::plan;
@@ -126,7 +126,12 @@ pub(crate) fn same_git_repo(cwd_a: &Path, cwd_b: &Path) -> bool {
 /// worktree (e.g. a cell restarted mid-flight) doesn't block the rebase.
 /// On failure the rebase is aborted automatically so the worktree is left
 /// clean. The error string describes which git step failed and why.
-pub(crate) fn rebase_onto(cwd: &Path, target_branch: &str) -> std::result::Result<(), String> {
+pub(crate) fn rebase_onto(
+    cwd: &Path,
+    target: impl Into<UpstreamRef>,
+) -> std::result::Result<(), String> {
+    let target_branch = crate::guardian_merge::qualify_upstream_ref(cwd, &target.into());
+    let target_branch = target_branch.as_str();
     // Detect any working-tree or index changes (tracked or untracked).
     let has_changes = !git(cwd, &["status", "--porcelain"])?.is_empty();
 
@@ -203,17 +208,16 @@ pub(crate) fn rebase_onto(cwd: &Path, target_branch: &str) -> std::result::Resul
 /// makes the marker a comparison point fixed at the moment this call ran,
 /// rather than a live pointer re-read at guard-check time.
 ///
-/// `baseline` is qualified via [`crate::guardian_merge::qualify_ambiguous_ref`]
-/// before resolution: a caller-supplied `@{upstream}` name (e.g. from
-/// `--abbrev-ref`) is exactly the kind of bare short name that can collide
-/// with a same-named local branch, which would otherwise silently freeze the
-/// baseline to the wrong commit.
+/// `baseline` is qualified via [`crate::guardian_merge::qualify_upstream_ref`]
+/// before resolution, so a remote base freezes to its remote-tracking ref and
+/// a local base to its `refs/heads/` ref rather than to whichever same-named
+/// ref git's DWIM search would pick.
 pub(crate) fn set_worktree_commit_baseline(
     cwd: &Path,
-    baseline: &str,
+    baseline: impl Into<UpstreamRef>,
 ) -> std::result::Result<(), String> {
     let branch = worktree_branch(cwd)?;
-    let qualified = crate::guardian_merge::qualify_ambiguous_ref(cwd, baseline);
+    let qualified = crate::guardian_merge::qualify_upstream_ref(cwd, &baseline.into());
     let resolved = git(cwd, &["rev-parse", "--verify", &qualified])?;
     git_config_write(
         cwd,
@@ -235,18 +239,21 @@ fn git_config_write(cwd: &Path, args: &[&str]) -> std::result::Result<(), String
     crate::worktrees::git_config_write_retrying(cwd, args).map(|_| ())
 }
 
-/// The upstream (`branch@{upstream}`) of the worktree's branch, if any.
-pub(crate) fn worktree_upstream(cwd: &Path) -> std::result::Result<String, String> {
-    git(
-        cwd,
-        &[
-            "rev-parse",
-            "--abbrev-ref",
-            "--symbolic-full-name",
-            "@{upstream}",
-        ],
-    )
-    .map_err(|_| "no upstream".to_string())
+/// The upstream the worktree's branch tracks, read from its
+/// `branch.<name>.remote` and `branch.<name>.merge` git config keys.
+pub(crate) fn worktree_upstream(cwd: &Path) -> std::result::Result<UpstreamRef, String> {
+    let branch = worktree_branch(cwd).map_err(|_| "no upstream".to_string())?;
+    let read = |key: &str| {
+        git(cwd, &["config", "--get", &format!("branch.{branch}.{key}")])
+            .map(|v| v.trim().to_string())
+            .ok()
+            .filter(|v| !v.is_empty())
+    };
+    let (Some(remote), Some(merge)) = (read("remote"), read("merge")) else {
+        return Err("no upstream".to_string());
+    };
+    let merge_branch = merge.strip_prefix("refs/heads/").unwrap_or(&merge);
+    Ok(UpstreamRef::new(remote, merge_branch))
 }
 
 /// The durable comparison ref [`worktree_has_commits_ahead_of_upstream`]
@@ -388,8 +395,8 @@ pub(crate) fn cell_upstream_display(
         };
     }
     match pending {
-        Some(p) => Some(p.upstream),
-        None => worktree_upstream(Path::new(cwd)).ok(),
+        Some(p) => Some(p.upstream.joined()),
+        None => worktree_upstream(Path::new(cwd)).ok().map(|u| u.joined()),
     }
 }
 
@@ -406,7 +413,7 @@ struct Membership {
     /// membership reached review creation through a raw-directory route.
     registered_project: Option<String>,
     branch: String,
-    upstream: String,
+    upstream: UpstreamRef,
     name: String,
     order: usize,
     /// The stable link key when the review id is `ralphus:new-review/<key>`; the
@@ -707,7 +714,15 @@ pub fn derive_reviews(
     derive_reviews_with_prefetch(store, squad_id, file, &HashMap::new())
 }
 
-/// Every `(registered project, bare upstream)` pair this submission's cell
+/// The upstream a `[[review]]` block declares, `None` unless both halves of
+/// the pair are present and non-empty.
+fn declared_upstream(review: &ReviewDef) -> Option<UpstreamRef> {
+    let remote = review.upstream_remote.as_deref()?.trim();
+    let branch = review.upstream_branch.as_deref()?.trim();
+    (!remote.is_empty() && !branch.is_empty()).then(|| UpstreamRef::new(remote, branch))
+}
+
+/// Every `(registered project, upstream)` pair this submission's cell
 /// cwd worktree placeholders AND its `[[review]]` blocks' own declared
 /// `upstream` fields would need a live `git fetch` for -- the union of
 /// [`crate::worktrees::collect_remote_upstream_prefetch_targets`] (cell
@@ -731,9 +746,9 @@ pub fn derive_reviews(
 pub fn collect_remote_upstream_prefetch_targets(
     store: &Store,
     file: &TaskFile,
-) -> Vec<(ProjectView, String)> {
+) -> Vec<(ProjectView, UpstreamRef)> {
     let (cells, tasks, cell_info) = rows_from_file(file);
-    let mut seen: HashSet<(String, String)> = HashSet::new();
+    let mut seen: HashSet<(String, UpstreamRef)> = HashSet::new();
     let mut out = crate::worktrees::collect_remote_upstream_prefetch_targets(store, &cells, &tasks);
     out.retain(|(project, upstream)| seen.insert((project.name.clone(), upstream.clone())));
 
@@ -745,20 +760,12 @@ pub fn collect_remote_upstream_prefetch_targets(
     let tasks_by_idx: BTreeMap<i64, &TaskRow> = tasks.iter().map(|t| (t.idx, t)).collect();
     for (pos, (_, rev_id_opt)) in cell_info.iter().enumerate() {
         let Some(rev_id) = rev_id_opt else { continue };
-        let Some(upstream) = review_map
-            .get(rev_id)
-            .copied()
-            .and_then(|r| r.upstream.as_deref())
-            .map(str::trim)
-            .filter(|b| !b.is_empty())
+        let Some(upstream) = review_map.get(rev_id).copied().and_then(declared_upstream)
         else {
             continue;
         };
-        // `ReviewDef.upstream` never supports a `<<...>>` sentinel (unlike a
-        // cell's own `?upstream=`) -- only the already-explicit-remote form
-        // (`contains('/')`) needs skipping here, matching
-        // `resolve_registered_remote_upstream`'s own no-op check.
-        if upstream.contains('/') {
+        // A local base is never fetched.
+        if upstream.is_local() {
             continue;
         }
         let Some(project_name) = tasks_by_idx
@@ -767,7 +774,7 @@ pub fn collect_remote_upstream_prefetch_targets(
         else {
             continue;
         };
-        if !seen.insert((project_name.to_string(), upstream.to_string())) {
+        if !seen.insert((project_name.to_string(), upstream.clone())) {
             continue;
         }
         let Ok(Some(project)) = store.resolve_project(project_name) else {
@@ -776,7 +783,7 @@ pub fn collect_remote_upstream_prefetch_targets(
         if project.clone_url.is_none() {
             continue;
         }
-        out.push((project, upstream.to_string()));
+        out.push((project, upstream));
     }
     out
 }
@@ -875,7 +882,7 @@ pub fn derive_reviews_with_prefetch(
     store: &crate::store_lock::StoreHandle,
     squad_id: &str,
     file: &TaskFile,
-    prefetched_upstreams: &HashMap<(String, String), String>,
+    prefetched_upstreams: &HashMap<(String, UpstreamRef), UpstreamRef>,
 ) -> std::result::Result<Vec<String>, ReviewError> {
     derive_reviews_with_full_prefetch(
         store,
@@ -906,7 +913,7 @@ pub fn derive_reviews_with_full_prefetch(
     store: &crate::store_lock::StoreHandle,
     squad_id: &str,
     file: &TaskFile,
-    prefetched_upstreams: &HashMap<(String, String), String>,
+    prefetched_upstreams: &HashMap<(String, UpstreamRef), UpstreamRef>,
     prefetched_worktrees: &HashMap<String, String>,
     progress: Option<&dyn Fn(&str)>,
 ) -> std::result::Result<Vec<String>, ReviewError> {
@@ -985,12 +992,7 @@ pub fn derive_reviews_with_full_prefetch(
             .as_deref()
             .ok_or_else(|| ReviewError::new("a cell declaring a review has no cwd"))?;
         let cwd_path = Path::new(cwd);
-        let declared_upstream = review_map
-            .get(rev_id)
-            .copied()
-            .and_then(|r| r.upstream.clone())
-            .map(|b| b.trim().to_string())
-            .filter(|b| !b.is_empty());
+        let declared_upstream = review_map.get(rev_id).copied().and_then(declared_upstream);
         // RAL-185: a cell that ran on another machine keeps its worktree
         // there, so none of the filesystem reads below can answer for it.
         // Everything needed is already known declaratively instead: the branch
@@ -1011,7 +1013,7 @@ pub fn derive_reviews_with_full_prefetch(
                     "review \"{rev_id}\" is fed by cell \"{}\" running on machine \"{}\", so \
                      its upstream branch cannot be read from that worktree's git upstream — \
                      this daemon cannot see another machine's filesystem. Declare it explicitly \
-                     on the review: [[review]] upstream = \"main\".",
+                     on the review: [[review]] upstream_remote = \".\" and upstream_branch = \"main\".",
                     rd.cell_id, rd.machine
                 ))
             })?;
@@ -1074,7 +1076,7 @@ pub fn derive_reviews_with_full_prefetch(
                             "{cwd}: review upstream requires a git upstream tracking branch for \
                              '{branch}', but none is configured (set one with \
                              'git branch --set-upstream-to=<branch>', or declare it on the review \
-                             as [[review]] upstream = \"<branch>\")"
+                             as [[review]] upstream_remote/upstream_branch)"
                         ))
                     })?,
                 },
@@ -1272,7 +1274,7 @@ pub fn derive_reviews_with_full_prefetch(
         members.sort_by_key(|m| m.order);
         let upstream = members
             .first()
-            .map_or_else(|| "main".to_string(), |m| m.upstream.clone());
+            .map_or_else(|| UpstreamRef::local("main"), |m| m.upstream.clone());
         let suggested = members
             .iter()
             .find(|m| !m.name.is_empty())
@@ -1323,7 +1325,7 @@ pub fn derive_reviews_with_full_prefetch(
             .unwrap_or_default();
         let upstream = members
             .first()
-            .map_or_else(|| "main".to_string(), |m| m.upstream.clone());
+            .map_or_else(|| UpstreamRef::local("main"), |m| m.upstream.clone());
         let name = members
             .iter()
             .find(|m| !m.name.is_empty())
@@ -2357,7 +2359,7 @@ fn build_review_from_drained_pool(
     let upstream = drained
         .first()
         .map(|c| c.upstream.clone())
-        .unwrap_or_else(|| "main".to_string());
+        .unwrap_or_else(|| UpstreamRef::local("main"));
     // Creation phase: guard re-taken for every store write that materializes
     // the review.
     let store = store.lock();
