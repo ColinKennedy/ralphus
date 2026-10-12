@@ -730,43 +730,6 @@ impl Store {
         Ok(())
     }
 
-    /// Delete a waypoint and its roster/affected rows. Used to undo a
-    /// waypoint whose creation was rejected part-way through.
-    ///
-    /// # Errors
-    /// Propagates any SQLite failure.
-    pub fn discard_waypoint(&self, id: &str) -> StoreResult<()> {
-        for table in ["waypoint_affected", "waypoint_roster"] {
-            self.conn.execute(
-                &format!("DELETE FROM {table} WHERE waypoint_id=?"),
-                params![id],
-            )?;
-        }
-        self.conn
-            .execute("DELETE FROM waypoints WHERE id=?", params![id])?;
-        Ok(())
-    }
-
-    /// Writes the whole roster before any affected entry, so a squad the
-    /// waypoint affects is never visible to the scheduler without the roster
-    /// that releases it.
-    fn add_submission_entries(
-        &self,
-        id: &str,
-        squad_id: &str,
-        w: &ralphus_core::schema::WaypointDef,
-    ) -> StoreResult<()> {
-        for entry in &w.roster {
-            let (kind, entry_id) = self.resolve_submission_entry(squad_id, "roster", entry)?;
-            self.add_roster_entry(id, kind, &entry_id, None)?;
-        }
-        for entry in &w.affected {
-            let (kind, entry_id) = self.resolve_submission_entry(squad_id, "affected", entry)?;
-            self.add_affected_entry(id, kind, &entry_id, AffectedMode::Block)?;
-        }
-        Ok(())
-    }
-
     /// Fetch one waypoint by id.
     ///
     /// # Errors
