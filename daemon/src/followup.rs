@@ -27,6 +27,8 @@ use std::path::Path;
 use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 
+use ralphus_core::schema::UpstreamRef;
+
 use crate::guardian::GuardianView;
 use crate::store::{Result, Store, StoreError, now_ms};
 
@@ -798,7 +800,7 @@ fn task_prompt(review_name: &str, item: &FollowupItem) -> String {
 pub fn draft_followup_toml(
     project: &str,
     guardian: &GuardianView,
-    base: &str,
+    base: &UpstreamRef,
     items: &[FollowupItem],
 ) -> String {
     let guardian_slug = slug(&guardian.id);
@@ -813,7 +815,11 @@ pub fn draft_followup_toml(
             let mut cell = toml::Table::new();
             cell.insert(
                 "cwd".into(),
-                format!("<<ralphus:new-worktree/{branch}?upstream={base}>>").into(),
+                format!(
+                    "<<ralphus:new-worktree/{branch}?upstream_remote={}&upstream_branch={}>>",
+                    base.remote, base.branch
+                )
+                .into(),
             );
             cell.insert("prompt".into(), task_prompt(&guardian.name, item).into());
             cell.insert("triage".into(), true.into());
@@ -1141,34 +1147,10 @@ impl Store {
     }
 }
 
-/// Splits a stored merge target into `(remote, branch)`. The daemon records a
-/// review's base either as a bare branch (`main`) or in remote-tracking form
-/// (`origin/main`), so a leading segment naming a configured remote is the
-/// remote, and anything else is a branch on `origin`.
-fn split_remote(root: &Path, name: &str) -> (String, String) {
-    if let Some((head, rest)) = name.split_once('/') {
-        let is_remote = ralphus_core::git_spawn::command(&["remote"])
-            .arg("-C")
-            .arg(root)
-            .args(["remote"])
-            .output()
-            .map(|out| {
-                String::from_utf8_lossy(&out.stdout)
-                    .lines()
-                    .any(|remote| remote.trim() == head)
-            })
-            .unwrap_or(false);
-        if is_remote {
-            return (head.to_string(), rest.to_string());
-        }
-    }
-    ("origin".to_string(), name.to_string())
-}
-
-/// Whether `git` finds `name` on its remote, falling back to the local refs
-/// when the remote cannot be asked (no such remote, offline).
-fn branch_exists(root: &Path, name: &str) -> bool {
-    let (remote, branch) = split_remote(root, name);
+/// Whether `base` exists on its remote, falling back to the local refs when
+/// the remote cannot be asked (no such remote, offline). A local base is
+/// looked up in the local refs only.
+fn branch_exists(root: &Path, base: &UpstreamRef) -> bool {
     let git = |args: &[&str]| {
         ralphus_core::git_spawn::command(args)
             .arg("-C")
@@ -1177,31 +1159,36 @@ fn branch_exists(root: &Path, name: &str) -> bool {
             .env("GIT_TERMINAL_PROMPT", "0")
             .output()
     };
-    let heads = format!("refs/heads/{branch}");
-    if let Ok(out) = git(&["ls-remote", "--exit-code", "--heads", &remote, &heads]) {
-        match out.status.code() {
-            Some(0) => return true,
-            // `--exit-code`: 2 means the remote answered and has no such ref.
-            Some(2) => return false,
-            _ => {}
+    let heads = format!("refs/heads/{}", base.branch);
+    if !base.is_local() {
+        if let Ok(out) = git(&["ls-remote", "--exit-code", "--heads", &base.remote, &heads]) {
+            match out.status.code() {
+                Some(0) => return true,
+                // `--exit-code`: 2 means the remote answered and has no such ref.
+                Some(2) => return false,
+                _ => {}
+            }
         }
     }
-    let remote_tracking = format!("refs/remotes/{remote}/{branch}");
-    [heads, remote_tracking].iter().any(|reference| {
-        git(&["rev-parse", "--verify", "--quiet", reference])
-            .map(|out| out.status.success())
-            .unwrap_or(false)
-    })
+    git(&["rev-parse", "--verify", "--quiet", &base.tracking_ref()])
+        .map(|out| out.status.success())
+        .unwrap_or(false)
 }
 
 /// The upstream a follow-up squad is based on: the branch the review merged
-/// into, or the remote's default branch when that branch is gone.
+/// into, or the default branch of the same remote (`origin` for a local base)
+/// when that branch is gone.
 #[must_use]
-pub fn resolve_followup_base(git_root: &Path, merged_into: &str) -> String {
-    if !merged_into.is_empty() && branch_exists(git_root, merged_into) {
-        merged_into.to_string()
+pub fn resolve_followup_base(git_root: &Path, merged_into: &UpstreamRef) -> UpstreamRef {
+    if !merged_into.branch.is_empty() && branch_exists(git_root, merged_into) {
+        merged_into.clone()
     } else {
-        DEFAULT_UPSTREAM.to_string()
+        let remote = if merged_into.is_local() {
+            "origin"
+        } else {
+            merged_into.remote.as_str()
+        };
+        UpstreamRef::new(remote, DEFAULT_UPSTREAM)
     }
 }
 
@@ -1331,7 +1318,7 @@ pub(crate) fn accept_offer(
     }
     Ok(AcceptResult {
         squad_id,
-        base,
+        base: base.joined(),
         started,
     })
 }
@@ -1429,7 +1416,7 @@ fn submit_followup_squad(
     daemon: &crate::server::Daemon,
     offer: &FollowupOfferView,
     guardian: &GuardianView,
-) -> std::result::Result<(String, String, bool), AcceptError> {
+) -> std::result::Result<(String, UpstreamRef, bool), AcceptError> {
     let rejected = |status: u16, message: String| AcceptError::Rejected { status, message };
     let Some(project) = guardian.project.clone() else {
         return Err(rejected(
@@ -1448,7 +1435,7 @@ fn submit_followup_squad(
         ));
     }
     let root = Path::new(&guardian.git_root);
-    let base = resolve_followup_base(root, &guardian.base_branch);
+    let base = resolve_followup_base(root, &guardian.upstream());
     let started = guardian.effective_followup_auto_start;
     let inherited: Vec<InheritedProofs> = {
         let store = daemon.lock();

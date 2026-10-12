@@ -361,7 +361,7 @@ fn run_watch(store: &crate::store_lock::StoreHandle, guardian_id: &str, branch_i
     let client = match crate::pr::forge_client_for_pr(
         store,
         &root,
-        &guardian.base_branch,
+        &guardian.upstream(),
         &forge_cfg,
         &pr.repo,
         guardian.owner.as_deref(),
@@ -890,7 +890,7 @@ pub fn poll_open_pr_ci_status(
         let Some(client) = crate::pr::forge_client_for_pr(
             store,
             &root,
-            &guardian.base_branch,
+            &guardian.upstream(),
             &forge_cfg,
             &pr.repo,
             guardian.owner.as_deref(),
@@ -1022,7 +1022,7 @@ pub fn poll_open_pr_ci_status(
             let Some(client) = crate::pr::forge_client_for_pr(
                 store,
                 &root,
-                &guardian.base_branch,
+                &guardian.upstream(),
                 &forge_cfg,
                 &decision.pr.repo,
                 guardian.owner.as_deref(),

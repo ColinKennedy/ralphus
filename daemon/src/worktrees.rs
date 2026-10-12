@@ -35,7 +35,8 @@ use std::sync::{Arc, LazyLock};
 use opentelemetry::Context;
 use opentelemetry::trace::{SpanKind, Status};
 
-use crate::guardian_merge::{git, qualify_ambiguous_ref};
+use crate::guardian_merge::{git, qualify_upstream_ref};
+use ralphus_core::schema::UpstreamRef;
 use crate::otel;
 use crate::store::{CellRow, ProjectView, Store, TaskRow};
 use crate::store_lock::StoreHandle;
@@ -43,8 +44,7 @@ use crate::store_lock::StoreHandle;
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum BranchMaterialization {
     ExistingLocal,
-    NewFromRemote { remote_ref: String },
-    NewFromHead { warning: Option<String> },
+    NewFromHead,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -100,7 +100,7 @@ pub(crate) struct PlaceholderContext<'a> {
     /// expansion) falls back to fetching live, right where the fetch used to
     /// happen unconditionally, so correctness never depends on this cache
     /// being complete.
-    pub(crate) prefetched_upstreams: &'a HashMap<(String, String), String>,
+    pub(crate) prefetched_upstreams: &'a HashMap<(String, UpstreamRef), UpstreamRef>,
     /// Per-project-root `git worktree list --porcelain` snapshots
     /// (short-name -> branch, [`existing_task_worktree_branches`]'s shape),
     /// lazily populated by [`GitProjectStartupAdapter::resolve_placeholder`]
@@ -277,18 +277,26 @@ fn creation_marker_path(root: &Path, short: &str) -> PathBuf {
 
 /// The `(branch, upstream)` a slot's creation marker names, `None` when there
 /// is no marker (or it is unreadable, which is treated the same: no proof of
-/// ownership).
-fn read_creation_marker(path: &Path) -> Option<(String, Option<String>)> {
+/// ownership). The upstream comes from the marker's `upstream_remote=` and
+/// `upstream_branch=` lines; a marker with only the combined `upstream=` line
+/// is taken apart against the remotes configured in `root`.
+fn read_creation_marker(root: &Path, path: &Path) -> Option<(String, Option<UpstreamRef>)> {
     let text = std::fs::read_to_string(path).ok()?;
     let mut lines = text.lines();
     let branch = lines.next()?.trim();
     if branch.is_empty() {
         return None;
     }
-    let upstream = lines
-        .find_map(|l| l.strip_prefix("upstream="))
-        .map(|u| u.trim().to_string())
-        .filter(|u| !u.is_empty());
+    let value = |key: &str| {
+        text.lines()
+            .find_map(|l| l.strip_prefix(key))
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+    };
+    let upstream = match (value("upstream_remote="), value("upstream_branch=")) {
+        (Some(remote), Some(branch)) => Some(UpstreamRef::new(remote, branch)),
+        _ => value("upstream=").map(|u| crate::legacy_upstream::split_legacy_base(&u, root)),
+    };
     Some((branch.to_string(), upstream))
 }
 
@@ -304,7 +312,7 @@ fn creation_markers(root: &Path) -> HashMap<String, String> {
         .filter_map(Result::ok)
         .filter_map(|entry| {
             let short = entry.file_name().to_str()?.to_string();
-            let (branch, _) = read_creation_marker(&entry.path())?;
+            let (branch, _) = read_creation_marker(root, &entry.path())?;
             Some((short, branch))
         })
         .collect()
@@ -325,7 +333,7 @@ fn write_creation_marker(
     root: &Path,
     short: &str,
     branch: &str,
-    upstream: &str,
+    upstream: &UpstreamRef,
 ) -> Result<bool, String> {
     use std::io::Write as _;
     let dir = creation_marker_dir(root);
@@ -340,14 +348,17 @@ fn write_creation_marker(
         Ok(mut file) => writeln!(
             file,
             "{branch}
-upstream={upstream}
+upstream_remote={}
+upstream_branch={}
 pid={}",
+            upstream.remote,
+            upstream.branch,
             std::process::id()
         )
         .map(|()| true)
         .map_err(|e| format!("could not write worktree creation marker: {e}")),
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-            Ok(read_creation_marker(&path).is_some_and(|(b, _)| b.eq_ignore_ascii_case(branch)))
+            Ok(read_creation_marker(root, &path).is_some_and(|(b, _)| b.eq_ignore_ascii_case(branch)))
         }
         Err(e) => Err(format!("could not write worktree creation marker: {e}")),
     }
@@ -514,24 +525,6 @@ fn resolve_task_worktree_dir_with_existing(
         .join(candidate)
 }
 
-/// Whether `branch` names an existing remote-tracking ref (`refs/remotes/<branch>`).
-///
-/// Mirrors the condition [`branch_materialization`] uses to pick
-/// [`BranchMaterialization::NewFromRemote`], but is deliberately checked
-/// against the *remote* ref rather than that enum: once the first squad has
-/// materialized `origin/foo`, a local branch by that literal name exists and
-/// `branch_materialization` reports `ExistingLocal`, so it can no longer tell
-/// a shared remote branch from an ordinary local one. `refs/remotes/` is
-/// stable across both resolutions.
-fn names_remote_tracking_branch(root: &Path, branch: &str) -> bool {
-    branch.contains('/')
-        && git(
-            root,
-            &["rev-parse", "--verify", &format!("refs/remotes/{branch}")],
-        )
-        .is_ok()
-}
-
 /// How many `<base>-2`, `-3`, ... branches one base branch may spawn before
 /// resolution gives up. A ceiling, not a quota: reaching it means something
 /// is allocating worktrees in a loop, and failing loudly beats silently
@@ -568,14 +561,6 @@ const MAX_BRANCH_SUFFIX: usize = 1000;
 /// included, so a branch already checked out in a hand-made worktree falls
 /// through to the next free `-2`, `-3`, ... suffix here instead of git
 /// itself rejecting the later `git worktree add`.
-///
-/// **A remote-tracking branch is exempt and always shared.** A placeholder
-/// like `ralphus:new-worktree/origin/foo` names one specific, externally
-/// owned branch — squads deliberately share that worktree and resync it to
-/// new pushes (see [`resync_remote_tracking_branch`]). Allocating
-/// `origin/foo-2` for the second squad would invent a local branch tracking
-/// nothing, which is not what the placeholder asked for. Per-squad allocation
-/// applies only to branches this daemon creates and owns.
 fn resolve_squad_branch(
     store: &StoreHandle,
     project: &ProjectView,
@@ -596,13 +581,6 @@ fn resolve_squad_branch(
 /// statement instead would let two concurrent submissions both observe the same
 /// branch as free and both claim it, handing two squads the same worktree --
 /// which is exactly the failure RAL-337 introduced this allocation to prevent.
-///
-/// Also the sole gate for the remote-tracking exemption documented on
-/// [`resolve_squad_branch`] -- this function has a second, direct caller
-/// ([`plan_local_worktree_jobs`]) that already holds the store guard it would
-/// otherwise need to take itself, so the exemption lives here rather than in
-/// [`resolve_squad_branch`] alone, where that second caller would silently
-/// miss it.
 fn resolve_squad_branch_claim(
     store: &Store,
     project: &ProjectView,
@@ -610,9 +588,6 @@ fn resolve_squad_branch_claim(
     squad_id: &str,
     on_disk: &HashMap<String, String>,
 ) -> Result<String, String> {
-    if names_remote_tracking_branch(Path::new(&project.path), base_branch) {
-        return Ok(base_branch.to_string());
-    }
     if let Some(existing) = store
         .task_worktree_claim_for_squad(&project.name, base_branch, squad_id)
         .map_err(|e| e.to_string())?
@@ -707,29 +682,43 @@ fn validate_branch_name(root: &Path, branch: &str) -> Result<(), String> {
     git(root, &["check-ref-format", "--branch", branch]).map(|_| ())
 }
 
-/// Resolve a placeholder cell `cwd`'s `?upstream=` value against the project
-/// `root` (RAL-258). The two reserved `<<...>>` sentinels are expanded to a
-/// concrete branch by querying live git state in `root`; any literal branch
-/// name or `<remote>/<branch>` value is passed through unchanged.
+/// Resolve a placeholder cell `cwd`'s explicit upstream (`upstream_remote` +
+/// `upstream_branch`, RAL-628) against the project `root`, returning the
+/// pair with its branch half concrete.
 ///
-/// `<<default>>` becomes the repository's default branch (the branch the
-/// `origin` remote's HEAD symref points at); `<<current_branch>>` becomes
-/// whatever branch `root` currently has checked out. Lookup failures are hard
-/// errors — ralphus never guesses `main`/`master`, consistent with RAL-100's
-/// no-guessing intent for `?upstream=`. Any other `<<...>>` value (a typo, or
-/// an unsupported sentinel) is also rejected here, defense-in-depth on top of
-/// the submit-time check in `ralphus_core::validate`.
-fn resolve_upstream(root: &Path, upstream: &str) -> Result<String, String> {
-    use ralphus_core::schema::{WORKTREE_UPSTREAM_CURRENT_BRANCH, WORKTREE_UPSTREAM_DEFAULT};
-    match upstream {
-        WORKTREE_UPSTREAM_DEFAULT => default_branch(root),
-        WORKTREE_UPSTREAM_CURRENT_BRANCH => current_checked_out_branch(root),
-        other if other.starts_with("<<") => Err(format!(
-            "\"?upstream={other}\" is not a supported sentinel; use \"{WORKTREE_UPSTREAM_DEFAULT}\" \
-             or \"{WORKTREE_UPSTREAM_CURRENT_BRANCH}\", or a literal branch name"
-        )),
-        other => Ok(other.to_string()),
-    }
+/// `<<default>>` (branch half only) becomes the default branch of the *named*
+/// remote -- the branch that remote's `HEAD` symref points at -- and
+/// `<<current_branch>>` becomes whatever branch `root` currently has checked
+/// out (valid only with the local remote `.`). Lookup failures are hard
+/// errors: ralphus never guesses `main`/`master`. Any other `<<...>>` value
+/// (a typo, or an unsupported sentinel) is rejected here, defense-in-depth on
+/// top of the submit-time check in `ralphus_core::validate`.
+fn resolve_upstream(
+    root: &Path,
+    upstream: ralphus_core::schema::WorktreeUpstream<'_>,
+) -> Result<ralphus_core::schema::UpstreamRef, String> {
+    use ralphus_core::schema::{
+        LOCAL_UPSTREAM_REMOTE, WORKTREE_UPSTREAM_CURRENT_BRANCH, WORKTREE_UPSTREAM_DEFAULT,
+    };
+    let remote = upstream.remote;
+    let branch = match upstream.branch {
+        WORKTREE_UPSTREAM_DEFAULT => default_branch(root, remote)?,
+        WORKTREE_UPSTREAM_CURRENT_BRANCH => {
+            if remote != LOCAL_UPSTREAM_REMOTE {
+                return Err(format!(
+                    "\"upstream_branch={WORKTREE_UPSTREAM_CURRENT_BRANCH}\" names the branch checked out in the project root, so it requires \"upstream_remote={LOCAL_UPSTREAM_REMOTE}\" (got \"{remote}\")"
+                ));
+            }
+            current_checked_out_branch(root)?
+        }
+        other if other.starts_with("<<") => {
+            return Err(format!(
+                "\"upstream_branch={other}\" is not a supported sentinel; use \"{WORKTREE_UPSTREAM_DEFAULT}\" or \"{WORKTREE_UPSTREAM_CURRENT_BRANCH}\", or a literal branch name"
+            ));
+        }
+        other => other.to_string(),
+    };
+    Ok(ralphus_core::schema::UpstreamRef::new(remote, branch))
 }
 
 /// For a project registered with a remote (`clone_url` set via
@@ -763,31 +752,24 @@ fn resolve_upstream(root: &Path, upstream: &str) -> Result<String, String> {
 pub(crate) fn resolve_registered_remote_upstream(
     root: &Path,
     project: &ProjectView,
-    upstream: &str,
-) -> Result<String, String> {
-    if project.clone_url.is_none() || upstream.contains('/') {
-        return Ok(upstream.to_string());
+    upstream: &UpstreamRef,
+) -> Result<UpstreamRef, String> {
+    if project.clone_url.is_none() || upstream.is_local() {
+        return Ok(upstream.clone());
     }
-    let cfg = crate::config::resolve_forge(root);
-    let remote = crate::forge::resolve_parent_remote_name(
-        root,
-        upstream,
-        &cfg,
-        project.clone_url.as_deref(),
-        None,
-    );
-    if git(root, &["remote", "get-url", &remote]).is_err() {
-        return Ok(upstream.to_string());
+    let remote = &upstream.remote;
+    if git(root, &["remote", "get-url", remote]).is_err() {
+        return Ok(upstream.clone());
     }
-    let refspec = format!("+refs/heads/{upstream}:refs/remotes/{remote}/{upstream}");
-    git(root, &["fetch", "--no-write-fetch-head", &remote, &refspec]).map_err(|e| {
+    let branch = &upstream.branch;
+    let refspec = format!("+refs/heads/{branch}:refs/remotes/{remote}/{branch}");
+    git(root, &["fetch", "--no-write-fetch-head", remote, &refspec]).map_err(|e| {
         format!(
-            "project \"{}\" is registered with a remote, but \"?upstream={upstream}\" could not \
-             be fetched from \"{remote}\": {e}",
+            "project \"{}\" is registered with a remote, but upstream remote \"{remote}\" branch \"{branch}\" could not              be fetched: {e}",
             project.name
         )
     })?;
-    Ok(format!("{remote}/{upstream}"))
+    Ok(upstream.clone())
 }
 
 /// The repository's default branch for `root`: the branch the `origin`
@@ -800,40 +782,24 @@ pub(crate) fn resolve_registered_remote_upstream(
 /// never cloned or fetched with its HEAD resolved) — this FAILS with a clear
 /// error rather than guessing `main`/`master`, consistent with RAL-100's
 /// no-guessing intent.
-fn default_branch(root: &Path) -> Result<String, String> {
-    let mut candidates = vec!["origin".to_string()];
-    if let Ok(remotes) = git(root, &["remote"]) {
-        let mut rest: Vec<String> = remotes
-            .lines()
-            .map(str::trim)
-            .filter(|r| !r.is_empty() && *r != "origin")
-            .map(str::to_string)
-            .collect();
-        rest.sort();
-        candidates.extend(rest);
+fn default_branch(root: &Path, remote: &str) -> Result<String, String> {
+    if remote == ralphus_core::schema::LOCAL_UPSTREAM_REMOTE {
+        return Err(
+            "\"upstream_branch=<<default>>\" needs a named remote to ask for its default branch; \"upstream_remote=.\" is a local base"
+                .to_string(),
+        );
     }
-    for remote in &candidates {
-        let symref = format!("refs/remotes/{remote}/HEAD");
-        let Ok(out) = git(root, &["symbolic-ref", &symref]) else {
-            continue;
-        };
-        let refname = out.trim();
-        // `refs/remotes/<remote>/<branch>` → the bare `<branch>`.
-        let branch = refname
-            .strip_prefix("refs/remotes/")
-            .and_then(|r| r.split_once('/'))
-            .map(|(_, b)| b)
-            .unwrap_or(refname);
-        if !branch.is_empty() {
-            return Ok(branch.to_string());
+    let prefix = format!("refs/remotes/{remote}/");
+    let symref = format!("{prefix}HEAD");
+    if let Ok(out) = git(root, &["symbolic-ref", &symref]) {
+        if let Some(branch) = out.trim().strip_prefix(prefix.as_str()) {
+            if !branch.is_empty() {
+                return Ok(branch.to_string());
+            }
         }
     }
     Err(format!(
-        "\"?upstream=<<default>>\" could not resolve a default branch in {}: no remote has a \
-         configured symbolic HEAD (no remote's `refs/remotes/<remote>/HEAD` is set), so there \
-         is no default branch for \"<<default>>\" to resolve to. Fix: run \
-         `git remote set-head origin --auto` in this repository, or use a literal branch name \
-         in the upstream field instead",
+        "\"upstream_branch=<<default>>\" could not resolve a default branch for remote \"{remote}\" in {}: `refs/remotes/{remote}/HEAD` is not set. Fix: run `git remote set-head {remote} --auto` in this repository, or use a literal branch name in upstream_branch instead",
         root.display()
     ))
 }
@@ -868,21 +834,7 @@ fn branch_materialization(root: &Path, branch: &str) -> Result<BranchMaterializa
     if git(root, &["rev-parse", "--verify", &branch_ref]).is_ok() {
         return Ok(BranchMaterialization::ExistingLocal);
     }
-    if branch.contains('/') {
-        let remote_ref = format!("refs/remotes/{branch}");
-        if git(root, &["rev-parse", "--verify", &remote_ref]).is_ok() {
-            return Ok(BranchMaterialization::NewFromRemote { remote_ref });
-        }
-    }
-    let warning = branch.contains('/').then(|| {
-        format!(
-            "placeholder branch \"{branch}\" looks like <remote>/<branch>, but \
-             refs/remotes/{branch} does not exist in {}. Reusing or creating a \
-             literal local branch named \"{branch}\" instead.",
-            root.display()
-        )
-    });
-    Ok(BranchMaterialization::NewFromHead { warning })
+    Ok(BranchMaterialization::NewFromHead)
 }
 
 /// Set `branch`'s (checked out in worktree `wt`) upstream to the explicit
@@ -998,56 +950,41 @@ pub(crate) fn git_config_write_retrying(cwd: &Path, args: &[&str]) -> Result<Str
     retry_transient_config_write(20, std::time::Duration::from_millis(25), || git(cwd, args))
 }
 
-fn set_explicit_upstream(wt: &Path, branch: &str, upstream: &str) -> Result<(), String> {
-    let _guard = WORKTREE_CONFIG_LOCK.lock();
+fn set_explicit_upstream(wt: &Path, branch: &str, upstream: &UpstreamRef) -> Result<(), String> {
     // RAL-258: the reserved `<<...>>` sentinels are never literal branch names.
     // They must be expanded by `resolve_upstream` before materialization; a
     // literal `<<...>>` here means resolution was skipped, not a real ref to
     // track (a branch named `<<default>>` would be meaningless and ambiguous).
-    if upstream.starts_with("<<") {
+    if upstream.branch.starts_with("<<") {
         return Err(format!(
-            "\"?upstream={upstream}\" is a reserved sentinel and must be resolved to a concrete \
-             branch (via resolve_upstream) before materializing a worktree, not treated as a \
-             literal branch name"
+            "upstream_branch {} is a reserved sentinel and must be resolved to a concrete branch (via resolve_upstream) before materializing a worktree, not treated as a literal branch name",
+            upstream.branch
         ));
     }
     let fail = |e: String| -> String {
         format!(
-            "could not set upstream to \"{upstream}\" for the worktree at {}: {e} -- the \
-             \"?upstream=\" value must already exist as a local branch or a remote-tracking ref \
-             (fetch the remote first if it names a \"<remote>/<branch>\" value)",
+            "could not set upstream to remote {:?} branch {:?} for the worktree at {}: {e} -- the branch must already exist as a local branch (remote \".\") or a remote-tracking ref (fetch the remote first)",
+            upstream.remote,
+            upstream.branch,
             wt.display()
         )
     };
-    let qualified = qualify_ambiguous_ref(wt, upstream);
-    if let Some(remote_ref) = qualified.strip_prefix("refs/remotes/") {
-        let (remote, remote_branch) = remote_ref
-            .split_once('/')
-            .ok_or_else(|| fail(format!("malformed remote-tracking ref \"{remote_ref}\"")))?;
-        git_config_write_retrying(wt, &["config", &format!("branch.{branch}.remote"), remote])
-            .map_err(fail)?;
-        git_config_write_retrying(
-            wt,
-            &[
-                "config",
-                &format!("branch.{branch}.merge"),
-                &format!("refs/heads/{remote_branch}"),
-            ],
-        )
-        .map_err(fail)?;
-        return Ok(());
-    }
-    if qualified.starts_with("refs/heads/") {
-        git_config_write_retrying(wt, &["config", &format!("branch.{branch}.remote"), "."])
-            .map_err(fail)?;
-        git_config_write_retrying(
-            wt,
-            &["config", &format!("branch.{branch}.merge"), &qualified],
-        )
-        .map_err(fail)?;
-        return Ok(());
-    }
-    Err(fail("no matching ref found".to_string()))
+    git(wt, &["rev-parse", "--verify", &upstream.tracking_ref()]).map_err(fail)?;
+    git_config_write_retrying(
+        wt,
+        &["config", &format!("branch.{branch}.remote"), &upstream.remote],
+    )
+    .map_err(fail)?;
+    git_config_write_retrying(
+        wt,
+        &[
+            "config",
+            &format!("branch.{branch}.merge"),
+            &format!("refs/heads/{}", upstream.branch),
+        ],
+    )
+    .map_err(fail)?;
+    Ok(())
 }
 
 /// Freeze the no-new-commits guard's durable baseline marker
@@ -1063,22 +1000,14 @@ fn set_explicit_upstream(wt: &Path, branch: &str, upstream: &str) -> Result<(), 
 /// best-effort, fall-back-to-live-`@{upstream}` contract in
 /// [`crate::reviews::workspace_baseline_ref`].
 fn freeze_commit_baseline(wt: &Path, branch: &str) {
-    let Ok(upstream) = git(
-        wt,
-        &[
-            "rev-parse",
-            "--abbrev-ref",
-            "--symbolic-full-name",
-            "@{upstream}",
-        ],
-    ) else {
+    let Ok(upstream) = crate::reviews::worktree_upstream(wt) else {
         return;
     };
     // `set_worktree_commit_baseline` writes `ralphus.<branch>.baseline` to
     // the same shared `.git/config` `set_explicit_upstream` writes to; it takes
     // `WORKTREE_CONFIG_LOCK` itself (see that static's doc comment), so this
     // caller must not already hold it.
-    if let Err(e) = crate::reviews::set_worktree_commit_baseline(wt, upstream.trim()) {
+    if let Err(e) = crate::reviews::set_worktree_commit_baseline(wt, upstream) {
         // ralphus[ignore-rlog-pair]: worktree helper has no Store; caller records review workflow outcomes
         crate::rlog!(
             WARNING,
@@ -1088,11 +1017,11 @@ fn freeze_commit_baseline(wt: &Path, branch: &str) {
     }
 }
 
-/// If `wt`'s checked-out branch tracks a remote (its `@{upstream}` resolves
-/// to a ref under `refs/remotes/...`), fetch that remote branch and rebase
+/// If `wt`'s checked-out branch tracks a remote (its tracking config names a
+/// remote other than `.`), fetch that remote branch and rebase
 /// `wt`'s local branch onto the freshly fetched commit — so a worktree
-/// materialized from a `ralphus:new-worktree/<remote>/<branch>` placeholder
-/// picks up new pushes to that remote branch on every resolution, rather than
+/// materialized from a `ralphus:new-worktree/<branch>?upstream_remote=...`
+/// placeholder picks up new pushes to that remote branch on every resolution, rather than
 /// freezing forever at whatever the remote-tracking ref held at first
 /// materialization (the [`ensure_worktree`] reuse path never touched it
 /// before this).
@@ -1109,16 +1038,16 @@ fn freeze_commit_baseline(wt: &Path, branch: &str) {
 /// left exactly as it was before this call; resolving that is left to a
 /// human, not attempted here.
 fn resync_remote_tracking_branch(wt: &Path) -> Result<(), String> {
-    let Ok(upstream) = git(wt, &["rev-parse", "--symbolic-full-name", "@{upstream}"]) else {
+    let Ok(tracked) = crate::reviews::worktree_upstream(wt) else {
         return Ok(());
     };
-    let upstream = upstream.trim();
-    let Some(rest) = upstream.strip_prefix("refs/remotes/") else {
+    if tracked.is_local() {
         return Ok(());
-    };
-    let Some((remote, remote_branch)) = rest.split_once('/') else {
-        return Ok(());
-    };
+    }
+    let remote = tracked.remote.as_str();
+    let remote_branch = tracked.branch.as_str();
+    let upstream = tracked.tracking_ref();
+    let upstream = upstream.as_str();
     let refspec = format!("{remote_branch}:{upstream}");
     git(wt, &["fetch", "--no-write-fetch-head", remote, &refspec]).map_err(|e| {
         format!(
@@ -1177,24 +1106,21 @@ fn resync_remote_tracking_branch(wt: &Path) -> Result<(), String> {
 /// mirror them (including rejecting path-traversal shapes like `../foo`
 /// before any path join or filesystem write happens).
 ///
-/// If no local branch by that literal name exists but a remote-tracking ref
-/// `refs/remotes/<branch>` does, the new local branch is created from that
-/// remote-tracking ref — a real, attached branch checkout (never a detached
-/// HEAD), so ordinary git operations (commit, diff, `@{upstream}`) behave
-/// normally inside it. Otherwise the branch name is treated literally —
-/// slashes included — and a new local branch is forked from the resolved
-/// `upstream` ref itself, **never from `root`'s current `HEAD`**: whatever
-/// the shared project checkout happens to have checked out at materialization
-/// time must never leak into a freshly created branch's history. When that
-/// literal name *looks* like `<remote>/<branch>` but no matching
-/// remote-tracking ref exists, a warning is emitted so the fallback is
-/// explicit rather than silently guessed. Either way, `upstream` -- not the
-/// branch's own name or `root`'s `HEAD` -- decides both what the branch
-/// actually starts from and what tracking gets configured; a review worktree
-/// tracking a remote keeps up with pushes to that branch over the life of the
-/// project via the resync described above.
-pub fn ensure_worktree(root: &Path, branch: &str, upstream: &str) -> Result<PathBuf, String> {
-    ensure_worktree_tracked(root, branch, upstream).map(|m| m.path)
+/// The branch name is always taken literally -- slashes included -- and a new
+/// local branch is forked from the resolved `upstream` ref itself, **never
+/// from `root`'s current `HEAD`**: whatever the shared project checkout
+/// happens to have checked out at materialization time must never leak into a
+/// freshly created branch's history. `upstream` -- not the branch's own name
+/// or `root`'s `HEAD` -- decides both what the branch actually starts from and
+/// what tracking gets configured; a review worktree tracking a remote keeps up
+/// with pushes to that branch over the life of the project via the resync
+/// described above.
+pub fn ensure_worktree(
+    root: &Path,
+    branch: &str,
+    upstream: impl Into<UpstreamRef>,
+) -> Result<PathBuf, String> {
+    ensure_worktree_tracked(root, branch, &upstream.into()).map(|m| m.path)
 }
 
 /// Install the RAL-445/RAL-531 `prepare-commit-msg` hook for a project
@@ -1476,7 +1402,7 @@ fn plan_worktree(
 fn execute_worktree_plan(
     root: &Path,
     branch: &str,
-    upstream: &str,
+    upstream: &UpstreamRef,
     plan: &WorktreePlan,
 ) -> Result<PathBuf, String> {
     sync_commit_metadata_hook_best_effort(&crate::workspace::Workspace::local(root), root);
@@ -1496,34 +1422,7 @@ fn execute_worktree_plan(
             preflight_worktree_budget(root, &plan.wt, branch, path_budget_limit())?;
             git(root, &["worktree", "add", &wt_str, branch])?;
         }
-        BranchMaterialization::NewFromRemote { remote_ref } => {
-            preflight_worktree_budget(root, &plan.wt, remote_ref, path_budget_limit())?;
-            // `--no-track`, not `--track`: `set_explicit_upstream` below sets
-            // the real tracking config anyway (under `WORKTREE_CONFIG_LOCK`),
-            // and git's own implicit auto-tracking setup for a new branch
-            // writes to the SAME shared `.git/config` this worktree's
-            // siblings may be concurrently touching -- unlike the explicit
-            // call, this implicit write has no lock protecting it, and races
-            // on git's own `.git/config.lock` under real concurrency (see
-            // `WORKTREE_CONFIG_LOCK`'s doc comment).
-            git(
-                root,
-                &[
-                    "worktree",
-                    "add",
-                    "--no-track",
-                    "-b",
-                    branch,
-                    &wt_str,
-                    remote_ref,
-                ],
-            )?;
-        }
-        BranchMaterialization::NewFromHead { warning } => {
-            if let Some(warning) = warning {
-                // ralphus[ignore-rlog-pair]: this low-level helper has no Store; its Store-owning caller records the structured workflow outcome
-                crate::rlog!(WARNING, "ralphus [scheduler] {warning}");
-            }
+        BranchMaterialization::NewFromHead => {
             // Branch explicitly from the resolved `upstream` ref -- never
             // implicit `HEAD` -- so this new branch's content always reflects
             // what the submitter named, not whatever the shared `root`
@@ -1536,10 +1435,9 @@ fn execute_worktree_plan(
             // git resolves an exact ref instead of guessing across
             // namespaces and failing with "ambiguous" (see
             // `qualify_ambiguous_ref`).
-            let qualified_upstream = qualify_ambiguous_ref(root, upstream);
+            let qualified_upstream = qualify_upstream_ref(root, upstream);
             preflight_worktree_budget(root, &plan.wt, &qualified_upstream, path_budget_limit())?;
-            // `--no-track`: see the `NewFromRemote` arm above -- `upstream`
-            // being a plain local branch still triggers git's own implicit,
+            // `--no-track`: `upstream` being a plain local branch still triggers git's own implicit,
             // unlocked auto-tracking setup by default (`branch.autoSetupMerge`),
             // which races the same way.
             git(
@@ -1573,7 +1471,7 @@ fn execute_worktree_plan(
 pub(crate) fn ensure_worktree_tracked(
     root: &Path,
     branch: &str,
-    upstream: &str,
+    upstream: &UpstreamRef,
 ) -> Result<Materialized, String> {
     let key = (root.to_path_buf(), branch.to_ascii_lowercase());
     let (lock, cv) = &*WORKTREE_CREATIONS;
@@ -1625,7 +1523,7 @@ pub(crate) fn ensure_worktree_tracked(
 fn materialize_exclusively(
     root: &Path,
     branch: &str,
-    upstream: &str,
+    upstream: &UpstreamRef,
 ) -> Result<Materialized, String> {
     let mut repaired = None;
     let (plan, marker_short) = {
@@ -1640,7 +1538,7 @@ fn materialize_exclusively(
             .to_string();
         let marker = creation_marker_path(root, &short);
         let owned =
-            read_creation_marker(&marker).is_some_and(|(b, _)| b.eq_ignore_ascii_case(branch));
+            read_creation_marker(root, &marker).is_some_and(|(b, _)| b.eq_ignore_ascii_case(branch));
         if marker.exists() && !owned {
             return Err(format!(
                 "worktree slot {} is claimed by another creation (marker {}); refusing to touch it",
@@ -1726,7 +1624,7 @@ fn placeholder_context_for_cell<'a>(
     squad_id: &'a str,
     cell: &'a CellRow,
     targets: &'a std::collections::BTreeMap<String, crate::machine_targets::MachineTarget>,
-    prefetched_upstreams: &'a HashMap<(String, String), String>,
+    prefetched_upstreams: &'a HashMap<(String, UpstreamRef), UpstreamRef>,
     on_disk_worktrees: &'a RefCell<HashMap<PathBuf, HashMap<String, String>>>,
 ) -> PlaceholderContext<'a> {
     PlaceholderContext {
@@ -2352,7 +2250,7 @@ fn provision_remote_with_targets(
     machine: &str,
     project: &crate::store::ProjectView,
     branch: &str,
-    upstream: &str,
+    upstream: &UpstreamRef,
     cell: &CellRow,
     squad_id: &str,
     targets: &std::collections::BTreeMap<String, crate::machine_targets::MachineTarget>,
@@ -2405,7 +2303,8 @@ fn provision_remote_with_targets(
             kind: project.vcs.clone(),
             url,
             branch: Some(branch.to_string()),
-            upstream: Some(upstream.to_string()),
+            upstream_remote: Some(upstream.remote.clone()),
+            upstream_branch: Some(upstream.branch.clone()),
         },
         squad_id: squad_id.to_string(),
         cell_id: cell.cell_id.clone(),
@@ -2469,7 +2368,8 @@ fn provision_remote_with_targets(
                         serde_json::json!({
                             "machine": machine,
                             "branch": branch,
-                            "upstream": upstream,
+                            "upstream_remote": upstream.remote,
+                            "upstream_branch": upstream.branch,
                             "error": e,
                         }),
                     );
@@ -2492,33 +2392,40 @@ fn provision_remote_with_targets(
 fn pin_remote_upstream_and_baseline(
     workspace: &crate::workspace::Workspace,
     branch: &str,
-    upstream: &str,
+    upstream: &UpstreamRef,
 ) -> Result<(), String> {
-    let upstream = upstream.trim();
-    let candidates = [
-        upstream.to_string(),
-        format!("refs/remotes/origin/{upstream}"),
-        format!("refs/remotes/{upstream}"),
-        format!("refs/heads/{upstream}"),
-    ];
+    // The provisioned workspace is a fresh clone whose only remote is
+    // `origin`, whatever the daemon-local remote is called, so a remote base
+    // is looked up there; a local base is looked up as a local branch.
+    let candidates = if upstream.is_local() {
+        vec![upstream.tracking_ref()]
+    } else {
+        vec![
+            format!("refs/remotes/origin/{}", upstream.branch),
+            upstream.tracking_ref(),
+        ]
+    };
     let qualified = candidates
         .iter()
-        .filter(|c| c.starts_with("refs/"))
         .find(|c| {
             workspace
                 .git(&["rev-parse", "--verify", "--quiet", c])
                 .is_ok()
         })
         .cloned()
-        .ok_or_else(|| format!("upstream \"{upstream}\" resolves to no ref in the workspace"))?;
-    let (remote, merge) = match qualified.strip_prefix("refs/remotes/") {
-        Some(remote_ref) => {
-            let (remote, remote_branch) = remote_ref
-                .split_once('/')
-                .ok_or_else(|| format!("malformed remote-tracking ref \"{remote_ref}\""))?;
-            (remote.to_string(), format!("refs/heads/{remote_branch}"))
-        }
-        None => (".".to_string(), qualified.clone()),
+        .ok_or_else(|| {
+            format!(
+                "upstream remote \"{}\" branch \"{}\" resolves to no ref in the workspace",
+                upstream.remote, upstream.branch
+            )
+        })?;
+    let (remote, merge) = if qualified.starts_with("refs/remotes/") {
+        (
+            "origin".to_string(),
+            format!("refs/heads/{}", upstream.branch),
+        )
+    } else {
+        (".".to_string(), qualified.clone())
     };
     workspace.git(&["config", &format!("branch.{branch}.remote"), &remote])?;
     workspace.git(&["config", &format!("branch.{branch}.merge"), &merge])?;
@@ -2666,7 +2573,7 @@ pub fn resolve_placeholders_with_prefetch(
     squad_id: &str,
     cells: &mut [CellRow],
     tasks: &[TaskRow],
-    prefetched_upstreams: &HashMap<(String, String), String>,
+    prefetched_upstreams: &HashMap<(String, UpstreamRef), UpstreamRef>,
     parent: &Context,
 ) -> Result<(), String> {
     resolve_placeholders_with_full_prefetch(
@@ -2700,7 +2607,7 @@ pub fn resolve_placeholders_with_full_prefetch(
     squad_id: &str,
     cells: &mut [CellRow],
     tasks: &[TaskRow],
-    prefetched_upstreams: &HashMap<(String, String), String>,
+    prefetched_upstreams: &HashMap<(String, UpstreamRef), UpstreamRef>,
     prefetched_worktrees: &HashMap<String, String>,
     parent: &Context,
 ) -> Result<(), String> {
@@ -2771,7 +2678,7 @@ pub fn collect_remote_upstream_prefetch_targets(
     store: &Store,
     cells: &[CellRow],
     tasks: &[TaskRow],
-) -> Vec<(ProjectView, String)> {
+) -> Vec<(ProjectView, UpstreamRef)> {
     let task_projects: HashMap<i64, Option<&str>> = tasks
         .iter()
         .map(|t| (t.idx, t.project.as_deref()))
@@ -2797,13 +2704,16 @@ pub fn collect_remote_upstream_prefetch_targets(
             else {
                 continue;
             };
-            if upstream.starts_with("<<") || upstream.contains('/') {
+            if upstream.branch.starts_with("<<")
+                || upstream.remote == ralphus_core::schema::LOCAL_UPSTREAM_REMOTE
+            {
                 continue;
             }
             let Some(project_name) = task_projects.get(&cell.task_idx).copied().flatten() else {
                 continue;
             };
-            if !seen.insert((project_name.to_string(), upstream.to_string())) {
+            let upstream = UpstreamRef::new(upstream.remote, upstream.branch);
+            if !seen.insert((project_name.to_string(), upstream.clone())) {
                 continue;
             }
             let Ok(Some(project)) = store.resolve_project(project_name) else {
@@ -2812,7 +2722,7 @@ pub fn collect_remote_upstream_prefetch_targets(
             if project.clone_url.is_none() {
                 continue;
             }
-            out.push((project, upstream.to_string()));
+            out.push((project, upstream));
         }
     }
     out
@@ -2827,7 +2737,7 @@ pub fn collect_remote_upstream_prefetch_targets(
 fn claim_worktree_slot(
     root: &Path,
     branch: &str,
-    upstream: &str,
+    upstream: &UpstreamRef,
     snapshot: &mut HashMap<String, String>,
 ) -> Result<WorktreePlan, String> {
     for _ in 0..16 {
@@ -2861,7 +2771,7 @@ fn claim_worktree_slot(
 pub(crate) struct PendingWorktree {
     pub(crate) root: PathBuf,
     pub(crate) branch: String,
-    pub(crate) upstream: String,
+    pub(crate) upstream: UpstreamRef,
     pub(crate) wt: PathBuf,
 }
 
@@ -2883,7 +2793,7 @@ pub(crate) fn pending_worktree_at(cwd: &Path) -> Option<PendingWorktree> {
         return None;
     }
     let root = git_dir.parent()?.to_path_buf();
-    let (branch, upstream) = read_creation_marker(&creation_marker_path(&root, short))?;
+    let (branch, upstream) = read_creation_marker(&root, &creation_marker_path(&root, short))?;
     Some(PendingWorktree {
         root,
         branch,
@@ -3087,7 +2997,7 @@ pub(crate) fn plan_local_worktree_jobs(
     squad_id: &str,
     cells: &[CellRow],
     tasks: &[TaskRow],
-    prefetched_upstreams: &HashMap<(String, String), String>,
+    prefetched_upstreams: &HashMap<(String, UpstreamRef), UpstreamRef>,
 ) -> Vec<LocalWorktreeJob> {
     let task_projects: HashMap<i64, Option<&str>> = tasks
         .iter()
@@ -3225,7 +3135,7 @@ fn resolve_placeholders_inner(
     cells: &mut [CellRow],
     tasks: &[TaskRow],
     targets: &std::collections::BTreeMap<String, crate::machine_targets::MachineTarget>,
-    prefetched_upstreams: &HashMap<(String, String), String>,
+    prefetched_upstreams: &HashMap<(String, UpstreamRef), UpstreamRef>,
     prefetched_worktrees: &HashMap<String, String>,
 ) -> Result<usize, String> {
     let task_projects: HashMap<i64, Option<&str>> = tasks
@@ -6106,7 +6016,7 @@ mod tests {
             "a different branch must not take an owned slot"
         );
         let (branch, upstream) =
-            read_creation_marker(&creation_marker_path(&repo, "slot")).unwrap();
+            read_creation_marker(&repo, &creation_marker_path(&repo, "slot")).unwrap();
         assert_eq!(
             (branch.as_str(), upstream.as_deref()),
             ("feat-x", Some("main"))
@@ -6136,7 +6046,7 @@ mod tests {
                 .collect();
             handles.into_iter().map(|h| h.join().unwrap()).collect()
         });
-        let (winner, _) = read_creation_marker(&creation_marker_path(&repo, "slot")).unwrap();
+        let (winner, _) = read_creation_marker(&repo, &creation_marker_path(&repo, "slot")).unwrap();
         for (branch, ok) in wins {
             assert_eq!(
                 ok,
@@ -6335,7 +6245,7 @@ mod tests {
         is_proof_scope: bool,
         proof_id: Option<&'a str>,
         targets: &'a std::collections::BTreeMap<String, crate::machine_targets::MachineTarget>,
-        prefetched_upstreams: &'a HashMap<(String, String), String>,
+        prefetched_upstreams: &'a HashMap<(String, UpstreamRef), UpstreamRef>,
         on_disk_worktrees: &'a RefCell<HashMap<PathBuf, HashMap<String, String>>>,
     ) -> PlaceholderContext<'a> {
         PlaceholderContext {

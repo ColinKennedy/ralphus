@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use rusqlite::{OptionalExtension, params};
+use ralphus_core::schema::UpstreamRef;
 
 use crate::cancel::Cancellations;
 use crate::config::ArkConfig;
@@ -153,22 +154,17 @@ fn remote_recovery_info(worktree: &Path, project_root: &Path) -> Result<Recovery
         return Err("worktree has uncommitted changes".to_string());
     }
     let head = git(worktree, &["rev-parse", "HEAD"])?;
-    let upstream = git(
-        worktree,
-        &["rev-parse", "--symbolic-full-name", "@{upstream}"],
-    )?;
-    let Some(remote_tail) = upstream.strip_prefix("refs/remotes/") else {
+    let upstream = crate::reviews::worktree_upstream(worktree)?;
+    if upstream.is_local() {
         return Err(format!("upstream {upstream} is not a remote-tracking ref"));
-    };
-    let Some((remote, branch)) = remote_tail.split_once('/') else {
-        return Err(format!("cannot parse remote upstream {upstream}"));
-    };
+    }
+    let UpstreamRef { remote, branch } = upstream;
     let remote_output = git(
         project_root,
         &[
             "ls-remote",
             "--exit-code",
-            remote,
+            &remote,
             &format!("refs/heads/{branch}"),
         ],
     )?;
