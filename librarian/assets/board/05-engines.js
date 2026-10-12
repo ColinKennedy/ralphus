@@ -258,7 +258,10 @@
       CLICK_HANDLERS.openReviewBranchMenu = (e, ds) => openReviewBranchMenu(e, ds.guardianId || "", ds.branchId || "", ds.canMove === "1");
       CLICK_HANDLERS.inspectBranchFromMenu = (e, ds) => inspectBranchFromMenu(ds.branchId || "", ds.tab || "overview");
       CLICK_HANDLERS.scopeReviewDockToBranch = (e, ds) => scopeReviewDockToBranch(ds.guardianId || "", ds.branchId || "");
-      CLICK_HANDLERS.runAllActionHints = (e, ds) => runAllActionHints(ds.guardianId || "");
+      CLICK_HANDLERS.stepBranchRun = (e, ds) => stepBranchRun(ds.branchId || "", Number(ds.dir));
+      CLICK_HANDLERS.jumpToLatestRun = (e, ds) => jumpToLatestRun(ds.branchId || "");
+      CLICK_HANDLERS.inspectorSetLiveSub = (e, ds) => inspectorSetLiveSub(ds.branchId || "", ds.sub || "terminal");
+      CLICK_HANDLERS.runAllActionHints =(e, ds) => runAllActionHints(ds.guardianId || "");
       CLICK_HANDLERS.rebuildPreparationNow = (e, ds) => rebuildPreparationNow(ds.guardianId || "");
       CLICK_HANDLERS.selectReviewCommandRow = (e, ds) => selectReviewCommandRow(ds.guardianId || "", ds.key || "", ds.cmd || "");
       CLICK_HANDLERS.scopeReviewDockToCommand = (e, ds) => scopeReviewDockToCommand(ds.guardianId || "", ds.key || "", ds.cmd || "");
