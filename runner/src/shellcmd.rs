@@ -15,28 +15,12 @@
 use std::path::Path;
 
 use crate::hostos::is_windows;
+use ralphus_core::shellcmd::{shell_kind_from_exe, shell_prefix};
 
 pub const SHELL_AUTO: &str = "auto";
 
 const REAL_SHELLS: &[&str] = &["powershell", "pwsh", "cmd", "bash", "sh", "zsh", "fish"];
 const ANCESTRY_MAX_DEPTH: u32 = 12;
-
-/// The argv prefix that makes each shell run one command line as a single
-/// argument. PowerShell deliberately does NOT get `-NoProfile` -- the whole
-/// point is that `--command` behaves like the same text typed at the user's
-/// own prompt, profile included.
-fn shell_prefix(shell: &str) -> &'static [&'static str] {
-    match shell {
-        "powershell" => &["powershell", "-NoLogo", "-Command"],
-        "pwsh" => &["pwsh", "-NoLogo", "-Command"],
-        "cmd" => &["cmd.exe", "/C"],
-        "bash" => &["bash", "-c"],
-        "sh" => &["sh", "-c"],
-        "zsh" => &["zsh", "-c"],
-        "fish" => &["fish", "-c"],
-        _ => &["sh", "-c"],
-    }
-}
 
 const WINDOWS_DIRECT_EXEC_SUFFIXES: &[&str] = &[".exe", ".com", ".bat", ".cmd"];
 const DEFAULT_PATHEXT: &str = ".COM;.EXE;.BAT;.CMD";
@@ -49,20 +33,6 @@ fn windows_suffixes(pathext: &str) -> Vec<String> {
         .collect();
     suffixes.push(String::new());
     suffixes
-}
-
-fn shell_kind_from_exe(name: &str) -> Option<&'static str> {
-    let cleaned = name.trim().trim_start_matches('-').to_lowercase();
-    match cleaned.as_str() {
-        "powershell" | "powershell.exe" => Some("powershell"),
-        "pwsh" | "pwsh.exe" => Some("pwsh"),
-        "cmd" | "cmd.exe" => Some("cmd"),
-        "bash" | "bash.exe" => Some("bash"),
-        "sh" | "sh.exe" | "dash" => Some("sh"),
-        "zsh" | "zsh.exe" => Some("zsh"),
-        "fish" | "fish.exe" => Some("fish"),
-        _ => None,
-    }
 }
 
 /// Normalizes a `--shell`/`$RALPHUS_SHELL` value to a concrete shell name.

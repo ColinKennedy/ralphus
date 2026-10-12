@@ -41,6 +41,9 @@ struct RunRequest {
     args: Vec<String>,
     #[serde(default)]
     env: std::collections::BTreeMap<String, String>,
+    /// Shell executable for an authored command line; `sh` when absent.
+    #[serde(default)]
+    shell: Option<String>,
 }
 
 /// Marker this module's `run` script always appends to its combined
@@ -233,8 +236,15 @@ pub(crate) fn run_script(
             .map(|(key, value)| shell_quote_single(&format!("{key}={value}")))
             .collect::<Vec<_>>()
             .join(" ");
+        let shell = req.shell.as_deref().unwrap_or("sh");
+        let flags = if req.shell.is_some() {
+            ralphus_core::shellcmd::shell_command_flags(shell).join(" ")
+        } else {
+            "-c".to_string()
+        };
         format!(
-            "env {assignments} sh -c {}",
+            "env {assignments} {} {flags} {}",
+            shell_quote_single(shell),
             shell_quote_single(&req.args[0])
         )
     };
@@ -303,6 +313,24 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.contains("git"), "{err}");
+    }
+
+    #[test]
+    fn an_authored_command_runs_through_the_selected_shell() {
+        let cfg = EffectiveConfig {
+            remote_base: "/srv/ralphus".to_string(),
+            ..config()
+        };
+        let cwd = "/srv/ralphus/w";
+        let payload = format!(r#"{{"cwd":"{cwd}","program":"","args":["a ; b"],"shell":"pwsh"}}"#);
+        let script = run_script(&payload, &cfg, "M", false).unwrap();
+        assert!(
+            script.contains("'pwsh' -NoLogo -Command 'a ; b'"),
+            "{script}"
+        );
+        let payload = format!(r#"{{"cwd":"{cwd}","program":"","args":["a ; b"]}}"#);
+        let script = run_script(&payload, &cfg, "M", false).unwrap();
+        assert!(script.contains("'sh' -c 'a ; b'"), "{script}");
     }
 
     #[test]

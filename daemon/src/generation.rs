@@ -299,6 +299,7 @@ pub fn run_generation(
         cwd: req.cwd.clone(),
         prompt: Some(prompt),
         command: None,
+        shell: None,
         agent: req.agent.clone(),
         executable: None,
         model: req.model.clone(),

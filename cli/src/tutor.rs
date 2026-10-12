@@ -208,6 +208,12 @@ Tip: validate before submitting -- `ralphus validate file.toml`
                                         "cargo build --release", not "build the
                                         project". Mutually exclusive with `prompt`. See
                                         `mode` below for what happens on failure.
+ shell                   string         Only valid alongside `command`. The shell
+                                        executable that runs it (`pwsh`, `bash`,
+                                        `cmd`, ... or a path). Unset: the
+                                        `[command] shell` config default, else `cmd`
+                                        on Windows and `sh` elsewhere. A shell that
+                                        cannot be started fails the cell.
  mode                    string         Only meaningful alongside `command`. One of
                                         "remediating" (DEFAULT -- also what an unset
                                         `mode` means) or "raw" (DISCOURAGED opt-out).
@@ -793,6 +799,11 @@ may embed <<ralphus:new-worktree/BRANCH?upstream=UPSTREAM
                                    "cargo build --release", not "make sure it
                                    builds". Exit 0 = PASS. See `mode` below for
                                    what happens on a nonzero exit.
+ shell              string         Only valid alongside `command`. The shell
+                                   executable that runs it (`pwsh`, `bash`,
+                                   `cmd`, ... or a path). Unset: the
+                                   `[command] shell` config default, else `cmd`
+                                   on Windows and `sh` elsewhere.
  mode               string         Only meaningful alongside `command`. One of
                                    "remediating" (DEFAULT -- also what an unset
                                    `mode` means) or "raw" (DISCOURAGED opt-out).

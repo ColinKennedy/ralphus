@@ -35,6 +35,89 @@ fn is_quote_wrapped(value: &str) -> bool {
             || (bytes[0] == b'\'' && bytes[bytes.len() - 1] == b'\''))
 }
 
+/// The argv prefix that makes each known shell run one command line as a
+/// single argument. PowerShell deliberately does NOT get `-NoProfile` -- the
+/// whole point is that the command behaves like the same text typed at the
+/// user's own prompt, profile included. An unrecognized `shell` falls back to
+/// `sh -c`.
+#[must_use]
+pub fn shell_prefix(shell: &str) -> &'static [&'static str] {
+    match shell {
+        "powershell" => &["powershell", "-NoLogo", "-Command"],
+        "pwsh" => &["pwsh", "-NoLogo", "-Command"],
+        "cmd" => &["cmd.exe", "/C"],
+        "bash" => &["bash", "-c"],
+        "sh" => &["sh", "-c"],
+        "zsh" => &["zsh", "-c"],
+        "fish" => &["fish", "-c"],
+        _ => &["sh", "-c"],
+    }
+}
+
+/// The canonical shell name for an executable name or path (`pwsh.exe`,
+/// `/usr/bin/bash`, a login shell's `-bash`), or `None`
+/// when the basename is not a known shell.
+#[must_use]
+pub fn shell_kind_from_exe(name: &str) -> Option<&'static str> {
+    let trimmed = name.trim();
+    let base = trimmed.rsplit(['/', '\\']).next().unwrap_or(trimmed);
+    let cleaned = base.trim_start_matches('-').to_lowercase();
+    match cleaned.as_str() {
+        "powershell" | "powershell.exe" => Some("powershell"),
+        "pwsh" | "pwsh.exe" => Some("pwsh"),
+        "cmd" | "cmd.exe" => Some("cmd"),
+        "bash" | "bash.exe" => Some("bash"),
+        "sh" | "sh.exe" | "dash" => Some("sh"),
+        "zsh" | "zsh.exe" => Some("zsh"),
+        "fish" | "fish.exe" => Some("fish"),
+        _ => None,
+    }
+}
+
+/// The flags that make the shell executable `shell` (a bare name or a path)
+/// run one command line passed as the next argument. Chosen by the
+/// executable's basename; an unrecognized shell gets `-c`.
+#[must_use]
+pub fn shell_command_flags(shell: &str) -> &'static [&'static str] {
+    match shell_kind_from_exe(shell) {
+        Some(kind) => &shell_prefix(kind)[1..],
+        None => &["-c"],
+    }
+}
+
+/// Build the [`std::process::Command`] that runs `command_line` through the
+/// shell executable `shell`. The program is `shell` exactly as written (so a
+/// path works and a bare name resolves on `PATH`). `cmd` on Windows takes the
+/// line through `raw_arg` (cmd does not parse its command line by MSVCRT
+/// argv-quoting rules, so `arg` would double-escape embedded quotes) with `/S`
+/// so exactly the outer quote pair is stripped; every other shell receives
+/// normal argv.
+#[must_use]
+pub fn shell_command(shell: &str, command_line: &str) -> std::process::Command {
+    #[cfg(windows)]
+    if shell_kind_from_exe(shell) == Some("cmd") {
+        use std::os::windows::process::CommandExt as _;
+        let mut cmd = std::process::Command::new(shell);
+        cmd.raw_arg("/S")
+            .raw_arg("/C")
+            .raw_arg(format!("\"{command_line}\""));
+        return cmd;
+    }
+    let mut cmd = std::process::Command::new(shell);
+    cmd.args(shell_command_flags(shell)).arg(command_line);
+    cmd
+}
+
+/// The message for a command whose selected shell could not be started.
+#[must_use]
+pub fn shell_spawn_error(shell: &str, error: &std::io::Error) -> String {
+    if error.kind() == std::io::ErrorKind::NotFound {
+        format!("shell `{shell}` was not found (is it installed and on PATH?): {error}")
+    } else {
+        format!("could not start shell `{shell}`: {error}")
+    }
+}
+
 /// Quotes `value` as exactly one literal token for `shell`.
 #[must_use]
 pub fn quote_for_shell(shell: &str, value: &str) -> String {
@@ -150,5 +233,54 @@ mod tests {
         // RAL-468: a wrapper program (e.g. `rez-env`) that execs into the
         // real agent binary is a compound command, not a single launcher.
         assert!(is_compound_command("foo bar -- claude"));
+    }
+
+    #[test]
+    fn shell_kind_from_exe_uses_the_basename() {
+        assert_eq!(shell_kind_from_exe("/usr/bin/bash"), Some("bash"));
+        assert_eq!(
+            shell_kind_from_exe(r"C:\Program Files\PowerShell\7\pwsh.exe"),
+            Some("pwsh")
+        );
+        assert_eq!(shell_kind_from_exe("-zsh"), Some("zsh"));
+        assert_eq!(shell_kind_from_exe("nushell"), None);
+    }
+
+    #[test]
+    fn shell_command_flags_follow_the_known_shell_table() {
+        assert_eq!(shell_command_flags("pwsh"), ["-NoLogo", "-Command"]);
+        assert_eq!(
+            shell_command_flags("powershell.exe"),
+            ["-NoLogo", "-Command"]
+        );
+        assert_eq!(shell_command_flags("cmd"), ["/C"]);
+        assert_eq!(shell_command_flags("/bin/bash"), ["-c"]);
+        assert_eq!(shell_command_flags("sh"), ["-c"]);
+        assert_eq!(shell_command_flags("some-unknown-shell"), ["-c"]);
+    }
+
+    #[test]
+    fn shell_command_passes_the_line_as_one_argument() {
+        let cmd = shell_command("bash", "echo 'a b' ; echo c");
+        let args: Vec<_> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(cmd.get_program(), "bash");
+        assert_eq!(args, ["-c", "echo 'a b' ; echo c"]);
+        let cmd = shell_command("pwsh", "a ; b");
+        let args: Vec<_> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(args, ["-NoLogo", "-Command", "a ; b"]);
+    }
+
+    #[test]
+    fn shell_spawn_error_names_the_shell() {
+        let missing = std::io::Error::from(std::io::ErrorKind::NotFound);
+        assert!(shell_spawn_error("fish", &missing).contains("`fish` was not found"));
+        let denied = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        assert!(shell_spawn_error("fish", &denied).contains("could not start shell `fish`"));
     }
 }

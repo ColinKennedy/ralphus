@@ -541,6 +541,7 @@ mod tests {
             cwd: ".".to_string(),
             prompt: None,
             command: Some(command.to_string()),
+            shell: None,
             agent: "raw".to_string(),
             executable: None,
             model: None,

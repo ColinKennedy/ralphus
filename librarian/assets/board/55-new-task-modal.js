@@ -201,6 +201,8 @@
        * @property {NtReviewMode} reviewMode
        * @property {boolean} generateManualChecks
        * @property {boolean} generateAutoBuild
+       * @property {string} proofShell Shell executable written as `shell` on
+       *   every proof step; blank leaves the platform/config default.
        * @property {NtListItem[]} proofItems
        * @property {NtListItem[]} checkItems
        * @property {NtListItem[]} buildItems
@@ -227,6 +229,8 @@
        */
       /** @type {NtSimpleState} */
       let ntSimple;
+      /** Shells offered in the proof-shell combo box; any other value may be typed. */
+      const NT_SHELL_CHOICES = ["powershell", "pwsh", "cmd", "bash", "sh", "zsh", "fish"];
       /**
        * Builds a fresh Simple-tab form state.
        * @returns {NtSimpleState}
@@ -238,7 +242,7 @@
           prompt: "", fieldValues: {}, agent: "", model: "",
           project: "", upstreamBranch: "", proofs: true, reviewMode: "auto", generateManualChecks: true,
           generateAutoBuild: true,
-          proofItems: [], checkItems: [], buildItems: [], generating: false, confirmStep: false,
+          proofShell: "", proofItems: [], checkItems: [], buildItems: [], generating: false, confirmStep: false,
           fieldErrors: [], activeGenerationIds: [], generationJobIds: [],
         };
       }
@@ -810,6 +814,7 @@
           lines.push("[[task.cell.proof]]");
           if (it.label.trim()) lines.push(`id = ${tomlStr(it.label.trim())}`);
           lines.push(`command = ${tomlStr(it.value.trim())}`);
+          if (ntSimple.proofShell.trim()) lines.push(`shell = ${tomlStr(ntSimple.proofShell.trim())}`);
           // A `command` with no `mode` is a remediating command, which the
           // validator requires a retry budget for (`core/src/validate.rs`
           // `check_command_mode`).
@@ -1129,6 +1134,12 @@
           ${ntSimple.proofItems.length
             ? `<div style="margin-top:6px">${ntListWidgetHtml(ntSimple.proofItems, "proofs", { labelPlaceholder: "id", valuePlaceholder: "shell command", addLabel: "Add a proof step by hand.", labelTip: "A short id for this proof step.", valueTip: "The shell command this proof step runs." })}</div>`
             : `<button class="btn" style="margin-top:6px" onclick="ntListAdd('proofs')" data-tip="Add a proof step by hand, without generating one.">+ Add a proof step by hand</button>`}
+          ${ntSimple.proofItems.length ? `
+          <label style="display:block;font-size:12px;color:var(--muted);margin-top:6px" data-tip="The shell that runs every proof step's command. Pick one or type any shell name or path (for example pwsh or bash). Leave blank for the default: cmd on Windows, sh elsewhere. A shell that is not installed fails the step.">
+            Proof shell (optional)
+            <input list="nt-proof-shell-options" style="${NT_INPUT_STYLE}" value="${esc(ntSimple.proofShell)}" oninput="ntSimple.proofShell=this.value" placeholder="(platform default)">
+            <datalist id="nt-proof-shell-options">${NT_SHELL_CHOICES.map((sh) => `<option value="${sh}"></option>`).join("")}</datalist>
+          </label>` : ""}
           <label style="display:block;font-size:12px;color:var(--muted);margin-top:10px" data-tip="Whether/how this task gets reviewed.\n&quot;Auto Review&quot; (the default) pools the work cell into Triage — the daemon's Arbiter classifies it and a review is created automatically once its pool threshold or schedule fires, no triage type needed from you.\n&quot;Add a Review&quot; creates an explicit review up front, letting you configure user actions and preparation steps now.\n&quot;No Review&quot; skips review entirely.">
             Review
             <select style="${NT_INPUT_STYLE}" onchange="ntSimple.reviewMode=this.value;renderNewTaskModal()">

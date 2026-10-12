@@ -248,7 +248,7 @@ pub fn run_cell(spec: &CellSpec, keep_temporary_files: bool) -> CellResult {
     };
 
     if let Some(command) = &spec.command {
-        return run_command(&workspace, command, spec.timeout_sec);
+        return run_command(&workspace, command, spec.timeout_sec, spec.shell.as_deref());
     }
 
     let Some(prompt) = &spec.prompt else {
@@ -258,8 +258,13 @@ pub fn run_cell(spec: &CellSpec, keep_temporary_files: bool) -> CellResult {
     run_prompt(spec, prompt, &workspace, keep_temporary_files)
 }
 
-fn run_command(workspace: &Workspace, command: &str, timeout_sec: Option<u64>) -> CellResult {
-    match workspace.run_bash_live(command, timeout_sec) {
+fn run_command(
+    workspace: &Workspace,
+    command: &str,
+    timeout_sec: Option<u64>,
+    shell: Option<&str>,
+) -> CellResult {
+    match workspace.run_bash_live_in(command, timeout_sec, shell) {
         Ok(out) if out.ok() => {
             let mut result = CellResult::done(tail(&out.stdout, COMMAND_TAIL_CHARS));
             // A command-mode cell has no agent to reason about a waypoint, so
@@ -1431,10 +1436,25 @@ RALPHUS_BEARING: accepted: renamed every call site"
         let dir = std::env::temp_dir().join(format!("ralphus-execute-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let ws = Workspace::create(&dir).unwrap();
-        let result = run_command(&ws, "exit 0", None);
+        let result = run_command(&ws, "exit 0", None, None);
         assert!(result.ok());
-        let result = run_command(&ws, "exit 7", None);
+        let result = run_command(&ws, "exit 7", None, None);
         assert!(!result.ok());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn run_command_with_a_missing_shell_fails_naming_the_shell() {
+        let dir = std::env::temp_dir().join(format!(
+            "ralphus-execute-test-missing-shell-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ws = Workspace::create(&dir).unwrap();
+        let result = run_command(&ws, "exit 0", None, Some("ralphus-no-such-shell"));
+        assert!(!result.ok());
+        let error = result.error.unwrap_or_default();
+        assert!(error.contains("ralphus-no-such-shell"), "{error}");
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -1710,6 +1730,7 @@ RALPHUS_BEARING: accepted: renamed every call site"
             task: "t".into(),
             cell_id: "c".into(),
             cwd: std::env::temp_dir().display().to_string(),
+            shell: None,
             prompt: Some("do the thing".into()),
             command: None,
             agent: "claude".into(),
@@ -2047,6 +2068,7 @@ RALPHUS_APPRAISAL: {{\"score\": {score}, \"summary\": \"s\"}}"
             cwd: dir.display().to_string(),
             prompt: None,
             command: None,
+            shell: None,
             agent: "claude".into(),
             executable: None,
             model: None,

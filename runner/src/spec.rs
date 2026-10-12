@@ -29,6 +29,9 @@ pub struct CellSpec {
     /// Exactly one of `prompt`/`command` is `Some` -- enforced in [`Self::from_json`].
     pub prompt: Option<String>,
     pub command: Option<String>,
+    /// Shell executable that runs `command` (a bare name or a path); `None`
+    /// keeps the platform default (`cmd` on Windows, `sh` elsewhere).
+    pub shell: Option<String>,
     pub agent: String,
     pub executable: Option<String>,
     pub model: Option<String>,
@@ -135,6 +138,7 @@ impl CellSpec {
         let cwd = require_str(obj, "cwd")?;
         let prompt = opt_str(obj, "prompt")?;
         let command = opt_str(obj, "command")?;
+        let shell = opt_str(obj, "shell")?;
         let agent = opt_str(obj, "agent")?.unwrap_or_else(|| "claude".to_string());
         let executable = opt_str(obj, "executable")?;
         let model = opt_str(obj, "model")?;
@@ -193,6 +197,7 @@ impl CellSpec {
             cwd,
             prompt,
             command,
+            shell,
             agent,
             executable,
             model,

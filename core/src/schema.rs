@@ -272,6 +272,12 @@ pub struct CellDef {
     /// Deterministic shell command. Mutually exclusive with `prompt`.
     #[serde(default)]
     pub command: Option<String>,
+    /// Only meaningful when `command` is set: the shell executable that runs
+    /// the command line -- a bare name resolved on `PATH` (`bash`, `pwsh`) or
+    /// a path to the executable. Unset uses the project/global
+    /// `[command] shell` default, then `cmd` on Windows and `sh` elsewhere.
+    #[serde(default)]
+    pub shell: Option<String>,
     /// Only meaningful when `command` is set: whether a failed attempt is
     /// handed to an agent to repair (a "remediating command") or simply
     /// fails outright with no agent involvement (a "raw command"). One of
@@ -2163,6 +2169,12 @@ pub struct ProofStep {
     /// Shell command; exit code is the verdict.
     #[serde(default)]
     pub command: Option<String>,
+    /// Only meaningful when `command` is set: the shell executable that runs
+    /// the command line -- a bare name resolved on `PATH` (`bash`, `pwsh`) or
+    /// a path to the executable. Unset uses the project/global
+    /// `[command] shell` default, then `cmd` on Windows and `sh` elsewhere.
+    #[serde(default)]
+    pub shell: Option<String>,
     /// Only meaningful when `command` is set: whether a failed attempt is
     /// handed to an agent to repair (a "remediating command") or simply
     /// fails outright with no agent involvement (a "raw command"). One of
@@ -2698,6 +2710,7 @@ mod tests {
             subprojects: vec![],
             prompt: Some("hi".into()),
             command: None,
+            shell: None,
             mode: None,
             remediation_attempts: None,
             depends_on: vec![],
