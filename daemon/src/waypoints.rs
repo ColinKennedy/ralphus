@@ -1014,9 +1014,10 @@ impl Store {
         // roster entries, or one that would close a cycle -- is skipped, never
         // enrolled: holding it could deadlock the waypoint.
         let blocked = |kind: WaypointEntryKind, id: &str| -> StoreResult<bool> {
-            match self.check_waypoint_entry(waypoint_id, "affected", kind, id) {
+            match Self::check_waypoint_entry_conn(conn, waypoint_id, "affected", kind, id) {
                 Ok(()) => Ok(false),
                 Err(StoreError::InvalidTransition(why)) => {
+                    // ralphus[ignore-rlog-pair]: survey skip is a filter operation; the caller (scheduler) logs the sweep outcome in Cartographer
                     crate::rlog!(
                         INFO,
                         "ralphus [waypoints] survey skipping {} {id} for waypoint \
@@ -1042,7 +1043,7 @@ impl Store {
             if is_terminal || is_affecteded(WaypointEntryKind::Squad, &squad_id) {
                 continue;
             }
-            if overlaps(&self.squad_scope_by_project(&squad_id)?)
+            if overlaps(&Self::squad_scope_by_project_conn(conn, &squad_id)?)
                 && !blocked(WaypointEntryKind::Squad, &squad_id)?
             {
                 candidates.push(SurveyCandidate {
@@ -1058,7 +1059,7 @@ impl Store {
             {
                 continue;
             }
-            if overlaps(&self.review_scope_by_project(&guardian_id)?)
+            if overlaps(&Self::review_scope_by_project_conn(conn, &guardian_id)?)
                 && !blocked(WaypointEntryKind::Review, &guardian_id)?
             {
                 candidates.push(SurveyCandidate {
@@ -1194,6 +1195,194 @@ impl Store {
 
     fn entry_label(kind: WaypointEntryKind, id: &str) -> String {
         format!("{} {id}", kind.as_str())
+    }
+
+    fn work_squads_conn(
+        conn: &Connection,
+        kind: WaypointEntryKind,
+        entry_id: &str,
+    ) -> StoreResult<std::collections::BTreeSet<String>> {
+        let mut out = std::collections::BTreeSet::new();
+        match kind {
+            WaypointEntryKind::Squad => {
+                out.insert(entry_id.to_string());
+            }
+            WaypointEntryKind::Review => {
+                let mut stmt = conn.prepare(
+                    "SELECT squad_id FROM guardians WHERE id=? AND squad_id IS NOT NULL
+                     UNION
+                     SELECT s.squad_id FROM cells s
+                     WHERE s.review_guardian_id = ?1
+                        OR (s.review_guardian_id IS NULL AND EXISTS (
+                            SELECT 1 FROM guardian_branches gb
+                            WHERE gb.guardian_id = ?1 AND gb.branch = s.review_branch))",
+                )?;
+                let rows = stmt
+                    .query_map(params![entry_id], |r| r.get::<_, String>(0))?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                out.extend(rows);
+            }
+        }
+        Ok(out)
+    }
+
+    fn same_work_conn(
+        conn: &Connection,
+        a: (WaypointEntryKind, &str),
+        b: (WaypointEntryKind, &str),
+    ) -> StoreResult<bool> {
+        if a == b {
+            return Ok(true);
+        }
+        Ok(match (a.0, b.0) {
+            (WaypointEntryKind::Squad, WaypointEntryKind::Review) => {
+                Self::work_squads_conn(conn, b.0, b.1)?.contains(a.1)
+            }
+            (WaypointEntryKind::Review, WaypointEntryKind::Squad) => {
+                Self::work_squads_conn(conn, a.0, a.1)?.contains(b.1)
+            }
+            _ => false,
+        })
+    }
+
+    fn list_roster_entries_conn(
+        conn: &Connection,
+        waypoint_id: &str,
+    ) -> StoreResult<Vec<(WaypointEntryKind, String)>> {
+        let mut stmt = conn.prepare(
+            "SELECT kind, entry_id FROM waypoint_roster WHERE waypoint_id=? ORDER BY created_at_ms ASC, entry_id ASC",
+        )?;
+        let raw: Vec<(String, String)> = stmt
+            .query_map(params![waypoint_id], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        drop(stmt);
+        let mut out = Vec::with_capacity(raw.len());
+        for (kind_s, entry_id) in raw {
+            if let Some(kind) = WaypointEntryKind::parse(&kind_s) {
+                out.push((kind, entry_id));
+            }
+        }
+        Ok(out)
+    }
+
+    fn find_wait_path_conn(
+        conn: &Connection,
+        start: &(WaypointEntryKind, String),
+        target: &(WaypointEntryKind, String),
+    ) -> StoreResult<Option<Vec<(WaypointEntryKind, String)>>> {
+        type WaypointGraph = Vec<(String, Vec<(WaypointEntryKind, String)>, Vec<(WaypointEntryKind, String)>)>;
+        let mut graph: WaypointGraph = Vec::new();
+        for wid in Self::list_open_waypoint_ids_conn(conn)? {
+            let aff = Self::list_affected_entries_conn(conn, &wid)?
+                .into_iter()
+                .map(|e| (e.kind, e.entry_id))
+                .collect();
+            let ros = Self::list_roster_entries_conn(conn, &wid)?;
+            graph.push((wid, aff, ros));
+        }
+        let mut visited = std::collections::BTreeSet::new();
+        let mut queue = std::collections::VecDeque::new();
+        queue.push_back((start.clone(), vec![start.clone()]));
+        while let Some((cur, trail)) = queue.pop_front() {
+            for (wid, aff, ros) in &graph {
+                let mut held = false;
+                for (ak, aid) in aff {
+                    if Self::same_work_conn(conn, (cur.0, &cur.1), (*ak, aid))? {
+                        held = true;
+                        break;
+                    }
+                }
+                if !held || !visited.insert(wid.clone()) {
+                    continue;
+                }
+                for r in ros {
+                    let mut next = trail.clone();
+                    next.push(r.clone());
+                    if Self::same_work_conn(conn, (r.0, &r.1), (target.0, &target.1))? {
+                        return Ok(Some(next));
+                    }
+                    queue.push_back((r.clone(), next));
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    fn check_waypoint_entry_conn(
+        conn: &Connection,
+        waypoint_id: &str,
+        side: &str,
+        kind: WaypointEntryKind,
+        entry_id: &str,
+    ) -> StoreResult<()> {
+        let table = if side == "roster" {
+            "waypoint_roster"
+        } else {
+            "waypoint_affected"
+        };
+        let exists: bool = conn.query_row(
+            &format!(
+                "SELECT EXISTS(SELECT 1 FROM {table} WHERE waypoint_id=? AND kind=? AND entry_id=?)"
+            ),
+            params![waypoint_id, kind.as_str(), entry_id],
+            |r| r.get(0),
+        )?;
+        if exists {
+            return Ok(());
+        }
+        let roster: Vec<(WaypointEntryKind, String)> =
+            Self::list_roster_entries_conn(conn, waypoint_id)?;
+        let affected: Vec<(WaypointEntryKind, String)> =
+            Self::list_affected_entries_conn(conn, waypoint_id)?
+                .into_iter()
+                .map(|e| (e.kind, e.entry_id))
+                .collect();
+        let (other, new_roster, new_affected) = if side == "roster" {
+            (
+                &affected,
+                vec![(kind, entry_id.to_string())],
+                affected.clone(),
+            )
+        } else {
+            (&roster, roster.clone(), vec![(kind, entry_id.to_string())])
+        };
+        for (ok, oid) in other {
+            if Self::same_work_conn(conn, (kind, entry_id), (*ok, oid))? {
+                let (r, a) = if side == "roster" {
+                    (
+                        Self::entry_label(kind, entry_id),
+                        Self::entry_label(*ok, oid),
+                    )
+                } else {
+                    (
+                        Self::entry_label(*ok, oid),
+                        Self::entry_label(kind, entry_id),
+                    )
+                };
+                return Err(StoreError::InvalidTransition(format!(
+                    "waypoint {waypoint_id} cannot list the same work on both its roster \
+                     and its affected list: {r} (roster) is the same work as {a} (affected), \
+                     so it could never land. Remove one of the two."
+                )));
+            }
+        }
+        // Cycle: each new edge is `affected -> roster`; a cycle exists when
+        // the roster end already reaches the affected end through open waypoints.
+        for a in &new_affected {
+            for r in &new_roster {
+                if let Some(path) = Self::find_wait_path_conn(conn, r, a)? {
+                    let mut names = vec![Self::entry_label(a.0, &a.1)];
+                    names.extend(path.iter().map(|(k, i)| Self::entry_label(*k, i)));
+                    return Err(StoreError::InvalidTransition(format!(
+                        "adding {} to waypoint {waypoint_id}'s {side} would create a waypoint \
+                         dependency cycle: {}. Remove one of the entries to break the cycle.",
+                        Self::entry_label(kind, entry_id),
+                        names.join(" -> ")
+                    )));
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Reject a new `entry` on `side` (`"roster"` or `"affected"`) of
@@ -1463,6 +1652,7 @@ impl Store {
             ) {
                 Ok(()) => {}
                 Err(StoreError::InvalidTransition(why)) => {
+                    // ralphus[ignore-rlog-pair]: enrollment skip is a constraint violation; the caller logs any enrollment in Cartographer
                     crate::rlog!(
                         WARNING,
                         "ralphus [waypoints] skipping enrollment of squad {squad_id} on \
