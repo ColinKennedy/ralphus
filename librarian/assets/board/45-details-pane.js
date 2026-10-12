@@ -372,6 +372,7 @@
           <div class="kv-row" data-tip="${SQUAD_TURNS_TIP}"><span class="k">turns</span><span class="v">${totalTurns === null ? "–" : String(totalTurns)}</span></div>
           <div class="kv-row"><span class="k">watchers</span><span class="v">${watchersHtml(`squad:${r.id}`)}</span></div>
           ${tasks}
+          ${worktreeInitSummary((r.tasks || []).flatMap((t) => t.cells || []))}
           ${reviews}
           ${generationCostSection(r)}
           ${envOverridesSection(r)}
@@ -803,6 +804,7 @@
           ${timingRows(t.started_at_ms, t.finished_at_ms, t.duration_ms ?? 0, t.active_duration_intervals ?? 0)}
           <div class="kv-row" data-tip="${TASK_TURNS_TIP}"><span class="k">turns</span><span class="v">${totalTurns === null ? "–" : String(totalTurns)}</span></div>
           ${cells}
+          ${worktreeInitSummary(t.cells || [])}
           ${proof}
           ${taskEnvOverridesSection(r, ti, t)}
           ${editBtn()}`;
@@ -1254,6 +1256,32 @@ On failure no agent starts; fix it with Edit, then Retry the squad.">Worktree in
           + `<div class="kv-row" data-tip="Source: ${esc(srcTip)}. Timeout for the whole list: ${w.timeout_sec}s."><span class="k">source</span><span class="v">${esc(src || "—")}</span></div>`
           + cmdBox(w.commands.join("\n"))
           + `<div class="kv-row"><span class="k">last run</span><span class="v">${status}${took}</span></div>${out}`;
+      }
+      /**
+       * RAL-615: read-only "Worktree init" section for the task and squad
+       * panes -- the distinct initialization commands resolved across the
+       * given cells, with how many cells use each and their combined last-run
+       * status. Empty when no cell has a command. Editing happens on a cell.
+       * @param {CellView[]} cells
+       * @returns {string}
+       */
+      function worktreeInitSummary(cells) {
+        /** @type {Map<string, {commands: string[], cells: number, statuses: Set<string>}>} */
+        const groups = new Map();
+        for (const c of cells) {
+          const w = c.worktree_init;
+          if (!w) continue;
+          const key = w.commands.join("\n");
+          const g = groups.get(key) || { commands: w.commands, cells: 0, statuses: new Set() };
+          g.cells += 1;
+          g.statuses.add(w.status || "not run yet");
+          groups.set(key, g);
+        }
+        if (!groups.size) return "";
+        return `<h3 class="section" data-tip="Commands run once in each freshly created worktree before any cell uses it. Read-only here: select a cell to edit or see its last run.">Worktree init</h3>`
+          + [...groups.values()].map((g) =>
+            cmdBox(g.commands.join("\n"))
+            + `<div class="kv-row"><span class="k">cells</span><span class="v">${g.cells} · ${esc([...g.statuses].join(", "))}</span></div>`).join("");
       }
       // CCTL-115: render each command line elided in a fixed-height box; a
       // double-click opens a floating popup with the full, scrollable text.
