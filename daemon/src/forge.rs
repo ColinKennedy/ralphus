@@ -1173,12 +1173,7 @@ impl ForgeClient {
     fn fetch_github_pull_request(&self, number: i64) -> Result<serde_json::Value, String> {
         let token = self.require_token()?;
         let url = format!("{}/repos/{}/pulls/{number}", self.api_base, self.repo_path);
-        self.get(
-            http_agent()
-                .get(&url)
-                .set("Authorization", &format!("Bearer {token}"))
-                .set("Accept", "application/vnd.github+json"),
-        )
+        self.get_github_cached(&url, token)
     }
 
     /// GitHub half of [`Self::check_pr_ci_status`], given the already-fetched PR
@@ -1298,12 +1293,7 @@ impl ForgeClient {
             "{}/repos/{}/commits/{sha}/status",
             self.api_base, self.repo_path
         );
-        let status = self.get(
-            http_agent()
-                .get(&status_url)
-                .set("Authorization", &format!("Bearer {token}"))
-                .set("Accept", "application/vnd.github+json"),
-        )?;
+        let status = self.get_github_cached(&status_url, token)?;
         if matches!(status["state"].as_str(), Some("failure") | Some("error")) {
             let failing: Vec<FailedCheck> = status["statuses"]
                 .as_array()
@@ -1472,12 +1462,7 @@ impl ForgeClient {
                 "{}/repos/{}/commits/{sha}/check-runs?per_page={PER_PAGE}&page={page}",
                 self.api_base, self.repo_path
             );
-            let body = self.get(
-                http_agent()
-                    .get(&url)
-                    .set("Authorization", &format!("Bearer {token}"))
-                    .set("Accept", "application/vnd.github+json"),
-            )?;
+            let body = self.get_github_cached(&url, token)?;
             let items = body["check_runs"].as_array().cloned().unwrap_or_default();
             let got = items.len();
             runs.extend(items);
@@ -3117,6 +3102,44 @@ impl ForgeClient {
         }
     }
 
+    /// `GET` a GitHub CI read with `If-None-Match`, so an unchanged resource
+    /// answers `304` and spends no quota. The previous body is replayed on a
+    /// `304`; a response without an `ETag` is returned but not cached.
+    fn get_github_cached(&self, url: &str, token: &str) -> Result<serde_json::Value, String> {
+        let key = format!("{}|{url}", self.rate_limit_key());
+        let prior = CI_ETAG_CACHE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&key)
+            .cloned();
+        let req = http_agent()
+            .get(url)
+            .set("Authorization", &format!("Bearer {token}"))
+            .set("Accept", "application/vnd.github+json");
+        match self.get_conditional(req, prior.as_ref().map(|(etag, _)| etag.as_str()))? {
+            ConditionalGet::NotModified => prior.map(|(_, body)| body).ok_or_else(|| {
+                "forge API 304 for a request that sent no If-None-Match".to_string()
+            }),
+            ConditionalGet::Modified { value, etag } => {
+                let mut cache = CI_ETAG_CACHE
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                match etag {
+                    Some(etag) => {
+                        if cache.len() >= CI_ETAG_CACHE_MAX_ENTRIES && !cache.contains_key(&key) {
+                            cache.clear();
+                        }
+                        cache.insert(key, (etag, value.clone()));
+                    }
+                    None => {
+                        cache.remove(&key);
+                    }
+                }
+                Ok(value)
+            }
+        }
+    }
+
     /// Registry key for the quota this client draws on: GitHub's primary limit
     /// is per token, not per repository, so every client built on the same
     /// token and API base shares one entry. Only a hash of the token is kept.
@@ -3281,6 +3304,16 @@ impl From<ForgeError> for String {
 fn parse_retry_after(value: &str) -> Option<Duration> {
     value.trim().parse::<u64>().ok().map(Duration::from_secs)
 }
+
+/// Cap on [`CI_ETAG_CACHE`]; the cache is emptied when it fills, since an
+/// entry is only a saved call and any miss simply refetches.
+const CI_ETAG_CACHE_MAX_ENTRIES: usize = 2048;
+
+/// `(ETag, body)` of the last `200` for a GitHub CI read, keyed by
+/// [`ForgeClient::rate_limit_key`] plus the request URL. Lives in memory only:
+/// losing it on restart costs one unconditional fetch per URL.
+static CI_ETAG_CACHE: std::sync::LazyLock<Mutex<HashMap<String, (String, serde_json::Value)>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// How long a `429` with no wait header holds a token off.
 const DEFAULT_QUOTA_BACKOFF: Duration = Duration::from_secs(60);
@@ -7733,6 +7766,101 @@ mod tests {
         let err = client.check_pr_ci_status(9).unwrap_err();
         assert!(err.contains("429"), "{err}");
         assert_eq!(client.rate_limit_backoff_remaining(), None);
+        mock.finish();
+    }
+
+    /// Serve one GitHub CI pass (PR, check-runs, combined status). Each
+    /// request is answered `304` when it carries the `If-None-Match` this
+    /// helper's first pass handed out, else `200` with that URL's body and an
+    /// `ETag`; returns the `If-None-Match` values seen, in request order.
+    fn serve_github_ci_pass(
+        server: &crate::mock_forge::MockForgeServer,
+        pr_body: &str,
+        pass: usize,
+    ) -> Vec<Option<String>> {
+        let mut seen = Vec::new();
+        for _ in 0..3 {
+            let req = server.recv();
+            let url = req.url().to_string();
+            let if_none_match = req
+                .headers()
+                .iter()
+                .find(|h| h.field.equiv("If-None-Match"))
+                .map(|h| h.value.as_str().to_string());
+            let (body, etag) = if url.ends_with("/pulls/4") {
+                (pr_body, format!("\"pr-{pass}\""))
+            } else if url.contains("/check-runs") {
+                (
+                    r#"{"total_count": 1, "check_runs": [{"name": "build", "status": "completed", "conclusion": "success"}]}"#,
+                    "\"runs-1\"".to_string(),
+                )
+            } else {
+                (r#"{"state": "success"}"#, "\"status-1\"".to_string())
+            };
+            let unchanged = if_none_match.as_deref() == Some(etag.as_str());
+            seen.push(if_none_match);
+            let resp = if unchanged {
+                tiny_http::Response::from_string("").with_status_code(304)
+            } else {
+                tiny_http::Response::from_string(body)
+                    .with_status_code(200)
+                    .with_header(
+                        tiny_http::Header::from_bytes(&b"ETag"[..], etag.as_bytes()).unwrap(),
+                    )
+            };
+            req.respond(resp).unwrap();
+        }
+        seen
+    }
+
+    #[test]
+    fn github_ci_reads_send_if_none_match_and_replay_the_cached_body_on_304() {
+        let pr = r#"{"mergeable_state": "clean", "head": {"sha": "deadbeef"}}"#;
+        let mock = MockForge::start(move |server| {
+            let first = serve_github_ci_pass(server, pr, 1);
+            let second = serve_github_ci_pass(server, pr, 1);
+            (first, second)
+        });
+        let client = mock.client(ForgeKind::GitHub, "acme/widget");
+        assert_eq!(client.check_pr_ci_status(4).unwrap(), PrCiState::Passing);
+        assert_eq!(client.check_pr_ci_status(4).unwrap(), PrCiState::Passing);
+        let (first, second) = mock.finish();
+        assert_eq!(first, vec![None, None, None]);
+        assert_eq!(
+            second,
+            vec![
+                Some("\"pr-1\"".to_string()),
+                Some("\"runs-1\"".to_string()),
+                Some("\"status-1\"".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn github_ci_reads_pick_up_a_changed_pr_after_its_etag_stops_matching() {
+        let clean = r#"{"mergeable_state": "clean", "head": {"sha": "deadbeef"}}"#;
+        let dirty = r#"{"mergeable_state": "dirty", "head": {"sha": "deadbeef"}}"#;
+        let mock = MockForge::start(move |server| {
+            serve_github_ci_pass(server, clean, 1);
+            // The PR's body (and ETag) changed; a conflict short-circuits
+            // before the check-runs and status calls.
+            let req = server.recv();
+            assert!(req.url().ends_with("/pulls/4"));
+            req.respond(
+                tiny_http::Response::from_string(dirty)
+                    .with_status_code(200)
+                    .with_header(
+                        tiny_http::Header::from_bytes(&b"ETag"[..], &b"\"pr-2\""[..]).unwrap(),
+                    ),
+            )
+            .unwrap();
+        });
+        let client = mock.client(ForgeKind::GitHub, "acme/widget");
+        assert_eq!(client.check_pr_ci_status(4).unwrap(), PrCiState::Passing);
+        assert!(matches!(
+            client.check_pr_ci_status(4).unwrap(),
+            PrCiState::Failing(_)
+        ));
         mock.finish();
     }
 
