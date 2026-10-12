@@ -761,6 +761,11 @@ use; see `READ_ONLY_NOTE`.
     - clear --all --keep-temporary --status [states] --yes (subagent)  {Delete tasks and reviews from the daemon.}
     - (read-only-safe) completion  {Print a shell tab-completion script. (Rust port: not yet implemented -- prints a placeholder message; Python's `shell` argument is not read.)}
     - (read-only-safe) configuration  {Show sourced .ralphus.toml files and resolved values. (Python's separate `configuration show` subcommand is flattened into this bare command in the Rust port; --no-local is not yet ported.)}
+    - forge  {Forge-wide settings: the poll-token pool used for read-only CI/PR polling.}
+        - pool  {Manage the daemon-wide poll-token pool that read-only forge polling rotates through when a token is rate-limited.}
+            - add kind [github|gitlab] label [str] --host [host] --token [token]  {Add a labelled personal access token to the poll pool for one forge host (default github.com / gitlab.com). Read-only polling rotates through the pool; writes always use the acting user's own token.}
+            - (read-only-safe) list  {List the poll-token pool: kind, host, label and a masked tail for each token (never the token).}
+            - remove kind [github|gitlab] label [str] --host [host]  {Remove a labelled token from the poll pool.}
     - (read-only-safe) get selector [uri] field [str, optional]  {Query one field from any entity's JSON view (jq-lite).}
     - (read-only-safe) graph squad_id [id, optional] --all --dot  {Render the task-order dependency graph. (Rust port simplifies Python's --global/--format ascii|dot choice to plain --dot/--all boolean flags.)}
     - (read-only-safe) history selector [uri] --type [str]  {Show a cell/proof step's tmux history (one-shot snapshot; Python's --live tailing and --wait-until-valid are not yet ported).}
@@ -952,6 +957,7 @@ use; see `READ_ONLY_NOTE`.
         - edit waypoint_id [id] --agent [name] --allow-advisory/--no-allow-advisory --label [text] --model [name] --prompt [text] --resurvey  {Update a waypoint's settings: label, guidance prompt, survey agent/model, and whether advisory affected entries are allowed. Survey verdicts are kept unless --resurvey re-queues every daemon-enrolled entry for re-judging; preview that first with 'waypoint resurvey-preview'.}
         - (read-only-safe) get waypoint_id [id]  {Show one waypoint's settings, roster, affected entries, tracked projects, and delivery summary.}
         - (read-only-safe) list --project [name] --state [open|closed]  {List waypoints.}
+        - override waypoint_id [id] entry_id [id]  {Release only one held affected entry and resume its halted work, recording 'overridden by <person>' in the waypoint's delivery feed. Use when a hold is wrong or the survey could not run.}
         - redo waypoint_id [id] entry_id [id]  {Re-run a squad whose finished work a closed waypoint flagged as stale, carrying its prior findings and the waypoint's bearings into the new run.}
         - reopen waypoint_id [id]  {Reopen a closed waypoint.}
         - resurvey-preview waypoint_id [id] (subagent)  {Show what 'waypoint edit --resurvey' would re-judge: which daemon-enrolled affected entries get their verdict cleared, and which human-declared entries are left alone.}
