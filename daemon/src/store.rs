@@ -11892,7 +11892,7 @@ impl Store {
         self.conn.execute(
             "UPDATE proofs SET state='pending', env_out_of_date=0, restart_note=NULL, halted_waypoint_id=NULL
              WHERE squad_id=? AND task_idx=? AND scope=? AND cell_idx=?
-               AND state IN ('halted','pending','running','done','failed')",
+               AND state IN ('halted','pending')",
             params![squad_id, task_idx, scope, cell_idx],
         )?;
         if scope == "task" {
