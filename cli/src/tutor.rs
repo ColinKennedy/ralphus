@@ -685,6 +685,39 @@ may embed <<ralphus:new-worktree/BRANCH?upstream=UPSTREAM
       before_reset_command = ["./scripts/stop-demo-if-running"]
 
 ---------------------------------------------------------------
+ [[waypoint]]   (zero or more per file, top-level)
+---------------------------------------------------------------
+ Cross-squad ordering: "hold this work until that work lands".
+ Keys:
+   prompt          (required) guidance published to the affected work
+   affected        (required, >= 1) the work being held
+   roster          (optional) the completion list that releases the
+                   hold; empty means the waypoint is only a broadcast
+   label           (optional) board label
+   agent, model    (optional) backend for the survey pass
+   allow_advisory  (optional bool) let the survey leave an affected
+                   entry advisory instead of block
+ Both lists are plain arrays of WRAPPED sentinels (a bare id is a
+ validation error):
+   "<<ralphus:review/ID>>"      an existing review
+   "<<ralphus:squad/ID>>"       an existing squad
+   "<<ralphus:new-review/KEY>>" a same-file [[review]] (matches its id)
+   "<<ralphus:new-squad>>"      the squad this file creates
+ (the older "<<review:ID>>" / "<<squad:ID>>" are also accepted.)
+ A review on the roster counts as landed at merged, approved,
+ cancelled or deployed. The roster is written before any affected
+ entry, so the squad is never claimable without it. Per-entry
+ block/advisory is decided by the survey, not declared here. An entry
+ may not be on both lists, and waypoints may not form a cycle.
+ `queued` on a squad means staged (submit --hold; release with
+ the squad "activate" command); a waypoint hold is separate and automatic.
+
+   [[waypoint]]
+   prompt = "RAL-615 builds on RAL-612's worktree changes."
+   affected = ["<<ralphus:new-squad>>"]
+   roster = ["<<ralphus:review/guardian-000000000215>>"]
+
+---------------------------------------------------------------
  Triage (RAL-318) -- auto-review opt-in, alternative to [[review]]
 ---------------------------------------------------------------
  Instead of declaring a [[review]] block and wiring

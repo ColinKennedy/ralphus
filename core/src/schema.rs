@@ -1331,6 +1331,13 @@ pub fn parse_cell_review_sentinel(review: &str) -> Option<&str> {
 /// [`parse_affected_entry_sentinel`].
 pub const SQUAD_REF_PREFIX: &str = "<<squad:";
 
+/// Namespaced spelling of [`SQUAD_REF_PREFIX`], `<<ralphus:squad/<id>>>`,
+/// following the `<<ralphus:{name}/...>>` convention of the other sentinels.
+pub const NAMESPACED_SQUAD_REF_PREFIX: &str = "<<ralphus:squad/";
+
+/// Namespaced spelling of [`REVIEW_REF_PREFIX`], `<<ralphus:review/<id>>>`.
+pub const NAMESPACED_REVIEW_REF_PREFIX: &str = "<<ralphus:review/";
+
 /// Sentinel naming the squad this same submission itself creates,
 /// `<<ralphus:new-squad>>` (RAL-400). Unlike [`REVIEW_LINK_PREFIX`]'s
 /// `ralphus:new-review/<key>`, this carries no `<key>` -- a single
@@ -1366,6 +1373,18 @@ pub enum AffectedEntryRef {
 pub fn parse_affected_entry_sentinel(entry: &str) -> Option<AffectedEntryRef> {
     if entry == NEW_SQUAD_SENTINEL {
         return Some(AffectedEntryRef::NewSquad);
+    }
+    if let Some(inner) = entry
+        .strip_prefix(NAMESPACED_SQUAD_REF_PREFIX)
+        .and_then(|s| s.strip_suffix(">>"))
+    {
+        return (!inner.is_empty()).then(|| AffectedEntryRef::ExistingSquad(inner.to_string()));
+    }
+    if let Some(inner) = entry
+        .strip_prefix(NAMESPACED_REVIEW_REF_PREFIX)
+        .and_then(|s| s.strip_suffix(">>"))
+    {
+        return (!inner.is_empty()).then(|| AffectedEntryRef::ExistingReview(inner.to_string()));
     }
     if let Some(inner) = entry
         .strip_prefix(SQUAD_REF_PREFIX)
@@ -2126,6 +2145,13 @@ pub struct WaypointDef {
     /// state).
     #[serde(default)]
     pub affected: Vec<String>,
+    /// The reviews/squads whose completion releases this waypoint's hold. Same
+    /// sentinel grammar as `affected` ([`parse_affected_entry_sentinel`]); a
+    /// bare id is invalid. Optional -- a waypoint with an empty roster is only
+    /// a broadcast. A review entry counts as landed at `merged`, `approved`,
+    /// `cancelled` or `deployed`.
+    #[serde(default)]
+    pub roster: Vec<String>,
 }
 
 /// One proof step. Exactly one of `command` / `prompt` must be set.

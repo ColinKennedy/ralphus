@@ -688,6 +688,7 @@ fn render_waypoint_list(waypoints: &Value) {
                 w["id"].as_str().unwrap_or_default().to_string(),
                 w["label"].as_str().unwrap_or_default().to_string(),
                 w["state"].as_str().unwrap_or_default().to_string(),
+                w["roster_count"].to_string(),
                 w["affected_count"].to_string(),
                 w["projects"]
                     .as_array()
@@ -701,7 +702,10 @@ fn render_waypoint_list(waypoints: &Value) {
             ]
         })
         .collect();
-    crate::output::print_table(&["ID", "LABEL", "STATE", "ROSTER", "PROJECTS"], &rows);
+    crate::output::print_table(
+        &["ID", "LABEL", "STATE", "ROSTER", "AFFECTED", "PROJECTS"],
+        &rows,
+    );
 }
 
 /// Renders a `GET /api/waypoints/{id}/resurvey-preview` body: what a

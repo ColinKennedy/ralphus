@@ -35,10 +35,12 @@ validation time — a typo fails fast at submit, before the daemon sees it.
 | `<<ralphus:new-worktree/<branch>?upstream=<upstream>>>` | cell `cwd` | a materialized (or reused) git worktree for `<branch>`, created under the owning task's `project`; the stored `cwd` is rewritten to the real path before the cell runs (RAL-100) |
 | `<<default>>` | the `?upstream=` value of a new-worktree placeholder | the repository's default branch — recommended |
 | `<<current_branch>>` | the `?upstream=` value of a new-worktree placeholder | whatever branch the project currently has checked out — riskier, since it can change between runs |
-| `<<review:<id>>>` | `[[task.cell]].review`, `[[waypoint]].roster` | an existing `[[review]]`'s id in the same submission (RAL-269); also valid as a roster entry (RAL-400) |
-| `<<ralphus:new-review/<key>>>` | `[[task.cell]].review` | mints a *fresh* review per submission; `<key>` groups the cells that share one new review (RAL-269) |
-| `<<squad:<id>>>` | `[[waypoint]].roster` | an existing squad's id already known to the daemon (RAL-400) |
-| `<<ralphus:new-squad>>` | `[[waypoint]].roster` | the squad this same submission itself creates — no `<key>`, since one submission file always produces exactly one squad (RAL-400) |
+| `<<review:<id>>>` | `[[task.cell]].review`, `[[waypoint]].affected` | an existing `[[review]]`'s id in the same submission (RAL-269); also an `affected` entry (RAL-400). Prefer `<<ralphus:review/<id>>>` in a waypoint |
+| `<<ralphus:new-review/<key>>>` | `[[task.cell]].review`, `[[waypoint]].affected` / `roster` | mints a *fresh* review per submission; `<key>` groups the cells that share one new review (RAL-269); in a waypoint it names the same-file `[[review]]` it creates |
+| `<<ralphus:review/<id>>>` | `[[waypoint]].roster`, `[[waypoint]].affected` | an existing review's id (RAL-621) |
+| `<<squad:<id>>>` | `[[waypoint]].affected` | an existing squad's id already known to the daemon (RAL-400); the namespaced spelling below is preferred |
+| `<<ralphus:squad/<id>>>` | `[[waypoint]].roster`, `[[waypoint]].affected` | an existing squad's id already known to the daemon (RAL-621) |
+| `<<ralphus:new-squad>>` | `[[waypoint]].roster`, `[[waypoint]].affected` | the squad this same submission itself creates — no `<key>`, since one submission file always produces exactly one squad (RAL-400) |
 | `<<ralphus:linked-field/<path>>>` | `environment` value (task, cell, proof step, or `[[default]]`) | the field `<path>` addresses relative to where this value is declared — `cwd`/`id`, or a same-table sibling `environment.<key>` (RAL-460) |
 | `<<ralphus:presets/<name>>>` | `extends` (an array, on `[[task]]`, `[[task.cell]]`, or any `[[*.proof]]` block) | stamps a registered **preset**'s field values into any of that entity's own fields still unset; the name may be hierarchical (`roles/judge/reviewer`) |
 
@@ -76,12 +78,31 @@ Rules and risks:
   `[[review]] upstream` declares the review's **base branch**; a cell
   placeholder's `?upstream=` sets *that cell's worktree's* git tracking
   upstream at creation time. See the glossary's Reviews section.
-- **A `[[waypoint]].roster` entry must be wrapped**, the same rule a cell's
-  `review` field follows: a bare, unwrapped id is a validation error, never a
-  silently-accepted literal. `<<review:<id>>>` doubles as a roster entry (a
-  waypoint can track a review directly) alongside the two squad-only forms
-  above; `<<ralphus:new-review/<key>>>` is cell-`review`-only and is not a
-  valid roster entry.
+- **Every `[[waypoint]]` `roster` and `affected` entry must be wrapped**, the
+  same rule a cell's `review` field follows: a bare, unwrapped id is a
+  validation error, never a silently-accepted literal. Both lists share one
+  grammar (`<<ralphus:review/<id>>>`, `<<ralphus:squad/<id>>>`,
+  `<<ralphus:new-review/<key>>>`, `<<ralphus:new-squad>>`, plus the older
+  `<<review:<id>>>` / `<<squad:<id>>>`). A same-file placeholder must match a
+  `[[review]].id` (or, for `new-squad`, a `[[task]]`) in the file; whether an
+  existing id is real is checked by the daemon.
+
+#### `[[waypoint]]` keys
+
+| Key | Required | Value |
+|---|---|---|
+| `prompt` | yes | the guidance the waypoint publishes to its affected work |
+| `affected` | yes | non-empty list of sentinels: the work held by (or told about) the waypoint |
+| `roster` | no | list of sentinels: the work whose completion releases the hold. A review counts as landed at `merged`, `approved`, `cancelled` or `deployed`; a squad when it reaches a terminal state. An empty roster makes the waypoint only a broadcast |
+| `label` | no | board label |
+| `agent`, `model` | no | backend (and its model, where it needs one) for the survey pass |
+| `allow_advisory` | no | bool; lets the survey leave an affected entry advisory instead of block |
+
+The whole roster is written before any affected entry, so the squad is never
+claimable without the roster that releases it. The per-entry `block`/`advisory`
+mode is decided by the survey, not declared in the file. `queued` on a squad
+means *staged* (`submit --hold`; release it with `ralphus squad activate`); a
+waypoint hold is a separate, automatic mechanism.
 
 ### `initialization_commands` (worktree init, RAL-615)
 

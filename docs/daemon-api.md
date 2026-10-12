@@ -5027,6 +5027,14 @@ re-judged, so nothing there is newly held.
 `404 not_found` for an unknown `id` — deliberately, rather than an empty
 preview, which would read as "this would do nothing".
 
+A `[[waypoint]]` in a submitted task file declares both lists with the same
+sentinel grammar (`roster = ["<<ralphus:review/ID>>", "<<ralphus:squad/ID>>",
+"<<ralphus:new-squad>>"]`, a plain list of strings with no per-entry note; a bare
+id is a validation error). The daemon writes the whole roster before any
+`affected` entry, in the same step that creates the waypoint, so the submitted
+squad is never claimable while its waypoint is half-built. `GET /api/waypoints`
+reports `roster_count` and `affected_count` per waypoint.
+
 A waypoint's roster can also be seeded at creation, via an optional `roster`
 array on `POST /api/waypoints` (`[{kind, entry_id, note?}]`). It is written
 before the affected entries, because the hold each affected entry may raise
