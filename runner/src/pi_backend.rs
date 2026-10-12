@@ -20,7 +20,11 @@ use crate::skills_install::SkillsHarness;
 use crate::tools::Workspace;
 
 const DEFAULT_PROGRAM: &str = "pi";
-const SUMMARY_TAIL_CHARS: usize = 2000;
+/// The tail of the agent's final message kept as the result summary. Large enough
+/// for a complete multi-section reply (a generated PR description with its
+/// `TITLE:` header is several thousand characters); the tail, not the head, is
+/// kept so a marker on the final line survives.
+const SUMMARY_TAIL_CHARS: usize = 16_000;
 
 /// Mirrors `claude_code_backend::DEFAULT_TOOL_ARG_TRUNCATE_CHARS` -- the
 /// per-value character budget (RAL-303) used when
