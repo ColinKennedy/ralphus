@@ -1828,7 +1828,14 @@ fn run_pr_fix(
             branch_id,
             pr.pr_number.unwrap_or_default()
         ),
-        serde_json::json!({"pr_number": pr.pr_number, "outcome": "auto_fix_dispatching"}),
+        serde_json::json!({
+            "pr_number": pr.pr_number,
+            "outcome": "auto_fix_dispatching",
+            "discourage_tests": discourage_tests,
+            "custom_template": guardian.auto_fix_prompt_template.is_some(),
+            "feedback_chars": feedback.chars().count(),
+            "message_seq": message_seq,
+        }),
     );
     let result = store
         .lock()
