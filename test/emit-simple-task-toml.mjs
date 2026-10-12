@@ -46,7 +46,6 @@ const base = {
   project: "demo",
   upstreamBranch: "",
   proofs: false,
-  proofShell: "",
   reviewMode: "none",
   generateManualChecks: false,
   generateAutoBuild: false,
