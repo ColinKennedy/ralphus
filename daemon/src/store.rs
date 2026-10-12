@@ -9040,7 +9040,7 @@ impl Store {
                  completed_active_duration_ms = completed_active_duration_ms +
                     CASE WHEN ?=1 AND active_started_at_ms IS NOT NULL THEN MAX(0, ? - active_started_at_ms) ELSE 0 END,
                  active_started_at_ms = CASE WHEN ?=1 THEN NULL ELSE active_started_at_ms END
-             WHERE squad_id=? AND task_idx=? AND scope=? AND cell_idx=? AND idx=? AND state IN ('pending', 'running', ?)",
+             WHERE squad_id=? AND task_idx=? AND scope=? AND cell_idx=? AND idx=? AND state IN ('pending', 'running')",
             params![
                 state.as_str(),
                 output,
@@ -9062,7 +9062,6 @@ impl Store {
                 scope,
                 cell_idx,
                 idx,
-                state.as_str(),
             ],
         )?;
         let reference = match &vid {
