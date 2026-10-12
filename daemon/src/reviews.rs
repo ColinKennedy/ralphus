@@ -1917,7 +1917,9 @@ pub fn derive_triage_pools(
                     .map_err(|e| ReviewError::new(format!("{cwd}: {e}")))?,
             };
             if let Some(root) = review_worktree_root(cwd_path) {
-                explicit_roots.push((root, branch.clone()));
+                if !explicit_roots.iter().any(|(r, _)| *r == root) {
+                    explicit_roots.push((root, branch.clone()));
+                }
             }
             let upstream = match &pending {
                 Some(p) => p.upstream.clone(),
@@ -3997,6 +3999,47 @@ print(json.dumps(result))
             vec!["b1".to_string(), "b2".to_string()],
             "an invalid proposal must not drop, duplicate, or reorder a candidate"
         );
+    }
+
+    /// RAL-636: several cells sharing one worktree each keep their review
+    /// link, but the review lists the worktree's branch exactly once.
+    #[test]
+    fn build_review_from_drained_pool_lists_a_shared_worktree_once() {
+        let store = std::sync::Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
+        let src = "[[task]]
+name=\"t\"
+project=\"proj\"
+[[task.cell]]
+id=\"one\"
+cwd=\".\"
+prompt=\"a\"
+[[task.cell]]
+id=\"two\"
+cwd=\".\"
+prompt=\"b\"
+[[task.cell]]
+id=\"three\"
+cwd=\".\"
+prompt=\"c\"
+";
+        let file: ralphus_core::schema::TaskFile = toml::from_str(src).unwrap();
+        let squad_id = store.lock().insert_squad(&file, None, false).unwrap();
+        for idx in 0..3 {
+            let guard = store.lock();
+            guard
+                .set_cell_state(&squad_id, 0, idx, crate::store::NodeState::Done)
+                .unwrap();
+            guard
+                .record_triage_pool_cell("proj", "bug", &squad_id, 0, idx, "b-shared", "main")
+                .unwrap();
+        }
+        let gid = create_review_from_triage_pool(&store, "proj", "bug", |_| None)
+            .unwrap()
+            .expect("pool was non-empty, must create a review");
+        let guard = store.lock();
+        assert_eq!(guard.get_guardian(&gid).unwrap().branches.len(), 1);
     }
 
     /// RAL-412: the whole-pool (cron/straggler) drain hands the Arbiter every

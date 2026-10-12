@@ -348,7 +348,7 @@ impl Store {
     pub fn triage_candidates(&self) -> StoreResult<Vec<TriageCandidateView>> {
         let mut stmt = self.conn.prepare(
             "SELECT DISTINCT c.squad_id, c.task_idx, c.idx, c.sid, c.name, c.state, c.cwd,
-                    t.name, t.project, sq.label
+                    t.name, t.project, sq.label, c.review_branch
              FROM cells c
              JOIN tasks t ON t.squad_id = c.squad_id AND t.idx = c.task_idx
              JOIN squads sq ON sq.id = c.squad_id
@@ -372,10 +372,16 @@ impl Store {
                     r.get::<_, String>(7)?,
                     r.get::<_, Option<String>>(8)?,
                     r.get::<_, Option<String>>(9)?,
+                    r.get::<_, Option<String>>(10)?,
                 ))
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
-        let mut out = Vec::with_capacity(rows.len());
+        let mut out: Vec<TriageCandidateView> = Vec::with_capacity(rows.len());
+        // Cells of one squad sharing a worktree (same pooled branch) are one
+        // candidate: the first cell represents it, types are unioned and the
+        // status is the least-settled of the group.
+        let mut by_worktree: std::collections::HashMap<(String, String), usize> =
+            std::collections::HashMap::new();
         for (
             squad_id,
             task_idx,
@@ -387,6 +393,7 @@ impl Store {
             task_name,
             project,
             squad_label,
+            review_branch,
         ) in rows
         {
             let triage_types = self.get_cell_triage_types(&squad_id, task_idx, idx)?;
@@ -401,6 +408,27 @@ impl Store {
                 _ => "scheduled",
             }
             .to_string();
+            if let Some(branch) = review_branch.filter(|b| !b.is_empty()) {
+                let key = (squad_id.clone(), branch);
+                if let Some(&at) = by_worktree.get(&key) {
+                    let first = &mut out[at];
+                    for t in triage_types {
+                        if !first.triage_types.contains(&t) {
+                            first.triage_types.push(t);
+                        }
+                    }
+                    let rank = |s: &str| match s {
+                        "failed" => 0,
+                        "scheduled" => 1,
+                        _ => 2,
+                    };
+                    if rank(&status) < rank(&first.status) {
+                        first.status = status;
+                    }
+                    continue;
+                }
+                by_worktree.insert(key, out.len());
+            }
             out.push(TriageCandidateView {
                 squad_id,
                 squad_label,
@@ -892,8 +920,9 @@ impl Store {
         Ok(rows)
     }
 
-    /// Current eligible pool size for `(project, triage_type)`: only cells
-    /// whose effective state (`Store::effective_state_for_cell`) is `done`.
+    /// Current eligible pool size for `(project, triage_type)`: unique
+    /// worktrees (squad + branch) with at least one cell whose effective state
+    /// (`Store::effective_state_for_cell`) is `done`.
     /// Pending cells remain in the pool and visible as scheduled candidates,
     /// but cannot make a threshold fire before their work and proof complete.
     ///
@@ -901,16 +930,19 @@ impl Store {
     /// Propagates any SQLite failure.
     pub fn triage_pool_count(&self, project: &str, triage_type: &str) -> StoreResult<i64> {
         let rows = self.list_pooled_cells(project, triage_type)?;
-        let mut count = 0;
+        // Cells of one squad sharing a worktree share a branch; the pool
+        // threshold counts that worktree once, however many cells pooled it.
+        let mut worktrees: std::collections::HashSet<(&str, &str)> =
+            std::collections::HashSet::new();
         for row in &rows {
             let effective = self
                 .effective_state_for_cell(&row.squad_id, row.task_idx, row.idx)?
                 .unwrap_or_default();
             if effective == "done" {
-                count += 1;
+                worktrees.insert((row.squad_id.as_str(), row.branch.as_str()));
             }
         }
-        Ok(count)
+        Ok(i64::try_from(worktrees.len()).unwrap_or(i64::MAX))
     }
 
     /// Every distinct `(project, triage_type)` key with at least one pooled
@@ -1718,6 +1750,66 @@ mod tests {
             0,
             "a cell whose proof failed must never count toward a threshold"
         );
+    }
+
+    const SHARED_WORKTREE_FIXTURE: &str = "[[task]]
+name=\"a\"
+[[task.cell]]
+id=\"work\"
+cwd=\"/repo\"
+prompt=\"x\"
+[[task.cell]]
+id=\"finalize\"
+cwd=\"/repo\"
+prompt=\"y\"
+[[task.cell]]
+id=\"third\"
+cwd=\"/repo\"
+prompt=\"z\"
+[[task]]
+name=\"b\"
+[[task.cell]]
+id=\"work\"
+cwd=\"/repo2\"
+prompt=\"x\"
+[[task.cell]]
+id=\"finalize\"
+cwd=\"/repo2\"
+prompt=\"y\"
+";
+
+    #[test]
+    fn triage_pool_count_and_candidates_count_a_shared_worktree_once() {
+        let mut s = store();
+        let file: TaskFile = toml::from_str(SHARED_WORKTREE_FIXTURE).unwrap();
+        let squad_id = s.insert_squad(&file, None, false).unwrap();
+        // Task 0: three cells on branch "b-a"; task 1: two cells on "b-b".
+        for (task, idx, branch) in [
+            (0, 0, "b-a"),
+            (0, 1, "b-a"),
+            (0, 2, "b-a"),
+            (1, 0, "b-b"),
+            (1, 1, "b-b"),
+        ] {
+            s.record_triage_pool_cell("proj", "bug", &squad_id, task, idx, branch, "main")
+                .unwrap();
+            s.set_cell_review_branch(&squad_id, task, idx, branch)
+                .unwrap();
+            s.set_cell_triage_types(&squad_id, task, idx, &["bug".to_string()])
+                .unwrap();
+            s.set_cell_state(&squad_id, task, idx, crate::store::NodeState::Done)
+                .unwrap();
+        }
+        assert_eq!(
+            s.triage_pool_count("proj", "bug").unwrap(),
+            2,
+            "5 cells on 2 worktrees count as 2"
+        );
+        let candidates = s.triage_candidates().unwrap();
+        assert_eq!(candidates.len(), 2, "one candidate per worktree");
+        assert!(candidates.iter().all(|c| c.status == "queued"));
+        // Draining still returns every cell so each one gets its review link.
+        assert_eq!(s.drain_triage_pool("proj", "bug").unwrap().len(), 5);
     }
 
     #[test]

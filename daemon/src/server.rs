@@ -8179,7 +8179,11 @@ fn squad_timeline(daemon: &Daemon, id: &str) -> Reply {
         crate::timeline::gather_squad_timeline(&store, id)
     };
     match gathered {
-        Ok(g) => json(200, &crate::timeline::finish_squad_timeline(g)),
+        Ok(g) => {
+            let mut timeline = crate::timeline::finish_squad_timeline(g);
+            crate::timeline::finalize_timeline_file(&mut timeline);
+            json(200, &timeline)
+        }
         Err(e) => store_error(&e),
     }
 }
