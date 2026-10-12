@@ -829,7 +829,7 @@
       /**
        * Switches the Live tab's sub-view.
        * @param {string} bid - The branch id.
-       * @param {string} sub - terminal | prompt | system.
+       * @param {string} sub - terminal | prompt | system | agentlog.
        * @returns {void}
        */
       function inspectorSetLiveSub(bid, sub) {
@@ -940,7 +940,7 @@
           </div>`;
 
         // 4 - which view, seated directly on what it switches
-        const subs = [["terminal", "Terminal"], ["prompt", "Prompt"], ["system", "System Prompt"]];
+        const subs = [["terminal", "Terminal"], ["prompt", "Prompt"], ["system", "System Prompt"], ["agentlog", "Agent Log (experimental)"]];
         const tabs = `<div class="subtabs">${subs.map((s) => `<button class="subtab ${sub === s[0] ? "on" : ""}" `
           + `data-click="inspectorSetLiveSub" data-branch-id="${esc(b.id)}" data-sub="${s[0]}" `
           + `data-tip="${esc(LIVE_SUB_TIP[s[0]])}">${s[1]}</button>`).join("")}</div>`;
@@ -949,6 +949,7 @@
         // The system prompt is per branch, not per run: `setLiveSub` fetches it under the branch-level key.
         if (sub === "system") return top + inspectorLiveSystemPromptView(g, `guardian|${g.id}|${b.id}`);
         if (sub === "prompt") return top + livePromptView(g, b, run);
+        if (sub === "agentlog") return top + liveAgentLogView(key);
         return top + inspectorLiveTerminalView(g, b, key, run, onNewestTape);
       }
       /**

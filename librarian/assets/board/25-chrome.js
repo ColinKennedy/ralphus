@@ -415,7 +415,7 @@
       /** Detail-pane tabs a `itab=` value may name. */
       const INSPECTOR_HASH_TABS = ["overview", "worktree", "feedback", "live", "appraisals"];
       /** Live sub-views an `lsub=` value may name. */
-      const INSPECTOR_HASH_LIVE_SUBS = ["terminal", "prompt", "system"];
+      const INSPECTOR_HASH_LIVE_SUBS = ["terminal", "prompt", "system", "agentlog"];
       /**
        * The Reviews tab's branch-inspector and log-drawer state as the URL carries it.
        * @typedef {object} InspectorHashState
