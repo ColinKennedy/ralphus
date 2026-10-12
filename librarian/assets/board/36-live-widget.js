@@ -51,7 +51,6 @@
         terminal: "The run's captured terminal output.\nThe newest run streams; an earlier one is the daemon's persisted record of it.",
         prompt: "The instruction this run's agent was given — the task it was asked to do, as opposed to the standing rules it works under.",
         agentlog: "Experimental. The run's tool calls as collapsible widgets with their input and output, filterable by tool, status and text.\nRebuilt from the terminal text, so it is as complete as that text is. Secrets are masked.",
-        diff: "What the fixer has changed in this branch's worktree so far, against the nearest enabled upstream branch (the remote base for the first enabled one).\nEmpty means no files have been edited yet.",
         system: "The exact system prompt this run's agent received: ralphus's hidden instructions plus the authored prompt.\nRead-only reference — changing it means changing where it is authored.\nAdmin-only view.",
       };
       /**

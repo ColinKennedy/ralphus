@@ -143,7 +143,6 @@ where one exists.
 | GET | `/api/guardians/{id}/manual-checks-env` | Resolved environment variables for the manual-checks step (RAL-324) |
 | GET | `/api/guardians/{id}/branches/{branch_id}/conflicts` | [Live conflicting-files list](#get-apiguardiansidbranchesbranch_idconflicts) for the board's Reviews UI (RAL-148) |
 | GET | `/api/guardians/{id}/branches/{branch_id}/diff-summary` | [Files/lines changed](#get-apiguardiansidbranchesbranch_iddiff-summary) in a branch worktree against its nearest enabled upstream (RAL-634) |
-| GET | `/api/guardians/{id}/branches/{branch_id}/live-diff` | [Live diff](#get-apiguardiansidbranchesbranch_idlive-diff) of a branch worktree against its nearest enabled upstream (RAL-634) |
 | GET | `/api/guardians/{id}/branches/{branch_id}/appraisals` | [Stored appraisals of one review branch](#get-apiguardiansidbranchesbranch_idappraisals) for the board's inspector Appraisals tab (RAL-588) |
 | GET | `/api/guardians/{id}/branches/{branch_id}/forge-status` | [Forge rate-limit and polling status of one review branch](#get-apiguardiansidbranchesbranch_idforge-status) for the board's inspector |
 | POST | `/api/guardians/{id}/branches/{branch_id}/open-terminal` | Spawn a resolver terminal **on the daemon host** |
@@ -2672,69 +2671,6 @@ Response: `{ base_kind: "remote"|"review", base_branch_id, base_ref,
 files_changed, files_added, files_removed, lines_added, lines_removed }`.
 `409 diff_summary_unavailable` when the branch is disabled, has no worktree on
 the daemon's host, or the base does not resolve.
-
-### `GET /api/guardians/{id}/branches/{branch_id}/forge-status`
-The forge API quota, any quota pause, and the poll schedule for one review
-branch, for the board's inspector "forge rate limit" section. Works for a
-branch with no PR or a failed one: the forge client is resolved from the
-review's repo (a PR's own `repo` under fork routing), not from a PR row. It
-never calls the forge; it reads the daemon's in-memory quota and poll state
-plus each PR's stored last-poll errors. Board-only (no CLI command).
-```json
-{
-  "now_ms": 1700000000000,
-  "client_resolved": true,
-  "forge": "github",
-  "repo": "acme/widget",
-  "quota_tracked": true,
-  "quota": { "limit": 5000, "remaining": 4000,
-             "reset_at_ms": 1700000600000, "observed_at_ms": 1700000000000 },
-  "backoff": { "active": false, "resume_at_ms": null, "remaining_ms": null },
-  "checks": {
-    "ci_standing": { "interval_ms": 120000, "next_due_at_ms": 1700000030000 },
-    "fast_watch_active": false,
-    "forge_cache": { "enabled": true, "interval_ms": 300000 },
-    "next_attempt_at_ms": 1700000030000
-  },
-  "pull_requests": [
-    { "pr_id": "pr-1", "pr_number": 616, "state": "open", "repo": "acme/widget",
-      "ci_checked_at_ms": 1699999940000, "ci_check_error": null,
-      "drift_check_error": null, "comments_check_error": null }
-  ]
-}
-```
-- `client_resolved` — `false` when no forge client could be built for the
-  review's repo; `forge`, `repo` and `quota` are then `null`.
-- `quota` — the last `X-RateLimit-*` reading the daemon saw for this token,
-  `null` before the first response after a restart. Per token, so every review
-  on the same token shares it. `quota_tracked` is `true` for GitHub only;
-  GitLab responses are not tracked yet.
-- `backoff` — `active` while the forge has said the token is out of calls
-  (a `429`, or a `403` with `Retry-After` or zero remaining); the CI pollers
-  skip the forge until `resume_at_ms`.
-- `checks.ci_standing.next_due_at_ms` — when the standing CI poll is next due,
-  `null` until this daemon process has polled the review once.
-  `next_attempt_at_ms` is that time pushed back to the end of any `backoff`.
-  `fast_watch_active` is `true` while a short-interval watch after a push or
-  PR open is running for the branch.
-- `pull_requests` — the branch's PRs, with each poll's last stored error.
-
-`404` if `id` or `branch_id` doesn't address a real guardian/branch.
-
-### `GET /api/guardians/{id}/branches/{branch_id}/live-diff`
-
-The diff a resolver or auto-fix has produced so far in a branch's review
-worktree (committed, uncommitted and untracked changes), for the board's Live
-view (RAL-634). The base is resolved from the stack at request time: the
-review's base branch as the remote holds it for the first enabled branch of the
-project, otherwise the review ref of the nearest enabled branch beneath it
-(disabled branches are skipped).
-
-Response: `{ base_kind: "remote"|"review", base_branch_id, base_ref, diff,
-empty, truncated }`. `diff` is capped at 256 KiB (`truncated: true` when cut);
-`empty` is true when there are no changes. `409 live_diff_unavailable` when the
-branch is disabled, has no worktree on the daemon's host, or the base does not
-resolve.
 
 ### `GET /api/guardians/{id}/branches/{branch_id}/conflicts`
 The live list of files still carrying unresolved `<<<<<<<` merge-conflict
