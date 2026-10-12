@@ -5479,7 +5479,7 @@ impl Store {
                     CASE WHEN active_started_at_ms IS NULL THEN 0 ELSE MAX(0, ? - active_started_at_ms) END,
                  active_started_at_ms = NULL
              WHERE squad_id=? AND task_idx=? AND scope='cell' AND cell_idx=?
-             AND state NOT IN ('done','failed','cancelled')",
+             AND state NOT IN ('done','failed','cancelled','halted')",
             params![now, squad_id, task_idx, idx],
         )?;
         if proofs_forced > 0 {
@@ -10209,7 +10209,7 @@ impl Store {
                  SELECT 1 FROM proofs v
                  WHERE v.squad_id=s.squad_id AND v.task_idx=s.task_idx
                  AND v.scope='cell' AND v.cell_idx=s.idx
-                 AND v.state NOT IN ('done','failed','cancelled')
+                 AND v.state NOT IN ('done','failed','cancelled','halted')
              )
              AND EXISTS (
                  SELECT 1 FROM proofs v2
@@ -12683,7 +12683,7 @@ impl Store {
                  SELECT 1 FROM proofs v
                  WHERE v.squad_id=s.squad_id AND v.task_idx=s.task_idx
                  AND v.scope='cell' AND v.cell_idx=s.idx
-                 AND v.state NOT IN ('done','failed','cancelled')
+                 AND v.state NOT IN ('done','failed','cancelled','halted')
              )",
         )?;
         let rows = stmt
