@@ -125,6 +125,29 @@ command = "test -f out.txt"          # fmt/lint/test-style gate
 remediation_attempts = 3
 ```
 
+A `command` runs through `cmd` on Windows and `sh` elsewhere. To pick another
+shell (so `a ; b` works on Windows, say), set `shell` on the cell or proof step
+— a bare name resolved on `PATH` (`pwsh`, `powershell`, `bash`, `zsh`, `fish`)
+or a path — or set a default for a project or machine in `.ralphus.toml` /
+the global config:
+
+```toml
+[[task.cell.proof]]
+command = "cargo fmt --check ; cargo clippy"
+shell = "pwsh"
+```
+
+```toml
+# .ralphus.toml
+[command]
+shell = "pwsh"
+```
+
+The invocation flag comes from the shell's name (`-NoLogo -Command` for
+PowerShell, `/C` for `cmd`, `-c` otherwise, including unknown shells). A shell
+that cannot be started fails the step with an error naming it; there is no
+fallback. `shell` is only valid alongside `command`.
+
 For an AI cell, replace `command` with a `prompt` and pick a model — local:
 
 ```toml

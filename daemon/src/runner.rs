@@ -151,6 +151,9 @@ pub struct RunnerSpec {
     pub prompt: Option<String>,
     /// Shell command, if this is a command cell.
     pub command: Option<String>,
+    /// Shell executable that runs `command` (a bare name or a path); `None`
+    /// keeps the platform default (`cmd` on Windows, `sh` elsewhere).
+    pub shell: Option<String>,
     /// Agent program.
     pub agent: String,
     /// Optional executable override for subprocess-spawning backends
@@ -804,6 +807,7 @@ impl RunnerSpec {
             cwd: row.cwd.clone().unwrap_or_default(),
             prompt: row.prompt.clone(),
             command: row.command.clone(),
+            shell: None,
             agent: row.agent.clone(),
             executable: None,
             model: row.model.clone(),
@@ -936,6 +940,7 @@ impl RunnerSpec {
             cwd: cwd.to_string(),
             prompt: Some(prompt.to_string()),
             command: None,
+            shell: None,
             agent: agent.to_string(),
             executable: None,
             model: model.map(str::to_string),
@@ -1023,6 +1028,7 @@ impl RunnerSpec {
             cwd: cwd.to_string(),
             prompt: None,
             command: Some(command.to_string()),
+            shell: None,
             agent: agent.to_string(),
             executable: None,
             model: None,
@@ -4616,6 +4622,7 @@ mod tests {
             cwd: std::env::temp_dir().to_string_lossy().into_owned(),
             prompt: Some("do something".to_string()),
             command: None,
+            shell: None,
             agent: "claude-code".to_string(),
             executable: None,
             model: None,
@@ -6666,6 +6673,7 @@ prompt = "make it build"
             cwd,
             prompt: Some("do something".to_string()),
             command: None,
+            shell: None,
             agent: "claude-code".to_string(),
             executable: None,
             model: None,
@@ -6814,6 +6822,7 @@ prompt = "make it build"
             cwd,
             prompt: Some("do something".to_string()),
             command: None,
+            shell: None,
             agent: "codex".to_string(),
             executable: None,
             model: None,

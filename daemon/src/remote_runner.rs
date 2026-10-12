@@ -194,6 +194,10 @@ pub struct RunRequest {
     /// Environment overrides applied by the provider before execution.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub env: BTreeMap<String, String>,
+    /// The shell executable that runs a single authored command line
+    /// (`program` empty); `None` lets the provider use its own `sh`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shell: Option<String>,
 }
 
 /// The payload sent to a provider's `provision` verb.
@@ -1858,6 +1862,7 @@ mod tests {
             cwd: ".".to_string(),
             prompt: Some("do work".to_string()),
             command: None,
+            shell: None,
             agent: "claude".to_string(),
             executable: None,
             model: None,
@@ -2766,6 +2771,7 @@ else:
             program: "git".to_string(),
             args: vec!["status".to_string()],
             env: BTreeMap::new(),
+            shell: None,
         };
         let sp = spec(Some("chantest:A"));
         let a = provider.run_vcs(&req, &sp).expect("first");
@@ -2811,6 +2817,7 @@ else:
             program: "git".to_string(),
             args: vec!["status".to_string()],
             env: BTreeMap::new(),
+            shell: None,
         };
         let err = provider
             .run_vcs(&req, &spec(Some("chanerr:A")))
@@ -2857,6 +2864,7 @@ else:
             program: "git".to_string(),
             args: vec!["status".to_string()],
             env: BTreeMap::new(),
+            shell: None,
         };
         let out = provider
             .run_vcs(&req, &spec(Some("falltest:A")))

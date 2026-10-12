@@ -3903,6 +3903,14 @@ fn run_cell_worker(
             }
         };
     let mut spec = RunnerSpec::from_row(squad_id, row);
+    if spec.command.is_some() {
+        spec.shell = store
+            .lock()
+            .cell_shell(squad_id, row.task_idx, row.idx)
+            .ok()
+            .flatten()
+            .or_else(|| crate::config::resolve_command_shell(std::path::Path::new(&spec.cwd)));
+    }
     let proof_awareness = {
         let guard = store.lock();
         guard
@@ -6536,6 +6544,12 @@ fn run_proofs(
                     proof_timeout.and_then(|s| u64::try_from(s).ok()),
                 );
                 runner_spec.executable = selection.executable.clone();
+                runner_spec.shell = store
+                    .lock()
+                    .proof_shell(squad_id, task_idx, scope, cell_idx, idx)
+                    .ok()
+                    .flatten()
+                    .or_else(|| crate::config::resolve_command_shell(std::path::Path::new(cwd)));
                 runner_spec.trace_context = otel::traceparent_from_context(&proof_span.cx);
                 runner_spec.env_overrides = std::mem::take(&mut env_overrides);
                 // RAL-185: a proof step runs where its owning cell/task does.

@@ -20,3 +20,8 @@ tag = "cell-command"
 [[test]]
 id = "ralphus-daemon worktree_init::tests::runs_every_command_in_order_in_the_worktree"
 tag = "worktree-init"
+
+# Selectable command shell (RAL-631; `shell` on a command proof / cell).
+[[test]]
+id = "ralphus-daemon proof::tests::explicit_sh_runs_a_semicolon_separated_command"
+tag = "command-shell"

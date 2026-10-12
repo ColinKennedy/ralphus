@@ -2718,6 +2718,7 @@ fn synthesize_pr_text(
         cwd: pr_cwd,
         prompt: Some(prompt),
         command: None,
+        shell: None,
         agent: resolved.backend,
         executable: resolved.executable,
         model: resolved.model,

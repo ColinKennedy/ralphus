@@ -374,6 +374,7 @@ impl Workspace {
                     program: String::new(),
                     args: vec![command.to_string()],
                     env: env.clone(),
+                    shell: crate::config::resolve_command_shell(&self.root),
                 };
                 match self.with_provider(|p, spec| p.run_vcs(&req, spec)) {
                     Ok(out) => (true, out),
@@ -720,6 +721,7 @@ impl Workspace {
             program: "git".to_string(),
             args: args.iter().map(|a| (*a).to_string()).collect(),
             env: non_interactive_git_env(),
+            shell: None,
         };
         self.with_provider(|p, spec| p.run_vcs(&req, spec))
     }

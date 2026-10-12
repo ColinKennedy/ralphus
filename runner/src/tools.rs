@@ -122,7 +122,7 @@ impl Workspace {
         command: &str,
         timeout_sec: Option<u64>,
     ) -> Result<CommandOutput, ToolError> {
-        self.run_shell(command, timeout_sec, false)
+        self.run_shell(command, timeout_sec, false, None)
     }
 
     /// Like [`Self::run_bash`], but also echoes every output line to this
@@ -136,7 +136,20 @@ impl Workspace {
         command: &str,
         timeout_sec: Option<u64>,
     ) -> Result<CommandOutput, ToolError> {
-        self.run_shell(command, timeout_sec, true)
+        self.run_shell(command, timeout_sec, true, None)
+    }
+
+    /// Like [`Self::run_bash_live`], but runs `command` through the shell
+    /// executable `shell` (a bare name resolved on `PATH`, or a path) instead
+    /// of the platform default. A shell that cannot be started fails with an
+    /// error naming it.
+    pub fn run_bash_live_in(
+        &self,
+        command: &str,
+        timeout_sec: Option<u64>,
+        shell: Option<&str>,
+    ) -> Result<CommandOutput, ToolError> {
+        self.run_shell(command, timeout_sec, true, shell)
     }
 
     fn run_shell(
@@ -144,13 +157,17 @@ impl Workspace {
         command: &str,
         timeout_sec: Option<u64>,
         echo: bool,
+        shell: Option<&str>,
     ) -> Result<CommandOutput, ToolError> {
-        let mut child = shell_command(command)
+        let mut child = shell_command(command, shell)
             .current_dir(&self.root)
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .spawn()
-            .map_err(|e| ToolError(format!("could not spawn command: {e}")))?;
+            .map_err(|e| match shell {
+                Some(shell) => ToolError(ralphus_core::shellcmd::shell_spawn_error(shell, &e)),
+                None => ToolError(format!("could not spawn command: {e}")),
+            })?;
         let mut tree = ProcessTree::confine(&child);
 
         // Both pipes are drained on their own threads for the whole run, so a
@@ -244,15 +261,24 @@ fn drain_lines<R: std::io::Read + Send + 'static>(
 }
 
 #[cfg(target_os = "windows")]
-fn shell_command(command: &str) -> Command {
-    crate::shellcmd::cmd_raw_shell_command(command)
+fn shell_command(command: &str, shell: Option<&str>) -> Command {
+    match shell {
+        Some(shell) => ralphus_core::shellcmd::shell_command(shell, command),
+        None => crate::shellcmd::cmd_raw_shell_command(command),
+    }
 }
 
 #[cfg(not(target_os = "windows"))]
-fn shell_command(command: &str) -> Command {
+fn shell_command(command: &str, shell: Option<&str>) -> Command {
     use std::os::unix::process::CommandExt as _;
-    let mut c = Command::new("sh");
-    c.arg("-c").arg(command);
+    let mut c = match shell {
+        Some(shell) => ralphus_core::shellcmd::shell_command(shell, command),
+        None => {
+            let mut c = Command::new("sh");
+            c.arg("-c").arg(command);
+            c
+        }
+    };
     // RAL-321: a fresh process group (pgid == the child's own pid) so
     // `ProcessTree::kill`'s `killpg` reaches this command's own descendants
     // on timeout, not just the `sh` wrapping them.

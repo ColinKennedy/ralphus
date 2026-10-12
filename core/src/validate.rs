@@ -237,6 +237,7 @@ const CELL_KEYS: &[&str] = &[
     "subprojects",
     "prompt",
     "command",
+    "shell",
     "mode",
     "remediation_attempts",
     "depends_on",
@@ -367,6 +368,7 @@ const PREPARATION_KEYS: &[&str] = &[
 const PROOF_KEYS: &[&str] = &[
     "id",
     "command",
+    "shell",
     "mode",
     "remediation_attempts",
     "prompt",
@@ -513,7 +515,8 @@ fn check_pass_score(ctx: &mut Ctx, table: &toml::Table, path: &str, header: Opti
     }
 }
 
-/// Validates `mode` and `remediation_attempts` (RAL-487) for a `command`
+/// Validates `mode` and `remediation_attempts` (RAL-487), plus the `shell`
+/// executable (a non-empty string, otherwise free-form), for a `command`
 /// cell or proof step. Both fields are only meaningful alongside `command`
 /// -- `has_command` tells this whether that key is present on `table`, so it
 /// doubles as the guard for a `prompt`-only cell/proof step (where neither
@@ -528,6 +531,25 @@ fn check_command_mode(
     check_type(ctx, table, "mode", Ty::Str, path, header);
     check_type(ctx, table, "remediation_attempts", Ty::Int, path, header);
     check_positive_number(ctx, table, "remediation_attempts", path, header);
+    check_type(ctx, table, "shell", Ty::Str, path, header);
+    if let Some(shell) = table.get("shell").and_then(toml::Value::as_str) {
+        if shell.trim().is_empty() {
+            ctx.error(
+                &format!("{path}.shell"),
+                ErrorKind::InvalidValue,
+                "'shell' must not be empty (omit it to use the platform default)",
+                ctx.key_line(header, "shell"),
+            );
+        }
+    }
+    if !has_command && table.contains_key("shell") {
+        ctx.error(
+            &format!("{path}.shell"),
+            ErrorKind::InvalidValue,
+            "'shell' is only valid alongside 'command'",
+            ctx.key_line(header, "shell"),
+        );
+    }
 
     let mode = table.get("mode").and_then(toml::Value::as_str);
     if let Some(m) = mode {
@@ -4180,6 +4202,60 @@ affected = ["<<ralphus:new-squad>>"]
                 .any(|e| e.kind == ErrorKind::InvalidValue
                     && e.message.contains("remediation_attempts")),
             "expected an InvalidValue error for remediation_attempts, got {:?}",
+            r.errors
+        );
+    }
+
+    #[test]
+    fn command_shell_is_accepted_on_cells_and_proofs() {
+        let src = "[[task]]
+name=\"t\"
+[[task.cell]]
+cwd=\"/r\"
+command=\"a ; b\"
+mode=\"raw\"
+shell=\"pwsh\"
+[[task.proof]]
+command=\"a ; b\"
+mode=\"raw\"
+shell=\"/usr/bin/bash\"
+";
+        let r = validate_toml(src);
+        assert!(r.errors.is_empty(), "{:?}", r.errors);
+    }
+
+    #[test]
+    fn empty_shell_is_rejected() {
+        let src = "[[task]]
+name=\"t\"
+[[task.cell]]
+cwd=\"/r\"
+command=\"x\"
+shell=\"  \"
+";
+        let r = validate_toml(src);
+        assert!(
+            r.errors.iter().any(|e| e.kind == ErrorKind::InvalidValue
+                && e.message.contains("'shell' must not be empty")),
+            "{:?}",
+            r.errors
+        );
+    }
+
+    #[test]
+    fn shell_without_command_is_rejected() {
+        let src = "[[task]]
+name=\"t\"
+[[task.cell]]
+cwd=\"/r\"
+prompt=\"p\"
+shell=\"bash\"
+";
+        let r = validate_toml(src);
+        assert!(
+            r.errors.iter().any(|e| e.kind == ErrorKind::InvalidValue
+                && e.message.contains("'shell' is only valid")),
+            "{:?}",
             r.errors
         );
     }

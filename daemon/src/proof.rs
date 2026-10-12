@@ -181,6 +181,24 @@ pub fn run_command_proof_capture_with_timeout(
     cancel: &CancelToken,
     timeout: Option<Duration>,
 ) -> (bool, String) {
+    let shell = crate::config::resolve_command_shell(std::path::Path::new(cwd));
+    run_command_proof_capture_in_shell(cwd, command, parent, env, cancel, timeout, shell.as_deref())
+}
+
+/// Like [`run_command_proof_capture_with_timeout`] but runs `command` through
+/// the shell executable `shell` (a bare name resolved on `PATH`, or a path).
+/// `None` uses `cmd` on Windows and `sh` elsewhere; a shell that cannot be
+/// started fails the command with an error naming it.
+#[must_use]
+pub fn run_command_proof_capture_in_shell(
+    cwd: &str,
+    command: &str,
+    parent: &Context,
+    env: &BTreeMap<String, String>,
+    cancel: &CancelToken,
+    timeout: Option<Duration>,
+    shell: Option<&str>,
+) -> (bool, String) {
     let span = crate::otel::start_span("proof.command", parent, SpanKind::Internal);
     span.set_attribute("proof.cwd", cwd.to_string());
     span.set_attribute("proof.command", command.to_string());
@@ -189,15 +207,20 @@ pub fn run_command_proof_capture_with_timeout(
         DEBUG,
         "ralphus [proof] command starting cwd={cwd:?} command={command:?}"
     );
-    let (shell, flag) = if cfg!(windows) {
-        ("cmd", "/C")
-    } else {
-        ("sh", "-c")
+    let mut builder = match shell {
+        Some(shell) => ralphus_core::shellcmd::shell_command(shell, command),
+        None => {
+            let (shell, flag) = if cfg!(windows) {
+                ("cmd", "/C")
+            } else {
+                ("sh", "-c")
+            };
+            let mut builder = Command::new(shell);
+            builder.arg(flag).arg(command);
+            builder
+        }
     };
-    let mut builder = Command::new(shell);
     builder
-        .arg(flag)
-        .arg(command)
         .current_dir(cwd)
         .envs(env)
         .stdin(Stdio::null())
@@ -284,7 +307,10 @@ pub fn run_command_proof_capture_with_timeout(
                 WARNING,
                 "ralphus [proof] command could not be spawned cwd={cwd:?}: {e}"
             );
-            (false, format!("could not run command: {e}"))
+            match shell {
+                Some(shell) => (false, ralphus_core::shellcmd::shell_spawn_error(shell, &e)),
+                None => (false, format!("could not run command: {e}")),
+            }
         }
     };
     span.set_status(if result.0 {
@@ -321,6 +347,40 @@ mod tests {
     #[test]
     fn passing_command_is_true() {
         assert!(run_command_proof(".", "exit 0"));
+    }
+
+    #[test]
+    fn missing_shell_fails_naming_the_shell() {
+        let (ok, out) = run_command_proof_capture_in_shell(
+            ".",
+            "exit 0",
+            &Context::new(),
+            &BTreeMap::new(),
+            &CancelToken::never(),
+            None,
+            Some("ralphus-no-such-shell"),
+        );
+        assert!(!ok);
+        assert!(out.contains("ralphus-no-such-shell"), "{out}");
+    }
+
+    #[test]
+    fn explicit_sh_runs_a_semicolon_separated_command() {
+        // `sh` is only guaranteed on PATH off Windows.
+        if cfg!(windows) {
+            return;
+        }
+        let (ok, out) = run_command_proof_capture_in_shell(
+            ".",
+            "echo a ; echo b",
+            &Context::new(),
+            &BTreeMap::new(),
+            &CancelToken::never(),
+            None,
+            Some("sh"),
+        );
+        assert!(ok, "{out}");
+        assert!(out.contains('a') && out.contains('b'));
     }
 
     #[test]

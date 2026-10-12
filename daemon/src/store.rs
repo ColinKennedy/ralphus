@@ -4010,6 +4010,12 @@ impl Store {
             "ALTER TABLE cells ADD COLUMN remediation_attempts INTEGER",
             "ALTER TABLE proofs ADD COLUMN mode TEXT",
             "ALTER TABLE proofs ADD COLUMN remediation_attempts INTEGER",
+            // RAL-631: the shell executable a `command` cell/proof step runs
+            // through (`ralphus_core::schema::CellDef::shell`/
+            // `ProofStep::shell`); NULL = the project/global `[command] shell`
+            // default, then the platform shell.
+            "ALTER TABLE cells ADD COLUMN shell TEXT",
+            "ALTER TABLE proofs ADD COLUMN shell TEXT",
             "ALTER TABLE proofs ADD COLUMN restart_note TEXT",
             // RAL-505: per-review opt-in to tell the resolver agent
             // dispatched for an automatic PR/MR fix to prefer automatic
@@ -4826,8 +4832,8 @@ impl Store {
                     (None, None)
                 };
                 tx.execute(
-                    "INSERT INTO cells(squad_id, task_idx, idx, sid, name, cwd, subprojects, prompt, command, agent, model, system_prompt, system_prompt_position, effective_system_prompt, state, depends_on, timeout_sec, budget_tokens, maximum_budget_usd, maximum_context, auto_compact_threshold, maximum_tool_output_tokens, turns, upstream, queue_rank, env_overrides, machine, share_session, maximum_timeout_sec, mode, remediation_attempts, effort, temperature, init_commands, init_source, init_timeout_sec, worktree_placeholder, init_state)
-                     VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    "INSERT INTO cells(squad_id, task_idx, idx, sid, name, cwd, subprojects, prompt, command, agent, model, system_prompt, system_prompt_position, effective_system_prompt, state, depends_on, timeout_sec, budget_tokens, maximum_budget_usd, maximum_context, auto_compact_threshold, maximum_tool_output_tokens, turns, upstream, queue_rank, env_overrides, machine, share_session, maximum_timeout_sec, mode, remediation_attempts, effort, temperature, init_commands, init_source, init_timeout_sec, worktree_placeholder, init_state, shell)
+                     VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     params![
                         squad_id,
                         t_idx_i,
@@ -4883,6 +4889,8 @@ impl Store {
                         // reused (not newly created) worktree is not
                         // re-initialized.
                         None::<&str>,
+                        // RAL-631: only a `command` cell runs through a shell.
+                        cell.command.as_ref().and(cell.shell.as_deref()),
                     ],
                 )?;
 
@@ -8168,8 +8176,8 @@ fn insert_proof(
                 .is_some_and(|name| name.starts_with(crate::preset_roles::JUDGE_PREFIX))
         });
     tx.execute(
-        "INSERT INTO proofs(squad_id, task_idx, scope, cell_idx, idx, vid, kind, spec, effective_system_prompt, model, agent, state, timeout_sec, maximum_timeout_sec, budget_tokens, maximum_tool_output_tokens, turns, env_overrides, mode, remediation_attempts, pass_score, receives_refusals)
-         VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        "INSERT INTO proofs(squad_id, task_idx, scope, cell_idx, idx, vid, kind, spec, effective_system_prompt, model, agent, state, timeout_sec, maximum_timeout_sec, budget_tokens, maximum_tool_output_tokens, turns, env_overrides, mode, remediation_attempts, pass_score, receives_refusals, shell)
+         VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         params![
             squad_id,
             task_idx,
@@ -8198,6 +8206,8 @@ fn insert_proof(
             remediation_attempts,
             pass_score,
             receives_refusals,
+            // RAL-631: only a `command` step runs through a shell.
+            v.command.as_ref().and(v.shell.as_deref()),
         ],
     )?;
     Ok(())
@@ -8810,6 +8820,41 @@ impl Store {
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(rows)
+    }
+
+    /// The `shell` a `command` proof step declared; `None` when it declared
+    /// none (or the step does not exist).
+    pub fn proof_shell(
+        &self,
+        squad_id: &str,
+        task_idx: i64,
+        scope: &str,
+        cell_idx: i64,
+        idx: i64,
+    ) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT shell FROM proofs WHERE squad_id=? AND task_idx=? AND scope=? AND cell_idx=? AND idx=?",
+                params![squad_id, task_idx, scope, cell_idx, idx],
+                |r| r.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten())
+    }
+
+    /// The `shell` a `command` cell declared; `None` when it declared none
+    /// (or the cell does not exist).
+    pub fn cell_shell(&self, squad_id: &str, task_idx: i64, idx: i64) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT shell FROM cells WHERE squad_id=? AND task_idx=? AND idx=?",
+                params![squad_id, task_idx, idx],
+                |r| r.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten())
     }
 
     /// The resolved `pass_score` of one proof step; `None` for an unscored

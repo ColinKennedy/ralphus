@@ -2536,6 +2536,41 @@ pub fn resolve_agent_isolation(cwd: &Path) -> AgentIsolationConfig {
     }
 }
 
+/// Command-execution defaults (`[command]` table, RAL-631).
+#[derive(Debug, Default, Deserialize, Clone, PartialEq, Eq)]
+pub struct CommandConfig {
+    /// Default shell executable for every `command` cell and proof step that
+    /// declares no `shell` of its own: a bare name resolved on `PATH`
+    /// (`bash`, `pwsh`) or a path. Unset (or empty) keeps `cmd` on Windows
+    /// and `sh` elsewhere.
+    #[serde(default)]
+    pub shell: Option<String>,
+}
+
+/// Parse a `CommandConfig` from the given TOML text; the default when the
+/// `[command]` table is absent.
+#[must_use]
+pub fn command_config_from_toml_str(s: &str) -> CommandConfig {
+    parse_config_file(s).command.unwrap_or_default()
+}
+
+fn load_command_config_file(path: &Path) -> CommandConfig {
+    read_config_text(path)
+        .map(|s| command_config_from_toml_str(&s))
+        .unwrap_or_default()
+}
+
+/// The project/global default shell for command cells and proof steps rooted
+/// at `cwd`: the global config layered under the nearest per-project
+/// `.ralphus.toml` (the project wins), `None` when neither sets one.
+#[must_use]
+pub fn resolve_command_shell(cwd: &Path) -> Option<String> {
+    let non_empty = |c: CommandConfig| c.shell.filter(|s| !s.trim().is_empty());
+    let project = find_project_config(cwd).map(|p| non_empty(load_command_config_file(&p)));
+    let global = global_config_path().map(|p| non_empty(load_command_config_file(&p)));
+    project.flatten().or(global.flatten())
+}
+
 /// Whether `key` is a syntactically valid environment-variable name
 /// (`[A-Za-z_][A-Za-z0-9_]*`) — required for a RAL-150 env override key.
 /// Enforced at the API boundary ([`crate::server`]'s env-override handler)
@@ -2873,6 +2908,8 @@ struct ConfigFile {
     env_overrides: Option<EnvOverridesConfig>,
     #[serde(default)]
     agent_isolation: Option<AgentIsolationConfig>,
+    #[serde(default)]
+    command: Option<CommandConfig>,
     #[serde(default)]
     budget: Option<BudgetConfig>,
     #[serde(default)]
@@ -5371,6 +5408,36 @@ fail_after_minutes = 5
     }
 
     // ── AgentIsolationConfig (RAL-336) ────────────────────────────────────
+
+    #[test]
+    fn command_shell_parses_from_the_command_table() {
+        assert_eq!(command_config_from_toml_str("").shell, None);
+        assert_eq!(
+            command_config_from_toml_str(
+                "[command]
+shell = \"pwsh\"
+"
+            )
+            .shell,
+            Some("pwsh".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_command_shell_prefers_the_project_over_global() {
+        let base =
+            std::env::temp_dir().join(format!("ralphus-command-shell-{}", std::process::id()));
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::write(
+            base.join(".ralphus.toml"),
+            "[command]
+shell = \"bash\"
+",
+        )
+        .unwrap();
+        assert_eq!(resolve_command_shell(&base), Some("bash".to_string()));
+        let _ = std::fs::remove_dir_all(&base);
+    }
 
     #[test]
     fn agent_isolation_defaults_to_fully_isolated_when_absent() {
