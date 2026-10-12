@@ -447,14 +447,18 @@
         return peekOpen[ctx.scope] ? `<div class="live-slot">${liveViewWidget(ctx)}</div>` : "";
       }
       /**
-       * The button that opens a squad step's live view; empty while it is open
-       * (the widget's own Hide button closes it).
+       * The button that opens a squad step's live view. It stays rendered while
+       * the view is open (as the pressed half of the split button, toggling the
+       * view closed) so the ▾ menu beside it never shifts out of place.
        * @param {string} key - The step's plain peek key.
        * @param {string} label - What the step is called in the tooltip.
        * @returns {string}
        */
       function squadLiveOpenBtn(key, label) {
-        if (peekOpen[key]) return "";
-        return `<button class="btn primary" data-click="togglePeek" data-key="${esc(key)}" style="border-radius:6px 0 0 6px"
-          data-tip="Open ${esc(label)}'s live view: its terminal, prompt and system prompt, with every attempt selectable.\nRead-only — nothing you do here is ever sent to the agent.">Live view</button>`;
+        const open = !!peekOpen[key];
+        const tip = open
+          ? `Close ${esc(label)}'s live view.`
+          : `Open ${esc(label)}'s live view: its terminal, prompt and system prompt, with every attempt selectable.\nRead-only — nothing you do here is ever sent to the agent.`;
+        return `<button class="btn${open ? "" : " primary"}" data-click="togglePeek" data-key="${esc(key)}" style="border-radius:6px 0 0 6px"
+          data-tip="${tip}">Live view</button>`;
       }
