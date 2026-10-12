@@ -3043,7 +3043,7 @@ fn cell_dispatch_priority(
 ) -> f64 {
     let guard = store.lock();
     match guard.cell_review_dispatch_priority(squad_id, row.task_idx, row.idx) {
-        Ok(Some(enabled_branch_count)) => -(enabled_branch_count as f64),
+        Ok(Some(enabled_branch_count)) => enabled_branch_count as f64,
         _ => f64::INFINITY,
     }
 }
