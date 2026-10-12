@@ -6469,6 +6469,7 @@ fn is_backed_off(client: &crate::forge::ForgeClient) -> bool {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .get(&key)
         .is_some_and(|resume_at| std::time::Instant::now() < *resume_at)
+        || client.rate_limit_backoff_remaining().is_some()
 }
 
 /// Start (or extend) a rate-limit backoff window for `client`, honoring the

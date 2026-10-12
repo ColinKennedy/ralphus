@@ -84,6 +84,9 @@ pub fn next_poll_delay(elapsed_since_start: Duration) -> Duration {
 /// headroom over the slowest pipelines observed (10+ minutes).
 pub const MAX_WATCH_DURATION: Duration = Duration::from_secs(2 * 60 * 60);
 
+/// Longest single sleep while a watched PR's forge quota is exhausted.
+const RATE_LIMIT_SLEEP_SLICE: Duration = Duration::from_secs(30);
+
 /// Do not accept an apparently-green result immediately after a push. Both
 /// forges can briefly report a clean mergeability verdict before the new
 /// commit's pipeline/check suite has been created; stopping on that first
@@ -403,6 +406,25 @@ fn run_watch(store: &crate::store_lock::StoreHandle, guardian_id: &str, branch_i
                 serde_json::json!({"pr_number": number, "outcome": "timed_out"}),
             );
             return;
+        }
+        // Out of quota: spend no calls (and record no poll error) until the
+        // window reopens. Sleeping in short slices keeps this loop's
+        // `MAX_WATCH_DURATION` accounting and cancellation responsive.
+        if let Some(wait) = client.rate_limit_backoff_remaining() {
+            log_ci_watch(
+                store,
+                guardian_id,
+                branch_id,
+                LogLevel::DEBUG,
+                format!(
+                    "ralphus [ci-watch] review {guardian_id} branch {branch_id} pr #{number} \
+                     forge quota exhausted; holding off for {}s",
+                    wait.as_secs()
+                ),
+                serde_json::json!({"pr_number": number, "outcome": "rate_limited", "wait_secs": wait.as_secs()}),
+            );
+            std::thread::sleep(wait.min(RATE_LIMIT_SLEEP_SLICE));
+            continue;
         }
         let checked = client.check_pr_ci_status(number);
         let result = store
@@ -873,6 +895,21 @@ pub fn poll_open_pr_ci_status(
             warn_on_pr_store_error(store, guardian_id, &pr, "record_pr_ci_check", result);
             continue;
         };
+        if let Some(wait) = client.rate_limit_backoff_remaining() {
+            log_ci_watch(
+                store,
+                guardian_id,
+                pr.branch_id.as_deref().unwrap_or(""),
+                LogLevel::DEBUG,
+                format!(
+                    "ralphus [ci-watch] review {guardian_id} pr #{number} standing poll skipped: \
+                     forge quota exhausted for {}s",
+                    wait.as_secs()
+                ),
+                serde_json::json!({"pr_number": number, "outcome": "rate_limited", "wait_secs": wait.as_secs()}),
+            );
+            continue;
+        }
         let probe = match client.check_pr_ci_status_probe(number) {
             Ok(p) => {
                 crate::forge_health::note_success(client.kind().as_str(), client.repo_label());
