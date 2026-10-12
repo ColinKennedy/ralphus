@@ -4818,6 +4818,23 @@ plus two lists that must not be confused:
   being carried out. It only comes into play for `block`-mode affected work,
   which waits on it. Advisory work never does.
 
+Two rules are enforced on every write that adds an entry (`POST /api/waypoints`,
+the roster and affected `POST`s, a `[[waypoint]]` in a submitted task file, and the
+daemon's own survey/submit-time enrollment). A violation is `409`
+(`invalid_transition`); automatic enrollment skips the candidate and logs instead:
+
+1. **No overlap.** An entry cannot be on both a waypoint's roster and its
+   affected list — it would wait on itself and never land. A squad and a review
+   containing its branches count as the same work, so a squad on the roster
+   conflicts with its review in affected (and vice versa); both on the *same*
+   list is fine.
+2. **No cycles.** Affected work waits on its waypoint's roster. A write that
+   would let that chain loop back across open waypoints
+   (`A -> B -> ... -> A`) is rejected, with the cycle path named in the error.
+
+Only new entries are checked: existing overlapping or cyclic data stays readable
+and closable, and updating the mode of an entry already present is not re-checked.
+
 A waypoint's tracked **projects** are inferred from its affected entries (by
 resolving each entry's own squad/review scope), so creation requires at least
 one affected entry.
