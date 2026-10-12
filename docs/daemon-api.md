@@ -262,6 +262,23 @@ produced no pane output.
 | DELETE | `/api/projects/{name}/forks/{user}` | Remove one user's fork row |
 | GET | `/api/health/project-forks` | [Advisory health checks](#fork-registration-ral-338) for every registered fork row |
 
+**Forge poll-token pool (RAL-635, admin-only)**
+| Method | Path | What |
+|---|---|---|
+| GET | `/api/forge/pool` | List the pooled poll tokens as `{"tokens": [{kind, host, label, masked, created_at_ms}]}`; the token value is never returned |
+| POST | `/api/forge/pool` | Add one (`{kind, host?, label, token}`); `201` with the masked record, `400` for an unknown kind or empty field, `409` when `(kind, host, label)` already exists |
+| DELETE | `/api/forge/pool/{kind}/{host}/{label}` | Remove one; `404` when absent |
+
+The pool is daemon-wide and keyed by `(kind, host)`. Read-only forge polling
+(CI watch, the PR cache refresh, base-state reads, the reorder poll) uses the
+first pooled token for the host and moves to the next on a `403`/`429`,
+putting the exhausted one on cooldown until its reset; after the pool it
+falls back to the acting user's own token. When every token is rejected the
+poll fails with an "all configured tokens rejected" error and the daemon
+writes a Cartographer row, a log line and an error mailbox message. Write
+calls (create/update/close a PR, comments, labels, stack retargets) never use
+pool tokens. An empty pool changes nothing.
+
 **Forge connectivity checks (RAL-523, manual-only)**
 | Method | Path | What |
 |---|---|---|

@@ -2286,6 +2286,46 @@ const PROOF_CHILDREN: &[HelpNode] = &[
     ),
 ];
 
+const FORGE_POOL_CHILDREN: &[HelpNode] = &[
+    node(
+        "list",
+        &[],
+        &[],
+        "List the poll-token pool: kind, host, label and a masked tail for each token (never the token).",
+        false,
+        true, // ("forge", "pool", "list")
+        &[],
+    ),
+    node(
+        "add",
+        &["kind [github|gitlab]", "label [str]"],
+        &["--host [host]", "--token [token]"],
+        "Add a labelled personal access token to the poll pool for one forge host (default github.com / gitlab.com). Read-only polling rotates through the pool; writes always use the acting user's own token.",
+        false,
+        false,
+        &[],
+    ),
+    node(
+        "remove",
+        &["kind [github|gitlab]", "label [str]"],
+        &["--host [host]"],
+        "Remove a labelled token from the poll pool.",
+        false,
+        false,
+        &[],
+    ),
+];
+
+const FORGE_CHILDREN: &[HelpNode] = &[node(
+    "pool",
+    &[],
+    &[],
+    "Manage the daemon-wide poll-token pool that read-only forge polling rotates through when a token is rate-limited.",
+    false,
+    false,
+    FORGE_POOL_CHILDREN,
+)];
+
 const PROPHECY_CHILDREN: &[HelpNode] = &[
     node(
         "list",
@@ -2775,6 +2815,15 @@ Python's `task show-tutor` to this top-level command.)",
             false,
             false,
             PROOF_CHILDREN,
+        ),
+        node(
+            "forge",
+            &[],
+            &[],
+            "Forge-wide settings: the poll-token pool used for read-only CI/PR polling.",
+            false,
+            false,
+            FORGE_CHILDREN,
         ),
         node(
             "prophecy",

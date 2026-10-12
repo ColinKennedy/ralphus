@@ -357,6 +357,9 @@ the daemon's hourly Free-tier background sweep
 | `review status <selector>` | Per-branch `merge_status`/`ready`/detail + a summary verdict — "is this review ready?" |
 | `review worktrees <selector>` | Worktrees/branches this review consumes, with source cell |
 | `review create <name> <base_branch> <git_root> [--checks] [--skip-checks] [--skip-worktrees] [--review-type]` | Create a review |
+| `forge pool list` | List the daemon-wide forge poll tokens (label and masked tail only) |
+| `forge pool add <kind> <label> --token <t> [--host <h>]` | Add a poll token for `github`/`gitlab` (host defaults to `github.com`/`gitlab.com`); admin-only |
+| `forge pool remove <kind> <label> [--host <h>]` | Remove a poll token; admin-only |
 | `review rename <selector> <name>` | Rename |
 | `review cancel <selector>` | Cancel |
 | `review reopen <selector>` | Reopen a cancelled or merged review, immediately staging in whatever branches are already ready |
@@ -815,6 +818,11 @@ use; see `READ_ONLY_NOTE`.
         - review-settings  {Manage a project's database-backed DEFAULT review settings (RAL-408) -- resolver agent/model, machine, budget, proof scope, and the project-level equivalents of every `ralphus review settings` opt-out flag.}
             - (read-only-safe) get name [str]  {Show a project's current review-setting overrides plus the fully resolved effective value for each (file config + database).}
             - set name [str] --auto-build [command] --auto-cancel-outdated-pr-pipelines/--no-auto-cancel-outdated-pr-pipelines --auto-fix-pr-errors/--no-auto-fix-pr-errors --auto-fix-prompt-template [str] --auto-run/--no-auto-run --auto-submit-pr-stack/--no-auto-submit-pr-stack --base-shift-maximum-rebuilds [count] --cache-manual-checks/--no-cache-manual-checks --ci-deferral [every|top|bottom+top] --clear-base-shift-maximum-rebuilds --clear-maximum-budget-usd --discourage-tests-during-auto-pr-fixes/--no-discourage-tests-during-auto-pr-fixes --dual-root-pr/--no-dual-root-pr --machine [scheme:uri] --match-pr-branch-name/--no-match-pr-branch-name --maximum-budget-usd [usd] --post-appraisals/--no-post-appraisals --proof-scope [each_branch|final_branch|nothing] --rebuild-on [none|inherit|rebase|feedback|auto_fix...] --resolver-agent [name] --resolver-model [name] --separate-pr-branch/--no-separate-pr-branch --skip-auto-clean/--no-skip-auto-clean --skip-base-updates/--no-skip-base-updates --skip-manual-checks/--no-skip-manual-checks --skip-worktrees/--no-skip-worktrees  {Update a project's DEFAULT review settings, applied to future reviews only (an Arbiter-created review with no [[review]] block, or any review whose own block leaves a field unset) -- existing reviews are unaffected.}
+    - forge  {Daemon-wide forge settings.}
+        - pool  {Poll-token pool used for read-only forge polling (RAL-635).}
+            - add kind [str] label [str] --host [host] --token [token]  {Add a labelled poll token (admin-only).}
+            - (read-only-safe) list  {List pooled poll tokens (label and masked tail only).}
+            - remove kind [str] label [str] --host [host]  {Remove a poll token (admin-only).}
     - proof  {Inspect and act on proof steps.}
         - edit selector [uri] --agent [name] --command [cmd] --maximum-tool-output-tokens [tokens] --model [name] --prompt [text]  {Edit a proof step's agent/model/command/prompt overrides.}
         - (read-only-safe) env selector [uri]  {List a proof step's resolved environment variables, read-only (RAL-324); values of names registered in the Secrets tab are masked.}

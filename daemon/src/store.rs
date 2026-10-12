@@ -2305,6 +2305,21 @@ impl Store {
                 updated_at_ms INTEGER NOT NULL,
                 PRIMARY KEY (user, host)
             );
+            -- The daemon-wide pool of forge personal access tokens used only for
+            -- polling reads (RAL-635), keyed by forge kind + host and ordered by
+            -- `id`. Independent of `user_forge_tokens`: no ralphus user owns a
+            -- pool token and write calls never use one. The raw value is read
+            -- only by the in-memory registry in `forge_pool.rs`; list APIs
+            -- return a masked tail.
+            CREATE TABLE IF NOT EXISTS forge_poll_tokens (
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                kind          TEXT NOT NULL,
+                host          TEXT NOT NULL,
+                label         TEXT NOT NULL,
+                token         TEXT NOT NULL,
+                created_at_ms INTEGER NOT NULL,
+                UNIQUE (kind, host, label)
+            );
             -- A short-lived grant minted once per worktree at fork-routing time
             -- (RAL-338 follow-up, `route_worktree_to_submitter_fork`), so that
             -- worktree's git-credential helper can later fetch its owner's

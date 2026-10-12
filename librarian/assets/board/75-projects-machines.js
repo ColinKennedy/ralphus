@@ -1449,7 +1449,105 @@ Work submitted against it will fail — fix the machine or deregister the provid
           projects = (d.projects || []).slice().sort((/** @type {ProjectView} */ a, /** @type {ProjectView} */ b) => a.name.localeCompare(b.name));
           if (!projectsValidated) { projectsValidated = true; await validateAllProjects(); }
           if (projectEditState === null) renderProjects();
+          await pollForgePool();
         } catch (e) { markUnreachable(); }
+      }
+      /**
+       * Polls `GET /api/forge/pool` (RAL-635) and re-renders the Forges
+       * section. Skips the re-render while a field inside it has focus so a
+       * half-typed token isn't wiped by the poll.
+       * @returns {Promise<void>}
+       */
+      async function pollForgePool() {
+        try {
+          const r = await fetch("/api/forge/pool");
+          if (!r.ok) { forgePoolTokens = []; renderForgePool(); return; }
+          const d = await r.json();
+          forgePoolTokens = d.tokens || [];
+          const active = document.activeElement;
+          if (!(active && byId("forge-pool").contains(active))) renderForgePool();
+        } catch (e) { /* daemon unreachable: the Projects poll already reports it */ }
+      }
+      /**
+       * `encodeURIComponent` that also escapes `'`, so the result can sit inside a single-quoted inline handler argument.
+       * @param {string} s
+       * @returns {string}
+       */
+      const encodeQuoteSafe = (s) => encodeURIComponent(s).replace(/'/g, "%27");
+      /**
+       * HTML for one forge kind's sub-section: its pool tokens (label + masked
+       * tail) and the add form.
+       * @param {string} kind - "github" or "gitlab"
+       * @param {string} title
+       * @param {string} defaultHost
+       * @returns {string}
+       */
+      function forgePoolSectionHtml(kind, title, defaultHost) {
+        const rows = forgePoolTokens.filter((t) => t.kind === kind).map((t) =>
+          `<tr>
+            <td data-tip="Label you gave this token; polling tries tokens in the order they were added.">${esc(t.label)}</td>
+            <td data-tip="The forge host this token is used against.">${esc(t.host)}</td>
+            <td class="forge-pool-mask" data-tip="Masked tail of the stored token. The full token is never shown again.">${esc(t.masked)}</td>
+            <td style="text-align:right"><button class="btn danger" style="padding:2px 8px;font-size:12px" onclick="removeForgePoolToken('${esc(kind)}', '${esc(encodeQuoteSafe(t.host))}', '${esc(encodeQuoteSafe(t.label))}')" data-tip="Remove this token from the poll pool. Polling falls back to the remaining tokens, then to the user's own token.">Remove</button></td>
+          </tr>`).join("");
+        const table = rows
+          ? `<table class="proj-table"><thead><tr><th data-tip="Label for this token.">Label</th><th data-tip="Forge host.">Host</th><th data-tip="Masked token tail.">Token</th><th></th></tr></thead><tbody>${rows}</tbody></table>`
+          : `<div class="empty">No ${esc(title)} poll tokens.</div>`;
+        return `<div class="forge-pool-kind">
+          <div class="forge-pool-title" data-tip="Read-only polling (CI watch, PR cache refresh, base-state reads) against ${esc(title)} uses these tokens in order, moving to the next when one is rate-limited, then falls back to the user's own token. Writes never use them.">${esc(title)}</div>
+          ${table}
+          <div class="row forge-pool-form" style="gap:8px;flex-wrap:wrap;margin-top:8px">
+            <input id="forge-pool-${kind}-label" type="text" placeholder="label (e.g. bot-1)" style="width:160px" data-tip="Short name for this token, unique per host. Shown in the list instead of the token." />
+            <input id="forge-pool-${kind}-host" type="text" placeholder="host (default ${esc(defaultHost)})" style="width:200px" data-tip="Forge host this token belongs to. Leave blank for ${esc(defaultHost)}; set it for a self-hosted instance." />
+            <input id="forge-pool-${kind}-token" type="password" autocomplete="off" placeholder="personal access token" style="width:260px" data-tip="A read-scoped personal access token. Stored by the daemon and never returned by the API." />
+            <button class="primary" onclick="addForgePoolToken('${esc(kind)}')" data-tip="Add this token to the ${esc(title)} poll pool.">Add</button>
+          </div>
+        </div>`;
+      }
+      /**
+       * Renders the "Forges" section (RAL-635) below the registered-projects
+       * list: GitHub and GitLab poll-token pool sub-sections.
+       * @returns {void}
+       */
+      function renderForgePool() {
+        const err = forgePoolError ? `<div class="verr" style="margin-bottom:8px">${esc(forgePoolError)}</div>` : "";
+        byId("forge-pool").innerHTML = err
+          + forgePoolSectionHtml("github", "GitHub", "github.com")
+          + forgePoolSectionHtml("gitlab", "GitLab", "gitlab.com");
+      }
+      /**
+       * Adds a poll token for `kind` from the Forges section's form.
+       * @param {string} kind - "github" or "gitlab"
+       * @returns {Promise<void>}
+       */
+      async function addForgePoolToken(kind) {
+        const field = (/** @type {string} */ name) => /** @type {HTMLInputElement} */ (byId(`forge-pool-${kind}-${name}`)).value.trim();
+        const label = field("label");
+        const host = field("host");
+        const token = field("token");
+        if (!label || !token) { forgePoolError = "A label and a token are required."; renderForgePool(); return; }
+        try {
+          const r = await post("/api/forge/pool", { kind, label, token, ...(host ? { host } : {}) });
+          forgePoolError = r.ok ? "" : await responseError(r, "add failed");
+        } catch (_) { forgePoolError = "daemon unreachable"; }
+        await pollForgePool();
+        renderForgePool();
+      }
+      /**
+       * Removes one poll token (host and label arrive URL-encoded from the row's button).
+       * @param {string} kind
+       * @param {string} host - URL-encoded
+       * @param {string} label - URL-encoded
+       * @returns {Promise<void>}
+       */
+      async function removeForgePoolToken(kind, host, label) {
+        if (!confirm(`Remove the ${kind} poll token "${decodeURIComponent(label)}" for ${decodeURIComponent(host)}?`)) return;
+        try {
+          const r = await del(`/api/forge/pool/${kind}/${host}/${label}`);
+          forgePoolError = r.ok ? "" : await responseError(r, "remove failed");
+        } catch (_) { forgePoolError = "daemon unreachable"; }
+        await pollForgePool();
+        renderForgePool();
       }
       /**
        * Forces the Projects tab to re-validate every row on the next poll.

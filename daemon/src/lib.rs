@@ -31,6 +31,7 @@ pub mod events;
 pub mod followup;
 pub mod forge;
 pub mod forge_health;
+pub mod forge_pool;
 pub mod generation;
 pub mod ghost;
 pub mod git_hooks;

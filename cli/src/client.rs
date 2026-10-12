@@ -646,6 +646,36 @@ impl DaemonClient {
         self.get(&format!("/api/users/{user}/forge-tokens"))
     }
 
+    /// `GET /api/forge/pool` (RAL-635): every poll-pool token, masked.
+    pub fn list_forge_pool(&self) -> Result<Value, DaemonError> {
+        self.get("/api/forge/pool")
+    }
+
+    /// `POST /api/forge/pool` (RAL-635): register a labelled poll token for
+    /// `(kind, host)`.
+    pub fn add_forge_pool_token(
+        &self,
+        kind: &str,
+        host: &str,
+        label: &str,
+        token: &str,
+    ) -> Result<Value, DaemonError> {
+        self.post(
+            "/api/forge/pool",
+            Some(json!({"kind": kind, "host": host, "label": label, "token": token})),
+        )
+    }
+
+    /// `DELETE /api/forge/pool/{kind}/{host}/{label}` (RAL-635).
+    pub fn remove_forge_pool_token(
+        &self,
+        kind: &str,
+        host: &str,
+        label: &str,
+    ) -> Result<Value, DaemonError> {
+        self.delete(&format!("/api/forge/pool/{kind}/{host}/{label}"))
+    }
+
     /// `POST /api/users/{user}/forge-tokens` (RAL-338 follow-up): set or
     /// replace `user`'s token for one forge host.
     pub fn set_user_forge_token(
