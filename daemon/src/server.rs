@@ -16485,12 +16485,14 @@ fn pr_poll_status(daemon: &Daemon, pr_id: &str) -> Reply {
             Err(e) => return store_error(&e),
         };
         let auto_fix = match store.get_guardian(&pr.guardian_id) {
-            Ok(g) => Some((
-                g.auto_fix_pr_errors.unwrap_or(false),
-                store
-                    .resolve_review_config(std::path::Path::new(&g.git_root))
-                    .auto_fix_max_attempts(),
-            )),
+            Ok(g) => {
+                let cfg = store.resolve_review_config(std::path::Path::new(&g.git_root));
+                Some((
+                    g.auto_fix_pr_errors
+                        .unwrap_or_else(|| cfg.auto_fix_pr_errors()),
+                    cfg.auto_fix_max_attempts(),
+                ))
+            }
             Err(_) => None,
         };
         let cache = match store.get_pr_forge_cache(pr_id) {
