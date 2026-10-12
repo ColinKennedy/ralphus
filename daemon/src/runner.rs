@@ -502,10 +502,10 @@ const PROPHECY_SYSTEM_PROMPT: &str = "Operational logging note, not a request to
      that already has a ticket, and never 'nothing more is needed'), or \
      unconfirmed (something you could not verify or do not know: a test or \
      check you could not run, behavior you did not exercise, an assumption \
-     you left untested), or refused (prompt work you explicitly decline or \
+     you left untested), refused (prompt work you explicitly decline or \
      say you cannot perform, written as '<the refused portion of the \
      prompt>; <why you refused>'; use it only for an explicit decline, not \
-     for a failure, a deferral, or something you merely could not check). \
+     for a failure, a deferral, or something you merely could not check), or suggestion (an optional \n     idea outside this task's scope that seems useful, such as a missing \n     test you noticed in passing or a related feature, which you chose not \n     to act on; deferred is work that should be done, suggestion is work \n     that might be nice). \
      When a note is about what you could not check, use unconfirmed, not \
      deferred. Writing a refused note does not make the work done. Write as many of these as are \
      genuinely useful, anywhere in your reply, not only at the end -- unlike \
