@@ -1595,6 +1595,15 @@ const WAYPOINT_CHILDREN: &[HelpNode] = &[
         &[],
     ),
     node(
+        "override",
+        &["waypoint_id [str]", "entry_id [str]"],
+        &[],
+        "Release only one held affected entry and resume its halted work, recording 'overridden by <person>' in the waypoint's delivery feed. Use when a hold is wrong or the survey could not run.",
+        false,
+        false,
+        &[],
+    ),
+    node(
         "redo",
         &["waypoint_id [str]", "entry_id [str]"],
         &[],

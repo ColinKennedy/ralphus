@@ -132,6 +132,10 @@ pub(crate) struct ForwardedEvent {
     pub(crate) is_activity_signal: bool,
 }
 
+/// The `task` name a waypoint survey's agent run is launched under. The runner
+/// never registers a waypoint-halt token for a run with this task.
+pub const WAYPOINT_SURVEY_TASK: &str = "waypoint-survey";
+
 /// The JSON spec sent to the runner on stdin (mirrors the runner's `CellSpec`).
 #[derive(Debug, Clone, Serialize)]
 pub struct RunnerSpec {
@@ -2386,11 +2390,15 @@ impl SubprocessRunner {
         // at once when that squad becomes gated behind an open block-mode
         // waypoint. `_waypoint_halt_guard` removes this cell's registration
         // on every return path, mirroring `_detach_guard`.
-        let waypoint_halt_token = self
+        // A waypoint survey's agent run carries its candidate's squad id but is
+        // not that squad's work: it is never registered, so neither a halt
+        // already in force for the candidate nor a later one can kill it.
+        let halt_registry = self
             .waypoint_halts
             .as_ref()
-            .map(|w| w.register_fresh(&spec.squad_id));
-        let _waypoint_halt_guard = self.waypoint_halts.as_ref().map(|w| WaypointHaltGuard {
+            .filter(|_| spec.task != WAYPOINT_SURVEY_TASK);
+        let waypoint_halt_token = halt_registry.map(|w| w.register_fresh(&spec.squad_id));
+        let _waypoint_halt_guard = halt_registry.map(|w| WaypointHaltGuard {
             waypoint_halts: w,
             squad_id: &spec.squad_id,
         });
