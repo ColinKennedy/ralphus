@@ -20215,4 +20215,206 @@ prompt = "do b"
         store.rename_task(&id, 0, "build").unwrap();
         assert_eq!(store.get_squad(&id).unwrap().tasks[0].name, "build");
     }
+
+    // ── worktree initialization (RAL-615) ───────────────────────────────────
+
+    fn init_columns(
+        store: &Store,
+        squad_id: &str,
+    ) -> Vec<(Option<String>, Option<String>, Option<String>)> {
+        let mut stmt = store
+            .conn
+            .prepare(
+                "SELECT init_commands, init_source, init_state FROM cells
+                 WHERE squad_id=? ORDER BY task_idx, idx",
+            )
+            .unwrap();
+        stmt.query_map(params![squad_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap()
+    }
+
+    #[test]
+    fn init_source_follows_nearest_level_and_empty_string_disables() {
+        let mut store = Store::open_in_memory().unwrap();
+        let src = r#"
+[[default]]
+initialization_commands = "squad-cmd"
+
+[[task]]
+name = "a"
+[[task.cell]]
+prompt = "inherits squad"
+[[task.cell]]
+prompt = "cell wins"
+initialization_commands = "cell-cmd"
+
+[[task]]
+name = "b"
+initialization_commands = "task-cmd"
+[[task.cell]]
+prompt = "inherits task"
+[[task.cell]]
+prompt = "disabled"
+initialization_commands = ""
+"#;
+        let id = store.insert_squad(&parse(src), None, false).unwrap();
+        let rows = init_columns(&store, &id);
+        let src_of = |i: usize| rows[i].1.as_deref();
+        assert_eq!(src_of(0), Some("squad"));
+        assert_eq!(src_of(1), Some("cell"));
+        assert_eq!(src_of(2), Some("task"));
+        assert_eq!(
+            rows[0].0.as_deref().map(from_json),
+            Some(vec!["squad-cmd".to_string()])
+        );
+        assert_eq!(
+            rows[1].0.as_deref().map(from_json),
+            Some(vec!["cell-cmd".to_string()])
+        );
+        assert_eq!(rows[3].0, None, "empty string stores no command");
+    }
+
+    #[test]
+    fn init_falls_back_to_the_project_config_and_squad_overrides_it() {
+        let root = std::env::temp_dir().join(format!("ral615-proj-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join(".ralphus.toml"),
+            "[worktree]
+initialization_commands = \"project-cmd\"
+initialization_timeout_sec = 42
+",
+        )
+        .unwrap();
+        let mut store = Store::open_in_memory().unwrap();
+        store
+            .register_project("p615", "", root.to_str().unwrap(), "git")
+            .unwrap();
+        let src = r#"
+[[task]]
+name = "a"
+project = "p615"
+[[task.cell]]
+prompt = "from project"
+[[task.cell]]
+prompt = "disabled"
+initialization_commands = ""
+[[task.cell]]
+prompt = "own"
+initialization_commands = "cell-cmd"
+"#;
+        let id = store.insert_squad(&parse(src), None, false).unwrap();
+        let rows = init_columns(&store, &id);
+        assert_eq!(rows[0].1.as_deref(), Some("project"));
+        assert_eq!(rows[1].0, None);
+        assert_eq!(rows[2].1.as_deref(), Some("cell"));
+        let timeout: Option<i64> = store
+            .conn
+            .query_row(
+                "SELECT init_timeout_sec FROM cells WHERE squad_id=? AND idx=0",
+                params![id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(timeout, Some(42));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    const SHARED_WT: &str = r#"
+[[task]]
+name = "a"
+initialization_commands = "make-assets"
+[[task.cell]]
+id = "work"
+cwd = "<<ralphus:new-worktree/shared>>"
+prompt = "work"
+[[task.cell]]
+id = "finalize"
+cwd = "<<ralphus:new-worktree/shared>>"
+prompt = "finalize"
+[[task.cell]]
+id = "other"
+prompt = "elsewhere"
+"#;
+
+    #[test]
+    fn worktree_init_is_found_through_the_shared_placeholder_for_every_sharer() {
+        let mut store = Store::open_in_memory().unwrap();
+        let id = store.insert_squad(&parse(SHARED_WT), None, false).unwrap();
+        let sel = WorktreeSelector::Placeholder("<<ralphus:new-worktree/shared>>".into());
+        let init = store.worktree_init_for(&id, &sel).unwrap().unwrap();
+        assert_eq!(init.commands, vec!["make-assets".to_string()]);
+        assert_eq!(init.cells.len(), 2);
+        assert_eq!(init.first_cell, (0, 0));
+        assert!(
+            store
+                .worktree_init_for(&id, &WorktreeSelector::Placeholder("<<nope>>".into()))
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn editing_one_sharer_updates_all_and_hash_decides_reinitialization() {
+        let mut store = Store::open_in_memory().unwrap();
+        let id = store.insert_squad(&parse(SHARED_WT), None, false).unwrap();
+        let sel = WorktreeSelector::Placeholder("<<ralphus:new-worktree/shared>>".into());
+        let original = vec!["make-assets".to_string()];
+        let outcome = crate::worktree_init::InitOutcome {
+            ok: true,
+            exit_status: "0".into(),
+            duration_ms: 1,
+            output: String::new(),
+            failed_command: None,
+            hash: crate::worktree_init::hash_commands(&original),
+        };
+        store.record_worktree_init(&id, &sel, &outcome).unwrap();
+        assert!(store.cells_needing_worktree_init(&id).unwrap().is_empty());
+
+        // Different commands: every sharer is flagged and marked `edited`.
+        let changed = vec!["other-cmd".to_string()];
+        let updated = store
+            .edit_worktree_init(&id, 0, 1, &changed, Some(7))
+            .unwrap();
+        assert_eq!(updated.len(), 2);
+        let needing = store.cells_needing_worktree_init(&id).unwrap();
+        assert_eq!(needing, HashSet::from([(0, 0), (0, 1)]));
+        let rows = init_columns(&store, &id);
+        assert_eq!(rows[0].1.as_deref(), Some("edited"));
+        assert_eq!(rows[1].1.as_deref(), Some("edited"));
+        assert_eq!(
+            rows[2].1.as_deref(),
+            Some("task"),
+            "the unrelated cell is untouched"
+        );
+
+        // Editing back to the commands that last succeeded needs no re-run.
+        store
+            .edit_worktree_init(&id, 0, 0, &original, None)
+            .unwrap();
+        assert!(store.cells_needing_worktree_init(&id).unwrap().is_empty());
+
+        // A failed run is flagged and keeps the last good hash.
+        let failed = crate::worktree_init::InitOutcome {
+            ok: false,
+            exit_status: "non-zero".into(),
+            hash: crate::worktree_init::hash_commands(&changed),
+            ..outcome
+        };
+        store.record_worktree_init(&id, &sel, &failed).unwrap();
+        assert_eq!(store.cells_needing_worktree_init(&id).unwrap().len(), 2);
+        let stored = store.worktree_init_for(&id, &sel).unwrap().unwrap();
+        assert_eq!(stored.state.as_deref(), Some("failed"));
+        assert_eq!(
+            stored.hash.as_deref(),
+            Some(crate::worktree_init::hash_commands(&original).as_str())
+        );
+
+        // Clearing the commands removes the requirement entirely.
+        store.edit_worktree_init(&id, 0, 0, &[], None).unwrap();
+        assert!(store.worktree_init_for(&id, &sel).unwrap().is_none());
+        assert!(store.cells_needing_worktree_init(&id).unwrap().is_empty());
+    }
 }

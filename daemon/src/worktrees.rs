@@ -6782,4 +6782,74 @@ mod tests {
         .expect_err("an unset proof step id must fail resolution");
         assert!(err.contains("id"), "{err}");
     }
+
+    fn init_spec(commands: &[&str], rerun_existing: bool) -> crate::worktree_init::InitSpec {
+        crate::worktree_init::InitSpec {
+            commands: commands.iter().map(|c| (*c).to_string()).collect(),
+            timeout: std::time::Duration::from_secs(60),
+            env: std::collections::BTreeMap::new(),
+            rerun_existing,
+            recorder: std::sync::Arc::new(|_| {}),
+        }
+    }
+
+    #[test]
+    fn initialization_runs_once_failure_keeps_the_worktree_and_resync_does_not_rerun() {
+        let repo = init_repo("ral615-init-lifecycle");
+        let branch = "init-feature";
+
+        // A newly created worktree runs the commands once, in its root.
+        crate::worktree_init::register(&repo, branch, init_spec(&["echo ran >> init.log"], false));
+        let wt = ensure_worktree(&repo, branch, "main").expect("materialize");
+        let log = std::fs::read_to_string(wt.join("init.log")).expect("init ran in the worktree");
+        assert_eq!(log.lines().count(), 1);
+
+        // Materializing the existing, complete worktree again (a resync) with a
+        // registered spec that is not a retry never re-runs it.
+        crate::worktree_init::register(&repo, branch, init_spec(&["echo ran >> init.log"], false));
+        let again = ensure_worktree(&repo, branch, "main").expect("resync");
+        assert_eq!(again, wt);
+        assert_eq!(
+            std::fs::read_to_string(wt.join("init.log"))
+                .unwrap()
+                .lines()
+                .count(),
+            1,
+            "resync must not re-run initialization"
+        );
+        crate::worktree_init::unregister(&repo, branch);
+
+        // A failing command errors the materialization but leaves a complete
+        // worktree behind, and a retry (rerun_existing) runs it in place.
+        let failing = "init-failing";
+        crate::worktree_init::register(
+            &repo,
+            failing,
+            init_spec(&["echo attempt >> attempts.log", "exit 3"], false),
+        );
+        let err = ensure_worktree(&repo, failing, "main").unwrap_err();
+        assert!(err.contains("exit 3"), "{err}");
+        let failed_wt = repo.join(".git").join(".ralphus").join("w");
+        assert!(failed_wt.exists());
+        let leftover = std::fs::read_dir(&failed_wt)
+            .unwrap()
+            .filter_map(Result::ok)
+            .find(|e| e.path().join("attempts.log").exists())
+            .expect("the failed worktree is left in place")
+            .path();
+        crate::worktree_init::register(
+            &repo,
+            failing,
+            init_spec(&["echo attempt >> attempts.log", "exit 3"], true),
+        );
+        assert!(ensure_worktree(&repo, failing, "main").is_err());
+        assert_eq!(
+            std::fs::read_to_string(leftover.join("attempts.log"))
+                .unwrap()
+                .lines()
+                .count(),
+            2,
+            "retry re-runs in the surviving worktree"
+        );
+    }
 }
