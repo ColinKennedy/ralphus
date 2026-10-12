@@ -1096,6 +1096,39 @@ impl ForgeClient {
     /// merge conflict, both come back as [`PrCiState::Failing`]. Logs the
     /// outbound call (start/done/error) via `rlog!`.
     pub fn check_pr_ci_status(&self, number: i64) -> Result<PrCiState, String> {
+        self.check_pr_ci_status_with_object(number)
+            .map(|(state, _)| state)
+    }
+
+    /// Poll CI and the forge's draft/WIP flag. On GitHub the draft flag is
+    /// read off the PR object the CI verdict already fetched, so it costs no
+    /// extra call; GitLab fetches the MR object separately.
+    pub fn check_pr_ci_status_probe(&self, number: i64) -> Result<PrCiProbe, String> {
+        let (ci, object) = self.check_pr_ci_status_with_object(number)?;
+        let object = match object {
+            Some(object) => object,
+            None => {
+                let token = self.require_token()?;
+                let url = format!(
+                    "{}/projects/{}/merge_requests/{number}",
+                    self.api_base, self.repo_path
+                );
+                self.get(http_agent().get(&url).set("PRIVATE-TOKEN", token))?
+            }
+        };
+        Ok(PrCiProbe {
+            ci,
+            draft: pr_object_draft(&object),
+        })
+    }
+
+    /// [`Self::check_pr_ci_status`]'s body: the CI verdict plus, on GitHub,
+    /// the PR object it was derived from (`None` on GitLab). Logs the
+    /// outbound call (start/done/error) via `rlog!`.
+    fn check_pr_ci_status_with_object(
+        &self,
+        number: i64,
+    ) -> Result<(PrCiState, Option<serde_json::Value>), String> {
         // ralphus[ignore-rlog-pair]: this provider boundary has no Store; its caller records the structured workflow outcome
         crate::rlog!(
             DEBUG,
@@ -1106,7 +1139,7 @@ impl ForgeClient {
         let result = self.check_pr_ci_status_inner(number);
         match &result {
             // ralphus[ignore-rlog-pair]: this provider boundary has no Store; its caller records the structured workflow outcome
-            Ok(state) => crate::rlog!(
+            Ok((state, _)) => crate::rlog!(
                 DEBUG,
                 "ralphus [forge] check pr ci status done kind={} repo={} number={number} state={state:?}",
                 self.kind.as_str(),
@@ -1123,42 +1156,33 @@ impl ForgeClient {
         result
     }
 
-    /// Poll CI and the forge's draft/WIP flag.
-    pub fn check_pr_ci_status_probe(&self, number: i64) -> Result<PrCiProbe, String> {
-        let ci = self.check_pr_ci_status(number)?;
-        let token = self.require_token()?;
-        let object = match self.kind {
-            ForgeKind::GitHub => {
-                let url = format!("{}/repos/{}/pulls/{number}", self.api_base, self.repo_path);
-                self.get(
-                    http_agent()
-                        .get(&url)
-                        .set("Authorization", &format!("Bearer {token}"))
-                        .set("Accept", "application/vnd.github+json"),
-                )?
-            }
-            ForgeKind::GitLab => {
-                let url = format!(
-                    "{}/projects/{}/merge_requests/{number}",
-                    self.api_base, self.repo_path
-                );
-                self.get(http_agent().get(&url).set("PRIVATE-TOKEN", token))?
-            }
-        };
-        Ok(PrCiProbe {
-            ci,
-            draft: pr_object_draft(&object),
-        })
-    }
-
-    fn check_pr_ci_status_inner(&self, number: i64) -> Result<PrCiState, String> {
+    fn check_pr_ci_status_inner(
+        &self,
+        number: i64,
+    ) -> Result<(PrCiState, Option<serde_json::Value>), String> {
         match self.kind {
-            ForgeKind::GitHub => self.check_github_pr_ci_status(number),
-            ForgeKind::GitLab => self.check_gitlab_pr_ci_status(number),
+            ForgeKind::GitHub => {
+                let pr = self.fetch_github_pull_request(number)?;
+                let state = self.github_ci_state_for_pull_request(&pr)?;
+                Ok((state, Some(pr)))
+            }
+            ForgeKind::GitLab => Ok((self.check_gitlab_pr_ci_status(number)?, None)),
         }
     }
 
-    /// GitHub half of [`Self::check_pr_ci_status`]: `mergeable_state` for the
+    fn fetch_github_pull_request(&self, number: i64) -> Result<serde_json::Value, String> {
+        let token = self.require_token()?;
+        let url = format!("{}/repos/{}/pulls/{number}", self.api_base, self.repo_path);
+        self.get(
+            http_agent()
+                .get(&url)
+                .set("Authorization", &format!("Bearer {token}"))
+                .set("Accept", "application/vnd.github+json"),
+        )
+    }
+
+    /// GitHub half of [`Self::check_pr_ci_status`], given the already-fetched PR
+    /// object `pr`: `mergeable_state` for the
     /// conflict verdict (`"dirty"` -- GitHub's own term for "has conflicts"),
     /// then the head commit's check-runs for CI. `"blocked"`/`"behind"`/
     /// `"unknown"` are treated as pending rather than failing -- they mean
@@ -1178,15 +1202,11 @@ impl ForgeClient {
     /// in-flight legacy status (`total_count > 0`) -- conflating them once
     /// made every such PR report `Pending` forever, no matter how green its
     /// check-runs were.
-    fn check_github_pr_ci_status(&self, number: i64) -> Result<PrCiState, String> {
+    fn github_ci_state_for_pull_request(
+        &self,
+        pr: &serde_json::Value,
+    ) -> Result<PrCiState, String> {
         let token = self.require_token()?;
-        let pr_url = format!("{}/repos/{}/pulls/{number}", self.api_base, self.repo_path);
-        let pr = self.get(
-            http_agent()
-                .get(&pr_url)
-                .set("Authorization", &format!("Bearer {token}"))
-                .set("Accept", "application/vnd.github+json"),
-        )?;
         match pr["mergeable_state"].as_str() {
             Some("dirty") => {
                 return Ok(PrCiState::Failing(PrFailure {
@@ -7495,6 +7515,68 @@ mod tests {
         });
         let client = mock.client(ForgeKind::GitHub, "acme/widget");
         assert_eq!(client.check_pr_ci_status(4).unwrap(), PrCiState::Passing);
+        mock.finish();
+    }
+
+    #[test]
+    fn github_probe_reads_the_draft_flag_from_the_pr_object_the_ci_check_fetched() {
+        // Exactly three scripted requests (PR, check-runs, combined status): a
+        // second PR GET for the draft flag would be a fourth request, which
+        // `MockForge` answers with a 500 and the probe would return `Err`.
+        let mock = MockForge::start(move |server| {
+            let req = server.recv();
+            assert_eq!(req.url(), "/repos/acme/widget/pulls/4");
+            req.respond(
+                tiny_http::Response::from_string(
+                    r#"{"mergeable_state": "clean", "draft": true, "head": {"sha": "deadbeef"}}"#,
+                )
+                .with_status_code(200),
+            )
+            .unwrap();
+            let req = server.recv();
+            req.respond(
+                tiny_http::Response::from_string(
+                    r#"{"check_runs": [{"name": "build", "status": "completed", "conclusion": "success"}]}"#,
+                )
+                .with_status_code(200),
+            )
+            .unwrap();
+            let req = server.recv();
+            assert_eq!(req.url(), "/repos/acme/widget/commits/deadbeef/status");
+            req.respond(
+                tiny_http::Response::from_string(r#"{"state": "success"}"#).with_status_code(200),
+            )
+            .unwrap();
+        });
+        let client = mock.client(ForgeKind::GitHub, "acme/widget");
+        let probe = client.check_pr_ci_status_probe(4).unwrap();
+        assert_eq!(probe.ci, PrCiState::Passing);
+        assert!(probe.draft);
+        mock.finish();
+    }
+
+    #[test]
+    fn gitlab_probe_still_fetches_the_merge_request_separately_for_the_draft_flag() {
+        let mock = MockForge::start(move |server| {
+            let req = server.recv();
+            assert_eq!(req.url(), "/projects/acme%2Fwidget/merge_requests/9");
+            req.respond(
+                tiny_http::Response::from_string(r#"{"merge_status": "can_be_merged"}"#)
+                    .with_status_code(200),
+            )
+            .unwrap();
+            let req = server.recv();
+            assert_eq!(req.url(), "/projects/acme%2Fwidget/merge_requests/9");
+            req.respond(
+                tiny_http::Response::from_string(r#"{"work_in_progress": true}"#)
+                    .with_status_code(200),
+            )
+            .unwrap();
+        });
+        let client = mock.client(ForgeKind::GitLab, "acme%2Fwidget");
+        let probe = client.check_pr_ci_status_probe(9).unwrap();
+        assert_eq!(probe.ci, PrCiState::Pending);
+        assert!(probe.draft);
         mock.finish();
     }
 
