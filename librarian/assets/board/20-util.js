@@ -455,6 +455,18 @@
         ? ` <span class="pill p-out-of-date" data-tip="This item's environment-variable overrides changed since it last ran/retried — a purely cosmetic signal, nothing is blocked or invalidated.\nWho/when: notice this before trusting an old run's results as still reflecting the current overrides.\nClears automatically the next time this item runs/retries, or when its status is set explicitly (e.g. via Set Status).">⚠ env out of date</span>`
         : "";
       /**
+       * Renders a "blocking N" badge (RAL-641) for a failed cell, or a review
+       * branch whose source cell failed, that is holding up other work, or an
+       * empty string when it is not blocking.
+       * @param {CellBlocking} [blocking]
+       * @returns {string}
+       */
+      const blockingBadge = (blocking) => {
+        if (!blocking) return "";
+        const total = blocking.blocked_cells + blocking.blocked_branches;
+        return ` <span class="pill p-failed" data-tip="${esc(`This cell has failed ${blocking.failure_count} times and is holding up ${blocking.blocked_cells} cell(s) and ${blocking.blocked_branches} review branch(es).\nWho/when: it failed at least ${blocking.threshold} times (the task's max_retries, default 3) and other work waits on it.\nUse Ignore and continue to let that work run without it, or disable its review branch.`)}">⛔ blocking ${total}</span>`;
+      };
+      /**
        * Renders a "detached" badge (RAL-288) for a cell that reads `running`
        * but has actually been cleanly stopped for a real interactive agent
        * session to take over — not stuck, not stalled, and not Done/Failed/

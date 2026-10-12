@@ -11919,6 +11919,7 @@ mod tests {
             auto_submit_error: None,
             finished_at_ms: None,
             disabled_reason: None,
+            blocking: None,
         }
     }
 

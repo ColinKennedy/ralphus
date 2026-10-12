@@ -2,6 +2,14 @@
       // authoritative wire shapes). Checked via `npm run typecheck` (tsc --checkJs
       // over the extracted <script> body) — see tsconfig.board.json. ----
       /**
+       * @typedef {object} CellBlocking
+       * @property {number} failure_count - RAL-641: times the cell itself failed (cascade and rate-limit failures excluded).
+       * @property {number} threshold - Failures after which the cell counts as blocking (`max_retries`, default 3).
+       * @property {number} blocked_cells - Downstream cells that cannot start while this one is failed.
+       * @property {number} blocked_branches - Enabled review branches stacked above this cell's branch.
+       * @property {[string, string]|null} [branch] - `[review id, branch]` this cell's branch sits in, if any.
+       */
+      /**
        * @typedef {object} AppraisalSection
        * @property {string} title
        * @property {string} body - Markdown.
@@ -108,6 +116,7 @@
        * @property {number|null} [started_at_ms]
        * @property {number|null} [finished_at_ms]
        * @property {boolean} [env_out_of_date] - RAL-271: cosmetic "out of date" badge — true once this cell's own `env_overrides` has been edited since the cell last ran/retried or had its status explicitly set. No behavioral effect.
+       * @property {CellBlocking} [blocking] - RAL-641: what this failed cell holds up; absent unless it has failed at least its threshold number of times and something waits on it.
        * @property {number|null} [detached_at_ms] - RAL-288: when this cell was cleanly stopped for a real interactive agent session to take over, or absent/null while it isn't detached. State still reads `running` while this is set — the cell is paused for a human, not stuck. Clears automatically on the cell's next dispatch (a restart, or resume-automation).
        * @property {number|null} [runner_stalled_at_ms] - RAL-626: Unix epoch milliseconds the daemon's runner watchdog flagged this `running` cell as having no live runner and no recent activity, or absent/null while healthy. State still reads `running` until the watchdog's second threshold fails the cell.
        * @property {number|null} [delayed_until_ms] - RAL-435: Unix epoch milliseconds this cell expects to automatically resume at, or absent/null while it isn't waiting out a rate limit. State still reads `running` while this is set — the daemon is waiting out a recognized, retryable provider rate limit's suggested delay before resuming the same agent session, not stuck and not waiting on a human (contrast `detached_at_ms`). Clears automatically once the delay elapses (a successful resume) or the retry thrashes and the cell fails.
@@ -276,6 +285,7 @@
        * @property {number|null} [rebase_commands_total] - Live rebase-todo total (RAL-145); null unless a rebase is actively paused/running in this branch's worktree.
        * @property {boolean} [can_reenable]
        * @property {string|null} [disabled_reason] - RAL-641: why the branch is disabled (`user`, `ignored`, `force-start`, `base drift`); null while enabled.
+       * @property {CellBlocking} [blocking] - RAL-641: what this branch's failing source cell holds up; absent unless it is blocking.
        * @property {string} [resolver_agent_session_id]
        * @property {{[key: string]: (string|null)}} [env_overrides] - RAL-191: this branch's own env-override layer. A string value overrides the inherited one; `null` is a tombstone removing the inherited variable entirely; an absent key is simply inherited.
        * @property {{[key: string]: string}} [inherited_env] - RAL-191: the environment inherited from this branch's source cell (`squad < task < cell`), before `env_overrides` is applied.

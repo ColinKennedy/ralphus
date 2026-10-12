@@ -700,6 +700,11 @@ pub struct BranchView {
     /// `None` while enabled or when the reason predates the column.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub disabled_reason: Option<String>,
+    /// RAL-641: what this branch's failing source cell is holding up. Present
+    /// only while that cell has failed at least its threshold number of times
+    /// and something waits on it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub blocking: Option<crate::store::CellBlocking>,
     /// RAL-317: a one-shot failure marker for this branch's most recent
     /// auto-submit-PR-stack attempt (best-effort side channel -- never blocks
     /// a Guardian merge transition). `None` means no failure to report;
@@ -6274,6 +6279,7 @@ impl Store {
                     auto_submit_error: r.get(23)?,
                     finished_at_ms: r.get(26)?,
                     disabled_reason: r.get(29)?,
+                    blocking: None,
                 })
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -6315,6 +6321,17 @@ impl Store {
                 _ => BTreeMap::new(),
             };
             b.resolved_env = apply_branch_env(&b.inherited_env, &b.env_overrides);
+            if let (Some("failed"), Some(squad_id), Some(ti), Some(si)) = (
+                b.source_cell_state.as_deref(),
+                b.source_squad_id.as_deref(),
+                b.source_task_idx,
+                b.source_cell_idx,
+            ) {
+                b.blocking = Self::cell_blocking_conn(conn, squad_id, ti, si)
+                    .ok()
+                    .flatten()
+                    .filter(crate::store::CellBlocking::is_blocking);
+            }
         }
         // RAL-145: git's own rebase-todo progress is a live filesystem read,
         // so it's gated to the (normally singular) branch actually mid-rebase
@@ -7475,6 +7492,7 @@ mod tests {
             auto_submit_error: None,
             finished_at_ms: None,
             disabled_reason: None,
+            blocking: None,
         }
     }
 

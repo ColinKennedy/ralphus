@@ -2167,7 +2167,7 @@ fn execute_squad_inner(
                 let outcome = CellOutcome {
                     state: NodeState::Failed,
                     usage: crate::store::RecordedUsage::default(),
-                    error: Some("blocked by a failed dependency".to_string()),
+                    error: Some(crate::store::BLOCKED_BY_FAILED_DEPENDENCY_ERROR.to_string()),
                     agent_session_id: None,
                 };
                 let guard = store.lock();
@@ -2845,6 +2845,7 @@ fn enqueue_cell_failure_mailbox(
                 );
         }
     }
+    guard.report_blocking_cell(squad_id, task_name, cell_id);
 }
 
 /// Park a proof scope whose step a waypoint halt killed: a cell-scope halt
