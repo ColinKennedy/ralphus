@@ -385,6 +385,7 @@ the daemon's hourly Free-tier background sweep
 | `review approve <selector>` | Approve an in_review review |
 | `review feedback <selector#branch> <text> [--author name]` | Post feedback on a branch, optionally attributed to a different registered user than the one submitting it (RAL-379); defaults to the submitter when omitted |
 | `review dismiss-reenable <selector#branch>` | Dismiss the "can re-enable" notice |
+| `review extract-branch <selector#branch>` | Move a branch into a new review of its own + rebuild both (RAL-641) |
 | `review move-branch <selector#branch> <to_review>` | Move a branch to another review + rebuild both (RAL-118) |
 | `review upstream list <selector>` | Candidate upstream branches |
 | `review upstream set <selector> <branch>` | Change upstream branch + rebuild |
@@ -874,6 +875,7 @@ use; see `READ_ONLY_NOTE`.
         - (read-only-safe) logs selector [uri]  {Show a review's state-transition audit log.}
         - manual-checks-env selector [uri] --clear [key...] --set [key=value...] --unset [key...]  {Set/unset/clear this review's manual-checks step environment overrides.}
         - merge selector [uri]  {Start (or continue) the stacked rebase.}
+        - extract-branch selector [uri]  {Move a branch into a new review of its own, then rebuild both.}
         - move-branch selector [uri] to_review [uri]  {Move a branch to another review, then rebuild both.}
         - pr  {Submit/query pull requests for a review.}
             - (read-only-safe) comments pr_id [id]  {List a PR's comments/notes.}

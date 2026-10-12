@@ -2550,13 +2550,19 @@ impl Store {
                 "source and destination review are not in the same git repository".to_string(),
             ));
         }
-        let (branch, existing_provenance): (String, Option<String>) = self
+        let (branch, existing_provenance, branch_project, branch_env_overrides): (
+            String,
+            Option<String>,
+            Option<String>,
+            String,
+        ) = self
             .conn
             .query_row(
-                "SELECT branch, moved_from_guardian_id FROM guardian_branches
+                "SELECT branch, moved_from_guardian_id, project, env_overrides
+                 FROM guardian_branches
                  WHERE guardian_id=? AND id=?",
                 params![from_guardian_id, branch_id],
-                |r| Ok((r.get(0)?, r.get(1)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
             )
             .optional()?
             .ok_or(StoreError::NotFound)?;
@@ -2604,8 +2610,8 @@ impl Store {
             // its own, collision-checked against the source's open PR alias
             // like any other.
             "INSERT INTO guardian_branches
-                 (guardian_id, position, branch, merge_status, detail, enabled, moved_from_guardian_id, id, readable_review_branch)
-             VALUES (?,?,?,?,NULL,1,?,?,1)",
+                 (guardian_id, position, branch, merge_status, detail, enabled, moved_from_guardian_id, id, readable_review_branch, project, env_overrides)
+             VALUES (?,?,?,?,NULL,1,?,?,1,?,?)",
             params![
                 to_guardian_id,
                 new_position,
@@ -2613,7 +2619,17 @@ impl Store {
                 MergeStatus::Pending.as_str(),
                 provenance,
                 branch_id,
+                branch_project,
+                branch_env_overrides,
             ],
+        )?;
+        // The destination's ready-promotion query only counts cells recorded
+        // against the destination (or against no review), so the cells that
+        // feed this branch follow it.
+        tx.execute(
+            "UPDATE cells SET review_guardian_id=?1
+             WHERE review_branch=?2 AND review_guardian_id=?3",
+            params![to_guardian_id, branch, from_guardian_id],
         )?;
         tx.commit()?;
         crate::cartographer::Note::new("guardian")
@@ -2633,6 +2649,98 @@ impl Store {
                 }),
             );
         Ok(new_position)
+    }
+
+    /// Extract one branch of `from_guardian_id` into a brand-new review and
+    /// return the new review's id.
+    ///
+    /// The new review is an `explicit` review (a user asked for it, whatever
+    /// the source's origin) on the source's base branch, git root, project and
+    /// owner (so fork routing resolves the same way), stamped with the
+    /// project's review defaults like any other new review. It is named after
+    /// the branch, with a `-2`/`-3` suffix when a review of that name already
+    /// exists. The branch itself travels through
+    /// [`Self::move_guardian_branch`], so every refusal of that move applies
+    /// here too, and `moved_from_guardian_id` links the new review back to the
+    /// source. Callers rebuild both reviews afterward, exactly as for a move.
+    pub fn extract_guardian_branch(
+        &mut self,
+        from_guardian_id: &str,
+        branch_id: &str,
+    ) -> Result<String> {
+        let source = self.get_guardian(from_guardian_id)?;
+        let branch = source
+            .branches
+            .iter()
+            .find(|b| b.id == branch_id)
+            .ok_or(StoreError::NotFound)?
+            .branch
+            .clone();
+        if source.status == "merging" || source.status == "merge_stopped" {
+            return Err(StoreError::InvalidTransition(
+                "cannot extract a branch while the review has a merge/rebase in progress or stopped mid-rebase"
+                    .to_string(),
+            ));
+        }
+        let taken: std::collections::HashSet<String> =
+            self.list_guardians()?.into_iter().map(|g| g.name).collect();
+        let name =
+            crate::review_branch::resolve_unique(&branch, |candidate| taken.contains(candidate))
+                .ok_or_else(|| {
+                    StoreError::InvalidTransition(format!(
+                        "no free review name derived from branch {branch:?}"
+                    ))
+                })?;
+        let new_id = self.create_guardian_keyed(
+            &name,
+            &source.base_branch,
+            &source.git_root,
+            None,
+            None,
+            source.project.as_deref(),
+        )?;
+        let finish = (|| -> Result<()> {
+            self.set_guardian_origin(&new_id, GUARDIAN_ORIGIN_EXPLICIT)?;
+            if source.owner.is_some() {
+                self.conn.execute(
+                    "UPDATE guardians SET owner=? WHERE id=?",
+                    params![source.owner, new_id],
+                )?;
+                self.auto_subscribe_review_submitter(&new_id, source.owner.as_deref())?;
+            }
+            crate::reviews::apply_project_review_defaults(self, &new_id, &source.git_root)
+                .map_err(|e| StoreError::InvalidTransition(e.to_string()))?;
+            // The extracted review exists to get its branch out on its own,
+            // so its PR is opened as soon as the branch builds, whatever the
+            // project's default for auto-submitting a PR stack.
+            self.conn.execute(
+                "UPDATE guardians SET auto_submit_pr_stack=1 WHERE id=?",
+                params![new_id],
+            )?;
+            self.move_guardian_branch(from_guardian_id, branch_id, &new_id)?;
+            Ok(())
+        })();
+        if let Err(err) = finish {
+            // The move refused or failed, so the new review would be an empty
+            // orphan; remove it rather than leave it on the board.
+            let _ = self.delete_guardian(&new_id);
+            return Err(err);
+        }
+        crate::cartographer::Note::new("guardian")
+            .guardian(from_guardian_id)
+            .emit(
+                self,
+                format!(
+                    "branch {branch_id} ('{branch}') extracted from review {from_guardian_id} into new review {new_id}"
+                ),
+                serde_json::json!({
+                    "branch_id": branch_id,
+                    "branch": branch,
+                    "from_guardian_id": from_guardian_id,
+                    "new_guardian_id": new_id,
+                }),
+            );
+        Ok(new_id)
     }
 
     fn guardian_exists(&self, id: &str) -> Result<()> {
@@ -10338,6 +10446,137 @@ mod tests {
         let branch = &store.get_guardian(&id).unwrap().branches[0];
         assert_eq!(branch.merge_status, MergeStatus::Ready.as_str());
         assert_eq!(branch.auto_submit_error.as_deref(), Some("still applies"));
+    }
+
+    #[test]
+    fn move_guardian_branch_carries_project_and_env_overrides() {
+        let mut store = Store::open_in_memory().unwrap();
+        let src = store.create_guardian("r1", "main", "/repo").unwrap();
+        let dst = store.create_guardian("r2", "main", "/repo").unwrap();
+        store.add_guardian_branch(&src, "a").unwrap();
+        let bid = store.get_guardian(&src).unwrap().branches[0].id.clone();
+        store
+            .conn
+            .execute(
+                "UPDATE guardian_branches SET project='proj' WHERE guardian_id=? AND id=?",
+                params![src, bid],
+            )
+            .unwrap();
+        store
+            .set_guardian_branch_env_overrides(
+                &src,
+                &bid,
+                &BTreeMap::from([("KEY".to_string(), "v".to_string())]),
+                &[],
+                &[],
+            )
+            .unwrap();
+
+        store.move_guardian_branch(&src, &bid, &dst).unwrap();
+
+        let moved = &store.get_guardian(&dst).unwrap().branches[0];
+        assert_eq!(moved.project.as_deref(), Some("proj"));
+        assert_eq!(
+            moved.env_overrides.get("KEY"),
+            Some(&Some("v".to_string())),
+            "the branch's env overrides must travel with it"
+        );
+    }
+
+    #[test]
+    fn move_guardian_branch_repoints_linked_cells_at_the_destination() {
+        let mut store = Store::open_in_memory().unwrap();
+        let src = store.create_guardian("r1", "main", "/repo").unwrap();
+        let dst = store.create_guardian("r2", "main", "/repo").unwrap();
+        store.add_guardian_branch(&src, "feat").unwrap();
+        let bid = store.get_guardian(&src).unwrap().branches[0].id.clone();
+        let squad = insert_cell_for_branch(&mut store, "feat", NodeState::Done);
+        store.set_cell_review_guardian(&squad, 0, 0, &src).unwrap();
+
+        store.move_guardian_branch(&src, &bid, &dst).unwrap();
+
+        let linked: String = store
+            .conn
+            .query_row(
+                "SELECT review_guardian_id FROM cells WHERE review_branch='feat'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(linked, dst);
+        assert_eq!(
+            store.mark_ready_branches_with_done_cells(&dst).unwrap(),
+            1,
+            "the moved branch's done cell must count for the destination"
+        );
+    }
+
+    #[test]
+    fn extract_guardian_branch_creates_an_explicit_review_with_the_branch() {
+        let mut store = Store::open_in_memory().unwrap();
+        let src = store.create_guardian("r1", "develop", "/repo").unwrap();
+        store.add_guardian_branch(&src, "a").unwrap();
+        store.add_guardian_branch(&src, "b").unwrap();
+        let bid_a = store.get_guardian(&src).unwrap().branches[0].id.clone();
+
+        let new_id = store.extract_guardian_branch(&src, &bid_a).unwrap();
+
+        assert_ne!(new_id, src);
+        let created = store.get_guardian(&new_id).unwrap();
+        assert_eq!(created.base_branch, "develop");
+        assert_eq!(created.git_root, "/repo");
+        assert_eq!(created.origin, GUARDIAN_ORIGIN_EXPLICIT);
+        assert_eq!(created.auto_submit_pr_stack, Some(true));
+        assert_eq!(created.branches.len(), 1);
+        assert_eq!(created.branches[0].id, bid_a);
+        assert_eq!(
+            created.branches[0].moved_from_guardian_id.as_deref(),
+            Some(src.as_str())
+        );
+        let source = store.get_guardian(&src).unwrap();
+        assert_eq!(source.branches.len(), 1);
+        assert_eq!(source.branches[0].branch, "b");
+        assert_eq!(source.branches[0].position, 0);
+    }
+
+    #[test]
+    fn extract_guardian_branch_leaves_no_orphan_review_when_the_move_is_refused() {
+        let mut store = Store::open_in_memory().unwrap();
+        let src = store.create_guardian("r1", "main", "/repo").unwrap();
+        store.add_guardian_branch(&src, "a").unwrap();
+        let bid = store.get_guardian(&src).unwrap().branches[0].id.clone();
+        store
+            .conn
+            .execute("UPDATE guardians SET status='merging' WHERE id=?", [&src])
+            .unwrap();
+        let before = store.list_guardians().unwrap().len();
+
+        assert!(matches!(
+            store.extract_guardian_branch(&src, &bid),
+            Err(StoreError::InvalidTransition(_))
+        ));
+        assert_eq!(store.list_guardians().unwrap().len(), before);
+        assert!(matches!(
+            store.extract_guardian_branch(&src, "nope"),
+            Err(StoreError::NotFound)
+        ));
+    }
+
+    #[test]
+    fn extract_guardian_branch_names_a_second_extraction_uniquely() {
+        let mut store = Store::open_in_memory().unwrap();
+        let src = store.create_guardian("r1", "main", "/repo").unwrap();
+        store.add_guardian_branch(&src, "feat").unwrap();
+        let bid_first = store.get_guardian(&src).unwrap().branches[0].id.clone();
+        let first = store.extract_guardian_branch(&src, &bid_first).unwrap();
+        let again = store.create_guardian("r3", "main", "/repo").unwrap();
+        store.add_guardian_branch(&again, "feat").unwrap();
+        let bid_second = store.get_guardian(&again).unwrap().branches[0].id.clone();
+        let second = store.extract_guardian_branch(&again, &bid_second).unwrap();
+        assert_ne!(
+            store.get_guardian(&first).unwrap().name,
+            store.get_guardian(&second).unwrap().name
+        );
     }
 
     #[test]

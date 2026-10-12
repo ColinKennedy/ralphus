@@ -329,6 +329,13 @@ pub fn execute(cmd: ReviewCommand, client: &DaemonClient) -> ExecResult {
                 &to_resolved.guardian_id,
             )?)
         }
+        ReviewCommand::ExtractBranch { selector } => {
+            let resolved = resolve_branch(client, &selector)?;
+            Ok(client.guardian_extract_branch(
+                &resolved.guardian_id,
+                resolved.branch_id.as_deref().unwrap_or_default(),
+            )?)
+        }
         ReviewCommand::Upstream(c) => exec_upstream(c, client),
         ReviewCommand::Pr(c) => exec_pr(c, client),
         ReviewCommand::Branch(c) => exec_branch(c, client),

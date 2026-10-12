@@ -3300,6 +3300,21 @@ Press Accept on the note to create it.">Squad pending</span>`;
         tick();
       }
 
+      /**
+       * Moves a branch out of its review into a brand-new review of its own, after confirmation.
+       * @param {string} gid
+       * @param {string} branchId
+       * @returns {Promise<void>}
+       */
+      async function extractBranch(gid, branchId) {
+        closeSquadMenu();
+        const g = guardians.find((x) => x.id === gid);
+        const branch = (g && (g.branches.find((b) => b.id === branchId) || {}).branch) || branchId;
+        if (!confirm(`Extract branch "${branch}" into a new review? Both reviews will rebuild. This cannot be undone.`)) return;
+        await guardianAction(`/api/guardians/${gid}/branches/${branchId}/extract`);
+        tick();
+      }
+
       // ---------- manual review commands (RAL-27) ----------
       /**
        * Toggles the "run individual manual check" dropdown.
