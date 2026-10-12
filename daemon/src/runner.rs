@@ -502,7 +502,7 @@ const PROPHECY_SYSTEM_PROMPT: &str = "Operational logging note, not a request to
      that already has a ticket, and never 'nothing more is needed'), or \
      unconfirmed (something you could not verify or do not know: a test or \
      check you could not run, behavior you did not exercise, an assumption \
-     you left untested), refused (prompt work you explicitly decline or \
+     you left untested), or refused (prompt work you explicitly decline or \
      say you cannot perform, written as '<the refused portion of the \
      prompt>; <why you refused>'; use it only for an explicit decline, not \
      for a failure, a deferral, or something you merely could not check), or suggestion (an optional \
