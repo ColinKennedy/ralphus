@@ -641,11 +641,6 @@ pub struct CellView {
     /// [`Store::set_cell_env_overrides`].
     #[serde(default)]
     pub env_out_of_date: bool,
-    /// RAL-641: what this cell is holding up. Present only while it has
-    /// failed at least its threshold number of times and something waits on
-    /// it; the board shows it as a "blocking N" badge.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub blocking: Option<CellBlocking>,
     /// RAL-288: when this cell was cleanly stopped ("Open Agent" on a
     /// still-running cell) for a real interactive agent session to take
     /// over. `None` while not detached. `state` stays `"running"`
@@ -4215,13 +4210,6 @@ impl Store {
             // its own run failed. NULL on rows written before this column
             // existed and on cells that are not failed.
             "ALTER TABLE cells ADD COLUMN failed_reason TEXT",
-            // RAL-641: how many times the cell itself failed. Not bumped by a
-            // failure cascaded from a prerequisite or by retry exhaustion, and
-            // never reset by a restart, so it reads as "keeps failing".
-            "ALTER TABLE cells ADD COLUMN failure_count INTEGER NOT NULL DEFAULT 0",
-            // RAL-641: the task's `max_retries`, the failure count at which a
-            // cell blocking other work is reported. NULL uses the default.
-            "ALTER TABLE tasks ADD COLUMN max_retries INTEGER",
             // RAL-400: `1` when this affected entry was auto-enrolled by the
             // daemon (submit-time scope overlap, or the survey sweep's own
             // discovery) rather than declared explicitly by a human/agent.
@@ -4747,7 +4735,7 @@ impl Store {
                 .maximum_timeout_seconds
                 .map(|s| i64::try_from(s).unwrap_or(i64::MAX));
             tx.execute(
-                "INSERT INTO tasks(squad_id, idx, name, project, agent, model, state, depends_on, queue_rank, env_overrides, no_commit_required, maximum_timeout_sec, max_retries) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "INSERT INTO tasks(squad_id, idx, name, project, agent, model, state, depends_on, queue_rank, env_overrides, no_commit_required, maximum_timeout_sec) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
                 params![
                     squad_id,
                     t_idx_i,
@@ -4771,7 +4759,6 @@ impl Store {
                     // Not resolved/inherited from anywhere; a task has no
                     // parent scope to fall back to.
                     task_maximum_timeout_sec,
-                    task.max_retries.map(i64::from),
                 ],
             )?;
 
@@ -6467,7 +6454,6 @@ impl Store {
                         started_at_ms: r.get::<_, Option<i64>>(21)?,
                         finished_at_ms: r.get::<_, Option<i64>>(22)?,
                         env_out_of_date: r.get::<_, bool>(23)?,
-                        blocking: None,
                         machine: r.get::<_, Option<String>>(24)?,
                         detached_at_ms: r.get::<_, Option<i64>>(25)?,
                         maximum_context: r.get::<_, Option<i64>>(26)?,
@@ -6496,10 +6482,6 @@ impl Store {
                 .unwrap_or_default();
             cell.state =
                 effective_cell_state(&cell.state, cell.proof.iter().map(|p| p.state.as_str()));
-            if cell.state == "failed" {
-                cell.blocking = Self::cell_blocking_conn(conn, squad_id, task_idx, idx)?
-                    .filter(CellBlocking::is_blocking);
-            }
             map.entry(task_idx).or_default().push(cell);
         }
         Ok(map)
@@ -10888,88 +10870,6 @@ impl Store {
             .unwrap_or(0)
     }
 
-    /// RAL-641: what a repeatedly failing cell is holding up. `None` when the
-    /// cell does not exist. See [`CellBlocking`].
-    pub fn cell_blocking(
-        &self,
-        squad_id: &str,
-        task_idx: i64,
-        idx: i64,
-    ) -> Result<Option<CellBlocking>> {
-        Self::cell_blocking_conn(&self.conn, squad_id, task_idx, idx)
-    }
-
-    /// [`Self::cell_blocking`] against any connection, so the board's read
-    /// pool can serve it without the writer lock.
-    pub(crate) fn cell_blocking_conn(
-        conn: &Connection,
-        squad_id: &str,
-        task_idx: i64,
-        idx: i64,
-    ) -> Result<Option<CellBlocking>> {
-        let row: Option<(i64, Option<i64>, Option<String>)> = conn
-            .query_row(
-                "SELECT c.failure_count, t.max_retries, c.review_branch
-                 FROM cells c JOIN tasks t ON t.squad_id = c.squad_id AND t.idx = c.task_idx
-                 WHERE c.squad_id=? AND c.task_idx=? AND c.idx=?",
-                params![squad_id, task_idx, idx],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-            )
-            .optional()?;
-        let Some((failure_count, max_retries, review_branch)) = row else {
-            return Ok(None);
-        };
-        let threshold = max_retries.map_or(DEFAULT_BLOCKING_FAILURE_THRESHOLD, |n| n.max(1));
-
-        let impact = Self::compute_cell_restart_impact_conn(conn, squad_id, task_idx, idx)?;
-        let mut blocked_cells = 0;
-        for c in &impact.cells {
-            if (c.task_idx, c.idx) == (task_idx, idx) {
-                continue;
-            }
-            let held: bool = conn.query_row(
-                "SELECT state='pending' OR (state='failed' AND failed_reason IS NOT ?)
-                 FROM cells WHERE squad_id=? AND task_idx=? AND idx=?",
-                params![FAILED_REASON_OWN, squad_id, c.task_idx, c.idx],
-                |r| r.get(0),
-            )?;
-            blocked_cells += i64::from(held);
-        }
-
-        let mut blocked_branches = 0;
-        let mut branch = None;
-        if let Some(name) = review_branch.filter(|b| !b.is_empty()) {
-            let mut stmt = conn.prepare(
-                "SELECT gb.guardian_id,
-                        (SELECT COUNT(*) FROM guardian_branches up
-                         WHERE up.guardian_id = gb.guardian_id AND up.position > gb.position
-                           AND up.enabled = 1)
-                 FROM guardian_branches gb JOIN guardians g ON g.id = gb.guardian_id
-                 WHERE gb.branch = ? AND gb.enabled = 1
-                   AND g.status IN ('collecting', 'merging', 'merge_failed', 'merge_stopped', 'in_review')
-                 ORDER BY g.created_at_ms, g.id",
-            )?;
-            let rows = stmt
-                .query_map(params![name], |r| {
-                    Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
-                })?
-                .collect::<std::result::Result<Vec<_>, _>>()?;
-            for (guardian_id, above) in rows {
-                blocked_branches += above;
-                if branch.is_none() {
-                    branch = Some((guardian_id, name.clone()));
-                }
-            }
-        }
-        Ok(Some(CellBlocking {
-            failure_count,
-            threshold,
-            blocked_cells,
-            blocked_branches,
-            branch,
-        }))
-    }
-
     /// Restart a single cell: reset it and every cell downstream of it
     /// within the squad to Pending, put the squad (and each affected task) back to
     /// Pending, and dirty every squad that depends on this one (RAL-19). Upstream
@@ -11674,13 +11574,6 @@ impl Store {
                     idx
                 ],
             )?;
-            if old.as_deref() != Some("failed") && counts_toward_failure_count(outcome) {
-                self.conn.execute(
-                    "UPDATE cells SET failure_count = failure_count + 1
-                     WHERE squad_id=? AND task_idx=? AND idx=?",
-                    params![squad_id, task_idx, idx],
-                )?;
-            }
         }
         let Some(old) = old.as_deref() else {
             return Ok(());
@@ -13627,61 +13520,11 @@ impl From<&crate::runner::RunnerResult> for RecordedUsage {
     }
 }
 
-/// The failure count at which a cell that blocks other work is reported, for a
-/// task without its own `max_retries`.
-pub const DEFAULT_BLOCKING_FAILURE_THRESHOLD: i64 = 3;
-
-/// A cell's failure count against its threshold, and the work waiting on it.
-#[derive(Debug, Clone, Serialize)]
-pub struct CellBlocking {
-    /// Times the cell itself failed (`cells.failure_count`).
-    pub failure_count: i64,
-    /// Failures at which the cell counts as repeatedly failing: the task's
-    /// `max_retries`, else [`DEFAULT_BLOCKING_FAILURE_THRESHOLD`].
-    pub threshold: i64,
-    /// Downstream cells that cannot start: pending, or failed only because a
-    /// prerequisite failed.
-    pub blocked_cells: i64,
-    /// Enabled review branches stacked above the cell's branch, across the
-    /// open reviews that hold it.
-    pub blocked_branches: i64,
-    /// `(review id, branch)` of the first open review holding the cell's
-    /// enabled branch.
-    pub branch: Option<(String, String)>,
-}
-
-impl CellBlocking {
-    /// Everything the cell holds up.
-    #[must_use]
-    pub fn total(&self) -> i64 {
-        self.blocked_cells + self.blocked_branches
-    }
-
-    /// True when the cell has failed at least [`Self::threshold`] times and
-    /// something waits on it.
-    #[must_use]
-    pub fn is_blocking(&self) -> bool {
-        self.failure_count >= self.threshold && self.total() > 0
-    }
-}
-
 /// `cells.failed_reason` for a cell whose own run failed.
 pub const FAILED_REASON_OWN: &str = "own";
 /// `cells.failed_reason` for a cell failed by the scheduler because a
 /// prerequisite failed.
 pub const FAILED_REASON_DEPENDENCY: &str = "dependency";
-/// The error the scheduler records on a cell failed because a prerequisite
-/// failed.
-pub const BLOCKED_BY_FAILED_DEPENDENCY_ERROR: &str = "blocked by a failed dependency";
-
-/// True when `outcome` is a failure of the cell itself: not one cascaded from
-/// a failed prerequisite, and not a provider rate-limit retry loop giving up.
-fn counts_toward_failure_count(outcome: &CellOutcome) -> bool {
-    outcome.state == NodeState::Failed
-        && outcome.error.as_deref().is_none_or(|e| {
-            e != BLOCKED_BY_FAILED_DEPENDENCY_ERROR && !crate::mailbox::is_retry_exhaustion_error(e)
-        })
-}
 
 /// The recorded outcome of running a cell.
 #[derive(Debug, Clone)]
@@ -17621,111 +17464,6 @@ command = "cargo test"
         assert_eq!(effective_cell_state("done", ["done", "halted"]), "halted");
         assert_eq!(effective_cell_state("done", ["failed", "halted"]), "failed");
     }
-    fn fail_cell(store: &Store, squad: &str, idx: i64, error: &str) {
-        store
-            .set_cell_state(squad, 0, idx, NodeState::Running)
-            .unwrap();
-        store
-            .record_cell_result(
-                squad,
-                0,
-                idx,
-                &CellOutcome {
-                    state: NodeState::Failed,
-                    usage: RecordedUsage::default(),
-                    error: Some(error.to_string()),
-                    agent_session_id: None,
-                },
-            )
-            .unwrap();
-    }
-
-    const BLOCKING_TOML: &str = "[[task]]\nname=\"t\"\nmax_retries=2\n[[task.cell]]\nid=\"a\"\ncwd=\"/r\"\nprompt=\"p\"\n[[task.cell]]\nid=\"b\"\ncwd=\"/r\"\nprompt=\"p\"\ndepends_on=[\"a\"]\n";
-
-    #[test]
-    fn failure_count_counts_own_failures_only_and_never_double_counts() {
-        let mut store = Store::open_in_memory().unwrap();
-        let squad = store
-            .insert_squad(&parse(BLOCKING_TOML), Some("r"), false)
-            .unwrap();
-        fail_cell(&store, &squad, 0, "blocked by a failed dependency");
-        assert_eq!(
-            store
-                .cell_blocking(&squad, 0, 0)
-                .unwrap()
-                .unwrap()
-                .failure_count,
-            0
-        );
-
-        // Already failed: a repeat record on the same failure is not a new one.
-        fail_cell(&store, &squad, 0, "boom");
-        assert_eq!(
-            store
-                .cell_blocking(&squad, 0, 0)
-                .unwrap()
-                .unwrap()
-                .failure_count,
-            1
-        );
-        store
-            .record_cell_result(
-                &squad,
-                0,
-                0,
-                &CellOutcome {
-                    state: NodeState::Failed,
-                    usage: RecordedUsage::default(),
-                    error: Some("boom".to_string()),
-                    agent_session_id: None,
-                },
-            )
-            .unwrap();
-        assert_eq!(
-            store
-                .cell_blocking(&squad, 0, 0)
-                .unwrap()
-                .unwrap()
-                .failure_count,
-            1
-        );
-
-        // Re-queued and failed again is a second failure.
-        store
-            .set_cell_state(&squad, 0, 0, NodeState::Pending)
-            .unwrap();
-        fail_cell(&store, &squad, 0, "boom");
-        assert_eq!(
-            store
-                .cell_blocking(&squad, 0, 0)
-                .unwrap()
-                .unwrap()
-                .failure_count,
-            2
-        );
-    }
-
-    #[test]
-    fn cell_blocking_uses_task_max_retries_and_counts_dependents() {
-        let mut store = Store::open_in_memory().unwrap();
-        let squad = store
-            .insert_squad(&parse(BLOCKING_TOML), Some("r"), false)
-            .unwrap();
-        fail_cell(&store, &squad, 0, "boom");
-        let b = store.cell_blocking(&squad, 0, 0).unwrap().unwrap();
-        assert_eq!(b.threshold, 2);
-        assert!(!b.is_blocking());
-
-        store
-            .set_cell_state(&squad, 0, 0, NodeState::Pending)
-            .unwrap();
-        fail_cell(&store, &squad, 0, "boom");
-        let b = store.cell_blocking(&squad, 0, 0).unwrap().unwrap();
-        assert_eq!(b.failure_count, 2);
-        assert_eq!(b.blocked_cells, 1);
-        assert!(b.is_blocking());
-    }
-
     #[test]
     fn record_cell_result_applies_to_a_never_started_pending_cell() {
         // Mirrors the "blocked by a failed dependency" scheduler path: the
