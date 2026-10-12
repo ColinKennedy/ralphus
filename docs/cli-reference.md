@@ -332,7 +332,7 @@ the daemon's hourly Free-tier background sweep
 | `cell worktree <selector>` | The worktree/project a cell is using |
 | `cell diff <selector> [--summary]` | A running cell's live worktree diff (full diff only recomputed after the runner pushes a change) |
 | `cell reviews <selector>` | Reviews this cell's branch participates in |
-| `cell set-status <selector> <state>` | Override a cell's status |
+| `cell set-status <selector> <state>` | Override a cell's status. `ignored` (RAL-641, "ignore and continue") also sets dependents that were failed only by the dependency cascade back to pending, and a finished squad back to pending |
 | `cell restart <selector>` | Restart a cell and its downstream |
 | `cell restart-proof <selector> --from <i>` | Restart every cell-level proof step, re-running from the start |
 | `cell edit <selector> [--cwd] [--agent] [--model] [--prompt] [--command] [--system-prompt] [--initialization-commands] [--initialization-timeout-sec]` | Edit a cell's fields |

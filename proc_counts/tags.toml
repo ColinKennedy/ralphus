@@ -76,3 +76,8 @@ tag = "review-rebase-stash"
 [[test]]
 id = "ralphus-daemon::guardian_merge squash_merged_base_shift_marks_review_and_branches_merged_without_rebuilding"
 tag = "review-base-shift-landed"
+
+# Upstream rebase that looks through an ignored cell (RAL-641).
+[[test]]
+id = "ralphus-daemon scheduler::tests::try_upstream_rebase_skips_an_ignored_cell_and_uses_its_upstream"
+tag = "upstream-rebase-ignored"

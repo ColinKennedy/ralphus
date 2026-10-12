@@ -1173,6 +1173,9 @@
           <div class="btn-row">
             <button class="btn primary" onclick="startEdit()" data-tip="Edit this cell — change its prompt, agent, model, command, or working directory.\nIf the squad is currently running it will be stopped and reset to Pending.">✎ Edit</button>
             <button class="btn" data-click="restartCell" data-squad-id="${esc(r.id)}" data-ti="${sel.taskIdx}" data-si="${sel.cellIdx}" data-tip="Re-run this cell and all downstream cells within this squad.\nDependent squads in other tasks are also re-queued.\nThis cannot be undone.">⟳ Restart cell</button>
+            ${["failed", "pending", "queued"].includes(s.state) ? `<button class="btn" data-click="ignoreCell" data-squad-id="${esc(r.id)}" data-ti="${sel.taskIdx}" data-si="${sel.cellIdx}" data-tip="Skip this cell and keep going.
+Dependents that were blocked only by this cell run again, starting from this cell's own upstream.
+Reversible: Restart cell runs it again.">⤼ Ignore and continue</button>` : ""}
           </div>
           ${(() => {
             // RAL-102/RAL-151: every command/prompt cell runs inside
