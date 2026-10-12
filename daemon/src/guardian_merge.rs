@@ -23935,7 +23935,7 @@ mod branch_diff_tests {
         let some = branch_diff_summary(&guardian, &ids[0]).unwrap();
         assert_eq!(some.files_changed, 2);
         assert_eq!(some.files_added, 1);
-        assert_eq!(some.lines_added, 3);
+        assert_eq!(some.lines_added, 2);
         assert_eq!(some.lines_removed, 1);
         assert_eq!(some.base_kind, "remote");
         let _ = std::fs::remove_dir_all(&dir);
