@@ -10370,6 +10370,68 @@ fn review_content_is_in_base(root: &Workspace, rev: &str, base_sha: &str) -> boo
         .is_ok_and(|base_tree| base_tree.trim() == merged_tree)
 }
 
+/// Whether `branch`'s review-branch tip is already in `base_sha`, by ancestry
+/// or by content ([`review_content_is_in_base`]). `false` for a branch with no
+/// review-branch tip yet.
+fn review_ref_landed(
+    root: &Workspace,
+    branch: &crate::guardian::BranchView,
+    base_sha: &str,
+) -> bool {
+    branch
+        .review_branch
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .is_some_and(|rev| {
+            root.git(&["merge-base", "--is-ancestor", rev, base_sha])
+                .is_ok()
+                || review_content_is_in_base(root, rev, base_sha)
+        })
+}
+
+/// Mark the landed prefix of each project's stack `merged` when only part of
+/// the stack has reached the base (e.g. the first four of six PRs squash-merged).
+///
+/// A review ref carries every branch beneath it, so the highest-position
+/// branch whose ref is already in the base landed together with everything
+/// below it; those branches are flagged `merged` and the rest keep their
+/// status. Only built branches count (a branch without a review-branch tip is
+/// never evidence), and an unanswerable comparison marks nothing.
+fn mark_landed_prefix_merged(
+    store: &crate::store_lock::StoreHandle,
+    id: &str,
+    guardian: &crate::guardian::GuardianView,
+    bases: &std::collections::BTreeMap<String, String>,
+) {
+    for (project, base_sha) in bases {
+        let root = Workspace::for_guardian(store, id, Path::new(project));
+        let mut branches: Vec<&crate::guardian::BranchView> = guardian
+            .branches
+            .iter()
+            .filter(|b| b.enabled)
+            .filter(|b| b.project.as_deref().unwrap_or(guardian.git_root.as_str()) == project)
+            .collect();
+        branches.sort_by_key(|b| b.position);
+        let Some(top) = branches
+            .iter()
+            .rposition(|b| review_ref_landed(&root, b, base_sha))
+        else {
+            continue;
+        };
+        for branch in &branches[..=top] {
+            if branch.merge_status == MergeStatus::Merged.as_str() {
+                continue;
+            }
+            let _ = store.lock().set_branch_status(
+                id,
+                &branch.id,
+                MergeStatus::Merged,
+                Some("base branch already contains this branch's commits"),
+            );
+        }
+    }
+}
+
 /// Whether every enabled branch under `project` already has its review-branch
 /// tip as an ancestor of `base_sha` (RAL-300) -- i.e. the base already
 /// contains that branch's work, so rebasing onto it would have nothing left
@@ -10392,15 +10454,7 @@ fn project_already_in_base(
         return false;
     }
     branches.iter().all(|b| {
-        let review_ref_is_in_base = b
-            .review_branch
-            .as_deref()
-            .filter(|s| !s.is_empty())
-            .is_some_and(|rev| {
-                root.git(&["merge-base", "--is-ancestor", rev, base_sha])
-                    .is_ok()
-                    || review_content_is_in_base(root, rev, base_sha)
-            });
+        let review_ref_is_in_base = review_ref_landed(root, b, base_sha);
         // RAL-300 bug fix: this must check the worktree's HEAD against
         // `base_sha` (the guardian's actual base branch), not against the
         // worktree's own `@{upstream}` -- for a review/PR worktree that
@@ -10695,6 +10749,11 @@ pub fn rebuild_on_base_shift_with_debounce(
         ..
     } = settled;
 
+    // A partially landed stack still rebuilds below, but the branches that did
+    // land are marked `merged` first so they read correctly right away.
+    if !fully_landed {
+        mark_landed_prefix_merged(store, id, &guardian, &shift_targets);
+    }
     // RAL-300: a base shift alone doesn't mean this review has new upstream
     // work to rebase onto -- if the shift itself is every project absorbing
     // this review's own branches (already-ancestor for all of them), then the

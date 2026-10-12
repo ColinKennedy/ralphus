@@ -4506,6 +4506,82 @@ fn squash_merged_base_shift_marks_review_and_branches_merged_without_rebuilding(
     let _ = std::fs::remove_dir_all(&root);
 }
 
+// Squash-merging only the lower part of a stack (a and b of a, b, c) lands
+// those branches together, so exactly those are flagged `merged` while the
+// still-open top branch keeps a not-merged status.
+#[test]
+fn partially_squash_merged_stack_marks_only_the_landed_branches_merged() {
+    let root = temp_repo();
+    init_repo(&root);
+    write(
+        &root, "base.txt", "base
+",
+    );
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "base"]);
+    for name in ["a", "b", "c"] {
+        let branch = format!("feature/{name}");
+        git(&root, &["checkout", "-b", &branch]);
+        write(
+            &root,
+            &format!("{name}.txt"),
+            &format!(
+                "from {name}
+"
+            ),
+        );
+        git(&root, &["add", "."]);
+        git(&root, &["commit", "-m", &format!("add {name}")]);
+    }
+    git(&root, &["checkout", "main"]);
+
+    let store = Arc::new(StoreMutex::new(Store::open_in_memory().unwrap()));
+    let id = {
+        let g = store.lock();
+        let id = g
+            .create_guardian("stack", "main", root.to_str().unwrap())
+            .unwrap();
+        for name in ["a", "b", "c"] {
+            g.add_guardian_branch(&id, &format!("feature/{name}"))
+                .unwrap();
+        }
+        id
+    };
+    run_merge(&store, &NoopRunner, &id);
+    assert_eq!(store.lock().get_guardian(&id).unwrap().status, "in_review");
+
+    // The forge squashes a and b (feature/b carries a) into one commit.
+    git(&root, &["merge", "--squash", "feature/b"]);
+    git(&root, &["commit", "-m", "a and b (#1)"]);
+
+    let sem = Semaphore::new(4);
+    rebuild_on_base_shift(&store, &NoopRunner, &id, &sem, &CancelToken::never());
+
+    let after = store.lock().get_guardian(&id).unwrap();
+    let status_of = |suffix: &str| {
+        after
+            .branches
+            .iter()
+            .find(|b| b.branch.ends_with(suffix))
+            .unwrap_or_else(|| panic!("no branch {suffix}"))
+            .merge_status
+            .clone()
+    };
+    assert_eq!(status_of("/a"), "merged");
+    assert_eq!(status_of("/b"), "merged");
+    assert_ne!(status_of("/c"), "merged", "the unlanded top branch");
+    assert_ne!(after.status, "merged", "the review is not fully landed");
+    let events = store.lock().events_for_guardian(&id, 500).unwrap();
+    assert!(
+        events.iter().any(|e| e
+            .message
+            .contains("base branch already contains this branch")),
+        "the landed prefix must be flagged directly, not only via the rebase: {events:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 // The converse: a squash that carried only part of the stack's work must not
 // read as landed.
 #[test]
