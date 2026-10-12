@@ -11331,7 +11331,7 @@ impl Store {
                  completed_active_duration_ms = completed_active_duration_ms +
                     CASE WHEN ?=1 AND active_started_at_ms IS NOT NULL THEN MAX(0, ? - active_started_at_ms) ELSE 0 END,
                  active_started_at_ms = CASE WHEN ?=1 THEN NULL ELSE active_started_at_ms END
-             WHERE squad_id=? AND task_idx=? AND idx=? AND state IN ('pending', 'running')",
+             WHERE squad_id=? AND task_idx=? AND idx=? AND state IN ('pending', 'running', ?)",
             params![
                 outcome.state.as_str(),
                 outcome.usage.tokens_in,
@@ -11353,6 +11353,7 @@ impl Store {
                 squad_id,
                 task_idx,
                 idx,
+                outcome.state.as_str(),
             ],
         )?;
         let Some(old) = old.as_deref() else {
