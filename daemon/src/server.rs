@@ -16132,17 +16132,26 @@ fn poll_status_entry(
 /// last review-feedback application -- all read from the stored
 /// [`crate::pr::PrForgeCacheView`], so it never touches the forge.
 fn pr_poll_status(daemon: &Daemon, pr_id: &str) -> Reply {
-    let (pr, cache) = {
+    let (pr, cache, auto_fix) = {
         let store = daemon.lock();
         let pr = match store.get_pull_request(pr_id) {
             Ok(pr) => pr,
             Err(e) => return store_error(&e),
         };
+        let auto_fix = match store.get_guardian(&pr.guardian_id) {
+            Ok(g) => Some((
+                g.auto_fix_pr_errors.unwrap_or(false),
+                store
+                    .resolve_review_config(std::path::Path::new(&g.git_root))
+                    .auto_fix_max_attempts(),
+            )),
+            Err(_) => None,
+        };
         let cache = match store.get_pr_forge_cache(pr_id) {
             Ok(c) => c,
             Err(e) => return store_error(&e),
         };
-        (pr, cache)
+        (pr, cache, auto_fix)
     };
     let pr_open = pr.state == "open";
     let pr_cache_cfg = crate::config::load_pr_cache_config();
@@ -16202,6 +16211,11 @@ fn pr_poll_status(daemon: &Daemon, pr_id: &str) -> Reply {
                 "applied_at_ms": c.and_then(|c| c.feedback_applied_at_ms),
             },
             "polls": polls,
+            "auto_fix": {
+                "attempts_used": pr.auto_fix_attempt_count,
+                "max_attempts": auto_fix.map(|(_, max)| max),
+                "enabled": auto_fix.map(|(on, _)| on),
+            },
         }),
     )
 }

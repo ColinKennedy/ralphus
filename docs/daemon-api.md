@@ -3454,6 +3454,7 @@ PR is selected. `polls` has one entry per poll (`ci`, `drift`, `comments`):
   "pr_id": "pr-abc123", "branch_id": "br-1", "pr_state": "open", "pr_number": 42,
   "now_ms": 1700000100000,
   "feedback": {"outcome": "applied", "applied_at_ms": 1700000050000},
+  "auto_fix": {"attempts_used": 2, "max_attempts": 3, "enabled": true},
   "polls": [
     {"kind": "ci", "state": "ok", "last_checked_at_ms": 1700000090000,
      "status": "ok", "error": null, "interval_ms": 120000,
@@ -3461,6 +3462,13 @@ PR is selected. `polls` has one entry per poll (`ci`, `drift`, `comments`):
   ]
 }
 ```
+`auto_fix` is the PR's unattended CI-fix budget: `attempts_used` is the stored
+`auto_fix_attempt_count` (a budget position, not a tally of fixes tried -- a
+refund lowers it), `max_attempts` the review project's effective
+`[review] auto_fix_max_attempts`, and `enabled` the review's
+`auto_fix_pr_errors`. `max_attempts`/`enabled` are `null` if the review row
+could not be read.
+
 `state` is `ok`, `error`, `never` (not polled yet), `inactive` (PR no longer
 open) or `disabled` (poller disabled in config); `inactive`/`disabled` carry a
 `reason` and no `next_due_at_ms`. `next_due_at_ms` is the stored last-attempt
