@@ -16186,12 +16186,14 @@ fn pr_poll_status(daemon: &Daemon, pr_id: &str) -> Reply {
             Err(e) => return store_error(&e),
         };
         let auto_fix = match store.get_guardian(&pr.guardian_id) {
-            Ok(g) => Some((
-                g.auto_fix_pr_errors.unwrap_or(false),
-                store
-                    .resolve_review_config(std::path::Path::new(&g.git_root))
-                    .auto_fix_max_attempts(),
-            )),
+            Ok(g) => {
+                let cfg = store.resolve_review_config(std::path::Path::new(&g.git_root));
+                Some((
+                    g.auto_fix_pr_errors
+                        .unwrap_or_else(|| cfg.auto_fix_pr_errors()),
+                    cfg.auto_fix_max_attempts(),
+                ))
+            }
             Err(_) => None,
         };
         let cache = match store.get_pr_forge_cache(pr_id) {
@@ -32950,6 +32952,38 @@ remediation_attempts=1
         let r = route(&d, "GET", &format!("/api/pull-requests/{pr_id}"), "");
         assert_eq!(r.status, 200);
         assert!(r.body.contains(&pr_id));
+    }
+
+    #[test]
+    fn poll_status_reports_auto_fix_budget() {
+        let d = daemon();
+        let gid = make_guardian(&d);
+        let pr_id = d
+            .lock()
+            .create_pull_request(
+                &gid,
+                Some("branch-000000000001"),
+                "github",
+                "acme/widget",
+                "feature/foo",
+                "main",
+                "Add foo",
+                "Adds the foo thing.",
+                Some(42),
+                Some("https://github.com/acme/widget/pull/42"),
+            )
+            .unwrap();
+        let r = route(
+            &d,
+            "GET",
+            &format!("/api/pull-requests/{pr_id}/poll-status"),
+            "",
+        );
+        assert_eq!(r.status, 200);
+        let v: serde_json::Value = serde_json::from_str(&r.body).unwrap();
+        assert_eq!(v["auto_fix"]["attempts_used"], 0);
+        assert_eq!(v["auto_fix"]["max_attempts"], 3);
+        assert_eq!(v["auto_fix"]["enabled"], false);
     }
 
     #[test]
