@@ -179,6 +179,7 @@
        * @typedef {object} SystemPromptReply
        * @property {boolean} available
        * @property {string} [system_prompt]
+       * @property {string|null} [restart_note] - The restart note (RAL-639) the latest attempt was dispatched with.
        * @property {string} [reason]
        */
       /**

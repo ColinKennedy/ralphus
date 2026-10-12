@@ -126,8 +126,8 @@ pub struct GatheredSquadTimeline {
 /// Build the merged, chronological timeline for `squad_id`. `NotFound` if the
 /// squad doesn't exist (mirrors every other squad-scoped `Store` accessor).
 /// Callers holding the daemon's store lock should use
-/// [`gather_squad_timeline`] under the lock and [`finish_squad_timeline`]
-/// after dropping it, since finishing reads log files and writes a temp file.
+/// [`gather_squad_timeline`] under the lock, [`finish_squad_timeline`]
+/// after dropping it, and [`finalize_timeline_file`] to write the temp file.
 pub fn build_squad_timeline(store: &Store, squad_id: &str) -> Result<SquadTimeline> {
     Ok(finish_squad_timeline(gather_squad_timeline(
         store, squad_id,
@@ -201,7 +201,7 @@ pub fn finish_squad_timeline(gathered: GatheredSquadTimeline) -> SquadTimeline {
         .collect();
 
     let text = render_text(&meta, &entries);
-    let file_path = write_temp_file(&meta.squad_id, &text);
+    let file_path = String::new();
 
     SquadTimeline {
         meta,
@@ -209,6 +209,12 @@ pub fn finish_squad_timeline(gathered: GatheredSquadTimeline) -> SquadTimeline {
         text,
         file_path,
     }
+}
+
+/// Finalize the timeline file path by writing the text to disk. Call this
+/// after releasing the store lock (blocking I/O, best-effort).
+pub fn finalize_timeline_file(timeline: &mut SquadTimeline) {
+    timeline.file_path = write_temp_file(&timeline.meta.squad_id, &timeline.text);
 }
 
 /// The current-attempt-only, chronologically-merged debug stream backing
