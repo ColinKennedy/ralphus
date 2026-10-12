@@ -8174,7 +8174,10 @@ fn apply_entity_filter(
 fn squad_timeline(daemon: &Daemon, id: &str) -> Reply {
     // Only the store reads run under the lock; the log-excerpt reads and the
     // temp-file write happen after it is dropped.
-    let gathered = crate::timeline::gather_squad_timeline(&daemon.lock(), id);
+    let gathered = {
+        let store = daemon.lock();
+        crate::timeline::gather_squad_timeline(&store, id)
+    };
     match gathered {
         Ok(g) => json(200, &crate::timeline::finish_squad_timeline(g)),
         Err(e) => store_error(&e),
