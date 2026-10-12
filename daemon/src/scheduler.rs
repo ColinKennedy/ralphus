@@ -3031,7 +3031,7 @@ fn enqueue_proof_failure_mailbox(
 /// Review's staged rebase over Cells that don't, when several are ready and
 /// only one machine slot frees up. Lower sorts first: a cell that is the
 /// first not-yet-contributed branch of a Review (see
-/// [`crate::store::Store::cell_review_dispatch_priority`]) gets a negative
+/// [`crate::store::Store::cell_review_dispatch_priority`]) gets a positive
 /// value scaled by that Review's enabled-branch count, so a longer stack's
 /// first branch beats a shorter stack's on a tie; everything else (no Review,
 /// or not first-in-line yet) gets `f64::INFINITY` — deprioritized, never
