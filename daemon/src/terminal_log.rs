@@ -788,10 +788,8 @@ fn list_run_variants_in(
             let suffix = name.strip_prefix(&prefix)?;
             let (kind, n) = if let Some(n) = suffix.strip_prefix("run-") {
                 ("command", n)
-            } else if let Some(n) = suffix.strip_prefix("remediate-") {
-                ("remediation", n)
             } else {
-                return None;
+                ("remediation", suffix.strip_prefix("remediate-")?)
             };
             Some((suffix.to_string(), kind, n.parse::<u32>().ok()?))
         })
