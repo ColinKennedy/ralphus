@@ -957,7 +957,6 @@ use; see `READ_ONLY_NOTE`.
         - edit waypoint_id [id] --agent [name] --allow-advisory/--no-allow-advisory --label [text] --model [name] --prompt [text] --resurvey  {Update a waypoint's settings: label, guidance prompt, survey agent/model, and whether advisory affected entries are allowed. Survey verdicts are kept unless --resurvey re-queues every daemon-enrolled entry for re-judging; preview that first with 'waypoint resurvey-preview'.}
         - (read-only-safe) get waypoint_id [id]  {Show one waypoint's settings, roster, affected entries, tracked projects, and delivery summary.}
         - (read-only-safe) list --project [name] --state [open|closed]  {List waypoints.}
-        - override waypoint_id [id] entry_id [id]  {Release only one held affected entry and resume its halted work, recording 'overridden by <person>' in the waypoint's delivery feed. Use when a hold is wrong or the survey could not run.}
         - redo waypoint_id [id] entry_id [id]  {Re-run a squad whose finished work a closed waypoint flagged as stale, carrying its prior findings and the waypoint's bearings into the new run.}
         - reopen waypoint_id [id]  {Reopen a closed waypoint.}
         - resurvey-preview waypoint_id [id] (subagent)  {Show what 'waypoint edit --resurvey' would re-judge: which daemon-enrolled affected entries get their verdict cleared, and which human-declared entries are left alone.}
