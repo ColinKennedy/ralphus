@@ -249,9 +249,6 @@
         // Opening the Live tab IS the request to watch, so it attaches and
         // shows the pane -- a second "Show Live View" click bought nothing,
         // since nothing had loaded before the tab was opened either way.
-        // Opening the Live tab IS the request to watch, so it attaches and
-        // shows the pane -- a second "Show Live View" click bought nothing,
-        // since nothing had loaded before the tab was opened either way.
         const bid = inspectorBranchId;
         if (tab === "appraisals" && bid) delete branchAppraisals[`${selectedGuardian}:${bid}`];
         syncHash();
