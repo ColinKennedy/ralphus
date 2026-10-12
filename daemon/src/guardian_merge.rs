@@ -16039,7 +16039,7 @@ fn parse_manual_commands_response(text: &str) -> Vec<GuardianCheck> {
             serde_json::from_str::<ManualChecksInference>(&text[start..=end]).ok()
         });
     if let Some(obj) = as_object {
-        return drop_prose_commands(obj.manual_commands.into_iter().map(Into::into).collect());
+        return obj.manual_commands.into_iter().map(Into::into).collect();
     }
     let as_array = serde_json::from_str::<Vec<ManualCheckItem>>(text)
         .ok()
@@ -16048,36 +16048,10 @@ fn parse_manual_commands_response(text: &str) -> Vec<GuardianCheck> {
             let end = text.rfind(']').unwrap_or(text.len().saturating_sub(1));
             serde_json::from_str::<Vec<ManualCheckItem>>(&text[start..=end]).ok()
         });
-    drop_prose_commands(
-        as_array
-            .unwrap_or_default()
-            .into_iter()
-            .map(Into::into)
-            .collect(),
-    )
-}
-
-/// Leading words of a sentence addressed to a person. No shell command starts
-/// with one of these, capitalised, as its program name.
-const PROSE_LEADING_WORDS: [&str; 14] = [
-    "Open", "Verify", "Load", "Check", "Navigate", "Click", "Visit", "Go", "Observe", "Confirm",
-    "Ensure", "Look", "Launch", "Review",
-];
-
-/// Whether `command` reads as an instruction for a person (`Open http://...
-/// Verify: ...`) rather than a command line a shell can run. A check like that
-/// can only fail when run, so it is dropped at parse time.
-fn command_is_prose(command: &str) -> bool {
-    let mut words = command.split_whitespace();
-    let first = words.next().unwrap_or("");
-    PROSE_LEADING_WORDS.contains(&first) && words.count() >= 3
-}
-
-/// Drop generated checks whose command is prose; see [`command_is_prose`].
-fn drop_prose_commands(checks: Vec<GuardianCheck>) -> Vec<GuardianCheck> {
-    checks
+    as_array
+        .unwrap_or_default()
         .into_iter()
-        .filter(|c| !c.command.as_deref().is_some_and(command_is_prose))
+        .map(Into::into)
         .collect()
 }
 
@@ -18453,26 +18427,6 @@ mod tests {
     fn manual_commands_prompt_requires_runnable_commands() {
         let prompt = manual_commands_prompt("tail", None);
         assert!(prompt.contains("must be a real, runnable command line"));
-    }
-
-    #[test]
-    fn parse_manual_commands_response_drops_prose_commands() {
-        let text = r#"{"manual_commands": [
-            {"command": "npm run dev"},
-            {"command": "Open http://localhost:3000 in your browser. Verify: it renders"},
-            "Start-Process http://localhost:3000"
-        ]}"#;
-        let commands: Vec<Option<String>> = parse_manual_commands_response(text)
-            .into_iter()
-            .map(|c| c.command)
-            .collect();
-        assert_eq!(
-            commands,
-            [
-                Some("npm run dev".to_string()),
-                Some("Start-Process http://localhost:3000".to_string())
-            ]
-        );
     }
 
     #[test]
