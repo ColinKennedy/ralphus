@@ -7672,6 +7672,32 @@ mod tests {
         {
             let guard = store.lock();
             guard
+                .create_waypoint(
+                    "waypoint-1",
+                    Some("halt proofs"),
+                    "is this squad affected?",
+                    None,
+                    None,
+                    false,
+                )
+                .unwrap();
+            guard
+                .add_affected_entry(
+                    "waypoint-1",
+                    crate::waypoints::WaypointEntryKind::Squad,
+                    &id,
+                    crate::waypoints::AffectedMode::Block,
+                )
+                .unwrap();
+            guard
+                .add_roster_entry(
+                    "waypoint-1",
+                    crate::waypoints::WaypointEntryKind::Squad,
+                    "squad-wp-roster",
+                    None,
+                )
+                .unwrap();
+            guard
                 .create_watch(
                     "colin",
                     &format!("squad:{id}"),
