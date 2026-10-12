@@ -142,6 +142,7 @@ where one exists.
 | GET | `/api/guardians/{id}/tests-env` | Legacy alias for the stored automated-check environment while existing reviews drain (RAL-324) |
 | GET | `/api/guardians/{id}/manual-checks-env` | Resolved environment variables for the manual-checks step (RAL-324) |
 | GET | `/api/guardians/{id}/branches/{branch_id}/conflicts` | [Live conflicting-files list](#get-apiguardiansidbranchesbranch_idconflicts) for the board's Reviews UI (RAL-148) |
+| GET | `/api/guardians/{id}/branches/{branch_id}/live-diff` | [Live diff](#get-apiguardiansidbranchesbranch_idlive-diff) of a branch worktree against its nearest enabled upstream (RAL-634) |
 | GET | `/api/guardians/{id}/branches/{branch_id}/appraisals` | [Stored appraisals of one review branch](#get-apiguardiansidbranchesbranch_idappraisals) for the board's inspector Appraisals tab (RAL-588) |
 | POST | `/api/guardians/{id}/branches/{branch_id}/open-terminal` | Spawn a resolver terminal **on the daemon host** |
 | GET | `/api/guardians/{id}/branches/{branch_id}/debug-events` | [The resolver's current-attempt debug stream](#get-apisquadsidcellstisidebug-events-and-its-proofguardian-siblings-ral-296) (RAL-296) |
@@ -2637,6 +2638,21 @@ holding one of its task's cells. Board-only (no CLI command).
   else `proof N`. Empty when none were recorded.
 
 `404` if `id` or `branch_id` doesn't address a real guardian/branch.
+
+### `GET /api/guardians/{id}/branches/{branch_id}/live-diff`
+
+The diff a resolver or auto-fix has produced so far in a branch's review
+worktree (committed, uncommitted and untracked changes), for the board's Live
+view (RAL-634). The base is resolved from the stack at request time: the
+review's base branch as the remote holds it for the first enabled branch of the
+project, otherwise the review ref of the nearest enabled branch beneath it
+(disabled branches are skipped).
+
+Response: `{ base_kind: "remote"|"review", base_branch_id, base_ref, diff,
+empty, truncated }`. `diff` is capped at 256 KiB (`truncated: true` when cut);
+`empty` is true when there are no changes. `409 live_diff_unavailable` when the
+branch is disabled, has no worktree on the daemon's host, or the base does not
+resolve.
 
 ### `GET /api/guardians/{id}/branches/{branch_id}/conflicts`
 The live list of files still carrying unresolved `<<<<<<<` merge-conflict
