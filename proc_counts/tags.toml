@@ -76,3 +76,13 @@ tag = "review-rebase-stash"
 [[test]]
 id = "ralphus-daemon::guardian_merge squash_merged_base_shift_marks_review_and_branches_merged_without_rebuilding"
 tag = "review-base-shift-landed"
+
+# Live diff of a review branch worktree against its enabled upstream (RAL-634).
+[[test]]
+id = "ralphus-daemon guardian_merge::live_diff_tests::live_diff_shows_worktree_edits_against_the_base_and_empty_without_them"
+tag = "branch-live-diff"
+
+# Truncation of diffs on line boundaries (RAL-634).
+[[test]]
+id = "ralphus-daemon guardian_merge::live_diff_tests::truncation_cuts_on_a_line_boundary_and_flags_it"
+tag = "branch-live-diff"

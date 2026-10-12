@@ -67,6 +67,24 @@
        * @type {Record<string, {at: number, summary: BranchDiffSummary|null}>}
        */
       const branchDiffSummaries = {};
+      /**
+       * @typedef {object} BranchLiveDiff
+       * @property {string} base_kind - "remote" or "review".
+       * @property {string|null} base_branch_id - The review branch diffed against, when not the remote.
+       * @property {string} base_ref - The revision actually diffed against.
+       * @property {string} diff - The (possibly truncated) unified diff.
+       * @property {boolean} empty - True when the worktree has no changes over the base.
+       * @property {boolean} truncated - True when the daemon cut the diff at its size cap.
+       */
+      /**
+       * Each branch's live diff, keyed `gid|bid`; `{error}` when the daemon could not compute one.
+       * @type {Record<string, BranchLiveDiff|{error: string}>}
+       */
+      const branchLiveDiffCache = {};
+      /** @type {Set<string>} Live-diff fetches in flight, so a repaint never starts a second. */
+      const branchLiveDiffLoading = new Set();
+      /** @type {Set<string>} Live-diff refreshes already scheduled, so the poll never doubles up. */
+      const branchLiveDiffScheduled = new Set();
       /** @type {boolean} True while the log dock is expanded. */
       let reviewDockOpen = false;
       /**
@@ -1072,6 +1090,79 @@
         return branchDiffSummaries[key].summary;
       }
       /**
+       * Fetches a branch's live diff and repaints only when it changed.
+       * @param {string} gid - The review id.
+       * @param {string} bid - The branch id.
+       * @returns {Promise<void>}
+       */
+      async function loadBranchLiveDiff(gid, bid) {
+        const key = `${gid}|${bid}`;
+        if (branchLiveDiffLoading.has(key)) return;
+        branchLiveDiffLoading.add(key);
+        const before = JSON.stringify(branchLiveDiffCache[key] || null);
+        try {
+          const r = await fetch(`/api/guardians/${encodeURIComponent(gid)}/branches/${encodeURIComponent(bid)}/live-diff`);
+          const data = await r.json().catch(() => ({}));
+          branchLiveDiffCache[key] = r.ok ? data : { error: (data.error && data.error.message) || data.message || "No live diff available." };
+        } catch {
+          branchLiveDiffCache[key] = { error: "Could not reach the daemon." };
+        } finally {
+          branchLiveDiffLoading.delete(key);
+        }
+        if (JSON.stringify(branchLiveDiffCache[key]) !== before) renderReviewInspector();
+      }
+      /**
+       * Re-reads a branch's live diff every few seconds for as long as the
+       * Diff view stays open on it (each repaint of that view re-arms this).
+       * @param {string} gid - The review id.
+       * @param {string} bid - The branch id.
+       * @returns {void}
+       */
+      function scheduleBranchLiveDiff(gid, bid) {
+        const key = `${gid}|${bid}`;
+        if (branchLiveDiffScheduled.has(key)) return;
+        branchLiveDiffScheduled.add(key);
+        setTimeout(() => {
+          branchLiveDiffScheduled.delete(key);
+          if (inspectorTab === "live" && inspectorBranchId === bid && selectedGuardian === gid && (liveSub[bid] || "terminal") === "diff") {
+            loadBranchLiveDiff(gid, bid).then(() => scheduleBranchLiveDiff(gid, bid));
+          }
+        }, 3000);
+      }
+      /**
+       * The Live tab's Diff view: what the fixer has changed in this branch's
+       * worktree so far, against the nearest enabled upstream.
+       * @param {GuardianView} g - The review.
+       * @param {GuardianBranch} b - The branch.
+       * @returns {string}
+       */
+      function inspectorLiveDiffView(g, b) {
+        const key = `${g.id}|${b.id}`;
+        if (branchLiveDiffCache[key] === undefined) loadBranchLiveDiff(g.id, b.id);
+        scheduleBranchLiveDiff(g.id, b.id);
+        const d = branchLiveDiffCache[key];
+        if (d === undefined) return `<div class="empty">Loading…</div>`;
+        if ("error" in d) return `<div class="empty" data-tip="The diff needs an enabled branch with a worktree on the daemon's host.">${esc(d.error)}</div>`;
+        const upstream = d.base_kind === "remote"
+          ? `the remote base <span class="mono">${esc(d.base_ref)}</span>`
+          : `the upstream review branch <span class="mono">${esc(d.base_ref)}</span>`;
+        const head = `<div class="hint" data-tip="Taken against the nearest enabled branch beneath this one; disabled branches are skipped.\nThe first enabled branch is measured against the remote base.">Changes against ${upstream}.</div>`;
+        if (d.empty) {
+          return head + `<div class="empty" data-tip="Nothing in this worktree differs from its base yet. If a fixer is running, it has not edited any files.">No changes yet.</div>`;
+        }
+        const lines = d.diff.split("\n").map((ln) => {
+          const color = ln.startsWith("+") && !ln.startsWith("+++") ? "var(--done)"
+            : ln.startsWith("-") && !ln.startsWith("---") ? "var(--failed)" : "";
+          return color ? `<span style="color:${color}">${esc(ln)}</span>` : esc(ln);
+        }).join("\n");
+        const cut = d.truncated
+          ? `<div class="warn" data-tip="The diff is cut at a size cap to keep this view light. Open the worktree to see the rest.">Diff truncated — showing the first part only.</div>`
+          : "";
+        return `${head}<pre class="runterm" style="height:${peekPaneHeight}px;white-space:pre;overflow:auto" tabindex="0"
+          data-tip="Read-only unified diff of this branch's worktree. Refreshes every few seconds while this view is open.">${lines}</pre>${cut}`;
+      }
+      }
+      /**
        * A branch's runs, oldest first; empty until the first fetch lands.
        * @param {string} gid - The review id.
        * @param {string} bid - The branch id.
@@ -1258,7 +1349,7 @@
           </div>`;
 
         // 4 - which view, seated directly on what it switches
-        const subs = [["terminal", "Terminal"], ["prompt", "Prompt"], ["system", "System Prompt"], ["agentlog", "Agent Log (experimental)"]];
+        const subs = [["terminal", "Terminal"], ["prompt", "Prompt"], ["system", "System Prompt"], ["agentlog", "Agent Log (experimental)"], ["diff", "Diff"]];
         const tabs = `<div class="subtabs">${subs.map((s) => `<button class="subtab ${sub === s[0] ? "on" : ""}" `
           + `data-click="inspectorSetLiveSub" data-branch-id="${esc(b.id)}" data-sub="${s[0]}" `
           + `data-tip="${esc(LIVE_SUB_TIP[s[0]])}">${s[1]}</button>`).join("")}</div>`;
@@ -1268,6 +1359,7 @@
         if (sub === "system") return top + inspectorLiveSystemPromptView(g, `guardian|${g.id}|${b.id}`);
         if (sub === "prompt") return top + livePromptView(g, b, run);
         if (sub === "agentlog") return top + liveAgentLogView(key);
+        if (sub === "diff") return top + inspectorLiveDiffView(g, b);
         return top + inspectorLiveTerminalView(g, b, key, run, onNewestTape);
       }
       /**

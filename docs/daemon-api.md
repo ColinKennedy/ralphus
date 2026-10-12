@@ -143,6 +143,7 @@ where one exists.
 | GET | `/api/guardians/{id}/manual-checks-env` | Resolved environment variables for the manual-checks step (RAL-324) |
 | GET | `/api/guardians/{id}/branches/{branch_id}/conflicts` | [Live conflicting-files list](#get-apiguardiansidbranchesbranch_idconflicts) for the board's Reviews UI (RAL-148) |
 | GET | `/api/guardians/{id}/branches/{branch_id}/diff-summary` | [Files/lines changed](#get-apiguardiansidbranchesbranch_iddiff-summary) in a branch worktree against its nearest enabled upstream (RAL-634) |
+| GET | `/api/guardians/{id}/branches/{branch_id}/live-diff` | [Live diff](#get-apiguardiansidbranchesbranch_idlive-diff) of a branch worktree against its nearest enabled upstream (RAL-634) |
 | GET | `/api/guardians/{id}/branches/{branch_id}/appraisals` | [Stored appraisals of one review branch](#get-apiguardiansidbranchesbranch_idappraisals) for the board's inspector Appraisals tab (RAL-588) |
 | GET | `/api/guardians/{id}/branches/{branch_id}/forge-status` | [Forge rate-limit and polling status of one review branch](#get-apiguardiansidbranchesbranch_idforge-status) for the board's inspector |
 | POST | `/api/guardians/{id}/branches/{branch_id}/open-terminal` | Spawn a resolver terminal **on the daemon host** |
@@ -2719,6 +2720,21 @@ plus each PR's stored last-poll errors. Board-only (no CLI command).
 - `pull_requests` — the branch's PRs, with each poll's last stored error.
 
 `404` if `id` or `branch_id` doesn't address a real guardian/branch.
+
+### `GET /api/guardians/{id}/branches/{branch_id}/live-diff`
+
+The diff a resolver or auto-fix has produced so far in a branch's review
+worktree (committed, uncommitted and untracked changes), for the board's Live
+view (RAL-634). The base is resolved from the stack at request time: the
+review's base branch as the remote holds it for the first enabled branch of the
+project, otherwise the review ref of the nearest enabled branch beneath it
+(disabled branches are skipped).
+
+Response: `{ base_kind: "remote"|"review", base_branch_id, base_ref, diff,
+empty, truncated }`. `diff` is capped at 256 KiB (`truncated: true` when cut);
+`empty` is true when there are no changes. `409 live_diff_unavailable` when the
+branch is disabled, has no worktree on the daemon's host, or the base does not
+resolve.
 
 ### `GET /api/guardians/{id}/branches/{branch_id}/conflicts`
 The live list of files still carrying unresolved `<<<<<<<` merge-conflict
