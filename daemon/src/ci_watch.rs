@@ -799,6 +799,23 @@ pub(crate) const STANDING_POLL_INTERVAL: Duration = Duration::from_secs(2 * 60);
 static STANDING_POLL_LAST: LazyLock<Mutex<HashMap<String, Instant>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
+/// How long until the next standing CI poll of `guardian_id` is allowed to
+/// run, or `None` if this process has not polled it yet (the next
+/// `review_maintenance` pass will). Read-only.
+pub(crate) fn standing_poll_next_due_in(guardian_id: &str) -> Option<Duration> {
+    let last = STANDING_POLL_LAST.lock().expect("poisoned");
+    let prev = last.get(guardian_id)?;
+    Some(STANDING_POLL_INTERVAL.saturating_sub(prev.elapsed()))
+}
+
+/// Whether a fast-start CI watch is currently in flight for this branch.
+pub(crate) fn is_watching(guardian_id: &str, branch_id: &str) -> bool {
+    WATCHING
+        .lock()
+        .expect("poisoned")
+        .contains(&(guardian_id.to_string(), branch_id.to_string()))
+}
+
 /// Poll every open, forge-numbered PR of `guardian_id` for its current CI
 /// status (RAL-395), persist the result (`crate::pr::PullRequestView::ci_status`)
 /// so the board can read it without a live forge call on every page load, and

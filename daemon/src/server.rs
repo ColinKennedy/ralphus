@@ -2125,6 +2125,18 @@ fn route_for_user(
         ("GET", ["api", "guardians", id, "branches", branch_id, "appraisals"]) => {
             guardian_branch_appraisals(daemon, id, branch_id)
         }
+        // ralphus[ignore-endpoint-cli]: board 'Forge rate limit' section of the branch inspector; no CLI equivalent
+        (
+            "GET",
+            [
+                "api",
+                "guardians",
+                id,
+                "branches",
+                branch_id,
+                "forge-status",
+            ],
+        ) => guardian_branch_forge_status(daemon, id, branch_id),
         // ralphus[ignore-endpoint-cli]: board conflict-resolution view for the branch
         ("GET", ["api", "guardians", id, "branches", branch_id, "conflicts"]) => {
             guardian_branch_conflicts(daemon, id, branch_id)
@@ -13215,6 +13227,145 @@ fn guardian_branch_appraisals(daemon: &Daemon, id: &str, branch_id: &str) -> Rep
             "post_appraisals": guardian.effective_post_appraisals,
             "appraisals": appraisals,
         }),
+    )
+}
+
+/// Epoch milliseconds `delay` from `now_ms`, saturating.
+fn after_ms(now_ms: i64, delay: std::time::Duration) -> i64 {
+    now_ms.saturating_add(i64::try_from(delay.as_millis()).unwrap_or(i64::MAX))
+}
+
+/// Everything the board's "Forge rate limit" section shows for one branch,
+/// from already-gathered inputs so the shape is unit-testable.
+///
+/// `next_attempt_at_ms` is the earliest the daemon will next call the forge
+/// for CI on this branch: the standing poll's due time, pushed back to the
+/// end of any quota backoff.
+fn branch_forge_status_json(
+    now_ms: i64,
+    client: Option<&crate::forge::ForgeClient>,
+    standing_due_in: Option<std::time::Duration>,
+    fast_watch_active: bool,
+    pr_cache: &crate::config::PrCacheConfig,
+    pull_requests: Vec<serde_json::Value>,
+) -> serde_json::Value {
+    let backoff_left = client.and_then(crate::forge::ForgeClient::rate_limit_backoff_remaining);
+    let backoff_resume = backoff_left.map(|d| after_ms(now_ms, d));
+    let standing_due = standing_due_in.map(|d| after_ms(now_ms, d));
+    let next_attempt = match (standing_due, backoff_resume) {
+        (Some(due), Some(resume)) => Some(due.max(resume)),
+        (due, resume) => due.or(resume),
+    };
+    let quota = client.and_then(crate::forge::ForgeClient::quota_snapshot);
+    serde_json::json!({
+        "now_ms": now_ms,
+        "client_resolved": client.is_some(),
+        "forge": client.map(|c| c.kind().as_str()),
+        "repo": client.map(crate::forge::ForgeClient::repo_label),
+        // Only GitHub responses carry a quota reading the daemon records.
+        "quota_tracked": client.is_some_and(|c| c.kind() == crate::forge::ForgeKind::GitHub),
+        "quota": quota.map(|q| serde_json::json!({
+            "limit": q.limit,
+            "remaining": q.remaining,
+            "reset_at_ms": q.reset_at_ms,
+            "observed_at_ms": q.observed_at_ms,
+        })),
+        "backoff": {
+            "active": backoff_left.is_some(),
+            "resume_at_ms": backoff_resume,
+            "remaining_ms": backoff_left.map(|d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX)),
+        },
+        "checks": {
+            "ci_standing": {
+                "interval_ms": i64::try_from(crate::ci_watch::STANDING_POLL_INTERVAL.as_millis())
+                    .unwrap_or(i64::MAX),
+                "next_due_at_ms": standing_due,
+            },
+            "fast_watch_active": fast_watch_active,
+            "forge_cache": {
+                "enabled": pr_cache.enabled(),
+                "interval_ms": i64::try_from(pr_cache.poll_interval().as_millis())
+                    .unwrap_or(i64::MAX),
+            },
+            "next_attempt_at_ms": next_attempt,
+        },
+        "pull_requests": pull_requests,
+    })
+}
+
+/// `GET /api/guardians/{id}/branches/{branch_id}/forge-status` -- the forge
+/// rate-limit and polling picture for one review branch, for the board's
+/// branch inspector. Works for a branch with no PR (or a failed one): the
+/// forge client is resolved from the review's repo, not from a PR row. Never
+/// calls the forge; it reads the daemon's in-memory quota and poll state plus
+/// each PR's stored last-poll errors.
+fn guardian_branch_forge_status(daemon: &Daemon, id: &str, branch_id: &str) -> Reply {
+    // Scoped so the store guard is released before `forge_client_for_pr`,
+    // which takes the store lock itself (the mutex is not reentrant).
+    let (guardian, prs) = {
+        let store = daemon.lock();
+        let guardian = match store.get_guardian(id) {
+            Ok(g) => g,
+            Err(e) => return store_error(&e),
+        };
+        if !guardian.branches.iter().any(|b| b.id == branch_id) {
+            return error(404, "not_found", "no such branch", vec![]);
+        }
+        let prs: Vec<crate::pr::PullRequestView> = match store.list_pull_requests_for_guardian(id) {
+            Ok(all) => all
+                .into_iter()
+                .filter(|p| p.branch_id.as_deref() == Some(branch_id))
+                .collect(),
+            Err(e) => return store_error(&e),
+        };
+        (guardian, prs)
+    };
+    let pull_requests: Vec<serde_json::Value> = {
+        let store = daemon.lock();
+        prs.iter()
+            .map(|pr| {
+                let cache = store.get_pr_forge_cache(&pr.id).ok().flatten();
+                let c = cache.as_ref();
+                serde_json::json!({
+                    "pr_id": pr.id,
+                    "pr_number": pr.pr_number,
+                    "state": pr.state,
+                    "repo": pr.repo,
+                    "ci_checked_at_ms": c.and_then(|c| c.ci_checked_at_ms),
+                    "ci_check_error": c.and_then(|c| c.ci_check_error.clone()),
+                    "drift_check_error": c.and_then(|c| c.drift_error.clone()),
+                    "comments_check_error": c.and_then(|c| c.comments_error.clone()),
+                })
+            })
+            .collect()
+    };
+    // The PR's own repo picks the client under fork routing; a branch with no
+    // PR yet falls back to the review's parent repo.
+    let repo = prs
+        .iter()
+        .find(|p| p.state == "open")
+        .or_else(|| prs.first())
+        .map_or("", |p| p.repo.as_str());
+    let root = Path::new(&guardian.git_root);
+    let forge_cfg = crate::config::resolve_forge(root);
+    let client = crate::pr::forge_client_for_pr(
+        &daemon.store_handle(),
+        root,
+        &guardian.base_branch,
+        &forge_cfg,
+        repo,
+        guardian.owner.as_deref(),
+    );
+    json(
+        200,
+        &branch_forge_status_json(
+            crate::store::now_ms(),
+            client.as_ref(),
+            crate::ci_watch::standing_poll_next_due_in(id),
+            crate::ci_watch::is_watching(id, branch_id),
+            &crate::config::load_pr_cache_config(),
+            pull_requests,
+        ),
     )
 }
 
@@ -27392,6 +27543,121 @@ remediation_attempts=1
             route(&d, "GET", "/api/squads/squad-999/worktrees", "").status,
             404
         );
+    }
+
+    #[test]
+    fn guardian_branch_forge_status_missing_guardian_is_404() {
+        let d = daemon();
+        assert_eq!(
+            route(
+                &d,
+                "GET",
+                "/api/guardians/guardian-999/branches/branch-1/forge-status",
+                ""
+            )
+            .status,
+            404
+        );
+    }
+
+    #[test]
+    fn guardian_branch_forge_status_missing_branch_is_404() {
+        let d = daemon();
+        let id = d.lock().create_guardian("g", "main", "/r").unwrap();
+        let r = route(
+            &d,
+            "GET",
+            &format!("/api/guardians/{id}/branches/branch-999/forge-status"),
+            "",
+        );
+        assert_eq!(r.status, 404);
+    }
+
+    #[test]
+    fn guardian_branch_forge_status_works_for_a_branch_with_no_pr() {
+        let d = daemon();
+        let id = d.lock().create_guardian("g", "main", "/r").unwrap();
+        d.lock().add_guardian_branch(&id, "feature/a").unwrap();
+        let branch_id = d.lock().guardian_branches(&id).unwrap()[0].id.clone();
+        let r = route(
+            &d,
+            "GET",
+            &format!("/api/guardians/{id}/branches/{branch_id}/forge-status"),
+            "",
+        );
+        assert_eq!(r.status, 200, "{}", r.body);
+        let v: serde_json::Value = serde_json::from_str(&r.body).unwrap();
+        assert_eq!(v["pull_requests"], serde_json::json!([]));
+        assert_eq!(v["backoff"]["active"], false);
+        assert_eq!(v["checks"]["fast_watch_active"], false);
+        assert_eq!(
+            v["checks"]["ci_standing"]["interval_ms"],
+            i64::try_from(crate::ci_watch::STANDING_POLL_INTERVAL.as_millis()).unwrap()
+        );
+    }
+
+    #[test]
+    fn branch_forge_status_json_reports_quota_backoff_and_a_pushed_back_next_attempt() {
+        let reset = u64::try_from(crate::store::now_ms() / 1000).unwrap() + 600;
+        let mock = crate::mock_forge::MockForge::start(move |server| {
+            let req = server.recv();
+            let mut resp = tiny_http::Response::from_string("{}").with_status_code(403);
+            for (name, value) in [
+                ("X-RateLimit-Limit", "5000".to_string()),
+                ("X-RateLimit-Remaining", "0".to_string()),
+                ("X-RateLimit-Reset", reset.to_string()),
+            ] {
+                resp = resp.with_header(
+                    tiny_http::Header::from_bytes(name.as_bytes(), value.as_bytes()).unwrap(),
+                );
+            }
+            req.respond(resp).unwrap();
+        });
+        let client = mock.client(crate::forge::ForgeKind::GitHub, "acme/widget");
+        assert!(client.check_pr_ci_status(4).is_err());
+        let now = crate::store::now_ms();
+        let v = branch_forge_status_json(
+            now,
+            Some(&client),
+            Some(std::time::Duration::from_secs(30)),
+            true,
+            &crate::config::PrCacheConfig::default(),
+            vec![],
+        );
+        assert_eq!(v["forge"], "github");
+        assert_eq!(v["quota_tracked"], true);
+        assert_eq!(v["quota"]["remaining"], 0);
+        assert_eq!(v["backoff"]["active"], true);
+        // The backoff outlasts the standing poll's 30s, so it sets the next
+        // attempt, and both are reported separately.
+        let resume = v["backoff"]["resume_at_ms"].as_i64().unwrap();
+        assert_eq!(v["checks"]["next_attempt_at_ms"].as_i64().unwrap(), resume);
+        assert_eq!(
+            v["checks"]["ci_standing"]["next_due_at_ms"]
+                .as_i64()
+                .unwrap(),
+            now + 30_000
+        );
+        assert!(resume > now + 30_000);
+        assert_eq!(v["checks"]["fast_watch_active"], true);
+        mock.finish();
+    }
+
+    #[test]
+    fn branch_forge_status_json_without_a_client_still_reports_poll_timing() {
+        let v = branch_forge_status_json(
+            1_000,
+            None,
+            Some(std::time::Duration::from_secs(5)),
+            false,
+            &crate::config::PrCacheConfig::default(),
+            vec![],
+        );
+        assert_eq!(v["client_resolved"], false);
+        assert!(v["forge"].is_null());
+        assert!(v["quota"].is_null());
+        assert_eq!(v["quota_tracked"], false);
+        assert_eq!(v["checks"]["next_attempt_at_ms"], 6_000);
     }
 
     #[test]
