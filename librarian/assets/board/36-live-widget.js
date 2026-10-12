@@ -322,6 +322,62 @@
       /** @type {{[baseKey: string]: AttemptMeta[]|"loading"}} Persisted attempts per step, fetched when its widget opens and dropped when it closes. */
       const liveAttempts = {};
       /**
+       * A remediated proof step's runs, as `GET .../proofs/.../runs` returns them.
+       * @typedef {object} StepRuns
+       * @property {boolean} current_started - Whether the step's own command session has logs again (a re-run after a fix), as opposed to a fix being the newest run.
+       * @property {{variant: string, kind: string, n: number}[]} runs - Archived command executions (`kind: "command"`) and repair passes (`"remediation"`), oldest first.
+       */
+      /** @type {{[baseKey: string]: StepRuns}} The latest runs list per proof step with its widget open. */
+      const liveStepRuns = {};
+      /** @type {{[baseKey: string]: number}} When each step's runs list was last requested (epoch ms), to throttle the refresh. */
+      const liveStepRunsAt = {};
+      /**
+       * Refreshes a proof step's remediation runs while its widget is open, so
+       * a fix attempt (and the command re-run after it) appears in the stepper
+       * as it starts. Throttled; repaints the owning pane only when the list
+       * changed.
+       * @param {string} baseKey - The step's plain peek key.
+       * @returns {Promise<void>}
+       */
+      async function refreshLiveStepRuns(baseKey) {
+        const [kind, squadId, ti, scope, si, vi] = baseKey.split("|");
+        if (kind !== "proof") return;
+        const now = Date.now();
+        if (now - (liveStepRunsAt[baseKey] || 0) < 2000) return;
+        liveStepRunsAt[baseKey] = now;
+        try {
+          const resp = await fetch(`/api/squads/${squadId}/proofs/${ti}/${scope}/${si}/${vi}/runs`);
+          if (!resp.ok || !peekOpen[baseKey]) return;
+          /** @type {StepRuns} */
+          const next = await resp.json();
+          if (JSON.stringify(next) === JSON.stringify(liveStepRuns[baseKey] || { runs: [], current_started: true })) return;
+          liveStepRuns[baseKey] = next;
+          rerenderOwningPane();
+        } catch (_) {
+          // The list is a refinement of the single current run; keep what is shown.
+        }
+      }
+      /**
+       * The runs of a step that failed into remediation: each command
+       * execution (COMMAND) and each repair pass (FIX), oldest first, ending
+       * with the step's own live command session once it has started again.
+       * @param {StepRuns} stepRuns - What the daemon recorded.
+       * @param {string} currentMeta - Metadata line for the newest run.
+       * @returns {BranchRun[]}
+       */
+      function remediationRuns(stepRuns, currentMeta) {
+        const commands = stepRuns.runs.filter((r) => r.kind === "command").length;
+        const out = stepRuns.runs.map((r, i) => {
+          const isCommand = r.kind === "command";
+          const newest = !stepRuns.current_started && i === stepRuns.runs.length - 1;
+          return squadLiveRun(`v:${r.variant}`, isCommand ? "command" : "fix",
+            isCommand ? `command run ${r.n}` : `fix attempt ${r.n}`,
+            newest ? currentMeta : (isCommand ? "failed" : "finished"));
+        });
+        if (stepRuns.current_started) out.push(squadLiveRun("current", "command", `command run ${commands + 1}`, currentMeta));
+        return out;
+      }
+      /**
        * Fetches a step's persisted attempts the first time its widget is
        * painted, then repaints the pane that owns it.
        * @param {string} baseKey - The step's plain peek key.
@@ -362,16 +418,19 @@
        * @param {string} baseKey - The step's plain peek key.
        * @param {boolean} withAttempts - False for a step whose daemon endpoint has no per-attempt reads.
        * @param {string} currentMeta - Metadata line for the current run.
+       * @param {string} currentKind - Picker badge for the current run.
        * @returns {BranchRun[]}
        */
-      function squadLiveRuns(baseKey, withAttempts, currentMeta) {
+      function squadLiveRuns(baseKey, withAttempts, currentMeta, currentKind) {
+        const stepRuns = withAttempts ? liveStepRuns[baseKey] : undefined;
+        if (stepRuns && stepRuns.runs.length) return remediationRuns(stepRuns, currentMeta);
         const stored = withAttempts ? liveAttempts[baseKey] : undefined;
         const persisted = Array.isArray(stored) ? stored : [];
         const when = (/** @type {AttemptMeta} */ a) => `${fmtAttemptSize(a.size_bytes)} · ${new Date(a.modified_ms).toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" })}`;
         const earlier = persisted.slice(0, -1).map((a) => squadLiveRun(`a${a.attempt}`, a.attempt === 0 ? "initial" : "reattach", `attempt ${a.attempt}`, when(a)));
         const newest = persisted.length ? persisted[persisted.length - 1] : null;
         const label = newest ? `attempt ${newest.attempt} · current` : "current run";
-        return [...earlier, squadLiveRun("current", "current", label, currentMeta)];
+        return [...earlier, squadLiveRun("current", currentKind, label, currentMeta)];
       }
       /**
        * Describes a squad cell, proof step or manual-checks run to the widget.
@@ -383,16 +442,20 @@
        * @param {string} o.promptHint - What that text is, for the Prompt tab's footnote.
        * @param {boolean} o.withAttempts - Whether earlier attempts can be read.
        * @param {string} o.currentMeta - Metadata line for the current run.
+       * @param {string} [o.currentKind] - Picker badge for the current run; "current" when omitted.
        * @param {string} o.closeKey - Peek key a Hide button toggles, or "".
        * @returns {LiveViewCtx}
        */
       function squadLiveCtx(o) {
         // Lazy: nothing is requested for a step whose live view is closed.
-        if (o.withAttempts && peekOpen[o.baseKey]) loadLiveAttempts(o.baseKey);
+        if (o.withAttempts && peekOpen[o.baseKey]) {
+          loadLiveAttempts(o.baseKey);
+          refreshLiveStepRuns(o.baseKey);
+        }
         return {
           scope: o.baseKey,
           title: o.title,
-          runs: squadLiveRuns(o.baseKey, o.withAttempts, o.currentMeta),
+          runs: squadLiveRuns(o.baseKey, o.withAttempts, o.currentMeta, o.currentKind || "current"),
           repaint: rerenderOwningPane,
           canThink: o.canThink,
           keyFor: (run) => (run && run.id !== "current" ? `${o.baseKey}|${run.id}` : o.baseKey),
@@ -421,13 +484,14 @@
        */
       function dropSquadLive(baseKey) {
         delete liveAttempts[baseKey];
+        delete liveStepRuns[baseKey];
+        delete liveStepRunsAt[baseKey];
         delete liveRunIdx[baseKey];
         delete liveSub[baseKey];
         delete liveWidgets[baseKey];
         // Earlier attempts opened through this step's widget are pinned keys of their own.
-        const pinned = `${baseKey}|a`;
         for (const k of Object.keys(peekOpen)) {
-          if (!k.startsWith(pinned) || splitPeekAttempt(k).base !== baseKey) continue;
+          if (!k.startsWith(`${baseKey}|`) || splitPeekAttempt(k).base !== baseKey) continue;
           delete peekOpen[k];
           delete peekContent[k];
           delete peekTape[k];

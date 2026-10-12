@@ -652,6 +652,8 @@
       .hkind.feedback { color: var(--accent); border-color: var(--accent-b); }
       .hkind.proof { color: var(--unverified); border-color: var(--amber-b); }
       .hkind.pr { color: var(--teal); border-color: var(--teal); }
+      .hkind.command { color: var(--teal); border-color: var(--teal); }
+      .hkind.fix { color: var(--solo); border-color: var(--solo); }
       .hlabel { color: var(--text); font-size: 10.5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
       .hmeta { color: var(--faint); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; flex: 1; }
       .hcount { color: var(--faint); flex: none; }

@@ -4309,6 +4309,31 @@ earliest history — this endpoint is best-effort (RAL-155 Q6), with no
 obligation to reconstruct pruned history. The board's "⏱ Timeline" button
 (next to "📄 Logs") calls this same endpoint and renders `text` in a modal.
 
+### `GET /api/squads/{id}/proofs/{task_idx}/{scope}/{cell_idx}/{proof_idx}/runs`
+The runs a remediating `command` proof step recorded beside its own command
+session, for the board's Live View run stepper. A failed command execution's
+terminal logs are archived as `run-<n>` before its repair agent starts, and
+each repair pass logs as `remediate-<n>`; the step's own session holds the
+newest command execution.
+
+```json
+{
+  "current_started": false,
+  "runs": [
+    { "variant": "run-1", "kind": "command", "n": 1 },
+    { "variant": "remediate-1", "kind": "remediation", "n": 1 }
+  ]
+}
+```
+
+`current_started` is whether the step's own session has logs again (the
+command re-running after a fix) rather than a repair pass being the newest
+run. `runs` is ordered by `n`, a command run before its repair. The proof
+`pane`, `pane-transcript`, `terminal-log-attempts` (list and detail),
+`debug-events` and `open-terminal` routes take `?variant=run-<n>` or
+`?variant=remediate-<n>` to address one of these runs instead of the step's
+own session; any other value is ignored.
+
 ### `GET /api/squads/{id}/cells/{ti}/{si}/debug-events` (and its proof/guardian siblings) (RAL-296)
 The same chronologically-merged Cartographer-row-plus-inlined-terminal-log-
 excerpt stream `GET /api/squads/{id}/timeline` builds for a whole squad

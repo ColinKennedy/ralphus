@@ -68,11 +68,11 @@ pub struct RepairAgent<'a> {
 ///
 /// Each retried command execution reuses `command_spec.cell_id` unchanged
 /// (so the board's live-view/peek endpoints keep addressing the same
-/// session they already do for a plain command cell/proof) -- which means a
-/// retry's terminal-log attempt file overwrites the previous attempt's own.
-/// That's fine for this loop's own purposes: the failed output a repair pass
-/// needs is always read *before* that pass triggers the next command
-/// execution. Each repair pass itself runs under a distinct
+/// session they already do for a plain command cell/proof). Before a repair
+/// pass starts, the failed execution's terminal logs are moved to the
+/// `"{session}-run-{n}"` session so the next execution does not overwrite
+/// them; the board's run stepper reads those siblings (see
+/// [`crate::terminal_log::list_run_variants`]). Each repair pass itself runs under a distinct
 /// `"{cell_id}-remediate-{n}"` cell id, so it never collides with the
 /// command's own session and stays individually inspectable on the board.
 ///
@@ -103,6 +103,17 @@ pub fn run_command_with_remediation(
         SnapshotGuard::none()
     };
 
+    let command_session = crate::tmux::session_name(
+        &command_spec.squad_id,
+        &command_spec.task,
+        &command_spec.cell_id,
+    );
+    if total_attempts > 1 {
+        // A re-run of this step starts its run history afresh.
+        for (suffix, _, _) in crate::terminal_log::list_run_variants(&command_session) {
+            crate::terminal_log::delete_for_session(&format!("{command_session}-{suffix}"));
+        }
+    }
     let mut result = runner.run_cancellable(command_spec, cancel);
     let mut attempt = 1u32;
     let mut last_repair_result: Option<RunnerResult> = None;
@@ -115,6 +126,12 @@ pub fn run_command_with_remediation(
             command_spec.squad_id,
             command_spec.task,
             command_spec.cell_id,
+        );
+        // Keep the failed execution's log as its own run: the next execution
+        // reuses this command's session name and would overwrite it.
+        crate::terminal_log::archive_session(
+            &command_session,
+            &format!("{command_session}-run-{attempt}"),
         );
         if let (Some(v), Some(dir)) = (vcs, snapshot.path()) {
             restore_worktree_before_repair(v, command_spec, dir, attempt);

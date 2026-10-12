@@ -541,7 +541,8 @@
        * @returns {string|null}
        */
       function terminalLogAttemptsUrlFor(key, attempt) {
-        const [kind, ...rest] = splitPeekAttempt(key).base.split("|");
+        const split = splitPeekAttempt(key);
+        const [kind, ...rest] = split.base.split("|");
         /** @type {string|null} */
         let base = null;
         if (kind === "cell") { const [squadId, ti, si] = rest; base = `/api/squads/${squadId}/cells/${ti}/${si}/terminal-log-attempts`; }
@@ -549,7 +550,8 @@
         else if (kind === "guardian") { const [gid, branchId] = rest; base = `/api/guardians/${gid}/branches/${branchId}/terminal-log-attempts`; }
         else if (kind === "guardian-manual") { const [gid] = rest; base = `/api/guardians/${gid}/manual-checks/terminal-log-attempts`; }
         if (base === null) return null;
-        return attempt === undefined ? base : `${base}/${attempt}`;
+        const variant = split.variant ? `?${peekVariantParam(split.variant)}` : "";
+        return (attempt === undefined ? base : `${base}/${attempt}`) + variant;
       }
       /**
        * Toggles the attempt-history box open or closed, keyed the same way as

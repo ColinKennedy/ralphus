@@ -1924,7 +1924,7 @@ fn route_for_user(
                 proof_idx,
                 "debug-events",
             ],
-        ) => proof_debug_events(daemon, id, task_idx, scope, cell_idx, proof_idx),
+        ) => proof_debug_events(daemon, id, task_idx, scope, cell_idx, proof_idx, query),
         // RAL-428: the admin-only System Prompt tab in the shared live
         // terminal viewer reads the step's exact effective system prompt
         // from these endpoints (the board never fetches them for
@@ -1946,6 +1946,21 @@ fn route_for_user(
         ) => admin_gated(daemon, user_header, || {
             proof_system_prompt(daemon, id, task_idx, scope, cell_idx, proof_idx)
         }),
+        // ralphus[ignore-endpoint-cli]: board run stepper's remediation history for a proof step
+        (
+            "GET",
+            [
+                "api",
+                "squads",
+                id,
+                "proofs",
+                task_idx,
+                scope,
+                cell_idx,
+                proof_idx,
+                "runs",
+            ],
+        ) => proof_runs(daemon, id, task_idx, scope, cell_idx, proof_idx),
         // ralphus[ignore-endpoint-cli]: board terminal-log attempt picker (RAL-154)
         (
             "GET",
@@ -1960,7 +1975,7 @@ fn route_for_user(
                 proof_idx,
                 "terminal-log-attempts",
             ],
-        ) => proof_terminal_log_attempts(daemon, id, task_idx, scope, cell_idx, proof_idx),
+        ) => proof_terminal_log_attempts(daemon, id, task_idx, scope, cell_idx, proof_idx, query),
         // ralphus[ignore-endpoint-cli]: board terminal-log attempt detail (RAL-154)
         (
             "GET",
@@ -1976,7 +1991,9 @@ fn route_for_user(
                 "terminal-log-attempts",
                 attempt,
             ],
-        ) => proof_terminal_log_attempt(daemon, id, task_idx, scope, cell_idx, proof_idx, attempt),
+        ) => proof_terminal_log_attempt(
+            daemon, id, task_idx, scope, cell_idx, proof_idx, attempt, query,
+        ),
         ("DELETE", ["api", "squads", id]) => delete_squad(daemon, id),
         ("GET", ["api", "guardians"]) => guardian_list(daemon),
         // ralphus[ignore-endpoint-cli]: board Reviews tab lean-summary list poll; CLI `review list` uses GET /api/guardians instead
@@ -11692,6 +11709,7 @@ fn open_proof_terminal(
         Err(e) => return store_error(&e),
     };
     let (squad_id, cell_id) = proof_tmux_keys(id, scope, proof_idx);
+    let cell_id = with_run_variant(&cell_id, query);
     attach_tmux_terminal(&squad_id, &task, &cell_id)
 }
 
@@ -11727,6 +11745,7 @@ fn proof_pane(
         Err(e) => return store_error(&e),
     };
     let (squad_id, cell_id) = proof_tmux_keys(id, scope, proof_idx);
+    let cell_id = with_run_variant(&cell_id, query);
     capture_pane_reply(daemon, &squad_id, &task, &cell_id, query)
 }
 
@@ -11763,6 +11782,7 @@ fn proof_pane_transcript(
         Err(e) => return store_error(&e),
     };
     let (squad_id, cell_id) = proof_tmux_keys(id, scope, proof_idx);
+    let cell_id = with_run_variant(&cell_id, query);
     pane_transcript_range_reply(&squad_id, &task, &cell_id, query)
 }
 
@@ -11775,6 +11795,7 @@ fn proof_terminal_log_attempts(
     scope: &str,
     cell_idx: &str,
     proof_idx: &str,
+    query: &str,
 ) -> Reply {
     let (Ok(task_idx_n), Ok(cell_idx_n), Ok(_proof_idx_n)) = (
         task_idx.parse::<i64>(),
@@ -11796,6 +11817,7 @@ fn proof_terminal_log_attempts(
         Err(e) => return store_error(&e),
     };
     let (squad_id, cell_id) = proof_tmux_keys(id, scope, proof_idx);
+    let cell_id = with_run_variant(&cell_id, query);
     terminal_log_attempts_reply(&squad_id, &task, &cell_id)
 }
 
@@ -11807,6 +11829,7 @@ fn proof_debug_events(
     task_idx: &str,
     scope: &str,
     cell_idx: &str,
+    query: &str,
     proof_idx: &str,
 ) -> Reply {
     let (Ok(task_idx_n), Ok(cell_idx_n), Ok(_proof_idx_n)) = (
@@ -11829,6 +11852,7 @@ fn proof_debug_events(
         Err(e) => return store_error(&e),
     };
     let (squad_id, cell_id) = proof_tmux_keys(id, scope, proof_idx);
+    let cell_id = with_run_variant(&cell_id, query);
     debug_events_reply(daemon, &squad_id, &task, &cell_id)
 }
 
@@ -11842,6 +11866,7 @@ fn proof_terminal_log_attempt(
     scope: &str,
     cell_idx: &str,
     proof_idx: &str,
+    query: &str,
     attempt: &str,
 ) -> Reply {
     let (Ok(task_idx_n), Ok(cell_idx_n), Ok(_proof_idx_n)) = (
@@ -11864,7 +11889,85 @@ fn proof_terminal_log_attempt(
         Err(e) => return store_error(&e),
     };
     let (squad_id, cell_id) = proof_tmux_keys(id, scope, proof_idx);
+    let cell_id = with_run_variant(&cell_id, query);
     terminal_log_attempt_content_reply(&squad_id, &task, &cell_id, attempt)
+}
+
+/// The cell id of one run of a remediated step: `cell_id` itself, or --
+/// when the request carries a valid `variant` (`run-<n>` for an archived
+/// earlier command execution, `remediate-<n>` for a repair agent's pass) --
+/// the sibling session that run's logs live under. An unrecognised variant is
+/// ignored rather than letting a caller address an arbitrary session name.
+fn with_run_variant(cell_id: &str, query: &str) -> String {
+    let valid = query_param(query, "variant").filter(|v| {
+        v.strip_prefix("run-")
+            .or_else(|| v.strip_prefix("remediate-"))
+            .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+    });
+    match valid {
+        Some(v) => format!("{cell_id}-{v}"),
+        None => cell_id.to_string(),
+    }
+}
+
+#[derive(Serialize)]
+struct StepRun {
+    variant: String,
+    kind: &'static str,
+    n: u32,
+}
+
+#[derive(Serialize)]
+struct StepRunsResponse {
+    current_started: bool,
+    runs: Vec<StepRun>,
+}
+
+/// The remediation runs recorded beside a proof step's own command session
+/// -- archived earlier command executions and repair-agent passes -- so the
+/// board's run stepper can list them in order. Empty for a step that never
+/// failed into remediation.
+fn proof_runs(
+    daemon: &Daemon,
+    id: &str,
+    task_idx: &str,
+    scope: &str,
+    cell_idx: &str,
+    proof_idx: &str,
+) -> Reply {
+    let (Ok(task_idx_n), Ok(cell_idx_n), Ok(_)) = (
+        task_idx.parse::<i64>(),
+        cell_idx.parse::<i64>(),
+        proof_idx.parse::<i64>(),
+    ) else {
+        return error(
+            400,
+            "bad_request",
+            "task/cell/proof index must be integers",
+            vec![],
+        );
+    };
+    if let Err(e) = daemon.lock().proof_specs(id, task_idx_n, scope, cell_idx_n) {
+        return store_error(&e);
+    }
+    let task = match daemon.lock().get_task_name(id, task_idx_n) {
+        Ok(v) => v,
+        Err(e) => return store_error(&e),
+    };
+    let (squad_id, cell_id) = proof_tmux_keys(id, scope, proof_idx);
+    let name = crate::tmux::session_name(&squad_id, &task, &cell_id);
+    let runs = crate::terminal_log::list_run_variants(&name)
+        .into_iter()
+        .map(|(variant, kind, n)| StepRun { variant, kind, n })
+        .collect();
+    let current_started = crate::terminal_log::latest_attempt(&name).is_some();
+    json(
+        200,
+        &StepRunsResponse {
+            runs,
+            current_started,
+        },
+    )
 }
 
 /// Open a terminal for a review branch.
