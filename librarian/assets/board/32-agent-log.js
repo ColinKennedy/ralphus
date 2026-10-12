@@ -160,8 +160,8 @@
       function agentLogListHtml(key, entries) {
         const f = agentLogFilter[key] || { tool: "", status: "", q: "" };
         const hits = entries.filter((e) => agentLogEntryVisible(e, f));
-        if (entries.length === 0) return `<div class="empty">No tool calls in this run's log yet.</div>`;
-        if (hits.length === 0) return `<div class="empty">No tool calls match the filter.</div>`;
+        if (entries.length === 0) return `<div class="empty alog-empty">No tool calls in this run's log yet.</div>`;
+        if (hits.length === 0) return `<div class="empty alog-empty">No tool calls match the filter.</div>`;
         const cut = agentLogAll[key] ? 0 : Math.max(0, hits.length - AGENT_LOG_PAGE);
         const more = cut > 0
           ? `<button class="btn" style="padding:3px 8px;font-size:11px" data-click="agentLogShowEarlier" data-key="${esc(key)}"

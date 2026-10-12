@@ -710,6 +710,7 @@
       .subtab.on { color: var(--accent); background: var(--accent-a); font-weight: 650; }
       /* Agent Log widgets (RAL-603, experimental) */
       .alog { max-height: 460px; overflow: auto; border: 1px solid var(--border); border-radius: 7px; background: var(--bg); padding: 6px; }
+      .alog .alog-empty { display: flex; align-items: center; justify-content: center; min-height: 120px; margin: 0; padding: 18px 0; box-sizing: border-box; }
       .alog-w { border: 1px solid var(--border-soft); border-radius: 6px; background: var(--panel); margin-bottom: 5px; font-size: 11px; }
       .alog-w.error { border-color: var(--failed-b); }
       .alog-w > summary { display: flex; align-items: center; gap: 8px; padding: 4px 8px; cursor: pointer; list-style: none; }
