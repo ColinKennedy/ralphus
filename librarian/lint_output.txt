@@ -1,0 +1,5 @@
+
+> lint
+> node scripts/generate-board-globals.mjs && eslint "librarian/assets/board/**/*.js"
+
+generate-board-globals: 34 chunks, 1949 globals
