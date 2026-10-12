@@ -6326,7 +6326,7 @@ impl Store {
                     CellView {
                         worktree_init: {
                             let commands: Vec<String> = r
-                                .get::<_, Option<String>>(41)?
+                                .get::<_, Option<String>>(42)?
                                 .map(|j| from_json(&j))
                                 .unwrap_or_default();
                             if commands.is_empty() {
@@ -6334,15 +6334,15 @@ impl Store {
                             } else {
                                 Some(CellInitView {
                                     commands,
-                                    source: r.get::<_, Option<String>>(42)?,
+                                    source: r.get::<_, Option<String>>(43)?,
                                     timeout_sec: r
-                                        .get::<_, Option<i64>>(43)?
+                                        .get::<_, Option<i64>>(44)?
                                         .unwrap_or_else(default_init_timeout_sec),
-                                    status: r.get::<_, Option<String>>(44)?,
-                                    duration_ms: r.get::<_, Option<i64>>(45)?,
-                                    exit_status: r.get::<_, Option<String>>(46)?,
-                                    output: r.get::<_, Option<String>>(47)?,
-                                    finished_at_ms: r.get::<_, Option<i64>>(48)?,
+                                    status: r.get::<_, Option<String>>(45)?,
+                                    duration_ms: r.get::<_, Option<i64>>(46)?,
+                                    exit_status: r.get::<_, Option<String>>(47)?,
+                                    output: r.get::<_, Option<String>>(48)?,
+                                    finished_at_ms: r.get::<_, Option<i64>>(49)?,
                                 })
                             }
                         },
@@ -14516,6 +14516,47 @@ prompt = "go"
         let cell = &squad.tasks[0].cells[0];
         assert_eq!(cell.auto_compact_threshold, Some(80_000));
         assert_eq!(cell.maximum_context, None);
+    }
+
+    #[test]
+    fn squad_view_reads_every_trailing_cell_column_at_its_own_index() {
+        // `cells_by_task` reads its SELECT by position, so every column it
+        // reads must carry a distinct non-NULL value here: a reader one index
+        // off then either fails on the type (`temperature` is REAL) or hands
+        // back a neighbour's value.
+        let src = r#"
+[[task]]
+name = "build"
+[[task.cell]]
+id = "worker"
+cwd = "/repo"
+prompt = "go"
+"#;
+        let mut store = Store::open_in_memory().unwrap();
+        let id = store.insert_squad(&parse(src), None, false).unwrap();
+        store
+            .edit_worktree_init(&id, 0, 0, &["make setup".to_string()], Some(42))
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE cells SET waypoint_halted_at_ms=11, runner_stalled_at_ms=22,
+                     effort='high', temperature=0.7, init_source='task'
+                 WHERE squad_id=?",
+                params![id],
+            )
+            .unwrap();
+
+        let squad = store.get_squad(&id).unwrap();
+        let cell = &squad.tasks[0].cells[0];
+        assert_eq!(cell.waypoint_halted_at_ms, Some(11));
+        assert_eq!(cell.runner_stalled_at_ms, Some(22));
+        assert_eq!(cell.effort.as_deref(), Some("high"));
+        assert_eq!(cell.temperature, Some(0.7));
+        let init = cell.worktree_init.as_ref().expect("worktree_init");
+        assert_eq!(init.commands, vec!["make setup".to_string()]);
+        assert_eq!(init.source.as_deref(), Some("task"));
+        assert_eq!(init.timeout_sec, 42);
     }
 
     #[test]
