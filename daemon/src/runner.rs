@@ -2403,7 +2403,7 @@ impl SubprocessRunner {
             .waypoint_halts
             .as_ref()
             .filter(|_| spec.task != WAYPOINT_SURVEY_TASK);
-        let waypoint_halt_token = halt_registry.map(|w| w.register(&spec.squad_id));
+        let waypoint_halt_token = halt_registry.map(|w| w.register_fresh(&spec.squad_id));
         let _waypoint_halt_guard = halt_registry.map(|w| WaypointHaltGuard {
             waypoint_halts: w,
             squad_id: &spec.squad_id,
