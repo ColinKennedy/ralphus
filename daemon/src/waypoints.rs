@@ -1408,7 +1408,11 @@ impl Store {
         start: &(WaypointEntryKind, String),
         target: &(WaypointEntryKind, String),
     ) -> StoreResult<Option<Vec<(WaypointEntryKind, String)>>> {
-        type WaypointGraph = Vec<(String, Vec<(WaypointEntryKind, String)>, Vec<(WaypointEntryKind, String)>)>;
+        type WaypointGraph = Vec<(
+            String,
+            Vec<(WaypointEntryKind, String)>,
+            Vec<(WaypointEntryKind, String)>,
+        )>;
         let mut graph: WaypointGraph = Vec::new();
         for wid in Self::list_open_waypoint_ids_conn(conn)? {
             let aff = Self::list_affected_entries_conn(conn, &wid)?
