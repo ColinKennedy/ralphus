@@ -6237,7 +6237,7 @@ fn add_forge_pool_token(daemon: &Daemon, body: &str) -> Reply {
         .filter(|h| !h.is_empty())
         .unwrap_or(default_host)
         .to_ascii_lowercase();
-    if host.contains('/') || host.contains(char::is_whitespace) {
+    if host.contains('/') || host.chars().any(char::is_whitespace) {
         return error(
             400,
             "invalid_value",
