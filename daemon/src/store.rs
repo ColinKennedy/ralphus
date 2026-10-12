@@ -3293,6 +3293,10 @@ impl Store {
             // NULL = never stamped (pre-RAL-250 project, deliberately not
             // backfilled -- the ticket's explicit no-migration decision).
             "ALTER TABLE projects ADD COLUMN skip_base_updates INTEGER",
+            // RAL-615: a project's own worktree-initialization timeout in
+            // seconds; NULL = unset (falls through to `.ralphus.toml`, then
+            // the `[daemon]` option, then the built-in default).
+            "ALTER TABLE projects ADD COLUMN initialization_timeout_sec INTEGER",
             // A project's authoritative remote provisioning source. `path`
             // remains the daemon-local checkout for compatibility and local
             // execution; no migration guesses this value from that checkout.
@@ -4728,6 +4732,12 @@ impl Store {
                 .as_deref()
                 .and_then(|name| Self::get_project_conn(&tx, name).ok().flatten())
                 .map(|p| crate::config::load_worktree_config(std::path::Path::new(&p.path)));
+            let project_db_timeout = task
+                .project
+                .as_deref()
+                .and_then(|name| Self::project_initialization_timeout_conn(&tx, name));
+            let daemon_init_timeout =
+                crate::config::load_daemon_config().initialization_timeout_sec();
             for (s_idx, cell) in task.cell.iter().enumerate() {
                 let resolved = ResolvedAgent::resolve(task, cell);
                 let init = {
@@ -4747,9 +4757,13 @@ impl Store {
                         ))
                     })?;
                     if r.timeout_sec.is_none() {
-                        r.timeout_sec = project_init
-                            .as_ref()
-                            .and_then(|c| c.initialization_timeout_sec);
+                        r.timeout_sec = project_db_timeout
+                            .or_else(|| {
+                                project_init
+                                    .as_ref()
+                                    .and_then(|c| c.initialization_timeout_sec)
+                            })
+                            .or(daemon_init_timeout);
                     }
                     r
                 };
@@ -7267,6 +7281,49 @@ impl Store {
             )
             .optional()
             .map_err(Into::into)
+    }
+
+    /// RAL-615: the project's own worktree-initialization timeout (seconds),
+    /// `None` when the project is unknown or has none set.
+    pub(crate) fn project_initialization_timeout_conn(
+        conn: &Connection,
+        name: &str,
+    ) -> Option<u64> {
+        conn.query_row(
+            "SELECT initialization_timeout_sec FROM projects WHERE name=?",
+            params![name],
+            |r| r.get::<_, Option<i64>>(0),
+        )
+        .optional()
+        .ok()
+        .flatten()
+        .flatten()
+        .and_then(|n| u64::try_from(n).ok())
+        .filter(|n| *n > 0)
+    }
+
+    /// RAL-615: set (`Some`, must be > 0) or clear (`None`) a project's own
+    /// worktree-initialization timeout. Affects cells submitted afterwards.
+    /// Returns whether the project exists.
+    pub fn set_project_initialization_timeout_sec(
+        &self,
+        name: &str,
+        timeout_sec: Option<u64>,
+    ) -> Result<bool> {
+        let value = match timeout_sec {
+            Some(0) => {
+                return Err(StoreError::InvalidTransition(
+                    "initialization_timeout_sec must be > 0".to_string(),
+                ));
+            }
+            Some(t) => Some(i64::try_from(t).unwrap_or(i64::MAX)),
+            None => None,
+        };
+        let n = self.conn.execute(
+            "UPDATE projects SET initialization_timeout_sec=? WHERE name=?",
+            params![value, name],
+        )?;
+        Ok(n > 0)
     }
 
     /// All registered projects, newest first.
@@ -18887,6 +18944,46 @@ command = "e"
         );
         assert_eq!(all[0].description, "new description");
         assert_eq!(all[0].path, "C:/new/path");
+    }
+
+    #[test]
+    fn project_initialization_timeout_round_trips_and_validates() {
+        let store = Store::open_in_memory().unwrap();
+        store
+            .register_project("p", "", "C:/repos/p", "git")
+            .unwrap();
+        assert_eq!(
+            Store::project_initialization_timeout_conn(&store.conn, "p"),
+            None
+        );
+        assert!(
+            store
+                .set_project_initialization_timeout_sec("p", Some(45))
+                .unwrap()
+        );
+        assert_eq!(
+            Store::project_initialization_timeout_conn(&store.conn, "p"),
+            Some(45)
+        );
+        assert!(
+            store
+                .set_project_initialization_timeout_sec("p", Some(0))
+                .is_err()
+        );
+        assert!(
+            store
+                .set_project_initialization_timeout_sec("p", None)
+                .unwrap()
+        );
+        assert_eq!(
+            Store::project_initialization_timeout_conn(&store.conn, "p"),
+            None
+        );
+        assert!(
+            !store
+                .set_project_initialization_timeout_sec("nope", Some(5))
+                .unwrap()
+        );
     }
 
     #[test]
