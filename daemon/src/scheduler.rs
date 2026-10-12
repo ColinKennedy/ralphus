@@ -979,6 +979,7 @@ fn enqueue_runner_stalled_mailbox(
         Some(task_name),
         Some(cell_id),
     ) {
+        // ralphus[ignore-rlog-pair]: error in delivering the remediation notice; the cell's failed state is the event that matters
         crate::rlog!(
             WARNING,
             "ralphus [scheduler] runner-stalled mailbox failed for {squad_id}/{cell_id}: {e}"
