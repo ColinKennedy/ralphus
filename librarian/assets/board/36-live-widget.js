@@ -440,6 +440,7 @@
        * @param {boolean} o.canThink - Whether the Thinking toggle applies.
        * @param {string} o.promptText - The step's authored instruction or command, "" when there is none.
        * @param {string} o.promptHint - What that text is, for the Prompt tab's footnote.
+       * @param {string} [o.noPromptText] - What the Prompt tab says when promptText is empty; a generic line when omitted.
        * @param {boolean} o.withAttempts - Whether earlier attempts can be read.
        * @param {string} o.currentMeta - Metadata line for the current run.
        * @param {string} [o.currentKind] - Picker badge for the current run; "current" when omitted.
@@ -470,7 +471,7 @@
               <div class="hint">${esc(o.promptHint)}</div>`
             : `<div class="absent-run">
                 <div class="abody"><div class="at">No authored instruction</div>
-                  <div class="as">This step has no prompt or command text of its own to show.</div></div>
+                  <div class="as">${esc(o.noPromptText || "This step has no prompt or command text of its own to show.")}</div></div>
               </div>`),
           terminalFoot: () => "",
           systemFoot: "",

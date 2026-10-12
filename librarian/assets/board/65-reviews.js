@@ -2302,7 +2302,7 @@ Press Accept on the note to create it.">Squad pending</span>`;
                         </div>${commandFullBlock(key, cmdText, { g, check: cmd, kind: "manual", i })}`;
                     }).join(""), false, headAttrs)
                 : reviewRunGroup(runControl, waitingNote, "", false, headAttrs)}
-              ${squadLiveSlot(squadLiveCtx({ baseKey: peekKey, title: "auto actions generation", canThink: true, promptText: "", promptHint: "", withAttempts: false, currentMeta: g.manual_checks_finished_at_ms ? "finished" : "running", closeKey: peekKey }))}
+              ${squadLiveSlot(squadLiveCtx({ baseKey: peekKey, title: "auto actions generation", canThink: true, promptText: "", promptHint: "", noPromptText: "The prompt that generated these actions is not stored with the review. The Agent Log tab shows what the agent did with it.", withAttempts: false, currentMeta: g.manual_checks_finished_at_ms ? "finished" : "running", closeKey: peekKey }))}
               `;
           })()}`;
         attachPeekResizeHandlers();
