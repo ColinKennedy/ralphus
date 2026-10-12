@@ -34614,8 +34614,12 @@ remediation_attempts=1
 
         // The same key submit-time pooling would use for a cell whose
         // worktree root is this project's path.
-        let store = d.lock();
-        let expected_key = crate::triage::pool_key_for_path(&store, &dir);
+        // Scoped so the guard drops before `route` below re-locks the store;
+        // `StoreMutex` is not reentrant and a held guard deadlocks the test.
+        let expected_key = {
+            let store = d.lock();
+            crate::triage::pool_key_for_path(&store, &dir)
+        };
         assert_eq!(expected_key, "proj");
 
         // Set the threshold via the raw path, exactly what the CLI's
