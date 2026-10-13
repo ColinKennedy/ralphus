@@ -395,6 +395,72 @@
         tick();
         if (tab === "queue") pollQueue();
       }
+      // RALPHUS-CELL-MENU-ACTIONS:BEGIN
+      /**
+       * The items of a cell's ⋯ menu in the details pane (RAL-641). Unblock…
+       * leads when the cell is holding up other work.
+       * @param {string} state - The cell's state.
+       * @param {CellBlocking|undefined} blocking - What the cell holds up, if it is blocking.
+       * @param {boolean} hasProject - Whether the cell's task belongs to a project (copy-from-its-own-work needs one).
+       * @returns {CellMenuAction[]}
+       */
+      function cellMenuActions(state, blocking, hasProject) {
+        /** @type {CellMenuAction[]} */
+        const out = [];
+        if (blocking) {
+          out.push({ key: "unblock", label: "⛔ Unblock…", tip: "This cell has failed repeatedly and other work is waiting on it.\nOpens a popup that explains each way to get it out of the way before you pick one." });
+        }
+        out.push({ key: "edit", label: "✎ Edit", tip: "Edit this cell — change its prompt, agent, model, command, or working directory.\nIf the squad is currently running it will be stopped and reset to Pending." });
+        out.push({ key: "restart", label: "⟳ Restart cell", tip: "Re-run this cell and all downstream cells within this squad.\nThis cannot be undone." });
+        if (["failed", "pending", "queued"].includes(state)) {
+          out.push({ key: "ignore", label: "⤼ Ignore and continue", tip: "Skip this cell and keep going.\nCells that failed only because of it run again, and its review branch is taken out of the review.\nReversible: Restart cell runs it again." });
+        }
+        out.push({ key: "copy", label: "⎘ Copy to new squad", tip: "Copy this cell into a new one-task squad that starts from the latest main code.\nThe two squads link to each other; this cell is not changed." });
+        if (hasProject) {
+          out.push({ key: "copy-branch", label: "⎘ Copy to new squad, from its own work", tip: "Same as Copy to new squad, but the new squad starts from this cell's own saved work instead of the latest main code." });
+        }
+        return out;
+      }
+      // RALPHUS-CELL-MENU-ACTIONS:END
+      /**
+       * Opens a cell's ⋯ menu from the details pane header (RAL-641).
+       * @param {MouseEvent} e
+       * @param {string} squadId
+       * @param {number} ti
+       * @param {number} si
+       * @returns {void}
+       */
+      function openCellMenu(e, squadId, ti, si) {
+        e.preventDefault(); e.stopPropagation(); closeSquadMenu();
+        const r = findSquad(squadId);
+        const task = r && r.tasks[ti];
+        const cell = task && task.cells[si];
+        if (!task || !cell) return;
+        const actions = cellMenuActions(cell.state, cell.blocking, !!task.project);
+        const menu = document.createElement("div");
+        menu.className = "ctx-menu"; menu.id = "squad-menu";
+        menu.innerHTML = actions.map((a, i) =>
+          `${a.key !== "unblock" && i > 0 && actions[i - 1].key === "unblock" ? `<div class="sep"></div>` : ""}<div data-click="cellMenuPick" data-action="${a.key}" data-squad-id="${esc(squadId)}" data-ti="${ti}" data-si="${si}" data-tip="${esc(a.tip)}">${esc(a.label)}</div>`).join("");
+        document.body.appendChild(menu);
+        menu.style.left = Math.min(e.clientX, window.innerWidth - 260) + "px";
+        menu.style.top = Math.min(e.clientY, window.innerHeight - 220) + "px";
+      }
+      /**
+       * Runs the item picked from a cell's ⋯ menu.
+       * @param {string} action
+       * @param {string} squadId
+       * @param {number} ti
+       * @param {number} si
+       * @returns {Promise<void>}
+       */
+      async function cellMenuPick(action, squadId, ti, si) {
+        closeSquadMenu();
+        if (action === "unblock") openUnblockCell(squadId, ti, si);
+        else if (action === "edit") startEdit();
+        else if (action === "restart") await restartCell(squadId, ti, si);
+        else if (action === "ignore") await ignoreCell(squadId, ti, si);
+        else if (action === "copy" || action === "copy-branch") await copyCell(squadId, ti, si, action === "copy-branch");
+      }
       // RALPHUS-UNBLOCK-OPTIONS:BEGIN
       /**
        * The options the Unblock popup offers for a blocking cell (RAL-641):
@@ -508,7 +574,7 @@
         } catch (_) { detail = null; }
         const entry = detail && (detail.branches || []).find((b) => b.branch === branchName);
         if (!entry) { notify("error", "Could not find this cell's review branch to extract."); return; }
-        await extractBranch(guardianId, entry.id, true);
+        await extractBranch(guardianId, entry.id);
       }
       /**
        * Copies one cell into a new one-task squad (RAL-641) and selects the

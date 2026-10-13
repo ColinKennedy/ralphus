@@ -10,6 +10,12 @@
        * @property {[string, string]|null} [branch] - `[review id, branch]` this cell's branch sits in, if any.
        */
       /**
+       * @typedef {object} CellMenuAction
+       * @property {"unblock"|"edit"|"restart"|"ignore"|"copy"|"copy-branch"} key - Which action the item runs.
+       * @property {string} label - Menu text.
+       * @property {string} tip - Tooltip explaining what the action does.
+       */
+      /**
        * @typedef {object} UnblockOption
        * @property {"ignore"|"extract"|"copy"|"copy-branch"} key - Which action the option runs.
        * @property {string} title - Short name of the action.

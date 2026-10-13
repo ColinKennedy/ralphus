@@ -107,11 +107,10 @@ test("every option has a title and an effect", () => {
   }
 });
 
-test("the button beside the state row opens the popup and its handlers are wired", () => {
-  assert.match(html, /\$\{blockingBadge\(s\.blocking\)\}\$\{s\.blocking \? unblockButton\(r\.id, sel\.taskIdx, sel\.cellIdx\) : ""\}/);
-  assert.match(html, /CLICK_HANDLERS\.openUnblockCell = /);
+test("the popup is reached from the cell's ⋯ menu, not a button beside the state", () => {
+  assert.doesNotMatch(html, /unblockButton\(/);
+  assert.match(html, /if \(action === "unblock"\) openUnblockCell\(squadId, ti, si\);/);
   assert.match(html, /CLICK_HANDLERS\.unblockPick = /);
-  assert.match(html, /data-click="openUnblockCell"/);
 });
 
 test("extract looks the branch up from the daemon, not the lean review list", () => {
@@ -125,7 +124,8 @@ test("extract looks the branch up from the daemon, not the lean review list", ()
 
 test("picking an option does not ask a second time", () => {
   assert.match(html, /async function ignoreCell\(squadId, ti, si, confirmed\)/);
-  assert.match(html, /async function extractBranch\(gid, branchId, confirmed\)/);
   assert.match(html, /ignoreCell\(squadId, ti, si, true\)/);
-  assert.match(html, /extractBranch\(guardianId, entry\.id, true\)/);
+  // extractBranch never prompts; every caller (this popup, Move or extract) is the confirmation.
+  assert.match(html, /async function extractBranch\(gid, branchId\) \{\s*await guardianAction/);
+  assert.match(html, /extractBranch\(guardianId, entry\.id\)/);
 });

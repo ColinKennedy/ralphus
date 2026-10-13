@@ -201,7 +201,8 @@
       CLICK_HANDLERS.openGenerationCosts = (e, ds) => openGenerationCosts(e, ds.squadId || "");
       CLICK_HANDLERS.gotoReviewBranch = (e, ds) => gotoReviewBranch(ds.guardianId || "", ds.branch || "");
       CLICK_HANDLERS.restartCell = (e, ds) => restartCell(ds.squadId || "", Number(ds.ti), Number(ds.si));
-      CLICK_HANDLERS.openUnblockCell = (e, ds) => openUnblockCell(ds.squadId || "", Number(ds.ti), Number(ds.si));
+      CLICK_HANDLERS.openCellMenu = (e, ds) => openCellMenu(e, ds.squadId || "", Number(ds.ti), Number(ds.si));
+      CLICK_HANDLERS.cellMenuPick = (e, ds) => { e.stopPropagation(); cellMenuPick(ds.action || "", ds.squadId || "", Number(ds.ti), Number(ds.si)); };
       CLICK_HANDLERS.unblockPick = (e, ds) => unblockPick(ds.option || "", ds.squadId || "", Number(ds.ti), Number(ds.si));
       CLICK_HANDLERS.ignoreCell = (e, ds) => ignoreCell(ds.squadId || "", Number(ds.ti), Number(ds.si));
       CLICK_HANDLERS.gotoSquad = (e, ds) => { e.preventDefault(); selectSquad(ds.squadId || ""); };
@@ -248,8 +249,8 @@
       CLICK_HANDLERS.toggleBranch = (e, ds) => { e.stopPropagation(); toggleBranch(e, ds.guardianId || "", ds.branchId || ""); };
       CLICK_HANDLERS.toggleBranchEnabled = (e, ds) => { e.stopPropagation(); toggleBranchEnabled(ds.guardianId || "", ds.branch || ""); };
       CLICK_HANDLERS.dismissReenable = (e, ds) => { e.stopPropagation(); dismissReenable(ds.guardianId || "", ds.branchId || ""); };
-      CLICK_HANDLERS.extractBranch = (e, ds) => { e.stopPropagation(); extractBranch(ds.guardianId || "", ds.branchId || ""); };
-      CLICK_HANDLERS.openMoveBranchMenu = (e, ds) => { e.stopPropagation(); openMoveBranchMenu(e, ds.guardianId || "", ds.branchId || ""); };
+      CLICK_HANDLERS.openMoveOrExtractBranch = (e, ds) => { e.stopPropagation(); openMoveOrExtractBranch(ds.guardianId || "", ds.branchId || ""); };
+      CLICK_HANDLERS.confirmMoveOrExtractBranch = (e, ds) => confirmMoveOrExtractBranch(ds.guardianId || "", ds.branchId || "");
       CLICK_HANDLERS.selectBranchRow = (e, ds) => selectBranchRow(e, ds.guardianId || "", ds.branch || "", ds.branchId || "");
       CLICK_HANDLERS.setInspectorTab = (e, ds) => setInspectorTab(ds.tab || "overview");
       CLICK_HANDLERS.toggleReviewDock = () => toggleReviewDock();
@@ -291,7 +292,6 @@
       CLICK_HANDLERS.toggleManualMenu = (e, ds) => toggleManualMenu(ds.guardianId || "");
       CLICK_HANDLERS.copyChatAs = (e, ds) => copyChatAs(ds.guardianId || "", ds.branchId || "", ds.format || "");
       CLICK_HANDLERS.doForceStart = (e, ds) => doForceStart(ds.guardianId || "");
-      CLICK_HANDLERS.moveBranchTo = (e, ds) => moveBranchTo(ds.guardianId || "", ds.branchId || "", ds.targetId || "");
       CLICK_HANDLERS.dismissReady = (e, ds) => dismissReady(ds.guardianId || "");
       CLICK_HANDLERS.setResSort = (e, ds) => setResSort(ds.col || "");
       CLICK_HANDLERS.jumpToTask = (e, ds) => jumpToTask(ds.squadId || "", Number(ds.ti), Number(ds.si));

@@ -871,16 +871,6 @@
         return `<span class="pill p-${safe}" data-tip="${esc(tip)}">${safe}</span>`;
       }
       /**
-       * Renders the "Ignore and continue" button (RAL-641) on a review branch
-       * whose failing source cell is blocking other work, or an empty string.
-       * @param {GuardianBranch} b
-       * @returns {string}
-       */
-      function branchIgnoreBtn(b) {
-        if (!b.blocking || !b.source_squad_id || b.source_task_idx == null || b.source_cell_idx == null) return "";
-        return ` <button class="btn" data-click="ignoreCell" data-squad-id="${esc(b.source_squad_id)}" data-ti="${b.source_task_idx}" data-si="${b.source_cell_idx}" data-tip="Skip this branch's failing cell and keep going.\nCells and branches held up by it run again without it, and this branch is left out of the stack.\nReversible: Restart cell runs it again.">⤼ Ignore and continue</button>`;
-      }
-      /**
        * Renders a review branch's merge-status badge (ready / conflict / resolved).
        * @param {GuardianBranch} b
        * @returns {string}
@@ -2130,7 +2120,7 @@ Press Accept on the note to create it.">Squad pending</span>`;
               ${toggle}
               <span>${gdot(b.merge_status || "")}</span>
               <span class="mono" style="flex:1${isEnabled ? "" : ";color:var(--muted)"}" data-tip="${esc(b.branch)}\nSelect it to read its position, source and status in the inspector.">${esc(b.branch)}</span>
-              ${isEnabled ? `${branchBadge(b)} ${autoFixExhaustedBadge(pullRequests[g.id] || [], b)} ${branchStatusPill(b)}${blockingBadge(b.blocking)}${branchIgnoreBtn(b)} ${branchPrLink(g, b)}` : '<span class="badge" style="color:var(--muted);border-color:var(--border);font-size:11px">disabled</span>'}
+              ${isEnabled ? `${branchBadge(b)} ${autoFixExhaustedBadge(pullRequests[g.id] || [], b)} ${branchStatusPill(b)}${blockingBadge(b.blocking)} ${branchPrLink(g, b)}` : '<span class="badge" style="color:var(--muted);border-color:var(--border);font-size:11px">disabled</span>'}
               ${enableToggle}${reEnableIcon}${branchMenuBtn}
             </div>
             ${branchConflictBar(b)}
@@ -3261,57 +3251,90 @@ Press Accept on the note to create it.">Squad pending</span>`;
         tick();
       }
 
-      // ---------- move a branch between reviews (RAL-118) ----------
+      // ---------- move or extract a branch (RAL-118, RAL-641) ----------
+      // RALPHUS-MOVE-BRANCH-TARGETS:BEGIN
       /**
-       * Opens the "move this branch to another review" context menu.
-       * @param {MouseEvent} e
+       * The reviews a branch of review `gid` can be moved into: every other
+       * review that can still take new work.
+       * @param {{id: string, name: string, status: string}[]} reviews
+       * @param {string} gid - The branch's current review.
+       * @returns {{id: string, name: string, status: string}[]}
+       */
+      function moveBranchTargets(reviews, gid) {
+        return reviews.filter((x) => x.id !== gid && !["merged", "approved", "cancelled", "deployed"].includes(x.status));
+      }
+      // RALPHUS-MOVE-BRANCH-TARGETS:END
+      /**
+       * Opens the "Move or extract branch" popup: pick an existing review to
+       * move the branch into, or a new review of its own.
        * @param {string} gid
        * @param {string} branchId
        * @returns {void}
        */
-      function openMoveBranchMenu(e, gid, branchId) {
-        e.preventDefault(); e.stopPropagation(); closeSquadMenu();
-        // Exclude the current review and reviews that can no longer accept new
-        // work (mirrors the canReorder gate used for the move button itself).
-        const targets = guardians.filter((x) => x.id !== gid && !["merged", "approved", "cancelled", "deployed"].includes(x.status));
-        const menu = document.createElement("div");
-        menu.className = "ctx-menu"; menu.id = "squad-menu";
-        menu.innerHTML = targets.length
-          ? targets.map((t) => `<div data-click="moveBranchTo" data-guardian-id="${esc(gid)}" data-branch-id="${esc(branchId)}" data-target-id="${esc(t.id)}" data-tip="Move this branch into \"${esc(t.name)}\".\nBoth reviews rebuild afterward.\nBlocked if either review has an active merge/rebase.">→ ${esc(t.name)}</div>`).join("")
-          : `<div style="color:var(--muted);padding:6px 10px;font-size:12px">No other open reviews to move into.</div>`;
-        document.body.appendChild(menu);
-        menu.style.left = Math.min(e.clientX, window.innerWidth - 220) + "px";
-        menu.style.top = Math.min(e.clientY, window.innerHeight - 90) + "px";
+      function openMoveOrExtractBranch(gid, branchId) {
+        closeSquadMenu();
+        const g = guardians.find((x) => x.id === gid);
+        const branch = (g && g.branches && (g.branches.find((x) => x.id === branchId) || {}).branch) || branchId;
+        const targets = moveBranchTargets(guardians, gid);
+        const row = (/** @type {string} */ value, /** @type {string} */ title, /** @type {string} */ detail, /** @type {string} */ tip, /** @type {boolean} */ checked) =>
+          `<label style="display:flex;gap:10px;align-items:flex-start;padding:8px 0;border-top:1px solid var(--border);cursor:pointer" data-tip="${esc(tip)}">
+            <input type="radio" name="move-branch-target" value="${esc(value)}"${checked ? " checked" : ""} data-tip="${esc(tip)}">
+            <span><span style="font-weight:600">${esc(title)}</span><br><span style="font-size:12px;color:var(--muted)">${esc(detail)}</span></span>
+          </label>`;
+        const rows = [row("__new__", "New review",
+          `A new review named after the branch, on the same base branch and project as this one. It opens its PR as soon as the branch builds.`,
+          "Move the branch into a brand-new review of its own.\nWho/when: this review is stalled or blocked by another branch, but this branch should ship on its own.", true)]
+          .concat(targets.map((t) => row(t.id, t.name, `Existing review · ${t.status}`,
+            `Move the branch into "${t.name}".\nBlocked if either review has an active merge/rebase.`, false)));
+        byId("modal-root").innerHTML = `
+          <div class="modal-bg" onclick="if(event.target===this)closeModal()"><div class="modal" style="width:560px;max-width:94vw">
+            <h2>Move or extract ${esc(branch)}</h2>
+            <p style="font-size:13px;margin:0 0 10px;color:var(--muted)">Take this branch out of this review and put it in another one. Both reviews rebuild afterward.</p>
+            <div data-tip="Where the branch goes: a new review of its own, or one of the open reviews.
+Scroll to see every open review." style="max-height:50vh;overflow:auto">${rows.join("")}</div>
+            <p style="font-size:12px;color:var(--failed);margin:10px 0 2px">This cannot be undone.</p>
+            <div class="btn-row">
+              <button class="btn" onclick="closeModal()" data-tip="Close this popup without moving anything.">Cancel</button>
+              <button class="btn primary" data-click="confirmMoveOrExtractBranch" data-guardian-id="${esc(gid)}" data-branch-id="${esc(branchId)}" data-tip="Move the branch to the review picked above.\nBoth reviews rebuild afterward.\nThis cannot be undone.">⇄ Move branch</button>
+            </div>
+          </div></div>`;
       }
       /**
-       * Moves a branch out of one review's stack and into another, after confirmation.
+       * Moves the branch to whatever the "Move or extract branch" popup has
+       * selected: a new review, or an existing one.
+       * @param {string} gid
+       * @param {string} branchId
+       * @returns {Promise<void>}
+       */
+      async function confirmMoveOrExtractBranch(gid, branchId) {
+        const picked = /** @type {HTMLInputElement|null} */ (document.querySelector('input[name="move-branch-target"]:checked'));
+        const target = picked ? picked.value : "";
+        closeModal();
+        if (!target) return;
+        if (target === "__new__") await extractBranch(gid, branchId);
+        else await moveBranchTo(gid, branchId, target);
+      }
+      /**
+       * Moves a branch out of one review's stack and into another. Callers
+       * confirm first.
        * @param {string} gid
        * @param {string} branchId
        * @param {string} toId
        * @returns {Promise<void>}
        */
       async function moveBranchTo(gid, branchId, toId) {
-        closeSquadMenu();
-        const g = guardians.find((x) => x.id === gid);
-        const branch = (g && (g.branches.find((b) => b.id === branchId) || {}).branch) || branchId;
-        const to = guardians.find((x) => x.id === toId);
-        if (!confirm(`Move branch "${branch}" to review "${to ? to.name : toId}"? Both reviews will rebuild. This cannot be undone.`)) return;
         await guardianAction(`/api/guardians/${gid}/branches/${branchId}/move`, { to_guardian_id: toId });
         tick();
       }
 
       /**
-       * Moves a branch out of its review into a brand-new review of its own, after confirmation.
+       * Moves a branch out of its review into a brand-new review of its own.
+       * Callers confirm first.
        * @param {string} gid
        * @param {string} branchId
-       * @param {boolean} [confirmed] - True when the caller already asked (the Unblock popup), so no second prompt.
        * @returns {Promise<void>}
        */
-      async function extractBranch(gid, branchId, confirmed) {
-        closeSquadMenu();
-        const g = guardians.find((x) => x.id === gid);
-        const branch = (g && (g.branches.find((b) => b.id === branchId) || {}).branch) || branchId;
-        if (!confirmed && !confirm(`Extract branch "${branch}" into a new review? Both reviews will rebuild. This cannot be undone.`)) return;
+      async function extractBranch(gid, branchId) {
         await guardianAction(`/api/guardians/${gid}/branches/${branchId}/extract`);
         tick();
       }

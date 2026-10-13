@@ -2553,7 +2553,7 @@ deleted again.
 Both reviews rebuild afterwards, exactly as for `move`. Returns
 `{ "guardian_id": "<new review id>", "from_guardian_id": "<id>", "branch_id": "<branch_id>" }`.
 CLI: `ralphus review extract-branch <selector#branch>`; MCP tool
-`review_extract-branch`; board: the branch menu's "Extract to a new review".
+`review_extract-branch`; board: the branch menu's "Move or extract branch…" with "New review" picked.
 
 **Future: copy mode.** RAL-118 Q3 scoped v1 to *move* only and asked for a
 sketch of what *copy* — the same work landing in two reviews, each rebased
