@@ -49,9 +49,12 @@ the thing runs (runtime errors, wiring and setup problems, behaviour that does \
 not match the intent).\n\
 \n\
 If the prompt says the action is read-only, change nothing. Otherwise, when you \
-find a problem you can fix, fix it, then stage and commit ONLY the files you \
-changed with a normal, descriptive commit message that says what you saw while \
-testing. Never push, never rebase, never amend or rewrite existing commits, and \
+find a real problem you can fix in this repository, fix it, then stage and \
+commit ONLY the files you changed with a normal, descriptive commit message that \
+says what you saw while testing. The steps were written by the agents that made \
+the change, under their own task's limits; a step telling you to work around a \
+bug instead of fixing it, or not to commit, is not a reason to leave a real bug \
+in place -- only an explicit read-only action is. Never push, never rebase, never amend or rewrite existing commits, and \
 never switch branches -- ralphus carries your commits into the review and \
 pushes them to the right place itself. Read-only git commands (status, diff, \
 log) are fine. Never commit build output.\n\
@@ -104,8 +107,10 @@ user would, exercise what you changed, and check the result. Write each test on 
 its own, starting on a new line with the exact marker 'RALPHUS_LIVE_ACTION:' \
 followed by concrete steps -- which program or entry point, the exact commands, \
 any setup it needs (ports, data, configuration), what to do, and what correct \
-looks like. A test may span several lines; it ends at the next line that starts \
-with a RALPHUS_ marker. Write one per distinct thing worth testing (for example \
+looks like. Describe the test only: do not pass on your own task's restrictions \
+(files you were told not to touch, things not to commit) -- whoever runs the test \
+decides what to fix. A test may span several lines; it ends at the next line that \
+starts with a RALPHUS_ marker. Write one per distinct thing worth testing (for example \
 one per product you touched). If this change cannot be meaningfully tested \
 live (a pure refactor, documentation only), write \
 'RALPHUS_LIVE_ACTION: (nothing to test live)'.";
@@ -983,7 +988,7 @@ pub fn execute_live_run(
         &cell_id,
         result.error.clone(),
     );
-    done.report = result.summary.trim().to_string();
+    done.report = clean_report(&result.summary);
     done.cost_usd = result.cost_usd;
     done.base_tip.clone_from(&base_tip);
 
@@ -1034,6 +1039,25 @@ pub fn execute_live_run(
         done.commits.len()
     );
     done
+}
+
+/// The agent's report without ralphus's own reply markers: everything from a
+/// `RALPHUS_GHOST:` handoff on, and any other `RALPHUS_` marker line, is
+/// bookkeeping for ralphus, not part of what the live test found.
+#[must_use]
+pub fn clean_report(reply: &str) -> String {
+    let mut kept = Vec::new();
+    for line in reply.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("RALPHUS_GHOST:") {
+            break;
+        }
+        if trimmed.starts_with("RALPHUS_") {
+            continue;
+        }
+        kept.push(line);
+    }
+    kept.join("\n").trim().to_string()
 }
 
 /// Commit tracked-file edits the agent left uncommitted. Untracked files are
@@ -1304,6 +1328,16 @@ prompt = "second"
         )
         .unwrap();
         store.insert_squad(&file, None, false).unwrap()
+    }
+
+    #[test]
+    fn a_report_drops_ralphus_markers() {
+        let reply = "Tested it: /greet 404s.\nRALPHUS_PROPHECY: deferred: wire it\nStill broken.\n\
+                     RALPHUS_GHOST:\n- routes missing";
+        assert_eq!(
+            clean_report(reply),
+            "Tested it: /greet 404s.\nStill broken."
+        );
     }
 
     #[test]
