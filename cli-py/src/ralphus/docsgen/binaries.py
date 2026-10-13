@@ -30,6 +30,11 @@ def find_binary(name: str, env_var: str) -> Path:
         path = Path(override)
         if path.is_file():
             return path
+        # On Windows, try appending .exe if the override doesn't have an extension
+        if path.suffix == "":
+            exe_path = Path(f"{override}.exe")
+            if exe_path.is_file():
+                return exe_path
         raise RuntimeError(f"{env_var}={override!r} does not exist")
 
     for candidate in (
