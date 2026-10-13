@@ -985,12 +985,19 @@ mod tests {
 
     #[test]
     fn local_paths_resolve_like_git() {
-        let root = Path::new("C:/work/repo");
-        assert_eq!(
-            local_path(root, "file:///C:/remotes/up.git"),
-            PathBuf::from("C:/remotes/up.git")
-        );
+        let root = Path::new("/work/repo");
         assert_eq!(local_path(root, "../up.git"), root.join("../up.git"));
+        if cfg!(windows) {
+            assert_eq!(
+                local_path(root, "file:///C:/remotes/up.git"),
+                PathBuf::from("C:/remotes/up.git")
+            );
+        } else {
+            assert_eq!(
+                local_path(root, "file:///remotes/up.git"),
+                PathBuf::from("/remotes/up.git")
+            );
+        }
     }
 
     #[test]
