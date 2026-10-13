@@ -8036,10 +8036,93 @@ pub fn run_feedback(
         feedback,
         message_seq,
         require_proof,
+        None,
         cancel,
     );
     record_feedback_outcome(store, id, branch_id, &outcome);
     outcome
+}
+
+/// Live actions: carry a live run's commits onto `branch_id` (the review's
+/// top branch) through the same pass feedback uses -- the branch's worktree
+/// lease, its proof gate, the push to its PR, the downstream restack and the
+/// rebuild. The commits are cherry-picked; when they do not apply cleanly to
+/// the branch's current head (feedback or an auto-fix moved it since the live
+/// run started), the pick is abandoned and the review's resolver agent is
+/// given `feedback` -- which carries the patch and the live run's report --
+/// to apply the change itself.
+pub fn run_live_action_integration(
+    store: &crate::store_lock::StoreHandle,
+    runner: &dyn Runner,
+    id: &str,
+    branch_id: &str,
+    feedback: &str,
+    commits: &[String],
+    cancel: &CancelToken,
+) -> FeedbackOutcome {
+    if should_rebuild_for(store, id, RebuildTrigger::Feedback) {
+        store.lock_free_memory().cancel_guardian_preparation(id);
+        invalidate_guardian_preparation(
+            store,
+            id,
+            "a live action's fix is landing on the stack; preparation will refresh afterward",
+        );
+        crate::auto_run::note_superseded(store, id, "live action");
+    }
+    let outcome = run_feedback_pass(
+        store,
+        runner,
+        id,
+        branch_id,
+        feedback,
+        None,
+        false,
+        Some(commits),
+        cancel,
+    );
+    record_feedback_outcome(store, id, branch_id, &outcome);
+    outcome
+}
+
+/// Cherry-pick `commits` (oldest first) onto `wt`'s HEAD, one at a time. A
+/// commit whose change is already on the branch (feedback or an auto-fix made
+/// the same fix) is skipped rather than failing the pick. On a real conflict
+/// the pick is aborted and the worktree reset to `start`, so whatever handles
+/// the change next sees the branch exactly as it was. Returns how many commits
+/// were applied, or `None` on a conflict.
+fn cherry_pick_live_commits(wt: &Workspace, commits: &[String], start: &str) -> Option<usize> {
+    let mut applied = 0;
+    for commit in commits {
+        if wt
+            .git(&[
+                "-c",
+                "core.editor=true",
+                "cherry-pick",
+                "--allow-empty-message",
+                commit,
+            ])
+            .is_ok()
+        {
+            applied += 1;
+            continue;
+        }
+        let conflicted = wt
+            .git(&["diff", "--name-only", "--diff-filter=U"])
+            .map(|out| !out.trim().is_empty())
+            .unwrap_or(true);
+        let nothing_left = wt.git(&["diff", "--cached", "--quiet"]).is_ok()
+            && wt.git(&["diff", "--quiet"]).is_ok();
+        if !conflicted && nothing_left {
+            // The change is already there: an empty pick.
+            if wt.git(&["cherry-pick", "--skip"]).is_ok() {
+                continue;
+            }
+        }
+        let _ = wt.git(&["cherry-pick", "--abort"]);
+        let _ = wt.git(&["reset", "--hard", start]);
+        return None;
+    }
+    Some(applied)
 }
 
 /// Persist [`run_feedback`]'s outcome on the branch's open PR rows. A branch
@@ -8084,6 +8167,7 @@ fn run_feedback_pass(
     feedback: &str,
     message_seq: Option<i64>,
     require_proof: bool,
+    live_commits: Option<&[String]>,
     cancel: &CancelToken,
 ) -> FeedbackOutcome {
     // RAL-380: mark the reviewer message this call was invoked for as
@@ -8433,14 +8517,44 @@ fn run_feedback_pass(
         .git(&["rev-parse", "HEAD"])
         .ok()
         .map(|s| s.trim().to_string());
-    let result = run_agent_with_stall_recovery(
-        store,
-        &mut spec,
-        runner,
-        cancel,
-        Some((store, id, branch_id)),
-    );
-    let _ = record_guardian_call_cost(store, id, Some(branch_id), "feedback", &result);
+    // Live actions: a live run's commits are cherry-picked first; only a
+    // conflict hands the change (carried in `feedback`) to the resolver.
+    let cleanly_picked = match (live_commits, before_resolver_sha.as_deref()) {
+        (Some(commits), Some(start)) => cherry_pick_live_commits(&wt, commits, start),
+        _ => None,
+    };
+    if live_commits.is_some() {
+        crate::cartographer::Note::new("guardian")
+            .guardian(id)
+            .scope("live_action")
+            .emit(
+                &store.lock(),
+                "live action commits carried",
+                serde_json::json!({
+                    "branch_id": branch_id,
+                    "commits": live_commits.map(<[String]>::len),
+                    "cherry_picked": cleanly_picked,
+                    "resolver_fallback": cleanly_picked.is_none(),
+                }),
+            );
+    }
+    let result = if let Some(applied) = cleanly_picked {
+        let mut picked = crate::runner::RunnerResult::failure("");
+        picked.status = "done".to_string();
+        picked.error = None;
+        picked.summary = format!("cherry-picked {applied} live-action commit(s)");
+        picked
+    } else {
+        let result = run_agent_with_stall_recovery(
+            store,
+            &mut spec,
+            runner,
+            cancel,
+            Some((store, id, branch_id)),
+        );
+        let _ = record_guardian_call_cost(store, id, Some(branch_id), "feedback", &result);
+        result
+    };
     if cancel.is_cancelled() {
         stop_feedback!();
     }
@@ -23274,7 +23388,7 @@ mod tests {
     fn preparation_order_puts_actions_needing_no_preparation_first() {
         let mut prompt_only = plain_action("prompt");
         prompt_only.command = None;
-        prompt_only.prompt = Some("expand me".to_string());
+        prompt_only.prompt = Some("test it live".to_string());
         let hints = vec![
             built_action("build-a", "make a"),
             plain_action("quick-1"),
@@ -23282,9 +23396,10 @@ mod tests {
             prompt_only,
             plain_action("quick-2"),
         ];
-        // Quick actions keep their relative order and lead; everything that
-        // needs work (a build, or a prompt to expand) follows in declaration order.
-        assert_eq!(preparation_order(&hints), vec![1, 4, 0, 2, 3]);
+        // Quick actions -- a plain command, or an agent prompt with nothing to
+        // build -- keep their relative order and lead; actions with a build
+        // follow in declaration order.
+        assert_eq!(preparation_order(&hints), vec![1, 3, 4, 0, 2]);
         assert_eq!(preparation_order(&[]), Vec::<usize>::new());
         assert_eq!(preparation_order(&hints[1..2]), vec![0]);
     }

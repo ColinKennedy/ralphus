@@ -91,3 +91,8 @@ tag = "git-fetch-inproc"
 [[test]]
 id = "ralphus-daemon live_actions::tests::a_live_runs_commits_and_leftover_edits_are_pinned_on_its_live_ref"
 tag = "review-live-action"
+
+# Live action integration (cherry-pick a live run's commits onto the top branch, push, restack).
+[[test]]
+id = "ralphus-daemon::live_actions a_clean_live_fix_is_cherry_picked_onto_the_top_branch_and_pushed"
+tag = "review-live-integration"

@@ -183,6 +183,15 @@ fn new_run_id() -> String {
 }
 
 impl crate::store::Store {
+    /// One live run.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::store::StoreError::NotFound`] when there is no such run.
+    pub fn live_run(&self, run_id: &str) -> crate::store::Result<LiveRunRow> {
+        live_run_conn(&self.conn, run_id)
+    }
+
     /// Queue one live run. Returns its id.
     ///
     /// # Errors
@@ -842,6 +851,250 @@ fn execute_queued_run(
         .lock()
         .finish_live_run(&run.run_id, &outcome, integration);
     post_report(store, &guardian, &target.label, &outcome);
+    if integration == "pending" {
+        let runner = runners(store);
+        integrate_run(store, runner.as_ref(), &run.run_id);
+    }
+}
+
+/// Most patch text handed to the resolver when a live run's commits do not
+/// cherry-pick cleanly.
+const INTEGRATION_PATCH_CHARS: usize = 60_000;
+
+/// The topmost enabled branch with a worktree: where a live run's commits
+/// land.
+fn top_branch(g: &GuardianView) -> Option<&crate::guardian::BranchView> {
+    g.branches
+        .iter()
+        .filter(|b| b.enabled && b.worktree.is_some())
+        .max_by_key(|b| b.position)
+}
+
+/// Whether every commit between `base` and `live_ref` has an equivalent
+/// (same patch-id) on `head` -- i.e. the live run's change really landed.
+fn commits_landed(
+    ws: &crate::workspace::Workspace,
+    head: &str,
+    live_ref: &str,
+    base: &str,
+) -> bool {
+    ws.git(&["cherry", head, live_ref, base])
+        .map(|out| out.lines().all(|l| !l.trim_start().starts_with('+')))
+        .unwrap_or(false)
+}
+
+/// Carry a finished live run's commits onto the review's top branch, through
+/// the same pass feedback uses (lease, proof gate, PR push, restack, rebuild):
+/// a clean cherry-pick when they apply, otherwise the review's resolver
+/// applies the patch. The live ref is deleted only once its commits are
+/// confirmed on the branch; when they cannot be carried, the ref is kept and
+/// the review's watchers get a notice with what to do.
+pub fn integrate_run(store: &crate::store_lock::StoreHandle, runner: &dyn Runner, run_id: &str) {
+    let loaded = {
+        let guard = store.lock();
+        let run = live_run_conn(&guard.conn, run_id);
+        let g = run
+            .as_ref()
+            .ok()
+            .map(|r| guard.get_guardian(&r.guardian_id));
+        (run, g)
+    };
+    let (Ok(run), Some(Ok(g))) = loaded else {
+        return;
+    };
+    let (Some(live_ref), Some(base)) = (run.live_ref.clone(), run.base_tip.clone()) else {
+        let _ = store
+            .lock()
+            .set_live_run_integration(run_id, "none", Some("no commits to carry"));
+        return;
+    };
+    if g.status.as_str() == "merge_stopped" {
+        // Picked up again by the maintenance sweep once the review resumes.
+        let _ = store.lock().set_live_run_integration(
+            run_id,
+            "pending",
+            Some("waiting: the review is stopped; its commits are carried when it resumes"),
+        );
+        return;
+    }
+    if matches!(g.status.as_str(), "deployed" | "cancelled") {
+        let _ = store.lock().set_live_run_integration(
+            run_id,
+            "skipped",
+            Some("the review finished before this run's commits could be carried"),
+        );
+        return;
+    }
+    let Some(branch) = top_branch(&g) else {
+        fail_integration(
+            store,
+            &g,
+            &run,
+            "the review has no enabled branch with a worktree to carry the commits onto",
+        );
+        return;
+    };
+    let branch_id = branch.id.clone();
+    let branch_name = branch.branch.clone();
+    let wt_path = branch.worktree.clone().unwrap_or_default();
+    let ws = crate::workspace::Workspace::for_guardian(store, &g.id, wt_path.as_str());
+    let current_head = ws
+        .git(&["rev-parse", "HEAD"])
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default();
+    if !current_head.is_empty() && commits_landed(&ws, &current_head, &live_ref, &base) {
+        // Feedback or an auto-fix already made the same change.
+        let _ = ws.git(&["update-ref", "-d", &live_ref]);
+        let _ = store.lock().set_live_run_integration(
+            run_id,
+            "integrated",
+            Some("already on the top branch (the same change landed another way)"),
+        );
+        return;
+    }
+    let patch = ws
+        .git(&["format-patch", "--stdout", &format!("{base}..{live_ref}")])
+        .unwrap_or_default();
+    let patch: String = patch.chars().take(INTEGRATION_PATCH_CHARS).collect();
+    let feedback = format!(
+        "A live action (\"{label}\") tested this review's tip live and committed a fix while \
+         doing so. Apply the same change to this branch -- it was made against an older tip, so \
+         adapt it to the current code rather than discarding it. Keep its intent; do not widen \
+         it.\n\nWhat the live test found:\n{report}\n\nThe change, as a patch:\n{patch}",
+        label = run.label,
+        report = run.report.as_deref().unwrap_or("(no report)"),
+    );
+    let _ = store.lock().set_live_run_integration(
+        run_id,
+        "integrating",
+        Some(&format!("onto {branch_name}")),
+    );
+    let outcome = crate::guardian_merge::run_live_action_integration(
+        store,
+        runner,
+        &g.id,
+        &branch_id,
+        &feedback,
+        &run.commits,
+        &CancelToken::never(),
+    );
+    if !outcome.committed {
+        fail_integration(
+            store,
+            &g,
+            &run,
+            "the commits could not be applied to the top branch (the cherry-pick conflicted and \
+             the resolver made no change)",
+        );
+        return;
+    }
+    let head = ws
+        .git(&["rev-parse", "HEAD"])
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default();
+    let exact = commits_landed(&ws, &head, &live_ref, &base);
+    let detail = match (exact, outcome.pushed) {
+        (true, true) => "cherry-picked onto the top branch and pushed".to_string(),
+        (true, false) => "cherry-picked onto the top branch (not pushed: no PR yet)".to_string(),
+        (false, _) => "applied by the review's resolver after a conflict".to_string(),
+    };
+    if exact {
+        // Confirmed on the branch: the live ref has done its job.
+        let _ = ws.git(&["update-ref", "-d", &live_ref]);
+    }
+    let _ = store
+        .lock()
+        .set_live_run_integration(run_id, "integrated", Some(&detail));
+    crate::cartographer::Note::new("guardian")
+        .guardian(&g.id)
+        .scope("live_action")
+        .emit(
+            &store.lock(),
+            "live run integrated",
+            serde_json::json!({
+                "run_id": run_id,
+                "branch_id": branch_id,
+                "commits": run.commits,
+                "new_head": head,
+                "exact": exact,
+                "pushed": outcome.pushed,
+                "live_ref_deleted": exact,
+            }),
+        );
+    let _ = store.lock().add_guardian_message(
+        &g.id,
+        "guardian",
+        &format!(
+            "Live action \"{}\": its {} commit(s) were {detail}.",
+            run.label,
+            run.commits.len()
+        ),
+        None,
+        Some(&branch_id),
+        Some(LIVE_ACTION_AUTHOR),
+        None,
+    );
+}
+
+fn fail_integration(
+    store: &crate::store_lock::StoreHandle,
+    g: &GuardianView,
+    run: &LiveRunRow,
+    reason: &str,
+) {
+    let guard = store.lock();
+    let _ = guard.set_live_run_integration(&run.run_id, "failed", Some(reason));
+    let live_ref = run.live_ref.as_deref().unwrap_or("(none)");
+    let _ = guard.enqueue_error_mailbox_message(
+        crate::mailbox::MailboxPriority::High,
+        &format!(
+            "Live action \"{}\" on review {} committed a fix that could not be carried into the \
+             review: {reason}",
+            run.label, g.id
+        ),
+        &crate::mailbox::Remediation::ManualInterventionRequired {
+            guidance: format!(
+                "the commits are kept on {live_ref} in the review's repository; inspect them with \
+                 `git log {live_ref}` and cherry-pick or re-apply them onto the review's top \
+                 branch by hand, or send them as feedback with `ralphus review feedback {}`",
+                g.id
+            ),
+        },
+        None,
+        None,
+        None,
+        Some(&format!("guardian:{}", g.id)),
+        Some("live_actions"),
+    );
+}
+
+/// Retry integrations left pending (the review was stopped when the run
+/// finished, or the daemon restarted mid-integration).
+pub fn retry_pending_integrations(
+    store: &crate::store_lock::StoreHandle,
+    runners: &LiveRunnerFactory,
+) {
+    let pending: Vec<(String, String)> = {
+        let guard = store.lock();
+        let Ok(mut stmt) = guard.conn.prepare(
+            "SELECT r.run_id, r.guardian_id FROM guardian_live_runs r
+             JOIN guardians g ON g.id = r.guardian_id
+             WHERE r.integration IN ('pending', 'integrating') AND g.status != 'merge_stopped'",
+        ) else {
+            return;
+        };
+        stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .map(|rows| rows.flatten().collect())
+            .unwrap_or_default()
+    };
+    for (run_id, gid) in pending {
+        if store.lock_free_memory().has_live_run_worker(&gid) {
+            // That review's worker integrates its own runs.
+            continue;
+        }
+        let runner = runners(store);
+        integrate_run(store, runner.as_ref(), &run_id);
+    }
 }
 
 /// Post the run's report into the review's conversation on its top branch,
@@ -923,6 +1176,7 @@ pub fn sweep_automatic_runs(store: &crate::store_lock::StoreHandle, runners: &Li
     for gid in candidates {
         let _ = maybe_start_automatic_run(store, runners, &gid);
     }
+    retry_pending_integrations(store, runners);
 }
 
 /// Queue manual runs: one action (`Some(idx)`) or all of them. Generates the
