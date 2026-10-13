@@ -22,6 +22,11 @@ use crate::store::{CellBlocking, Result, Store};
 pub const CATEGORY: &str = "blocking";
 
 /// One way to get a repeatedly failing cell out of the way.
+///
+/// There are two ways out of a block, [`Self::IgnoreAndContinue`] and
+/// [`Self::ExtractBranch`]; [`Self::CopyToSquad`] is an optional retry that
+/// goes with either (see [`Self::is_add_on`]). `review branch disable` is not
+/// offered on its own because ignoring the cell already disables its branch.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WayOut {
     /// Set the cell to `ignored`, which re-pends what it held back and
@@ -29,11 +34,6 @@ pub enum WayOut {
     IgnoreAndContinue {
         /// `squad/task/cell` selector of the failing cell.
         cell_ref: String,
-    },
-    /// Take the cell's branch out of its review's stack.
-    DisableBranch {
-        /// `review#branch` selector of the branch.
-        branch_ref: String,
     },
     /// Move the cell's branch into a new review of its own.
     ExtractBranch {
@@ -48,36 +48,43 @@ pub enum WayOut {
 }
 
 impl WayOut {
+    /// Whether this is an optional retry that goes with a main way out rather
+    /// than a way out of its own.
+    #[must_use]
+    pub fn is_add_on(&self) -> bool {
+        matches!(self, Self::CopyToSquad { .. })
+    }
+
+    /// The command and what running it does.
     fn render(&self) -> String {
         match self {
             Self::IgnoreAndContinue { cell_ref } => format!(
-                "ignore the cell and continue with `ralphus cell set-status {cell_ref} ignored`"
+                "ignore the cell and continue: `ralphus cell set-status {cell_ref} ignored` \
+                 marks the cell ignored, re-runs the cells that failed only because of it, and \
+                 disables its review branch so the review stops waiting on it"
             ),
-            Self::DisableBranch { branch_ref } => {
-                format!(
-                    "disable its review branch with `ralphus review branch disable {branch_ref}`"
-                )
-            }
             Self::ExtractBranch { branch_ref } => format!(
-                "extract its branch to a new review with `ralphus review extract-branch {branch_ref}`"
+                "extract its branch to a new review: `ralphus review extract-branch {branch_ref}` \
+                 moves the branch out of this review's stack into a review of its own and leaves \
+                 the cell as it is, so the same cell can be retried there"
             ),
             Self::CopyToSquad { cell_ref } => format!(
-                "copy it to a new squad with `ralphus cell copy {cell_ref}` (add `--from-branch` to start from its branch)"
+                "copy the cell to a new squad: `ralphus cell copy {cell_ref}` creates a one-task \
+                 squad with the same definition for an isolated retry, starting from a clean base \
+                 (add `--from-branch` to start from the cell's own branch); the original cell is \
+                 not changed"
             ),
         }
     }
 }
 
-/// The ways out for the cell `cell_ref`, in the order they are offered.
+/// The ways out for the cell `cell_ref`: the main ways first, then any add-on.
 #[must_use]
 pub fn way_outs(cell_ref: &str, blocking: &CellBlocking) -> Vec<WayOut> {
     let mut out = vec![WayOut::IgnoreAndContinue {
         cell_ref: cell_ref.to_string(),
     }];
     if let Some((review_id, branch)) = &blocking.branch {
-        out.push(WayOut::DisableBranch {
-            branch_ref: format!("{review_id}#{branch}"),
-        });
         out.push(WayOut::ExtractBranch {
             branch_ref: format!("{review_id}#{branch}"),
         });
@@ -114,11 +121,24 @@ pub fn blocking_message(cell_ref: &str, blocking: &CellBlocking) -> (String, Rem
         "cell '{cell_ref}' has failed {times} and is holding up {}.",
         holding_up(blocking)
     );
-    let options: Vec<String> = way_outs(cell_ref, blocking)
-        .iter()
-        .map(WayOut::render)
-        .collect();
-    let guidance = format!("to unblock it, {}", options.join(", or "));
+    let ways = way_outs(cell_ref, blocking);
+    let mains = ways.iter().filter(|w| !w.is_add_on()).count();
+    let mut guidance = String::from(if mains > 1 {
+        "to unblock it, pick one:"
+    } else {
+        "to unblock it:"
+    });
+    for (n, way) in ways.iter().filter(|w| !w.is_add_on()).enumerate() {
+        guidance.push_str(&format!("\n{}. {}", n + 1, way.render()));
+    }
+    let optional = if mains > 1 {
+        "Optionally, with either"
+    } else {
+        "Optionally"
+    };
+    for way in ways.iter().filter(|w| w.is_add_on()) {
+        guidance.push_str(&format!("\n{optional}: {}", way.render()));
+    }
     (
         message,
         Remediation::ManualInterventionRequired { guidance },
@@ -269,17 +289,110 @@ mod tests {
     }
 
     #[test]
-    fn message_names_the_counts_and_every_way_out() {
-        let (message, remediation) = blocking_message("squad-1/build/compile", &blocking(4, 2));
+    fn message_names_the_counts() {
+        let (message, _) = blocking_message("squad-1/build/compile", &blocking(4, 2));
         assert_eq!(
             message,
             "cell 'squad-1/build/compile' has failed 4 times and is holding up 4 cells and 2 review branches."
         );
-        let rendered = remediation.render();
-        assert!(rendered.contains("ralphus cell set-status squad-1/build/compile ignored"));
-        assert!(rendered.contains("ralphus review branch disable guardian-1#t-review"));
-        assert!(rendered.contains("ralphus review extract-branch guardian-1#t-review"));
-        assert!(rendered.contains("ralphus cell copy squad-1/build/compile"));
+    }
+
+    fn guidance(b: &CellBlocking) -> String {
+        match blocking_message("squad-1/build/compile", b).1 {
+            Remediation::ManualInterventionRequired { guidance } => guidance,
+            other => panic!("expected manual guidance, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn guidance_offers_two_numbered_ways_out_and_copy_as_an_add_on() {
+        let g = guidance(&blocking(4, 2));
+        let lines: Vec<&str> = g.lines().collect();
+        assert_eq!(lines.len(), 4, "header, two ways out, one add-on: {g}");
+        assert_eq!(lines[0], "to unblock it, pick one:");
+        assert!(
+            lines[1].starts_with("1. ignore the cell and continue:"),
+            "{g}"
+        );
+        assert!(
+            lines[2].starts_with("2. extract its branch to a new review:"),
+            "{g}"
+        );
+        assert!(
+            lines[3].starts_with("Optionally, with either: copy the cell to a new squad:"),
+            "{g}"
+        );
+    }
+
+    #[test]
+    fn ignore_option_says_it_also_disables_the_review_branch() {
+        let g = guidance(&blocking(1, 1));
+        let line = g.lines().find(|l| l.starts_with("1. ")).unwrap();
+        assert!(line.contains("ralphus cell set-status squad-1/build/compile ignored"));
+        assert!(line.contains("disables its review branch"), "{line}");
+        assert!(
+            line.contains("re-runs the cells that failed only because of it"),
+            "{line}"
+        );
+    }
+
+    #[test]
+    fn disable_branch_is_not_offered_as_its_own_option() {
+        let g = guidance(&blocking(1, 1));
+        assert!(!g.contains("review branch disable"), "{g}");
+    }
+
+    #[test]
+    fn extract_option_says_the_cell_is_left_for_retry() {
+        let g = guidance(&blocking(1, 1));
+        let line = g.lines().find(|l| l.starts_with("2. ")).unwrap();
+        assert!(line.contains("ralphus review extract-branch guardian-1#t-review"));
+        assert!(line.contains("leaves the cell as it is"), "{line}");
+        assert!(line.contains("the same cell can be retried"), "{line}");
+    }
+
+    #[test]
+    fn copy_option_says_what_it_creates_and_that_the_original_is_untouched() {
+        let g = guidance(&blocking(1, 1));
+        let line = g.lines().last().unwrap();
+        assert!(line.contains("ralphus cell copy squad-1/build/compile"));
+        assert!(line.contains("one-task squad"), "{line}");
+        assert!(line.contains("--from-branch"), "{line}");
+        assert!(line.contains("the original cell is not changed"), "{line}");
+    }
+
+    #[test]
+    fn without_a_review_branch_only_ignore_is_a_way_out_and_copy_is_still_an_add_on() {
+        let mut b = blocking(1, 0);
+        b.branch = None;
+        let g = guidance(&b);
+        let lines: Vec<&str> = g.lines().collect();
+        assert_eq!(lines[0], "to unblock it:");
+        assert!(
+            lines[1].starts_with("1. ignore the cell and continue:"),
+            "{g}"
+        );
+        assert!(!g.contains("extract-branch"), "{g}");
+        assert!(
+            lines[2].starts_with("Optionally: copy the cell to a new squad:"),
+            "{g}"
+        );
+        assert_eq!(lines.len(), 3, "{g}");
+    }
+
+    #[test]
+    fn only_copy_is_an_add_on() {
+        let b = blocking(1, 1);
+        let add_ons: Vec<WayOut> = way_outs("s/t/c", &b)
+            .into_iter()
+            .filter(WayOut::is_add_on)
+            .collect();
+        assert_eq!(
+            add_ons,
+            vec![WayOut::CopyToSquad {
+                cell_ref: "s/t/c".into()
+            }]
+        );
     }
 
     #[test]
