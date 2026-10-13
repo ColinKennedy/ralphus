@@ -1758,6 +1758,7 @@
         }
         if (canMove) {
           items.push(`<div class="sep"></div>`);
+          items.push(`<div data-click="extractBranch" data-guardian-id="${esc(gid)}" data-branch-id="${esc(bid)}" data-tip="Move this branch into a new review of its own.\nWho/when: this review is stalled or blocked by another branch, but this branch is ready and should open its PR on its own.\nThe new review copies this review's base branch and project; both reviews rebuild afterward.\nThis cannot be undone.">⇱ Extract to a new review</div>`);
           items.push(`<div data-click="openMoveBranchMenu" data-guardian-id="${esc(gid)}" data-branch-id="${esc(bid)}" data-tip="Move this branch to a different review.\nWho/when: a change needs to ship independently of the review it started in — this review is stalled but this branch is ready, or another review needs just this branch.\nBoth reviews rebuild afterward.\nThis cannot be undone.">⇄ Move to another review…</div>`);
         }
         menu.innerHTML = items.join("");

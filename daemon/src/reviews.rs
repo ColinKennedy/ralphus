@@ -1422,7 +1422,7 @@ fn record_review_guardian(
 /// project default regardless of how the guardian was created.
 /// `auto_submit_pr_stack` also doesn't need one: `create_guardian_keyed`
 /// already stamps it at INSERT time for every guardian, both paths included.
-fn apply_project_review_defaults(
+pub(crate) fn apply_project_review_defaults(
     store: &Store,
     gid: &str,
     project: &str,

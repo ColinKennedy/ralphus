@@ -35,6 +35,11 @@ pub enum WayOut {
         /// `review#branch` selector of the branch.
         branch_ref: String,
     },
+    /// Move the cell's branch into a new review of its own.
+    ExtractBranch {
+        /// `review#branch` selector of the branch.
+        branch_ref: String,
+    },
 }
 
 impl WayOut {
@@ -48,6 +53,9 @@ impl WayOut {
                     "disable its review branch with `ralphus review branch disable {branch_ref}`"
                 )
             }
+            Self::ExtractBranch { branch_ref } => format!(
+                "extract its branch to a new review with `ralphus review extract-branch {branch_ref}`"
+            ),
         }
     }
 }
@@ -60,6 +68,9 @@ pub fn way_outs(cell_ref: &str, blocking: &CellBlocking) -> Vec<WayOut> {
     }];
     if let Some((review_id, branch)) = &blocking.branch {
         out.push(WayOut::DisableBranch {
+            branch_ref: format!("{review_id}#{branch}"),
+        });
+        out.push(WayOut::ExtractBranch {
             branch_ref: format!("{review_id}#{branch}"),
         });
     }
@@ -256,6 +267,7 @@ mod tests {
         let rendered = remediation.render();
         assert!(rendered.contains("ralphus cell set-status squad-1/build/compile ignored"));
         assert!(rendered.contains("ralphus review branch disable guardian-1#t-review"));
+        assert!(rendered.contains("ralphus review extract-branch guardian-1#t-review"));
     }
 
     #[test]

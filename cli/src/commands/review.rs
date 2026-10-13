@@ -229,6 +229,9 @@ pub enum ReviewCommand {
         selector: String,
         to_review: String,
     },
+    ExtractBranch {
+        selector: String,
+    },
     Upstream(ReviewUpstreamCommand),
     Pr(ReviewPrCommand),
     Branch(ReviewBranchCommand),
@@ -645,6 +648,9 @@ pub fn parse(args: &[String]) -> ReviewCommand {
                 ),
             }
         }
+        Some("extract-branch") => with_selector(scanner, |selector| ReviewCommand::ExtractBranch {
+            selector,
+        }),
         Some("upstream") => ReviewCommand::Upstream(parse_upstream(&scanner.remaining())),
         Some("pr") => ReviewCommand::Pr(parse_pr(&scanner.remaining())),
         Some("branch") => ReviewCommand::Branch(parse_branch(&scanner.remaining())),
@@ -1799,6 +1805,24 @@ pub fn dispatch(cmd: ReviewCommand, opts: &GlobalOpts) -> i32 {
                 Ok(result) => {
                     emit(opts, &result, |_| {
                         println!("{selector} moved to {to_review}; rebuilding both reviews")
+                    });
+                    0
+                }
+                Err(e) => fail_daemon(opts, e),
+            }
+        }
+        ReviewCommand::ExtractBranch { selector } => {
+            let resolved = match resolve_branch(opts, &client, &selector) {
+                Ok(r) => r,
+                Err(code) => return code,
+            };
+            match client.guardian_extract_branch(
+                &resolved.guardian_id,
+                resolved.branch_id.as_deref().unwrap_or_default(),
+            ) {
+                Ok(result) => {
+                    emit(opts, &result, |_| {
+                        println!("{selector} extracted into a new review; rebuilding both reviews")
                     });
                     0
                 }

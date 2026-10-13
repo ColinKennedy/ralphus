@@ -135,6 +135,7 @@ where one exists.
 | POST | `/api/guardians/{id}/force_start` | Disable not-yet-done branches, merge immediately |
 | POST | `/api/guardians/{id}/branches/{branch_id}/dismiss_reenable` | Dismiss the "can re-enable" notice |
 | POST | `/api/guardians/{id}/branches/{branch_id}/move` | [Move a branch to another review](#post-apiguardiansidbranchesposmove) (RAL-118) |
+| POST | `/api/guardians/{id}/branches/{branch_id}/extract` | [Extract a branch into a new review](#post-apiguardiansidbranchesbranch_idextract) (RAL-641) |
 | POST | `/api/guardians/{id}/branches/{branch_id}/link_cell` | [Link a cell/task to an already-attached branch](#post-apiguardiansidbranchesbranch_idlink_cell) (RAL-392) |
 | POST | `/api/guardians/{id}/branches/{branch_id}/env` | [Set/unset/clear this review worktree's env overrides](#post-apiguardiansidbranchesbidenv--review-worktree-overrides) (RAL-191) |
 | GET | `/api/guardians/{id}/branches/{branch_id}/env` | [Resolved environment variables](#get-env--resolved-environment-views-ral-324) for that review worktree (RAL-324) |
@@ -2509,6 +2510,25 @@ destination's merge-start Reply) — the same convention
 `branches/{branch_id}/move`'s sibling `POST .../base` uses for its own rebuild
 kickoff. The move itself is already persisted by the time that reply is
 returned, regardless of whether the rebuild succeeds.
+
+### `POST /api/guardians/{id}/branches/{branch_id}/extract`
+Extract a branch out of this review into a **new** review (RAL-641): the
+shortcut for "create a review, then move the branch into it", for a branch
+that is ready while the rest of `{id}` is stalled or blocked. No body.
+
+The new review copies `{id}`'s base branch, project, owner (so fork/upstream
+routing resolves the same way) and environment overrides, receives the
+project's review defaults, has origin `explicit`, and auto-opens its PR once
+the branch is built so neither review stalls. The moved branch keeps its
+`branch_id`, and its `moved_from_guardian_id` records `{id}`. Every refusal of
+the move endpoint applies (`409` while either review is `merging`, `404` for a
+missing review/branch); if the move is refused the half-created review is
+deleted again.
+
+Both reviews rebuild afterwards, exactly as for `move`. Returns
+`{ "guardian_id": "<new review id>", "from_guardian_id": "<id>", "branch_id": "<branch_id>" }`.
+CLI: `ralphus review extract-branch <selector#branch>`; MCP tool
+`review_extract-branch`; board: the branch menu's "Extract to a new review".
 
 **Future: copy mode.** RAL-118 Q3 scoped v1 to *move* only and asked for a
 sketch of what *copy* — the same work landing in two reviews, each rebased

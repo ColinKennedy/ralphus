@@ -2068,6 +2068,9 @@ fn route_for_user(
         ("POST", ["api", "guardians", id, "branches", branch_id, "move"]) => {
             guardian_move_branch(daemon, id, branch_id, body)
         }
+        ("POST", ["api", "guardians", id, "branches", branch_id, "extract"]) => {
+            guardian_extract_branch(daemon, id, branch_id)
+        }
         ("POST", ["api", "guardians", id, "branches", branch_id, "link_cell"]) => {
             guardian_link_cell(daemon, id, branch_id, body)
         }
@@ -19665,15 +19668,10 @@ fn guardian_move_branch(daemon: &Daemon, id: &str, branch_id: &str, body: &str) 
         );
     }
 
-    let (source_remaining, source_git_root) = {
-        let store = daemon.lock();
-        match store.get_guardian(id) {
-            Ok(g) => (
-                g.branches.iter().filter(|b| b.id != branch_id).count(),
-                g.git_root,
-            ),
-            Err(e) => return store_error(&e),
-        }
+    let (source_remaining, source_git_root) = match source_remaining_and_root(daemon, id, branch_id)
+    {
+        Ok(v) => v,
+        Err(reply) => return reply,
     };
 
     if let Err(e) = daemon
@@ -19683,12 +19681,76 @@ fn guardian_move_branch(daemon: &Daemon, id: &str, branch_id: &str, body: &str) 
         return store_error(&e);
     }
 
+    rebuild_after_branch_move(
+        daemon,
+        id,
+        &source_git_root,
+        source_remaining,
+        &to_guardian_id,
+    )
+}
+
+/// How many branches stay in review `id` once `branch_id` leaves, plus its git
+/// root, read before the move.
+fn source_remaining_and_root(
+    daemon: &Daemon,
+    id: &str,
+    branch_id: &str,
+) -> Result<(usize, String), Reply> {
+    let store = daemon.lock();
+    match store.get_guardian(id) {
+        Ok(g) => Ok((
+            g.branches.iter().filter(|b| b.id != branch_id).count(),
+            g.git_root,
+        )),
+        Err(e) => Err(store_error(&e)),
+    }
+}
+
+/// Extract one branch of review `id` into a brand-new review and rebuild both.
+/// Replies 200 `{guardian_id, from_guardian_id, branch_id}`; the new review's
+/// merge (and, with its auto-submit setting on, its PR) proceeds in the
+/// background. The refusals are `move_guardian_branch`'s (409).
+fn guardian_extract_branch(daemon: &Daemon, id: &str, branch_id: &str) -> Reply {
+    let (source_remaining, source_git_root) = match source_remaining_and_root(daemon, id, branch_id)
+    {
+        Ok(v) => v,
+        Err(reply) => return reply,
+    };
+    let new_id = match daemon.lock().extract_guardian_branch(id, branch_id) {
+        Ok(new_id) => new_id,
+        Err(e) => return store_error(&e),
+    };
+    let merge_reply =
+        rebuild_after_branch_move(daemon, id, &source_git_root, source_remaining, &new_id);
+    if merge_reply.status >= 400 {
+        return merge_reply;
+    }
+    json(
+        200,
+        &serde_json::json!({
+            "guardian_id": new_id,
+            "from_guardian_id": id,
+            "branch_id": branch_id,
+        }),
+    )
+}
+
+/// Rebuild the source and destination reviews after a branch left `id` for
+/// `to_guardian_id`, returning the destination's merge-kickoff reply.
+fn rebuild_after_branch_move(
+    daemon: &Daemon,
+    id: &str,
+    source_git_root: &str,
+    source_remaining: usize,
+    to_guardian_id: &str,
+) -> Reply {
     // The remaining source branches may have been stacked on top of the one
     // that just left; purge the source's worktrees/branches/carry-refs so the
     // rebuild below re-derives them from their own feature-branch tips
     // instead of replaying stale history that still contains the moved
     // branch's commits (see `guardian_merge::purge_worktrees`).
-    crate::guardian_merge::purge_worktrees(&daemon.store_handle(), &source_git_root, id);
+    crate::guardian_merge::purge_worktrees(&daemon.store_handle(), source_git_root, id);
 
     // RAL-279: the moved branch may have had PRs stacked on top of it in the
     // source review; retarget those onto the nearest remaining branch (or the
@@ -19710,7 +19772,7 @@ fn guardian_move_branch(daemon: &Daemon, id: &str, branch_id: &str, body: &str) 
     crate::guardian_merge::start_merge(
         daemon.store_handle(),
         runner,
-        &to_guardian_id,
+        to_guardian_id,
         daemon.semaphore_handle(),
         daemon.cancellations_handle(),
     )

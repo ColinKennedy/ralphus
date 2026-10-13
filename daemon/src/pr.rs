@@ -10831,6 +10831,13 @@ pub fn sync_remote_pr_commits(
             .as_deref()
             .and_then(|r| git(&root, &["rev-parse", r]).ok())
             .map(|s| s.trim().to_string());
+        // A review branch whose ref is gone (its worktrees were purged for a
+        // rebuild, as after a branch left the review) has no worktree to pull
+        // into; the rebuild that follows recreates it, and publishing is
+        // guarded against clobbering the PR's own commits.
+        if local_sha.is_none() {
+            continue;
+        }
         let (pr_ahead, _, _) = classify_pr_sync(
             &root,
             remote_sha.as_deref(),

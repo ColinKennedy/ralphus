@@ -2043,6 +2043,18 @@ impl DaemonClient {
         )
     }
 
+    /// Move `branch_id` out of `guardian_id` into a brand-new review (RAL-641).
+    pub fn guardian_extract_branch(
+        &self,
+        guardian_id: &str,
+        branch_id: &str,
+    ) -> Result<Value, DaemonError> {
+        self.post(
+            &format!("/api/guardians/{guardian_id}/branches/{branch_id}/extract"),
+            None,
+        )
+    }
+
     /// Link an existing cell/task to `guardian_id`'s `branch_id` after the
     /// fact (RAL-392) -- see `ralphus review link-cell`.
     pub fn guardian_link_cell(

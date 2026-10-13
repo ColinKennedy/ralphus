@@ -7515,6 +7515,111 @@ fn moving_a_branch_mid_feedback_is_refused_then_allowed_once_the_round_ends() {
     assert_eq!(view.branches.len(), 2, "{what}: {}", fx.describe());
 }
 
+/// Extracting the top branch of a published stack into a new review (RAL-641)
+/// leaves the source's PR stack intact, builds the extracted branch in its own
+/// review, and lets that review open its PR -- on either forge.
+fn extracting_a_branch_keeps_the_pr_stack_intact_and_opens_its_own_pr_on(kind: &str) {
+    let what = "extract branch";
+    let (fx, forge) = Fixture::with_forge_kind(&["feature/a", "feature/b", "feature/c"], kind);
+    fx.submit_stack();
+    let daemon = DaemonPump::start(&fx);
+    let first = fx
+        .store
+        .lock()
+        .get_guardian(&fx.id)
+        .unwrap()
+        .base_commit
+        .unwrap_or_default();
+    fx.wait_settled_on(first.trim(), "before the extract");
+    let (_, alias_a) = fx.open_pr_row(0);
+    let (_, alias_b) = fx.open_pr_row(1);
+
+    let new_id = fx
+        .store
+        .lock()
+        .extract_guardian_branch(&fx.id, &fx.branch_ids[2])
+        .unwrap_or_else(|e| panic!("{what}: extract failed: {e}\n{}", fx.describe()));
+    ralphus_daemon::guardian_merge::purge_worktrees(&fx.store, fx.root.to_str().unwrap(), &fx.id);
+    let resynced = ralphus_daemon::pr::resync_pr_bases_synchronously(&fx.store, &fx.id);
+    for id in [fx.id.as_str(), new_id.as_str()] {
+        ralphus_daemon::guardian_merge::start_merge(
+            Arc::clone(&fx.store),
+            Arc::new(NoAgentExpected),
+            id,
+            Arc::clone(&daemon.sem),
+            daemon.cancellations.clone(),
+        );
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(180);
+    loop {
+        let view = fx.store.lock().get_guardian(&new_id).unwrap();
+        if view.status == "in_review" && view.branches.iter().all(|b| b.merge_status == "done") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{what}: the extracted review never built (status {})\n{}",
+            view.status,
+            fx.describe()
+        );
+        std::thread::sleep(SETTLE_POLL);
+    }
+    fx.wait_settled_on(first.trim(), what);
+
+    let source = fx.store.lock().get_guardian(&fx.id).unwrap();
+    assert_eq!(source.branches.len(), 2, "{what}: {}", fx.describe());
+    let extracted = fx.store.lock().get_guardian(&new_id).unwrap();
+    assert_eq!(extracted.branches.len(), 1, "{what}: {}", fx.describe());
+
+    let prs = ralphus_daemon::pr::submit_pull_requests(
+        &fx.store,
+        &NoAgentExpected,
+        &new_id,
+        stack_request(),
+        "tester",
+        false,
+    )
+    .unwrap_or_else(|e| {
+        panic!(
+            "{what}: the extracted review's PR failed: {e}\n{}",
+            fx.describe()
+        )
+    });
+    assert_eq!(prs.len(), 1, "{what}: {}", fx.describe());
+
+    {
+        let state = forge.state.lock().unwrap();
+        for alias in [&alias_a, &alias_b] {
+            assert!(
+                state.prs.iter().any(|p| p.open && &p.head == alias),
+                "{what}: the source's PR {alias} did not stay open ({resynced:?})"
+            );
+        }
+        let base_of_b = state
+            .prs
+            .iter()
+            .find(|p| p.head == alias_b)
+            .map(|p| p.base.clone())
+            .unwrap_or_default();
+        assert_eq!(
+            base_of_b, alias_a,
+            "{what}: b's PR lost its place in the stack"
+        );
+    }
+    fx.assert_forge_routed_everything(what, &forge);
+}
+
+#[test]
+fn extracting_a_branch_keeps_the_pr_stack_intact_and_opens_its_own_pr() {
+    extracting_a_branch_keeps_the_pr_stack_intact_and_opens_its_own_pr_on("github");
+}
+
+#[test]
+fn extracting_a_branch_keeps_the_pr_stack_intact_and_opens_its_own_pr_on_gitlab() {
+    extracting_a_branch_keeps_the_pr_stack_intact_and_opens_its_own_pr_on("gitlab");
+}
+
 // ---------------------------------------------------------------------------
 // Native-stack restrictions and auto-fix attempt budgets.
 // ---------------------------------------------------------------------------

@@ -649,6 +649,15 @@ const REVIEW_CHILDREN: &[HelpNode] = &[
         &[],
     ),
     node(
+        "extract-branch",
+        &["selector [str]"],
+        &[],
+        "Move a branch into a new review of its own, then rebuild both.",
+        false,
+        false,
+        &[],
+    ),
+    node(
         "move-branch",
         &["selector [str]", "to_review [str]"],
         &[],
