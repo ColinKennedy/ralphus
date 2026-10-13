@@ -410,7 +410,7 @@ fn try_fetch_with(
         if spec.direction() != git2::Direction::Fetch {
             continue;
         }
-        let (Ok(src), Ok(dst)) = (spec.src(), spec.dst()) else {
+        let (Some(src), Some(dst)) = (spec.src(), spec.dst()) else {
             return None;
         };
         if src.starts_with('^') {
@@ -418,12 +418,12 @@ fn try_fetch_with(
         }
         configured.push((spec.is_force(), src.to_string(), dst.to_string()));
     }
-    let transport = transport_for(root, named.url().ok()?, token_for)?;
+    let transport = transport_for(root, named.url()?, token_for)?;
     if recently_failed(transport.url()) {
         return None;
     }
     let started = Instant::now();
-    match fetch(&repo, remote_name, &transport, &specs, &configured) {
+    match fetch(root, &repo, remote_name, &transport, &specs, &configured) {
         Ok(Attempt::Done(output)) => {
             // ralphus[ignore-rlog-pair]: low-level transport detail with no Store; callers record the outcome of the work the fetch serves
             crate::rlog!(
@@ -443,7 +443,7 @@ fn try_fetch_with(
             if let Transport::Https { host, path, .. } = &transport {
                 forget_token(host, path);
             }
-            note_failure(transport.url(), e.message());
+            note_failure(transport.url(), &e);
             None
         }
     }
@@ -452,10 +452,7 @@ fn try_fetch_with(
 fn callbacks(transport: &Transport, deadline: Instant) -> git2::RemoteCallbacks<'static> {
     let mut cbs = git2::RemoteCallbacks::new();
     if let Transport::Https { kind, token, .. } = transport {
-        let user = match kind {
-            ForgeKind::GitHub => "x-access-token",
-            ForgeKind::GitLab => "oauth2",
-        };
+        let user = forge_git_user(*kind);
         let token = token.clone();
         let mut offered = false;
         cbs.credentials(move |_url, _user, allowed| {
@@ -473,46 +470,162 @@ fn callbacks(transport: &Transport, deadline: Instant) -> git2::RemoteCallbacks<
     cbs
 }
 
-/// The remote's advertised refs and the commits they point at, peeled tag
-/// entries (`^{}`) left out.
-fn advertised(remote: &git2::Remote<'_>) -> Result<Vec<(String, git2::Oid)>, git2::Error> {
-    Ok(remote
-        .list()?
-        .iter()
-        .filter(|h| !h.name().ends_with("^{}"))
-        .map(|h| (h.name().to_string(), h.oid()))
-        .collect())
+/// The refs `transport`'s remote advertises and the commits they point at,
+/// peeled tag entries (`^{}`) left out, or `None` when they cannot be listed
+/// the way git's upload-pack would list them.
+///
+/// The list is read here rather than through libgit2's `Remote::list`, which
+/// in this git2 version builds a slice from a null pointer whenever a remote
+/// advertises no refs at all (an empty repository) -- undefined behavior that
+/// aborts the process in debug builds.
+fn list_refs(
+    root: &Path,
+    transport: &Transport,
+) -> Result<Option<Vec<(String, git2::Oid)>>, String> {
+    match transport {
+        Transport::Local(url) => local_refs(&local_path(root, url)),
+        Transport::Https {
+            url, kind, token, ..
+        } => https_refs(url, *kind, token).map(Some),
+    }
+}
+
+fn local_path(root: &Path, url: &str) -> PathBuf {
+    let raw = url.strip_prefix("file://").unwrap_or(url);
+    // `file:///C:/x` names the drive path `C:/x`.
+    let raw = match raw.strip_prefix('/') {
+        Some(rest) if rest.as_bytes().get(1) == Some(&b':') => rest,
+        _ => raw,
+    };
+    let path = Path::new(raw);
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        root.join(path)
+    }
+}
+
+/// What `git upload-pack` would advertise for the repository at `path`:
+/// `HEAD` when it resolves, then every ref.
+fn local_refs(path: &Path) -> Result<Option<Vec<(String, git2::Oid)>>, String> {
+    let remote = git2::Repository::open(path).map_err(|e| e.message().to_string())?;
+    let cfg = remote.config().map_err(|e| e.message().to_string())?;
+    if cfg.get_entry("uploadpack.hiderefs").is_ok() || cfg.get_entry("transfer.hiderefs").is_ok() {
+        return Ok(None);
+    }
+    let mut out = Vec::new();
+    if let Some(oid) = remote.head().ok().and_then(|h| h.target()) {
+        out.push(("HEAD".to_string(), oid));
+    }
+    for reference in remote.references().map_err(|e| e.message().to_string())? {
+        let reference = reference.map_err(|e| e.message().to_string())?;
+        let Some(name) = reference.name() else {
+            return Ok(None);
+        };
+        if let Some(oid) = reference.resolve().ok().and_then(|r| r.target()) {
+            out.push((name.to_string(), oid));
+        }
+    }
+    Ok(Some(out))
+}
+
+/// The ref advertisement from a smart-HTTP remote's
+/// `info/refs?service=git-upload-pack`.
+fn https_refs(url: &str, kind: ForgeKind, token: &str) -> Result<Vec<(String, git2::Oid)>, String> {
+    use base64::Engine as _;
+    let endpoint = format!(
+        "{}/info/refs?service=git-upload-pack",
+        url.trim_end_matches('/')
+    );
+    let credentials = base64::engine::general_purpose::STANDARD
+        .encode(format!("{}:{token}", forge_git_user(kind)));
+    let response = crate::forge::bounded_http_agent(Duration::from_secs(30))
+        .get(&endpoint)
+        .set("Authorization", &format!("Basic {credentials}"))
+        .set("User-Agent", "git/2.0 (ralphus)")
+        .call()
+        .map_err(|e| format!("listing refs: {}", redact(&e.to_string())))?;
+    if response.content_type() != "application/x-git-upload-pack-advertisement" {
+        return Err(format!(
+            "listing refs: unexpected content type {:?}",
+            response.content_type()
+        ));
+    }
+    let mut body = Vec::new();
+    std::io::Read::read_to_end(&mut response.into_reader(), &mut body)
+        .map_err(|e| format!("listing refs: {e}"))?;
+    parse_advertisement(&body)
+}
+
+/// The refs in a protocol-v0 smart-HTTP ref advertisement (pkt-lines).
+fn parse_advertisement(body: &[u8]) -> Result<Vec<(String, git2::Oid)>, String> {
+    let mut out = Vec::new();
+    let mut pos = 0;
+    while pos + 4 <= body.len() {
+        let len = std::str::from_utf8(&body[pos..pos + 4])
+            .ok()
+            .and_then(|hex| usize::from_str_radix(hex, 16).ok())
+            .ok_or("listing refs: malformed pkt-line length")?;
+        if len == 0 {
+            pos += 4;
+            continue;
+        }
+        if len < 4 || pos + len > body.len() {
+            return Err("listing refs: truncated pkt-line".to_string());
+        }
+        let line = &body[pos + 4..pos + len];
+        pos += len;
+        let line = line.strip_suffix(b"\n").unwrap_or(line);
+        let line = line.split(|b| *b == 0).next().unwrap_or(line);
+        let line = std::str::from_utf8(line).map_err(|_| "listing refs: non-UTF-8 ref name")?;
+        if line.starts_with("# service=") || line == "version 1" {
+            continue;
+        }
+        if line.starts_with("version ") {
+            return Err(format!("listing refs: unsupported protocol {line:?}"));
+        }
+        let (oid, name) = line
+            .split_once(' ')
+            .ok_or("listing refs: malformed ref line")?;
+        if name == "capabilities^{}" || name.ends_with("^{}") {
+            continue;
+        }
+        let oid = git2::Oid::from_str(oid).map_err(|_| "listing refs: malformed object id")?;
+        out.push((name.to_string(), oid));
+    }
+    Ok(out)
+}
+
+/// The username a forge accepts alongside a token for git over HTTPS.
+fn forge_git_user(kind: ForgeKind) -> &'static str {
+    match kind {
+        ForgeKind::GitHub => "x-access-token",
+        ForgeKind::GitLab => "oauth2",
+    }
 }
 
 /// Downloads `specs` from the remote and writes each destination ref.
 ///
 /// The refs are written here rather than through libgit2's `update_tips`,
 /// which truncates `FETCH_HEAD` on every call: git leaves that file alone under
-/// `--no-write-fetch-head`, and another git command may be reading it.
-/// Tags are not followed; nothing in the daemon reads a fetched tag.
+/// `--no-write-fetch-head`, and another git command may be reading it. Each
+/// ref is set to the commit the listing advertised, once that commit is known
+/// to be in the object database. Tags are not followed; nothing in the daemon
+/// reads a fetched tag.
 fn fetch(
+    root: &Path,
     repo: &git2::Repository,
     remote_name: &str,
     transport: &Transport,
     specs: &[Refspec<'_>],
     configured: &[(bool, String, String)],
-) -> Result<Attempt, git2::Error> {
+) -> Result<Attempt, String> {
     let deadline = Instant::now() + FETCH_DEADLINE;
-    let Some(mut remote) = unrewritten_remote(repo, transport)? else {
+    let Some(advertised) = list_refs(root, transport)? else {
         return Ok(Attempt::Fallback);
     };
-    let first: Vec<String> = {
-        let mut conn = remote.connect_auth(
-            git2::Direction::Fetch,
-            Some(callbacks(transport, deadline)),
-            Some(proxy()),
-        )?;
-        advertised(conn.remote())?
-            .into_iter()
-            .map(|(name, _)| name)
-            .collect()
-    };
-    let planned = match plan_refspecs(specs, &first, configured) {
+    let names: Vec<String> = advertised.iter().map(|(n, _)| n.clone()).collect();
+    let planned = match plan_refspecs(specs, &names, configured) {
         Ok(Some(planned)) => planned,
         Ok(None) => return Ok(Attempt::Fallback),
         Err(missing) => {
@@ -525,34 +638,45 @@ fn fetch(
     if planned.iter().any(|(_, dst)| checked_out(repo, dst)) {
         return Ok(Attempt::Fallback);
     }
-    let wanted: Vec<String> = planned
+    let tips: HashMap<String, git2::Oid> = advertised.into_iter().collect();
+    let odb = repo.odb().map_err(|e| e.message().to_string())?;
+    // Nothing to download when every advertised commit is already here.
+    if planned
         .iter()
-        .map(|(src, dst)| format!("+{src}:{dst}"))
-        .collect();
-    let mut opts = git2::FetchOptions::new();
-    opts.remote_callbacks(callbacks(transport, deadline))
-        .proxy_options(proxy())
-        .update_fetchhead(false)
-        .download_tags(git2::AutotagOption::None);
-    remote.download(&wanted, Some(&mut opts))?;
-    // The commits this download negotiated for; the first listing may be
-    // older if the remote moved in between.
-    let tips: HashMap<String, git2::Oid> = advertised(&remote)?.into_iter().collect();
-    remote.disconnect()?;
-    let odb = repo.odb()?;
-    let mut updates = Vec::with_capacity(planned.len());
-    for (src, dst) in &planned {
-        let Some(oid) = tips.get(src) else {
+        .any(|(src, _)| tips.get(src).is_none_or(|oid| !odb.exists(*oid)))
+    {
+        let Some(mut remote) =
+            unrewritten_remote(repo, transport).map_err(|e| e.message().to_string())?
+        else {
             return Ok(Attempt::Fallback);
         };
-        if !odb.exists(*oid) {
-            return Ok(Attempt::Fallback);
+        let wanted: Vec<String> = planned
+            .iter()
+            .map(|(src, dst)| format!("+{src}:{dst}"))
+            .collect();
+        let mut opts = git2::FetchOptions::new();
+        opts.remote_callbacks(callbacks(transport, deadline))
+            .proxy_options(proxy())
+            .update_fetchhead(false)
+            .download_tags(git2::AutotagOption::None);
+        remote
+            .download(&wanted, Some(&mut opts))
+            .map_err(|e| e.message().to_string())?;
+        remote.disconnect().map_err(|e| e.message().to_string())?;
+    }
+    let mut updates = Vec::with_capacity(planned.len());
+    for (src, dst) in &planned {
+        // A commit missing after the download means the remote moved between
+        // the listing and the download; git's own fetch answers that.
+        match tips.get(src) {
+            Some(oid) if odb.exists(*oid) => updates.push((dst, *oid)),
+            _ => return Ok(Attempt::Fallback),
         }
-        updates.push((dst, *oid));
     }
     let message = format!("fetch {remote_name}: storing head");
     for (dst, oid) in updates {
-        repo.reference(dst, oid, true, &message)?;
+        repo.reference(dst, oid, true, &message)
+            .map_err(|e| e.message().to_string())?;
     }
     Ok(Attempt::Done(
         crate::vcs_refs::success_output(String::new()),
@@ -579,7 +703,7 @@ fn unrewritten_remote<'r>(
     }
     for candidate in candidates {
         let remote = repo.remote_anonymous(&candidate)?;
-        if remote.url().ok() == Some(candidate.as_str()) {
+        if remote.url() == Some(candidate.as_str()) {
             return Ok(Some(remote));
         }
     }
@@ -805,6 +929,68 @@ mod tests {
             transport_for(root, "git@example.org:acme/widget.git", with_token),
             None
         );
+    }
+
+    fn pkt(line: &str) -> String {
+        format!("{:04x}{line}", line.len() + 4)
+    }
+
+    #[test]
+    fn parses_a_smart_http_ref_advertisement() {
+        let a = "1".repeat(40);
+        let b = "2".repeat(40);
+        let body = [
+            pkt("# service=git-upload-pack\n"),
+            "0000".to_string(),
+            pkt(&format!(
+                "{a} HEAD\0multi_ack side-band-64k symref=HEAD:refs/heads/main\n"
+            )),
+            pkt(&format!("{a} refs/heads/main\n")),
+            pkt(&format!("{b} refs/tags/v1\n")),
+            pkt(&format!("{a} refs/tags/v1^{{}}\n")),
+            "0000".to_string(),
+        ]
+        .concat();
+        let oid = |s: &str| git2::Oid::from_str(s).unwrap();
+        assert_eq!(
+            parse_advertisement(body.as_bytes()),
+            Ok(vec![
+                ("HEAD".to_string(), oid(&a)),
+                ("refs/heads/main".to_string(), oid(&a)),
+                ("refs/tags/v1".to_string(), oid(&b)),
+            ])
+        );
+    }
+
+    #[test]
+    fn an_empty_repositorys_advertisement_has_no_refs() {
+        let zero = "0".repeat(40);
+        let body = [
+            pkt("# service=git-upload-pack\n"),
+            "0000".to_string(),
+            pkt(&format!("{zero} capabilities^{{}}\0side-band-64k\n")),
+            "0000".to_string(),
+        ]
+        .concat();
+        assert_eq!(parse_advertisement(body.as_bytes()), Ok(Vec::new()));
+    }
+
+    #[test]
+    fn a_protocol_v2_or_malformed_advertisement_is_rejected() {
+        let v2 = [pkt("version 2\n"), pkt("ls-refs\n"), "0000".to_string()].concat();
+        assert!(parse_advertisement(v2.as_bytes()).is_err());
+        assert!(parse_advertisement(b"zzzzjunk").is_err());
+        assert!(parse_advertisement(b"00ffshort").is_err());
+    }
+
+    #[test]
+    fn local_paths_resolve_like_git() {
+        let root = Path::new("C:/work/repo");
+        assert_eq!(
+            local_path(root, "file:///C:/remotes/up.git"),
+            PathBuf::from("C:/remotes/up.git")
+        );
+        assert_eq!(local_path(root, "../up.git"), root.join("../up.git"));
     }
 
     #[test]

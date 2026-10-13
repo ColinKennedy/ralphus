@@ -339,7 +339,7 @@ fn ref_pattern(p: &str) -> bool {
 /// a message that is not UTF-8, declares another encoding, starts with blank
 /// lines, or whose first paragraph is not a single clean line.
 fn clean_subject(commit: &git2::Commit<'_>) -> Option<String> {
-    if !matches!(commit.message_encoding(), Ok(None)) {
+    if commit.message_encoding().is_some() {
         return None;
     }
     let message = std::str::from_utf8(commit.message_bytes()).ok()?;
@@ -515,10 +515,7 @@ fn repo_level_entries(config: &git2::Config) -> Option<Vec<(String, String)>> {
         let mut entries = scoped.entries(None).ok()?;
         while let Some(entry) = entries.next() {
             let entry = entry.ok()?;
-            out.push((
-                entry.name().ok()?.to_string(),
-                entry.value().ok()?.to_string(),
-            ));
+            out.push((entry.name()?.to_string(), entry.value()?.to_string()));
         }
     }
     Some(out)
@@ -536,7 +533,7 @@ fn remote_verbose(root: &Path) -> Option<Answer> {
     let mut rewrite_prefixes = Vec::new();
     let mut rewrites = config.entries(Some("^url\\..*\\.(push)?insteadof$")).ok()?;
     while let Some(entry) = rewrites.next() {
-        rewrite_prefixes.push(entry.ok()?.value().ok()?.to_string());
+        rewrite_prefixes.push(entry.ok()?.value()?.to_string());
     }
     let mut remotes: std::collections::BTreeMap<String, (Vec<String>, Vec<String>, bool)> =
         std::collections::BTreeMap::new();
@@ -649,7 +646,7 @@ pub fn try_config_read(root: &Path, args: &[&str]) -> Option<Answer> {
         }
         let mut rewrites = config.entries(Some("^url\\..*\\.insteadof$")).ok()?;
         while let Some(entry) = rewrites.next() {
-            rewrite_prefixes.push(entry.ok()?.value().ok()?.to_string());
+            rewrite_prefixes.push(entry.ok()?.value()?.to_string());
         }
     }
     for level in [git2::ConfigLevel::Worktree, git2::ConfigLevel::Local] {
@@ -659,7 +656,7 @@ pub fn try_config_read(root: &Path, args: &[&str]) -> Option<Answer> {
         let mut values = scoped.multivar(&key, None).ok()?;
         let mut found = Vec::new();
         while let Some(entry) = values.next() {
-            found.push(entry.ok()?.value().ok()?.to_string());
+            found.push(entry.ok()?.value()?.to_string());
         }
         match found.as_slice() {
             [] => {}
@@ -702,13 +699,13 @@ impl Repo {
                 return git2::TreeWalkResult::Ok;
             }
             match entry.name() {
-                Ok(name) => {
+                Some(name) => {
                     out.push_str(dir);
                     out.push_str(name);
                     out.push('\0');
                     git2::TreeWalkResult::Ok
                 }
-                Err(_) => {
+                None => {
                     valid = false;
                     git2::TreeWalkResult::Abort
                 }
@@ -766,7 +763,7 @@ impl Repo {
             return Some("HEAD\n".to_string());
         }
         let head = self.repo.head().ok()?;
-        let name = head.name().ok()?.to_string();
+        let name = head.name()?.to_string();
         Some(format!("{}\n", self.shorten(&name)?))
     }
 
@@ -784,7 +781,7 @@ impl Repo {
                 git2::Branch::wrap(head)
             }
         };
-        let full = local.upstream().ok()?.get().name().ok()?.to_string();
+        let full = local.upstream().ok()?.get().name()?.to_string();
         let shown = if short { self.shorten(&full)? } else { full };
         Some(format!("{shown}\n"))
     }
@@ -910,7 +907,7 @@ impl Repo {
     /// `git symbolic-ref [--quiet] [--short] <reference>` for a symbolic ref.
     fn symbolic_ref(&self, reference: &str, short: bool) -> Option<String> {
         let found = self.repo.find_reference(reference).ok()?;
-        let target = found.symbolic_target().ok().flatten()?.to_string();
+        let target = found.symbolic_target()?.to_string();
         let shown = if short {
             self.shorten(&target)?
         } else {
@@ -926,7 +923,7 @@ impl Repo {
         let mut names = Vec::new();
         for reference in self.repo.references().ok()? {
             let reference = reference.ok()?;
-            let name = reference.name().ok()?.to_string();
+            let name = reference.name()?.to_string();
             // Per-worktree namespaces differ between libgit2 and git.
             if name.starts_with("refs/worktree/") || name.starts_with("refs/bisect/") {
                 return None;
