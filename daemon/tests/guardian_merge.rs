@@ -2302,6 +2302,10 @@ fn auto_fix_dispatch_gives_every_failing_check_its_own_log_file_and_prompt_parag
     );
     assert!(text.contains("'build' failed"), "{text}");
     assert!(text.contains("'test' failed"), "{text}");
+    assert!(
+        text.contains("this round must end with a code change that fixes it"),
+        "the prompt must require a change, not just passing local checks: {text}"
+    );
 
     let _ = std::fs::remove_dir_all(&root);
     let _ = std::fs::remove_dir_all(&remote_dir);

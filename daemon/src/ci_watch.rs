@@ -1442,6 +1442,20 @@ pub const AUTO_FIX_AUTHOR: &str = "PR Auto-Fix";
 /// with [`AUTO_FIX_AUTHOR`], identifying the subsystem that posted the message.
 const AUTO_FIX_SUBMITTED_BY: &str = "guardian:ci-watch-auto-fix";
 
+/// The auto-fix prompt's rule that a CI failure demands a code change. It
+/// sits in the generated failure section, not the template, so a custom
+/// template or the testing-paragraph swap can never drop it. Without it, a
+/// fixer that re-runs only local cheap checks and sees them pass reports the
+/// failure "already fixed" and commits nothing.
+const AUTO_FIX_CHANGE_REQUIRED: &str = "A failing CI check is a call to action: this round \
+must end with a code change that fixes it. Cheap checks passing on this machine do not show \
+that the failure is fixed -- most CI failures (tests, other platforms, release builds) cannot \
+be reproduced by them. Find what broke from the failing job above and change the code; do not \
+end the round by reporting that everything is already fixed. The only exception is a failure \
+the job's output shows has nothing to do with this branch's code -- a flaky test, or a problem \
+with the CI runner itself (authentication, network, disk space). In that case make no change, \
+and say so in your final reply, quoting the job output that shows it.";
+
 /// Dispatch the review's agent to fix a failing PR/MR (RAL-395): composes the
 /// auto-fix prompt (project/per-review template, `<<prompt>>` replaced by the
 /// failing branch's own Cells' prompts, `{insert URL here}` replaced by the
@@ -1859,7 +1873,7 @@ fn run_pr_fix(
     .map_or_else(String::new, |note| format!("\n\n{note}"));
 
     let prompt_body = format!(
-        "{paragraphs}{stack_note}\n\n\
+        "{paragraphs}{stack_note}\n\n{AUTO_FIX_CHANGE_REQUIRED}\n\n\
          The following are the prompts of the work already done on this branch -- keep this \
          behavior intact while fixing the CI failure:\n\n{cells}",
         paragraphs = paragraphs.join("\n\n"),
