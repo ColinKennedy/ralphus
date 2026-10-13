@@ -1240,29 +1240,32 @@ fn plan_auto_fix_dispatch<'a>(
 const LARGE_LOG_LINE_THRESHOLD: usize = 500;
 
 /// The on-disk path a failing check/job's log gets written to (RAL-395,
-/// extended for RAL-<new>'s per-check breakdown): when there's exactly one
-/// failing check, the original single, stably-named `.ralphus-ci-failure.log`
-/// -- unchanged from before per-check breakdown existed. With more than one,
-/// each gets its own `.ralphus-ci-failure-<name>.log` so no failing check's
-/// log clobbers another's.
+/// extended for RAL-<new>'s per-check breakdown): `log_index` is `None` when
+/// there's exactly one failing check, which gets `.ralphus-ci-failure.log`.
+/// With more than one, check `i` gets `.ralphus-ci-failure-<i+1>-<name>.log`
+/// -- the index keeps two checks whose names sanitize alike (identical names
+/// from two workflows, names differing only in punctuation, or only in case
+/// on a case-insensitive filesystem) from overwriting each other's log.
 ///
-/// The file goes in the worktree's own git dir, not its working tree: a log
+/// The file goes in the worktree's own git dir, never its working tree: a log
 /// in the working tree is an untracked file that a later worktree recovery
-/// "rescue" commit, or the agent's own `git add`, pushes into the PR -- where
-/// it quotes the failing line back at the CI check that failed on it. The
-/// agent is given the absolute path either way. Falls back to the working
-/// tree only when the git dir cannot be found.
-fn ci_failure_log_path(worktree: &str, check_name: &str, only_one: bool) -> PathBuf {
-    let dir = crate::vcs_refs::worktree_git_dir(Path::new(worktree))
-        .unwrap_or_else(|| PathBuf::from(worktree));
-    if only_one {
-        dir.join(".ralphus-ci-failure.log")
-    } else {
-        dir.join(format!(
-            ".ralphus-ci-failure-{}.log",
+/// "rescue" commit, or the agent's own `git add`, pushes into the PR. `None`
+/// when the git dir cannot be found -- the caller then points the agent at
+/// the job URL instead.
+fn ci_failure_log_path(
+    worktree: &str,
+    check_name: &str,
+    log_index: Option<usize>,
+) -> Option<PathBuf> {
+    let dir = crate::vcs_refs::worktree_git_dir(Path::new(worktree))?;
+    Some(match log_index {
+        None => dir.join(".ralphus-ci-failure.log"),
+        Some(index) => dir.join(format!(
+            ".ralphus-ci-failure-{}-{}.log",
+            index + 1,
             sanitize_path_segment(check_name)
-        ))
-    }
+        )),
+    })
 }
 
 /// Write one failing check/job's full, untrimmed CI failure log to `path`
@@ -1293,12 +1296,13 @@ fn write_ci_failure_log(path: &Path, log_text: &str) -> Option<PathBuf> {
 /// (in which case `PrFailure::reason` already reads naturally, e.g. "check
 /// 'build' failed") or one of several (in which case a generic "'name'
 /// failed" is used, since the specific noun -- check/job/status -- isn't
-/// carried per-check).
+/// carried per-check). `log_index` names this check's log file -- see
+/// [`ci_failure_log_path`].
 fn describe_failing_check(
     worktree: Option<&str>,
     check: &FailedCheck,
     reason_line: &str,
-    only_one: bool,
+    log_index: Option<usize>,
 ) -> String {
     // RAL-<new>: a job's name alone can be misleadingly broad -- see
     // `FailedCheck::failing_step`'s doc comment for the incident this
@@ -1334,8 +1338,9 @@ fn describe_failing_check(
     let log_note = match (worktree, &check.log_text) {
         (Some(worktree), Some(log_text)) => {
             let line_count = log_text.lines().count();
-            let path = ci_failure_log_path(worktree, &check.name, only_one);
-            match write_ci_failure_log(&path, log_text) {
+            match ci_failure_log_path(worktree, &check.name, log_index)
+                .and_then(|path| write_ci_failure_log(&path, log_text))
+            {
                 Some(path) => {
                     let size_note = if line_count > LARGE_LOG_LINE_THRESHOLD {
                         format!(
@@ -1776,13 +1781,14 @@ fn run_pr_fix(
                 failing_step: None,
             },
             &failure.reason,
-            only_one,
+            None,
         )]
     } else {
         failure
             .checks
             .iter()
-            .map(|check| {
+            .enumerate()
+            .map(|(index, check)| {
                 let reason_line = if only_one {
                     failure.reason.clone()
                 } else {
@@ -1822,7 +1828,7 @@ fn run_pr_fix(
                     branch.worktree.as_deref(),
                     &enriched,
                     &reason_line,
-                    only_one,
+                    (!only_one).then_some(index),
                 )
             })
             .collect()
@@ -2132,7 +2138,7 @@ mod tests {
             log_text: None,
             failing_step: Some("cargo nextest run --workspace".to_string()),
         };
-        let text = describe_failing_check(None, &check, "check 'build' failed", true);
+        let text = describe_failing_check(None, &check, "check 'build' failed", None);
         assert!(
             text.contains("the exact command this failing step ran"),
             "must instruct the agent to find the step's own command: {text}"
@@ -2156,7 +2162,7 @@ mod tests {
             log_text: None,
             failing_step: None,
         };
-        let text = describe_failing_check(None, &check, "check 'build' failed", true);
+        let text = describe_failing_check(None, &check, "check 'build' failed", None);
         assert!(
             text.contains("Look up https://ci.example/job/1 to find out what the error was"),
             "{text}"
@@ -2167,11 +2173,55 @@ mod tests {
             job_url: None,
             ..check
         };
-        let text = describe_failing_check(None, &no_url, "check 'build' failed", true);
+        let text = describe_failing_check(None, &no_url, "check 'build' failed", None);
         assert!(
             text.contains("Look up this pull request's CI checks"),
             "{text}"
         );
+    }
+
+    /// Check names that sanitize alike (identical, punctuation-only or
+    /// case-only differences) must still get distinct log files.
+    #[test]
+    fn ci_failure_log_path_keeps_alike_check_names_apart() {
+        let root = std::env::temp_dir().join(format!("ralphus-ci-log-path-{}", std::process::id()));
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        let wt = root.to_str().unwrap();
+        let paths: Vec<PathBuf> = ["build", "build", "test (a.b)", "test (a/b)", "Build"]
+            .iter()
+            .enumerate()
+            .map(|(i, name)| ci_failure_log_path(wt, name, Some(i)).unwrap())
+            .collect();
+        let lowered: std::collections::HashSet<String> = paths
+            .iter()
+            .map(|p| p.to_string_lossy().to_lowercase())
+            .collect();
+        assert_eq!(lowered.len(), paths.len(), "{paths:?}");
+        assert!(paths.iter().all(|p| p.starts_with(root.join(".git"))));
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// Without a git dir there is nowhere safe from `git add`, so no log file
+    /// is written and the agent is pointed at the job URL instead.
+    #[test]
+    fn ci_failure_log_is_never_written_into_the_working_tree() {
+        let root =
+            std::env::temp_dir().join(format!("ralphus-ci-log-nogit-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        assert_eq!(
+            ci_failure_log_path(root.to_str().unwrap(), "build", None),
+            None
+        );
+        let check = FailedCheck {
+            name: "build".to_string(),
+            job_url: Some("https://ci.example/job/1".to_string()),
+            log_text: Some("boom\n".to_string()),
+            failing_step: None,
+        };
+        let text = describe_failing_check(root.to_str(), &check, "check 'build' failed", None);
+        assert!(text.contains("Look up https://ci.example/job/1"), "{text}");
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
+        std::fs::remove_dir_all(&root).ok();
     }
 
     /// A top-of-stack PR's CI is where an earlier branch's bug surfaces, so
@@ -2219,7 +2269,7 @@ mod tests {
             log_text: None,
             failing_step: None,
         };
-        let text = describe_failing_check(None, &check, "check 'test' failed", true);
+        let text = describe_failing_check(None, &check, "check 'test' failed", None);
         assert!(
             text.contains("the exact command this failing step ran"),
             "instruction must not depend on a resolved failing_step: {text}"

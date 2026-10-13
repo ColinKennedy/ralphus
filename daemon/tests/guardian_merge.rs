@@ -2278,10 +2278,10 @@ fn auto_fix_dispatch_gives_every_failing_check_its_own_log_file_and_prompt_parag
     let git_dir = std::path::PathBuf::from(
         git(Path::new(&worktree), &["rev-parse", "--absolute-git-dir"]).trim(),
     );
-    let build_log = std::fs::read_to_string(git_dir.join(".ralphus-ci-failure-build.log"))
+    let build_log = std::fs::read_to_string(git_dir.join(".ralphus-ci-failure-1-build.log"))
         .expect("build check's own log file written");
     assert_eq!(build_log, "build broke\n");
-    let test_log = std::fs::read_to_string(git_dir.join(".ralphus-ci-failure-test.log"))
+    let test_log = std::fs::read_to_string(git_dir.join(".ralphus-ci-failure-2-test.log"))
         .expect("test check's own log file written");
     assert_eq!(test_log, "test failed\n");
     assert!(
