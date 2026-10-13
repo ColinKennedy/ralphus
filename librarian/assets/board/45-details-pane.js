@@ -1167,7 +1167,7 @@
           ? `<h3 class="section">system prompt</h3>${promptBox(s.system_prompt, `system-prompt-box-${sel.taskIdx}-${sel.cellIdx}`, SYSTEM_PROMPT_TIP)}`
           : "";
         const initRow = worktreeInitRow(s);
-        return `<div class="dhead"><span class="k">◉ cell</span> <span>${esc(s.name ?? s.id)}</span><button class="icon-btn" style="margin-left:auto" data-click="openCellMenu" data-squad-id="${esc(r.id)}" data-ti="${sel.taskIdx}" data-si="${sel.cellIdx}" data-tip="Actions for this cell: edit, restart, ignore, copy${s.blocking ? ", and Show ways to fix this block… (it is holding up other work)" : ""}.">⋯</button></div>
+        return `<div class="dhead"><span class="k">◉ cell</span> <span>${esc(s.name ?? s.id)}</span><button class="icon-btn" style="margin-left:auto" data-click="openCellMenu" data-squad-id="${esc(r.id)}" data-ti="${sel.taskIdx}" data-si="${sel.cellIdx}" data-tip="Actions for this cell: edit and restart${s.blocking ? ", and Show ways to fix this block… (it is holding up other work)" : ""}.">⋯</button></div>
           ${s.name ? `<div class="kv-row"><span class="k">name</span><span class="v">${esc(s.name)}</span></div>` : ""}
           <div class="kv-row"><span class="k">id</span><span class="v mono">${esc(s.id)}${copyBtn(s.id)}</span></div>
           <div class="kv-row"><span class="k">task</span><span class="v">${esc(t.name)}</span></div>

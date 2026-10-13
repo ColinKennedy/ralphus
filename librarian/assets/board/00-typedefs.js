@@ -17,7 +17,7 @@
        */
       /**
        * @typedef {object} CellMenuAction
-       * @property {"unblock"|"edit"|"restart"|"ignore"|"copy"|"copy-branch"} key - Which action the item runs.
+       * @property {"unblock"|"edit"|"restart"} key - Which action the item runs.
        * @property {string} label - Menu text.
        * @property {string} tip - Tooltip explaining what the action does.
        */

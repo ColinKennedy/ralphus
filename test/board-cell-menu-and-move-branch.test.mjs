@@ -1,7 +1,8 @@
 // Coverage for two RAL-641 board changes:
 //
-// - a cell's actions live in a ⋯ menu at the top of its details pane, with
-//   "Show ways to fix this block…" first whenever the cell is holding up other work;
+// - a cell's ⋯ menu at the top of its details pane holds Edit and Restart, led
+//   by "Show ways to fix this block…" whenever the cell is holding up other
+//   work; the block-fixing actions themselves live only in that popup;
 // - a review branch has one "Move or extract branch…" action whose popup
 //   offers a new review alongside every open review, replacing the separate
 //   "Extract to a new review" and "Move to another review…" items;
@@ -44,33 +45,31 @@ const blocking = { failure_count: 2, threshold: 2, blocked_cells: 1, blocked_bra
 const keys = (actions) => actions.map((a) => a.key);
 
 test("a blocking cell's menu leads with Show ways to fix this block…", () => {
-  const actions = cellMenuActions("failed", blocking, true);
+  const actions = cellMenuActions(blocking);
   assert.equal(actions[0].key, "unblock");
   assert.match(actions[0].label, /Show ways to fix this block…/);
-  assert.deepEqual(keys(actions), ["unblock", "edit", "restart", "ignore", "copy", "copy-branch"]);
+  assert.deepEqual(keys(actions), ["unblock", "edit", "restart"]);
 });
 
 test("a cell that is not blocking has no fix-the-block item", () => {
-  assert.ok(!keys(cellMenuActions("failed", undefined, true)).includes("unblock"));
-  assert.ok(!keys(cellMenuActions("done", undefined, true)).includes("unblock"));
+  assert.deepEqual(keys(cellMenuActions(undefined)), ["edit", "restart"]);
 });
 
-test("ignore is offered only while the cell can still be skipped", () => {
-  for (const state of ["failed", "pending", "queued"]) {
-    assert.ok(keys(cellMenuActions(state, undefined, true)).includes("ignore"), state);
+test("the menu holds no block-fixing action other than Show ways to fix this block…", () => {
+  for (const b of [blocking, undefined]) {
+    for (const action of cellMenuActions(b)) {
+      assert.doesNotMatch(action.key, /ignore|copy|extract/, action.key);
+      assert.doesNotMatch(action.label, /Ignore|Copy|Extract/, action.label);
+    }
   }
-  for (const state of ["done", "running", "ignored", "cancelled"]) {
-    assert.ok(!keys(cellMenuActions(state, undefined, true)).includes("ignore"), state);
-  }
-});
-
-test("copy from its own work needs a project", () => {
-  assert.ok(keys(cellMenuActions("failed", blocking, true)).includes("copy-branch"));
-  assert.ok(!keys(cellMenuActions("failed", blocking, false)).includes("copy-branch"));
+  const start = html.indexOf("async function cellMenuPick(");
+  const end = html.indexOf("// RALPHUS-UNBLOCK-OPTIONS:BEGIN", start);
+  const body = html.slice(start, end);
+  assert.doesNotMatch(body, /ignoreCell|copyCell|extractBranch/);
 });
 
 test("every cell menu item has a label and a tooltip", () => {
-  for (const action of cellMenuActions("failed", blocking, true)) {
+  for (const action of cellMenuActions(blocking)) {
     assert.ok(action.label.length > 0, action.key);
     assert.ok(action.tip.length > 0, action.key);
   }

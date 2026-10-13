@@ -129,3 +129,15 @@ test("picking an option does not ask a second time", () => {
   assert.match(html, /async function extractBranch\(gid, branchId\) \{\s*await guardianAction/);
   assert.match(html, /extractBranch\(guardianId, entry\.id\)/);
 });
+
+test("the popup heads the ways out with To unblock… and the copies with Optionally…", () => {
+  const start = html.indexOf("function openUnblockCell(");
+  const end = html.indexOf("async function unblockPick(", start);
+  const body = html.slice(start, end);
+  const unblockAt = body.indexOf(">To unblock…</h3>");
+  const mainAt = body.indexOf("${main}");
+  const optionallyAt = body.indexOf(">Optionally…</h3>");
+  const addOnsAt = body.indexOf("${addOns}");
+  assert.ok(unblockAt !== -1 && optionallyAt !== -1, "both headers are present");
+  assert.ok(unblockAt < mainAt && mainAt < optionallyAt && optionallyAt < addOnsAt, "each header sits right above its section");
+});
