@@ -275,6 +275,7 @@
        * @property {number|null} [rebase_commands_done] - Live rebase-todo position (RAL-145); null unless a rebase is actively paused/running in this branch's worktree.
        * @property {number|null} [rebase_commands_total] - Live rebase-todo total (RAL-145); null unless a rebase is actively paused/running in this branch's worktree.
        * @property {boolean} [can_reenable]
+       * @property {string|null} [disabled_reason] - RAL-641: why the branch is disabled (`user`, `ignored`, `force-start`, `base drift`); null while enabled.
        * @property {string} [resolver_agent_session_id]
        * @property {{[key: string]: (string|null)}} [env_overrides] - RAL-191: this branch's own env-override layer. A string value overrides the inherited one; `null` is a tombstone removing the inherited variable entirely; an absent key is simply inherited.
        * @property {{[key: string]: string}} [inherited_env] - RAL-191: the environment inherited from this branch's source cell (`squad < task < cell`), before `env_overrides` is applied.

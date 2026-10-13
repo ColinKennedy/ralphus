@@ -526,6 +526,29 @@ pub(crate) fn combined_env_from_branches(branches: &[BranchView]) -> BTreeMap<St
         .unwrap_or_default()
 }
 
+/// `guardian_branches.disabled_reason` for a branch the user disabled.
+pub const DISABLED_BY_USER: &str = "user";
+/// `guardian_branches.disabled_reason` for a branch disabled because its
+/// source cell or task is `ignored`; the only reason ralphus re-enables on its
+/// own.
+pub const DISABLED_IGNORED: &str = "ignored";
+/// `guardian_branches.disabled_reason` for a branch force-start disabled.
+pub const DISABLED_FORCE_START: &str = "force-start";
+/// `guardian_branches.disabled_reason` for a branch dropped from the stack by a
+/// forge-side PR base drift.
+pub const DISABLED_BASE_DRIFT: &str = "base drift";
+
+/// One branch toggled by [`Store::sync_ignored_review_branches`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IgnoredBranchChange {
+    pub guardian_id: String,
+    /// The review's status when the branch was toggled.
+    pub guardian_status: String,
+    pub branch: String,
+    /// `true` when the branch was disabled, `false` when it was re-enabled.
+    pub disabled: bool,
+}
+
 /// A branch row in a guardian, for display.
 #[derive(Debug, Clone, Serialize)]
 pub struct BranchView {
@@ -673,6 +696,10 @@ pub struct BranchView {
     /// attempt (see `Store::stamp_branch_finished_at`); persists after the
     /// resolver finishes so completed reviews still show it.
     pub finished_at_ms: Option<i64>,
+    /// Why this branch is disabled (`user`, `ignored`, `force-start`, `base drift`);
+    /// `None` while enabled or when the reason predates the column.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub disabled_reason: Option<String>,
     /// RAL-317: a one-shot failure marker for this branch's most recent
     /// auto-submit-PR-stack attempt (best-effort side channel -- never blocks
     /// a Guardian merge transition). `None` means no failure to report;
@@ -1931,14 +1958,14 @@ impl Store {
                        SELECT s.state FROM cells s
                        WHERE s.review_branch = gb.branch
                        ORDER BY s.rowid DESC LIMIT 1
-                   ) != 'done'
+                   ) NOT IN ('done', 'ignored')
              )
              AND NOT EXISTS (
                  SELECT 1 FROM guardian_branches gb
                  JOIN cells s ON s.review_branch = gb.branch
                  JOIN tasks t ON t.squad_id = s.squad_id AND t.idx = s.task_idx
                  WHERE gb.guardian_id = guardians.id AND gb.enabled = 1
-                   AND t.state != 'done'
+                   AND t.state NOT IN ('done', 'ignored')
              )
              ORDER BY created_at_ms, id",
         )?;
@@ -1979,7 +2006,7 @@ impl Store {
                  FROM guardian_branches gb
                  WHERE gb.guardian_id = ?1 AND gb.enabled = 1
              )
-             WHERE latest_state != 'done'
+             WHERE latest_state NOT IN ('done', 'ignored')
              ORDER BY branch",
         )?;
         let branches = stmt
@@ -2107,14 +2134,14 @@ impl Store {
                    SELECT 1 FROM cells s
                    WHERE s.review_branch = guardian_branches.branch
                      AND (s.review_guardian_id = guardian_branches.guardian_id OR s.review_guardian_id IS NULL)
-                     AND s.state != 'done'
+                     AND s.state NOT IN ('done', 'ignored')
                )
                AND NOT EXISTS (
                    SELECT 1 FROM cells s
                    JOIN tasks t ON t.squad_id = s.squad_id AND t.idx = s.task_idx
                    WHERE s.review_branch = guardian_branches.branch
                      AND (s.review_guardian_id = guardian_branches.guardian_id OR s.review_guardian_id IS NULL)
-                     AND t.state != 'done'
+                     AND t.state NOT IN ('done', 'ignored')
                )",
             params![guardian_id],
         )?;
@@ -2141,14 +2168,14 @@ impl Store {
                      SELECT 1 FROM cells s
                      WHERE s.review_branch = ?2
                        AND (s.review_guardian_id = ?1 OR s.review_guardian_id IS NULL)
-                       AND s.state != 'done'
+                       AND s.state NOT IN ('done', 'ignored')
                  )
                  OR EXISTS (
                      SELECT 1 FROM cells s
                      JOIN tasks t ON t.squad_id = s.squad_id AND t.idx = s.task_idx
                      WHERE s.review_branch = ?2
                        AND (s.review_guardian_id = ?1 OR s.review_guardian_id IS NULL)
-                       AND t.state != 'done'
+                       AND t.state NOT IN ('done', 'ignored')
                  )
              )",
             params![guardian_id, branch],
@@ -2276,7 +2303,7 @@ impl Store {
                      SELECT 1 FROM guardian_branches gb
                      JOIN cells s ON s.review_branch = gb.branch
                      WHERE gb.guardian_id = ?1 AND gb.enabled = 1 AND gb.position < ?2
-                       AND s.state != 'done'
+                       AND s.state NOT IN ('done', 'ignored')
                  )",
                 params![guardian_id, position],
                 |r| r.get(0),
@@ -5399,10 +5426,10 @@ impl Store {
             .collect::<std::result::Result<Vec<_>, _>>()?;
         let not_ready: Vec<(String, Option<String>)> = rows
             .into_iter()
-            .filter(|(_, state)| state.as_deref() != Some("done"))
+            .filter(|(_, state)| !matches!(state.as_deref(), Some("done" | "ignored")))
             .collect();
         for (branch, _) in &not_ready {
-            self.set_branch_enabled_by_name(guardian_id, branch, false)?;
+            self.disable_branch_with_reason(guardian_id, branch, DISABLED_FORCE_START)?;
         }
         // RAL-<new>: force-start is a user-visible automated action -- it
         // silently disabled every enabled branch not yet `done`, with zero
@@ -5644,17 +5671,135 @@ impl Store {
 
     /// Set a branch's enabled/disabled state by branch name (RAL-43). Unknown
     /// branch names are silently ignored (0 rows updated is not an error).
+    ///
+    /// A disable made here is recorded as [`DISABLED_BY_USER`] unless the
+    /// branch was already disabled (its existing reason is kept); an enable
+    /// clears the reason. Other callers that disable a branch use
+    /// [`Self::disable_branch_with_reason`] so the reason says why.
     pub fn set_branch_enabled_by_name(
         &self,
         guardian_id: &str,
         branch: &str,
         enabled: bool,
     ) -> Result<()> {
+        if enabled {
+            self.conn.execute(
+                "UPDATE guardian_branches SET enabled=1, disabled_reason=NULL
+                 WHERE guardian_id=? AND branch=?",
+                params![guardian_id, branch],
+            )?;
+        } else {
+            self.disable_branch_with_reason(guardian_id, branch, DISABLED_BY_USER)?;
+        }
+        Ok(())
+    }
+
+    /// Disable a branch by name and record why. A branch that is already
+    /// disabled keeps the reason it was first disabled with, so a later
+    /// disable never rewrites who took the branch out. Unknown branch names
+    /// are silently ignored.
+    pub fn disable_branch_with_reason(
+        &self,
+        guardian_id: &str,
+        branch: &str,
+        reason: &str,
+    ) -> Result<()> {
         self.conn.execute(
-            "UPDATE guardian_branches SET enabled=? WHERE guardian_id=? AND branch=?",
-            params![i64::from(enabled), guardian_id, branch],
+            "UPDATE guardian_branches
+             SET disabled_reason = CASE WHEN enabled=1 THEN ?1 ELSE disabled_reason END,
+                 enabled=0
+             WHERE guardian_id=?2 AND branch=?3",
+            params![reason, guardian_id, branch],
         )?;
         Ok(())
+    }
+
+    /// Bring review branches in line with their source cell's `ignored` state
+    /// (RAL-641): an enabled branch whose latest linked cell, or that cell's
+    /// task, is `ignored` is disabled with [`DISABLED_IGNORED`]; a branch
+    /// disabled with that reason whose cell and task are no longer ignored is
+    /// re-enabled. Branches disabled for any other reason are never touched.
+    ///
+    /// `squad_id` limits the pass to branches fed by that squad's cells;
+    /// `None` covers every review. Reviews that are merging, merge-stopped, or
+    /// finished are skipped -- the next pass picks them up if they still
+    /// differ -- so a running rebuild never has its branch set changed under
+    /// it.
+    pub fn sync_ignored_review_branches(
+        &self,
+        squad_id: Option<&str>,
+    ) -> Result<Vec<IgnoredBranchChange>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT g.id, g.status, gb.branch, gb.enabled, gb.disabled_reason,
+                    COALESCE(
+                        (SELECT s.state FROM cells s WHERE s.review_branch = gb.branch
+                         ORDER BY s.rowid DESC LIMIT 1), '') AS cell_state,
+                    COALESCE(
+                        (SELECT t.state FROM cells s
+                         JOIN tasks t ON t.squad_id = s.squad_id AND t.idx = s.task_idx
+                         WHERE s.review_branch = gb.branch
+                         ORDER BY s.rowid DESC LIMIT 1), '') AS task_state
+             FROM guardian_branches gb
+             JOIN guardians g ON g.id = gb.guardian_id
+             WHERE g.status IN ('collecting', 'merge_failed', 'in_review')
+               AND (?1 IS NULL OR EXISTS (
+                   SELECT 1 FROM cells c
+                   WHERE c.squad_id = ?1 AND c.review_branch = gb.branch
+               ))
+             ORDER BY g.created_at_ms, g.id, gb.position",
+        )?;
+        #[allow(clippy::type_complexity)]
+        let rows: Vec<(String, String, String, bool, Option<String>, String, String)> = stmt
+            .query_map(params![squad_id], |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get::<_, i64>(3)? != 0,
+                    r.get(4)?,
+                    r.get(5)?,
+                    r.get(6)?,
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        drop(stmt);
+        let mut changes = Vec::new();
+        for (guardian_id, status, branch, enabled, reason, cell_state, task_state) in rows {
+            let ignored = cell_state == "ignored" || task_state == "ignored";
+            let disable = enabled && ignored;
+            let reenable = !enabled && !ignored && reason.as_deref() == Some(DISABLED_IGNORED);
+            if disable {
+                self.disable_branch_with_reason(&guardian_id, &branch, DISABLED_IGNORED)?;
+            } else if reenable {
+                self.set_branch_enabled_by_name(&guardian_id, &branch, true)?;
+            } else {
+                continue;
+            }
+            let verb = if disable { "disabled" } else { "re-enabled" };
+            crate::rlog!(
+                INFO,
+                "ralphus [guardian] review {guardian_id} branch {branch} auto-{verb}: source cell ignored={ignored}"
+            );
+            crate::cartographer::Note::new("guardian")
+                .scope("guardian")
+                .guardian(&guardian_id)
+                .emit(
+                    self,
+                    format!("review {guardian_id} branch {branch} auto-{verb} (ignored source)"),
+                    serde_json::json!({
+                        "branch": branch,
+                        "disabled": disable,
+                        "reason": DISABLED_IGNORED,
+                    }),
+                );
+            changes.push(IgnoredBranchChange {
+                guardian_id,
+                guardian_status: status,
+                branch,
+                disabled: disable,
+            });
+        }
+        Ok(changes)
     }
 
     /// Reset a branch to Pending and clear its review-branch/worktree columns.
@@ -6061,7 +6206,7 @@ impl Store {
                     gb.is_empty, s.machine AS source_cell_machine,
                     gb.env_overrides, gb.started_at_ms, gb.auto_submit_error,
                     gb.readable_review_branch, gb.review_branch_name, gb.finished_at_ms,
-                    gb.delayed_until_ms, gb.delayed_reason
+                    gb.delayed_until_ms, gb.delayed_reason, gb.disabled_reason
              FROM guardian_branches gb
              LEFT JOIN cells s ON s.rowid = (
                  SELECT s2.rowid FROM cells s2
@@ -6128,6 +6273,7 @@ impl Store {
                     started_at_ms: r.get(22)?,
                     auto_submit_error: r.get(23)?,
                     finished_at_ms: r.get(26)?,
+                    disabled_reason: r.get(29)?,
                 })
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -7328,6 +7474,7 @@ mod tests {
             started_at_ms: None,
             auto_submit_error: None,
             finished_at_ms: None,
+            disabled_reason: None,
         }
     }
 
@@ -10782,6 +10929,68 @@ mod tests {
             store.guardian_unfinished_linked_branches(&id).unwrap(),
             vec!["feat".to_string()]
         );
+    }
+
+    #[test]
+    fn ignored_cell_counts_as_finished_for_readiness() {
+        let mut store = Store::open_in_memory().unwrap();
+        let id = store.create_guardian("r", "main", "/repo").unwrap();
+        store.add_guardian_branch(&id, "feat").unwrap();
+        let squad = insert_cell_for_branch(&mut store, "feat", NodeState::Ignored);
+        store.set_cell_review_guardian(&squad, 0, 0, &id).unwrap();
+        assert_eq!(store.mark_ready_branches_with_done_cells(&id).unwrap(), 1);
+        assert_eq!(
+            store.guardian_unfinished_linked_branches(&id).unwrap(),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn sync_ignored_review_branches_disables_and_reenables_own_reason_only() {
+        let mut store = Store::open_in_memory().unwrap();
+        let id = store.create_guardian("r", "main", "/repo").unwrap();
+        store.add_guardian_branch(&id, "feat").unwrap();
+        let squad = insert_cell_for_branch(&mut store, "feat", NodeState::Ignored);
+        store.set_cell_review_guardian(&squad, 0, 0, &id).unwrap();
+
+        let changes = store.sync_ignored_review_branches(Some(&squad)).unwrap();
+        assert_eq!(changes.len(), 1);
+        assert!(changes[0].disabled);
+        let b = &store.get_guardian(&id).unwrap().branches[0];
+        assert!(!b.enabled);
+        assert_eq!(b.disabled_reason.as_deref(), Some(DISABLED_IGNORED));
+        // Idempotent.
+        assert!(store.sync_ignored_review_branches(None).unwrap().is_empty());
+
+        store
+            .set_cell_state(&squad, 0, 0, NodeState::Pending)
+            .unwrap();
+        let changes = store.sync_ignored_review_branches(None).unwrap();
+        assert_eq!(changes.len(), 1);
+        assert!(!changes[0].disabled);
+        let b = &store.get_guardian(&id).unwrap().branches[0];
+        assert!(b.enabled);
+        assert_eq!(b.disabled_reason, None);
+    }
+
+    #[test]
+    fn sync_ignored_review_branches_leaves_user_disabled_branch_disabled() {
+        let mut store = Store::open_in_memory().unwrap();
+        let id = store.create_guardian("r", "main", "/repo").unwrap();
+        store.add_guardian_branch(&id, "feat").unwrap();
+        let squad = insert_cell_for_branch(&mut store, "feat", NodeState::Pending);
+        store.set_cell_review_guardian(&squad, 0, 0, &id).unwrap();
+        store
+            .set_branch_enabled_by_name(&id, "feat", false)
+            .unwrap();
+        assert_eq!(
+            store.get_guardian(&id).unwrap().branches[0]
+                .disabled_reason
+                .as_deref(),
+            Some(DISABLED_BY_USER)
+        );
+        assert!(store.sync_ignored_review_branches(None).unwrap().is_empty());
+        assert!(!store.get_guardian(&id).unwrap().branches[0].enabled);
     }
 
     #[test]
