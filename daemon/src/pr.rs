@@ -10198,11 +10198,13 @@ type GonePrBranches = HashMap<(PathBuf, String, String), std::time::Instant>;
 static GONE_PR_BRANCHES: Mutex<Option<GonePrBranches>> = Mutex::new(None);
 
 /// The branch named by git's `couldn't find remote ref` fetch error, if `err`
-/// is one.
+/// is one. `err` is a [`git`] error, which puts git's stderr after the command
+/// on the same line (`git fetch ... failed: fatal: couldn't find remote ref
+/// <branch>`), so the message is found anywhere in it.
 fn missing_remote_ref(err: &str) -> Option<&str> {
-    err.lines()
-        .find_map(|l| l.trim().strip_prefix("fatal: couldn't find remote ref "))
-        .map(str::trim)
+    const MESSAGE: &str = "fatal: couldn't find remote ref ";
+    let rest = &err[err.find(MESSAGE)? + MESSAGE.len()..];
+    rest.split_whitespace().next()
 }
 
 /// Fetches `branches` from `remote` through `fetch`, leaving out any branch
@@ -10274,6 +10276,99 @@ mod gone_pr_branch_tests {
     fn parses_the_missing_ref_from_git_stderr() {
         assert_eq!(missing_remote_ref(MISSING_B), Some("b"));
         assert_eq!(missing_remote_ref("fatal: unable to access remote"), None);
+    }
+
+    #[test]
+    fn parses_the_missing_ref_from_a_git_error() {
+        // The shape `git()` returns: command, then git's stderr, on one line.
+        assert_eq!(
+            missing_remote_ref(
+                "git fetch --no-write-fetch-head origin +a:refs/ralphus/sync/pr-1 \
+                 +gone-branch:refs/ralphus/sync/pr-2 failed: fatal: couldn't find remote ref \
+                 gone-branch"
+            ),
+            Some("gone-branch")
+        );
+    }
+
+    /// A batched fetch through the real `git()` -- answered in-process for
+    /// this local remote -- leaves out the deleted branch and still fetches
+    /// the others.
+    #[test]
+    fn a_real_batched_fetch_skips_a_deleted_branch_and_fetches_the_rest() {
+        use std::process::Command;
+        let run = |dir: &Path, args: &[&str]| {
+            let out = Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@example.invalid")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@example.invalid")
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        let base = std::env::temp_dir().join(format!(
+            "ralphus-gone-pr-branch-real-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let upstream = base.join("upstream");
+        std::fs::create_dir_all(&upstream).unwrap();
+        run(&upstream, &["init", "-q", "-b", "main"]);
+        std::fs::write(upstream.join("f"), "1").unwrap();
+        run(&upstream, &["add", "f"]);
+        run(&upstream, &["commit", "-q", "-m", "one"]);
+        for branch in ["a", "b", "c"] {
+            run(&upstream, &["branch", branch]);
+        }
+        let clone = base.join("clone");
+        run(
+            &base,
+            &[
+                "clone",
+                "-q",
+                &upstream.to_string_lossy().replace('\\', "/"),
+                &clone.to_string_lossy().replace('\\', "/"),
+            ],
+        );
+        run(&upstream, &["branch", "-D", "b"]);
+
+        let (gone, error) =
+            fetch_pr_branches_skipping_gone(&clone, "origin", &["a", "b", "c"], |branches| {
+                let refspecs: Vec<String> = branches
+                    .iter()
+                    .map(|b| format!("+{b}:refs/ralphus/sync/{b}"))
+                    .collect();
+                let mut args = vec!["fetch", "--no-write-fetch-head", "origin"];
+                args.extend(refspecs.iter().map(String::as_str));
+                git(&clone, &args).map(|_| ())
+            });
+        assert_eq!(gone, HashSet::from(["b"]));
+        assert_eq!(error, None);
+        for fetched in ["a", "c"] {
+            assert!(
+                git(
+                    &clone,
+                    &[
+                        "rev-parse",
+                        "--verify",
+                        &format!("refs/ralphus/sync/{fetched}")
+                    ]
+                )
+                .is_ok(),
+                "{fetched} was fetched"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]

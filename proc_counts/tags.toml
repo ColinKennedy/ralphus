@@ -81,3 +81,8 @@ tag = "review-base-shift-landed"
 [[test]]
 id = "ralphus-daemon scheduler::tests::try_upstream_rebase_skips_an_ignored_cell_and_uses_its_upstream"
 tag = "upstream-rebase-ignored"
+
+# The daemon's fetch shape answered in-process with libgit2 (no git process).
+[[test]]
+id = "ralphus-daemon git_fetch_inproc::tests::parity::fetch_leaves_the_same_refs_as_git"
+tag = "git-fetch-inproc"
