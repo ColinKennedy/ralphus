@@ -2662,6 +2662,18 @@ impl Store {
                 created_at_ms   INTEGER NOT NULL,
                 PRIMARY KEY (squad_id, task_idx, cell_idx, ordinal)
             );
+            -- A review's live actions: its member cells' handoffs, deduplicated
+            -- once and then fixed. `source_cells` is a JSON array of the cell
+            -- URIs each action came from.
+            CREATE TABLE IF NOT EXISTS guardian_live_actions (
+                guardian_id   TEXT NOT NULL REFERENCES guardians(id) ON DELETE CASCADE,
+                idx           INTEGER NOT NULL,
+                label         TEXT NOT NULL,
+                prompt        TEXT NOT NULL,
+                source_cells  TEXT NOT NULL,
+                created_at_ms INTEGER NOT NULL,
+                PRIMARY KEY (guardian_id, idx)
+            );
             -- Prophecy subsystem (docs/prophecy-design.md): a durable,
             -- append-only record of what an agent learned while it worked.
             -- Unlike ghosts, this is NOT one row per owner -- every write is

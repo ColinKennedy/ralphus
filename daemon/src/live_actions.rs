@@ -265,6 +265,429 @@ pub fn cell_live_handoffs_conn(
     Ok(out)
 }
 
+// ---- a review's member cells and their handoffs ----------------------------
+
+/// Cell states that count as finished for live actions: nothing more will
+/// change the review's tip because of this cell.
+const FINISHED_CELL_STATES: [&str; 4] = ["done", "failed", "cancelled", "ignored"];
+
+/// One cell that feeds a review.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemberCell {
+    pub squad_id: String,
+    pub task_idx: i64,
+    pub cell_idx: i64,
+    pub state: String,
+    pub finished_at_ms: Option<i64>,
+}
+
+impl MemberCell {
+    /// Whether this cell has finished.
+    #[must_use]
+    pub fn is_finished(&self) -> bool {
+        FINISHED_CELL_STATES.contains(&self.state.as_str())
+    }
+
+    /// The cell's stable URI, the same key its ghost lives under.
+    #[must_use]
+    pub fn uri(&self) -> String {
+        crate::ghost::cell_uri(&self.squad_id, self.task_idx, self.cell_idx)
+    }
+}
+
+/// Every cell that feeds review `guardian_id`: cells recorded against it at
+/// submission, plus (for cells with no recorded review) cells whose branch is
+/// one of its branches -- the same membership rule the scheduler's
+/// stack-readiness gating uses.
+///
+/// # Errors
+///
+/// On a database failure.
+pub fn review_member_cells_conn(
+    conn: &rusqlite::Connection,
+    guardian_id: &str,
+) -> crate::store::Result<Vec<MemberCell>> {
+    let mut stmt = conn.prepare(
+        "SELECT s.squad_id, s.task_idx, s.idx, s.state, s.finished_at_ms FROM cells s
+         WHERE s.review_guardian_id = ?1
+            OR (
+                s.review_guardian_id IS NULL
+                AND EXISTS (
+                    SELECT 1 FROM guardian_branches gb
+                    WHERE gb.guardian_id = ?1 AND gb.branch = s.review_branch
+                )
+            )
+         ORDER BY s.squad_id, s.task_idx, s.idx",
+    )?;
+    let rows = stmt.query_map(rusqlite::params![guardian_id], |r| {
+        Ok(MemberCell {
+            squad_id: r.get(0)?,
+            task_idx: r.get(1)?,
+            cell_idx: r.get(2)?,
+            state: r.get(3)?,
+            finished_at_ms: r.get(4)?,
+        })
+    })?;
+    Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+}
+
+/// One handoff selected for a review, with the cell it came from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CollectedHandoff {
+    pub source_cell: String,
+    pub text: String,
+}
+
+/// The handoffs that seed a review's live actions: for each task among the
+/// review's member cells, only the latest-finished cell's (a later phase of a
+/// split-up unit of work replaces an earlier one's).
+///
+/// # Errors
+///
+/// On a database failure.
+pub fn collect_review_handoffs_conn(
+    conn: &rusqlite::Connection,
+    guardian_id: &str,
+) -> crate::store::Result<Vec<CollectedHandoff>> {
+    let members = review_member_cells_conn(conn, guardian_id)?;
+    let mut latest: std::collections::BTreeMap<(String, i64), MemberCell> =
+        std::collections::BTreeMap::new();
+    for cell in members.into_iter().filter(MemberCell::is_finished) {
+        let key = (cell.squad_id.clone(), cell.task_idx);
+        let replace = latest.get(&key).is_none_or(|current| {
+            (cell.finished_at_ms, cell.cell_idx) > (current.finished_at_ms, current.cell_idx)
+        });
+        if replace {
+            latest.insert(key, cell);
+        }
+    }
+    let mut out = Vec::new();
+    for cell in latest.values() {
+        let handoffs = cell_live_handoffs_conn(conn, &cell.squad_id, cell.task_idx, cell.cell_idx)?;
+        for text in handoffs.tests {
+            out.push(CollectedHandoff {
+                source_cell: cell.uri(),
+                text,
+            });
+        }
+    }
+    Ok(out)
+}
+
+// ---- a review's live actions ------------------------------------------------
+
+/// One live action of a review: a deduplicated live test.
+#[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
+pub struct LiveAction {
+    pub idx: i64,
+    pub label: String,
+    pub prompt: String,
+    /// URIs of the cells whose handoffs this action came from.
+    pub source_cells: Vec<String>,
+    pub created_at_ms: i64,
+}
+
+/// A live action about to be stored.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewLiveAction {
+    pub label: String,
+    pub prompt: String,
+    pub source_cells: Vec<String>,
+}
+
+/// A review's live actions, in order.
+///
+/// # Errors
+///
+/// On a database failure.
+pub fn guardian_live_actions_conn(
+    conn: &rusqlite::Connection,
+    guardian_id: &str,
+) -> crate::store::Result<Vec<LiveAction>> {
+    let mut stmt = conn.prepare(
+        "SELECT idx, label, prompt, source_cells, created_at_ms FROM guardian_live_actions
+         WHERE guardian_id=? ORDER BY idx",
+    )?;
+    let rows = stmt.query_map(rusqlite::params![guardian_id], |r| {
+        let sources: String = r.get(3)?;
+        Ok(LiveAction {
+            idx: r.get(0)?,
+            label: r.get(1)?,
+            prompt: r.get(2)?,
+            source_cells: serde_json::from_str(&sources).unwrap_or_default(),
+            created_at_ms: r.get(4)?,
+        })
+    })?;
+    Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+}
+
+impl crate::store::Store {
+    /// A review's live actions, in order.
+    ///
+    /// # Errors
+    ///
+    /// On a database failure.
+    pub fn guardian_live_actions(
+        &self,
+        guardian_id: &str,
+    ) -> crate::store::Result<Vec<LiveAction>> {
+        guardian_live_actions_conn(&self.conn, guardian_id)
+    }
+
+    /// Store a review's live actions -- once. The set is fixed after it is
+    /// first written; a review that already has live actions keeps them and
+    /// this returns `false`.
+    ///
+    /// # Errors
+    ///
+    /// On a database failure.
+    pub fn insert_guardian_live_actions(
+        &self,
+        guardian_id: &str,
+        actions: &[NewLiveAction],
+    ) -> crate::store::Result<bool> {
+        let existing: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM guardian_live_actions WHERE guardian_id=?",
+            rusqlite::params![guardian_id],
+            |r| r.get(0),
+        )?;
+        if existing > 0 {
+            return Ok(false);
+        }
+        let now = crate::store::now_ms();
+        for (idx, action) in actions.iter().enumerate() {
+            self.conn.execute(
+                "INSERT INTO guardian_live_actions
+                    (guardian_id, idx, label, prompt, source_cells, created_at_ms)
+                 VALUES (?, ?, ?, ?, ?, ?)",
+                rusqlite::params![
+                    guardian_id,
+                    i64::try_from(idx).unwrap_or(i64::MAX),
+                    action.label,
+                    action.prompt,
+                    serde_json::to_string(&action.source_cells).unwrap_or_else(|_| "[]".into()),
+                    now
+                ],
+            )?;
+        }
+        Ok(true)
+    }
+}
+
+/// A short button label for a handoff that dedupe did not name: its first
+/// line, cut to a readable length.
+fn fallback_label(text: &str) -> String {
+    const MAX: usize = 60;
+    let first = text.lines().next().unwrap_or_default().trim();
+    if first.chars().count() <= MAX {
+        first.to_string()
+    } else {
+        let cut: String = first.chars().take(MAX - 1).collect();
+        format!("{}…", cut.trim_end())
+    }
+}
+
+/// One action per handoff, used when deduplication is unnecessary (a single
+/// handoff) or the deduplicating agent's answer could not be used.
+#[must_use]
+pub fn undeduplicated(handoffs: &[CollectedHandoff]) -> Vec<NewLiveAction> {
+    handoffs
+        .iter()
+        .map(|h| NewLiveAction {
+            label: fallback_label(&h.text),
+            prompt: h.text.clone(),
+            source_cells: vec![h.source_cell.clone()],
+        })
+        .collect()
+}
+
+/// The instructions for the deduplicating agent.
+const DEDUPE_SYSTEM_PROMPT: &str = "You merge live-test descriptions for a code \
+review. You will be given numbered descriptions, each written by an agent that \
+changed part of the code, of how to test its change live. Several may describe \
+the same test (the same product, the same setup, overlapping checks). Merge \
+those into one test that keeps every distinct check from each, and keep tests \
+of different things separate -- do not force everything into one. Keep the \
+concrete steps: commands, setup, what to check. Do not invent steps no \
+description asked for. Answer with ONLY a JSON object, no prose and no code \
+fence, of the form {\"live_actions\": [{\"label\": \"<short button label, at \
+most 60 characters>\", \"prompt\": \"<the merged steps>\", \"sources\": [<the \
+numbers of every description merged into this one>]}]}. Every description \
+number must appear in exactly one entry's sources. Do not edit any file.";
+
+#[derive(serde::Deserialize)]
+struct DedupeAnswer {
+    live_actions: Vec<DedupeEntry>,
+}
+
+#[derive(serde::Deserialize)]
+struct DedupeEntry {
+    label: String,
+    prompt: String,
+    #[serde(default)]
+    sources: Vec<usize>,
+}
+
+/// Parse the deduplicating agent's answer against the handoffs it was given.
+/// `None` when the answer is unusable: not JSON, empty, a source number out of
+/// range, or a handoff left out -- the caller then keeps one action per
+/// handoff rather than silently dropping a test.
+#[must_use]
+pub fn parse_dedupe_answer(
+    reply: &str,
+    handoffs: &[CollectedHandoff],
+) -> Option<Vec<NewLiveAction>> {
+    let start = reply.find('{')?;
+    let end = reply.rfind('}')?;
+    let answer: DedupeAnswer = serde_json::from_str(reply.get(start..=end)?).ok()?;
+    if answer.live_actions.is_empty() {
+        return None;
+    }
+    let mut covered = vec![false; handoffs.len()];
+    let mut out = Vec::new();
+    for entry in answer.live_actions {
+        let prompt = entry.prompt.trim();
+        if prompt.is_empty() || entry.sources.is_empty() {
+            return None;
+        }
+        let mut sources: Vec<String> = Vec::new();
+        for n in entry.sources {
+            // The agent is shown 1-based numbers.
+            let i = n.checked_sub(1)?;
+            let handoff = handoffs.get(i)?;
+            covered[i] = true;
+            if !sources.contains(&handoff.source_cell) {
+                sources.push(handoff.source_cell.clone());
+            }
+        }
+        let label = entry.label.trim();
+        out.push(NewLiveAction {
+            label: if label.is_empty() {
+                fallback_label(prompt)
+            } else {
+                fallback_label(label)
+            },
+            prompt: prompt.to_string(),
+            source_cells: sources,
+        });
+    }
+    covered.iter().all(|c| *c).then_some(out)
+}
+
+/// Turn a review's handoffs into its live actions with one agent call. One
+/// handoff needs no call. An unusable answer falls back to one action per
+/// handoff.
+pub fn deduplicate_handoffs(
+    store: &crate::store_lock::StoreHandle,
+    runner: &dyn Runner,
+    guardian: &GuardianView,
+    cwd: &str,
+    handoffs: &[CollectedHandoff],
+    cancel: &CancelToken,
+) -> Vec<NewLiveAction> {
+    if handoffs.len() <= 1 {
+        return undeduplicated(handoffs);
+    }
+    let gid = guardian.id.as_str();
+    let resolved = match crate::guardian_merge::resolve_resolver_agent(
+        guardian.resolver_agent.as_deref(),
+        guardian.resolver_model.as_deref(),
+        store,
+        Path::new(cwd),
+    ) {
+        Ok(resolved) => resolved,
+        Err(message) => {
+            crate::rlog!(
+                WARNING,
+                "ralphus [guardian] review {gid} live-action dedupe skipped (agent: {message}); keeping one action per handoff"
+            );
+            return undeduplicated(handoffs);
+        }
+    };
+    let numbered = handoffs
+        .iter()
+        .enumerate()
+        .map(|(i, h)| format!("Description {}:\n{}", i + 1, h.text))
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    let ws = Workspace::for_guardian(store, gid, cwd);
+    let mut spec = RunnerSpec {
+        squad_id: live_run_squad_id(gid),
+        task: LIVE_ACTION_TASK.to_string(),
+        cell_id: format!("live-dedupe-{}", crate::store::now_ms()),
+        cwd: cwd.to_string(),
+        prompt: Some(format!(
+            "Merge these live-test descriptions for review {}.\n\n{numbered}",
+            guardian.name
+        )),
+        command: None,
+        shell: None,
+        agent: resolved.backend.clone(),
+        executable: resolved.executable.clone(),
+        model: resolved.model.clone(),
+        system_prompt: Some(DEDUPE_SYSTEM_PROMPT.to_string()),
+        system_prompt_position: None,
+        timeout_sec: None,
+        budget_tokens: None,
+        maximum_budget_usd: None,
+        maximum_context: None,
+        auto_compact_threshold: None,
+        maximum_tool_output_tokens: None,
+        effort: None,
+        temperature: None,
+        proof: false,
+        trace_context: None,
+        resume_agent_session_id: None,
+        assigned_agent_session_id: None,
+        env_overrides: resolved.env.clone(),
+        machine: ws.machine().map(str::to_string),
+        tool_arg_truncate_chars: None,
+        thrash_max_compactions: None,
+        thrash_min_turn_gap: None,
+        allow_personal_settings: false,
+        allow_personal_memory: false,
+        waypoint_context: false,
+        retry_attempt: 0,
+        retry_after_unknown_default_seconds: crate::config::resolve(Path::new(cwd))
+            .retry_after_unknown_default_seconds(),
+        maximum_timeout: None,
+        pass_score: None,
+    };
+    let result = crate::guardian_merge::run_agent_with_stall_recovery(
+        store, &mut spec, runner, cancel, None,
+    );
+    let _ = crate::guardian_merge::record_guardian_call_cost(
+        store,
+        gid,
+        None,
+        "live_action_dedupe",
+        &result,
+    );
+    let parsed = (result.status == "done")
+        .then(|| parse_dedupe_answer(&result.summary, handoffs))
+        .flatten();
+    let used_fallback = parsed.is_none();
+    let actions = parsed.unwrap_or_else(|| undeduplicated(handoffs));
+    note(
+        store,
+        gid,
+        if used_fallback {
+            crate::logging::LogLevel::WARNING
+        } else {
+            crate::logging::LogLevel::INFO
+        },
+        "live actions deduplicated",
+        serde_json::json!({
+            "cell_id": spec.cell_id,
+            "handoffs": handoffs.len(),
+            "actions": actions.len(),
+            "fallback": used_fallback,
+            "error": result.error,
+        }),
+    );
+    actions
+}
+
 /// The live ref a run's commits are pinned on.
 #[must_use]
 pub fn live_ref_name(guardian_id: &str, run_id: &str) -> String {
@@ -960,6 +1383,173 @@ prompt = "second"
             store.cell_live_handoffs(&squad, 0, 1).unwrap(),
             CellLiveHandoffs::default()
         );
+    }
+
+    fn handoff(cell: &str, text: &str) -> CollectedHandoff {
+        CollectedHandoff {
+            source_cell: cell.to_string(),
+            text: text.to_string(),
+        }
+    }
+
+    #[test]
+    fn a_dedupe_answer_merges_and_keeps_every_source() {
+        let handoffs = vec![
+            handoff("c1", "start the board; open reviews"),
+            handoff("c2", "start the board; expand a branch"),
+            handoff("c3", "run ralphus review show"),
+        ];
+        let reply = r#"Here you go: {"live_actions": [
+            {"label": "Board review inspector", "prompt": "start the board; open reviews; expand a branch", "sources": [1, 2]},
+            {"label": "CLI review show", "prompt": "run ralphus review show", "sources": [3]}
+        ]}"#;
+        let actions = parse_dedupe_answer(reply, &handoffs).unwrap();
+        assert_eq!(actions.len(), 2);
+        assert_eq!(
+            actions[0].source_cells,
+            vec!["c1".to_string(), "c2".to_string()]
+        );
+        assert_eq!(actions[1].label, "CLI review show");
+    }
+
+    #[test]
+    fn an_unusable_dedupe_answer_is_rejected() {
+        let handoffs = vec![handoff("c1", "a"), handoff("c2", "b")];
+        for reply in [
+            "not json",
+            r#"{"live_actions": []}"#,
+            // Description 2 dropped.
+            r#"{"live_actions": [{"label": "x", "prompt": "a", "sources": [1]}]}"#,
+            // Out of range.
+            r#"{"live_actions": [{"label": "x", "prompt": "a", "sources": [1, 2, 3]}]}"#,
+            // Zero is not a description number.
+            r#"{"live_actions": [{"label": "x", "prompt": "a", "sources": [0, 1, 2]}]}"#,
+        ] {
+            assert!(parse_dedupe_answer(reply, &handoffs).is_none(), "{reply}");
+        }
+    }
+
+    #[test]
+    fn a_single_handoff_needs_no_agent() {
+        let (store, g, dir) = setup("single");
+        let agent = ScriptedAgent {
+            act: Box::new(|_| panic!("one handoff needs no dedupe call")),
+            reply: String::new(),
+            seen: parking_lot::Mutex::new(Vec::new()),
+        };
+        let actions = deduplicate_handoffs(
+            &store,
+            &agent,
+            &g,
+            &dir.to_string_lossy(),
+            &[handoff("c1", "Open the board.\nCheck the row.")],
+            &CancelToken::never(),
+        );
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0].label, "Open the board.");
+        assert_eq!(actions[0].prompt, "Open the board.\nCheck the row.");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_agent_that_answers_badly_keeps_one_action_per_handoff() {
+        let (store, g, dir) = setup("bad-dedupe");
+        let agent = ScriptedAgent {
+            act: Box::new(|_| {}),
+            reply: "I merged them all, trust me".to_string(),
+            seen: parking_lot::Mutex::new(Vec::new()),
+        };
+        let actions = deduplicate_handoffs(
+            &store,
+            &agent,
+            &g,
+            &dir.to_string_lossy(),
+            &[handoff("c1", "a"), handoff("c2", "b")],
+            &CancelToken::never(),
+        );
+        assert_eq!(actions.len(), 2, "no test is silently dropped");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn only_the_latest_finished_cell_of_each_task_seeds_the_review() {
+        let mut store = crate::store::Store::open_in_memory().unwrap();
+        let squad = insert_squad(&mut store);
+        let gid = store.create_guardian("r", "main", "/repo").unwrap();
+        for (idx, finished) in [(0_i64, 100_i64), (1, 200)] {
+            store
+                .conn
+                .execute(
+                    "UPDATE cells SET state='done', finished_at_ms=?, review_guardian_id=?
+                     WHERE squad_id=? AND task_idx=0 AND idx=?",
+                    rusqlite::params![finished, gid, squad, idx],
+                )
+                .unwrap();
+        }
+        store
+            .replace_cell_live_handoffs(
+                &squad,
+                0,
+                0,
+                &LiveHandoffs::Tests(vec!["phase one".into()]),
+            )
+            .unwrap();
+        store
+            .replace_cell_live_handoffs(
+                &squad,
+                0,
+                1,
+                &LiveHandoffs::Tests(vec!["phase two".into()]),
+            )
+            .unwrap();
+
+        let collected = collect_review_handoffs_conn(&store.conn, &gid).unwrap();
+        assert_eq!(collected.len(), 1);
+        assert_eq!(collected[0].text, "phase two");
+        assert_eq!(
+            collected[0].source_cell,
+            crate::ghost::cell_uri(&squad, 0, 1)
+        );
+
+        // A still-running cell contributes nothing yet.
+        store
+            .conn
+            .execute(
+                "UPDATE cells SET state='running' WHERE squad_id=? AND idx=1",
+                rusqlite::params![squad],
+            )
+            .unwrap();
+        let collected = collect_review_handoffs_conn(&store.conn, &gid).unwrap();
+        assert_eq!(collected[0].text, "phase one");
+    }
+
+    #[test]
+    fn a_reviews_live_actions_are_written_once() {
+        let store = crate::store::Store::open_in_memory().unwrap();
+        let gid = store.create_guardian("r", "main", "/repo").unwrap();
+        let first = vec![NewLiveAction {
+            label: "a".into(),
+            prompt: "do a".into(),
+            source_cells: vec!["c1".into()],
+        }];
+        assert!(store.insert_guardian_live_actions(&gid, &first).unwrap());
+        assert!(
+            !store
+                .insert_guardian_live_actions(
+                    &gid,
+                    &[NewLiveAction {
+                        label: "b".into(),
+                        prompt: "do b".into(),
+                        source_cells: vec![],
+                    }]
+                )
+                .unwrap(),
+            "the set is fixed once written"
+        );
+        let stored = store.guardian_live_actions(&gid).unwrap();
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].prompt, "do a");
+        assert_eq!(stored[0].source_cells, vec!["c1".to_string()]);
     }
 
     #[test]
