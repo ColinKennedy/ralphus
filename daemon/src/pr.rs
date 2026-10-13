@@ -3166,6 +3166,30 @@ impl PrRepoRouting {
             None => &self.parent_remote_name,
         }
     }
+
+    /// Credential for the remote that holds PR branches. The root PR in a
+    /// forked stack is filed at the parent, but its branch is on the fork.
+    fn fetch_token(&self) -> Option<&str> {
+        match &self.fork_remote_name {
+            Some(_) => self.fork_client.as_ref(),
+            None => self.parent_client.as_ref(),
+        }
+        .and_then(crate::forge::ForgeClient::token)
+    }
+}
+
+fn fetch_review_refs(
+    root: &Path,
+    remote: &str,
+    refspecs: &[&str],
+    token: Option<&str>,
+) -> std::result::Result<(), String> {
+    let mut args = vec!["fetch", "--no-write-fetch-head", remote];
+    args.extend_from_slice(refspecs);
+    match crate::git_fetch::try_fetch_with_token(root, &args, token) {
+        Some(result) => result,
+        None => git(root, &args).map(|_| ()),
+    }
 }
 
 /// The remote name to strip/qualify a guardian's `base_branch` against when
@@ -6831,9 +6855,8 @@ fn refresh_pr_forge_cache_for_guardian(store: &crate::store_lock::StoreHandle, i
                     .filter(|pr| branches.contains(&pr.branch_alias.as_str()))
                     .map(|pr| format!("+{}:{}", pr.branch_alias, sync_fetch_ref(&pr.id)))
                     .collect();
-                let mut args: Vec<&str> = vec!["fetch", "--no-write-fetch-head", &remote_name];
-                args.extend(refspecs.iter().map(String::as_str));
-                git(&root, &args).map(|_| ())
+                let refs: Vec<&str> = refspecs.iter().map(String::as_str).collect();
+                fetch_review_refs(&root, &remote_name, &refs, routing.fetch_token())
             });
         prs.iter()
             .zip(guards.iter())
@@ -10722,8 +10745,8 @@ fn fetch_remote_pr_tip(
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let dest_ref = sync_fetch_ref(pr_id);
-    // A `git fetch` is a git process, a transport process (ssh or a remote
-    // helper) and a network connection. When the forge's REST view -- read
+    // A fetch opens a network connection and may need a credential helper.
+    // When the forge's REST view -- read
     // moments ago by this same maintenance pass's merge check -- says the
     // branch head is exactly what the sync ref already holds, the fetch
     // would write the same commit, so skip it (bounded by
@@ -10755,11 +10778,7 @@ fn fetch_remote_pr_tip(
     // non-fast-forward from whatever this ref last pointed at, which a
     // plain refspec would otherwise refuse to write.
     let refspec = format!("+{}:{dest_ref}", pr.branch_alias);
-    let fetched = git(
-        &root,
-        &["fetch", "--no-write-fetch-head", &remote_name, &refspec],
-    )
-    .ok();
+    let fetched = fetch_review_refs(&root, &remote_name, &[&refspec], routing.fetch_token()).ok();
     if fetched.is_some() {
         last_pr_fetches().lock().insert(pr_id.to_string(), now);
     }

@@ -662,12 +662,9 @@ impl ForgeClient {
         &self.repo_path
     }
 
-    /// The API token this client will authenticate with, if any -- test-only,
-    /// so a caller resolving a client on someone else's behalf (e.g. a
-    /// fork's registered owner) can assert that the intended identity's
-    /// token actually made it through, rather than silently falling back to
-    /// the daemon's own env-var/CLI identity.
-    #[cfg(test)]
+    /// The token resolved for this forge client. The review fetch path also
+    /// uses it for Git-over-HTTPS against the same remote, without starting a
+    /// separate credential-helper process.
     #[must_use]
     pub(crate) fn token(&self) -> Option<&str> {
         self.token.as_deref()
