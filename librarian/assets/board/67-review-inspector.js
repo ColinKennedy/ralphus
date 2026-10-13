@@ -103,6 +103,7 @@
        */
       function openAutoActionsPane(gid) {
         const key = autoActionsPeekKey(gid);
+        closeLiveRunPane();
         inspectorAutoActionsGid = gid;
         inspectorBranchId = null;
         selectedBranch[gid] = null;
@@ -144,6 +145,386 @@
             closeKey: "",
           }))}</div>`;
       }
+
+      // ---------- live actions: agent-run live tests of a review's tip ----------
+      /**
+       * Each review's `GET /api/guardians/{id}/live-actions` answer, fetched
+       * alongside the open review's detail. `null` means the daemon has no
+       * such endpoint (an older daemon), and the section renders nothing.
+       * @type {{[gid: string]: LiveActionsView|null}}
+       */
+      const liveActionsViews = {};
+      /** @type {{[gid: string]: Promise<void>}} In-flight live-actions fetches, so concurrent callers share one request. */
+      const liveActionsFetches = {};
+      /** @type {{[gid: string]: number}} Pending quick-refresh timers, one per review, armed only while one of its runs is in flight. */
+      const liveActionsTimers = {};
+      /** How soon the live-actions view refreshes while a run is queued, running or carrying its fix. */
+      const LIVE_ACTIONS_ACTIVE_REFRESH_MS = 3000;
+      /** @type {{gid: string, runId: string}|null} The live run the inspector shows in place of a branch, or null. */
+      let inspectorLiveRun = null;
+      /** @type {{[key: string]: boolean}} Live-action rows whose details are expanded, keyed `<gid>:live:<idx>`. */
+      const liveActionOpen = {};
+
+      /**
+       * Fetches one review's live actions and their runs. While a run is in
+       * flight it schedules one more refresh a few seconds out (re-rendering
+       * the review when it lands); otherwise the next ordinary review poll
+       * refreshes it.
+       * @param {string} gid - The review id.
+       * @returns {Promise<void>}
+       */
+      function pollLiveActions(gid) {
+        const inFlight = liveActionsFetches[gid];
+        if (inFlight) return inFlight;
+        const p = fetch(`/api/guardians/${encodeURIComponent(gid)}/live-actions`)
+          .then(async (r) => {
+            if (r.status === 404) { liveActionsViews[gid] = null; return; }
+            if (!r.ok) return;
+            /** @type {LiveActionsView} */
+            const view = await r.json();
+            liveActionsViews[gid] = {
+              ...view,
+              actions: Array.isArray(view.actions) ? view.actions : [],
+              runs: Array.isArray(view.runs) ? view.runs : [],
+            };
+            scheduleLiveActionsRefresh(gid);
+          })
+          .catch(() => { /* transient -- the next poll retries */ })
+          .finally(() => { delete liveActionsFetches[gid]; });
+        liveActionsFetches[gid] = p;
+        return p;
+      }
+      /**
+       * Whether a live run still has something left to happen: it is queued or
+       * running, or ralphus is still carrying its commits onto the top branch.
+       * @param {LiveRunRow} r - The run.
+       * @returns {boolean}
+       */
+      function liveRunInFlight(r) {
+        return r.state === "queued" || r.state === "running" || r.integration === "pending" || r.integration === "integrating";
+      }
+      /**
+       * Arms one quick refresh of a review's live actions while any of its runs
+       * is in flight and the review is the open one. No-op otherwise, so an idle
+       * review costs nothing beyond the ordinary review poll.
+       * @param {string} gid - The review id.
+       * @returns {void}
+       */
+      function scheduleLiveActionsRefresh(gid) {
+        const view = liveActionsViews[gid];
+        if (liveActionsTimers[gid] || !view || !view.runs.some(liveRunInFlight)) return;
+        liveActionsTimers[gid] = window.setTimeout(() => {
+          delete liveActionsTimers[gid];
+          if (selectedGuardian !== gid) return;
+          void pollLiveActions(gid).then(() => {
+            if (selectedGuardian === gid) preserveUserState(document.getElementById("review-detail"), renderReviewDetail);
+          });
+        }, LIVE_ACTIONS_ACTIVE_REFRESH_MS);
+      }
+      /**
+       * The newest run of one live action or one prompt user action.
+       * @param {LiveActionsView|null|undefined} view - The review's live-actions view.
+       * @param {"live"|"action"} kind - Which list the action belongs to.
+       * @param {number} idx - The action's index within that list.
+       * @returns {LiveRunRow|null}
+       */
+      function latestLiveRun(view, kind, idx) {
+        if (!view) return null;
+        return view.runs.find((r) => r.kind === kind && r.action_idx === idx) || null;
+      }
+      /**
+       * The live-view peek key of one live run's agent session.
+       * @param {string} gid - The review id.
+       * @param {string} runId - The run id.
+       * @returns {string}
+       */
+      function liveRunPeekKey(gid, runId) {
+        return `guardian-live-run|${gid}|${runId}`;
+      }
+      /**
+       * The prompt a live run was given: its live action's, or its prompt user
+       * action's.
+       * @param {GuardianView} g - The review.
+       * @param {LiveRunRow} run - The run.
+       * @returns {string}
+       */
+      function liveRunPrompt(g, run) {
+        if (run.kind === "action") return ((g.action_hints || [])[run.action_idx] || {}).prompt || "";
+        const view = liveActionsViews[g.id];
+        const action = view ? view.actions.find((a) => a.idx === run.action_idx) : undefined;
+        return action ? action.prompt : "";
+      }
+      /**
+       * A live run's state as a status chip.
+       * @param {LiveRunRow} r - The run.
+       * @returns {string}
+       */
+      function liveRunStateBadge(r) {
+        /** @type {Record<LiveRunRow["state"], [string, string, string]>} */
+        const look = {
+          queued: ["running", "queued", "Waiting its turn: a review runs one agent at a time, in the order they were started.\nCancel it from its details if you no longer want it."],
+          running: ["running", "running", "An agent is testing the review's tip right now.\nClick the row to watch it in Live View."],
+          finished: ["passed", "finished", "The agent finished and wrote a report.\nOpen the row's details to read it."],
+          failed: ["failed", "failed", "The agent run failed. Its details say why; Live View has its session."],
+          cancelled: ["idle", "cancelled", "Cancelled before it finished."],
+          over_budget: ["failed", "over budget", "Stopped because it reached its spending limit before finishing."],
+          interrupted: ["failed", "interrupted", "The daemon stopped while this run was in flight, so it never finished.\nRun it again to retry."],
+        };
+        const [cls, label, tip] = look[r.state] || ["idle", r.state, "This run's state."];
+        const when = r.trigger === "auto" ? "\nStarted automatically, once every cell had finished and the build was prepared." : "";
+        return `<span class="cmd-status ${cls}" data-tip="${esc(tip + when)}">${esc(label)}</span>`;
+      }
+      /**
+       * Whether a live run's commits made it onto the review's top branch, as a
+       * chip; "" when the run made no commits to carry.
+       * @param {LiveRunRow} r - The run.
+       * @returns {string}
+       */
+      function liveRunIntegrationBadge(r) {
+        const detail = r.integration_detail ? `\n${r.integration_detail}` : "";
+        if (r.integration === "integrated") {
+          return `<span class="cmd-status passed" data-tip="${esc(`The agent committed a fix and ralphus carried it onto the review's top branch.${detail}`)}">fix carried onto top branch</span>`;
+        }
+        if (r.integration === "failed") {
+          return `<span class="cmd-status failed" data-tip="${esc(`The agent committed a fix, but ralphus could not carry it onto the review's top branch.${detail}`)}">fix could not be carried</span>`;
+        }
+        if (r.integration === "pending" || r.integration === "integrating") {
+          return `<span class="cmd-status running" data-tip="${esc(`The agent committed a fix; ralphus is carrying it onto the review's top branch.${detail}`)}">carrying fix…</span>`;
+        }
+        if (r.integration === "skipped") {
+          return `<span class="cmd-status idle" data-tip="${esc(`The agent's commits were not carried onto the top branch.${detail}`)}">fix not carried</span>`;
+        }
+        return "";
+      }
+      /**
+       * The button that shows one live run's agent session in the details pane.
+       * @param {string} gid - The review id.
+       * @param {LiveRunRow} r - The run.
+       * @returns {string}
+       */
+      function liveRunViewBtn(gid, r) {
+        const on = !!inspectorLiveRun && inspectorLiveRun.gid === gid && inspectorLiveRun.runId === r.run_id;
+        const tip = r.state === "queued"
+          ? "This run has not started yet; its Live View fills in once the agent starts."
+          : r.state === "running"
+            ? "Watch the agent's session live in the details pane on the right.\nRead-only — nothing you do there is sent to the agent."
+            : "Read the agent's session transcript in the details pane on the right.";
+        return `<button class="btn${on ? "" : " primary"}" data-click="openLiveRunPane" data-guardian-id="${esc(gid)}" data-run-id="${esc(r.run_id)}" data-tip="${esc(tip)}">${on ? "Showing in Live View" : "Live View"}</button>`;
+      }
+      /**
+       * The details of one live run: how it ended, its report, error and
+       * commits, with its Live View and (while it can still be stopped) Cancel.
+       * @param {GuardianView} g - The review.
+       * @param {LiveRunRow} r - The run.
+       * @returns {string}
+       */
+      function liveRunDetailsHtml(g, r) {
+        const canCancel = r.state === "queued" || r.state === "running";
+        const cost = typeof r.cost_usd === "number" ? ` · $${r.cost_usd.toFixed(2)}` : "";
+        const ended = r.finished_at_ms && r.started_at_ms ? ` · ran ${fmtRunTime(r.finished_at_ms - r.started_at_ms)}` : "";
+        const commits = r.commits.length;
+        return `<div class="run-result">
+            <div class="run-result-head">${liveRunStateBadge(r)}${liveRunIntegrationBadge(r)}
+              <span class="rg-sub" data-tip="Who started this run, how long it took, and what it cost.">${r.trigger === "auto" ? "automatic" : "manual"}${esc(ended)}${esc(cost)}</span>
+              <span class="rg-sub" data-tip="${esc(commits ? `Commits the agent made while testing:\n${r.commits.join("\n")}` : "The agent made no commits.")}">${commits} commit${commits === 1 ? "" : "s"}</span>
+              <span style="margin-left:auto;display:flex;align-items:center;gap:6px">
+                ${liveRunViewBtn(g.id, r)}
+                ${canCancel ? `<button class="btn" data-click="cancelLiveRun" data-guardian-id="${esc(g.id)}" data-run-id="${esc(r.run_id)}" data-tip="Stop this agent run${r.state === "queued" ? " before it starts" : ""}. Anything it already committed stays on its own ref and is not carried.\nThis cannot be undone.">■ Cancel</button>` : ""}
+              </span>
+            </div>
+            ${r.error ? `<div class="warn" data-tip="Why this run did not finish cleanly.">${esc(r.error)}</div>` : ""}
+            ${r.report
+              ? `<div class="run-out" data-unbounded="1" data-tip="The agent's own report of what it tried and what it found.">${esc(r.report)}</div>`
+              : `<div class="run-out empty-out" data-tip="The agent writes a report when it finishes.">${liveRunInFlight(r) ? "No report yet." : "This run left no report."}</div>`}
+          </div>`;
+      }
+      /**
+       * The run state shown on a prompt user action's row, from its newest
+       * agent run; "" when it has never run.
+       * @param {GuardianView} g - The review.
+       * @param {number} i - The action's index.
+       * @returns {string}
+       */
+      function promptActionRunStatus(g, i) {
+        const r = latestLiveRun(liveActionsViews[g.id], "action", i);
+        if (!r) {
+          return `<span class="cmd-status idle" data-tip="This action has not been run by an agent yet.">idle</span>`;
+        }
+        return liveRunStateBadge(r) + liveRunIntegrationBadge(r);
+      }
+      /**
+       * The expanded block under a prompt user action: what the agent is told,
+       * and its newest run.
+       * @param {GuardianView} g - The review.
+       * @param {string} key - The row's key, `<gid>:action:<i>`.
+       * @param {number} i - The action's index.
+       * @param {string} prompt - The action's prompt.
+       * @returns {string}
+       */
+      function promptActionFullBlock(g, key, i, prompt) {
+        if (!commandFullOpen[key]) return "";
+        const r = latestLiveRun(liveActionsViews[g.id], "action", i);
+        return `<div class="cmd-full">
+            <div class="cmd-preview mono" data-tip="What the agent is told to do in the built review.">${esc(prompt)}</div>
+            ${r ? liveRunDetailsHtml(g, r) : ""}
+            <div class="btn-row" style="margin-top:7px">
+              <button class="btn" data-copy="${esc(prompt)}" onclick="copyText(event)" data-tip="Copy this action's prompt.">⧉ Copy</button>
+              <button class="btn" data-click="toggleReviewCommandFull" data-key="${esc(key)}" data-tip="Collapse this back to one line.">Collapse</button>
+            </div>
+          </div>`;
+      }
+      /**
+       * The review's "live actions" section: the handoffs its cells posted, a
+       * row per action with its newest run, and a Run all. Renders nothing for
+       * a review with live actions off and nothing to show, or on a daemon
+       * without the endpoint.
+       * @param {GuardianView} g - The review.
+       * @returns {string}
+       */
+      function liveActionsSectionHtml(g) {
+        const view = liveActionsViews[g.id];
+        if (view === null) return "";
+        const actions = view ? view.actions : [];
+        const runs = view ? view.runs.filter((r) => r.kind === "live") : [];
+        if (!g.effective_live_actions && !(view && view.enabled) && !actions.length && !runs.length) return "";
+        const headTip = "Live actions: things the cells' agents asked to have tried against the finished review, posted as handoffs when they finished.\nAn agent runs each one against the review's prepared tip and writes a report. Runs cost money.\nAdvisory — they never block Approve or Merge / rebase.";
+        const autoRan = view ? view.auto_ran_at_ms : g.live_actions_auto_ran_at_ms;
+        const statusTip = "Live actions run once automatically, when every cell has finished and the build is prepared. After that they run only when you press Run.\nEach run is an agent session, so it costs money.\nAn agent may commit a fix while testing; ralphus carries those commits onto the review's top branch.";
+        const status = autoRan
+          ? `<span data-tip="${esc(`${statusTip}\nThe automatic run started ${new Date(autoRan).toLocaleString()}.`)}">automatic run done</span>`
+          : `<span data-tip="${esc(statusTip)}">runs once automatically when every cell has finished and the build is prepared</span>`;
+        const failure = view && view.preparation_failure
+          ? `<div class="warn" data-tip="The live runs' checkout could not be prepared, so they cannot start until it is.">${esc(view.preparation_failure)}</div>`
+          : "";
+        const control = reviewRunControl(g, "live", actions.length > 0, "▶ Run all",
+          actions.length
+            ? `Queue an agent run for every live action, one after another against the review's tip.\nEach run costs money. Fixes the agents commit are carried onto the top branch.`
+            : "No live actions to run yet: none of this review's finished cells posted a handoff.");
+        const rows = actions.map((a) => {
+          const key = `${g.id}:live:${a.idx}`;
+          const r = latestLiveRun(view, "live", a.idx);
+          const open = !!liveActionOpen[key];
+          const rowClick = r ? `data-click="openLiveRunPane" data-guardian-id="${esc(g.id)}" data-run-id="${esc(r.run_id)}"` : `data-click="toggleLiveActionDetails" data-key="${esc(key)}"`;
+          const rowTip = r
+            ? "Click to show this action's newest agent run in Live View in the details pane.\nUse + for its prompt, report and commits."
+            : "This action has not run yet. Click to see its prompt.";
+          const sources = a.source_cells.length ? a.source_cells.join(", ") : "unknown";
+          return `<div class="cmd-row selectable${r && inspectorLiveRun && inspectorLiveRun.runId === r.run_id ? " sel" : ""}" ${rowClick} data-tip="${esc(rowTip)}">
+              <button class="cmd-run" data-click="runLiveAction" data-guardian-id="${esc(g.id)}" data-i="${a.idx}" data-tip="${esc(`Queue an agent run of this live action against the review's tip.\nIt costs money, and any fix the agent commits is carried onto the top branch.\nTry: ${a.prompt}`)}">▶</button>
+              <span class="cmd-label">${esc(a.label)}</span>
+              <span class="cmd-text" data-tip="${esc(a.prompt)}">${esc(a.prompt)}</span>
+              ${r ? liveRunStateBadge(r) + liveRunIntegrationBadge(r) : `<span class="cmd-status idle" data-tip="No agent has run this live action yet.">not run</span>`}
+              <button class="cmd-expand" data-click="toggleLiveActionDetails" data-key="${esc(key)}" data-tip="Show or hide this live action's prompt, where it came from, and its newest run's report.">${open ? "−" : "+"}</button>
+            </div>${open ? `<div class="cmd-full">
+              <div class="cmd-preview mono" data-tip="What the agent is told to try against the review's tip.">${esc(a.prompt)}</div>
+              <div class="hint" data-tip="The cells whose agents posted this handoff when they finished.">from ${esc(sources)}</div>
+              ${r ? liveRunDetailsHtml(g, r) : ""}
+            </div>` : ""}`;
+        }).join("");
+        const empty = actions.length ? "" : (runs.length
+          ? "No live actions are posted now; earlier runs are below."
+          : "None yet. A prompt cell posts one by ending its reply with a <span class=\"mono\">RALPHUS_LIVE_ACTION</span> handoff.");
+        return `<h3 class="section" data-tip="${esc(headTip)}">live actions</h3>
+          ${failure}
+          ${reviewRunGroup(control, `${status}${empty ? ` · ${empty}` : ""}`, rows)}`;
+      }
+      /**
+       * Queues agent runs of a review's live actions: every one, or just
+       * `index`.
+       * @param {string} gid - The review id.
+       * @param {number|null} index - One live action's `idx`, or null for all.
+       * @returns {Promise<void>}
+       */
+      async function runLiveActions(gid, index) {
+        const resp = await guardianAction(`/api/guardians/${gid}/live-actions/run`, index === null ? {} : { index });
+        if (!resp || !resp.ok) return;
+        /** @type {{queued?: string[]}} */
+        const data = await resp.json().catch(() => ({}));
+        const n = (data.queued || []).length;
+        notify("info", n === 1 ? "Live action queued — its row shows the run's progress." : `${n} live actions queued — they run one at a time.`);
+        await pollLiveActions(gid);
+        rerenderOwningPane();
+      }
+      /**
+       * Cancels one queued or running live run, after confirming.
+       * @param {string} gid - The review id.
+       * @param {string} runId - The run id.
+       * @returns {Promise<void>}
+       */
+      async function cancelLiveRun(gid, runId) {
+        if (!confirm("Cancel this agent run? Anything it already committed is not carried onto the top branch. This cannot be undone.")) return;
+        const resp = await guardianAction(`/api/guardians/${gid}/live-runs/${encodeURIComponent(runId)}/cancel`, {});
+        if (resp && resp.ok) notify("info", "Live run cancelled.");
+        await pollLiveActions(gid);
+        rerenderOwningPane();
+      }
+      /**
+       * Expands or collapses one live action's details.
+       * @param {string} key - The row's key, `<gid>:live:<idx>`.
+       * @returns {void}
+       */
+      function toggleLiveActionDetails(key) {
+        liveActionOpen[key] = !liveActionOpen[key];
+        renderReviewDetail();
+      }
+      /**
+       * Shows one live run's agent session in the inspector's Live View,
+       * replacing the branch details until a branch is selected -- the same
+       * way the auto-actions header shows its generation agent.
+       * @param {string} gid - The review id.
+       * @param {string} runId - The run id.
+       * @returns {void}
+       */
+      function openLiveRunPane(gid, runId) {
+        const prior = inspectorLiveRun;
+        if (prior && (prior.gid !== gid || prior.runId !== runId)) closeLiveRunPane();
+        closeAutoActionsPane();
+        const key = liveRunPeekKey(gid, runId);
+        inspectorLiveRun = { gid, runId };
+        inspectorBranchId = null;
+        selectedBranch[gid] = null;
+        if (!peekOpen[key]) peekOpen[key] = true;
+        syncHash();
+        renderReviewDetail();
+        fetchPeek(key, !peekScrollState[key]);
+      }
+      /**
+       * Hides the live-run pane and releases its Live View. No-op when it is
+       * not showing.
+       * @returns {void}
+       */
+      function closeLiveRunPane() {
+        const sel = inspectorLiveRun;
+        if (!sel) return;
+        inspectorLiveRun = null;
+        const key = liveRunPeekKey(sel.gid, sel.runId);
+        if (peekOpen[key]) togglePeek(key);
+      }
+      /**
+       * The inspector's body while it shows one live run's agent session.
+       * @param {GuardianView} g - The review.
+       * @param {string} runId - The run id.
+       * @returns {string}
+       */
+      function liveRunInspectorHtml(g, runId) {
+        const key = liveRunPeekKey(g.id, runId);
+        const view = liveActionsViews[g.id];
+        const run = view ? view.runs.find((r) => r.run_id === runId) : undefined;
+        const what = run && run.kind === "action" ? "User action run" : "Live action run";
+        const title = run ? run.label : "live run";
+        return `<div class="insp-head"><div class="insp-title"><span class="t" data-tip="An agent testing this review's tip. Click a branch in the stack to go back to its details.">${esc(what)}: ${esc(title)}</span>${run ? liveRunStateBadge(run) + liveRunIntegrationBadge(run) : ""}</div></div>
+          <div class="insp-body">${squadLiveSlot(squadLiveCtx({
+            baseKey: key,
+            title: `${what.toLowerCase()} · ${title}`,
+            canThink: true,
+            promptText: run ? liveRunPrompt(g, run) : "",
+            promptHint: "What the agent was told to try against the review's tip.",
+            noPromptText: "This run's prompt is not available on the board. The terminal tab shows what the agent did.",
+            withAttempts: false,
+            currentMeta: run ? run.state : "",
+            closeKey: "",
+          }))}</div>`;
+      }
       /**
        * The branch the inspector is showing, or null when nothing is selected
        * or the selection does not belong to the open review.
@@ -164,6 +545,7 @@
        */
       function selectInspectorBranch(branchId) {
         closeAutoActionsPane();
+        closeLiveRunPane();
         inspectorBranchId = branchId || null;
         if (!reviewDockSticky) reviewDockScope = branchId;
         // Switching branches while watching is still watching: the newly
@@ -311,6 +693,12 @@
         }
         if (inspectorAutoActionsGid === g.id) {
           host.innerHTML = autoActionsInspectorHtml(g);
+          restorePeekScrollPositions();
+          return;
+        }
+        const liveRun = inspectorLiveRun;
+        if (liveRun && liveRun.gid === g.id) {
+          host.innerHTML = liveRunInspectorHtml(g, liveRun.runId);
           restorePeekScrollPositions();
           return;
         }

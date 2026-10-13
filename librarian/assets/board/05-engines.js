@@ -272,6 +272,11 @@
       CLICK_HANDLERS.jumpToLatestRun = (e, ds) => jumpToLatestRun(ds.branchId || "");
       CLICK_HANDLERS.inspectorSetLiveSub = (e, ds) => inspectorSetLiveSub(ds.branchId || "", ds.sub || "terminal");
       CLICK_HANDLERS.runAllActionHints =(e, ds) => runAllActionHints(ds.guardianId || "");
+      CLICK_HANDLERS.runAllLiveActions = (e, ds) => runAllLiveActions(ds.guardianId || "");
+      CLICK_HANDLERS.runLiveAction = (e, ds) => runLiveActions(ds.guardianId || "", Number(ds.i));
+      CLICK_HANDLERS.cancelLiveRun = (e, ds) => cancelLiveRun(ds.guardianId || "", ds.runId || "");
+      CLICK_HANDLERS.openLiveRunPane = (e, ds) => openLiveRunPane(ds.guardianId || "", ds.runId || "");
+      CLICK_HANDLERS.toggleLiveActionDetails = (e, ds) => toggleLiveActionDetails(ds.key || "");
       CLICK_HANDLERS.rebuildPreparationNow = (e, ds) => rebuildPreparationNow(ds.guardianId || "");
       CLICK_HANDLERS.selectReviewCommandRow = (e, ds) => selectReviewCommandRow(ds.guardianId || "", ds.key || "", ds.cmd || "");
       CLICK_HANDLERS.scopeReviewDockToCommand = (e, ds) => scopeReviewDockToCommand(ds.guardianId || "", ds.key || "", ds.cmd || "");

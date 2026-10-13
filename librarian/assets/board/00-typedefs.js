@@ -353,6 +353,54 @@
        * @property {string} [auto_run_note] - RAL-565: why auto-run skipped this check, or why its last auto-run may be out of date (a rebase, feedback pass or auto-PR fix arrived while it ran). Cleared when the check is prepared again.
        */
       /**
+       * One live action: a handoff a finished prompt cell posted
+       * (`RALPHUS_LIVE_ACTION`), deduplicated per review. An agent runs its
+       * prompt against the review's prepared tip.
+       * @typedef {object} LiveAction
+       * @property {number} idx - Position within the review's live actions; what `POST .../live-actions/run` takes as `index`.
+       * @property {string} label
+       * @property {string} prompt - What the agent is told to try.
+       * @property {string[]} source_cells - The cells that posted this handoff.
+       * @property {number} created_at_ms
+       */
+      /**
+       * One agent run against a review's tip: a live action (`kind: "live"`)
+       * or a user `[[review.action]]` whose body is a prompt (`kind: "action"`).
+       * @typedef {object} LiveRunRow
+       * @property {string} run_id
+       * @property {string} guardian_id
+       * @property {"live"|"action"} kind
+       * @property {number} action_idx - The live action's `idx` (kind "live") or the user action's index (kind "action").
+       * @property {string} label
+       * @property {"auto"|"manual"} trigger
+       * @property {"queued"|"running"|"finished"|"failed"|"cancelled"|"over_budget"|"interrupted"} state
+       * @property {string} cwd
+       * @property {string} base_tip
+       * @property {string} live_ref
+       * @property {string[]} commits - Commits the agent made (fixes ralphus tries to carry onto the review's top branch).
+       * @property {string|null} report - The agent's own account of what it tried and found.
+       * @property {string|null} error
+       * @property {number|null} cost_usd
+       * @property {string|null} cell_id
+       * @property {"none"|"pending"|"integrating"|"integrated"|"failed"|"skipped"} integration
+       * @property {string|null} integration_detail
+       * @property {number} queued_at_ms
+       * @property {number|null} started_at_ms
+       * @property {number|null} finished_at_ms
+       */
+      /**
+       * `GET /api/guardians/{id}/live-actions`: a review's live actions and
+       * every agent run against its tip, newest first.
+       * @typedef {object} LiveActionsView
+       * @property {boolean} enabled - Whether live actions are on for this review (its own setting resolved against the project default).
+       * @property {boolean|null} own_setting
+       * @property {number|null} auto_ran_at_ms - When the one automatic run started; null until then.
+       * @property {string|null} checkout
+       * @property {string|null} preparation_failure
+       * @property {LiveAction[]} actions
+       * @property {LiveRunRow[]} runs
+       */
+      /**
        * @typedef {object} BranchConflicts
        * @property {string[]} files - Paths (relative to the branch's worktree root) still carrying unresolved conflict markers. Empty once resolved, or if the worktree doesn't exist (yet, or anymore).
        * @property {boolean} rebase_in_progress - Whether the worktree is currently mid-`git rebase`. Can be false while `files` is still non-empty.
