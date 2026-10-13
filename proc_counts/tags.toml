@@ -86,3 +86,8 @@ tag = "upstream-rebase-ignored"
 [[test]]
 id = "ralphus-daemon git_fetch_inproc::tests::parity::fetch_leaves_the_same_refs_as_git"
 tag = "git-fetch-inproc"
+
+# Live action runs (agent run in a review checkout, commits pinned on a live ref).
+[[test]]
+id = "ralphus-daemon live_actions::tests::a_live_runs_commits_and_leftover_edits_are_pinned_on_its_live_ref"
+tag = "review-live-action"

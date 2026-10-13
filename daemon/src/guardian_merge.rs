@@ -473,7 +473,7 @@ fn run_agent_with_rate_limit_retry(
 /// resets `ThinkingStallDetector`'s own per-attempt low-diversity streak,
 /// and the terminal mailbox escalation once the interview's
 /// `THINKING_STALL_MAX_STRIKES` limit is reached.
-fn run_agent_with_stall_recovery(
+pub(crate) fn run_agent_with_stall_recovery(
     store: &crate::store_lock::StoreHandle,
     spec: &mut RunnerSpec,
     runner: &dyn Runner,
@@ -2155,7 +2155,7 @@ pub(crate) struct ResolvedResolverAgent {
 /// conflict-resolution path RAL-408's database-backed project defaults are
 /// meant to govern, so it resolves through `Store::resolve_review_config`
 /// (file layers + database) directly rather than delegating to them.
-fn resolve_resolver_agent(
+pub(crate) fn resolve_resolver_agent(
     stored_agent: Option<&str>,
     stored_model: Option<&str>,
     store: &crate::store_lock::StoreHandle,
@@ -2359,7 +2359,7 @@ fn final_branch_id(branches: &[crate::guardian::OrderedBranch]) -> Option<&str> 
 /// it. Mirrors the RAL-161 cell/task budget kill-switch: once exceeded,
 /// callers should stop making further resolver/prover calls and fail the
 /// guardian/branch, using the returned error message.
-fn record_guardian_call_cost(
+pub(crate) fn record_guardian_call_cost(
     store: &crate::store_lock::StoreHandle,
     id: &str,
     branch_id: Option<&str>,

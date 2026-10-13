@@ -45,6 +45,7 @@ pub mod health_sweep;
 pub mod health_targets;
 pub mod hidden;
 pub mod jobobject;
+pub mod live_actions;
 pub mod logging;
 pub mod machine_targets;
 pub mod machines;
