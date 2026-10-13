@@ -8514,6 +8514,48 @@ fn decide_stack_action(
     }
 }
 
+/// Whether the review's recorded native stack is unusable: it has members, but
+/// none of them is among the review's currently open PRs. That is a stack whose
+/// PRs all merged or closed (the review was re-filed after a partial merge).
+/// GitHub refuses to unstack such a stack (`422 ... cannot be removed from
+/// this stack`), so treating it as a mismatch and rebuilding fails on every
+/// pass and the live PRs never get grouped; it has to be forgotten instead.
+/// Requires two open PRs so a view that merely sees too little of the review
+/// (see [`is_ordered_subset`]) never discards a working stack.
+fn recorded_stack_is_dead(members: &[i64], open_prs: &[(String, i64, i64)]) -> bool {
+    open_prs.len() >= 2
+        && !members.is_empty()
+        && !members
+            .iter()
+            .any(|m| open_prs.iter().any(|(_, _, number)| number == m))
+}
+
+/// Writes one structured Cartographer row for a native-stack decision, so the
+/// board's log shows what happened to the stack instead of only the daemon's
+/// stderr.
+fn note_native_stack_outcome(
+    store: &crate::store_lock::StoreHandle,
+    id: &str,
+    level: crate::logging::LogLevel,
+    message: &'static str,
+    payload: serde_json::Value,
+) {
+    let guard = store.lock();
+    let _ = guard.cartographer_log(crate::cartographer::CartographerEntry {
+        level,
+        source: "pr",
+        message,
+        scope: Some("guardian"),
+        squad_id: None,
+        guardian_id: Some(id),
+        cell_id: None,
+        task: None,
+        log_path: None,
+        payload,
+        admin_only: false,
+    });
+}
+
 /// Whether every PR in `expected` also appears in `members`, in the same
 /// relative order -- i.e. `expected` is a subsequence of `members`.
 ///
@@ -9015,6 +9057,20 @@ fn reconcile_native_pr_stack(
         .map_err(|e| e.to_string())?;
     let recorded = match recorded {
         Some(stack_number) => match client.get_stack_pull_requests(stack_number) {
+            Ok(Some(members)) if recorded_stack_is_dead(&members, &all_with_prs) => {
+                store
+                    .lock()
+                    .clear_guardian_forge_stack_number(id)
+                    .map_err(|e| e.to_string())?;
+                note_native_stack_outcome(
+                    store,
+                    id,
+                    crate::logging::LogLevel::WARNING,
+                    "recorded github pr stack holds none of the review's open PRs; registering a new one",
+                    serde_json::json!({"stale_stack_number": stack_number, "members": members}),
+                );
+                None
+            }
             Ok(Some(members)) => Some((stack_number, members)),
             Ok(None) => {
                 store
@@ -9071,6 +9127,13 @@ fn reconcile_native_pr_stack(
                 Err(e) => {
                     // ralphus[ignore-rlog-pair]: the surrounding stack-submission handler records the durable workflow outcome after this best-effort native-stack action
                     crate::rlog!(WARNING, "ralphus [pr] review {id} create stack failed: {e}");
+                    note_native_stack_outcome(
+                        store,
+                        id,
+                        crate::logging::LogLevel::WARNING,
+                        "github pr stack registration failed",
+                        serde_json::json!({"action": "create", "error": e, "pull_requests": all_with_prs.iter().map(|(_, _, n)| *n).collect::<Vec<_>>()}),
+                    );
                 }
             }
         }
@@ -9114,6 +9177,13 @@ fn reconcile_native_pr_stack(
                         WARNING,
                         "ralphus [pr] review {id} add to stack {stack_number} failed: {e}"
                     );
+                    note_native_stack_outcome(
+                        store,
+                        id,
+                        crate::logging::LogLevel::WARNING,
+                        "github pr stack registration failed",
+                        serde_json::json!({"action": "append", "stack_number": stack_number, "error": e}),
+                    );
                 }
             }
         }
@@ -9141,6 +9211,13 @@ fn reconcile_native_pr_stack(
                             WARNING,
                             "ralphus [pr] review {id} could not rebuild github pr stack {stack_number}: {e}"
                         );
+                        note_native_stack_outcome(
+                            store,
+                            id,
+                            crate::logging::LogLevel::WARNING,
+                            "github pr stack registration failed",
+                            serde_json::json!({"action": "rebuild_create", "stack_number": stack_number, "error": e}),
+                        );
                     }
                 }
             }
@@ -9149,6 +9226,13 @@ fn reconcile_native_pr_stack(
                 crate::rlog!(
                     WARNING,
                     "ralphus [pr] review {id} could not dissolve mismatched github pr stack {stack_number}: {e}"
+                );
+                note_native_stack_outcome(
+                    store,
+                    id,
+                    crate::logging::LogLevel::WARNING,
+                    "github pr stack registration failed",
+                    serde_json::json!({"action": "rebuild_unstack", "stack_number": stack_number, "error": e}),
                 );
             }
         },
@@ -12835,6 +12919,136 @@ mod tests {
         assert!(
             mock.finish().is_empty(),
             "reconciling a correct stack must not write to the forge"
+        );
+
+        let _ = std::fs::remove_dir_all(&root_dir);
+    }
+
+    #[test]
+    fn recorded_stack_is_dead_only_when_it_shares_no_pr_with_two_or_more_open_ones() {
+        let open = vec![("b-a".to_string(), 0, 10), ("b-b".to_string(), 1, 11)];
+        assert!(recorded_stack_is_dead(&[1, 2, 3], &open));
+        assert!(!recorded_stack_is_dead(&[1, 10], &open), "shares #10");
+        assert!(!recorded_stack_is_dead(&[], &open), "no members to judge");
+        assert!(
+            !recorded_stack_is_dead(&[1, 2, 3], &open[..1]),
+            "a one-PR view of the review proves nothing"
+        );
+    }
+
+    /// The bug that left a review with correctly chained PRs and no native
+    /// stack: the recorded stack held only PRs that had since merged, GitHub
+    /// refuses to unstack such a stack (422), so the `Rebuild` it triggered
+    /// failed on every submit and the live PRs were never grouped. The dead
+    /// stack must be forgotten and a new one registered over the live PRs,
+    /// without ever calling `unstack` on it.
+    #[test]
+    fn reconcile_native_pr_stack_replaces_a_recorded_stack_of_only_merged_prs() {
+        let mock = MockForge::start(move |server| {
+            let mut writes: Vec<String> = Vec::new();
+            for req in server.requests() {
+                let method = req.method().clone();
+                let url = req.url().to_string();
+                if method == tiny_http::Method::Get && url.starts_with("/repos/acme/widget/pulls/")
+                {
+                    req.respond(
+                        tiny_http::Response::from_string(
+                            r#"{"state":"open","base":{"ref":"x"},"updated_at":"2026-01-01T00:00:00Z"}"#,
+                        )
+                        .with_status_code(200),
+                    )
+                    .unwrap();
+                } else if method == tiny_http::Method::Get && url == "/repos/acme/widget/stacks/42"
+                {
+                    req.respond(
+                        tiny_http::Response::from_string(
+                            r#"{"number":42,"open":false,"pull_requests":[{"number":1},{"number":2},{"number":3}]}"#,
+                        )
+                        .with_status_code(200),
+                    )
+                    .unwrap();
+                } else if method == tiny_http::Method::Post
+                    && url == "/repos/acme/widget/stacks/42/unstack"
+                {
+                    writes.push(format!("{method} {url}"));
+                    req.respond(
+                        tiny_http::Response::from_string(
+                            r#"{"message":"Pull requests #1, #2, #3 cannot be removed from this stack"}"#,
+                        )
+                        .with_status_code(422),
+                    )
+                    .unwrap();
+                } else {
+                    writes.push(format!("{method} {url}"));
+                    req.respond(
+                        tiny_http::Response::from_string(r#"{"number":99}"#).with_status_code(200),
+                    )
+                    .unwrap();
+                }
+            }
+            writes
+        });
+
+        let root_dir = tmp_dir("dead-recorded-stack-work");
+        g(&root_dir, &["init", "--initial-branch", "release"]);
+        gwrite(&root_dir, "base.txt", "base\n");
+        g(&root_dir, &["add", "."]);
+        g(&root_dir, &["commit", "--message", "base"]);
+
+        let s = store();
+        let gid = s
+            .create_guardian("demo", "release", root_dir.to_str().unwrap())
+            .unwrap();
+        for branch in ["a", "b", "c"] {
+            s.add_guardian_branch(&gid, branch).unwrap();
+        }
+        s.set_guardian_forge_stack_number(&gid, 42).unwrap();
+        let branch_ids: Vec<String> = s
+            .get_guardian(&gid)
+            .unwrap()
+            .branches
+            .into_iter()
+            .map(|b| b.id)
+            .collect();
+        let chain = [
+            ("a-review", "release", 10_i64),
+            ("b-review", "a-review", 11),
+            ("c-review", "b-review", 12),
+        ];
+        for (branch_id, (alias, base, number)) in branch_ids.iter().zip(chain) {
+            s.set_branch_review(&gid, branch_id, alias, "wt").unwrap();
+            s.create_pull_request(
+                &gid,
+                Some(branch_id),
+                "github",
+                "acme/widget",
+                alias,
+                base,
+                "Title",
+                "Description",
+                Some(number),
+                Some("http://x"),
+            )
+            .unwrap();
+            s.set_branch_status(&gid, branch_id, MergeStatus::Done, None)
+                .unwrap();
+        }
+
+        let store = Arc::new(crate::store_lock::StoreMutex::new(s));
+        let client = mock.client(crate::forge::ForgeKind::GitHub, "acme/widget");
+
+        reconcile_native_pr_stack(&store, &client, &gid, None, 0).unwrap();
+
+        assert_eq!(
+            store.lock().get_guardian_forge_stack_number(&gid).unwrap(),
+            Some(99),
+            "the live PRs must end up in a newly registered stack"
+        );
+        let writes = mock.finish();
+        assert_eq!(
+            writes,
+            vec!["POST /repos/acme/widget/stacks".to_string()],
+            "the dead stack must be forgotten, never unstacked"
         );
 
         let _ = std::fs::remove_dir_all(&root_dir);
