@@ -193,6 +193,7 @@ ENDPOINT_TO_CLI: dict[str, list[str]] = {
     "POST /api/squads/{id}/retry": ["squad retry", "retry"],
     "POST /api/squads/{id}/restart": ["squad restart"],
     "POST /api/squads/{id}/cells/{ti}/{si}/restart": ["cell restart"],
+    "POST /api/squads/{id}/cells/{ti}/{si}/copy": ["cell copy"],
     "POST /api/squads/{id}/cells/{ti}/{si}/proof/{vi}/restart": ["cell restart-proof", "proof restart"],
     "POST /api/squads/{id}/tasks/{ti}/proof/{vi}/restart": ["task restart-proof", "proof restart"],
     # env: read-only resolved views (RAL-324); the POST setters are board-only

@@ -334,6 +334,7 @@ the daemon's hourly Free-tier background sweep
 | `cell reviews <selector>` | Reviews this cell's branch participates in |
 | `cell set-status <selector> <state>` | Override a cell's status. `ignored` (RAL-641, "ignore and continue") also sets dependents that were failed only by the dependency cascade back to pending, and a finished squad back to pending |
 | `cell restart <selector>` | Restart a cell and its downstream |
+| `cell copy <selector> [--from-branch]` | Copy a cell into a new one-task squad from a clean base (or from the cell's own branch), linked both ways (RAL-641) |
 | `cell restart-proof <selector> --from <i>` | Restart every cell-level proof step, re-running from the start |
 | `cell edit <selector> [--cwd] [--agent] [--model] [--prompt] [--command] [--system-prompt] [--initialization-commands] [--initialization-timeout-sec]` | Edit a cell's fields |
 | `cell terminal <selector> [--mode open\|readonly]` | Print the `claude --resume` command + cwd (does **not** ask the daemon to spawn a terminal — see below) |
@@ -742,6 +743,7 @@ use; see `READ_ONLY_NOTE`.
             - update name [str] --backend [name] --executable [cmd] --link [key=target...] --model [name] --set [key=value...] --thinking-capable/--no-thinking-capable  {Administrative (RAL-473): replace an existing agent profile's backend/executable/model/env. --thinking-capable/--no-thinking-capable (RAL-516) overrides whether a Live View pane running this profile shows the "Show Thinking" checkbox at all; omitted, it inherits the backend's own default.}
     - cartographer --ascending --cell [str] --entity [uri] --for [uri] --guardian [id] --level [str] --limit [integer] --offset [integer] --q [str] --scope [str] --source [str] --squad [id] --task [str]  {Query the structured Cartographer event log (RAL-98/RAL-155).}
     - cell  {Inspect and act on cells.}
+        - copy selector [uri] --from-branch  {Copy a cell (prompt or command, agent, proofs) into a new one-task squad submitted from a clean base, linked both ways (RAL-641). --from-branch starts from the cell's own branch instead.}
         - (read-only-safe) diff selector [uri] --summary  {Show a running cell's live worktree diff (full diff computed only when changes were pushed).}
         - edit selector [uri] --agent [name] --auto-compact-threshold [tokens] --command [cmd] --cwd [path] --effort [level] --initialization-commands [text] --initialization-timeout-sec [seconds] --maximum-context [tokens] --maximum-tool-output-tokens [tokens] --model [name] --prompt [text] --system-prompt [text] --temperature [number]  {Edit a cell's fields. --initialization-commands (one command per line; blank clears) sets the worktree initialization that runs once in the cell's freshly created worktree.}
         - (read-only-safe) env selector [uri] --scope [cell|proof]  {List a cell's resolved environment variables, read-only (RAL-324); --scope proof shows what its own proof steps inherit.}

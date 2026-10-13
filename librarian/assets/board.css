@@ -109,6 +109,7 @@
       .running-menu div:hover { background: var(--panel-2); }
       .icon-btn { background: none; border: 1px solid var(--border); color: var(--text); border-radius: 6px; padding: 3px 8px; }
       a.icon-btn { display: inline-block; line-height: normal; text-decoration: none; cursor: pointer; }
+      .icon-btn:disabled { opacity: .35; cursor: default; }
       .copy-btn { background: none; border: 1px solid var(--border); color: var(--muted); border-radius: 5px; padding: 0 6px; font-size: 12px; line-height: 1.7; vertical-align: middle; }
       .copy-btn:hover { color: var(--text); }
       .copy-btn.copied { color: var(--done); border-color: var(--done); }
@@ -427,6 +428,7 @@
       .materializing-graph { color: var(--materializing); cursor: help; }
       .materializing-phase { color: var(--muted); font-size: 12px; margin-top: 6px; }
       .dhead { display: flex; align-items: center; gap: 8px; margin-bottom: 4px; }
+      .modal h3.section.popup-heading { font-size: 15px; letter-spacing: .5px; color: var(--text); margin: 18px 0 6px; }
       .dhead .k { font-size: 11px; text-transform: uppercase; letter-spacing: 1px; color: var(--muted); }
       h3.section { font-size: 11px; text-transform: uppercase; letter-spacing: 1px; color: var(--muted); margin: 18px 0 8px; }
       .kv-row { display: flex; gap: 8px; margin: 4px 0; font-size: 13px; }

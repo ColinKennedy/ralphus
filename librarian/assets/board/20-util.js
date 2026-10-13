@@ -464,7 +464,7 @@
       const blockingBadge = (blocking) => {
         if (!blocking) return "";
         const total = blocking.blocked_cells + blocking.blocked_branches;
-        return ` <span class="pill p-failed" data-tip="${esc(`This cell has failed ${blocking.failure_count} times and is holding up ${blocking.blocked_cells} cell(s) and ${blocking.blocked_branches} review branch(es).\nWho/when: it failed at least ${blocking.threshold} times (the task's max_retries, default 3) and other work waits on it.\nUse Ignore and continue to let that work run without it, or disable its review branch.`)}">⛔ blocking ${total}</span>`;
+        return ` <span class="pill p-failed" data-tip="${esc(`This cell has failed ${blocking.failure_count} times and is holding up ${blocking.blocked_cells} cell(s) and ${blocking.blocked_branches} review branch(es).\nWho/when: it failed at least ${blocking.threshold} times (the task's max_retries, default 3) and other work waits on it.\nOpen the cell, then choose \"Show ways to fix this block…\" from the ⋯ menu at the top of its details.`)}">⛔ blocking ${total}</span>`;
       };
       /**
        * Renders a "detached" badge (RAL-288) for a cell that reads `running`

@@ -379,6 +379,29 @@
           ${editBtn()}`;
       }
       /**
+       * Copied-from / copied-to links between squads (RAL-641).
+       * @param {SquadView} r
+       * @returns {string}
+       */
+      function copyLinksSection(r) {
+        /**
+         * @param {string} id
+         * @param {string} text
+         * @param {string} tip
+         * @returns {string}
+         */
+        const link = (id, text, tip) => `<a href="#" data-click="gotoSquad" data-squad-id="${esc(id)}" style="color:var(--accent)" data-tip="${esc(tip)}">${esc(text)}</a>`;
+        const rows = [];
+        if (r.copied_from) {
+          const c = r.copied_from;
+          rows.push(`<div class="kv-row"><span class="k">copied from</span><span class="v">${link(c.from_squad_id, `${c.from_squad_id} · task ${c.from_task_idx} cell ${c.from_cell_idx}`, "Open the squad this one was copied from.")}${c.from_branch ? " (from its branch)" : ""}</span></div>`);
+        }
+        for (const c of r.copied_to || []) {
+          rows.push(`<div class="kv-row"><span class="k">copied to</span><span class="v">${link(c.to_squad_id, `${c.to_squad_id} · task ${c.from_task_idx} cell ${c.from_cell_idx}`, "Open the squad this cell was copied into.")}</span></div>`);
+        }
+        return rows.length ? `<h3 class="section">copies</h3>${rows.join("")}` : "";
+      }
+      /**
        * Renders the squad's pre-work generation cost (RAL-420), when it has
        * any: the retained usage of the agent/model calls the Simple form made
        * before this squad was submitted (Generate proof steps / manual checks
@@ -1144,7 +1167,7 @@
           ? `<h3 class="section">system prompt</h3>${promptBox(s.system_prompt, `system-prompt-box-${sel.taskIdx}-${sel.cellIdx}`, SYSTEM_PROMPT_TIP)}`
           : "";
         const initRow = worktreeInitRow(s);
-        return `<div class="dhead"><span class="k">◉ cell</span> <span>${esc(s.name ?? s.id)}</span></div>
+        return `<div class="dhead"><span class="k">◉ cell</span> <span>${esc(s.name ?? s.id)}</span><button class="icon-btn" style="margin-left:auto" data-click="openCellMenu" data-squad-id="${esc(r.id)}" data-ti="${sel.taskIdx}" data-si="${sel.cellIdx}" data-tip="Actions for this cell: edit and restart${s.blocking ? ", and Show ways to fix this block… (it is holding up other work)" : ""}.">⋯</button></div>
           ${s.name ? `<div class="kv-row"><span class="k">name</span><span class="v">${esc(s.name)}</span></div>` : ""}
           <div class="kv-row"><span class="k">id</span><span class="v mono">${esc(s.id)}${copyBtn(s.id)}</span></div>
           <div class="kv-row"><span class="k">task</span><span class="v">${esc(t.name)}</span></div>
@@ -1173,10 +1196,8 @@
           <div class="btn-row">
             <button class="btn primary" onclick="startEdit()" data-tip="Edit this cell — change its prompt, agent, model, command, or working directory.\nIf the squad is currently running it will be stopped and reset to Pending.">✎ Edit</button>
             <button class="btn" data-click="restartCell" data-squad-id="${esc(r.id)}" data-ti="${sel.taskIdx}" data-si="${sel.cellIdx}" data-tip="Re-run this cell and all downstream cells within this squad.\nDependent squads in other tasks are also re-queued.\nThis cannot be undone.">⟳ Restart cell</button>
-            ${["failed", "pending", "queued"].includes(s.state) ? `<button class="btn" data-click="ignoreCell" data-squad-id="${esc(r.id)}" data-ti="${sel.taskIdx}" data-si="${sel.cellIdx}" data-tip="Skip this cell and keep going.
-Dependents that were blocked only by this cell run again, starting from this cell's own upstream.
-Reversible: Restart cell runs it again.">⤼ Ignore and continue</button>` : ""}
           </div>
+          ${copyLinksSection(r)}
           ${(() => {
             // RAL-102/RAL-151: every command/prompt cell runs inside
             // tmux, so both a cell's kind is always live-view capable

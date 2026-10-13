@@ -81,6 +81,7 @@ where one exists.
 | POST | `/api/squads/{id}/add-dependency` | [Add a cross-squad dependency](#post-apisquadsidadd-dependency) post-submission |
 | POST | `/api/squads/{id}/cells/{ti}/{si}/restart/preview` | [Dry-run preview](#post-apisquadsidcellstask_idxcell_idxrestartpreview) of a cell restart's downstream impact |
 | POST | `/api/squads/{id}/cells/{ti}/{si}/restart` | [Restart one cell](#post-apisquadsidcellstask_idxcell_idxrestart) + its downstream |
+| POST | `/api/squads/{id}/cells/{ti}/{si}/copy` | [Copy one cell into a new one-task squad](#post-apisquadsidcellstask_idxcell_idxcopy) (RAL-641) |
 | POST | `/api/squads/{id}/cells/{ti}/{si}/proof/{vi}/restart` | Restart a cell's whole proof sequence, re-running from the start (`vi` names the step that triggered it) |
 | POST | `/api/squads/{id}/tasks/{ti}/proof/{vi}/restart` | Restart a task's whole proof sequence, re-running from the start (`vi` names the step that triggered it) |
 | POST | `/api/squads/{id}/tasks/{ti}/restart/preview` | [Dry-run preview](#post-apisquadsidtaskstirestartpreview) of a task restart's downstream impact |
@@ -1555,6 +1556,30 @@ above. A non-integer index is a `400`. Accepts the optional `note`/`apply_to_all
 body documented under [`POST /api/squads/{id}/restart`](#post-apisquadsidrestart)
 above (RAL-174) — here the exact target is this one cell.
 
+### `POST /api/squads/{id}/cells/{task_idx}/{cell_idx}/copy`
+Copy one cell into a **new** one-task squad (RAL-641). The task file is
+rebuilt from the cell's stored definition (prompt or command, agent, model,
+system prompt, subprojects, machine, and its cell-scope proof steps; command
+proofs run once in `raw` mode because the stored row keeps no remediation
+budget) and submitted through the normal submit path, so it is validated and
+materialized like any squad. `depends_on` and stacking `upstream` are not
+carried over.
+
+Body (optional): `{ "from_branch": false }`. By default the copy starts from a
+clean base (the project's default branch). With `from_branch: true` it starts
+from the copied cell's own branch; that needs a task `project` (`409
+copy_needs_project`) and a resolvable cell branch (`409 copy_no_branch`). A
+missing cell is a `404`.
+
+Returns the submit response (`201`, `{ squad_id, state, warnings }`) plus
+`copied_from: { squad_id, task_idx, cell_idx, from_branch }`. Both squads are
+linked: the squad view of the original carries `copied_to` (a list of
+`{ from_squad_id, from_task_idx, from_cell_idx, to_squad_id, from_branch }`)
+and the new one carries `copied_from` (same shape). Deleting the original
+squad leaves the copy and its `copied_from` intact.
+CLI: `ralphus cell copy <selector> [--from-branch]`; MCP tool `cell_copy`;
+board: the cell details pane's "Copy to new squad" / "Copy from branch".
+
 ### `POST /api/squads/{id}/tasks/{task_idx}/restart/preview`
 Dry-run preview of
 [`POST /api/squads/{id}/tasks/{task_idx}/restart`](#post-apisquadsidtaskstirestart)
@@ -2482,10 +2507,15 @@ from worktrees belonging to other reviews"). `branch_id` is the branch's
 stable id (RAL-122, e.g. `branch-000000000042`) — not its stack position,
 which changes under reorder and isn't a valid addressing key. Body:
 ```json
-{ "to_guardian_id": "guardian-000000000002" }
+{ "to_guardian_id": "guardian-000000000002", "position": 1 }
 ```
+`position` is optional (RAL-641): where the branch lands in `to_guardian_id`'s
+stack, `0` being the bottom (built first). The branches from that position up
+shift up by one. Without it, or with a position at or past the end, the branch
+is appended to the top of the stack.
+
 This is a **move, not a copy** (see "Future: copy mode" below): the branch leaves `{id}`'s stack entirely and is
-appended to the end of `to_guardian_id`'s stack. `{id}`'s remaining branches
+placed in `to_guardian_id`'s stack as above. `{id}`'s remaining branches
 are renumbered to stay contiguous, but the moved branch's `branch_id` itself
 is unchanged by the move — the same id continues to address it in its new
 review. The moved branch's merge state is reset to
@@ -2528,7 +2558,7 @@ deleted again.
 Both reviews rebuild afterwards, exactly as for `move`. Returns
 `{ "guardian_id": "<new review id>", "from_guardian_id": "<id>", "branch_id": "<branch_id>" }`.
 CLI: `ralphus review extract-branch <selector#branch>`; MCP tool
-`review_extract-branch`; board: the branch menu's "Extract to a new review".
+`review_extract-branch`; board: the branch menu's "Move or extract branch…" with "New review" picked.
 
 **Future: copy mode.** RAL-118 Q3 scoped v1 to *move* only and asked for a
 sketch of what *copy* — the same work landing in two reviews, each rebased

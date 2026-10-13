@@ -10,6 +10,25 @@
        * @property {[string, string]|null} [branch] - `[review id, branch]` this cell's branch sits in, if any.
        */
       /**
+       * @typedef {object} MoveBranchPickerItem
+       * @property {string} id - A review id, or `__new__` for a new review.
+       * @property {string} title - The row's name.
+       * @property {string} detail - The row's second line.
+       */
+      /**
+       * @typedef {object} CellMenuAction
+       * @property {"unblock"|"edit"|"restart"} key - Which action the item runs.
+       * @property {string} label - Menu text.
+       * @property {string} tip - Tooltip explaining what the action does.
+       */
+      /**
+       * @typedef {object} UnblockOption
+       * @property {"ignore"|"extract"|"copy"|"copy-branch"} key - Which action the option runs.
+       * @property {string} title - Short name of the action.
+       * @property {string} effect - Plain-language account of what happens when it is chosen.
+       * @property {boolean} addOn - True for an optional retry that goes with a main option rather than a way out of its own.
+       */
+      /**
        * @typedef {object} AppraisalSection
        * @property {string} title
        * @property {string} body - Markdown.
@@ -206,7 +225,17 @@
        * @property {{id: string, name: string, status: string}[]} [reviews]
        * @property {{[key: string]: string}} [env_overrides] - Persistent environment-variable overrides (RAL-150); applied to every cell/proof subprocess this squad spawns from now on, until unset. Empty/absent for the vast majority of squads.
        * @property {GenerationUsage} [generation_cost] - RAL-420: this squad's own pre-work generation cost — the retained usage of the agent/model calls the Simple form made before submission (Generate proof steps / manual checks / auto-build steps, plus the suggest-name fallback), attributed to this squad at submit time and folded into its normal totals exactly once. Absent for the vast majority of squads (only Simple-tab submissions that used the Generate buttons or the suggest-name fallback have rows).
+       * @property {CellCopyLink} [copied_from] - RAL-641: set on a squad created by copying a cell; names the original cell.
+       * @property {CellCopyLink[]} [copied_to] - RAL-641: squads created by copying one of this squad's cells.
        * @property {SquadMaterializationPhase} [materialization_phase] - In-progress materialization progress, present only while `state === "materializing"`. `total` is a fixed, coarse step count for the named phases the background submit follow-up runs through — not an exact per-squad computation — so it's a rough progress hint, not a guarantee `step` reaches `total`.
+       */
+      /**
+       * @typedef {object} CellCopyLink
+       * @property {string} from_squad_id
+       * @property {number} from_task_idx
+       * @property {number} from_cell_idx
+       * @property {string} to_squad_id
+       * @property {boolean} from_branch - True when the copy started from the original cell's branch.
        */
       /**
        * @typedef {object} SquadMaterializationPhase

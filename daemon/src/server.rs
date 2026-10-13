@@ -1757,6 +1757,9 @@ fn route_for_user(
         ("POST", ["api", "squads", id, "cells", ti, si, "restart"]) => {
             restart_cell(daemon, id, ti, si, body)
         }
+        ("POST", ["api", "squads", id, "cells", ti, si, "copy"]) => {
+            copy_cell(daemon, id, ti, si, body, query, user_header)
+        }
         ("POST", ["api", "squads", id, "cells", ti, si, "proof", vi, "restart"]) => {
             restart_cell_proof(daemon, id, ti, si, vi, body)
         }
@@ -10392,6 +10395,127 @@ fn restart_squad_preview(daemon: &Daemon, id: &str) -> Reply {
 /// that; `claim_ready` (`scheduler.rs`) now defers re-claiming a `Pending`
 /// squad until any worker still registered for it exits naturally, so this
 /// stays double-dispatch-safe even without the cancel.
+/// Body of `POST /api/squads/{id}/cells/{ti}/{si}/copy`.
+#[derive(Deserialize, Default)]
+struct CopyCellBody {
+    /// Start the copy from the copied cell's own branch instead of a clean base.
+    #[serde(default)]
+    from_branch: bool,
+}
+
+/// The branch a cell's worktree has checked out (or, before it exists, will
+/// have), for starting a copy from it.
+fn copy_source_branch(cwd: Option<&str>) -> Option<String> {
+    let path = std::path::Path::new(cwd?);
+    match crate::worktrees::pending_worktree_at(path) {
+        Some(pending) => Some(pending.branch),
+        None => crate::reviews::worktree_branch(path).ok(),
+    }
+}
+
+/// Copy cell `(ti, si)` of squad `id` into a new one-task squad (RAL-641),
+/// submitted through [`submit`] and linked to the original in both directions.
+/// Replies with `submit`'s `201 {squad_id, state, warnings}` plus
+/// `copied_from`.
+fn copy_cell(
+    daemon: &Daemon,
+    id: &str,
+    ti: &str,
+    si: &str,
+    body: &str,
+    query: &str,
+    user_header: Option<&str>,
+) -> Reply {
+    let (Ok(task_idx), Ok(cell_idx)) = (ti.parse::<i64>(), si.parse::<i64>()) else {
+        return error(
+            400,
+            "bad_request",
+            "task/cell index must be integers",
+            vec![],
+        );
+    };
+    let req: CopyCellBody = if body.trim().is_empty() {
+        CopyCellBody::default()
+    } else {
+        match serde_json::from_str(body) {
+            Ok(r) => r,
+            Err(e) => return error(400, "bad_request", &format!("bad body: {e}"), vec![]),
+        }
+    };
+    let source = match daemon.lock().cell_copy_source(id, task_idx, cell_idx) {
+        Ok(s) => s,
+        Err(e) => return store_error(&e),
+    };
+    let base = if req.from_branch {
+        if source.project.is_none() {
+            return error(
+                409,
+                "copy_needs_project",
+                "starting from the cell's branch needs a task with a registered project",
+                vec![],
+            );
+        }
+        // git runs here, outside the store lock.
+        match copy_source_branch(source.cell.cwd.as_deref()) {
+            Some(branch) => crate::cell_copy::CopyBase::Branch(branch),
+            None => {
+                return error(
+                    409,
+                    "copy_no_branch",
+                    "the cell has no branch to start from; copy it from a clean base instead",
+                    vec![],
+                );
+            }
+        }
+    } else {
+        crate::cell_copy::CopyBase::Clean
+    };
+    let unique = format!("{:x}", crate::store::now_ms());
+    let toml = crate::cell_copy::build_copy_toml(&source, &base, &unique);
+    let submit_body = serde_json::json!({
+        "toml": toml,
+        "label": crate::cell_copy::copy_label(&source),
+    })
+    .to_string();
+    let reply = submit(daemon, &submit_body, query, user_header);
+    if reply.status != 201 {
+        return reply;
+    }
+    let Some(new_id) = serde_json::from_str::<serde_json::Value>(&reply.body)
+        .ok()
+        .and_then(|v| v["squad_id"].as_str().map(str::to_string))
+    else {
+        return reply;
+    };
+    let store = daemon.lock();
+    if let Err(e) = store.record_cell_copy(id, task_idx, cell_idx, &new_id, req.from_branch) {
+        return store_error(&e);
+    }
+    crate::cartographer::Note::new("server")
+        .squad(id)
+        .task(&source.cell.task_name)
+        .cell(&source.cell.cell_id)
+        .scope("copy")
+        .emit(
+            &store,
+            format!("cell copied to new squad {new_id}"),
+            serde_json::json!({
+                "to_squad_id": new_id,
+                "from_branch": req.from_branch,
+            }),
+        );
+    drop(store);
+    let mut value: serde_json::Value =
+        serde_json::from_str(&reply.body).unwrap_or_else(|_| serde_json::json!({}));
+    value["copied_from"] = serde_json::json!({
+        "squad_id": id,
+        "task_idx": task_idx,
+        "cell_idx": cell_idx,
+        "from_branch": req.from_branch,
+    });
+    json(201, &value)
+}
+
 fn restart_cell(daemon: &Daemon, id: &str, ti: &str, si: &str, body: &str) -> Reply {
     let note_req = RestartNoteBody::parse(body);
     let (Ok(task_idx), Ok(cell_idx)) = (ti.parse::<i64>(), si.parse::<i64>()) else {
@@ -19639,12 +19763,17 @@ fn guardian_link_cell(daemon: &Daemon, id: &str, branch_id: &str, body: &str) ->
 #[derive(Deserialize)]
 struct MoveBranchBody {
     to_guardian_id: String,
+    /// Where the branch lands in the destination's stack (0 is the bottom);
+    /// absent, or at/past the end, appends.
+    #[serde(default)]
+    position: Option<usize>,
 }
 
 /// Move a branch from this guardian to another review (RAL-118: "compose a
 /// review from worktrees belonging to other reviews"). This is a move, not a
-/// copy (RAL-118 Q3): the branch leaves this guardian's stack and is
-/// appended to the destination's. `Store::move_guardian_branch` blocks the
+/// copy (RAL-118 Q3): the branch leaves this guardian's stack and lands in the
+/// destination's at `position`, or on top of it when no position is given
+/// (RAL-641). `Store::move_guardian_branch_at` blocks the
 /// move (409) while either review has a merge/rebase in flight (RAL-118 Q4),
 /// and renumbers/records provenance (RAL-118 Q2) as part of the same call.
 ///
@@ -19674,9 +19803,10 @@ fn guardian_move_branch(daemon: &Daemon, id: &str, branch_id: &str, body: &str) 
         Err(reply) => return reply,
     };
 
-    if let Err(e) = daemon
-        .lock()
-        .move_guardian_branch(id, branch_id, &to_guardian_id)
+    if let Err(e) =
+        daemon
+            .lock()
+            .move_guardian_branch_at(id, branch_id, &to_guardian_id, req.position)
     {
         return store_error(&e);
     }
@@ -21229,6 +21359,7 @@ fn manual_action_label(method: &str, segs: &[&str]) -> Option<&'static str> {
         ("POST", ["api", "squads", _, "edit"]) => "edit squad",
         ("POST", ["api", "squads", _, "tasks", _, "restart"]) => "restart task",
         ("POST", ["api", "squads", _, "cells", _, _, "restart"]) => "restart cell",
+        ("POST", ["api", "squads", _, "cells", _, _, "copy"]) => "copy cell to a new squad",
         ("POST", ["api", "squads", _, "cells", _, _, "proof", _, "restart"])
         | ("POST", ["api", "squads", _, "tasks", _, "proof", _, "restart"]) => "restart proof",
         ("POST", ["api", "clear"]) => "clear squads and reviews",
@@ -29854,6 +29985,59 @@ remediation_attempts = 1
     }
 
     #[test]
+    fn guardian_move_branch_route_places_the_branch_at_the_given_position() {
+        // RAL-641: `position` puts the moved branch inside the destination's
+        // stack instead of on top of it; the rest keep their relative order.
+        let d = daemon();
+        for name in ["r1", "r2"] {
+            let body = serde_json::json!({"name":name,"base_branch":"main","git_root":"/repo"})
+                .to_string();
+            route(&d, "POST", "/api/guardians", &body);
+        }
+        let src = "guardian-000000000001";
+        let dst = "guardian-000000000002";
+        route(
+            &d,
+            "POST",
+            &format!("/api/guardians/{src}/branches"),
+            &serde_json::json!({ "branch": "a" }).to_string(),
+        );
+        for br in ["x", "y"] {
+            let body = serde_json::json!({ "branch": br }).to_string();
+            route(&d, "POST", &format!("/api/guardians/{dst}/branches"), &body);
+        }
+        let src_json: serde_json::Value =
+            serde_json::from_str(&route(&d, "GET", &format!("/api/guardians/{src}"), "").body)
+                .unwrap();
+        let branch_id_a = src_json["branches"][0]["id"].as_str().unwrap().to_string();
+
+        let move_body = serde_json::json!({"to_guardian_id": dst, "position": 0}).to_string();
+        let r = route(
+            &d,
+            "POST",
+            &format!("/api/guardians/{src}/branches/{branch_id_a}/move"),
+            &move_body,
+        );
+        assert_ne!(r.status, 400, "move itself must succeed: {}", r.body);
+
+        let dest_json: serde_json::Value =
+            serde_json::from_str(&route(&d, "GET", &format!("/api/guardians/{dst}"), "").body)
+                .unwrap();
+        let order: Vec<(i64, &str)> = dest_json["branches"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|b| {
+                (
+                    b["position"].as_i64().unwrap(),
+                    b["branch"].as_str().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(order, vec![(0, "a"), (1, "x"), (2, "y")]);
+    }
+
+    #[test]
     fn guardian_move_branch_route_bad_body_is_400() {
         let d = daemon();
         let body =
@@ -30590,6 +30774,60 @@ remediation_attempts = 1
             "",
         );
         assert_eq!(r.status, 400);
+    }
+
+    #[test]
+    fn copy_cell_creates_a_linked_squad_in_both_directions() {
+        let d = daemon();
+        route(&d, "POST", "/api/squads", &submit_body(GOOD));
+        let r = route(
+            &d,
+            "POST",
+            "/api/squads/squad-000000000001/cells/0/0/copy",
+            "",
+        );
+        assert_eq!(r.status, 201, "{}", r.body);
+        let body: serde_json::Value = serde_json::from_str(&r.body).unwrap();
+        let new_id = body["squad_id"].as_str().unwrap().to_string();
+        assert_ne!(new_id, "squad-000000000001");
+        assert_eq!(body["copied_from"]["squad_id"], "squad-000000000001");
+
+        let original = d.lock().get_squad("squad-000000000001").unwrap();
+        assert_eq!(original.copied_to.len(), 1);
+        assert_eq!(original.copied_to[0].to_squad_id, new_id);
+        let copy = d.lock().get_squad(&new_id).unwrap();
+        let from = copy.copied_from.expect("copy links back to the original");
+        assert_eq!(from.from_squad_id, "squad-000000000001");
+        assert!(!from.from_branch);
+    }
+
+    #[test]
+    fn copy_cell_from_branch_without_a_project_is_409() {
+        let d = daemon();
+        route(&d, "POST", "/api/squads", &submit_body(GOOD));
+        let r = route(
+            &d,
+            "POST",
+            "/api/squads/squad-000000000001/cells/0/0/copy",
+            r#"{"from_branch": true}"#,
+        );
+        assert_eq!(r.status, 409);
+        assert!(r.body.contains("copy_needs_project"));
+    }
+
+    #[test]
+    fn copy_cell_missing_is_404_and_bad_index_is_400() {
+        let d = daemon();
+        route(&d, "POST", "/api/squads", &submit_body(GOOD));
+        let missing = route(
+            &d,
+            "POST",
+            "/api/squads/squad-000000000001/cells/9/9/copy",
+            "",
+        );
+        assert_eq!(missing.status, 404);
+        let bad = route(&d, "POST", "/api/squads/squad-1/cells/x/y/copy", "");
+        assert_eq!(bad.status, 400);
     }
 
     #[test]
