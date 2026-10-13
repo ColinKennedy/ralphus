@@ -145,7 +145,7 @@ test("confirming extracts for a new review and opens the placement step for an e
   const end = html.indexOf("async function openMoveBranchPlacement(", start);
   assert.ok(start !== -1 && end > start, "could not find confirmMoveOrExtractBranch");
   const body = html.slice(start, end);
-  assert.match(body, /if \(target === "__new__"\) \{ closeModal\(\); await extractBranch\(gid, branchId\); return; \}/);
+  assert.match(body, /const newId = await extractBranch\(gid, branchId\);\s*if \(newId\) await revealMovedBranch\(newId, branchId\);/);
   assert.match(body, /await openMoveBranchPlacement\(target\);/);
   assert.doesNotMatch(body, /moveBranchTo\(/, "an existing review is never moved into without placing the branch first");
 });
@@ -174,10 +174,22 @@ test("the placement step sends the chosen position with the move", () => {
   const start = html.indexOf("async function confirmMoveBranchPlacement(");
   const end = html.indexOf("async function moveBranchTo(", start);
   const body = html.slice(start, end);
-  assert.match(body, /await moveBranchTo\(gid, branchId, toId, index\);/);
+  assert.match(body, /if \(await moveBranchTo\(gid, branchId, toId, index\)\) await revealMovedBranch\(toId, branchId\);/);
   assert.match(html, /\{ to_guardian_id: toId, position \}/);
 });
 
 test("a review branch row has no inline Ignore and continue button", () => {
   assert.doesNotMatch(html, /branchIgnoreBtn/);
+});
+
+test("after a move or extract the board shows the branch where it landed", () => {
+  const start = html.indexOf("async function revealMovedBranch(");
+  const end = html.indexOf("async function moveBranchTo(", start);
+  assert.ok(start !== -1 && end > start, "could not find revealMovedBranch");
+  const body = html.slice(start, end);
+  assert.match(body, /await pollReviews\(\);/, "an extracted review is new, so the review list is refreshed first");
+  assert.match(body, /await fetchGuardianDetail\(gid\);/, "the destination's stack just changed, so its branches are refetched");
+  assert.match(body, /gotoReviewBranch\(gid, entry\.branch\);/, "switches to the review with the branch selected");
+  assert.match(body, /selectInspectorBranch\(branchId\);/, "the inspector follows the moved branch");
+  assert.match(html, /async function extractBranch\(gid, branchId\)[\s\S]*?return body\.guardian_id \|\| "";/, "extract hands back the new review's id");
 });

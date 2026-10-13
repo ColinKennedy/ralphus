@@ -528,9 +528,9 @@
           <div class="modal-bg" onclick="if(event.target===this)closeModal()"><div class="modal" style="width:640px;max-width:94vw">
             <h2>Ways to fix the block on ${esc(cell.name || cell.id)}</h2>
             <p style="font-size:13px;margin:0 0 10px;color:var(--muted)">This cell has failed ${blocking.failure_count} times and is holding up ${heldUp}. Pick one of these to fix the block${branch ? "" : " (it has no review branch, so there is no branch to extract)"}.</p>
-            <h3 class="section" data-tip="The ways out of the block. Pick one; each says what it will do.">To unblock…</h3>
+            <h3 class="section popup-heading" data-tip="The ways out of the block. Pick one; each says what it will do.">To unblock…</h3>
             <div data-tip="The ways out. Each one says what it will do.">${main}</div>
-            <h3 class="section" data-tip="Optional retries in a new squad, alongside either way out above.\nThey do not unblock this cell by themselves.">Optionally…</h3>
+            <h3 class="section popup-heading" data-tip="Optional retries in a new squad, alongside either way out above.\nThey do not unblock this cell by themselves.">Optionally…</h3>
             <div data-tip="Optional retries in a new squad. They do not unblock this cell by themselves.">${addOns}</div>
             <div class="btn-row">
               <button class="btn" onclick="closeModal()" data-tip="Close this popup without changing anything.">Cancel</button>

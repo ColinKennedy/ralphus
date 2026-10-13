@@ -18,7 +18,11 @@
 
 import test from "node:test";
 import assert from "node:assert/strict";
-import { boardScript } from "./board-source.mjs";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
+import { boardDir, boardScript } from "./board-source.mjs";
+
+const css = readFileSync(join(boardDir, "..", "board.css"), "utf8");
 
 const BEGIN = "// RALPHUS-UNBLOCK-OPTIONS:BEGIN";
 const END = "// RALPHUS-UNBLOCK-OPTIONS:END";
@@ -126,7 +130,10 @@ test("picking an option does not ask a second time", () => {
   assert.match(html, /async function ignoreCell\(squadId, ti, si, confirmed\)/);
   assert.match(html, /ignoreCell\(squadId, ti, si, true\)/);
   // extractBranch never prompts; every caller (this popup, Move or extract) is the confirmation.
-  assert.match(html, /async function extractBranch\(gid, branchId\) \{\s*await guardianAction/);
+  const start = html.indexOf("async function extractBranch(gid, branchId) {");
+  const end = html.indexOf("\n      }", start);
+  assert.ok(start !== -1 && end > start, "could not find extractBranch");
+  assert.doesNotMatch(html.slice(start, end), /confirm\(/);
   assert.match(html, /extractBranch\(guardianId, entry\.id\)/);
 });
 
@@ -134,6 +141,9 @@ test("the popup heads the ways out with To unblock… and the copies with Option
   const start = html.indexOf("function openUnblockCell(");
   const end = html.indexOf("async function unblockPick(", start);
   const body = html.slice(start, end);
+  assert.match(body, /<h3 class="section popup-heading"[^>]*>To unblock…<\/h3>/, "a large heading, not the small section caption");
+  assert.match(body, /<h3 class="section popup-heading"[^>]*>Optionally…<\/h3>/, "a large heading, not the small section caption");
+  assert.match(css, /\.modal h3\.section\.popup-heading \{[^}]*font-size: 15px/);
   const unblockAt = body.indexOf(">To unblock…</h3>");
   const mainAt = body.indexOf("${main}");
   const optionallyAt = body.indexOf(">Optionally…</h3>");

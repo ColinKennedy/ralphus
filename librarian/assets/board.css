@@ -428,6 +428,7 @@
       .materializing-graph { color: var(--materializing); cursor: help; }
       .materializing-phase { color: var(--muted); font-size: 12px; margin-top: 6px; }
       .dhead { display: flex; align-items: center; gap: 8px; margin-bottom: 4px; }
+      .modal h3.section.popup-heading { font-size: 15px; letter-spacing: .5px; color: var(--text); margin: 18px 0 6px; }
       .dhead .k { font-size: 11px; text-transform: uppercase; letter-spacing: 1px; color: var(--muted); }
       h3.section { font-size: 11px; text-transform: uppercase; letter-spacing: 1px; color: var(--muted); margin: 18px 0 8px; }
       .kv-row { display: flex; gap: 8px; margin: 4px 0; font-size: 13px; }

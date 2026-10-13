@@ -3398,7 +3398,12 @@ Press Accept on the note to create it.">Squad pending</span>`;
         const { gid, branchId, query, selected } = moveBranchPicker;
         const target = (moveBranchPickerItems(guardians, gid, query)[selected] || { id: "" }).id;
         if (!target || !gid || !branchId) { closeModal(); return; }
-        if (target === "__new__") { closeModal(); await extractBranch(gid, branchId); return; }
+        if (target === "__new__") {
+          closeModal();
+          const newId = await extractBranch(gid, branchId);
+          if (newId) await revealMovedBranch(newId, branchId);
+          return;
+        }
         await openMoveBranchPlacement(target);
       }
       /**
@@ -3500,7 +3505,29 @@ Press Accept on the note to create it.">Squad pending</span>`;
         const { toId, index } = moveBranchPlacement;
         closeModal();
         if (!gid || !branchId || !toId) return;
-        await moveBranchTo(gid, branchId, toId, index);
+        if (await moveBranchTo(gid, branchId, toId, index)) await revealMovedBranch(toId, branchId);
+      }
+      /**
+       * Shows where a moved or extracted branch ended up: switches to review
+       * `gid`, selects the branch in its stack and binds the inspector to it.
+       * The review list is refreshed first (an extracted review is brand new)
+       * and so is the review's own detail (its stack just changed).
+       * @param {string} gid - The review the branch is now in.
+       * @param {string} branchId - The branch's stable id, unchanged by the move.
+       * @returns {Promise<void>}
+       */
+      async function revealMovedBranch(gid, branchId) {
+        // A review the board already knows can be shown straight away; the
+        // branch is selected once the refreshed stack arrives.
+        if (findGuardian(gid)) gotoReview(gid);
+        await pollReviews();
+        await fetchGuardianDetail(gid);
+        const g = guardians.find((x) => x.id === gid);
+        const entry = g && g.branches ? g.branches.find((b) => b.id === branchId) : undefined;
+        if (!entry) { gotoReview(gid); return; }
+        gotoReviewBranch(gid, entry.branch);
+        selectInspectorBranch(branchId);
+        syncHash(true);
       }
       /**
        * Moves a branch out of one review's stack and into another. Callers
@@ -3509,11 +3536,12 @@ Press Accept on the note to create it.">Squad pending</span>`;
        * @param {string} branchId
        * @param {string} toId
        * @param {number} position - Where the branch lands in `toId`'s stack; 0 is the bottom.
-       * @returns {Promise<void>}
+       * @returns {Promise<boolean>} Whether the daemon accepted the move.
        */
       async function moveBranchTo(gid, branchId, toId, position) {
-        await guardianAction(`/api/guardians/${gid}/branches/${branchId}/move`, { to_guardian_id: toId, position });
+        const resp = await guardianAction(`/api/guardians/${gid}/branches/${branchId}/move`, { to_guardian_id: toId, position });
         tick();
+        return !!resp && resp.ok;
       }
 
       /**
@@ -3521,11 +3549,15 @@ Press Accept on the note to create it.">Squad pending</span>`;
        * Callers confirm first.
        * @param {string} gid
        * @param {string} branchId
-       * @returns {Promise<void>}
+       * @returns {Promise<string>} The new review's id, or "" when the daemon refused.
        */
       async function extractBranch(gid, branchId) {
-        await guardianAction(`/api/guardians/${gid}/branches/${branchId}/extract`);
+        const resp = await guardianAction(`/api/guardians/${gid}/branches/${branchId}/extract`);
         tick();
+        if (!resp || !resp.ok) return "";
+        /** @type {{guardian_id?: string}} */
+        const body = await resp.clone().json().catch(() => ({}));
+        return body.guardian_id || "";
       }
 
       // ---------- manual review commands (RAL-27) ----------
