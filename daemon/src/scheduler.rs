@@ -719,7 +719,9 @@ pub fn run_loop(
             last_forge_reorder_poll = std::time::Instant::now();
         }
         if last_triage_schedule_check.elapsed() >= TRIAGE_SCHEDULE_INTERVAL {
-            crate::triage::run_schedule_tick(&store);
+            for gid in crate::triage::run_schedule_tick(&store) {
+                start_review_if_bottom_ready(&store, &gid, &sem, &cancellations);
+            }
             last_triage_schedule_check = std::time::Instant::now();
         }
         if last_cpu_stall_sweep.elapsed() >= CPU_STALL_SWEEP_INTERVAL {
@@ -5875,6 +5877,26 @@ pub(crate) fn try_start_ready_reviews_for_task(
     // looks up -- not a throwaway registry `restart_guardian_merge` could
     // never see into.
     start_reviews(store, ready, sem, cancellations);
+}
+
+/// Start `gid`'s staged merge when it is `collecting` and the bottom of its
+/// stack is `ready`. [`try_start_ready_reviews_for_task`] does this when a task
+/// finishes; this covers a review created after its cells already finished
+/// (a Triage pool drained by hand or by a schedule), where no later task
+/// completion will ever arrive.
+pub(crate) fn start_review_if_bottom_ready(
+    store: &crate::store_lock::StoreHandle,
+    gid: &str,
+    sem: &Arc<Semaphore>,
+    cancellations: &Cancellations,
+) {
+    let ready = store
+        .lock()
+        .collecting_guardian_bottom_ready(gid)
+        .unwrap_or(false);
+    if ready {
+        start_reviews(store, vec![gid.to_string()], sem, cancellations);
+    }
 }
 
 /// Mark every task and the squad failed — used when the squad cannot even be

@@ -61,15 +61,20 @@ getrandom = { workspace = true }
 # `disk` feeds the low-free-space health probe (RAL-596).
 sysinfo = { version = "0.36.1", default-features = false, features = ["system", "disk"] }
 sha2.workspace = true
+git2 = { workspace = true }
 
 [dev-dependencies]
 ureq = { workspace = true }
-git2 = { workspace = true }
 # `Connection::trace`, used to count the statements a store call issues.
 rusqlite = { workspace = true, features = ["trace"] }
 
 [target."cfg(windows)".dependencies]
 win32job = "2.0.3"
+# `src/git_fetch_inproc.rs`: libgit2's HTTPS transport, so a forge fetch runs
+# in-process instead of as a `git` + transport process tree. On Windows it is
+# the system WinHTTP library, so this adds no OpenSSL build; elsewhere the
+# fetch of a forge remote stays on real git.
+git2 = { workspace = true, features = ["https"] }
 
 [target."cfg(unix)".dependencies]
 # RAL-239: killing a cancelled review's check-gate subprocess (`cargo test`,

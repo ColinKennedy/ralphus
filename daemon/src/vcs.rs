@@ -203,6 +203,11 @@ impl GitVcs {
         if let Some(output) = crate::vcs_refs::cached_ancestry(root, args) {
             return Ok(output);
         }
+        // The daemon's fetch shape, from a local or forge remote (see
+        // `crate::git_fetch_inproc`).
+        if let Some(output) = crate::git_fetch_inproc::try_fetch(root, args) {
+            return Ok(output);
+        }
         let config_stamp = crate::vcs_refs::config_read_stamp(root, args);
         // One OS process instead of two or three for read-only subcommands
         // on Windows; see `ralphus_core::git_spawn`.

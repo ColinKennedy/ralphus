@@ -5150,6 +5150,9 @@ fn resolve_remote_for_inner(
             },
         },
     };
+    if let Some(token) = &token {
+        crate::git_fetch_inproc::remember_token(kind, &host, &path, token);
+    }
 
     let repo_path = match kind {
         ForgeKind::GitHub => path,

@@ -4624,7 +4624,15 @@ fn force_drain_triage_pool(daemon: &Daemon, body: &str) -> Reply {
             )
         },
     ) {
-        Ok(Some(guardian_id)) => json(200, &DrainTriagePoolResponse { guardian_id }),
+        Ok(Some(guardian_id)) => {
+            crate::scheduler::start_review_if_bottom_ready(
+                &store_handle,
+                &guardian_id,
+                &daemon.sem,
+                &daemon.cancellations,
+            );
+            json(200, &DrainTriagePoolResponse { guardian_id })
+        }
         Ok(None) => error(
             409,
             "empty_pool",

@@ -6812,25 +6812,29 @@ fn refresh_pr_forge_cache_for_guardian(store: &crate::store_lock::StoreHandle, i
             prs.iter().map(|p| sync_fetch_lock(&root, &p.id)).collect();
         let guards: Vec<Option<std::sync::MutexGuard<'_, ()>>> =
             locks.iter().map(|l| l.try_lock().ok()).collect();
-        let refspecs: Vec<String> = prs
-            .iter()
-            .zip(guards.iter())
-            .filter(|(_, g)| g.is_some())
-            .map(|(pr, _)| format!("+{}:{}", pr.branch_alias, sync_fetch_ref(&pr.id)))
-            .collect();
         // Whether the batched fetch actually succeeded decides whether what
         // follows is a fresh observation or a re-read of whatever the last
         // successful fetch left behind. Discarding this made a network failure
         // indistinguishable from success: `rev-parse` still resolves the
         // *previous* cycle's sync ref, so stale drift was written back stamped
         // as a current, successful reading.
-        let fetch_error: Option<String> = if refspecs.is_empty() {
-            None
-        } else {
-            let mut args: Vec<&str> = vec!["fetch", "--no-write-fetch-head", &remote_name];
-            args.extend(refspecs.iter().map(String::as_str));
-            git(&root, &args).err()
-        };
+        let held: Vec<&str> = prs
+            .iter()
+            .zip(guards.iter())
+            .filter(|(_, g)| g.is_some())
+            .map(|(pr, _)| pr.branch_alias.as_str())
+            .collect();
+        let (gone, fetch_error) =
+            fetch_pr_branches_skipping_gone(&root, &remote_name, &held, |branches| {
+                let refspecs: Vec<String> = prs
+                    .iter()
+                    .filter(|pr| branches.contains(&pr.branch_alias.as_str()))
+                    .map(|pr| format!("+{}:{}", pr.branch_alias, sync_fetch_ref(&pr.id)))
+                    .collect();
+                let mut args: Vec<&str> = vec!["fetch", "--no-write-fetch-head", &remote_name];
+                args.extend(refspecs.iter().map(String::as_str));
+                git(&root, &args).map(|_| ())
+            });
         prs.iter()
             .zip(guards.iter())
             .map(|(pr, guard)| {
@@ -6839,6 +6843,12 @@ fn refresh_pr_forge_cache_for_guardian(store: &crate::store_lock::StoreHandle, i
                 // the first must not move the stored timestamp at all, the
                 // second moves it but records the half as unknown.
                 guard.is_some().then(|| {
+                    if gone.contains(pr.branch_alias.as_str()) {
+                        return Err(format!(
+                            "branch {} no longer exists on remote {remote_name}",
+                            pr.branch_alias
+                        ));
+                    }
                     if let Some(e) = &fetch_error {
                         return Err(e.clone());
                     }
@@ -10276,6 +10286,250 @@ fn sync_fetch_lock(root: &Path, pr_id: &str) -> Arc<Mutex<()>> {
             .entry((root.to_path_buf(), pr_id.to_string()))
             .or_default(),
     )
+}
+
+/// How long a PR branch the remote reported missing stays out of the PR
+/// poller's batched fetch before it is asked for again.
+///
+/// git aborts a multi-ref fetch at the first ref the remote lacks, so without
+/// this a deleted PR branch fails the whole batched fetch on every poll, for
+/// every PR in the review, re-spawning git and its transport each time for an
+/// answer that does not change until someone pushes the branch back.
+const GONE_PR_BRANCH_RECHECK: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+
+/// `(git root, remote, branch) -> when the remote last reported it missing`.
+type GonePrBranches = HashMap<(PathBuf, String, String), std::time::Instant>;
+static GONE_PR_BRANCHES: Mutex<Option<GonePrBranches>> = Mutex::new(None);
+
+/// The branch named by git's `couldn't find remote ref` fetch error, if `err`
+/// is one. `err` is a [`git`] error, which puts git's stderr after the command
+/// on the same line (`git fetch ... failed: fatal: couldn't find remote ref
+/// <branch>`), so the message is found anywhere in it.
+fn missing_remote_ref(err: &str) -> Option<&str> {
+    const MESSAGE: &str = "fatal: couldn't find remote ref ";
+    let rest = &err[err.find(MESSAGE)? + MESSAGE.len()..];
+    rest.split_whitespace().next()
+}
+
+/// Fetches `branches` from `remote` through `fetch`, leaving out any branch
+/// the remote reported missing within [`GONE_PR_BRANCH_RECHECK`].
+///
+/// When the fetch fails because the remote lacks one of the branches, that
+/// branch is recorded and the fetch retried without it, so one deleted branch
+/// no longer leaves every other PR in the review unknown. Returns the branches
+/// known to be gone (skipped, or just found missing) and any other fetch
+/// error.
+fn fetch_pr_branches_skipping_gone<'a>(
+    root: &Path,
+    remote: &str,
+    branches: &[&'a str],
+    mut fetch: impl FnMut(&[&'a str]) -> std::result::Result<(), String>,
+) -> (HashSet<&'a str>, Option<String>) {
+    let key = |branch: &str| (root.to_path_buf(), remote.to_string(), branch.to_string());
+    let mut gone: HashSet<&'a str> = {
+        let mut memo = GONE_PR_BRANCHES
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let memo = memo.get_or_insert_with(HashMap::new);
+        memo.retain(|_, at| at.elapsed() < GONE_PR_BRANCH_RECHECK);
+        branches
+            .iter()
+            .copied()
+            .filter(|b| memo.contains_key(&key(b)))
+            .collect()
+    };
+    loop {
+        let wanted: Vec<&'a str> = branches
+            .iter()
+            .copied()
+            .filter(|b| !gone.contains(b))
+            .collect();
+        if wanted.is_empty() {
+            return (gone, None);
+        }
+        let Err(error) = fetch(&wanted) else {
+            return (gone, None);
+        };
+        let Some(missing) =
+            missing_remote_ref(&error).and_then(|name| wanted.iter().copied().find(|b| *b == name))
+        else {
+            return (gone, Some(error));
+        };
+        // ralphus[ignore-rlog-pair]: the caller records the per-PR outcome in the forge cache and poller health
+        crate::rlog!(
+            INFO,
+            "ralphus [pr] branch {missing} is gone from remote {remote}; leaving it out of PR fetches for {}s",
+            GONE_PR_BRANCH_RECHECK.as_secs()
+        );
+        GONE_PR_BRANCHES
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get_or_insert_with(HashMap::new)
+            .insert(key(missing), std::time::Instant::now());
+        gone.insert(missing);
+    }
+}
+
+#[cfg(test)]
+mod gone_pr_branch_tests {
+    use super::*;
+
+    const MISSING_B: &str = "fatal: couldn't find remote ref b\n";
+
+    #[test]
+    fn parses_the_missing_ref_from_git_stderr() {
+        assert_eq!(missing_remote_ref(MISSING_B), Some("b"));
+        assert_eq!(missing_remote_ref("fatal: unable to access remote"), None);
+    }
+
+    #[test]
+    fn parses_the_missing_ref_from_a_git_error() {
+        // The shape `git()` returns: command, then git's stderr, on one line.
+        assert_eq!(
+            missing_remote_ref(
+                "git fetch --no-write-fetch-head origin +a:refs/ralphus/sync/pr-1 \
+                 +gone-branch:refs/ralphus/sync/pr-2 failed: fatal: couldn't find remote ref \
+                 gone-branch"
+            ),
+            Some("gone-branch")
+        );
+    }
+
+    /// A batched fetch through the real `git()` -- answered in-process for
+    /// this local remote -- leaves out the deleted branch and still fetches
+    /// the others.
+    #[test]
+    fn a_real_batched_fetch_skips_a_deleted_branch_and_fetches_the_rest() {
+        use std::process::Command;
+        let run = |dir: &Path, args: &[&str]| {
+            let out = Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@example.invalid")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@example.invalid")
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        let base = std::env::temp_dir().join(format!(
+            "ralphus-gone-pr-branch-real-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let upstream = base.join("upstream");
+        std::fs::create_dir_all(&upstream).unwrap();
+        run(&upstream, &["init", "-q", "-b", "main"]);
+        std::fs::write(upstream.join("f"), "1").unwrap();
+        run(&upstream, &["add", "f"]);
+        run(&upstream, &["commit", "-q", "-m", "one"]);
+        for branch in ["a", "b", "c"] {
+            run(&upstream, &["branch", branch]);
+        }
+        let clone = base.join("clone");
+        run(
+            &base,
+            &[
+                "clone",
+                "-q",
+                &upstream.to_string_lossy().replace('\\', "/"),
+                &clone.to_string_lossy().replace('\\', "/"),
+            ],
+        );
+        run(&upstream, &["branch", "-D", "b"]);
+
+        let (gone, error) =
+            fetch_pr_branches_skipping_gone(&clone, "origin", &["a", "b", "c"], |branches| {
+                let refspecs: Vec<String> = branches
+                    .iter()
+                    .map(|b| format!("+{b}:refs/ralphus/sync/{b}"))
+                    .collect();
+                let mut args = vec!["fetch", "--no-write-fetch-head", "origin"];
+                args.extend(refspecs.iter().map(String::as_str));
+                git(&clone, &args).map(|_| ())
+            });
+        assert_eq!(gone, HashSet::from(["b"]));
+        assert_eq!(error, None);
+        for fetched in ["a", "c"] {
+            assert!(
+                git(
+                    &clone,
+                    &[
+                        "rev-parse",
+                        "--verify",
+                        &format!("refs/ralphus/sync/{fetched}")
+                    ]
+                )
+                .is_ok(),
+                "{fetched} was fetched"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn retries_without_the_missing_branch_then_skips_it_next_poll() {
+        let root = Path::new("/gone-pr-branch-tests/retry");
+        let mut calls: Vec<Vec<String>> = Vec::new();
+        let (gone, error) =
+            fetch_pr_branches_skipping_gone(root, "origin", &["a", "b", "c"], |w| {
+                calls.push(w.iter().map(|s| s.to_string()).collect());
+                if w.contains(&"b") {
+                    Err(MISSING_B.to_string())
+                } else {
+                    Ok(())
+                }
+            });
+        assert_eq!(gone, HashSet::from(["b"]));
+        assert_eq!(error, None);
+        assert_eq!(calls, vec![vec!["a", "b", "c"], vec!["a", "c"]]);
+
+        let mut next: Vec<Vec<String>> = Vec::new();
+        let (gone, _) = fetch_pr_branches_skipping_gone(root, "origin", &["a", "b", "c"], |w| {
+            next.push(w.iter().map(|s| s.to_string()).collect());
+            Ok(())
+        });
+        assert_eq!(gone, HashSet::from(["b"]));
+        assert_eq!(
+            next,
+            vec![vec!["a", "c"]],
+            "a gone branch is not fetched again"
+        );
+    }
+
+    #[test]
+    fn a_gone_branch_is_scoped_to_its_root_and_remote() {
+        let root = Path::new("/gone-pr-branch-tests/scope");
+        let _ =
+            fetch_pr_branches_skipping_gone(root, "origin", &["b"], |_| Err(MISSING_B.to_string()));
+        let mut fetched = Vec::new();
+        let _ = fetch_pr_branches_skipping_gone(root, "fork", &["b"], |w| {
+            fetched.extend(w.iter().map(|s| s.to_string()));
+            Ok(())
+        });
+        assert_eq!(fetched, vec!["b"]);
+    }
+
+    #[test]
+    fn other_fetch_errors_are_returned_without_marking_anything_gone() {
+        let root = Path::new("/gone-pr-branch-tests/other");
+        let (gone, error) = fetch_pr_branches_skipping_gone(root, "origin", &["a"], |_| {
+            Err("fatal: Could not read from remote repository.".to_string())
+        });
+        assert!(gone.is_empty());
+        assert_eq!(
+            error.as_deref(),
+            Some("fatal: Could not read from remote repository.")
+        );
+    }
 }
 
 /// The local ref [`compute_sync_status`] fetches a PR's remote branch tip
