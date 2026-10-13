@@ -8217,13 +8217,16 @@ fn run_feedback_pass(
     let wt = root.at(PathBuf::from(&wt_str));
     set_status(GuardianStatus::Merging, None);
 
-    // The agent edits the review worktree; we commit onto its review branch.
+    // The agent edits, and may commit, in the review worktree; anything it
+    // leaves uncommitted goes through `run_commit_step`, and only Ralphus
+    // pushes -- `push_feedback_branch` resolves the PR's real remote/alias and
+    // reconciles a reviewer's concurrent pushes, which an agent's own `git
+    // push` would bypass.
     let prompt = format!(
         "You are revising branch '{feature}' in response to reviewer feedback. \
-         Edit the files in this worktree to satisfy the feedback, then stop. \
-         Feedback: {feedback}. You may run read-only git commands (e.g. `git \
-         status`, `git diff`, `git log`) to inspect the worktree or the change \
-         so far, but do not commit or push -- a separate step handles that."
+         Edit the files in this worktree to satisfy the feedback. \
+         Feedback: {feedback}. You may commit your change, but do not push -- \
+         Ralphus pushes it to the pull request for you."
     );
     let feedback_run_cell_id = format!("feedback-{branch_id}-{}", crate::store::now_ms());
     {

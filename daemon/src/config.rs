@@ -416,7 +416,7 @@ pub const PERMISSIVE_AUTO_FIX_TESTING_PARAGRAPH: &str = "Prefer fixing fast chec
 /// RAL-619: replaces [`PERMISSIVE_AUTO_FIX_TESTING_PARAGRAPH`] when
 /// [`ReviewConfig::discourage_tests_during_auto_pull_request_fixes`] is
 /// effective. Language-neutral on purpose.
-pub const STRICT_AUTO_FIX_TESTING_PARAGRAPH: &str = "Run only cheap checks on the current machine: automatic formatters, linters, and static-analysis or type-checking tools. Do not run test suites locally, however small they seem -- the tests run on the pull request's own CI, and any failure is sent back to you in a later round. Cheap checks only confirm your change did not break anything else; they are not proof that the CI failure is fixed. Once you have made the fix and the cheap checks are clean, commit and push.";
+pub const STRICT_AUTO_FIX_TESTING_PARAGRAPH: &str = "Run only cheap checks on the current machine: automatic formatters, linters, and static-analysis or type-checking tools. Do not run test suites locally, however small they seem -- the tests run on the pull request's own CI, and any failure is sent back to you in a later round. Cheap checks only confirm your change did not break anything else; they are not proof that the CI failure is fixed. Once you have made the fix and the cheap checks are clean, commit it; Ralphus pushes it to the pull request.";
 
 /// RAL-395: the built-in fallback prompt template for auto-fixing a failing
 /// PR/MR, used when neither a per-review override nor a project-level
@@ -435,7 +435,7 @@ Prefer fixing fast checks first: run and fix any linters/formatters on the curre
 /// earlier test guidance. Pure addition to the PR-fix prompt only.
 pub const DISCOURAGE_TESTS_DURING_AUTO_PR_FIX_GUIDANCE: &str = "
 
-Test guidance (overrides any earlier instruction about running tests): run only cheap checks -- automatic formatters, linters, and static-analysis or type-checking tools. Do not run test suites locally; the tests run on the pull request's own CI, and any failure is sent back to you in a later round. Cheap checks only confirm your change did not break anything else; they are not proof that the CI failure is fixed. Once you have made the fix and the cheap checks are clean, commit and push.";
+Test guidance (overrides any earlier instruction about running tests): run only cheap checks -- automatic formatters, linters, and static-analysis or type-checking tools. Do not run test suites locally; the tests run on the pull request's own CI, and any failure is sent back to you in a later round. Cheap checks only confirm your change did not break anything else; they are not proof that the CI failure is fixed. Once you have made the fix and the cheap checks are clean, commit it; Ralphus pushes it to the pull request.";
 
 /// Builds the auto-fix prompt template for a PR/MR. With `discourage_tests`
 /// off the result is `custom` (or the default) unchanged. With it on, the

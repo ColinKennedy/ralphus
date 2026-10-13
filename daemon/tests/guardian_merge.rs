@@ -64,11 +64,9 @@ fn temp_repo() -> PathBuf {
 /// instruction. Every `Runner` double used with `run_feedback` or
 /// `dispatch_pr_auto_fix` must call this first and return its result when
 /// `Some`, falling through to its own resolver-editing behavior otherwise --
-/// the fixer prompt itself (RAL-456) tells the resolver it may inspect the
-/// worktree with read-only git commands but must not commit or push, so
-/// without this the worktree would never actually get committed and every
-/// such test would see `committed: false` regardless of what the resolver
-/// wrote.
+/// these doubles' resolvers only edit files and never commit, so without
+/// this the worktree would never actually get committed and every such test
+/// would see `committed: false` regardless of what the resolver wrote.
 fn maybe_run_commit_step(spec: &RunnerSpec) -> Option<RunnerResult> {
     if !spec.cell_id.ends_with("-commit") {
         return None;
