@@ -394,6 +394,9 @@ the daemon's hourly Free-tier background sweep
 | `review checks run <selector> [--index N...] [--all] [--input NAME=VALUE...]` | Print command(s) + cwd for one/some/all checks (not run by the daemon — see below) |
 | `review action list <selector>` | List user-declared `[[review.action]]` hints |
 | `review action run <selector> --index N [--input NAME=VALUE...]` | Print the command + cwd for a `command`-kind hint |
+| `review live list <selector>` | List the review's live actions (agent-run live tests from its cells' `RALPHUS_LIVE_ACTION` handoffs) and their runs |
+| `review live run <selector> [--index N]` | Queue a run of one live action or all of them; generates them from the finished cells' handoffs first if the review has none |
+| `review live cancel <selector> <run_id>` | Cancel a queued or running live run |
 | `review pr submit <selector> (--position N \| --combined) [--alias] [--title] [--description] [--allow-unlinked-fork]` | Submit a PR/MR (RAL-117); title/description default to an LLM suggestion. `--allow-unlinked-fork` (RAL-338) downgrades a definite "no forge relationship" fork pre-flight result from a hard error to a logged warning; ignored for a project with no registered fork |
 | `review pr list <selector>` | List PRs submitted for a review |
 | `review pr show <pr_id>` | Show one PR row |

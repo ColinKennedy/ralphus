@@ -561,6 +561,15 @@ Tip: validate before submitting -- `ralphus validate file.toml`
                 then the project's .ralphus.toml [review] auto_run, then
                 false. A submission that defines checks is authoritative:
                 project hints are not layered on top of them.
+ live_actions
+        bool    Run this review's live actions: every prompt cell is
+                asked how it would test its work live
+                (RALPHUS_LIVE_ACTION:), and once every cell has finished
+                and the review's build is prepared, those tests are
+                merged and an agent runs each against the review's tip --
+                once, automatically, then only by hand. Fixes it commits
+                are carried onto the top branch. Unset inherits the
+                project's .ralphus.toml [review] live_actions, then false.
  rebuild_on
         string[] Which events tear down and rebuild this review's prepared
                 build (its preparation, then its actions): any of "rebase"
@@ -614,8 +623,10 @@ Tip: validate before submitting -- `ralphus validate file.toml`
  Key     Type    Notes
  label   string  REQUIRED. Text shown on the UI button.
  command string  ONE-OF Verbatim shell command run in a terminal.
- prompt  string  ONE-OF Hint text forwarded to the resolver LLM
-                 to expand into a runnable command during preparation.
+ prompt  string  ONE-OF An agent prompt: the review's agent runs it
+                 live in the prepared checkout (Live View follows it)
+                 and may commit fixes, which ralphus carries onto the
+                 top branch. Say "read-only" in it to forbid edits.
  description string     What the reviewer should inspect.
 
 [[review.action.prepare]] belongs to the immediately preceding
@@ -747,7 +758,7 @@ may embed <<ralphus:new-worktree/BRANCH?upstream=UPSTREAM
  dual_root_pr, auto_build, auto_submit_pr_stack, auto_fix_pr_errors,
  auto_fix_prompt_template, discourage_tests_during_auto_pull_request_fixes,
  auto_cancel_outdated_pr_pipelines, post_appraisals, cache_manual_checks,
- skip_manual_checks, auto_run, rebuild_on, and skip_auto_clean) can also be set from
+ skip_manual_checks, auto_run, live_actions, rebuild_on, and skip_auto_clean) can also be set from
  the database, via `ralphus project review-settings set <name>
  [flags]` or the board's Projects tab (the ... menu -> Review
  Settings), instead of hand-editing .ralphus.toml. A database
@@ -1335,7 +1346,7 @@ Rules:
 - The nearest .ralphus.toml wins for a given label; a parent directory's
   file only fills labels the nearer files did not mention.
 - Copy a suggestion into a real [[review.action]] (command, input, prepare,
-  description, success). Do not set auto_run = true on a check whose
+  description). Do not set auto_run = true on a check whose
   suggestion says auto_run = false.
 - Parameterize anything that could collide or vary (ports, paths, branch
   names) as an input with a default, never a hardcoded value.

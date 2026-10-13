@@ -144,6 +144,9 @@ Eleven Rust workspace members; `cli-py/` is a Python project kept only for `docs
 - `daemon/src/plan.rs` — dependency graph (Kahn topological sort).
 - `daemon/src/guardian.rs` — Guardian store + state machine (Collecting→Merged→Deployed).
 - `daemon/src/guardian_merge.rs` — stacked linear rebase in a worktree, agent conflict resolution.
+- `daemon/src/live_actions.rs` — live actions: the `RALPHUS_LIVE_ACTION:` handoff question every prompt cell gets and its parser, per-cell handoff storage, collecting a review's handoffs (latest-finished cell per task) and deduplicating them into its fixed live actions, and executing one live run (hold the checkout, agent in tmux, commit leftovers, pin commits on a live ref).
+- `daemon/src/live_runs.rs` — the live-run queue (one worker per review via `StoreMemory`), the one automatic run and its write-once claim, manual runs and cancel, restart interruption, posting reports into the review, carrying commits onto the top branch (`guardian_merge::run_live_action_integration`, a cherry-pick through the feedback pass), and live-ref retirement.
+- `daemon/src/checkout_hold.rs` — RAL-642: durable, expiring "this checkout is in use" records; `claim_post_merge_checkout` never resets a held prepared checkout.
 - `daemon/src/review_branch.rs` — RAL-378: readable review-branch naming (`<task branch>-review`, length cap, ref-validity repair, `-2`/`-3` collision walk). Pure; the git/SQL "is this taken" lookups live in `guardian_merge.rs`/`guardian.rs`.
 - `daemon/src/reviews.rs` — review derivation (per-guardian, per-branch merge status).
 - `daemon/src/project_forks.rs` — per-project, per-user fork registration; fork-aware PR/MR routing and reconcile-first promotion live in `pr.rs`/`forge.rs` (RAL-338, see [`docs/fork-workflows.md`](docs/fork-workflows.md)).
