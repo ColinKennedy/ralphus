@@ -13500,10 +13500,11 @@ fn guardian_branch_forge_status(daemon: &Daemon, id: &str, branch_id: &str) -> R
         .map_or("", |p| p.repo.as_str());
     let root = Path::new(&guardian.git_root);
     let forge_cfg = crate::config::resolve_forge(root);
+    let upstream = UpstreamRef::new(&guardian.upstream_remote, &guardian.upstream_branch);
     let client = crate::pr::forge_client_for_pr(
         &daemon.store_handle(),
         root,
-        &guardian.base_branch,
+        &upstream,
         &forge_cfg,
         repo,
         guardian.owner.as_deref(),

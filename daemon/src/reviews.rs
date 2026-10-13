@@ -4100,7 +4100,15 @@ prompt=\"c\"
                 .set_cell_state(&squad_id, 0, idx, crate::store::NodeState::Done)
                 .unwrap();
             guard
-                .record_triage_pool_cell("proj", "bug", &squad_id, 0, idx, "b-shared", "main")
+                .record_triage_pool_cell(
+                    "proj",
+                    "bug",
+                    &squad_id,
+                    0,
+                    idx,
+                    "b-shared",
+                    &ralphus_core::schema::UpstreamRef::new("origin", "main"),
+                )
                 .unwrap();
         }
         let gid = create_review_from_triage_pool(&store, "proj", "bug", |_| None)
@@ -4137,7 +4145,15 @@ prompt=\"a\"
                 .set_task_state(&squad_id, 0, crate::store::NodeState::Done)
                 .unwrap();
             guard
-                .record_triage_pool_cell("proj", "bug", &squad_id, 0, 0, "b-work", "main")
+                .record_triage_pool_cell(
+                    "proj",
+                    "bug",
+                    &squad_id,
+                    0,
+                    0,
+                    "b-work",
+                    &ralphus_core::schema::UpstreamRef::new("origin", "main"),
+                )
                 .unwrap();
         }
         let gid = create_review_from_triage_pool(&store, "proj", "bug", |_| None)
