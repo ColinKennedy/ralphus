@@ -142,6 +142,8 @@ pub enum ReviewCommand {
         /// skipped. Defaults to `false` (generation runs) when unset.
         skip_manual_checks: Option<bool>,
         auto_run: Option<bool>,
+        /// This review's own live-actions opt-in. Defaults to off when unset.
+        live_actions: Option<bool>,
         /// This review's own list of events that tear down and rebuild its
         /// prepared build. Outer `None` leaves it alone, `Some(None)` clears
         /// it back to inherit, `Some(Some(list))` sets it (an empty list never
@@ -484,6 +486,7 @@ pub fn parse(args: &[String]) -> ReviewCommand {
             let cache_manual_checks = take_tri_bool(&mut scanner, "--cache-manual-checks");
             let skip_manual_checks = take_tri_bool(&mut scanner, "--skip-manual-checks");
             let auto_run = take_tri_bool(&mut scanner, "--auto-run");
+            let live_actions = take_tri_bool(&mut scanner, "--live-actions");
             let rebuild_on = match take_rebuild_on(&mut scanner) {
                 Ok(value) => value,
                 Err(UsageError(message)) => return ReviewCommand::UsageError(message),
@@ -520,6 +523,7 @@ pub fn parse(args: &[String]) -> ReviewCommand {
                 cache_manual_checks,
                 skip_manual_checks,
                 auto_run,
+                live_actions,
                 rebuild_on,
                 followup_enabled,
                 followup_auto_start,
@@ -1554,6 +1558,7 @@ pub fn dispatch(cmd: ReviewCommand, opts: &GlobalOpts) -> i32 {
             cache_manual_checks,
             skip_manual_checks,
             auto_run,
+            live_actions,
             rebuild_on,
             followup_enabled,
             followup_auto_start,
@@ -1581,6 +1586,7 @@ pub fn dispatch(cmd: ReviewCommand, opts: &GlobalOpts) -> i32 {
                 cache_manual_checks,
                 skip_manual_checks,
                 auto_run,
+                live_actions,
                 rebuild_on,
                 followup_enabled,
                 followup_auto_start,
@@ -3584,6 +3590,22 @@ mod tests {
                 skip_manual_checks, ..
             } => assert_eq!(skip_manual_checks, None),
             other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_settings_live_actions_tri_state() {
+        for (flag, want) in [
+            (Some("--live-actions"), Some(true)),
+            (Some("--no-live-actions"), Some(false)),
+            (None, None),
+        ] {
+            let mut args = vec!["settings".to_string(), "r1".to_string()];
+            args.extend(flag.map(str::to_string));
+            match parse(&args) {
+                ReviewCommand::Settings { live_actions, .. } => assert_eq!(live_actions, want),
+                other => panic!("unexpected: {other:?}"),
+            }
         }
     }
 

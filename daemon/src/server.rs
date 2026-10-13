@@ -3131,6 +3131,9 @@ struct EffectiveReviewDefaults {
     /// RAL-565: the resolved manual-check auto-run default (per-review >
     /// database default > `.ralphus.toml`/global > `false`).
     auto_run: bool,
+    /// The resolved live-actions default (per-review > database default >
+    /// `.ralphus.toml`/global > `false`).
+    live_actions: bool,
     /// The resolved list of events that rebuild a review's prepared build
     /// (per-review override > database default > `.ralphus.toml`/global >
     /// every event).
@@ -3164,6 +3167,7 @@ impl EffectiveReviewDefaults {
             cache_manual_checks: cfg.cache_manual_checks(),
             skip_manual_checks: cfg.skip_manual_checks(),
             auto_run: cfg.auto_run(),
+            live_actions: cfg.live_actions(),
             rebuild_on: cfg.rebuild_on(),
         }
     }
@@ -3291,6 +3295,10 @@ struct ProjectReviewSettingsBody {
     /// ready -- see [`crate::store::ProjectReviewSettings`].
     #[serde(default)]
     auto_run: Option<bool>,
+    /// Project-level default for whether reviews run their live actions --
+    /// see [`crate::store::ProjectReviewSettings`].
+    #[serde(default)]
+    live_actions: Option<bool>,
     /// Project-level default for which events (`rebase`, `feedback`,
     /// `auto_fix`) tear down and rebuild a review's prepared build -- see
     /// [`crate::store::ProjectReviewSettings`]. Absent leaves the setting
@@ -3518,6 +3526,9 @@ fn set_project_review_settings(daemon: &Daemon, name: &str, body: &str) -> Reply
     }
     if let Some(v) = req.auto_run {
         settings.auto_run = Some(v);
+    }
+    if let Some(v) = req.live_actions {
+        settings.live_actions = Some(v);
     }
     if let Some(v) = req.rebuild_on {
         settings.rebuild_on = v;
@@ -15207,6 +15218,10 @@ struct GuardianSettingsBody {
     /// auto-run once ready. `None` inherits the project/global default.
     #[serde(default)]
     auto_run: Option<bool>,
+    /// This review's own live-actions opt-in. `None` inherits the
+    /// project/global default.
+    #[serde(default)]
+    live_actions: Option<bool>,
     /// Which events (`rebase`, `feedback`, `auto_fix`) tear down and rebuild
     /// this review's prepared build. Absent leaves it untouched, a list sets
     /// it (an empty list never rebuilds automatically), and an explicit
@@ -15335,6 +15350,9 @@ struct GuardianDetailsBody {
     /// See [`GuardianSettingsBody::auto_run`].
     #[serde(default)]
     auto_run: Option<bool>,
+    /// See [`GuardianSettingsBody::live_actions`].
+    #[serde(default)]
+    live_actions: Option<bool>,
     /// See [`GuardianSettingsBody::rebuild_on`].
     #[serde(default, deserialize_with = "deserialize_present")]
     rebuild_on: Option<Option<Vec<String>>>,
@@ -15924,6 +15942,11 @@ fn guardian_settings(daemon: &Daemon, id: &str, body: &str) -> Reply {
             return store_error(&e);
         }
     }
+    if let Some(enabled) = req.live_actions {
+        if let Err(e) = store.set_guardian_live_actions(id, Some(enabled)) {
+            return store_error(&e);
+        }
+    }
     if let Some(events) = &req.rebuild_on {
         if let Err(e) = store.set_guardian_rebuild_on(id, events.as_deref()) {
             return store_error(&e);
@@ -16288,6 +16311,11 @@ fn guardian_details(daemon: &Daemon, id: &str, body: &str) -> Reply {
     }
     if let Some(enabled) = req.auto_run {
         if let Err(e) = store.set_guardian_auto_run(id, Some(enabled)) {
+            return store_error(&e);
+        }
+    }
+    if let Some(enabled) = req.live_actions {
+        if let Err(e) = store.set_guardian_live_actions(id, Some(enabled)) {
             return store_error(&e);
         }
     }

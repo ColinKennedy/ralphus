@@ -1049,6 +1049,10 @@ pub struct ProjectReviewSettings {
     /// ready. Defaults to `false` when unset.
     #[serde(default)]
     pub auto_run: Option<bool>,
+    /// Live actions: project-level default for whether reviews run their live
+    /// actions. Defaults to `false` when unset.
+    #[serde(default)]
+    pub live_actions: Option<bool>,
     /// Project-level default for which events (`rebase`, `feedback`,
     /// `auto_fix`) tear down and rebuild a review's prepared build. Unset
     /// resolves to all three; an empty list never rebuilds automatically.
@@ -1111,6 +1115,7 @@ impl ProjectReviewSettings {
             cache_manual_checks: self.cache_manual_checks,
             skip_manual_checks: self.skip_manual_checks,
             auto_run: self.auto_run,
+            live_actions: self.live_actions,
             rebuild_on: self.rebuild_on,
             auto_fix_max_attempts: None,
             auto_fix_retry_base_seconds: None,
@@ -4174,6 +4179,11 @@ impl Store {
             // RAL-565: per-review default for auto-running manual checks. NULL
             // inherits the project/global default, which resolves to `false`.
             "ALTER TABLE guardians ADD COLUMN auto_run INTEGER",
+            // Live actions: per-review opt-in (NULL inherits the project/global
+            // default, which resolves to off) and the write-once marker of the
+            // review's one automatic live-action run.
+            "ALTER TABLE guardians ADD COLUMN live_actions INTEGER",
+            "ALTER TABLE guardians ADD COLUMN live_actions_auto_ran_at_ms INTEGER",
             // Per-review overrides of the global `[followup]` config: whether
             // this review offers follow-up work when it merges, and whether an
             // accepted follow-up squad starts at once. NULL inherits the
@@ -20069,6 +20079,7 @@ command = "e"
             cache_manual_checks: Some(false),
             skip_manual_checks: Some(true),
             auto_run: Some(true),
+            live_actions: Some(true),
             rebuild_on: Some(vec!["feedback".to_string(), "auto_fix".to_string()]),
             base_shift_maximum_rebuilds: Some(5),
             default_pr_user: Some("alice".to_string()),

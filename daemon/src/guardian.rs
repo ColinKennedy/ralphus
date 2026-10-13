@@ -954,6 +954,15 @@ pub struct GuardianView {
     /// [`Self::auto_run`] resolved against the project settings and global
     /// config -- always a plain `bool`, `false` when every layer is unset.
     pub effective_auto_run: bool,
+    /// Live actions: this review's own opt-in. `None` inherits the
+    /// project/global default.
+    pub live_actions: Option<bool>,
+    /// [`Self::live_actions`] resolved against the project settings and
+    /// global config -- `false` when every layer is unset.
+    pub effective_live_actions: bool,
+    /// When this review's one automatic live-action run was started; `None`
+    /// until it has run.
+    pub live_actions_auto_ran_at_ms: Option<i64>,
     /// This review's own override of whether it offers follow-up work for
     /// its `deferred` prophecies when it merges. `None` inherits the global
     /// `[followup] enabled`.
@@ -3885,6 +3894,38 @@ impl Store {
         }
     }
 
+    /// Set this review's own live-actions opt-in (`[[review]] live_actions`,
+    /// or the settings endpoint). `None` inherits.
+    ///
+    /// # Errors
+    /// [`StoreError::NotFound`] when no such guardian exists.
+    pub fn set_guardian_live_actions(&self, id: &str, enabled: Option<bool>) -> Result<()> {
+        let n = self.conn.execute(
+            "UPDATE guardians SET live_actions=?, updated_at_ms=? WHERE id=?",
+            params![enabled.map(i64::from), crate::store::now_ms(), id],
+        )?;
+        if n == 0 {
+            Err(StoreError::NotFound)
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Claim this review's one automatic live-action run: stamps
+    /// `live_actions_auto_ran_at_ms` only when it is still unset. `true`
+    /// when this call made the claim, `false` when it had already run.
+    ///
+    /// # Errors
+    /// On a database failure.
+    pub fn claim_guardian_live_actions_auto_run(&self, id: &str) -> Result<bool> {
+        let n = self.conn.execute(
+            "UPDATE guardians SET live_actions_auto_ran_at_ms=?, updated_at_ms=?
+             WHERE id=? AND live_actions_auto_ran_at_ms IS NULL",
+            params![crate::store::now_ms(), crate::store::now_ms(), id],
+        )?;
+        Ok(n == 1)
+    }
+
     /// Set this review's own manual-check auto-run default
     /// (`[[review]] auto_run`, or the settings endpoint). `None` inherits.
     ///
@@ -6020,7 +6061,7 @@ impl Store {
     pub(crate) fn get_guardian_conn(conn: &Connection, id: &str) -> Result<GuardianView> {
         let row = conn
             .query_row(
-                "SELECT id, name, base_branch, git_root, review_branch, status, detail, checks, squad_id, combined_worktree, conflicts_found, conflicts_fixed, conflicts_committed, skip_worktree_checks, review_type, skip_worktrees, created_at_ms, resolver_agent, resolver_model, base_commit, change_summary, base_commits, manual_commands, action_hints, summary_agent, summary_model, manual_commands_agent, manual_commands_model, manual_commands_agent_session_id, squash_projects, auto_pr_feedback, input_values, proof_scope, proof_skip_auto_clean, machine, build_env_overrides, manual_checks_env_overrides, maximum_budget_usd, merge_attempt, skip_base_updates, manual_checks_started_at_ms, notice_kind, notice_message, notice_at_ms, match_pr_branch_name, auto_submit_pr_stack, origin, auto_build_json, separate_pr_branch, readable_review_branch, review_branch_name, project, auto_fix_pr_errors, auto_fix_prompt_template, manual_checks_finished_at_ms, post_merge_status, post_merge_detail, post_merge_started_at_ms, post_merge_finished_at_ms, owner, dual_root_pr, discourage_tests_during_auto_pull_request_fixes, base_shift_maximum_rebuilds, base_shift_rebuild_attempts, base_shift_rebuild_targets, base_shift_exhausted_notified_at_ms, auto_cancel_outdated_pr_pipelines, cache_manual_checks, manual_checks_cached, manual_checks_basis, manual_checks_focus, summary_format, base_shift_rebuild_attempts_by_project, rebuild_on, skip_manual_checks, auto_run, followup_enabled, followup_auto_start, post_appraisals, ci_deferral
+                "SELECT id, name, base_branch, git_root, review_branch, status, detail, checks, squad_id, combined_worktree, conflicts_found, conflicts_fixed, conflicts_committed, skip_worktree_checks, review_type, skip_worktrees, created_at_ms, resolver_agent, resolver_model, base_commit, change_summary, base_commits, manual_commands, action_hints, summary_agent, summary_model, manual_commands_agent, manual_commands_model, manual_commands_agent_session_id, squash_projects, auto_pr_feedback, input_values, proof_scope, proof_skip_auto_clean, machine, build_env_overrides, manual_checks_env_overrides, maximum_budget_usd, merge_attempt, skip_base_updates, manual_checks_started_at_ms, notice_kind, notice_message, notice_at_ms, match_pr_branch_name, auto_submit_pr_stack, origin, auto_build_json, separate_pr_branch, readable_review_branch, review_branch_name, project, auto_fix_pr_errors, auto_fix_prompt_template, manual_checks_finished_at_ms, post_merge_status, post_merge_detail, post_merge_started_at_ms, post_merge_finished_at_ms, owner, dual_root_pr, discourage_tests_during_auto_pull_request_fixes, base_shift_maximum_rebuilds, base_shift_rebuild_attempts, base_shift_rebuild_targets, base_shift_exhausted_notified_at_ms, auto_cancel_outdated_pr_pipelines, cache_manual_checks, manual_checks_cached, manual_checks_basis, manual_checks_focus, summary_format, base_shift_rebuild_attempts_by_project, rebuild_on, skip_manual_checks, auto_run, followup_enabled, followup_auto_start, post_appraisals, ci_deferral, live_actions, live_actions_auto_ran_at_ms
                   FROM guardians WHERE id=?", // `skip_worktree_checks` (col 13) is read-only legacy data (RAL-285) -- see `GuardianRow::legacy_skip_worktree_checks`.
                 /*
                 "SELECT id, name, base_branch, git_root, review_branch, status, detail, checks, squad_id, combined_worktree, conflicts_found, conflicts_fixed, conflicts_committed, skip_worktree_checks, review_type, skip_worktrees, created_at_ms, resolver_agent, resolver_model, base_commit, change_summary, base_commits, manual_commands, action_hints, summary_agent, summary_model, manual_commands_agent, manual_commands_model, manual_commands_agent_session_id, squash_projects, auto_pr_feedback, input_values, proof_scope, proof_skip_auto_clean, machine, build_env_overrides, manual_checks_env_overrides, maximum_budget_usd, merge_attempt, skip_base_updates, manual_checks_started_at_ms, notice_kind, notice_message, notice_at_ms, match_pr_branch_name, auto_submit_pr_stack, origin, auto_build_json, separate_pr_branch, readable_review_branch, review_branch_name, project, auto_fix_pr_errors, auto_fix_prompt_template, manual_checks_finished_at_ms, post_merge_status, post_merge_detail, post_merge_started_at_ms, post_merge_finished_at_ms, owner, dual_root_pr, discourage_tests_during_auto_pull_request_fixes, base_shift_maximum_rebuilds, base_shift_rebuild_attempts, base_shift_rebuild_targets, base_shift_exhausted_notified_at_ms, auto_cancel_outdated_pr_pipelines, cache_manual_checks, manual_checks_cached, manual_checks_basis, manual_checks_focus
@@ -6181,7 +6222,7 @@ impl Store {
     /// (`crate::store_pool`) can serve it without the writer lock.
     pub(crate) fn list_guardians_conn(conn: &Connection) -> Result<Vec<GuardianView>> {
         let mut stmt = conn.prepare(
-            "SELECT id, name, base_branch, git_root, review_branch, status, detail, checks, squad_id, combined_worktree, conflicts_found, conflicts_fixed, conflicts_committed, skip_worktree_checks, review_type, skip_worktrees, created_at_ms, resolver_agent, resolver_model, base_commit, change_summary, base_commits, manual_commands, action_hints, summary_agent, summary_model, manual_commands_agent, manual_commands_model, manual_commands_agent_session_id, squash_projects, auto_pr_feedback, input_values, proof_scope, proof_skip_auto_clean, machine, build_env_overrides, manual_checks_env_overrides, maximum_budget_usd, merge_attempt, skip_base_updates, manual_checks_started_at_ms, notice_kind, notice_message, notice_at_ms, match_pr_branch_name, auto_submit_pr_stack, origin, auto_build_json, separate_pr_branch, readable_review_branch, review_branch_name, project, auto_fix_pr_errors, auto_fix_prompt_template, manual_checks_finished_at_ms, post_merge_status, post_merge_detail, post_merge_started_at_ms, post_merge_finished_at_ms, owner, dual_root_pr, discourage_tests_during_auto_pull_request_fixes, base_shift_maximum_rebuilds, base_shift_rebuild_attempts, base_shift_rebuild_targets, base_shift_exhausted_notified_at_ms, auto_cancel_outdated_pr_pipelines, cache_manual_checks, manual_checks_cached, manual_checks_basis, manual_checks_focus, summary_format, base_shift_rebuild_attempts_by_project, rebuild_on, skip_manual_checks, auto_run, followup_enabled, followup_auto_start, post_appraisals, ci_deferral
+            "SELECT id, name, base_branch, git_root, review_branch, status, detail, checks, squad_id, combined_worktree, conflicts_found, conflicts_fixed, conflicts_committed, skip_worktree_checks, review_type, skip_worktrees, created_at_ms, resolver_agent, resolver_model, base_commit, change_summary, base_commits, manual_commands, action_hints, summary_agent, summary_model, manual_commands_agent, manual_commands_model, manual_commands_agent_session_id, squash_projects, auto_pr_feedback, input_values, proof_scope, proof_skip_auto_clean, machine, build_env_overrides, manual_checks_env_overrides, maximum_budget_usd, merge_attempt, skip_base_updates, manual_checks_started_at_ms, notice_kind, notice_message, notice_at_ms, match_pr_branch_name, auto_submit_pr_stack, origin, auto_build_json, separate_pr_branch, readable_review_branch, review_branch_name, project, auto_fix_pr_errors, auto_fix_prompt_template, manual_checks_finished_at_ms, post_merge_status, post_merge_detail, post_merge_started_at_ms, post_merge_finished_at_ms, owner, dual_root_pr, discourage_tests_during_auto_pull_request_fixes, base_shift_maximum_rebuilds, base_shift_rebuild_attempts, base_shift_rebuild_targets, base_shift_exhausted_notified_at_ms, auto_cancel_outdated_pr_pipelines, cache_manual_checks, manual_checks_cached, manual_checks_basis, manual_checks_focus, summary_format, base_shift_rebuild_attempts_by_project, rebuild_on, skip_manual_checks, auto_run, followup_enabled, followup_auto_start, post_appraisals, ci_deferral, live_actions, live_actions_auto_ran_at_ms
               FROM guardians ORDER BY created_at_ms DESC", // `skip_worktree_checks` (col 13) is read-only legacy data (RAL-285) -- see `GuardianRow::legacy_skip_worktree_checks`.
         )?;
         let rows = stmt
@@ -6330,6 +6371,8 @@ impl Store {
             followup_auto_start: r.get::<_, Option<i64>>(77)?.map(|v| v != 0),
             post_appraisals: r.get::<_, Option<i64>>(78)?.map(|v| v != 0),
             ci_deferral: r.get(79)?,
+            live_actions: r.get::<_, Option<i64>>(80)?.map(|v| v != 0),
+            live_actions_auto_ran_at_ms: r.get(81)?,
         })
     }
 
@@ -6815,6 +6858,14 @@ impl Store {
             .or(live_global.auto_run)
             .unwrap_or(false);
 
+        // Whether the review runs its live actions, layered the same way.
+        let effective_live_actions = row
+            .live_actions
+            .or(db_settings.live_actions)
+            .or(explicit_project.live_actions)
+            .or(live_global.live_actions)
+            .unwrap_or(false);
+
         // Follow-up offers: per-review override > the project's
         // `.ralphus.toml [followup]` > the live global `[followup]` config > on.
         let followup = ctx
@@ -6951,6 +7002,9 @@ impl Store {
             effective_skip_manual_checks,
             auto_run: row.auto_run,
             effective_auto_run,
+            live_actions: row.live_actions,
+            effective_live_actions,
+            live_actions_auto_ran_at_ms: row.live_actions_auto_ran_at_ms,
             followup_enabled: row.followup_enabled,
             effective_followup_enabled,
             followup_auto_start: row.followup_auto_start,
@@ -7517,6 +7571,10 @@ struct GuardianRow {
     skip_manual_checks: Option<bool>,
     /// This review's own manual-check auto-run default. `None` inherits.
     auto_run: Option<bool>,
+    /// This review's own live-actions opt-in. `None` inherits.
+    live_actions: Option<bool>,
+    /// When the review's one automatic live-action run was started.
+    live_actions_auto_ran_at_ms: Option<i64>,
     /// This review's own follow-up offer override. `None` inherits.
     followup_enabled: Option<bool>,
     /// This review's own follow-up auto-start override. `None` inherits.
@@ -9593,6 +9651,62 @@ mod tests {
         store.set_guardian_auto_run(&id, None).unwrap();
         assert!(store.get_guardian(&id).unwrap().effective_auto_run);
         assert!(store.set_guardian_auto_run("nope", Some(true)).is_err());
+    }
+
+    #[test]
+    fn live_actions_resolve_review_over_project_over_default() {
+        let store = Store::open_in_memory().unwrap();
+        store.register_project("proj", "", "/repo", "git").unwrap();
+        let id = store.create_guardian("r", "main", "/repo").unwrap();
+        let g = store.get_guardian(&id).unwrap();
+        assert_eq!(g.live_actions, None);
+        assert!(!g.effective_live_actions, "off by default");
+
+        store
+            .set_project_review_settings(
+                "proj",
+                &crate::store::ProjectReviewSettings {
+                    live_actions: Some(true),
+                    ..crate::store::ProjectReviewSettings::default()
+                },
+            )
+            .unwrap();
+        assert!(
+            store.get_guardian(&id).unwrap().effective_live_actions,
+            "the project default reaches a review with no setting of its own"
+        );
+
+        store.set_guardian_live_actions(&id, Some(false)).unwrap();
+        assert!(!store.get_guardian(&id).unwrap().effective_live_actions);
+
+        store.set_guardian_live_actions(&id, None).unwrap();
+        assert!(store.get_guardian(&id).unwrap().effective_live_actions);
+        assert!(store.set_guardian_live_actions("nope", Some(true)).is_err());
+    }
+
+    #[test]
+    fn the_automatic_live_action_run_is_claimed_exactly_once() {
+        let store = Store::open_in_memory().unwrap();
+        let id = store.create_guardian("r", "main", "/repo").unwrap();
+        assert!(
+            store
+                .get_guardian(&id)
+                .unwrap()
+                .live_actions_auto_ran_at_ms
+                .is_none()
+        );
+        assert!(store.claim_guardian_live_actions_auto_run(&id).unwrap());
+        assert!(
+            !store.claim_guardian_live_actions_auto_run(&id).unwrap(),
+            "a second claim -- a restart, a later rebase -- never runs it again"
+        );
+        assert!(
+            store
+                .get_guardian(&id)
+                .unwrap()
+                .live_actions_auto_ran_at_ms
+                .is_some()
+        );
     }
 
     // RAL-521: `cache_manual_checks` defaults to ON (caching enabled) and

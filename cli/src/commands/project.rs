@@ -97,6 +97,7 @@ pub enum ProjectReviewSettingsCommand {
         cache_manual_checks: Option<bool>,
         skip_manual_checks: Option<bool>,
         auto_run: Option<bool>,
+        live_actions: Option<bool>,
         /// The project's default list of events that rebuild a review's
         /// prepared build. Outer `None` leaves it alone, `Some(None)` clears
         /// it back to inherit, `Some(Some(list))` sets it (an empty list never
@@ -377,6 +378,7 @@ fn parse_review_settings_set(
     let skip_manual_checks =
         crate::commands::review::take_tri_bool(scanner, "--skip-manual-checks");
     let auto_run = crate::commands::review::take_tri_bool(scanner, "--auto-run");
+    let live_actions = crate::commands::review::take_tri_bool(scanner, "--live-actions");
     let rebuild_on = crate::commands::review::take_rebuild_on(scanner)?;
     if clear_maximum_budget_usd && maximum_budget_usd_raw.is_some() {
         return Err(UsageError(
@@ -441,6 +443,7 @@ fn parse_review_settings_set(
         cache_manual_checks,
         skip_manual_checks,
         auto_run,
+        live_actions,
         rebuild_on,
     })
 }
@@ -597,6 +600,7 @@ fn dispatch_review_settings(cmd: ProjectReviewSettingsCommand, opts: &GlobalOpts
             cache_manual_checks,
             skip_manual_checks,
             auto_run,
+            live_actions,
             rebuild_on,
         } => {
             let patch = crate::client::ProjectReviewSettingsPatch {
@@ -625,6 +629,7 @@ fn dispatch_review_settings(cmd: ProjectReviewSettingsCommand, opts: &GlobalOpts
                 cache_manual_checks,
                 skip_manual_checks,
                 auto_run,
+                live_actions,
                 rebuild_on,
             };
             match client.set_project_review_settings(&name, &patch) {
@@ -722,6 +727,7 @@ fn render_review_settings(payload: &Value) {
     row_bool("cache manual checks:", "cache_manual_checks");
     row_bool("skip manual checks:", "skip_manual_checks");
     row_bool("auto run manual checks:", "auto_run");
+    row_bool("live actions:", "live_actions");
     let list = |value: &serde_json::Value| -> Option<String> {
         value.as_array().map(|entries| {
             if entries.is_empty() {

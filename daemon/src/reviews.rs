@@ -469,6 +469,8 @@ struct Membership {
     /// Optional review-wide default (`[[review]] auto_run`) for auto-running
     /// manual checks.
     auto_run: Option<bool>,
+    /// The review's own live-actions opt-in (`[[review]] live_actions`).
+    live_actions: Option<bool>,
     /// Optional override declared on the review (`[[review]] rebuild_on`) for
     /// which events tear down and rebuild its prepared build. `Some(vec![])`
     /// is a declared "never automatically"; `None` inherits.
@@ -1149,6 +1151,7 @@ pub fn derive_reviews_with_full_prefetch(
             cache_manual_checks: rv.and_then(|r| r.cache_manual_checks),
             skip_manual_checks: rv.and_then(|r| r.skip_manual_checks),
             auto_run: rv.and_then(|r| r.auto_run),
+            live_actions: rv.and_then(|r| r.live_actions),
             rebuild_on: rv.and_then(|r| r.rebuild_on.clone()),
         });
     }
@@ -1656,6 +1659,13 @@ fn apply_resolver(
     if let Some(enabled) = members.iter().find_map(|m| m.auto_run) {
         store
             .set_guardian_auto_run(gid, Some(enabled))
+            .map_err(|e| ReviewError::new(e.to_string()))?;
+    }
+    // This review's own live-actions opt-in, authored via
+    // `[[review]] live_actions`.
+    if let Some(enabled) = members.iter().find_map(|m| m.live_actions) {
+        store
+            .set_guardian_live_actions(gid, Some(enabled))
             .map_err(|e| ReviewError::new(e.to_string()))?;
     }
     // This review's own list of rebuild events, authored via
@@ -3329,6 +3339,7 @@ mod tests {
             cache_manual_checks: None,
             skip_manual_checks: None,
             auto_run: None,
+            live_actions: None,
             rebuild_on: None,
         }
     }

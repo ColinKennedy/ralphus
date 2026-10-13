@@ -303,6 +303,7 @@ pub const REVIEW_KEYS: &[&str] = &[
     "cache_manual_checks",
     "skip_manual_checks",
     "auto_run",
+    "live_actions",
     "rebuild_on",
 ];
 /// The full set of top-level `[[waypoint]]` keys (RAL-400).
@@ -2369,6 +2370,7 @@ fn validate_review_blocks(value: Option<&toml::Value>, ctx: &mut Ctx) {
         check_type(ctx, table, "cache_manual_checks", Ty::Bool, &rpath, header);
         check_type(ctx, table, "skip_manual_checks", Ty::Bool, &rpath, header);
         check_type(ctx, table, "auto_run", Ty::Bool, &rpath, header);
+        check_type(ctx, table, "live_actions", Ty::Bool, &rpath, header);
         validate_rebuild_on(table, &rpath, ctx, header);
         check_type(
             ctx,
@@ -4786,6 +4788,29 @@ auto_run=false
                 r.errors
             );
         }
+    }
+
+    // ── [[review]] live_actions ──
+
+    #[test]
+    fn review_live_actions_must_be_a_bool() {
+        let base = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nreview=\"<<review:r>>\"\n[[review]]\nid=\"r\"\n";
+        for value in ["true", "false"] {
+            let r = validate_toml(&format!("{base}live_actions={value}\n"));
+            assert!(r.is_ok(), "{:?}", r.errors);
+        }
+        for bad in ["\"yes\"", "1"] {
+            let r = validate_toml(&format!("{base}live_actions={bad}\n"));
+            assert!(
+                r.errors
+                    .iter()
+                    .any(|e| e.kind == ErrorKind::WrongType && e.message.contains("live_actions")),
+                "{bad}: {:?}",
+                r.errors
+            );
+        }
+        let typo = validate_toml(&format!("{base}live_action=true\n"));
+        assert!(!typo.is_ok(), "a misspelled key is rejected as unknown");
     }
 
     // ── [[review]] cache_manual_checks (RAL-521) ──

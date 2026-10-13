@@ -73,6 +73,8 @@
        * @property {boolean} originalSkipManualChecks
        * @property {boolean} autoRun - Whether this review's ready manual checks run automatically after their build succeeds.
        * @property {boolean} originalAutoRun
+       * @property {boolean} liveActions - Whether this review runs its live actions (agent-run live tests from its cells' handoffs).
+       * @property {boolean} originalLiveActions
        * @property {boolean} followupEnabled - Whether this review offers follow-up work for its deferred prophecies when it merges.
        * @property {boolean} originalFollowupEnabled
        * @property {boolean} followupAutoStart - Whether an accepted follow-up squad starts at once instead of being held.
@@ -350,6 +352,7 @@
         const discourageTests = !!g.discourage_tests_during_auto_pull_request_fixes;
         const skipManualChecks = !!g.effective_skip_manual_checks;
         const autoRun = !!g.effective_auto_run;
+        const liveActions = !!g.effective_live_actions;
         const followupEnabled = g.effective_followup_enabled !== false;
         const followupAutoStart = g.effective_followup_auto_start !== false;
         const rebuildOnEffective = normalizeRebuildOn(g.effective_rebuild_on === undefined ? REBUILD_TRIGGERS : g.effective_rebuild_on);
@@ -378,6 +381,7 @@
           discourageTests, originalDiscourageTests: discourageTests,
           skipManualChecks, originalSkipManualChecks: skipManualChecks,
           autoRun, originalAutoRun: autoRun,
+          liveActions, originalLiveActions: liveActions,
           followupEnabled, originalFollowupEnabled: followupEnabled,
           followupAutoStart, originalFollowupAutoStart: followupAutoStart,
           rebuildOn: buildRebuildOnDraft(g.rebuild_on, rebuildOnEffective),
@@ -570,6 +574,12 @@
        * @returns {void}
        */
       function onEditAutoRun(checked) { if (reviewEditDraft) reviewEditDraft.autoRun = checked; }
+      /**
+       * Stages the live-actions opt-in.
+       * @param {boolean} checked
+       * @returns {void}
+       */
+      function onEditLiveActions(checked) { if (reviewEditDraft) reviewEditDraft.liveActions = checked; }
       /**
        * Stages whether this review offers follow-up work when it merges.
        * @param {boolean} checked
@@ -989,6 +999,9 @@
                 <input type="checkbox" ${draft.skipManualChecks ? "checked" : ""} onchange="onEditSkipManualChecks(this.checked)">skip auto action generation</label>
               <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--muted);margin-top:4px" data-tip="Overrides the project default for this review only: run each action automatically once its build commands succeed (one with no build commands runs as soon as it is ready). Only actions whose inputs all have defaults run; each runs once per machine per build, in a visible terminal. An action's own auto_run in the task file wins over this. Applies on Save.">
                 <input type="checkbox" ${draft.autoRun ? "checked" : ""} onchange="onEditAutoRun(this.checked)">auto-run actions after build</label></div>
+            <div ${grp("live-actions")}><h3 class="section">live actions</h3>
+              <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--muted);margin-top:4px" data-tip="Overrides the project default for this review only: once every member cell has finished and the review's build is prepared, collect how each cell's agent said it would test its work live, merge similar ones, and have an agent run each against the review's tip -- once, automatically. It may commit fixes; ralphus carries them onto the top branch. Rerun from the review's live actions section. Costs agent time; off by default. Applies on Save.">
+                <input type="checkbox" ${draft.liveActions ? "checked" : ""} onchange="onEditLiveActions(this.checked)">run live actions</label></div>
             <div ${grp("followup")}><h3 class="section">follow-up</h3>
               <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--muted);margin-top:4px" data-tip="Overrides the global [followup] default for this review only: when it merges, offer to turn the follow-up work its agents deferred (deferred prophecies) into a new squad. On unless the global config turns it off. Applies on Save.">
                 <input type="checkbox" ${draft.followupEnabled ? "checked" : ""} onchange="onEditFollowupEnabled(this.checked)">offer follow-up work when this review merges</label>
@@ -1079,6 +1092,7 @@
         if (draft.discourageTests !== draft.originalDiscourageTests) body.discourage_tests_during_auto_pull_request_fixes = draft.discourageTests;
         if (draft.skipManualChecks !== draft.originalSkipManualChecks) body.skip_manual_checks = draft.skipManualChecks;
         if (draft.autoRun !== draft.originalAutoRun) body.auto_run = draft.autoRun;
+        if (draft.liveActions !== draft.originalLiveActions) body.live_actions = draft.liveActions;
         if (draft.followupEnabled !== draft.originalFollowupEnabled) body.followup_enabled = draft.followupEnabled;
         if (draft.followupAutoStart !== draft.originalFollowupAutoStart) body.followup_auto_start = draft.followupAutoStart;
         if (rebuildOnChanged(draft.rebuildOn, draft.originalRebuildOn)) body.rebuild_on = rebuildOnBodyValue(draft.rebuildOn);

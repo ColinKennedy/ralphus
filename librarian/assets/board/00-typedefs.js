@@ -534,6 +534,9 @@
        * @property {boolean|null} [skip_manual_checks] - this review's own override for whether manual-check generation is skipped; null = inherit the project default.
        * @property {boolean|null} [auto_run] - this review's own override for whether ready manual checks run automatically after their build succeeds; null = inherit the project default.
        * @property {boolean} [effective_auto_run] - `auto_run` resolved against the project/global defaults (false when nothing sets it).
+       * @property {boolean|null} [live_actions] - This review's own live-actions opt-in; null inherits.
+       * @property {boolean} [effective_live_actions] - `live_actions` resolved against the project/global defaults (false when nothing sets it).
+       * @property {number|null} [live_actions_auto_ran_at_ms] - When the review's one automatic live-action run started; null until then.
        * @property {boolean|null} [followup_enabled] - this review's own override for whether it offers follow-up work for its deferred prophecies when it merges; null = inherit the global [followup] enabled.
        * @property {boolean} [effective_followup_enabled] - `followup_enabled` resolved against the global [followup] config (true when nothing sets it).
        * @property {FollowupSummary} [pending_followups] - the review's deferred follow-ups: how many are pending (RAL-582).
@@ -973,6 +976,7 @@
        * @property {boolean|null|undefined} cache_manual_checks
        * @property {boolean|null|undefined} skip_manual_checks
        * @property {boolean|null|undefined} auto_run
+       * @property {boolean|null|undefined} live_actions
        * @property {string[]|null|undefined} rebuild_on - Which events rebuild a review's prepared build: any of "rebase", "feedback", "auto_fix". `[]` = manual only; null/absent = inherit.
        */
       /**
@@ -1003,6 +1007,7 @@
        * @property {boolean} cache_manual_checks
        * @property {boolean} skip_manual_checks
        * @property {boolean} auto_run
+       * @property {boolean} live_actions
        * @property {string[]|undefined} rebuild_on - The resolved file-config/global rebuild triggers a review inherits when neither it nor its project sets any.
        */
       /**

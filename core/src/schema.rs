@@ -1935,6 +1935,12 @@ pub struct ReviewDef {
     /// then `false`.
     #[serde(default)]
     pub auto_run: Option<bool>,
+    /// Live actions: whether this review runs its live actions (agent-run
+    /// live tests generated from its cells' `RALPHUS_LIVE_ACTION:`
+    /// handoffs). Unset inherits the project-level `.ralphus.toml [review]
+    /// live_actions` default, then `false`.
+    #[serde(default)]
+    pub live_actions: Option<bool>,
     /// Which events tear down and rebuild this review's prepared build: any
     /// of [`REBUILD_ON_VALUES`] (`"rebase"` -- a merge or restack of the
     /// stack, `"feedback"` -- applied reviewer feedback, `"auto_fix"` -- an
