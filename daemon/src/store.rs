@@ -2642,6 +2642,21 @@ impl Store {
             );
             CREATE INDEX IF NOT EXISTS idx_ghosts_squad ON ghosts(squad_id);
             CREATE INDEX IF NOT EXISTS idx_ghosts_guardian ON ghosts(guardian_id);
+            -- Live handoffs (`crate::live_actions`): how a prompt cell's agent
+            -- said it would test its work live, one row per
+            -- `RALPHUS_LIVE_ACTION:` marker of its latest reply. A single row
+            -- with `nothing_to_test = 1` records the explicit 'nothing to test
+            -- live' answer.
+            CREATE TABLE IF NOT EXISTS cell_live_handoffs (
+                squad_id        TEXT NOT NULL REFERENCES squads(id) ON DELETE CASCADE,
+                task_idx        INTEGER NOT NULL,
+                cell_idx        INTEGER NOT NULL,
+                ordinal         INTEGER NOT NULL,
+                text            TEXT NOT NULL,
+                nothing_to_test INTEGER NOT NULL DEFAULT 0,
+                created_at_ms   INTEGER NOT NULL,
+                PRIMARY KEY (squad_id, task_idx, cell_idx, ordinal)
+            );
             -- Prophecy subsystem (docs/prophecy-design.md): a durable,
             -- append-only record of what an agent learned while it worked.
             -- Unlike ghosts, this is NOT one row per owner -- every write is

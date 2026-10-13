@@ -506,6 +506,21 @@ tool guidance, but without the waypoint section (`waypoint_context` false). The 
   and one level of dependent cells' prompts — that is its whole routing
   scope. The bullet-count and "not a changelog" framing are prompt
   conventions, not parser-enforced shapes; only the marker line is parsed.
+- **`RALPHUS_LIVE_ACTION: <how to test this live>`** (or
+  `RALPHUS_LIVE_ACTION: (nothing to test live)`) — a **live handoff**: how a
+  prompt cell's agent says it would test its work live. Only prompt cells are
+  asked for it (the question is appended to their system prompt by
+  `RunnerSpec::from_row`; review agents never see it). Parsed daemon-side from
+  the cell's final reply (`live_actions::parse_live_handoffs`): every marker
+  starts one handoff, whose text runs until the next line that starts with a
+  `RALPHUS_` marker, so it may span several lines and a cell may post several.
+  Write them **before** `RALPHUS_GHOST:` — the ghost takes everything after its
+  marker to the end of the reply. The `(nothing to test live)` answer
+  (case-insensitive) records an explicit "no", distinct from no marker at all.
+  Stored per cell (`cell_live_handoffs`, `GET
+  /api/squads/{id}/cells/{t}/{c}/live-handoffs`, shown by `ralphus cell show`)
+  and turned into its review's **live actions** when the review first runs
+  them.
 - **`RALPHUS_PROPHECY: <kind>: <note>`** — an append-only design note from
   a prompt cell. Every standalone marker line is carried in the runner
   result, rather than only the last one; `<kind>` is one of `discovery`,

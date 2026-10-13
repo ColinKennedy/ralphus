@@ -81,6 +81,190 @@ started before you finish.\n\
 End your reply with a short report: what you tested, what you observed, and \
 anything broken (with the exact error and where it comes from).";
 
+/// The marker a cell's agent writes a live handoff under.
+pub const LIVE_ACTION_MARKER: &str = "RALPHUS_LIVE_ACTION:";
+
+/// The explicit "this cannot be tested live" answer.
+const NOTHING_TO_TEST_LIVE: &str = "(nothing to test live)";
+
+/// Longest single handoff kept; longer text is cut.
+const HANDOFF_MAX_CHARS: usize = 4000;
+
+/// Most handoffs kept from one cell.
+const MAX_HANDOFFS_PER_CELL: usize = 8;
+
+/// Appended to every prompt cell's system prompt (`RunnerSpec::from_row`): the
+/// question whose answer becomes the review's live actions.
+pub const LIVE_HANDOFF_SYSTEM_PROMPT: &str = "## Live Test Handoff\n\
+Operational note, not a change to your task: after this work is merged into a \
+review, ralphus may test it live with a separate agent that has not seen this \
+conversation. When you finish, and before any RALPHUS_GHOST section, say how \
+you would test this change live if you had to: run the real program the way a \
+user would, exercise what you changed, and check the result. Write each test on \
+its own, starting on a new line with the exact marker 'RALPHUS_LIVE_ACTION:' \
+followed by concrete steps -- which program or entry point, the exact commands, \
+any setup it needs (ports, data, configuration), what to do, and what correct \
+looks like. A test may span several lines; it ends at the next line that starts \
+with a RALPHUS_ marker. Write one per distinct thing worth testing (for example \
+one per product you touched). If this change cannot be meaningfully tested \
+live (a pure refactor, documentation only), write \
+'RALPHUS_LIVE_ACTION: (nothing to test live)'.";
+
+/// The live handoffs one agent reply carries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LiveHandoffs {
+    /// The reply has no `RALPHUS_LIVE_ACTION:` marker at all.
+    NoMarker,
+    /// The agent said there is nothing to test live.
+    NothingToTest,
+    /// One or more test descriptions, in reply order.
+    Tests(Vec<String>),
+}
+
+/// Extract every `RALPHUS_LIVE_ACTION:` handoff from an agent's reply. Each
+/// marker starts one handoff, which runs until the next line that starts with
+/// a `RALPHUS_` marker (another handoff, the ghost, a prophecy) or the end of
+/// the reply.
+#[must_use]
+pub fn parse_live_handoffs(reply: &str) -> LiveHandoffs {
+    fn finish(current: &mut Option<String>, tests: &mut Vec<String>) {
+        if let Some(text) = current.take() {
+            let text = text.trim();
+            if !text.is_empty() && !text.eq_ignore_ascii_case(NOTHING_TO_TEST_LIVE) {
+                tests.push(text.chars().take(HANDOFF_MAX_CHARS).collect());
+            }
+        }
+    }
+    let mut tests: Vec<String> = Vec::new();
+    let mut saw_marker = false;
+    let mut current: Option<String> = None;
+    for line in reply.lines() {
+        let trimmed = line.trim_start();
+        if let Some(rest) = trimmed.strip_prefix(LIVE_ACTION_MARKER) {
+            finish(&mut current, &mut tests);
+            saw_marker = true;
+            current = Some(rest.trim().to_string());
+        } else if trimmed.starts_with("RALPHUS_") {
+            finish(&mut current, &mut tests);
+        } else if let Some(text) = current.as_mut() {
+            text.push('\n');
+            text.push_str(line);
+        }
+    }
+    finish(&mut current, &mut tests);
+    tests.truncate(MAX_HANDOFFS_PER_CELL);
+    match (saw_marker, tests.is_empty()) {
+        (false, _) => LiveHandoffs::NoMarker,
+        (true, true) => LiveHandoffs::NothingToTest,
+        (true, false) => LiveHandoffs::Tests(tests),
+    }
+}
+
+/// One cell's stored live handoffs.
+#[derive(Debug, Clone, Default, serde::Serialize, PartialEq, Eq)]
+pub struct CellLiveHandoffs {
+    /// The test descriptions, in the order the agent wrote them.
+    pub tests: Vec<String>,
+    /// The agent said there is nothing to test live.
+    pub nothing_to_test: bool,
+    /// When they were recorded; `None` when the cell never posted any.
+    pub recorded_at_ms: Option<i64>,
+}
+
+impl crate::store::Store {
+    /// Replace a cell's live handoffs with the ones from its latest reply.
+    /// A reply with no marker at all leaves nothing stored for the cell.
+    ///
+    /// # Errors
+    ///
+    /// On a database failure.
+    pub fn replace_cell_live_handoffs(
+        &self,
+        squad_id: &str,
+        task_idx: i64,
+        cell_idx: i64,
+        handoffs: &LiveHandoffs,
+    ) -> crate::store::Result<()> {
+        let now = crate::store::now_ms();
+        self.conn.execute(
+            "DELETE FROM cell_live_handoffs WHERE squad_id=? AND task_idx=? AND cell_idx=?",
+            rusqlite::params![squad_id, task_idx, cell_idx],
+        )?;
+        let rows: Vec<(String, bool)> = match handoffs {
+            LiveHandoffs::NoMarker => Vec::new(),
+            LiveHandoffs::NothingToTest => vec![(String::new(), true)],
+            LiveHandoffs::Tests(tests) => tests.iter().map(|t| (t.clone(), false)).collect(),
+        };
+        for (ordinal, (text, nothing)) in rows.iter().enumerate() {
+            self.conn.execute(
+                "INSERT INTO cell_live_handoffs
+                    (squad_id, task_idx, cell_idx, ordinal, text, nothing_to_test, created_at_ms)
+                 VALUES (?, ?, ?, ?, ?, ?, ?)",
+                rusqlite::params![
+                    squad_id,
+                    task_idx,
+                    cell_idx,
+                    i64::try_from(ordinal).unwrap_or(i64::MAX),
+                    text,
+                    i64::from(*nothing),
+                    now
+                ],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// A cell's stored live handoffs.
+    ///
+    /// # Errors
+    ///
+    /// On a database failure.
+    pub fn cell_live_handoffs(
+        &self,
+        squad_id: &str,
+        task_idx: i64,
+        cell_idx: i64,
+    ) -> crate::store::Result<CellLiveHandoffs> {
+        cell_live_handoffs_conn(&self.conn, squad_id, task_idx, cell_idx)
+    }
+}
+
+/// [`crate::store::Store::cell_live_handoffs`] over a bare connection, for
+/// read-pool callers.
+///
+/// # Errors
+///
+/// On a database failure.
+pub fn cell_live_handoffs_conn(
+    conn: &rusqlite::Connection,
+    squad_id: &str,
+    task_idx: i64,
+    cell_idx: i64,
+) -> crate::store::Result<CellLiveHandoffs> {
+    let mut stmt = conn.prepare(
+        "SELECT text, nothing_to_test, created_at_ms FROM cell_live_handoffs
+         WHERE squad_id=? AND task_idx=? AND cell_idx=? ORDER BY ordinal",
+    )?;
+    let rows = stmt.query_map(rusqlite::params![squad_id, task_idx, cell_idx], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, i64>(1)? != 0,
+            r.get::<_, i64>(2)?,
+        ))
+    })?;
+    let mut out = CellLiveHandoffs::default();
+    for row in rows {
+        let (text, nothing, at) = row?;
+        out.recorded_at_ms = Some(at);
+        if nothing {
+            out.nothing_to_test = true;
+        } else {
+            out.tests.push(text);
+        }
+    }
+    Ok(out)
+}
+
 /// The live ref a run's commits are pinned on.
 #[must_use]
 pub fn live_ref_name(guardian_id: &str, run_id: &str) -> String {
@@ -677,6 +861,105 @@ mod tests {
             "released when the run ends"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A squad with one task holding two prompt cells.
+    pub(crate) fn insert_squad(store: &mut crate::store::Store) -> String {
+        let file: ralphus_core::schema::TaskFile = toml::from_str(
+            r#"
+[[task]]
+name = "build"
+[[task.cell]]
+id = "one"
+cwd = "/repo"
+prompt = "first"
+[[task.cell]]
+id = "two"
+cwd = "/repo"
+prompt = "second"
+"#,
+        )
+        .unwrap();
+        store.insert_squad(&file, None, false).unwrap()
+    }
+
+    #[test]
+    fn parses_no_marker_as_no_marker() {
+        assert_eq!(parse_live_handoffs("all done"), LiveHandoffs::NoMarker);
+    }
+
+    #[test]
+    fn parses_several_multi_line_handoffs_and_stops_at_the_ghost() {
+        let reply = "Implemented it.\n\
+            RALPHUS_LIVE_ACTION: Start the board with `scripts/dev.sh`.\n\
+            Open Reviews and expand a branch; the rate-limit row shows a countdown.\n\
+            RALPHUS_LIVE_ACTION: Run `ralphus review show r1` and check the fields print.\n\
+            RALPHUS_GHOST: - nothing odd";
+        assert_eq!(
+            parse_live_handoffs(reply),
+            LiveHandoffs::Tests(vec![
+                "Start the board with `scripts/dev.sh`.\nOpen Reviews and expand a branch; the rate-limit row shows a countdown."
+                    .to_string(),
+                "Run `ralphus review show r1` and check the fields print.".to_string(),
+            ])
+        );
+    }
+
+    #[test]
+    fn a_prophecy_line_ends_a_handoff() {
+        let reply = "RALPHUS_LIVE_ACTION: run it\nRALPHUS_PROPHECY: hazard: x\ntrailing prose";
+        assert_eq!(
+            parse_live_handoffs(reply),
+            LiveHandoffs::Tests(vec!["run it".to_string()])
+        );
+    }
+
+    #[test]
+    fn parses_the_explicit_nothing_to_test_answer() {
+        assert_eq!(
+            parse_live_handoffs("RALPHUS_LIVE_ACTION: (Nothing to test live)\nRALPHUS_GHOST: -"),
+            LiveHandoffs::NothingToTest
+        );
+        // A real test next to the "nothing" answer wins.
+        assert_eq!(
+            parse_live_handoffs(
+                "RALPHUS_LIVE_ACTION: (nothing to test live)\nRALPHUS_LIVE_ACTION: run it"
+            ),
+            LiveHandoffs::Tests(vec!["run it".to_string()])
+        );
+    }
+
+    #[test]
+    fn handoffs_round_trip_and_a_new_reply_replaces_the_old_one() {
+        let mut store = crate::store::Store::open_in_memory().unwrap();
+        let squad = insert_squad(&mut store);
+        store
+            .replace_cell_live_handoffs(
+                &squad,
+                0,
+                1,
+                &LiveHandoffs::Tests(vec!["a".to_string(), "b".to_string()]),
+            )
+            .unwrap();
+        let got = store.cell_live_handoffs(&squad, 0, 1).unwrap();
+        assert_eq!(got.tests, vec!["a".to_string(), "b".to_string()]);
+        assert!(!got.nothing_to_test);
+        assert!(got.recorded_at_ms.is_some());
+
+        store
+            .replace_cell_live_handoffs(&squad, 0, 1, &LiveHandoffs::NothingToTest)
+            .unwrap();
+        let got = store.cell_live_handoffs(&squad, 0, 1).unwrap();
+        assert!(got.tests.is_empty());
+        assert!(got.nothing_to_test);
+
+        store
+            .replace_cell_live_handoffs(&squad, 0, 1, &LiveHandoffs::NoMarker)
+            .unwrap();
+        assert_eq!(
+            store.cell_live_handoffs(&squad, 0, 1).unwrap(),
+            CellLiveHandoffs::default()
+        );
     }
 
     #[test]

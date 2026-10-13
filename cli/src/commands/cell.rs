@@ -289,11 +289,18 @@ pub fn dispatch(cmd: CellCommand, opts: &GlobalOpts) -> i32 {
             let resolved = resolve_scoped(&client, &selector, "cell")?;
             let squad = client.squad(&resolved.squad_id)?;
             let uri = squad_view_uri(&squad, &resolved);
-            let cell = with_uri(
+            let mut cell = with_uri(
                 squad["tasks"][resolved.task_idx as usize]["cells"][resolved.cell_idx as usize]
                     .clone(),
                 uri,
             );
+            // A daemon without live actions has no such route; the cell is
+            // still shown, just without handoffs.
+            if let Ok(handoffs) =
+                client.cell_live_handoffs(&resolved.squad_id, resolved.task_idx, resolved.cell_idx)
+            {
+                cell["live_handoffs"] = handoffs;
+            }
             emit(opts, &cell, render_cell_detail);
             Ok(())
         }),
@@ -562,6 +569,24 @@ fn render_cell_detail(s: &Value) {
     ]);
     for (vi, v) in s["proof"].as_array().into_iter().flatten().enumerate() {
         println!("  proof/{vi}  {}  {}", v["kind"], v["state"]);
+    }
+    let handoffs = &s["live_handoffs"];
+    if handoffs["nothing_to_test"].as_bool() == Some(true) {
+        println!("live handoffs: (nothing to test live)");
+    }
+    let tests = handoffs["tests"].as_array().cloned().unwrap_or_default();
+    if !tests.is_empty() {
+        println!("live handoffs:");
+        for (i, test) in tests.iter().enumerate() {
+            let text = test.as_str().unwrap_or_default();
+            for (line_no, line) in text.lines().enumerate() {
+                if line_no == 0 {
+                    println!("  {i}. {line}");
+                } else {
+                    println!("     {line}");
+                }
+            }
+        }
     }
 }
 

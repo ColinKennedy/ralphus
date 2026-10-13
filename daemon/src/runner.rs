@@ -792,6 +792,18 @@ impl RunnerSpec {
             }
             (None, None) => None,
         };
+        // Live actions: every prompt cell is asked how it would test its own
+        // work live; the answer (`RALPHUS_LIVE_ACTION:` markers) seeds its
+        // review's live actions. Only cells get this -- review-side agents
+        // build their specs elsewhere and never see it.
+        let system_prompt = if row.prompt.is_some() {
+            combine_system_prompts([
+                system_prompt.as_deref(),
+                Some(crate::live_actions::LIVE_HANDOFF_SYSTEM_PROMPT),
+            ])
+        } else {
+            system_prompt
+        };
         // Carry the stored position through; when the subproject injection
         // creates a system prompt where none existed before, record "append" so
         // the wire contract is self-consistent.
@@ -4478,6 +4490,10 @@ mod tests {
             remediation_attempts: None,
         };
         let spec = RunnerSpec::from_row("run-1", &row);
+        assert!(
+            spec.system_prompt.is_none(),
+            "a command cell has no agent to ask for live handoffs"
+        );
         let json = serde_json::to_string(&spec).unwrap();
         assert!(json.contains("\"squad_id\":\"run-1\""));
         assert!(json.contains("\"command\":\"cargo build\""));
@@ -4607,11 +4623,20 @@ mod tests {
         let spec = RunnerSpec::from_row("run-1", &row);
         assert_eq!(
             spec.system_prompt.as_deref(),
-            Some("Follow the house style.")
+            Some(
+                format!(
+                    "Follow the house style.
+
+{}",
+                    crate::live_actions::LIVE_HANDOFF_SYSTEM_PROMPT
+                )
+                .as_str()
+            ),
+            "the author's system prompt comes first, then the live-handoff question"
         );
         assert_eq!(spec.system_prompt_position.as_deref(), Some("append"));
         let json = serde_json::to_string(&spec).unwrap();
-        assert!(json.contains("\"system_prompt\":\"Follow the house style.\""));
+        assert!(json.contains("\"system_prompt\":\"Follow the house style."));
         assert!(json.contains("\"system_prompt_position\":\"append\""));
     }
 
@@ -4907,6 +4932,10 @@ mod tests {
         assert!(effective.contains("non-interactive cell"));
         assert!(effective.contains("single, non-interactive invocation"));
         assert!(effective.contains("RALPHUS_GHOST:"));
+        assert!(
+            effective.contains("RALPHUS_LIVE_ACTION:"),
+            "prompt cells are asked for live handoffs: {effective}"
+        );
         assert!(!effective.contains("RALPHUS_PROOF: PASS"));
         assert!(
             effective.contains("waypoint bearing block"),
@@ -5249,11 +5278,12 @@ mod tests {
             remediation_attempts: None,
         };
         let spec = RunnerSpec::from_row("run-1", &row);
-        assert!(
-            spec.system_prompt.is_none(),
-            "no injection when subproject is absent"
+        assert_eq!(
+            spec.system_prompt.as_deref(),
+            Some(crate::live_actions::LIVE_HANDOFF_SYSTEM_PROMPT),
+            "no subproject injection when subproject is absent -- only the              live-handoff question every prompt cell gets"
         );
-        assert!(spec.system_prompt_position.is_none());
+        assert_eq!(spec.system_prompt_position.as_deref(), Some("append"));
     }
 
     #[test]

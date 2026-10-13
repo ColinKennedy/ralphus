@@ -4718,6 +4718,34 @@ fn run_cell_worker(
         }
     }
 
+    // Live actions: how this cell's agent said it would test its work live.
+    // Recorded from every finished prompt cell's final reply; the review the
+    // cell lands in turns them into live actions.
+    if row.prompt.is_some() && result.is_done() {
+        let handoffs = crate::live_actions::parse_live_handoffs(&result.summary);
+        let guard = store.lock();
+        if guard
+            .replace_cell_live_handoffs(squad_id, row.task_idx, row.idx, &handoffs)
+            .is_ok()
+        {
+            let (count, nothing_to_test) = match &handoffs {
+                crate::live_actions::LiveHandoffs::NoMarker => (0, false),
+                crate::live_actions::LiveHandoffs::NothingToTest => (0, true),
+                crate::live_actions::LiveHandoffs::Tests(tests) => (tests.len(), false),
+            };
+            crate::cartographer::Note::new("scheduler")
+                .squad(squad_id)
+                .cell(&row.cell_id)
+                .task(&row.task_name)
+                .scope("cell")
+                .emit(
+                    &guard,
+                    "live handoffs recorded",
+                    serde_json::json!({"count": count, "nothing_to_test": nothing_to_test}),
+                );
+        }
+    }
+
     if let Some(ghost_text) = result.ghost.as_deref().map(str::trim) {
         if !ghost_text.is_empty() {
             let uri = crate::ghost::cell_uri(squad_id, row.task_idx, row.idx);

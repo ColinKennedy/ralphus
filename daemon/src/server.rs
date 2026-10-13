@@ -1802,6 +1802,9 @@ fn route_for_user(
             cell_proof_env_view(daemon, id, ti, si)
         }
         ("GET", ["api", "squads", id, "cells", ti, si, "env"]) => cell_env_view(daemon, id, ti, si),
+        ("GET", ["api", "squads", id, "cells", ti, si, "live-handoffs"]) => {
+            cell_live_handoffs_view(daemon, id, ti, si)
+        }
         // RAL-191: the per-step routes must precede the scope-wide ones, since
         // `["proof", "env"]` and `["proof", vi, "env"]` are otherwise
         // ambiguous to a reader (they are not to the matcher, which is
@@ -10099,6 +10102,23 @@ fn cell_env_view(daemon: &Daemon, id: &str, ti: &str, si: &str) -> Reply {
     env_view_reply(daemon, |store| {
         crate::env_view::cell_env(store, id, task_idx, cell_idx)
     })
+}
+
+/// `GET /api/squads/{id}/cells/{ti}/{si}/live-handoffs`: how this cell's
+/// agent said it would test its work live (`RALPHUS_LIVE_ACTION:`), the seed
+/// of its review's live actions.
+fn cell_live_handoffs_view(daemon: &Daemon, id: &str, ti: &str, si: &str) -> Reply {
+    let (task_idx, cell_idx) = match (parse_index(ti, "task index"), parse_index(si, "cell index"))
+    {
+        (Ok(t), Ok(c)) => (t, c),
+        (Err(reply), _) | (_, Err(reply)) => return reply,
+    };
+    match daemon.with_read_snapshot(|conn| {
+        crate::live_actions::cell_live_handoffs_conn(conn, id, task_idx, cell_idx)
+    }) {
+        Ok(handoffs) => json(200, &handoffs),
+        Err(e) => store_error(&e),
+    }
 }
 
 /// `GET /api/squads/{id}/cells/{ti}/{si}/proof/env` (RAL-324).

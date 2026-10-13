@@ -380,6 +380,19 @@ impl DaemonClient {
         self.get(&format!("/api/squads/{squad_id}"))
     }
 
+    /// How one cell's agent said it would test its work live
+    /// (`RALPHUS_LIVE_ACTION:` handoffs).
+    pub fn cell_live_handoffs(
+        &self,
+        squad_id: &str,
+        task_idx: i64,
+        cell_idx: i64,
+    ) -> Result<Value, DaemonError> {
+        self.get(&format!(
+            "/api/squads/{squad_id}/cells/{task_idx}/{cell_idx}/live-handoffs"
+        ))
+    }
+
     /// One surface's resolved environment (RAL-324). `api_path` is the very
     /// path that surface's overrides are *set* on -- the daemon serves each
     /// read-only view as a `GET` twin of the matching `POST .../env` route --
