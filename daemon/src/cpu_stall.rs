@@ -291,6 +291,10 @@ mod tests {
                 .expect("baseline entry recorded");
             entry.flat_since_ms -= CPU_STALL_MIN_SPAN_MS + 1000;
             entry.flat_samples = CPU_STALL_MIN_SAMPLES - 1;
+            // A just-spawned child can still be burning startup CPU between
+            // the two sweeps, which would restart the streak; pin the
+            // baseline above any reading so the second sweep counts as flat.
+            entry.last_cpu_secs = f64::MAX;
         }
         tracker.sweep(&store, &procs);
 
