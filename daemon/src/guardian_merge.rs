@@ -16306,8 +16306,6 @@ enum ManualCheckItem {
         #[serde(default)]
         description: Option<String>,
         #[serde(default)]
-        success: Option<String>,
-        #[serde(default)]
         run_on: Option<String>,
         #[serde(default)]
         prepare: Vec<crate::guardian::GuardianAutoBuild>,
@@ -16336,7 +16334,6 @@ impl From<ManualCheckItem> for GuardianCheck {
             ManualCheckItem::Structured {
                 command,
                 description,
-                success,
                 run_on,
                 prepare,
                 artifacts,
@@ -16348,7 +16345,6 @@ impl From<ManualCheckItem> for GuardianCheck {
                 command: Some(command),
                 prompt: None,
                 description,
-                success,
                 run_on: Some(run_on.unwrap_or_else(|| "daemon".to_string())),
                 prepare,
                 artifacts,
@@ -16496,7 +16492,7 @@ pub fn manual_commands_prompt(tail: &str, steering: Option<&str>) -> String {
          runnable command line -- never an instruction written for a person. To get a person \
          to look at something, launch it with a command (e.g. `Start-Process \
          http://localhost:{port}`) and write what to look at and what correct looks like in \
-         \"description\" and \"success\". A \"command\" such as `Open http://... in your browser. \
+         \"description\". A \"command\" such as `Open http://... in your browser. \
          Verify: ...` is wrong and will fail. \
          If a command depends on a value that could vary or collide between runs -- a \
          port number, a file path, a branch name, anything where running the same \
@@ -16511,7 +16507,7 @@ pub fn manual_commands_prompt(tail: &str, steering: Option<&str>) -> String {
          a blanket kill by image name such as `taskkill /IM python.exe` or `pkill python`, \
          which would take down unrelated work on the machine. A command with nothing variable and nothing \
          left running can stay a plain string. Structured objects may also include \
-         \"description\" and \"success\" guidance. Set \"auto_run\": true on an object only \
+         \"description\" guidance. Set \"auto_run\": true on an object only \
          when you are very confident the command is safe to start unattended -- idempotent, \
          non-destructive, non-interactive, and every input has a safe \"default\"; omit it \
          otherwise. You are writing every check of this review in this one answer, so look at \
@@ -18935,6 +18931,8 @@ mod tests {
 
     #[test]
     fn generated_manual_command_can_carry_preparation_and_observation_guidance() {
+        // A model that still answers with the retired "success" key is
+        // tolerated; the key is simply dropped.
         let text = r#"{
             "manual_commands": [{
                 "command": "target/debug/demo",
@@ -18948,10 +18946,6 @@ mod tests {
 
         assert_eq!(checks[0].run_on.as_deref(), Some("daemon"));
         assert_eq!(checks[0].description.as_deref(), Some("Open the window"));
-        assert_eq!(
-            checks[0].success.as_deref(),
-            Some("The greeting is visible")
-        );
         assert_eq!(
             checks[0].prepare[0].command.as_deref(),
             Some("cargo build --bin demo")

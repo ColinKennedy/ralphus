@@ -2044,9 +2044,6 @@ pub struct ReviewActionDef {
     /// What the reviewer should inspect while the action runs.
     #[serde(default)]
     pub description: Option<String>,
-    /// A concise statement of what a successful observation looks like.
-    #[serde(default)]
-    pub success: Option<String>,
     /// Ordered unattended steps specific to this action.
     #[serde(default)]
     pub prepare: Vec<PreparationStepDef>,

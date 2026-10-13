@@ -617,8 +617,6 @@ Tip: validate before submitting -- `ralphus validate file.toml`
  prompt  string  ONE-OF Hint text forwarded to the resolver LLM
                  to expand into a runnable command during preparation.
  description string     What the reviewer should inspect.
- success string         Optional guidance on what to inspect. Omit it for the
-                        normal "exit code 0" manual action.
 
 [[review.action.prepare]] belongs to the immediately preceding
 [[review.action]] and uses the same command/prompt shape as [[review.prepare]]
@@ -1214,7 +1212,6 @@ agent   = "{<insert recommended agent here>}"  # optional: uses review's agent i
 label   = "Run tests"
 command = "target/debug/my-test-runner"
 description = "Run the already-built focused test executable."
-success = "The focused scenario completes and prints PASS."
 
 [[review.action]]
 label  = "Frontend smoke test"

@@ -25,7 +25,6 @@ label = "Tutor shows this project's hints"
 command = "cargo run -q -p ralphus-cli -- tutor"
 auto_run = true
 description = "Prints the task tutorial followed by this file's suggested checks, nearest .ralphus.toml first."
-success = "The output ends with the project's manual-check suggestions and lists every label in this file."
 
 [[review.action.hint]]
 include_when = "Any change to the tutor text, the project-file parser, or this file's [[review.action]] / [[review.action.hint]] schema."
@@ -37,7 +36,6 @@ command = "bash scripts/build-debug.sh --daemon-port {daemon_port} --librarian-p
 cleanup_command = "ralphus-daemon stop --port {daemon_port}"
 auto_run = false
 description = "Boots a second daemon and board on their own database, then open the board at the librarian port. Ctrl-C stops both; the cleanup command stops a daemon left behind on that daemon port."
-success = "The Reviews tab renders the changed UI in both themes, tooltips read correctly, and the browser console is clean."
 
 [[review.action.input]]
 name = "daemon_port"
@@ -62,7 +60,6 @@ command = "bash scripts/build-debug.sh --daemon-port {daemon_port} --librarian-p
 cleanup_command = "ralphus-daemon stop --port {daemon_port}"
 auto_run = false
 description = "Boots the isolated stack, then exercise the changed route against the daemon port (for example its /api/daemon), or point the CLI at it with --daemon-url."
-success = "The changed endpoint answers with the documented shape, an existing database is migrated without errors in the daemon log, and the board still loads."
 
 [[review.action.input]]
 name = "daemon_port"
@@ -83,7 +80,6 @@ label = "Auto-run of a manual check"
 prompt = "Using the isolated dev stack from the checks above, on the same daemon and librarian ports they use, submit a task file with a [[review]] whose [[review.action]] sets auto_run = true and has no prepare steps. Confirm its terminal opens by itself when the review settles, runs once, and the board row shows an 'auto' badge. Then start a rebase or feedback pass while the check is still running and confirm the row shows the out-of-date warning and the run is not killed."
 auto_run = false
 description = "End-to-end check of auto-run, which no unit test can see: a real terminal opening unattended."
-success = "One terminal, one run, an 'auto' badge, and a warning (not a kill) when a newer rebase, feedback pass or auto-PR fix arrives mid-run."
 
 [[review.action.hint]]
 include_when = "Any change to auto-run: daemon/src/auto_run.rs, the manual-check preparation hooks in guardian_merge.rs, or the auto_run setting."
@@ -94,7 +90,6 @@ label = "CLI and MCP surface"
 prompt = "Build the CLI and MCP server, then run the CLI with '<group> --help' for each command group you changed and confirm the help text, flags and defaults read correctly. List the MCP tools and confirm every new CLI command or flag has a matching tool."
 auto_run = false
 description = "Reads the changed help text the way a user would; mcp/tests/parity.rs only proves a tool exists, not that its description is right."
-success = "Help text is accurate, flags are documented with their defaults, and each new CLI command has an MCP tool."
 
 [[review.action.hint]]
 include_when = "Any change to the CLI command tree (cli/src/help_map.rs, cli/src/commands/) or the MCP server."
@@ -105,7 +100,6 @@ label = "Documentation site"
 command = "bash scripts/docs-build.sh"
 auto_run = true
 description = "Renders docs/site/pages into docs/site/_site with MkDocs (git-ignored). Read the changed pages in the output."
-success = "The build finishes without warnings about broken links or missing pages."
 
 [[review.action.hint]]
 include_when = "Any change under docs/ or to a command or board surface the docs describe."

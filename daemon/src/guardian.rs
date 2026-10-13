@@ -139,9 +139,6 @@ pub struct GuardianCheck {
     /// What the reviewer should observe while this action runs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
-    /// Human-facing success criteria. This is guidance, never an approval gate.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub success: Option<String>,
     /// `daemon` or `review_machine`; unset selects the review machine for a
     /// remote review and the daemon for a local review.
     #[serde(default, skip_serializing_if = "Option::is_none")]

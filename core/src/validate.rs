@@ -336,7 +336,6 @@ const REVIEW_ACTION_KEYS: &[&str] = &[
     "prompt",
     "command",
     "description",
-    "success",
     "prepare",
     "cleanup_command",
     "input",
@@ -3083,7 +3082,6 @@ fn validate_review_action_array(value: Option<&toml::Value>, path: &str, ctx: &m
         check_type(ctx, table, "cleanup_command", Ty::Str, &apath, None);
         check_type(ctx, table, "auto_run", Ty::Bool, &apath, None);
         check_type(ctx, table, "description", Ty::Str, &apath, None);
-        check_type(ctx, table, "success", Ty::Str, &apath, None);
         for key in ["command", "cleanup_command"] {
             if let Some(value) = table.get(key).and_then(toml::Value::as_str) {
                 check_worktree_text_placeholders(ctx, &format!("{apath}.{key}"), value);
@@ -6529,7 +6527,6 @@ command = "cargo build"
 label = "Run build"
 command = "staged/app"
 description = "Exercise the prepared binary"
-success = "It prints PASS"
 [[review.action.artifact]]
 source = "target/debug/app"
 destination = "staged/app"

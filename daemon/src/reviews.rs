@@ -557,7 +557,6 @@ fn actions_to_hints(actions: &[ReviewActionDef]) -> Vec<GuardianCheck> {
             command: a.command.clone(),
             prompt: a.prompt.clone(),
             description: a.description.clone(),
-            success: a.success.clone(),
             prepare: a.prepare.iter().map(into_guardian_preparation).collect(),
             cleanup_command: a.cleanup_command.clone(),
             shared_store: a.shared_store.as_ref().map(|store| {
