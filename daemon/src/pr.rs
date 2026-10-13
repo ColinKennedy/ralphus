@@ -8819,17 +8819,19 @@ fn submit_stack_for_guardian(
     // A PR the `refresh_open_prs` call above just found merged on the forge is
     // not yet settled into its branch's own `merged` status -- that happens on
     // the next merge poll, once the merged base has been fetched. Until then
-    // the branch must not be filed again when nothing was committed since that
-    // PR's last push: the new PR would re-open work that already landed (and,
-    // stacked on its lower neighbour, show it as a fresh diff). A branch with
-    // newer commits still gets its new PR.
-    let landed_pushes: Vec<(String, String)> = store
+    // the branch must not be filed again: the new PR would re-open work that
+    // already landed (and, stacked on its lower neighbour, show it as a fresh
+    // diff). The branch's current tip is deliberately not compared with the
+    // merged push -- a restack onto the base that just absorbed the merge
+    // rewrites the tip, so a SHA match misses exactly the case this guards.
+    // An explicit per-branch request still bypasses this.
+    let merged_branch_ids: std::collections::HashSet<String> = store
         .lock()
         .list_pull_requests_for_guardian(id)
         .unwrap_or_default()
         .into_iter()
-        .filter(|pr| pr.state == "merged")
-        .filter_map(|pr| Some((pr.branch_id?, pr.last_pushed_sha?)))
+        .filter(|pr| pr.state == "merged" && pr.pr_kind == "parent")
+        .filter_map(|pr| pr.branch_id)
         .collect();
     let mut created = Vec::new();
     // One branch's PR failing to submit (e.g. GitHub's "no commits between
@@ -8852,29 +8854,15 @@ fn submit_stack_for_guardian(
         ) {
             continue;
         }
-        if landed_pushes
-            .iter()
-            .any(|(branch_id, _)| *branch_id == branch.id)
-        {
-            let branch_root = branch.project.as_deref().map_or(root, Path::new);
-            let tip = branch
-                .review_branch
-                .as_deref()
-                .and_then(|rev| crate::guardian_merge::git(branch_root, &["rev-parse", rev]).ok())
-                .map(|sha| sha.trim().to_string());
-            if landed_pushes
-                .iter()
-                .any(|(branch_id, sha)| *branch_id == branch.id && Some(sha) == tip.as_ref())
-            {
-                // ralphus[ignore-rlog-pair]: a skipped re-file; the merge poll records the branch's `merged` transition
-                crate::rlog!(
-                    INFO,
-                    "ralphus [pr] review {id} branch {} not re-filed: its last push is already \
-                     merged on the forge",
-                    branch.branch
-                );
-                continue;
-            }
+        if merged_branch_ids.contains(branch.id.as_str()) {
+            // ralphus[ignore-rlog-pair]: a skipped re-file; the merge poll records the branch's `merged` transition
+            crate::rlog!(
+                INFO,
+                "ralphus [pr] review {id} branch {} not re-filed: its PR is already merged on \
+                 the forge",
+                branch.branch
+            );
+            continue;
         }
         let req = PrRequest {
             branch_id: Some(branch.id.clone()),
@@ -16741,6 +16729,125 @@ mod tests {
             branch.merge_status,
             MergeStatus::Closed.as_str(),
             "the branch must be marked closed, not silently left done"
+        );
+
+        mock.finish();
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&remote_dir);
+    }
+
+    #[test]
+    fn submit_stack_for_guardian_never_refiles_a_branch_whose_pr_merged_even_after_a_restack() {
+        // Regression test (guardian-000000000217, PR #665): a branch's PR
+        // merged, the review then restacked the branch onto the base that
+        // absorbed the merge, and the terminal transition's auto-submit opened
+        // a second PR for it -- the branch's `merge_status` is still `done`
+        // until the next merge poll, and its rewritten tip no longer matched
+        // the merged PR's last pushed SHA, so the same-SHA guard let it
+        // through. A merged PR row alone must keep the branch out of a
+        // whole-stack submission, whatever its tip is now.
+        let mock = MockForge::start(move |_server| {
+            // No forge request is expected: the only PR row is already
+            // merged, so nothing is polled and nothing may be created.
+        });
+
+        let root = tmp_dir("refile-merged-root");
+        let remote_dir = tmp_dir("refile-merged-remote");
+        let mut init_opts = git2::RepositoryInitOptions::new();
+        init_opts.initial_head("main");
+        let repo = git2::Repository::init_opts(&root, &init_opts).unwrap();
+        let sig = git2::Signature::now("t", "t@t").unwrap();
+        gwrite(&root, "base.txt", "base\n");
+        let base_oid = git2_commit_all(&repo, &sig, "base", &[]);
+        let base_commit = repo.find_commit(base_oid).unwrap();
+        repo.branch("branch-a", &base_commit, false).unwrap();
+        git2_checkout(&repo, "branch-a");
+        gwrite(&root, "a.txt", "a\n");
+        git2_commit_all(&repo, &sig, "commit a", &[&base_commit]);
+        git2_checkout(&repo, "main");
+
+        git2::Repository::init_bare(&remote_dir).unwrap();
+        repo.remote("origin", remote_dir.to_str().unwrap()).unwrap();
+
+        let store = Arc::new(crate::store_lock::StoreMutex::new(store()));
+        let gid = store
+            .lock()
+            .create_guardian("demo", "main", root.to_str().unwrap())
+            .unwrap();
+        store.lock().add_guardian_branch(&gid, "branch-a").unwrap();
+        let branch_id = store.lock().get_guardian(&gid).unwrap().branches[0]
+            .id
+            .clone();
+        store
+            .lock()
+            .set_branch_review(&gid, &branch_id, "branch-a", root.to_str().unwrap())
+            .unwrap();
+        store
+            .lock()
+            .set_branch_status(&gid, &branch_id, MergeStatus::Done, None)
+            .unwrap();
+        let merged_pr_id = store
+            .lock()
+            .create_pull_request(
+                &gid,
+                Some(branch_id.as_str()),
+                "github",
+                "acme/w",
+                "branch-a-pr",
+                "main",
+                "Add a",
+                "Adds a.",
+                Some(99),
+                Some("http://x/99"),
+            )
+            .unwrap();
+        store
+            .lock()
+            .update_pull_request(&merged_pr_id, None, None, None, Some("merged"))
+            .unwrap();
+
+        let client = mock.client(crate::forge::ForgeKind::GitHub, "acme/w");
+        let runner = NoopRunner;
+        let guardian = store.lock().get_guardian(&gid).unwrap();
+        let ordered_enabled: Vec<&BranchView> = guardian.branches.iter().collect();
+        let existing_prs = store.lock().list_pull_requests_for_guardian(&gid).unwrap();
+        let mut alias_by_branch = HashMap::new();
+
+        let (created, failed) = submit_stack_for_guardian(
+            &store,
+            &runner,
+            &client,
+            &gid,
+            &root,
+            "origin",
+            &guardian,
+            &ordered_enabled,
+            &mut alias_by_branch,
+            "main",
+            &existing_prs,
+            "{name}-pr",
+            None,
+            "stack-1",
+            None,
+            None,
+            None,
+            false,
+        )
+        .expect("skipping a merged branch must not fail the batch");
+
+        assert!(
+            created.is_empty(),
+            "a branch whose PR already merged must not get a second PR"
+        );
+        assert!(failed.is_empty());
+        assert_eq!(
+            store
+                .lock()
+                .list_pull_requests_for_guardian(&gid)
+                .unwrap()
+                .len(),
+            1,
+            "no new PR row may be recorded"
         );
 
         mock.finish();
