@@ -109,6 +109,7 @@
       .running-menu div:hover { background: var(--panel-2); }
       .icon-btn { background: none; border: 1px solid var(--border); color: var(--text); border-radius: 6px; padding: 3px 8px; }
       a.icon-btn { display: inline-block; line-height: normal; text-decoration: none; cursor: pointer; }
+      .icon-btn:disabled { opacity: .35; cursor: default; }
       .copy-btn { background: none; border: 1px solid var(--border); color: var(--muted); border-radius: 5px; padding: 0 6px; font-size: 12px; line-height: 1.7; vertical-align: middle; }
       .copy-btn:hover { color: var(--text); }
       .copy-btn.copied { color: var(--done); border-color: var(--done); }
