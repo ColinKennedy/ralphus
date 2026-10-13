@@ -555,6 +555,7 @@ pub fn run_loop(
     // down is retired promptly instead of waiting a full interval.
     if first_run {
         crate::guardian_merge::retire_stale_worktrees(&store);
+        crate::live_runs::retire_live_refs(&store);
         crate::pr::sweep_terminal_dual_root_upstream_branches(&store);
     }
     let mut last_worktree_retirement = std::time::Instant::now();
@@ -680,6 +681,7 @@ pub fn run_loop(
         }
         if last_worktree_retirement.elapsed() >= WORKTREE_RETIREMENT_INTERVAL {
             crate::guardian_merge::retire_stale_worktrees(&store);
+            crate::live_runs::retire_live_refs(&store);
             crate::pr::sweep_terminal_dual_root_upstream_branches(&store);
             last_worktree_retirement = std::time::Instant::now();
         }

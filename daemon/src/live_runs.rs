@@ -326,6 +326,19 @@ impl crate::store::Store {
         Ok(n == 1)
     }
 
+    /// Forget a run's live ref once it has been deleted.
+    ///
+    /// # Errors
+    ///
+    /// On a database failure.
+    pub fn clear_live_run_ref(&self, run_id: &str) -> crate::store::Result<()> {
+        self.conn.execute(
+            "UPDATE guardian_live_runs SET live_ref=NULL WHERE run_id=?",
+            rusqlite::params![run_id],
+        )?;
+        Ok(())
+    }
+
     /// Record what happened to a run's commits.
     ///
     /// # Errors
@@ -1179,6 +1192,134 @@ pub fn sweep_automatic_runs(store: &crate::store_lock::StoreHandle, runners: &Li
     retry_pending_integrations(store, runners);
 }
 
+/// Daily cleanup of live refs (called with the worktree retirement sweep).
+///
+/// For a review that has finished (`deployed`, `cancelled`, `merge_failed`):
+/// a live ref whose commits were carried (or that never had any) is deleted.
+/// One whose commits never landed is kept -- it may be the only copy of a fix
+/// -- and the review's watchers are told once, with what to do.
+///
+/// Live refs of a review that no longer exists at all are deleted: deleting
+/// the review discarded its work.
+pub fn retire_live_refs(store: &crate::store_lock::StoreHandle) {
+    let finished: Vec<(String, String, String, String, String)> = {
+        let guard = store.lock();
+        let Ok(mut stmt) = guard.conn.prepare(
+            "SELECT r.run_id, r.live_ref, r.integration, g.id, g.git_root
+             FROM guardian_live_runs r JOIN guardians g ON g.id = r.guardian_id
+             WHERE r.live_ref IS NOT NULL
+               AND g.status IN ('deployed', 'cancelled', 'merge_failed')",
+        ) else {
+            return;
+        };
+        stmt.query_map([], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+        })
+        .map(|rows| rows.flatten().collect())
+        .unwrap_or_default()
+    };
+    for (run_id, live_ref, integration, gid, git_root) in finished {
+        let ws = crate::workspace::Workspace::for_guardian(store, &gid, git_root.as_str());
+        match integration.as_str() {
+            "integrated" | "none" | "skipped" => {
+                let _ = ws.git(&["update-ref", "-d", &live_ref]);
+                let _ = store.lock().clear_live_run_ref(&run_id);
+                crate::cartographer::Note::new("guardian")
+                    .guardian(&gid)
+                    .scope("live_action")
+                    .emit(
+                        &store.lock(),
+                        "live ref retired",
+                        serde_json::json!({"run_id": run_id, "live_ref": live_ref}),
+                    );
+            }
+            "kept" => {}
+            _ => {
+                // Commits that never landed: keep them, say so once.
+                let guard = store.lock();
+                let _ = guard.set_live_run_integration(
+                    &run_id,
+                    "kept",
+                    Some("the review finished with this run's commits not carried; kept on its live ref"),
+                );
+                let _ = guard.enqueue_error_mailbox_message(
+                    crate::mailbox::MailboxPriority::Normal,
+                    &format!(
+                        "Review {gid} finished, but a live action's commits were never carried                          into it; they are kept on {live_ref}."
+                    ),
+                    &crate::mailbox::Remediation::ManualInterventionRequired {
+                        guidance: format!(
+                            "inspect them with `git log {live_ref}` in {git_root}; cherry-pick                              what is worth keeping, then delete the ref with                              `git update-ref -d {live_ref}`"
+                        ),
+                    },
+                    None,
+                    None,
+                    None,
+                    Some(&format!("guardian:{gid}")),
+                    Some("live_actions"),
+                );
+            }
+        }
+    }
+    retire_orphan_live_refs(store);
+}
+
+/// Delete live refs whose review no longer exists, in every repository a
+/// review or registered project lives in.
+fn retire_orphan_live_refs(store: &crate::store_lock::StoreHandle) {
+    let (roots, known): (Vec<String>, std::collections::HashSet<String>) = {
+        let guard = store.lock();
+        let mut roots: Vec<String> = Vec::new();
+        if let Ok(mut stmt) = guard
+            .conn
+            .prepare("SELECT DISTINCT git_root FROM guardians")
+        {
+            if let Ok(rows) = stmt.query_map([], |r| r.get::<_, String>(0)) {
+                roots.extend(rows.flatten());
+            }
+        }
+        if let Ok(projects) = guard.list_projects() {
+            roots.extend(projects.into_iter().map(|p| p.path));
+        }
+        roots.sort();
+        roots.dedup();
+        let mut known = std::collections::HashSet::new();
+        if let Ok(mut stmt) = guard.conn.prepare("SELECT id FROM guardians") {
+            if let Ok(rows) = stmt.query_map([], |r| r.get::<_, String>(0)) {
+                known.extend(rows.flatten());
+            }
+        }
+        (roots, known)
+    };
+    for root in roots {
+        if !std::path::Path::new(&root).is_dir() {
+            continue;
+        }
+        let ws = crate::workspace::Workspace::local(&root);
+        let Ok(refs) = ws.git(&[
+            "for-each-ref",
+            "--format=%(refname)",
+            crate::live_actions::LIVE_REF_PREFIX,
+        ]) else {
+            continue;
+        };
+        for name in refs.lines().map(str::trim).filter(|l| !l.is_empty()) {
+            let owner = name
+                .strip_prefix(crate::live_actions::LIVE_REF_PREFIX)
+                .and_then(|rest| rest.trim_start_matches('/').split('/').next())
+                .unwrap_or_default();
+            if owner.is_empty() || known.contains(owner) {
+                continue;
+            }
+            let _ = ws.git(&["update-ref", "-d", name]);
+            crate::rlog!(
+                INFO,
+                "ralphus [guardian] deleted orphan live ref {name} in {root} (its review no longer exists)"
+            );
+        }
+    }
+}
+
 /// Queue manual runs: one action (`Some(idx)`) or all of them. Generates the
 /// review's live actions first when it has none yet. Returns the queued run
 /// ids.
@@ -1606,6 +1747,109 @@ prompt = "first"
         let run = live_run_conn(&f.store.lock().conn, &id).unwrap();
         assert_eq!(run.state, "cancelled");
         assert!(cancel_run(&f.store, &id).is_err(), "nothing left to cancel");
+    }
+
+    fn ref_exists(dir: &Path, name: &str) -> bool {
+        std::process::Command::new("git")
+            .args(["rev-parse", "--verify", "--quiet", name])
+            .current_dir(dir)
+            .status()
+            .unwrap()
+            .success()
+    }
+
+    /// A finished run of `f`'s review with its commits pinned on a live ref.
+    fn run_with_ref(f: &Fixture, integration: &str) -> (String, String) {
+        let id = f
+            .store
+            .lock()
+            .queue_live_run(&f.gid, LiveRunKind::Live, 0, "x", "auto")
+            .unwrap();
+        let live_ref = crate::live_actions::live_ref_name(&f.gid, &id);
+        git(&f.dir, &["update-ref", &live_ref, "HEAD"]);
+        f.store
+            .lock()
+            .conn
+            .execute(
+                "UPDATE guardian_live_runs SET state='finished', live_ref=?, integration=?
+                 WHERE run_id=?",
+                rusqlite::params![live_ref, integration, id],
+            )
+            .unwrap();
+        (id, live_ref)
+    }
+
+    #[test]
+    fn a_finished_reviews_spent_live_refs_are_retired_and_unlanded_ones_kept() {
+        let f = fixture("retire", "ok");
+        let (done_id, done_ref) = run_with_ref(&f, "integrated");
+        let (kept_id, kept_ref) = run_with_ref(&f, "failed");
+
+        // Still in review: nothing is touched.
+        retire_live_refs(&f.store);
+        assert!(ref_exists(&f.dir, &done_ref) && ref_exists(&f.dir, &kept_ref));
+
+        f.store
+            .lock()
+            .conn
+            .execute(
+                "UPDATE guardians SET status='deployed' WHERE id=?",
+                rusqlite::params![f.gid],
+            )
+            .unwrap();
+        retire_live_refs(&f.store);
+        assert!(
+            !ref_exists(&f.dir, &done_ref),
+            "carried commits: ref retired"
+        );
+        assert!(
+            f.store
+                .lock()
+                .live_run(&done_id)
+                .unwrap()
+                .live_ref
+                .is_none()
+        );
+        assert!(
+            ref_exists(&f.dir, &kept_ref),
+            "commits that never landed are kept"
+        );
+        assert_eq!(
+            f.store.lock().live_run(&kept_id).unwrap().integration,
+            "kept"
+        );
+
+        // Kept refs are reported once, not on every sweep.
+        let notices = |f: &Fixture| -> i64 {
+            f.store
+                .lock()
+                .conn
+                .query_row(
+                    "SELECT COUNT(*) FROM mailbox_messages WHERE category='live_actions'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap()
+        };
+        let after_first = notices(&f);
+        assert_eq!(after_first, 1, "the kept ref is reported");
+        retire_live_refs(&f.store);
+        assert_eq!(notices(&f), after_first);
+        assert!(ref_exists(&f.dir, &kept_ref));
+    }
+
+    #[test]
+    fn live_refs_of_a_deleted_review_are_removed() {
+        let f = fixture("orphan", "ok");
+        let orphan = format!("{}/guardian-gone/r1", crate::live_actions::LIVE_REF_PREFIX);
+        git(&f.dir, &["update-ref", &orphan, "HEAD"]);
+        let (_, mine) = run_with_ref(&f, "pending");
+        retire_live_refs(&f.store);
+        assert!(!ref_exists(&f.dir, &orphan), "no review owns it any more");
+        assert!(
+            ref_exists(&f.dir, &mine),
+            "a live review's ref is left alone"
+        );
     }
 
     #[test]
