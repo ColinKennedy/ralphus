@@ -17708,6 +17708,107 @@ token_env = "RALPHUS_TEST_FORGE_TOKEN"
         assert_eq!(view.merge_status, MergeStatus::Merged.as_str());
     }
 
+    /// Live gitlab.com check of the merge-detection fixes. Needs two private
+    /// projects that both have an `!1`: `$RALPHUS_LIVE_GITLAB_A` (encoded
+    /// path; `!1` open, from `feature/foo`) and `$RALPHUS_LIVE_GITLAB_B`
+    /// (`!1` merged, from another branch), plus `$RALPHUS_LIVE_GITLAB_TOKEN`.
+    #[test]
+    #[ignore = "live gitlab.com: needs RALPHUS_LIVE_GITLAB_{TOKEN,A,B}"]
+    fn live_gitlab_same_numbered_mr_in_another_project_is_not_a_merge() {
+        let (Ok(token), Ok(a), Ok(b)) = (
+            std::env::var("RALPHUS_LIVE_GITLAB_TOKEN"),
+            std::env::var("RALPHUS_LIVE_GITLAB_A"),
+            std::env::var("RALPHUS_LIVE_GITLAB_B"),
+        ) else {
+            return;
+        };
+        let new_client = |repo: &str| {
+            crate::forge::ForgeClient::new(
+                crate::forge::ForgeKind::GitLab,
+                "https://gitlab.com/api/v4".to_string(),
+                repo.to_string(),
+                Some(token.clone()),
+            )
+        };
+        let store = Arc::new(crate::store_lock::StoreMutex::new(store()));
+        let gid = store
+            .lock()
+            .create_guardian("demo", "main", "/repo")
+            .unwrap();
+        store
+            .lock()
+            .set_guardian_status(&gid, GuardianStatus::InReview, None)
+            .unwrap();
+        store
+            .lock()
+            .add_guardian_branch(&gid, "feature/foo")
+            .unwrap();
+        let branch = store.lock().get_guardian(&gid).unwrap().branches[0]
+            .id
+            .clone();
+        store
+            .lock()
+            .set_branch_status(&gid, &branch, MergeStatus::Done, None)
+            .unwrap();
+        let pr = store
+            .lock()
+            .create_pull_request(
+                &gid,
+                Some(&branch),
+                "gitlab",
+                &a,
+                "feature/foo",
+                "main",
+                "Add foo",
+                "Adds foo.",
+                Some(1),
+                None,
+            )
+            .unwrap();
+        let state_of = || store.lock().get_pull_request(&pr).unwrap().state;
+        let branch_status = || {
+            let guardian = store.lock().get_guardian(&gid).unwrap();
+            guardian
+                .branches
+                .iter()
+                .find(|x| x.id == branch)
+                .unwrap()
+                .merge_status
+                .clone()
+        };
+        let run = |client: &crate::forge::ForgeClient| {
+            let prs = store.lock().list_pull_requests_for_guardian(&gid).unwrap();
+            apply_pr_merge_check(&store, &gid, &prs, client)
+        };
+
+        // Project B's `!1` is merged; asking B about A's number must not
+        // merge A's branch.
+        run(&new_client(&b));
+        assert_eq!(state_of(), "open", "B's merged !1 leaked into A's row");
+        assert_eq!(branch_status(), MergeStatus::Done.as_str());
+        assert_eq!(
+            store.lock().get_guardian(&gid).unwrap().status.as_str(),
+            "in_review"
+        );
+
+        // Asking the right project keeps it open.
+        run(&new_client(&a));
+        assert_eq!(state_of(), "open");
+
+        // A wrongly recorded merge is corrected from the right project.
+        store
+            .lock()
+            .update_pull_request(&pr, None, None, None, Some("merged"))
+            .unwrap();
+        store
+            .lock()
+            .set_branch_status(&gid, &branch, MergeStatus::Merged, Some("pr merged"))
+            .unwrap();
+        run(&new_client(&a));
+        assert_eq!(state_of(), "open", "recorded merge was not re-verified");
+        assert_eq!(branch_status(), MergeStatus::Done.as_str());
+    }
+
     #[test]
     fn check_pr_merges_drops_a_pr_merged_out_of_band_while_mid_flight() {
         let mock = MockForge::start(move |server| {
