@@ -103,6 +103,44 @@ checkout. It never performs a build or transfer. An action stays disabled and
 shows `preparing`, `transferring`, or an actionable failure until its setup is
 complete. These outcomes are useful history but never block approval.
 
+A user action with a `prompt` instead of a `command` is run by an agent: it
+follows the steps in the prompt live in the prepared checkout, you can watch it
+in **Live View**, and if it fixes something it commits (it never pushes) and
+ralphus carries the fix onto the review's top branch. Say "read-only" in the
+prompt to forbid edits.
+
+## Live actions
+
+The tests above are ones you write. **Live actions** are the ones the work
+itself suggests: every prompt cell is asked how it would test its change live,
+and answers with one or more `RALPHUS_LIVE_ACTION:` steps (shown by `ralphus cell
+show`). When a review is opted in, ralphus collects those answers from its
+cells -- only the latest finished cell of each task -- merges the ones that
+test the same thing, and has an agent run each against the review's tip: start
+the real program, drive it, report what happened. That is what catches the
+change that passes its tests but does not actually work.
+
+Opt in per review with `[[review]] live_actions = true`, `ralphus review
+settings <selector> --live-actions`, or the "run live actions" checkbox in the
+review's Setup modal; or for a whole project with `[review] live_actions =
+true` in `.ralphus.toml` or the project's Review Settings. It is off by default:
+each run is an agent session and costs accordingly.
+
+Live actions run **once, automatically**: the first time the review's build has
+been prepared while every one of its cells has finished. They never wait for CI.
+A rebase, feedback, an auto-fix or a daemon restart never runs them again; after
+that, use **▶ Run all** or a row's **▶ Run** in the review's live actions
+section (or `ralphus review live run <selector> [--index N]`). Runs of one review
+go one at a time. Select a run to watch it in **Live View**, live while it runs
+and as a transcript afterwards; its report is also posted to the review's
+conversation.
+
+When a live run fixes something, it commits; ralphus carries those commits onto
+the review's top branch the same way it applies feedback -- pushed to the PR,
+rebuilt, restacked -- by cherry-pick when they apply cleanly, or by the review's
+resolver when the branch has moved on. A fix that cannot be carried is kept on
+its `refs/ralphus/live/...` ref and you are told how to recover it.
+
 ## Feedback
 
 ![A feedback thread with one reviewer note and one guardian reply describing an amend + push](../screenshots/reviews-chat.png)
