@@ -243,6 +243,7 @@ fn a_clean_live_fix_is_cherry_picked_onto_the_top_branch_and_pushed() {
         "the agent's own message is kept"
     );
     assert!(!r.ref_exists(&live_ref), "a confirmed live ref is deleted");
+    assert!(run.live_ref.is_none(), "and forgotten on the run");
 
     // Pushed to the PR remote, and the combined worktree rebuilt on top.
     let pushed = git(&r.remote, &["ls-tree", "-r", "--name-only", &review_branch]);

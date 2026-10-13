@@ -62,7 +62,12 @@ log) are fine. Never commit build output.\n\
 Setup and runtime failures are real findings: if the program will not start, a \
 command the steps rely on is missing, or the configuration is wrong, that is \
 exactly what you are here to catch -- report it (and fix it if it is in this \
-repository). Stop any process you started before you finish.\n\
+repository).\n\
+\n\
+Before you finish, stop every process you started -- and only those: stop each \
+by its own process id (or the terminal or job you started it in), never by \
+program name (no `taskkill /IM python.exe`, `pkill python` or similar), which \
+would kill unrelated work on this machine.\n\
 \n\
 End your reply with a short report: what you tested, what you observed, what \
 you fixed (if anything), and anything still broken.";
@@ -78,8 +83,10 @@ the thing runs (runtime errors, wiring and setup problems, behaviour that does \
 not match the intent).\n\
 \n\
 This run is read-only: do not edit, stage or commit anything, and never push. \
-Setup and runtime failures are real findings: report them. Stop any process you \
-started before you finish.\n\
+Setup and runtime failures are real findings: report them. Before you finish, \
+stop every process you started -- and only those, each by its own process id, \
+never by program name (no `taskkill /IM python.exe`, `pkill python` or \
+similar).\n\
 \n\
 End your reply with a short report: what you tested, what you observed, and \
 anything broken (with the exact error and where it comes from).";

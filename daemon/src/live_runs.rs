@@ -966,6 +966,7 @@ pub fn integrate_run(store: &crate::store_lock::StoreHandle, runner: &dyn Runner
     if !current_head.is_empty() && commits_landed(&ws, &current_head, &live_ref, &base) {
         // Feedback or an auto-fix already made the same change.
         let _ = ws.git(&["update-ref", "-d", &live_ref]);
+        let _ = store.lock().clear_live_run_ref(run_id);
         let _ = store.lock().set_live_run_integration(
             run_id,
             "integrated",
@@ -1022,6 +1023,7 @@ pub fn integrate_run(store: &crate::store_lock::StoreHandle, runner: &dyn Runner
     if exact {
         // Confirmed on the branch: the live ref has done its job.
         let _ = ws.git(&["update-ref", "-d", &live_ref]);
+        let _ = store.lock().clear_live_run_ref(run_id);
     }
     let _ = store
         .lock()
