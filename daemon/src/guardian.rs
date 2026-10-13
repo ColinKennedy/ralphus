@@ -2381,6 +2381,28 @@ impl Store {
         Ok(ids)
     }
 
+    /// Whether `guardian_id` is `collecting` and the bottom of its stack -- its
+    /// lowest-position enabled branch, the one nearest the base -- is `ready`.
+    /// That is the moment a staged merge has something to rebase: it builds the
+    /// contiguous ready prefix from the bottom and stops at the first branch
+    /// still waiting, so the rest of the stack need not be ready.
+    pub fn collecting_guardian_bottom_ready(&self, guardian_id: &str) -> Result<bool> {
+        let ready = self.conn.query_row(
+            "SELECT EXISTS (
+                 SELECT 1 FROM guardians g
+                 WHERE g.id = ?1 AND g.status = 'collecting'
+                   AND (
+                       SELECT gb.merge_status FROM guardian_branches gb
+                       WHERE gb.guardian_id = g.id AND gb.enabled = 1
+                       ORDER BY gb.position ASC LIMIT 1
+                   ) = 'ready'
+             )",
+            params![guardian_id],
+            |r| r.get::<_, i64>(0),
+        )?;
+        Ok(ready != 0)
+    }
+
     /// The `cwd` of the most recent cell that contributed to `branch` (matched
     /// via `cells.review_branch`), if any (RAL-103). Used to compute a
     /// preliminary, git-log-only change summary from the task's own worktree
@@ -11366,6 +11388,39 @@ mod tests {
         );
         assert!(store.sync_ignored_review_branches(None).unwrap().is_empty());
         assert!(!store.get_guardian(&id).unwrap().branches[0].enabled);
+    }
+
+    #[test]
+    fn bottom_ready_gate_follows_the_lowest_position_enabled_branch() {
+        // A staged merge builds the ready prefix from the bottom of the stack,
+        // so a review is startable once its bottom branch is `ready` -- even
+        // while later branches are still `pending` -- and not before.
+        let store = Store::open_in_memory().unwrap();
+        let id = store.create_guardian("r", "main", "/repo").unwrap();
+        store.add_guardian_branch(&id, "bottom").unwrap();
+        store.add_guardian_branch(&id, "top").unwrap();
+        let g = store.get_guardian(&id).unwrap();
+        let (bottom, top) = (g.branches[0].id.clone(), g.branches[1].id.clone());
+
+        assert!(!store.collecting_guardian_bottom_ready(&id).unwrap());
+        store
+            .set_branch_status(&id, &top, MergeStatus::Ready, None)
+            .unwrap();
+        assert!(
+            !store.collecting_guardian_bottom_ready(&id).unwrap(),
+            "a ready branch above a pending bottom has nothing to rebase onto"
+        );
+        store
+            .set_branch_status(&id, &bottom, MergeStatus::Ready, None)
+            .unwrap();
+        assert!(store.collecting_guardian_bottom_ready(&id).unwrap());
+        store
+            .set_guardian_status(&id, GuardianStatus::Merging, None)
+            .unwrap();
+        assert!(
+            !store.collecting_guardian_bottom_ready(&id).unwrap(),
+            "only a collecting review is startable"
+        );
     }
 
     #[test]
