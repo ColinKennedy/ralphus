@@ -2352,6 +2352,12 @@ fn build_review_from_drained_pool(
                 .add_guardian_branch_with_project(&gid, &cell.branch, None)
                 .map_err(|e| ReviewError::new(e.to_string()))?;
         }
+        // Stamp the branch beside the guardian link: readiness
+        // (`mark_ready_branches_with_done_cells`, `collecting_guardians_ready`)
+        // matches a branch to its cells through `cells.review_branch`.
+        store
+            .set_cell_review_branch(&cell.squad_id, cell.task_idx, cell.idx, &cell.branch)
+            .map_err(|e| ReviewError::new(e.to_string()))?;
         store
             .set_cell_review_guardian(&cell.squad_id, cell.task_idx, cell.idx, &gid)
             .map_err(|e| ReviewError::new(e.to_string()))?;
@@ -2365,6 +2371,11 @@ fn build_review_from_drained_pool(
                 .map_err(|e| ReviewError::new(e.to_string()))?;
         }
     }
+    // A drained pool holds only completed cells, so its branches are ready the
+    // moment the review exists; no later task completion will promote them.
+    store
+        .mark_ready_branches_with_done_cells(&gid)
+        .map_err(|e| ReviewError::new(e.to_string()))?;
     crate::cartographer::Note::new("arbiter")
         .guardian(&gid)
         .emit(
@@ -4040,6 +4051,49 @@ prompt=\"c\"
             .expect("pool was non-empty, must create a review");
         let guard = store.lock();
         assert_eq!(guard.get_guardian(&gid).unwrap().branches.len(), 1);
+    }
+
+    /// A review built from a pool of already-finished cells has nothing left
+    /// to wait for: its branches are `ready` and the review is eligible to
+    /// start, since no later task completion will ever promote them.
+    #[test]
+    fn build_review_from_drained_pool_marks_finished_branches_ready() {
+        let store = std::sync::Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
+        let src = "[[task]]
+name=\"t\"
+project=\"proj\"
+[[task.cell]]
+id=\"work\"
+cwd=\".\"
+prompt=\"a\"
+";
+        let file: ralphus_core::schema::TaskFile = toml::from_str(src).unwrap();
+        let squad_id = store.lock().insert_squad(&file, None, false).unwrap();
+        {
+            let guard = store.lock();
+            guard
+                .set_cell_state(&squad_id, 0, 0, crate::store::NodeState::Done)
+                .unwrap();
+            guard
+                .set_task_state(&squad_id, 0, crate::store::NodeState::Done)
+                .unwrap();
+            guard
+                .record_triage_pool_cell("proj", "bug", &squad_id, 0, 0, "b-work", "main")
+                .unwrap();
+        }
+        let gid = create_review_from_triage_pool(&store, "proj", "bug", |_| None)
+            .unwrap()
+            .expect("pool was non-empty, must create a review");
+        let guard = store.lock();
+        let g = guard.get_guardian(&gid).unwrap();
+        assert_eq!(g.branches[0].merge_status, "ready");
+        assert_eq!(
+            guard.collecting_guardians_ready().unwrap(),
+            vec![gid],
+            "a review of finished cells must be eligible to start"
+        );
     }
 
     /// RAL-412: the whole-pool (cron/straggler) drain hands the Arbiter every
