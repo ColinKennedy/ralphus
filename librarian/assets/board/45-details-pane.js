@@ -1196,14 +1196,6 @@
           <div class="btn-row">
             <button class="btn primary" onclick="startEdit()" data-tip="Edit this cell — change its prompt, agent, model, command, or working directory.\nIf the squad is currently running it will be stopped and reset to Pending.">✎ Edit</button>
             <button class="btn" data-click="restartCell" data-squad-id="${esc(r.id)}" data-ti="${sel.taskIdx}" data-si="${sel.cellIdx}" data-tip="Re-run this cell and all downstream cells within this squad.\nDependent squads in other tasks are also re-queued.\nThis cannot be undone.">⟳ Restart cell</button>
-            ${["failed", "pending", "queued"].includes(s.state) ? `<button class="btn" data-click="ignoreCell" data-squad-id="${esc(r.id)}" data-ti="${sel.taskIdx}" data-si="${sel.cellIdx}" data-tip="Skip this cell and keep going.
-Dependents that were blocked only by this cell run again, starting from this cell's own upstream.
-Reversible: Restart cell runs it again.">⤼ Ignore and continue</button>` : ""}
-            <button class="btn" data-click="copyCell" data-squad-id="${esc(r.id)}" data-ti="${sel.taskIdx}" data-si="${sel.cellIdx}" data-tip="Copy this cell (prompt or command, agent, proof steps) into a new one-task squad that starts from a clean base.
-The two squads link to each other.
-Who/when: a cell failed or was ignored and you want to retry it without touching this squad.">⎘ Copy to new squad</button>
-            ${r.tasks[sel.taskIdx]?.project ? `<button class="btn" data-click="copyCell" data-from-branch="1" data-squad-id="${esc(r.id)}" data-ti="${sel.taskIdx}" data-si="${sel.cellIdx}" data-tip="Same as Copy to new squad, but the new squad starts from this cell's own branch instead of a clean base.
-Who/when: the cell's earlier work is worth keeping.">⎘ Copy from branch</button>` : ""}
           </div>
           ${copyLinksSection(r)}
           ${(() => {

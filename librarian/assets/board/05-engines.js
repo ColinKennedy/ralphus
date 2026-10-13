@@ -204,9 +204,7 @@
       CLICK_HANDLERS.openCellMenu = (e, ds) => openCellMenu(e, ds.squadId || "", Number(ds.ti), Number(ds.si));
       CLICK_HANDLERS.cellMenuPick = (e, ds) => { e.stopPropagation(); cellMenuPick(ds.action || "", ds.squadId || "", Number(ds.ti), Number(ds.si)); };
       CLICK_HANDLERS.unblockPick = (e, ds) => unblockPick(ds.option || "", ds.squadId || "", Number(ds.ti), Number(ds.si));
-      CLICK_HANDLERS.ignoreCell = (e, ds) => ignoreCell(ds.squadId || "", Number(ds.ti), Number(ds.si));
       CLICK_HANDLERS.gotoSquad = (e, ds) => { e.preventDefault(); selectSquad(ds.squadId || ""); };
-      CLICK_HANDLERS.copyCell = (e, ds) => copyCell(ds.squadId || "", Number(ds.ti), Number(ds.si), ds.fromBranch === "1");
       CLICK_HANDLERS.gotoSquadItem = (e, ds) => gotoSquadItem(ds.squadId || "", ds.kind || "", Number(ds.ti), Number(ds.si), Number(ds.vi));
       CLICK_HANDLERS.gotoTriageCandidate = (e, ds) => gotoSquadItem(ds.squadId || "", "cell", Number(ds.ti), Number(ds.si), -1);
       CLICK_HANDLERS.gotoRunningItem = (e, ds) => { gotoSquadItem(ds.squadId || "", ds.kind || "", Number(ds.ti), Number(ds.si), Number(ds.vi)); byId("running-menu").classList.add("hidden"); };

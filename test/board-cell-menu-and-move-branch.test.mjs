@@ -68,6 +68,12 @@ test("the menu holds no block-fixing action other than Show ways to fix this blo
   assert.doesNotMatch(body, /ignoreCell|copyCell|extractBranch/);
 });
 
+test("the details pane has no block-fixing buttons of its own", () => {
+  assert.doesNotMatch(html, /data-click="ignoreCell"/);
+  assert.doesNotMatch(html, /data-click="copyCell"/);
+  assert.doesNotMatch(html, /CLICK_HANDLERS\.(ignoreCell|copyCell) = /);
+});
+
 test("every cell menu item has a label and a tooltip", () => {
   for (const action of cellMenuActions(blocking)) {
     assert.ok(action.label.length > 0, action.key);
