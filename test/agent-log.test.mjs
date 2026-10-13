@@ -37,3 +37,32 @@ test("filters by tool, status and text; unanswered call stays pending", () => {
   assert.equal(f({ status: "pending" }), 1);
   assert.equal(f({ q: "HIT" }), 1);
 });
+
+const { splitAgentLogArgs, agentLogPreview } = new Function(
+  `${src.slice(a, b)}\nreturn { splitAgentLogArgs, agentLogPreview };`,
+)();
+const kv = (s) => splitAgentLogArgs(s).map((x) => [x.key, x.value]);
+
+test("splits quoted args, sorted by key, tolerating commas and quotes in values", () => {
+  assert.deepEqual(kv('command="git log --oneline -20", description="Check, \\"recent\\" commits"'), [
+    ["command", "git log --oneline -20"],
+    ["description", 'Check, "recent" commits'],
+  ]);
+  assert.deepEqual(kv('b=2, a=x y'), [["a", "x y"], ["b", "2"]]);
+});
+
+test("keeps multi-line values and falls back to no args for free text", () => {
+  assert.deepEqual(kv('command="a\nb", z=1'), [["command", "a\nb"], ["z", "1"]]);
+  assert.deepEqual(kv("just some text"), []);
+  assert.deepEqual(kv('{"b":1,"a":"x"}'), [["a", "x"], ["b", "1"]]);
+});
+
+test("preview skips leading cd but expanded input keeps it", () => {
+  const e = parseAgentLog('[tool.Bash.git] Bash(command="cd \\"/a b\\" && cd c; git fetch origin", description="d")')[0];
+  assert.equal(agentLogPreview(e), "git fetch origin");
+  assert.match(e.args[0].value, /^cd "\/a b" && cd c; git fetch/);
+  const only = parseAgentLog('[tool.Bash] Bash(command="cd /x")')[0];
+  assert.equal(agentLogPreview(only), "cd /x");
+  const other = parseAgentLog("[tool.Read] Read(path=a)")[0];
+  assert.equal(agentLogPreview(other), "path=a");
+});

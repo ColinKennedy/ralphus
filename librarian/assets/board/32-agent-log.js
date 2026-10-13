@@ -13,11 +13,86 @@
        * @property {string} sub - The sub-command or sub-tool (`git`, `server.tool`), or "".
        * @property {string} tag - The full bracketed type, e.g. `tool.Bash.git`.
        * @property {string} input - The call's arguments as printed.
+       * @property {AgentLogArg[]} args - `input` split into named arguments, sorted by name; empty when it is not `name=value` shaped.
        * @property {string} output - The result text, or "" while none has arrived.
        * @property {"pending"|"ok"|"error"} status - `pending` until a result line arrives.
        */
+      /**
+       * @typedef {object} AgentLogArg
+       * @property {string} key - The argument name.
+       * @property {string} value - The argument value, quotes removed.
+       */
+      /** Tools whose `command` argument is a shell command line. */
+      const AGENT_LOG_SHELL_TOOLS = ["Bash", "bash", "powershell", "exec"];
       /** How many of the newest entries are drawn before "show earlier" is pressed. */
       const AGENT_LOG_PAGE = 150;
+      /**
+       * Splits the printed arguments (`key="v", key2=v2`, values possibly
+       * quoted and spanning lines) into named arguments sorted by name. A quote
+       * inside a quoted value only closes it when a `, key=` or the end follows.
+       * Input that is not `name=value` shaped yields no arguments.
+       * @param {string} input
+       * @returns {AgentLogArg[]}
+       */
+      function splitAgentLogArgs(input) {
+        const trimmed = input.trim();
+        if (trimmed.startsWith("{")) {
+          try {
+            const obj = JSON.parse(trimmed);
+            if (obj !== null && typeof obj === "object" && !Array.isArray(obj)) {
+              return Object.keys(obj).sort().map((key) => ({ key, value: typeof obj[key] === "string" ? obj[key] : JSON.stringify(obj[key]) }));
+            }
+          } catch (_) { /* not JSON: fall through to name=value */ }
+        }
+        const next = /^\s*(?:,\s*[A-Za-z_][\w.-]*=|$)/;
+        const keyRe = /^\s*,?\s*([A-Za-z_][\w.-]*)=/;
+        /** @type {AgentLogArg[]} */
+        const args = [];
+        let pos = 0;
+        while (pos < input.length) {
+          const km = keyRe.exec(input.slice(pos));
+          if (km === null) return [];
+          pos += km[0].length;
+          const q = input[pos];
+          let value = "";
+          if (q === '"' || q === "'") {
+            let i = pos + 1;
+            let closed = false;
+            for (; i < input.length; i++) {
+              if (input[i] === "\\" && i + 1 < input.length) { value += input[i + 1] === q ? q : input[i] + input[i + 1]; i++; continue; }
+              if (input[i] === q && next.test(input.slice(i + 1))) { closed = true; break; }
+              value += input[i];
+            }
+            pos = closed ? i + 1 : input.length;
+          } else {
+            const m = /,\s*[A-Za-z_][\w.-]*=/.exec(input.slice(pos));
+            const end = m === null ? input.length : pos + m.index;
+            value = input.slice(pos, end);
+            pos = end;
+          }
+          args.push({ key: km[1], value });
+        }
+        return args.sort((x, y) => (x.key < y.key ? -1 : x.key > y.key ? 1 : 0));
+      }
+      /**
+       * The one-line text shown on a collapsed row. A shell command's leading
+       * `cd <dir> &&` / `cd <dir>;` prefixes are skipped so the command that
+       * matters shows; a call that is only `cd` keeps showing it.
+       * @param {AgentLogEntry} e
+       * @returns {string}
+       */
+      function agentLogPreview(e) {
+        let text = e.input;
+        if (AGENT_LOG_SHELL_TOOLS.includes(e.tool)) {
+          const cmd = e.args.find((a) => a.key === "command" || a.key === "cmd");
+          if (cmd !== undefined) text = cmd.value;
+          const cd = /^\s*cd\s+(?:"[^"]*"|'[^']*'|[^\s&;|]+)\s*(?:&&|;|\n)\s*/;
+          let rest = text;
+          while (cd.test(rest)) rest = rest.replace(cd, "");
+          if (rest.trim() !== "") text = rest;
+        }
+        return text.trimStart().split("\n")[0].slice(0, 120);
+      }
       /**
        * Parses a tag-flattened log into one entry per tool call.
        * @param {string} text - The scrubbed transcript text.
@@ -45,7 +120,7 @@
             let input = rest;
             const head = `${segs[1]}(`;
             if (input.startsWith(head) && input.endsWith(")")) input = input.slice(head.length, -1);
-            cur = { index: entries.length, tool: segs[1], sub: segs.slice(2).join("."), tag, input, output: "", status: "pending" };
+            cur = { index: entries.length, tool: segs[1], sub: segs.slice(2).join("."), tag, input, args: [], output: "", status: "pending" };
             entries.push(cur);
             awaiting = cur;
             section = "input";
@@ -59,6 +134,7 @@
             section = null;
           }
         }
+        for (const e of entries) e.args = splitAgentLogArgs(e.input);
         return entries;
       }
       /**
@@ -139,7 +215,10 @@
         const open = !!(agentLogOpen[key] && agentLogOpen[key][e.index]);
         const color = e.status === "error" ? "var(--turn-error)" : typeColor(e.tag, document.documentElement.dataset.theme === "light" ? "light" : "dark");
         const statusTip = e.status === "pending" ? "No result has been logged for this call yet." : (e.status === "error" ? "The tool reported an error." : "The tool returned a result.");
-        const preview = e.input.split("\n")[0].slice(0, 120);
+        const preview = agentLogPreview(e);
+        const inputHtml = e.args.length === 0
+          ? `<pre class="alog-pre">${esc(e.input) || "(none)"}</pre>`
+          : e.args.map((a) => `<div class="alog-kv"><span class="alog-k" data-tip="The &quot;${esc(a.key)}&quot; argument of this call.">${esc(a.key)}</span><pre class="alog-pre">${esc(a.value)}</pre></div>`).join("");
         return `<details class="alog-w ${e.status}" data-idx="${e.index}" data-sig="${e.status}|${e.input.length}|${e.output.length}" ${open ? "open" : ""}
             ontoggle="agentLogToggled(this,'${esc(key).replace(/'/g, "&#39;")}')">
           <summary data-tip="Click to expand or collapse this call's input and output.\nThe log is reconstructed from the terminal text, so long values may be truncated.">
@@ -147,7 +226,7 @@
             <span class="alog-prev">${esc(preview)}</span>
             <span class="alog-st ${e.status}" data-tip="${esc(statusTip)}">${e.status === "pending" ? "…" : (e.status === "error" ? "error" : "ok")}</span>
           </summary>
-          <div class="alog-lbl">Input</div><pre class="alog-pre">${esc(e.input) || "(none)"}</pre>
+          <div class="alog-lbl">Input</div>${inputHtml}
           <div class="alog-lbl">Output</div><pre class="alog-pre">${e.output === "" ? (e.status === "pending" ? "(waiting for result)" : "(not logged)") : esc(e.output)}</pre>
         </details>`;
       }
