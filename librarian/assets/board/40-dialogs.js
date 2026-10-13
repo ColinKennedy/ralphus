@@ -397,7 +397,7 @@
       }
       // RALPHUS-CELL-MENU-ACTIONS:BEGIN
       /**
-       * The items of a cell's ⋯ menu in the details pane (RAL-641). Unblock…
+       * The items of a cell's ⋯ menu in the details pane (RAL-641). "Show ways to fix this block…"
        * leads when the cell is holding up other work.
        * @param {string} state - The cell's state.
        * @param {CellBlocking|undefined} blocking - What the cell holds up, if it is blocking.
@@ -408,7 +408,7 @@
         /** @type {CellMenuAction[]} */
         const out = [];
         if (blocking) {
-          out.push({ key: "unblock", label: "⛔ Unblock…", tip: "This cell has failed repeatedly and other work is waiting on it.\nOpens a popup that explains each way to get it out of the way before you pick one." });
+          out.push({ key: "unblock", label: "⛔ Show ways to fix this block…", tip: "This cell has failed repeatedly and other work is waiting on it.\nOpens a popup that lists each way to fix the block and explains what it does, before you pick one." });
         }
         out.push({ key: "edit", label: "✎ Edit", tip: "Edit this cell — change its prompt, agent, model, command, or working directory.\nIf the squad is currently running it will be stopped and reset to Pending." });
         out.push({ key: "restart", label: "⟳ Restart cell", tip: "Re-run this cell and all downstream cells within this squad.\nThis cannot be undone." });
@@ -535,8 +535,8 @@
         const heldUp = `${blocking.blocked_cells} cell(s) and ${blocking.blocked_branches} review branch(es)`;
         byId("modal-root").innerHTML = `
           <div class="modal-bg" onclick="if(event.target===this)closeModal()"><div class="modal" style="width:640px;max-width:94vw">
-            <h2>Unblock ${esc(cell.name || cell.id)}</h2>
-            <p style="font-size:13px;margin:0 0 10px;color:var(--muted)">This cell has failed ${blocking.failure_count} times and is holding up ${heldUp}. Pick one of these to get it out of the way${branch ? "" : " (it has no review branch, so there is no branch to extract)"}.</p>
+            <h2>Ways to fix the block on ${esc(cell.name || cell.id)}</h2>
+            <p style="font-size:13px;margin:0 0 10px;color:var(--muted)">This cell has failed ${blocking.failure_count} times and is holding up ${heldUp}. Pick one of these to fix the block${branch ? "" : " (it has no review branch, so there is no branch to extract)"}.</p>
             <div data-tip="The ways out. Each one says what it will do.">${main}</div>
             <p style="font-size:12px;color:var(--muted);margin:12px 0 0">Optional: retry the work separately, alongside either option above.</p>
             <div data-tip="Optional retries in a new squad. They do not unblock this cell by themselves.">${addOns}</div>

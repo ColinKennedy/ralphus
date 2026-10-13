@@ -1,7 +1,7 @@
 // Coverage for two RAL-641 board changes:
 //
 // - a cell's actions live in a ⋯ menu at the top of its details pane, with
-//   Unblock… first whenever the cell is holding up other work;
+//   "Show ways to fix this block…" first whenever the cell is holding up other work;
 // - a review branch has one "Move or extract branch…" action whose popup
 //   offers a new review alongside every open review, replacing the separate
 //   "Extract to a new review" and "Move to another review…" items;
@@ -42,14 +42,14 @@ const moveBranchTargets = slice("RALPHUS-MOVE-BRANCH-TARGETS", "moveBranchTarget
 const blocking = { failure_count: 2, threshold: 2, blocked_cells: 1, blocked_branches: 1, branch: ["g-1", "b"] };
 const keys = (actions) => actions.map((a) => a.key);
 
-test("a blocking cell's menu leads with Unblock…", () => {
+test("a blocking cell's menu leads with Show ways to fix this block…", () => {
   const actions = cellMenuActions("failed", blocking, true);
   assert.equal(actions[0].key, "unblock");
-  assert.match(actions[0].label, /Unblock…/);
+  assert.match(actions[0].label, /Show ways to fix this block…/);
   assert.deepEqual(keys(actions), ["unblock", "edit", "restart", "ignore", "copy", "copy-branch"]);
 });
 
-test("a cell that is not blocking has no Unblock… item", () => {
+test("a cell that is not blocking has no fix-the-block item", () => {
   assert.ok(!keys(cellMenuActions("failed", undefined, true)).includes("unblock"));
   assert.ok(!keys(cellMenuActions("done", undefined, true)).includes("unblock"));
 });

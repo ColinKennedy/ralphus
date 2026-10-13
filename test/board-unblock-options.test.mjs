@@ -1,4 +1,4 @@
-// Coverage for the "Unblock…" popup of a blocking cell (RAL-641): which
+// Coverage for the "Ways to fix the block" popup of a blocking cell (RAL-641): which
 // options it offers and what each says it will do.
 //
 // - the two ways out are ignore and extract; copy is only ever an add-on, so
