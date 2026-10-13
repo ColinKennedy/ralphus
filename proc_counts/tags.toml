@@ -81,3 +81,11 @@ tag = "review-base-shift-landed"
 [[test]]
 id = "ralphus-daemon scheduler::tests::try_upstream_rebase_skips_an_ignored_cell_and_uses_its_upstream"
 tag = "upstream-rebase-ignored"
+
+[[test]]
+id = "ralphus-daemon vcs::tests::fetch_named_refs_from_local_remote_in_process"
+tag = "git-fetch"
+
+[[test]]
+id = "ralphus-daemon guardian_merge::tests::base_freshness_fetch_updates_the_remote_tracking_ref_in_process"
+tag = "base-fetch"

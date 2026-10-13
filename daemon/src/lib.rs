@@ -36,6 +36,7 @@ pub mod forge_health;
 pub mod forge_pool;
 pub mod generation;
 pub mod ghost;
+mod git_fetch;
 pub mod git_hooks;
 pub mod guardian;
 pub mod guardian_merge;

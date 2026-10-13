@@ -15075,8 +15075,9 @@ fn guardian_ids_for_target(
 fn fetch_base_branch(
     store: &crate::store_lock::StoreHandle,
     target: &BaseFetchTarget,
+    guardian_id: &str,
 ) -> std::result::Result<(), String> {
-    let ws = Workspace::on(&target.root, target.machine.as_deref()).with_store(Arc::clone(store));
+    let ws = Workspace::for_guardian(store, guardian_id, &target.root);
     let base = &target.base_branch;
 
     if let Some((remote, branch)) = base.split_once('/') {
@@ -15143,7 +15144,9 @@ pub fn poll_base_branch_freshness_once(store: &crate::store_lock::StoreHandle) {
         let store = Arc::clone(store);
         std::thread::spawn(move || {
             let _claim = claim;
-            let result = fetch_base_branch(&store, &target);
+            let result = guardian_ids
+                .first()
+                .map_or(Ok(()), |id| fetch_base_branch(&store, &target, id));
             let outcome = match &result {
                 Ok(()) => crate::poller_health::PollOutcome::Healthy,
                 Err(e) => {
@@ -17591,6 +17594,48 @@ mod tests {
             fetch_info("deployed", "origin/main", &["/repo/a"], None),
         ];
         assert!(collect_base_fetch_targets(&guardians).is_empty());
+    }
+
+    #[test]
+    fn base_freshness_fetch_updates_the_remote_tracking_ref_in_process() {
+        let (base, repo, _feature) = make_repo("base-freshness-inproc");
+        let origin = base.join("origin.git");
+        g(&base, &["init", "--bare", origin.to_str().unwrap()]);
+        g(
+            &repo,
+            &["remote", "add", "origin", origin.to_str().unwrap()],
+        );
+        g(&repo, &["push", "origin", "main"]);
+        g(&origin, &["symbolic-ref", "HEAD", "refs/heads/main"]);
+        g(&repo, &["fetch", "origin", "main"]);
+        let old = g_out(&repo, &["rev-parse", "origin/main"]);
+        let writer = base.join("writer");
+        g(
+            &base,
+            &["clone", origin.to_str().unwrap(), writer.to_str().unwrap()],
+        );
+        std::fs::write(writer.join("next.txt"), "next\n").unwrap();
+        g(&writer, &["add", "next.txt"]);
+        g(&writer, &["commit", "--message", "advance base"]);
+        g(&writer, &["push", "origin", "main"]);
+        let new = g_out(&writer, &["rev-parse", "main"]);
+        assert_ne!(old, new);
+
+        let store: crate::store_lock::StoreHandle = Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
+        let id = store
+            .lock()
+            .create_guardian("fetch-test", "origin/main", repo.to_str().unwrap())
+            .unwrap();
+        let target = BaseFetchTarget {
+            root: repo.clone(),
+            machine: None,
+            base_branch: "origin/main".to_string(),
+        };
+        fetch_base_branch(&store, &target, &id).unwrap();
+        assert_eq!(g_out(&repo, &["rev-parse", "origin/main"]), new);
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// The once-a-minute base-freshness poll and the per-branch proof gate both

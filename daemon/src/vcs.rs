@@ -40,8 +40,9 @@ pub const DEFAULT_KIND: &str = "git";
 
 /// Wall-clock cap on any single `git` subprocess this module spawns.
 ///
-/// Every git call in the daemon funnels through [`GitVcs::exec_raw`] — including
-/// `git fetch` against a remote (`pr.rs`'s [`compute_sync_status`](crate::pr::compute_sync_status)),
+/// Git subprocess calls in the daemon funnel through [`GitVcs::exec_raw`],
+/// including fetches unsupported by the in-process path
+/// (`pr.rs`'s [`compute_sync_status`](crate::pr::compute_sync_status)),
 /// which has no OS-level timeout of its own and can hang indefinitely on a
 /// dead remote, a stalled TCP connection, or an interactive auth prompt with
 /// no TTY to answer it. Without a cap, one stuck fetch blocks every request
@@ -162,6 +163,10 @@ impl GitVcs {
     /// reason `std::process::Command::output()` normally does this itself;
     /// this hand-rolls it only because `output()` has no timeout variant.
     fn exec_raw(root: &Path, args: &[&str]) -> Result<std::process::Output, String> {
+        if let Some(result) = crate::git_fetch::try_fetch(root, args) {
+            result?;
+            return Ok(crate::vcs_refs::success_output(String::new()));
+        }
         // A plain ref lookup is a file read; answer it without a process when
         // the answer is exact (see `crate::vcs_refs`).
         if let Some(output) = crate::vcs_refs::try_rev_parse(root, args) {
@@ -521,6 +526,101 @@ pub fn for_project_root(store: &crate::store::Store, root: &Path) -> Result<Box<
 mod tests {
     use super::*;
     use std::process::Command;
+
+    #[test]
+    fn fetch_named_refs_from_local_remote_in_process() {
+        let dir = std::env::temp_dir().join(format!(
+            "ralphus-fetch-inproc-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let source_dir = dir.join("source");
+        let remote_dir = dir.join("remote.git");
+        let target_dir = dir.join("target");
+        std::fs::create_dir_all(&dir).unwrap();
+        let source = git2::Repository::init(&source_dir).unwrap();
+        git2::Repository::init_bare(&remote_dir).unwrap();
+        let signature = git2::Signature::now("tester", "tester@example.invalid").unwrap();
+        std::fs::write(source_dir.join("file.txt"), "one").unwrap();
+        let mut index = source.index().unwrap();
+        index.add_path(Path::new("file.txt")).unwrap();
+        let tree_id = index.write_tree().unwrap();
+        let tree = source.find_tree(tree_id).unwrap();
+        let first = source
+            .commit(
+                Some("refs/heads/main"),
+                &signature,
+                &signature,
+                "first",
+                &tree,
+                &[],
+            )
+            .unwrap();
+        source.set_head("refs/heads/main").unwrap();
+        source
+            .remote("origin", remote_dir.to_str().unwrap())
+            .unwrap()
+            .push(&["refs/heads/main:refs/heads/main"], None)
+            .unwrap();
+
+        let target = git2::Repository::init(&target_dir).unwrap();
+        target
+            .remote("origin", remote_dir.to_str().unwrap())
+            .unwrap();
+        let refspec = "+refs/heads/main:refs/ralphus/test/main";
+        assert!(matches!(
+            crate::git_fetch::try_fetch(
+                &target_dir,
+                &["fetch", "--no-write-fetch-head", "origin", refspec]
+            ),
+            Some(Ok(()))
+        ));
+        assert_eq!(
+            target.refname_to_id("refs/ralphus/test/main").unwrap(),
+            first
+        );
+        std::fs::write(source_dir.join("file.txt"), "two").unwrap();
+        index.add_path(Path::new("file.txt")).unwrap();
+        let updated_tree_id = index.write_tree().unwrap();
+        let updated_tree = source.find_tree(updated_tree_id).unwrap();
+        let parent = source.find_commit(first).unwrap();
+        let second = source
+            .commit(
+                Some("refs/heads/main"),
+                &signature,
+                &signature,
+                "second",
+                &updated_tree,
+                &[&parent],
+            )
+            .unwrap();
+        source
+            .find_remote("origin")
+            .unwrap()
+            .push(&["refs/heads/main:refs/heads/main"], None)
+            .unwrap();
+        GitVcs
+            .run(
+                &target_dir,
+                &["fetch", "--no-write-fetch-head", "origin", refspec],
+            )
+            .unwrap();
+        assert_eq!(
+            target.refname_to_id("refs/ralphus/test/main").unwrap(),
+            second
+        );
+        assert_eq!(
+            std::fs::read(target.path().join("FETCH_HEAD")).unwrap_or_default(),
+            Vec::<u8>::new()
+        );
+        drop(target);
+        drop(parent);
+        drop(updated_tree);
+        drop(tree);
+        drop(index);
+        drop(source);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[test]
     fn git_is_the_only_implemented_kind() {
