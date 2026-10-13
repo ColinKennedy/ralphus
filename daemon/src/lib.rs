@@ -18,6 +18,7 @@ pub mod auto_run;
 pub mod branch_runs;
 pub mod cancel;
 pub mod cartographer;
+pub mod cell_blocking;
 pub mod channel;
 pub mod chat_client;
 pub mod ci_watch;

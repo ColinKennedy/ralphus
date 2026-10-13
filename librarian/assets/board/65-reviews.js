@@ -871,6 +871,16 @@
         return `<span class="pill p-${safe}" data-tip="${esc(tip)}">${safe}</span>`;
       }
       /**
+       * Renders the "Ignore and continue" button (RAL-641) on a review branch
+       * whose failing source cell is blocking other work, or an empty string.
+       * @param {GuardianBranch} b
+       * @returns {string}
+       */
+      function branchIgnoreBtn(b) {
+        if (!b.blocking || !b.source_squad_id || b.source_task_idx == null || b.source_cell_idx == null) return "";
+        return ` <button class="btn" data-click="ignoreCell" data-squad-id="${esc(b.source_squad_id)}" data-ti="${b.source_task_idx}" data-si="${b.source_cell_idx}" data-tip="Skip this branch's failing cell and keep going.\nCells and branches held up by it run again without it, and this branch is left out of the stack.\nReversible: Restart cell runs it again.">⤼ Ignore and continue</button>`;
+      }
+      /**
        * Renders a review branch's merge-status badge (ready / conflict / resolved).
        * @param {GuardianBranch} b
        * @returns {string}
@@ -2120,7 +2130,7 @@ Press Accept on the note to create it.">Squad pending</span>`;
               ${toggle}
               <span>${gdot(b.merge_status || "")}</span>
               <span class="mono" style="flex:1${isEnabled ? "" : ";color:var(--muted)"}" data-tip="${esc(b.branch)}\nSelect it to read its position, source and status in the inspector.">${esc(b.branch)}</span>
-              ${isEnabled ? `${branchBadge(b)} ${autoFixExhaustedBadge(pullRequests[g.id] || [], b)} ${branchStatusPill(b)} ${branchPrLink(g, b)}` : '<span class="badge" style="color:var(--muted);border-color:var(--border);font-size:11px">disabled</span>'}
+              ${isEnabled ? `${branchBadge(b)} ${autoFixExhaustedBadge(pullRequests[g.id] || [], b)} ${branchStatusPill(b)}${blockingBadge(b.blocking)}${branchIgnoreBtn(b)} ${branchPrLink(g, b)}` : '<span class="badge" style="color:var(--muted);border-color:var(--border);font-size:11px">disabled</span>'}
               ${enableToggle}${reEnableIcon}${branchMenuBtn}
             </div>
             ${branchConflictBar(b)}
