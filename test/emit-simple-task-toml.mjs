@@ -44,6 +44,7 @@ const base = {
   agent: "claude-code",
   model: "",
   project: "demo",
+  upstreamRemote: "",
   upstreamBranch: "",
   proofs: false,
   reviewMode: "none",
@@ -74,7 +75,7 @@ const cases = {
     checkItems: [{ label: "Smoke", value: "Open the board and click around." }],
   },
   "ticket label": { label: "RAL-123", proofItems: proofs.slice(0, 1) },
-  "typed upstream branch": { upstreamBranch: "staging", proofItems: proofs.slice(0, 1) },
+  "typed upstream branch": { upstreamRemote: "alt", upstreamBranch: "staging", proofItems: proofs.slice(0, 1) },
   "proofs with a chosen shell": { proofShell: "bash", proofItems: proofs },
 };
 

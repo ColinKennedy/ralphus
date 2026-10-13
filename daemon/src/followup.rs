@@ -39,9 +39,6 @@ pub const STATUS_ACCEPTED: &str = "accepted";
 /// The user declined; nothing was created.
 pub const STATUS_DECLINED: &str = "declined";
 
-/// The sentinel upstream meaning "the remote's default branch".
-const DEFAULT_UPSTREAM: &str = "<<default>>";
-
 /// Longest original prompt kept in an offer's snapshot, in characters. The
 /// snapshot is context for the follow-up agent, not an archive.
 const MAX_PROMPT_CHARS: usize = 4000;
@@ -1175,20 +1172,19 @@ fn branch_exists(root: &Path, base: &UpstreamRef) -> bool {
         .unwrap_or(false)
 }
 
-/// The upstream a follow-up squad is based on: the branch the review merged
-/// into, or the default branch of the same remote (`origin` for a local base)
-/// when that branch is gone.
-#[must_use]
-pub fn resolve_followup_base(git_root: &Path, merged_into: &UpstreamRef) -> UpstreamRef {
+/// The upstream a follow-up squad is based on: exactly the review's own
+/// (remote, branch) pair, or an error naming the pair when it no longer exists.
+pub fn resolve_followup_base(
+    git_root: &Path,
+    merged_into: &UpstreamRef,
+) -> std::result::Result<UpstreamRef, String> {
     if !merged_into.branch.is_empty() && branch_exists(git_root, merged_into) {
-        merged_into.clone()
+        Ok(merged_into.clone())
     } else {
-        let remote = if merged_into.is_local() {
-            "origin"
-        } else {
-            merged_into.remote.as_str()
-        };
-        UpstreamRef::new(remote, DEFAULT_UPSTREAM)
+        Err(format!(
+            "the review's upstream remote '{}' / branch '{}' no longer exists, so a follow-up              squad has nothing to be based on: restore the branch or point the review at another              upstream, then accept again",
+            merged_into.remote, merged_into.branch
+        ))
     }
 }
 
@@ -1435,7 +1431,7 @@ fn submit_followup_squad(
         ));
     }
     let root = Path::new(&guardian.git_root);
-    let base = resolve_followup_base(root, &guardian.upstream());
+    let base = resolve_followup_base(root, &guardian.upstream()).map_err(|m| rejected(409, m))?;
     let started = guardian.effective_followup_auto_start;
     let inherited: Vec<InheritedProofs> = {
         let store = daemon.lock();
@@ -1923,7 +1919,12 @@ mode = "raw"
             s.followup_inherited_proofs("g1", &items[0]),
             InheritedProofs::default(),
         ];
-        let draft = draft_followup_toml("proj", &guardian, "main", &items);
+        let draft = draft_followup_toml(
+            "proj",
+            &guardian,
+            &UpstreamRef::new("origin", "main"),
+            &items,
+        );
         let toml = attach_inherited_proofs(&draft, &inherited);
         let report = ralphus_core::validate::validate_toml(&toml);
         assert!(
@@ -2163,7 +2164,7 @@ mode = "raw"
         let toml = draft_followup_toml(
             "proj",
             &guardian,
-            "release/1.0",
+            &UpstreamRef::new("origin", "release/1.0"),
             &[
                 item("add the cache", Some("the original ask")),
                 item("document \"the\" flag", None),
@@ -2183,7 +2184,7 @@ mode = "raw"
             cell.cwd
                 .as_deref()
                 .unwrap()
-                .contains("upstream=release/1.0")
+                .contains("upstream_branch=release/1.0")
         );
         assert_eq!(
             cell.agent,
@@ -2208,7 +2209,12 @@ mode = "raw"
             )
             .unwrap();
         let guardian = s.get_guardian("g1").unwrap();
-        let toml = draft_followup_toml("proj", &guardian, "main", &[item("later", None)]);
+        let toml = draft_followup_toml(
+            "proj",
+            &guardian,
+            &UpstreamRef::new("origin", "main"),
+            &[item("later", None)],
+        );
         let file: ralphus_core::schema::TaskFile = toml::from_str(&toml).unwrap();
         assert_eq!(file.task[0].machine.as_deref(), Some("loopback:exercise"));
 
@@ -2220,7 +2226,7 @@ mode = "raw"
                     .unwrap();
                 s.get_guardian("g1").unwrap()
             },
-            "main",
+            &UpstreamRef::new("origin", "main"),
             &[item("later", None)],
         );
         let file: ralphus_core::schema::TaskFile = toml::from_str(&local).unwrap();
@@ -2229,11 +2235,12 @@ mode = "raw"
     }
 
     #[test]
-    fn a_missing_base_branch_falls_back_to_the_default_sentinel() {
+    fn a_missing_base_branch_is_an_error_naming_the_pair() {
         let root = temp_root("base");
         // Not a repository at all: nothing to find the branch in.
-        assert_eq!(resolve_followup_base(&root, "gone"), DEFAULT_UPSTREAM);
-        assert_eq!(resolve_followup_base(&root, ""), DEFAULT_UPSTREAM);
+        let err = resolve_followup_base(&root, &UpstreamRef::local("gone")).unwrap_err();
+        assert!(err.contains("'.'") && err.contains("'gone'"), "{err}");
+        assert!(resolve_followup_base(&root, &UpstreamRef::local("")).is_err());
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -2260,19 +2267,24 @@ mode = "raw"
     }
 
     #[test]
-    fn the_base_is_the_merge_target_while_it_exists_and_the_default_once_it_is_gone() {
+    fn the_base_is_the_merge_target_while_it_exists_and_an_error_once_it_is_gone() {
         let root = temp_root("realbase");
         run_git(&root, &["init", "-q", "-b", "main"]);
         run_git(&root, &["commit", "-q", "--allow-empty", "-m", "init"]);
         run_git(&root, &["branch", "release/1.0"]);
-        assert_eq!(resolve_followup_base(&root, "release/1.0"), "release/1.0");
-        assert_eq!(resolve_followup_base(&root, "main"), "main");
+        assert_eq!(
+            resolve_followup_base(&root, &UpstreamRef::local("release/1.0")),
+            Ok(UpstreamRef::local("release/1.0"))
+        );
+        assert_eq!(
+            resolve_followup_base(&root, &UpstreamRef::local("main")),
+            Ok(UpstreamRef::local("main"))
+        );
 
         run_git(&root, &["branch", "-D", "release/1.0"]);
-        assert_eq!(
-            resolve_followup_base(&root, "release/1.0"),
-            DEFAULT_UPSTREAM,
-            "a merge target deleted after the merge falls back to the remote default"
+        assert!(
+            resolve_followup_base(&root, &UpstreamRef::local("release/1.0")).is_err(),
+            "a merge target deleted after the merge is reported, not replaced by the default"
         );
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -2290,24 +2302,23 @@ mode = "raw"
             &["remote", "add", "origin", &origin.to_string_lossy()],
         );
 
-        // The daemon stores a review's base as `origin/main`, not `main`.
-        assert_eq!(resolve_followup_base(&root, "origin/main"), "origin/main");
-        assert_eq!(resolve_followup_base(&root, "main"), "main");
+        let on_origin = |branch: &str| UpstreamRef::new("origin", branch);
         assert_eq!(
-            resolve_followup_base(&root, "origin/release/1.0"),
-            "origin/release/1.0"
+            resolve_followup_base(&root, &on_origin("main")),
+            Ok(on_origin("main"))
+        );
+        assert_eq!(
+            resolve_followup_base(&root, &on_origin("release/1.0")),
+            Ok(on_origin("release/1.0"))
         );
 
         run_git(&origin, &["branch", "-D", "release/1.0"]);
-        assert_eq!(
-            resolve_followup_base(&root, "origin/release/1.0"),
-            DEFAULT_UPSTREAM,
-            "a base deleted on the remote after the merge falls back to the default"
+        let err = resolve_followup_base(&root, &on_origin("release/1.0")).unwrap_err();
+        assert!(
+            err.contains("'origin'") && err.contains("'release/1.0'"),
+            "{err}"
         );
-        assert_eq!(
-            resolve_followup_base(&root, "origin/gone"),
-            DEFAULT_UPSTREAM
-        );
+        assert!(resolve_followup_base(&root, &on_origin("gone")).is_err());
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&origin);
     }

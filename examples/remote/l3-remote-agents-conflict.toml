@@ -13,7 +13,7 @@ agent = "ollama"
 model = "qwen3:8b"
 
 [[task.cell]]
-cwd = "<<ralphus:new-worktree/l3-ask?upstream=<<default>>>>"
+cwd = "<<ralphus:new-worktree/l3-ask?upstream_remote=origin&upstream_branch=<<default>>>>"
 prompt = "List the files in the current directory using your tools, then reply with one short sentence naming them."
 
 [[task.cell.proof]]
@@ -26,7 +26,7 @@ project = "fx2"
 machine = "loopback:lb"
 
 [[task.cell]]
-cwd = "<<ralphus:new-worktree/l3-x?upstream=<<default>>>>"
+cwd = "<<ralphus:new-worktree/l3-x?upstream_remote=origin&upstream_branch=<<default>>>>"
 mode = "raw"
 command = "python -c \"open('shared.txt','w').write('one\\nTWO-from-x\\nthree\\n')\" && git add shared.txt && git -c user.email=l@x -c user.name=l commit -q -m x && git push -q -u origin HEAD"
 review = "<<ralphus:new-review/l3>>"
@@ -37,14 +37,15 @@ project = "fx2"
 machine = "loopback:lb"
 
 [[task.cell]]
-cwd = "<<ralphus:new-worktree/l3-y?upstream=<<default>>>>"
+cwd = "<<ralphus:new-worktree/l3-y?upstream_remote=origin&upstream_branch=<<default>>>>"
 mode = "raw"
 command = "python -c \"open('shared.txt','w').write('one\\nTWO-from-y\\nthree\\n')\" && git add shared.txt && git -c user.email=l@x -c user.name=l commit -q -m y && git push -q -u origin HEAD"
 review = "<<ralphus:new-review/l3>>"
 
 [[review]]
 id = "ralphus:new-review/l3"
-upstream = "main"
+upstream_remote = "origin"
+upstream_branch = "main"
 machine = "loopback:lb"
 agent = "ollama"
 model = "qwen3:8b"

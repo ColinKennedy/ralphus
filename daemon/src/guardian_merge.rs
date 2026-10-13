@@ -31,7 +31,6 @@ use std::sync::{Arc, LazyLock, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard}
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
-use ralphus_core::schema::UpstreamRef;
 use crate::cancel::{CancelToken, Cancellations};
 use crate::guardian::{
     CheckInput, CheckInputType, FeedbackActionStatus, GuardianCheck, GuardianStatus, MergeStatus,
@@ -42,6 +41,7 @@ use crate::server::Reply;
 use crate::store::Store;
 use crate::vcs::{GitOps, GitVcs};
 use crate::workspace::Workspace;
+use ralphus_core::schema::UpstreamRef;
 
 /// How often a poll loop waiting on a branch's worktree lease is allowed to
 /// narrate itself.
@@ -879,10 +879,14 @@ pub(crate) fn push_feedback_branch(
         )
     } else {
         let tracked = |suffix: &str| {
-            wt.git(&["config", "--get", &format!("branch.{local_branch}.{suffix}")])
-                .ok()
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
+            wt.git(&[
+                "config",
+                "--get",
+                &format!("branch.{local_branch}.{suffix}"),
+            ])
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
         };
         match tracked("remote").filter(|r| r != ralphus_core::schema::LOCAL_UPSTREAM_REMOTE) {
             Some(remote) => {
@@ -14935,22 +14939,28 @@ fn clean_rebase_status(post_rebase_is_empty: bool) -> (MergeStatus, Option<Strin
     }
 }
 
-/// List candidate base branches for a guardian, scoped to the remote that owns
-/// the current `base_branch`.  If `base_branch` looks like a remote-tracking ref
-/// (e.g. `origin/main`) only refs under that remote are returned; otherwise local
-/// branches are returned.  Returns an empty list on any git error.
-pub fn list_base_branches(git_root: &str, base_branch: &str) -> Vec<String> {
+/// Branch names present on `remote` in the checkout at `git_root`: the
+/// `refs/remotes/<remote>/` tracking refs, or the local `refs/heads/` branches
+/// when `remote` is `.`. Returns an empty list on any git error.
+pub fn list_base_branches(git_root: &str, remote: &str) -> Vec<String> {
     let root = Path::new(git_root);
-    let ref_prefix = if let Some(slash) = base_branch.find('/') {
-        let remote = &base_branch[..slash];
-        format!("refs/remotes/{remote}/")
-    } else {
-        "refs/heads/".to_string()
-    };
-    match git(
-        root,
-        &["for-each-ref", "--format=%(refname:short)", &ref_prefix],
-    ) {
+    let ref_prefix = UpstreamRef::new(remote, "").tracking_ref();
+    match git(root, &["for-each-ref", "--format=%(refname)", &ref_prefix]) {
+        Ok(s) => s
+            .lines()
+            .map(str::trim)
+            .filter_map(|l| l.strip_prefix(ref_prefix.as_str()))
+            .filter(|b| !b.is_empty() && *b != "HEAD")
+            .map(str::to_string)
+            .collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// Names of the remotes configured in the checkout at `git_root`. Returns an
+/// empty list on any git error.
+pub fn list_remotes(git_root: &str) -> Vec<String> {
+    match git(Path::new(git_root), &["remote"]) {
         Ok(s) => s
             .lines()
             .map(str::trim)
@@ -17296,7 +17306,7 @@ mod tests {
         let mut check = crate::guardian::GuardianCheck {
             shared_store: Some(crate::guardian::GuardianSharedStore {
                 store: "review-artifacts".to_string(),
-                path: "reviews/<<ralphus:new-worktree/RAL-999-add_widget?upstream=main&text=basename({})>>/demo"
+                path: "reviews/<<ralphus:new-worktree/RAL-999-add_widget?upstream_remote=.&upstream_branch=main&text=basename({})>>/demo"
                     .to_string(),
             }),
             ..crate::guardian::GuardianCheck::default()
@@ -17555,12 +17565,15 @@ mod tests {
         ];
         let targets = collect_base_fetch_targets(&guardians);
         assert_eq!(targets.len(), 3, "got: {targets:?}");
+        assert!(targets.iter().any(|t| t.base_branch
+            == ralphus_core::schema::UpstreamRef::new("origin", "main")
+            && t.machine.is_none()));
         assert!(
             targets
                 .iter()
-                .any(|t| t.base_branch == "origin/main" && t.machine.is_none())
+                .any(|t| t.base_branch
+                    == ralphus_core::schema::UpstreamRef::new("origin", "develop"))
         );
-        assert!(targets.iter().any(|t| t.base_branch == "origin/develop"));
         assert!(
             targets
                 .iter()
@@ -18113,7 +18126,11 @@ mod tests {
         g(&dir, &["update-ref", "refs/remotes/alt/staging", &real_sha]);
 
         let workspace = Workspace::local(&dir);
-        let resolved = resolve_base(&workspace, "alt/staging").expect("resolve_base resolves");
+        let resolved = resolve_base(
+            &workspace,
+            &ralphus_core::schema::UpstreamRef::new("alt", "staging"),
+        )
+        .expect("resolve_base resolves");
         assert_eq!(
             resolved, real_sha,
             "resolve_base must prefer the remote-tracking ref over the stale same-named local \
@@ -23354,7 +23371,7 @@ mod tests {
             commands,
             environment: std::collections::BTreeMap::from([(
                 "OUTPUT_NAME".to_string(),
-                "<<ralphus:new-worktree/RAL-999-add_widget?upstream=main&text=basename({})>>"
+                "<<ralphus:new-worktree/RAL-999-add_widget?upstream_remote=.&upstream_branch=main&text=basename({})>>"
                     .to_string(),
             )]),
             ..crate::guardian::GuardianAutoBuild::default()
@@ -23370,7 +23387,7 @@ mod tests {
                     &[
                         crate::guardian::GuardianCheck {
                             label: Some("First".to_string()),
-                            command: Some("echo <<ralphus:new-worktree/RAL-999-add_widget?upstream=main&text=basename({})>>".to_string()),
+                            command: Some("echo <<ralphus:new-worktree/RAL-999-add_widget?upstream_remote=.&upstream_branch=main&text=basename({})>>".to_string()),
                             prepare: vec![group.clone()],
                             ..crate::guardian::GuardianCheck::default()
                         },

@@ -32,9 +32,9 @@ validation time — a typo fails fast at submit, before the daemon sees it.
 | Sentinel | Field | What it resolves to |
 |---|---|---|
 | `<<task:<name>[/<cell>]>>` | cell `upstream` | the tip of that dependency task's (or cell's) branch — the cell's branch rebases onto it |
-| `<<ralphus:new-worktree/<branch>?upstream=<upstream>>>` | cell `cwd` | a materialized (or reused) git worktree for `<branch>`, created under the owning task's `project`; the stored `cwd` is rewritten to the real path before the cell runs (RAL-100) |
-| `<<default>>` | the `?upstream=` value of a new-worktree placeholder | the repository's default branch — recommended |
-| `<<current_branch>>` | the `?upstream=` value of a new-worktree placeholder | whatever branch the project currently has checked out — riskier, since it can change between runs |
+| `<<ralphus:new-worktree/<branch>?upstream_remote=<remote>&upstream_branch=<upstream>>>` | cell `cwd` | a materialized (or reused) git worktree for `<branch>`, created under the owning task's `project`; the stored `cwd` is rewritten to the real path before the cell runs (RAL-100) |
+| `<<default>>` | the `upstream_branch` value of a new-worktree placeholder | the repository's default branch — recommended |
+| `<<current_branch>>` | the `upstream_branch` value of a new-worktree placeholder | whatever branch the project currently has checked out — riskier, since it can change between runs |
 | `<<review:<id>>>` | `[[task.cell]].review`, `[[waypoint]].affected` | an existing `[[review]]`'s id in the same submission (RAL-269); also an `affected` entry (RAL-400). Prefer `<<ralphus:review/<id>>>` in a waypoint |
 | `<<ralphus:new-review/<key>>>` | `[[task.cell]].review`, `[[waypoint]].affected` / `roster` | mints a *fresh* review per submission; `<key>` groups the cells that share one new review (RAL-269); in a waypoint it names the same-file `[[review]]` it creates |
 | `<<ralphus:review/<id>>>` | `[[waypoint]].roster`, `[[waypoint]].affected` | an existing review's id (RAL-621) |
@@ -60,12 +60,12 @@ Rules and risks:
   materializes once). An `environment` value may instead be a **linked
   field** (RAL-460, below), which points back at another field on the same
   cell instead of repeating that field's placeholder text.
-- **`?upstream=` is required** on a new-worktree placeholder cwd, so ralphus
+- **`?upstream_remote=` and `?upstream_branch=` are both required** (the old combined `?upstream=` form is rejected) on a new-worktree placeholder cwd, so ralphus
   always knows what the created branch tracks instead of guessing from HEAD.
 - **Review preparation text interpolation.** In `[[review.prepare]]`,
   `[[review.action.prepare]]`, action `command`/`cleanup_command`, and shared
   store `path`, a wrapped
-  `<<ralphus:new-worktree/<branch>?upstream=<upstream>&text=basename({})>>`
+  `<<ralphus:new-worktree/<branch>?upstream_remote=<remote>&upstream_branch=<upstream>&text=basename({})>>`
   marker expands to the declared branch text (or its registered `text`
   transform). It is a deterministic naming aid for output/share paths; it
   does not materialize or select a worktree. `upstream` remains required so a
@@ -75,8 +75,9 @@ Rules and risks:
   lookup into IDs that already exist in the file; nothing about it is
   resolved or modified later.
 - **Don't conflate the two same-named `upstream`s** (RAL-284): a
-  `[[review]] upstream` declares the review's **base branch**; a cell
-  placeholder's `?upstream=` sets *that cell's worktree's* git tracking
+  `[[review]] upstream_remote`/`upstream_branch` declare the review's
+  **upstream**; a cell
+  placeholder's `?upstream_remote=`/`?upstream_branch=` set *that cell's worktree's* git tracking
   upstream at creation time. See the glossary's Reviews section.
 - **Every `[[waypoint]]` `roster` and `affected` entry must be wrapped**, the
   same rule a cell's `review` field follows: a bare, unwrapped id is a
@@ -139,7 +140,7 @@ task-scoped proof step's `..` reaches that task:
 ```toml
 [[task.cell]]
 id = "worker"
-cwd = "<<ralphus:new-worktree/RAL-100-my-feature?upstream=main>>"
+cwd = "<<ralphus:new-worktree/RAL-100-my-feature?upstream_remote=origin&upstream_branch=main>>"
 environment.WORKTREE = "<<ralphus:linked-field/./cwd>>"
 environment.LOG_DIR = "<<ralphus:linked-field/./cwd>>/logs"
 
@@ -187,7 +188,7 @@ task-level proof. Anything else in brackets (`..[`, `..[]`, `.[proof]`,
 
   ```toml
   [[task.cell]]
-  cwd = "<<ralphus:new-worktree/RAL-1234-add_payment_system?upstream=main>>"
+  cwd = "<<ralphus:new-worktree/RAL-1234-add_payment_system?upstream_remote=origin&upstream_branch=main>>"
   environment.WORKTREE_NAME = "<<ralphus:linked-field/./cwd?text=basename({})>>"
   ```
 
@@ -231,7 +232,7 @@ task-level proof. Anything else in brackets (`..[`, `..[]`, `.[proof]`,
 
   ```toml
   [[task.cell]]
-  cwd = "<<ralphus:new-worktree/RAL-100-my-feature?upstream=main>>"
+  cwd = "<<ralphus:new-worktree/RAL-100-my-feature?upstream_remote=origin&upstream_branch=main>>"
   environment.BASE = "<<ralphus:linked-field/./cwd>>"
   environment.LOG_DIR = "<<ralphus:linked-field/./environment.BASE>>/logs"
   ```
@@ -266,7 +267,7 @@ task-level proof. Anything else in brackets (`..[`, `..[]`, `.[proof]`,
   [[task]]
   name = "t"
   [[task.cell]]
-  cwd = "<<ralphus:new-worktree/RAL-100-my-feature?upstream=main>>"
+  cwd = "<<ralphus:new-worktree/RAL-100-my-feature?upstream_remote=origin&upstream_branch=main>>"
   ```
 
   Here every cell in the submission gets its own `WORKTREE` env var pointing

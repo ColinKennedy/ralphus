@@ -107,7 +107,10 @@ mod tests {
 
     #[test]
     fn fixture_is_a_valid_remote_task_file() {
-        let toml = fixture_toml("p", "<<ralphus:new-worktree/b?upstream=<<default>>>>");
+        let toml = fixture_toml(
+            "p",
+            "<<ralphus:new-worktree/b?upstream_remote=origin&upstream_branch=<<default>>>>",
+        );
         let file: ralphus_core::schema::TaskFile = toml::from_str(&toml).unwrap();
         assert_eq!(file.task[0].machine.as_deref(), Some(REMOTE_MACHINE));
         assert_eq!(file.task[0].cell[0].environment["EXERCISE_ENV"], EXPECTED);

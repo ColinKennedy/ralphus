@@ -814,7 +814,8 @@ fn change_base_route_records_base_but_defers_merge_while_last_branch_is_pending(
         &daemon,
         "POST",
         &format!("/api/guardians/{gid}/base"),
-        &serde_json::json!({ "branch": "release/2026" }).to_string(),
+        &serde_json::json!({ "upstream_remote": ".", "upstream_branch": "release/2026" })
+            .to_string(),
     );
     assert_eq!(reply.status, 200, "body={}", reply.body);
     let body: serde_json::Value = serde_json::from_str(&reply.body).unwrap();

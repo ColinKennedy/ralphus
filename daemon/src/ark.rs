@@ -6,8 +6,8 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use rusqlite::{OptionalExtension, params};
 use ralphus_core::schema::UpstreamRef;
+use rusqlite::{OptionalExtension, params};
 
 use crate::cancel::Cancellations;
 use crate::config::ArkConfig;

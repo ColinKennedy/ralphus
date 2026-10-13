@@ -36,7 +36,7 @@ Tip: validate before submitting -- `ralphus validate file.toml`
  name         string  REQ    Unique task name, e.g. "build"
  project      string         Namespace label. REQUIRED, whenever a
                              placeholder cwd is used
-                             (e.g. "<<ralphus:new-worktree/<branch>?upstream=<upstream>>>").
+                             (e.g. "<<ralphus:new-worktree/<branch>?upstream_remote=<remote>&upstream_branch=<branch>>>").
                              `project` MUST match a project from `ralphus project list`.
  root         string         The VCS root, if any. e.g. a git repository root.
  agent        string         Default agent for the task's cells
@@ -135,7 +135,7 @@ Tip: validate before submitting -- `ralphus validate file.toml`
  name                    string         Human-readable display label shown in the board
                                         (card and detail pane). Falls back to `id` when
                                         unset. No structural meaning -- safe to rename.
- cwd                     string  REQ    RECOMMENDED: "<<ralphus:new-worktree/<branch>?upstream=<upstream>>>"
+ cwd                     string  REQ    RECOMMENDED: "<<ralphus:new-worktree/<branch>?upstream_remote=<remote>&upstream_branch=<branch>>>"
                                         -- a placeholder naming a branch to materialize.
                                         Requires the task's `project` field to name a
                                         project registered via `ralphus project git`
@@ -146,24 +146,25 @@ Tip: validate before submitting -- `ralphus validate file.toml`
                                         cell runs. The marker may be embedded in a
                                         longer value, e.g. "<<...>>/subdir". See
                                         "Project registry" below.
-                                        The "?upstream=<upstream>" suffix names what
+                                        The "?upstream_remote=<remote>&upstream_branch=<branch>" suffix names what
                                         branch <branch> should track -- i.e. what it is
                                         based on/compared against. Add it only when
                                         <branch> should track something (almost always the
                                         case for a review/feature branch). You rarely need
                                         to name a specific branch up front: use the
-                                        reserved sentinel "?upstream=<<default>>" (the
+                                        reserved sentinel "?upstream_remote=origin&upstream_branch=<<default>>" (the
                                         repo's default branch, recommended) and ralphus
                                         resolves it at run time, or
-                                        "?upstream=<<current_branch>>" (whatever branch the
+                                        "?upstream_remote=.&upstream_branch=<<current_branch>>" (whatever branch the
                                         project currently has checked out -- riskier, since
                                         it can silently change between runs). Name a literal
-                                        branch -- a local one, e.g. "?upstream=main", or a
-                                        remote-qualified one, e.g.
-                                        "?upstream=origin/main" -- when it should track
+                                        branch -- a local one, e.g.
+                                        "?upstream_remote=.&upstream_branch=main" (remote "." means a
+                                        local branch), or one on a remote, e.g.
+                                        "?upstream_remote=origin&upstream_branch=main" -- when it should track
                                         something other than the default (e.g. a specific
                                         remote branch it should resync with). A placeholder
-                                        cwd with no "?upstream=" at all fails validation,
+                                        cwd without both upstream_remote and upstream_branch fails validation,
                                         so always include a suffix (sentinel or name). This
                                         value is what `derive_reviews` uses to find a
                                         review's upstream branch and what drives resync-on-reuse (fetch
@@ -174,9 +175,9 @@ Tip: validate before submitting -- `ralphus validate file.toml`
                                         one only configures git tracking). A cell may need
                                         both.
                                         Examples:
-                                          cwd = "<<ralphus:new-worktree/RAL-123-fix?upstream=<<default>>>>"
-                                          cwd = "<<ralphus:new-worktree/RAL-123-fix?upstream=beta>>"
-                                          cwd = "<<ralphus:new-worktree/origin/feature/x?upstream=origin/blah>>"
+                                          cwd = "<<ralphus:new-worktree/RAL-123-fix?upstream_remote=origin&upstream_branch=<<default>>>>"
+                                          cwd = "<<ralphus:new-worktree/RAL-123-fix?upstream_remote=.&upstream_branch=beta>>"
+                                          cwd = "<<ralphus:new-worktree/origin/feature/x?upstream_remote=origin&upstream_branch=blah>>"
                                         ALTERNATIVE: an absolute path to an
                                         already-built git WORKTREE, if you built it
                                         yourself. ALWAYS use forward slashes (e.g.
@@ -316,7 +317,7 @@ Tip: validate before submitting -- `ralphus validate file.toml`
                                         seeds this cell's starting Queue position.
  depends_on              array<string>  Cells that must finish first (see formats below)
  upstream               string         Branch-chaining sentinel (DIFFERENT from
-                                        `cwd`'s "?upstream=" query above -- that one
+                                        `cwd`'s "?upstream_remote=&upstream_branch=" query above -- that one
                                         sets git tracking; this one triggers a rebase).
                                         Set to "<<task:task-name>>" or
                                         "<<task:task-name/cell-id>>" and
@@ -392,8 +393,8 @@ Tip: validate before submitting -- `ralphus validate file.toml`
  error if the branch has no upstream and none is declared below).
  Set the tracking upstream with:
    git branch --set-upstream-to=main <your-branch>
- -- or declare it explicitly with `upstream = "main"` on the
- review, which also overrides inference when both are present.
+ -- or declare it explicitly with `upstream_remote = "."` and
+ `upstream_branch = "main"` on the review, which also overrides inference when both are present.
 
  Two ways branches fold into a review:
    * By PROJECT (default): cells with a plain `id` are grouped
@@ -441,9 +442,13 @@ Tip: validate before submitting -- `ralphus validate file.toml`
                 Unset falls back to RALPHUS_RESOLVER_MODEL, then
                 .ralphus.toml's [review].default_resolver_model,
                 then "qwen3:8b" for the ollama backend.
- upstream
-        string  The branch this review's stack rebases onto.
-                Optional for an all-local review (inferred from
+ upstream_remote
+        string  The remote of the branch this review's stack rebases
+                onto ("." means a local branch). Set together with
+                upstream_branch.
+ upstream_branch
+        string  The branch (on upstream_remote) this review's stack
+                rebases onto, as literal text. Optional for an all-local review (inferred from
                 each contributing worktree's git upstream), but
                 REQUIRED when any contributing cell runs on a
                 remote machine, since that worktree's git upstream
@@ -628,7 +633,7 @@ preparation groups are run once per preparation generation and satisfy every
 action that declares them.
 
 Preparation/action commands, group environment values, and shared-store paths
-may embed <<ralphus:new-worktree/BRANCH?upstream=UPSTREAM
+may embed <<ralphus:new-worktree/BRANCH?upstream_remote=REMOTE&upstream_branch=BRANCH
 &text=basename({})>>. This is text interpolation only: it expands to BRANCH
 (or its requested text transform) and does not create another worktree.
 
@@ -676,7 +681,7 @@ may embed <<ralphus:new-worktree/BRANCH?upstream=UPSTREAM
 
       [review.action.shared_store]
       store = "review-artifacts"
-      path = "reviews/<<ralphus:new-worktree/RAL-999-add_widget?upstream=main&text=basename({})>>/demo"
+      path = "reviews/<<ralphus:new-worktree/RAL-999-add_widget?upstream_remote=.&upstream_branch=main&text=basename({})>>/demo"
 
       [[review.action.prepare]]
       command = [
@@ -898,7 +903,7 @@ may embed <<ralphus:new-worktree/BRANCH?upstream=UPSTREAM
  Project registry + placeholder cwd
 ---------------------------------------------------------------
  A cell `cwd` may be the placeholder
- "<<ralphus:new-worktree/<branch>?upstream=<upstream>>>" instead of a real path.
+ "<<ralphus:new-worktree/<branch>?upstream_remote=<remote>&upstream_branch=<branch>>>" instead of a real path.
  Register the project once, up front:
 
    ralphus project git --path C:/Users/me/repo --url git@github.com:me/repo.git --name my-project --description "Backend API service"
@@ -911,7 +916,7 @@ may embed <<ralphus:new-worktree/BRANCH?upstream=UPSTREAM
    project = "my-project"          # REQUIRED: must match a registered name
 
      [[task.cell]]
-     cwd    = "<<ralphus:new-worktree/RAL-123-add_feature?upstream=origin/main>>"
+     cwd    = "<<ralphus:new-worktree/RAL-123-add_feature?upstream_remote=origin&upstream_branch=main>>"
      prompt = "..."
 
  The daemon resolves "my-project" (the task's `project` field) against its
@@ -923,24 +928,24 @@ may embed <<ralphus:new-worktree/BRANCH?upstream=UPSTREAM
  speech-to-text) still resolves via fuzzy/description matching, but prefer
  exact names.
 
- The trailing "?upstream=<upstream>" tells ralphus what <branch> tracks (its
+ The trailing "?upstream_remote=<remote>&upstream_branch=<branch>" tells ralphus what <branch> tracks (its
  base/compare target) rather than guessing from HEAD. It is only something
  you need to pin down explicitly when that target *can't* be inferred; for
  the common case -- a fresh feature branch based on the repo's default
- branch -- use the sentinel "?upstream=<<default>>" instead of hardcoding a
+ branch -- use the sentinel "?upstream_remote=origin&upstream_branch=<<default>>" instead of hardcoding a
  name:
 
    [[task.cell]]
-   cwd    = "<<ralphus:new-worktree/RAL-124-other_feature?upstream=<<default>>>>"
+   cwd    = "<<ralphus:new-worktree/RAL-124-other_feature?upstream_remote=origin&upstream_branch=<<default>>>>"
    prompt = "..."
 
  ralphus resolves "<<default>>" to the project's default branch at run time.
- The alternative sentinel, "?upstream=<<current_branch>>", tracks whatever
+ The alternative sentinel, "?upstream_remote=.&upstream_branch=<<current_branch>>", tracks whatever
  branch the project currently has checked out -- use it with care, since that
- can silently change between runs. Give a literal name ("?upstream=beta", or
- a remote-qualified "?upstream=origin/<branch>") only when <branch> should
+ can silently change between runs. Give a literal pair ("?upstream_remote=.&upstream_branch=beta" for a
+ local branch, or "?upstream_remote=origin&upstream_branch=<branch>" for one on a remote) only when <branch> should
  track something other than the default -- e.g. a remote branch you want it
- to resync with. A placeholder cwd with no "?upstream=" at all fails
+ to resync with. A placeholder cwd without both upstream_remote and upstream_branch fails
  validation, so always include a suffix (a sentinel or a literal name).
 
 ---------------------------------------------------------------
@@ -960,7 +965,7 @@ may embed <<ralphus:new-worktree/BRANCH?upstream=UPSTREAM
  crossed with ".." -- only "cwd"/"id" can).
 
    [[task.cell]]
-   cwd         = "<<ralphus:new-worktree/RAL-1234-add_payment_system?upstream=main>>"
+   cwd         = "<<ralphus:new-worktree/RAL-1234-add_payment_system?upstream_remote=.&upstream_branch=main>>"
    environment = { WORKTREE = "<<ralphus:linked-field/./cwd>>" }
 
  `WORKTREE` resolves to this cell's own `cwd` once the daemon has
@@ -976,7 +981,7 @@ may embed <<ralphus:new-worktree/BRANCH?upstream=UPSTREAM
  component (like POSIX basename(1)):
 
    [[task.cell]]
-   cwd         = "<<ralphus:new-worktree/RAL-1234-add_payment_system?upstream=main>>"
+   cwd         = "<<ralphus:new-worktree/RAL-1234-add_payment_system?upstream_remote=.&upstream_branch=main>>"
    environment = { WORKTREE_NAME = "<<ralphus:linked-field/./cwd?text=basename({})>>" }
 
  If that cwd resolves to ".../RAL-1234-add_payment_system", `WORKTREE_NAME`
@@ -1037,7 +1042,7 @@ Guardian exists to surface, and is almost never what you want.
       [[task.cell]]
       id                     = "work"
       agent                  = "{<insert recommended agent here>}"  # see "Agent selection" above
-      cwd                    = "<<ralphus:new-worktree/RAL-X?upstream=DEV-1234-add_payment_system>>"
+      cwd                    = "<<ralphus:new-worktree/RAL-X?upstream_remote=.&upstream_branch=DEV-1234-add_payment_system>>"
       system_prompt          = "Do NOT commit and do NOT push under any circumstances.\nYou are working in a dedicated git worktree of the ralphus repository. Implement the work exactly as-described and keep your changes only within the worktree."
       system_prompt_position = "append"
       prompt                 = "{<ticket text>}"
@@ -1128,7 +1133,7 @@ name    = "hello"
 project = "my-project"            # REQUIRED: must match a registered name
 
   [[task.cell]]
-  cwd    = "<<ralphus:new-worktree/hello?upstream=main>>"
+  cwd    = "<<ralphus:new-worktree/hello?upstream_remote=.&upstream_branch=main>>"
   prompt = "Print 'Hello, World!' to a new file hello.txt."
 
 -- 2. A local (Ollama) deterministic check --------------------
@@ -1138,7 +1143,7 @@ name    = "check"
 project = "my-project"
 
   [[task.cell]]
-  cwd     = "<<ralphus:new-worktree/check?upstream=beta>>"
+  cwd     = "<<ralphus:new-worktree/check?upstream_remote=.&upstream_branch=beta>>"
   agent   = "{<...put your recommended agent here>}"
   model   = "qwen3:8b"
   command = "cargo test"          # a remediating command: `agent`/`model` above
@@ -1152,7 +1157,7 @@ project = "my-project"
 
   [[task.cell]]
   id     = "init"
-  cwd    = "<<ralphus:new-worktree/feature-a?upstream=origin/main>>"
+  cwd    = "<<ralphus:new-worktree/feature-a?upstream_remote=origin&upstream_branch=main>>"
   prompt = "Create data.json with {\"version\": 1}."
   review = "<<review:backend>>"   # opt this worktree branch into the review
 
@@ -1166,7 +1171,7 @@ project    = "my-project"
 depends_on = ["setup"]            # waits for all of setup's cells + proof steps
 
   [[task.cell]]
-  cwd      = "<<ralphus:new-worktree/feature-b?upstream=release/1.2>>"
+  cwd      = "<<ralphus:new-worktree/feature-b?upstream_remote=.&upstream_branch=release/1.2>>"
   upstream = "<<task:setup>>"     # rebase feature-b onto setup's branch tip first
   prompt   = "Using {handoff:setup}, write a summary to report.md."
   review   = "<<review:backend>>"
@@ -1179,7 +1184,8 @@ depends_on = ["setup"]            # waits for all of setup's cells + proof steps
 # worktree's git upstream tracking branch; declared explicitly here).
 [[review]]
 id       = "backend"
-upstream = "foo"
+upstream_remote = "."
+upstream_branch = "foo"
 
 -- 4. Recommended per-branch shape (remediating proof + finalize) --
 
@@ -1191,7 +1197,8 @@ upstream = "foo"
 [[review]]
 id                 = "ralphus:new-review/ral-batch"
 name               = "RAL batch"
-upstream           = "foo"
+upstream_remote    = "."
+upstream_branch    = "foo"
 agent              = "{<insert recommended agent here>}"  # claude-code, codex-cli, claude, ollama, etc
 auto_fix_pr_errors = true  # dispatch the resolver agent to fix a failing PR/MR CI status automatically
 auto_cancel_outdated_pr_pipelines = true  # on by default; cancel stale CI runs when a newer commit is force-pushed
@@ -1230,7 +1237,7 @@ project = "my-project"            # both cells' worktree materializes under this
   [[task.cell]]
   id                     = "work"
   agent                  = "claude-code"  # claude-code/claude-cli/codex/codex-cli/pi all support system_prompt (see field reference above)
-  cwd                    = "<<ralphus:new-worktree/ral-2?upstream=staging>>"
+  cwd                    = "<<ralphus:new-worktree/ral-2?upstream_remote=.&upstream_branch=staging>>"
   review                 = "<<ralphus:new-review/ral-batch>>"
   system_prompt          = "Do NOT commit and do NOT push under any circumstances.\nYou are working in a dedicated git worktree of the ralphus repository. Implement the work exactly as-described and keep your changes only within the worktree."
   system_prompt_position = "append"
@@ -1256,7 +1263,7 @@ project = "my-project"            # both cells' worktree materializes under this
   [[task.cell]]
   id                     = "finalize"
   agent                  = "claude-code"  # claude-code/claude-cli/codex/codex-cli/pi all support system_prompt (see field reference above)
-  cwd                    = "<<ralphus:new-worktree/ral-2?upstream=staging>>"
+  cwd                    = "<<ralphus:new-worktree/ral-2?upstream_remote=.&upstream_branch=staging>>"
   depends_on             = ["work"]
   system_prompt          = "ONLY git stage the intended source files, commit them, and push the commit if a remote exists. \n                            Re-staging and retrying the commit is fine if a commit hook fails. \n                            Do NOT run tests, formatters, or linters, and do NOT modify any file."
   system_prompt_position = "append"
@@ -1272,7 +1279,7 @@ depends_on = ["ral-2"]
   [[task.cell]]
   id                     = "work"
   agent                  = "claude-code"  # claude-code/claude-cli/codex/codex-cli/pi all support system_prompt (see field reference above)
-  cwd                    = "<<ralphus:new-worktree/ral-3?upstream=origin/main>>"
+  cwd                    = "<<ralphus:new-worktree/ral-3?upstream_remote=origin&upstream_branch=main>>"
   upstream               = "<<task:ral-2>>"
   review                 = "<<ralphus:new-review/ral-batch>>"  # same key folds into same review
   system_prompt          = "Do NOT commit and do NOT push under any circumstances.\nYou are working in a dedicated git worktree of the ralphus repository. Implement the work exactly as-described and keep your changes only within the worktree."
@@ -1287,12 +1294,12 @@ name    = "add-widget"
 project = "my-project"
 
   [[task.cell]]
-  cwd    = "<<ralphus:new-worktree/RAL-999-add_widget?upstream=main>>"
+  cwd    = "<<ralphus:new-worktree/RAL-999-add_widget?upstream_remote=.&upstream_branch=main>>"
   # Repeating the same marker in an environment value reuses this worktree.
   # A linked field reaches the same resolved value without retyping the
   # marker; "?text=basename({})" then trims it to just the worktree's final
   # path component instead of the full path.
-  environment = { WIDGET_WORKTREE = "<<ralphus:new-worktree/RAL-999-add_widget?upstream=main>>", WIDGET_NAME = "<<ralphus:linked-field/./cwd?text=basename({})>>" }
+  environment = { WIDGET_WORKTREE = "<<ralphus:new-worktree/RAL-999-add_widget?upstream_remote=.&upstream_branch=main>>", WIDGET_NAME = "<<ralphus:linked-field/./cwd?text=basename({})>>" }
   prompt = "Add a widget module."
 
 Submit it:  ralphus submit tasks.toml
@@ -1449,7 +1456,9 @@ mod tests {
     #[test]
     fn task_tutor_preserves_protocol_markers() {
         let text = task_tutor();
-        assert!(text.contains("<<ralphus:new-worktree/hello?upstream=main>>"));
+        assert!(
+            text.contains("<<ralphus:new-worktree/hello?upstream_remote=.&upstream_branch=main>>")
+        );
         assert!(text.contains("ralphus:new-review/<key>"));
     }
 
@@ -1494,17 +1503,19 @@ mod tests {
 
     #[test]
     fn tutor_uses_wrapped_worktree_placeholders_for_cwd_examples() {
-        assert!(TASK_TUTOR.contains("cwd    = \"<<ralphus:new-worktree/hello?upstream=main>>\""));
+        assert!(TASK_TUTOR.contains(
+            "cwd    = \"<<ralphus:new-worktree/hello?upstream_remote=.&upstream_branch=main>>\""
+        ));
         assert!(
             TASK_TUTOR
-                .contains("cwd = \"<<ralphus:new-worktree/RAL-123-fix?upstream=<<default>>>>\"")
+                .contains("cwd = \"<<ralphus:new-worktree/RAL-123-fix?upstream_remote=origin&upstream_branch=<<default>>>>\"")
         );
         assert!(
             !TASK_TUTOR
                 .lines()
                 .any(|line| line.contains("cwd") && line.contains("= \"ralphus:new-worktree/")),
             "cwd examples must teach the wrapped <<...>> expansion syntax -- including \
-             when the ?upstream= value is itself a reserved <<...>> sentinel, which \
+             when the upstream_branch value is itself a reserved <<...>> sentinel, which \
              nests inside the outer <<...>> wrap"
         );
     }
@@ -1544,7 +1555,7 @@ mod tests {
     #[test]
     fn tutor_shows_an_environment_value_reusing_the_cwd_worktree() {
         assert!(TASK_TUTOR.contains(
-            "environment = { WIDGET_WORKTREE = \"<<ralphus:new-worktree/RAL-999-add_widget?upstream=main>>\", \
+            "environment = { WIDGET_WORKTREE = \"<<ralphus:new-worktree/RAL-999-add_widget?upstream_remote=.&upstream_branch=main>>\", \
              WIDGET_NAME = \"<<ralphus:linked-field/./cwd?text=basename({})>>\" }"
         ));
         assert!(

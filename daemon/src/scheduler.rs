@@ -12340,7 +12340,7 @@ mod tests {
         let repo = wt_test_repo("resolve");
         // no_commit_required: this test is about worktree materialization, not
         // the RAL-156 commit guard, and FakeRunner never actually commits.
-        let toml = "[[task]]\nname=\"t\"\nproject=\"proj\"\nno_commit_required=true\n[[task.cell]]\ncwd=\"ralphus:new-worktree/feat-a?upstream=main\"\ncommand=\"do-thing\"\n";
+        let toml = "[[task]]\nname=\"t\"\nproject=\"proj\"\nno_commit_required=true\n[[task.cell]]\ncwd=\"ralphus:new-worktree/feat-a?upstream_remote=.&upstream_branch=main\"\ncommand=\"do-thing\"\n";
         let mut store = Store::open_in_memory().unwrap();
         store
             .register_project("proj", "", &repo.to_string_lossy(), "git")
@@ -12355,7 +12355,7 @@ mod tests {
         let cells = store.lock().cells_of(&id).unwrap();
         let cwd = cells[0].cwd.clone().unwrap();
         assert_ne!(
-            cwd, "ralphus:new-worktree/feat-a?upstream=main",
+            cwd, "ralphus:new-worktree/feat-a?upstream_remote=.&upstream_branch=main",
             "placeholder must be rewritten"
         );
         let expected = crate::worktrees::worktree_dir(&repo, "feat-a");
@@ -12369,8 +12369,8 @@ mod tests {
         // no_commit_required: this test is about worktree deduplication, not
         // the RAL-156 commit guard, and FakeRunner never actually commits.
         let toml = "[[task]]\nname=\"t\"\nproject=\"proj\"\nno_commit_required=true\n\
-             [[task.cell]]\nid=\"a\"\ncwd=\"ralphus:new-worktree/shared?upstream=main\"\ncommand=\"do-a\"\n\
-             [[task.cell]]\nid=\"b\"\ncwd=\"ralphus:new-worktree/shared?upstream=main\"\ncommand=\"do-b\"\n";
+             [[task.cell]]\nid=\"a\"\ncwd=\"ralphus:new-worktree/shared?upstream_remote=.&upstream_branch=main\"\ncommand=\"do-a\"\n\
+             [[task.cell]]\nid=\"b\"\ncwd=\"ralphus:new-worktree/shared?upstream_remote=.&upstream_branch=main\"\ncommand=\"do-b\"\n";
         let mut store = Store::open_in_memory().unwrap();
         store
             .register_project("proj", "", &repo.to_string_lossy(), "git")
@@ -12400,7 +12400,7 @@ mod tests {
         // no_commit_required: this test is about worktree reuse across a
         // restart, not the RAL-156 commit guard, and FakeRunner never
         // actually commits.
-        let toml = "[[task]]\nname=\"t\"\nproject=\"proj\"\nno_commit_required=true\n[[task.cell]]\ncwd=\"ralphus:new-worktree/feat-b?upstream=main\"\ncommand=\"do-thing\"\n";
+        let toml = "[[task]]\nname=\"t\"\nproject=\"proj\"\nno_commit_required=true\n[[task.cell]]\ncwd=\"ralphus:new-worktree/feat-b?upstream_remote=.&upstream_branch=main\"\ncommand=\"do-thing\"\n";
         let mut store = Store::open_in_memory().unwrap();
         store
             .register_project("proj", "", &repo.to_string_lossy(), "git")
@@ -12467,7 +12467,7 @@ mod tests {
     #[test]
     fn execute_squad_materializes_shared_cwd_and_env_placeholder_once_and_preserves_unknown_text() {
         let repo = wt_test_repo("env-materialize");
-        let toml = "[[task]]\nname=\"t\"\nproject=\"proj\"\nno_commit_required=true\n[[task.cell]]\ncwd=\"<<ralphus:new-worktree/feat-env?upstream=main>>\"\ncommand=\"do-thing\"\nenvironment={WT=\"<<ralphus:new-worktree/feat-env?upstream=main>>\", NESTED=\"<<ralphus:new-worktree/feat-env?upstream=main>>/nested\", RAW=\"prefix <<unknown>> suffix\"}\n";
+        let toml = "[[task]]\nname=\"t\"\nproject=\"proj\"\nno_commit_required=true\n[[task.cell]]\ncwd=\"<<ralphus:new-worktree/feat-env?upstream_remote=.&upstream_branch=main>>\"\ncommand=\"do-thing\"\nenvironment={WT=\"<<ralphus:new-worktree/feat-env?upstream_remote=.&upstream_branch=main>>\", NESTED=\"<<ralphus:new-worktree/feat-env?upstream_remote=.&upstream_branch=main>>/nested\", RAW=\"prefix <<unknown>> suffix\"}\n";
         let mut store = Store::open_in_memory().unwrap();
         store
             .register_project("proj", "", &repo.to_string_lossy(), "git")

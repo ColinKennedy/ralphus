@@ -1123,7 +1123,7 @@
         // cwd is actually inside a git project — a plain command cell (or
         // one whose cwd isn't a worktree at all) has no upstream to show.
         const upstreamTip = "Read-only — computed live from git, not stored config; there's nothing here to edit."
-          + "\nShows what this cell's branch is based on: a chained dependency's branch (when this cell declares an upstream = <<task:...>> sentinel) or, otherwise, the worktree's own git tracking branch."
+          + "\nShows what this cell's branch is based on: a chained dependency's branch (when this cell declares an upstream = <<task:...>> sentinel) or, otherwise, the worktree's own git tracking branch, shown as <remote>/<branch> (just the branch for a local base)."
           + "\nWho/when: check this while reviewing a cell's worktree to see what it branched from or gets rebased onto before each run.";
         const upstreamRow = (paths && paths.project)
           ? `<div class="kv-row"><span class="k">upstream <span class="ro-badge" data-tip="${upstreamTip}">🔒</span></span><span class="v mono">${esc(paths.upstream || "—")}</span></div>`

@@ -15,6 +15,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use opentelemetry::trace::{SpanKind, Status};
+use ralphus_core::schema::UpstreamRef;
 use ralphus_core::uri::{RalphusUri, Segment, Token, parse_uri};
 use ralphus_core::validate::{ValidationError, validate_toml};
 use serde::{Deserialize, Serialize};
@@ -6661,8 +6662,9 @@ fn validate_project(daemon: &Daemon, name: &str) -> Reply {
     }
 }
 
-/// `GET /api/projects/{name}/branches` (RAL-297): local and `origin`
-/// remote-tracking branch names for a registered git project, so the Simple
+/// `GET /api/projects/{name}/branches` (RAL-297): the local branches (remote
+/// `.`) and every configured remote's tracking branches for a registered git
+/// project, as `{remote, branch}` entries, so the Simple
 /// task form can validate a user-typed upstream branch at submit time
 /// before generating a `ralphus:new-worktree/...?upstream=...` placeholder
 /// that would otherwise only fail much later, at worktree-materialization
@@ -6674,22 +6676,31 @@ fn validate_project(daemon: &Daemon, name: &str) -> Reply {
 /// first place.
 #[derive(Serialize)]
 struct ProjectBranchesResponse {
-    branches: Vec<String>,
+    branches: Vec<UpstreamRef>,
+}
+
+/// Every `(remote, branch)` pair the checkout at `git_root` knows: local
+/// branches under remote `.`, then each configured remote's tracking branches.
+fn upstream_candidates(git_root: &str) -> Vec<UpstreamRef> {
+    let mut remotes = vec![ralphus_core::schema::LOCAL_UPSTREAM_REMOTE.to_string()];
+    remotes.extend(crate::guardian_merge::list_remotes(git_root));
+    remotes
+        .into_iter()
+        .flat_map(|remote| {
+            crate::guardian_merge::list_base_branches(git_root, &remote)
+                .into_iter()
+                .map(move |branch| UpstreamRef::new(remote.clone(), branch))
+        })
+        .collect()
 }
 
 fn project_branches(daemon: &Daemon, name: &str) -> Reply {
-    // Bound before the `match`: both `list_base_branches` calls below spawn a
-    // `git for-each-ref`, and this endpoint is polled by the board -- two
-    // subprocesses per poll under the global store lock. WS-E.2: pooled too.
+    // Bound before the `match`: the candidate listing spawns `git` per remote,
+    // and this endpoint is polled by the board. WS-E.2: pooled too.
     let project = daemon.with_read_snapshot(|c| Store::get_project_conn(c, name));
     match project {
         Ok(Some(p)) if p.vcs == "git" => {
-            let mut branches = crate::guardian_merge::list_base_branches(&p.path, "main");
-            for b in crate::guardian_merge::list_base_branches(&p.path, "origin/HEAD") {
-                if !branches.contains(&b) {
-                    branches.push(b);
-                }
-            }
+            let branches = upstream_candidates(&p.path);
             json(200, &ProjectBranchesResponse { branches })
         }
         Ok(Some(_)) => json(200, &ProjectBranchesResponse { branches: vec![] }),
@@ -15064,7 +15075,8 @@ fn guardian_subscribe_recipient(daemon: &Daemon, id: &str, body: &str) -> Reply 
 #[derive(Deserialize)]
 struct CreateGuardianBody {
     name: String,
-    base_branch: String,
+    upstream_remote: String,
+    upstream_branch: String,
     /// Raw-directory creation route. Mutually exclusive with `project`.
     #[serde(default)]
     git_root: Option<String>,
@@ -15088,7 +15100,9 @@ struct GuardianSettingsBody {
     #[serde(default)]
     resolver_model: Option<String>,
     #[serde(default)]
-    base_branch: Option<String>,
+    upstream_remote: Option<String>,
+    #[serde(default)]
+    upstream_branch: Option<String>,
     /// RAL-117: opt this review into automatically incorporating PR feedback
     /// comments instead of requiring the manual "Pull in PR feedback" action.
     #[serde(default)]
@@ -15264,7 +15278,9 @@ struct GuardianDetailsBody {
     #[serde(default)]
     name: Option<String>,
     #[serde(default)]
-    base_branch: Option<String>,
+    upstream_remote: Option<String>,
+    #[serde(default)]
+    upstream_branch: Option<String>,
     #[serde(default)]
     resolver_agent: Option<String>,
     #[serde(default)]
@@ -15617,7 +15633,7 @@ fn guardian_create(daemon: &Daemon, user_header: Option<&str>, body: &str) -> Re
         return error(
             400,
             "bad_request",
-            "body must be {name, base_branch, git_root} or {name, base_branch, project}",
+            "body must be {name, upstream_remote, upstream_branch, git_root} or {name, upstream_remote, upstream_branch, project}",
             vec![],
         );
     };
@@ -15631,13 +15647,21 @@ fn guardian_create(daemon: &Daemon, user_header: Option<&str>, body: &str) -> Re
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty());
+    let (remote, branch) = (req.upstream_remote.trim(), req.upstream_branch.trim());
+    if remote.is_empty() || branch.is_empty() {
+        return error(
+            400,
+            "bad_request",
+            "upstream_remote and upstream_branch must not be empty (use remote \".\" for a local branch)",
+            vec![],
+        );
+    }
+    let base = UpstreamRef::new(remote, branch);
     let auto_watch_user = current_user(daemon, user_header).ok().flatten();
     let store = daemon.lock();
     let created = match (git_root, project) {
-        (Some(git_root), None) => store.create_guardian(&req.name, &req.base_branch, git_root),
-        (None, Some(project)) => {
-            store.create_guardian_for_project(&req.name, &req.base_branch, project)
-        }
+        (Some(git_root), None) => store.create_guardian(&req.name, &base, git_root),
+        (None, Some(project)) => store.create_guardian_for_project(&req.name, &base, project),
         (Some(_), Some(_)) => {
             return error(
                 400,
@@ -15764,6 +15788,26 @@ fn resolver_field(raw: Option<&str>) -> Option<Option<&str>> {
 
 /// Update per-review settings (opt-out flags). Only the fields present in the
 /// body are changed; the updated guardian view is returned.
+/// The base a settings/details body asks for: `None` when it names neither
+/// half, an error reply when it names only one (the pair is set together).
+fn requested_base(
+    remote: Option<&str>,
+    branch: Option<&str>,
+) -> Result<Option<UpstreamRef>, Reply> {
+    let remote = remote.map(str::trim).filter(|s| !s.is_empty());
+    let branch = branch.map(str::trim).filter(|s| !s.is_empty());
+    match (remote, branch) {
+        (None, None) => Ok(None),
+        (Some(remote), Some(branch)) => Ok(Some(UpstreamRef::new(remote, branch))),
+        _ => Err(error(
+            400,
+            "bad_request",
+            "upstream_remote and upstream_branch are set together (use remote \".\" for a local branch)",
+            vec![],
+        )),
+    }
+}
+
 fn guardian_settings(daemon: &Daemon, id: &str, body: &str) -> Reply {
     let Ok(req) = serde_json::from_str::<GuardianSettingsBody>(body) else {
         return error(
@@ -15779,6 +15823,13 @@ fn guardian_settings(daemon: &Daemon, id: &str, body: &str) -> Reply {
     if let Some(reply) = reject_invalid_ci_deferral(req.ci_deferral.as_deref()) {
         return reply;
     }
+    let base = match requested_base(
+        req.upstream_remote.as_deref(),
+        req.upstream_branch.as_deref(),
+    ) {
+        Ok(base) => base,
+        Err(reply) => return reply,
+    };
     let store = daemon.lock();
     if let Some(skip) = req.skip_worktrees {
         if let Err(e) = store.set_guardian_skip_worktrees(id, skip) {
@@ -15801,8 +15852,8 @@ fn guardian_settings(daemon: &Daemon, id: &str, body: &str) -> Reply {
             return store_error(&e);
         }
     }
-    if let Some(branch) = req.base_branch.as_deref().filter(|s| !s.is_empty()) {
-        if let Err(e) = store.set_guardian_base_branch(id, branch) {
+    if let Some(base) = &base {
+        if let Err(e) = store.set_guardian_base_branch(id, base) {
             return store_error(&e);
         }
     }
@@ -15925,7 +15976,7 @@ fn guardian_settings(daemon: &Daemon, id: &str, body: &str) -> Reply {
     // writes above have already succeeded and must not be undone by a
     // restart hiccup, so a failure here is logged, not surfaced to the caller.
     let status = store.get_guardian(id).map(|g| g.status).ok();
-    let base_changed = req.base_branch.as_deref().is_some_and(|s| !s.is_empty());
+    let base_changed = base.is_some();
     drop(store);
     // RAL-277: a local base edit is not complete until every open PR/MR base
     // has been verified on the forge. Keep this inside the request so callers
@@ -16089,6 +16140,13 @@ fn guardian_details(daemon: &Daemon, id: &str, body: &str) -> Reply {
     if let Some(reply) = reject_invalid_ci_deferral(req.ci_deferral.as_deref()) {
         return reply;
     }
+    let base = match requested_base(
+        req.upstream_remote.as_deref(),
+        req.upstream_branch.as_deref(),
+    ) {
+        Ok(base) => base,
+        Err(reply) => return reply,
+    };
 
     let store = daemon.lock();
     let guardian = match store.get_guardian(id) {
@@ -16099,14 +16157,7 @@ fn guardian_details(daemon: &Daemon, id: &str, body: &str) -> Reply {
     // Guard: base/resolver are frozen once merged/deployed, same as
     // guardian_change_base's existing check.
     let frozen = matches!(guardian.status.as_str(), "merged" | "deployed");
-    if frozen
-        && (req
-            .base_branch
-            .as_deref()
-            .is_some_and(|s| !s.trim().is_empty())
-            || req.resolver_agent.is_some()
-            || req.resolver_model.is_some())
-    {
+    if frozen && (base.is_some() || req.resolver_agent.is_some() || req.resolver_model.is_some()) {
         return error(
             409,
             "invalid_transition",
@@ -16155,14 +16206,9 @@ fn guardian_details(daemon: &Daemon, id: &str, body: &str) -> Reply {
             return store_error(&e);
         }
     }
-    let base_changed = req
-        .base_branch
-        .as_deref()
-        .is_some_and(|s| !s.trim().is_empty());
-    if base_changed {
-        if let Err(e) =
-            store.set_guardian_base_branch(id, req.base_branch.as_deref().unwrap().trim())
-        {
+    let base_changed = base.is_some();
+    if let Some(base) = &base {
+        if let Err(e) = store.set_guardian_base_branch(id, base) {
             return store_error(&e);
         }
     }
@@ -19506,14 +19552,18 @@ fn guardian_base_branches(daemon: &Daemon, id: &str) -> Reply {
         Ok(g) => g,
         Err(e) => return store_error(&e),
     };
-    let branches =
-        crate::guardian_merge::list_base_branches(&guardian.git_root, &guardian.base_branch);
+    let branches: Vec<UpstreamRef> =
+        crate::guardian_merge::list_base_branches(&guardian.git_root, &guardian.upstream_remote)
+            .into_iter()
+            .map(|branch| UpstreamRef::new(guardian.upstream_remote.clone(), branch))
+            .collect();
     json(200, &branches)
 }
 
 #[derive(Deserialize)]
 struct ChangeBaseBody {
-    branch: String,
+    upstream_remote: String,
+    upstream_branch: String,
 }
 
 #[derive(Serialize)]
@@ -19540,12 +19590,24 @@ struct ChangeBaseReply {
 /// `merged`/`deployed` status; all other states are permitted.
 fn guardian_change_base(daemon: &Daemon, id: &str, body: &str) -> Reply {
     let Ok(req) = serde_json::from_str::<ChangeBaseBody>(body) else {
-        return error(400, "bad_request", "body must be {branch}", vec![]);
+        return error(
+            400,
+            "bad_request",
+            "body must be {upstream_remote, upstream_branch}",
+            vec![],
+        );
     };
-    let branch = req.branch.trim();
-    if branch.is_empty() {
-        return error(400, "bad_request", "branch must not be empty", vec![]);
+    let (remote, branch) = (req.upstream_remote.trim(), req.upstream_branch.trim());
+    if remote.is_empty() || branch.is_empty() {
+        return error(
+            400,
+            "bad_request",
+            "upstream_remote and upstream_branch must not be empty",
+            vec![],
+        );
     }
+    let base = UpstreamRef::new(remote, branch);
+    let joined = base.joined();
     let store = daemon.lock();
     let guardian = match store.get_guardian(id) {
         Ok(g) => g,
@@ -19559,7 +19621,7 @@ fn guardian_change_base(daemon: &Daemon, id: &str, body: &str) -> Reply {
             vec![],
         );
     }
-    if let Err(e) = store.set_guardian_base_branch(id, branch) {
+    if let Err(e) = store.set_guardian_base_branch(id, &base) {
         return store_error(&e);
     }
     let has_branches = !guardian.branches.is_empty();
@@ -19586,7 +19648,7 @@ fn guardian_change_base(daemon: &Daemon, id: &str, body: &str) -> Reply {
                 guardian: updated_guardian,
                 base_change: ChangeBaseStatus {
                     status: "saved".to_string(),
-                    message: format!("Base branch saved as '{branch}'."),
+                    message: format!("Base branch saved as '{joined}'."),
                     action: None,
                 },
             },
@@ -19623,7 +19685,7 @@ fn guardian_change_base(daemon: &Daemon, id: &str, body: &str) -> Reply {
                 guardian: updated_guardian,
                 base_change: ChangeBaseStatus {
                     status: "merging".to_string(),
-                    message: format!("Base branch saved as '{branch}' and the rebase restarted."),
+                    message: format!("Base branch saved as '{joined}' and the rebase restarted."),
                     action: None,
                 },
             },
@@ -19681,7 +19743,7 @@ fn guardian_change_base(daemon: &Daemon, id: &str, body: &str) -> Reply {
                 guardian: updated_guardian,
                 base_change: ChangeBaseStatus {
                     status: "saved".to_string(),
-                    message: format!("Base branch saved as '{branch}'."),
+                    message: format!("Base branch saved as '{joined}'."),
                     action: None,
                 },
             },
@@ -25053,7 +25115,7 @@ ANTHROPIC_AUTH_TOKEN = { from_env = "RALPHUS_AGENT_PROFILES_HEALTH_ROUTE_TEST_VA
     #[test]
     fn submit_rejects_placeholder_cwd_with_unregistered_project() {
         let d = daemon();
-        let toml = "[[task]]\nname=\"t\"\nproject=\"ghost\"\n[[task.cell]]\ncwd=\"<<ralphus:new-worktree/feat?upstream=main>>\"\nprompt=\"p\"\n";
+        let toml = "[[task]]\nname=\"t\"\nproject=\"ghost\"\n[[task.cell]]\ncwd=\"<<ralphus:new-worktree/feat?upstream_remote=.&upstream_branch=main>>\"\nprompt=\"p\"\n";
         let r = route(&d, "POST", "/api/squads", &submit_body(toml));
         assert_eq!(r.status, 400, "{}", r.body);
         assert!(r.body.contains("project_validation_failed"));
@@ -25433,7 +25495,7 @@ ANTHROPIC_AUTH_TOKEN = { from_env = "RALPHUS_AGENT_PROFILES_HEALTH_ROUTE_TEST_VA
         assert_eq!(route(&d, "POST", "/api/projects", &project).status, 201);
 
         let toml = "[[task]]\nname=\"t\"\nproject=\"proj\"\n\
-                    [[task.cell]]\nid=\"work\"\ncwd=\"<<ralphus:new-worktree/feat?upstream=main>>\"\n\
+                    [[task.cell]]\nid=\"work\"\ncwd=\"<<ralphus:new-worktree/feat?upstream_remote=.&upstream_branch=main>>\"\n\
                     prompt=\"p\"\nreview=\"<<ralphus:new-review/r>>\"\n\
                     [[review]]\nid=\"ralphus:new-review/r\"\n";
         let r = route(&d, "POST", "/api/squads", &submit_body(toml));
@@ -25513,7 +25575,7 @@ ANTHROPIC_AUTH_TOKEN = { from_env = "RALPHUS_AGENT_PROFILES_HEALTH_ROUTE_TEST_VA
             &machine_body("incredibuild", "/opt/ib.sh"),
         );
         let toml = "[[task]]\nname=\"t\"\nproject=\"proj\"\nmachine=\"incredibuild:A\"\n\
-                    [[task.cell]]\nid=\"work\"\ncwd=\"<<ralphus:new-worktree/feat?upstream=main>>\"\nprompt=\"p\"\n";
+                    [[task.cell]]\nid=\"work\"\ncwd=\"<<ralphus:new-worktree/feat?upstream_remote=.&upstream_branch=main>>\"\nprompt=\"p\"\n";
         let r = route(&d, "POST", "/api/squads", &submit_body(toml));
         assert_eq!(r.status, 201, "{}", r.body);
     }
@@ -25530,7 +25592,7 @@ ANTHROPIC_AUTH_TOKEN = { from_env = "RALPHUS_AGENT_PROFILES_HEALTH_ROUTE_TEST_VA
             &register_body("proj", &repo.to_string_lossy(), ""),
         );
         let toml = "[[task]]\nname=\"t\"\nproject=\"proj\"\nmachine=\"local\"\n\
-                    [[task.cell]]\ncwd=\"<<ralphus:new-worktree/feat?upstream=main>>\"\nprompt=\"p\"\n";
+                    [[task.cell]]\ncwd=\"<<ralphus:new-worktree/feat?upstream_remote=.&upstream_branch=main>>\"\nprompt=\"p\"\n";
         let r = route(&d, "POST", "/api/squads", &submit_body(toml));
         assert_eq!(r.status, 201, "{}", r.body);
     }
@@ -25743,7 +25805,7 @@ machine=\"incredibuild:B\"
         assert_eq!(r.status, 201, "{}", r.body);
 
         let toml = "[[task]]\nname=\"t\"\nproject=\"proj\"\n\
-                    [[task.cell]]\nid=\"work\"\ncwd=\"<<ralphus:new-worktree/feat?upstream=main>>\"\nprompt=\"p\"\nreview=\"<<review:r>>\"\n\
+                    [[task.cell]]\nid=\"work\"\ncwd=\"<<ralphus:new-worktree/feat?upstream_remote=.&upstream_branch=main>>\"\nprompt=\"p\"\nreview=\"<<review:r>>\"\n\
                     [[review]]\nid=\"r\"\n";
         let r = route(&d, "POST", "/api/squads", &submit_body(toml));
         assert_eq!(r.status, 201, "{}", r.body);
@@ -25823,7 +25885,7 @@ machine=\"incredibuild:B\"
             &machine_body("incredibuild", "/opt/ib.sh"),
         );
         let toml = "[[task]]\nname=\"t\"\nproject=\"proj\"\nmachine=\"incredibuild:A\"\n\
-                    [[task.cell]]\nid=\"work\"\ncwd=\"<<ralphus:new-worktree/feat?upstream=main>>\"\nprompt=\"p\"\nreview=\"<<review:r>>\"\n\
+                    [[task.cell]]\nid=\"work\"\ncwd=\"<<ralphus:new-worktree/feat?upstream_remote=.&upstream_branch=main>>\"\nprompt=\"p\"\nreview=\"<<review:r>>\"\n\
                     [[review]]\nid=\"r\"\n";
         let r = route(&d, "POST", "/api/squads", &submit_body(toml));
         assert_eq!(r.status, 400, "{}", r.body);
@@ -25855,7 +25917,8 @@ machine=\"incredibuild:B\"
         );
         let toml = "[[task]]\nname=\"t\"\nproject=\"proj\"\nmachine=\"incredibuild:A\"\n\
                     [[task.cell]]\nid=\"work\"\ncwd=\"/remote/wt\"\nprompt=\"p\"\nreview=\"<<review:r>>\"\n\
-                    [[review]]\nid=\"r\"\nupstream=\"main\"\n";
+                    [[review]]\nid=\"r\"\nupstream_remote=\".\"
+upstream_branch=\"main\"\n";
         let r = route(&d, "POST", "/api/squads", &submit_body(toml));
         assert_eq!(r.status, 400, "{}", r.body);
         assert!(r.body.contains("new-worktree"), "{}", r.body);
@@ -25906,7 +25969,7 @@ machine=\"incredibuild:B\"
             "/api/projects",
             &register_body("proj", &repo.to_string_lossy(), ""),
         );
-        let toml = "[[task]]\nname=\"t\"\nproject=\"proj\"\n[[task.cell]]\ncwd=\"<<ralphus:new-worktree/feat?upstream=main>>\"\nprompt=\"p\"\n";
+        let toml = "[[task]]\nname=\"t\"\nproject=\"proj\"\n[[task.cell]]\ncwd=\"<<ralphus:new-worktree/feat?upstream_remote=.&upstream_branch=main>>\"\nprompt=\"p\"\n";
         let r = route(&d, "POST", "/api/squads", &submit_body(toml));
         assert_eq!(r.status, 201, "{}", r.body);
     }
@@ -27708,7 +27771,7 @@ remediation_attempts=1
     fn guardian_logs_records_status() {
         let d = daemon();
         let body =
-            serde_json::json!({"name":"r","base_branch":"main","git_root":"/repo"}).to_string();
+            serde_json::json!({"name":"r","upstream_remote": ".", "upstream_branch": "main","git_root":"/repo"}).to_string();
         route(&d, "POST", "/api/guardians", &body);
         let gid = "guardian-000000000001";
         d.lock()
@@ -28191,7 +28254,7 @@ remediation_attempts=1
             .unwrap();
 
         let gbody =
-            serde_json::json!({"name":"r","base_branch":"main","git_root":"/repo"}).to_string();
+            serde_json::json!({"name":"r","upstream_remote": ".", "upstream_branch": "main","git_root":"/repo"}).to_string();
         route(&d, "POST", "/api/guardians", &gbody);
         let gid = "guardian-000000000001";
 
@@ -29873,7 +29936,7 @@ remediation_attempts = 1
     fn guardian_reorder_route() {
         let d = daemon();
         let body =
-            serde_json::json!({"name":"r","base_branch":"main","git_root":"/repo"}).to_string();
+            serde_json::json!({"name":"r","upstream_remote": ".", "upstream_branch": "main","git_root":"/repo"}).to_string();
         route(&d, "POST", "/api/guardians", &body);
         let gid = "guardian-000000000001";
         for br in ["a", "b", "c"] {
@@ -29900,7 +29963,7 @@ remediation_attempts = 1
         // guardian view reflects them.
         let d = daemon();
         let body =
-            serde_json::json!({"name":"r","base_branch":"main","git_root":"/repo"}).to_string();
+            serde_json::json!({"name":"r","upstream_remote": ".", "upstream_branch": "main","git_root":"/repo"}).to_string();
         route(&d, "POST", "/api/guardians", &body);
         let gid = "guardian-000000000001";
         for br in ["a", "b", "c"] {
@@ -29943,7 +30006,7 @@ remediation_attempts = 1
         // regardless of that async merge outcome.
         let d = daemon();
         for name in ["r1", "r2"] {
-            let body = serde_json::json!({"name":name,"base_branch":"main","git_root":"/repo"})
+            let body = serde_json::json!({"name":name,"upstream_remote": ".", "upstream_branch": "main","git_root":"/repo"})
                 .to_string();
             route(&d, "POST", "/api/guardians", &body);
         }
@@ -30055,7 +30118,7 @@ remediation_attempts = 1
     fn guardian_move_branch_route_bad_body_is_400() {
         let d = daemon();
         let body =
-            serde_json::json!({"name":"r","base_branch":"main","git_root":"/repo"}).to_string();
+            serde_json::json!({"name":"r","upstream_remote": ".", "upstream_branch": "main","git_root":"/repo"}).to_string();
         route(&d, "POST", "/api/guardians", &body);
         let gid = "guardian-000000000001";
         route(
@@ -30079,7 +30142,7 @@ remediation_attempts = 1
         // blocked with a clear 409, not silently corrupted state.
         let d = daemon();
         for name in ["r1", "r2"] {
-            let body = serde_json::json!({"name":name,"base_branch":"main","git_root":"/repo"})
+            let body = serde_json::json!({"name":name,"upstream_remote": ".", "upstream_branch": "main","git_root":"/repo"})
                 .to_string();
             route(&d, "POST", "/api/guardians", &body);
         }
@@ -30120,7 +30183,7 @@ remediation_attempts = 1
             .unwrap();
 
         let body =
-            serde_json::json!({"name":"r","base_branch":"main","git_root":"/repo"}).to_string();
+            serde_json::json!({"name":"r","upstream_remote": ".", "upstream_branch": "main","git_root":"/repo"}).to_string();
         route(&d, "POST", "/api/guardians", &body);
         let gid = "guardian-000000000001";
         route(
@@ -30155,7 +30218,7 @@ remediation_attempts = 1
     fn guardian_link_cell_route_bad_body_is_400() {
         let d = daemon();
         let body =
-            serde_json::json!({"name":"r","base_branch":"main","git_root":"/repo"}).to_string();
+            serde_json::json!({"name":"r","upstream_remote": ".", "upstream_branch": "main","git_root":"/repo"}).to_string();
         route(&d, "POST", "/api/guardians", &body);
         let gid = "guardian-000000000001";
         route(
@@ -30178,7 +30241,7 @@ remediation_attempts = 1
         let d = daemon();
         let squad_id = submit_squad(&d);
         let body =
-            serde_json::json!({"name":"r","base_branch":"main","git_root":"/repo"}).to_string();
+            serde_json::json!({"name":"r","upstream_remote": ".", "upstream_branch": "main","git_root":"/repo"}).to_string();
         route(&d, "POST", "/api/guardians", &body);
         let gid = "guardian-000000000001";
         route(
@@ -30212,7 +30275,7 @@ remediation_attempts = 1
         // panic and the arrangement is persisted regardless of merge outcome.
         let d = daemon();
         let body =
-            serde_json::json!({"name":"r","base_branch":"main","git_root":"/repo"}).to_string();
+            serde_json::json!({"name":"r","upstream_remote": ".", "upstream_branch": "main","git_root":"/repo"}).to_string();
         route(&d, "POST", "/api/guardians", &body);
         let gid = "guardian-000000000001";
         for br in ["a", "b", "c"] {
@@ -30250,7 +30313,7 @@ remediation_attempts = 1
     fn guardian_arrange_bad_body_is_400() {
         let d = daemon();
         let body =
-            serde_json::json!({"name":"r","base_branch":"main","git_root":"/repo"}).to_string();
+            serde_json::json!({"name":"r","upstream_remote": ".", "upstream_branch": "main","git_root":"/repo"}).to_string();
         route(&d, "POST", "/api/guardians", &body);
         let gid = "guardian-000000000001";
         let r = route(
@@ -30916,7 +30979,7 @@ remediation_attempts = 1
     fn guardian_branch_messages_endpoint_starts_empty() {
         let d = daemon();
         let body =
-            serde_json::json!({"name":"r","base_branch":"main","git_root":"/repo"}).to_string();
+            serde_json::json!({"name":"r","upstream_remote": ".", "upstream_branch": "main","git_root":"/repo"}).to_string();
         route(&d, "POST", "/api/guardians", &body);
         let r = route(
             &d,
@@ -30935,7 +30998,7 @@ remediation_attempts = 1
         // branch never sees another's feedback.
         let d = daemon();
         let body =
-            serde_json::json!({"name":"r","base_branch":"main","git_root":"/repo"}).to_string();
+            serde_json::json!({"name":"r","upstream_remote": ".", "upstream_branch": "main","git_root":"/repo"}).to_string();
         route(&d, "POST", "/api/guardians", &body);
         let gid = "guardian-000000000001";
         d.lock().add_guardian_branch(gid, "feature/a").unwrap();
@@ -30982,7 +31045,7 @@ remediation_attempts = 1
     fn feedback_empty_is_400() {
         let d = daemon();
         let body =
-            serde_json::json!({"name":"r","base_branch":"main","git_root":"/repo"}).to_string();
+            serde_json::json!({"name":"r","upstream_remote": ".", "upstream_branch": "main","git_root":"/repo"}).to_string();
         route(&d, "POST", "/api/guardians", &body);
         let r = route(
             &d,
@@ -31000,7 +31063,7 @@ remediation_attempts = 1
         let d = daemon();
         d.lock().create_user("bob").unwrap();
         let body =
-            serde_json::json!({"name":"r","base_branch":"main","git_root":"/repo"}).to_string();
+            serde_json::json!({"name":"r","upstream_remote": ".", "upstream_branch": "main","git_root":"/repo"}).to_string();
         route(&d, "POST", "/api/guardians", &body);
         let gid = "guardian-000000000001";
         d.lock().add_guardian_branch(gid, "feature/a").unwrap();
@@ -31034,7 +31097,7 @@ remediation_attempts = 1
         d.lock().create_user("alice").unwrap();
         d.lock().create_user("bob").unwrap();
         let body =
-            serde_json::json!({"name":"r","base_branch":"main","git_root":"/repo"}).to_string();
+            serde_json::json!({"name":"r","upstream_remote": ".", "upstream_branch": "main","git_root":"/repo"}).to_string();
         route(&d, "POST", "/api/guardians", &body);
         let gid = "guardian-000000000001";
         d.lock().add_guardian_branch(gid, "feature/a").unwrap();
@@ -31064,7 +31127,7 @@ remediation_attempts = 1
         // pass even starts.
         let d = daemon();
         let body =
-            serde_json::json!({"name":"r","base_branch":"main","git_root":"/repo"}).to_string();
+            serde_json::json!({"name":"r","upstream_remote": ".", "upstream_branch": "main","git_root":"/repo"}).to_string();
         route(&d, "POST", "/api/guardians", &body);
         let gid = "guardian-000000000001";
         d.lock().add_guardian_branch(gid, "feature/a").unwrap();
@@ -31094,7 +31157,7 @@ remediation_attempts = 1
     fn feedback_rejects_an_unregistered_author() {
         let d = daemon();
         let body =
-            serde_json::json!({"name":"r","base_branch":"main","git_root":"/repo"}).to_string();
+            serde_json::json!({"name":"r","upstream_remote": ".", "upstream_branch": "main","git_root":"/repo"}).to_string();
         route(&d, "POST", "/api/guardians", &body);
         let gid = "guardian-000000000001";
         d.lock().add_guardian_branch(gid, "feature/a").unwrap();
@@ -31112,7 +31175,7 @@ remediation_attempts = 1
     fn guardian_rename_and_delete() {
         let d = daemon();
         let body =
-            serde_json::json!({"name":"r","base_branch":"main","git_root":"/repo"}).to_string();
+            serde_json::json!({"name":"r","upstream_remote": ".", "upstream_branch": "main","git_root":"/repo"}).to_string();
         route(&d, "POST", "/api/guardians", &body);
         let gid = "guardian-000000000001";
         // rename
@@ -31149,10 +31212,10 @@ remediation_attempts = 1
     fn guardian_delete_batch_deletes_all_and_reports_unknown_id_as_failed() {
         let d = daemon();
         let body =
-            serde_json::json!({"name":"r1","base_branch":"main","git_root":"/repo"}).to_string();
+            serde_json::json!({"name":"r1","upstream_remote": ".", "upstream_branch": "main","git_root":"/repo"}).to_string();
         route(&d, "POST", "/api/guardians", &body);
         let body2 =
-            serde_json::json!({"name":"r2","base_branch":"main","git_root":"/repo"}).to_string();
+            serde_json::json!({"name":"r2","upstream_remote": ".", "upstream_branch": "main","git_root":"/repo"}).to_string();
         route(&d, "POST", "/api/guardians", &body2);
         let gid1 = "guardian-000000000001";
         let gid2 = "guardian-000000000002";
@@ -31209,7 +31272,7 @@ remediation_attempts = 1
     fn guardian_index_returns_lean_summary_only() {
         let d = daemon();
         let body = serde_json::json!({
-            "name": "r", "base_branch": "main", "git_root": "/repo",
+            "name": "r", "upstream_remote": ".", "upstream_branch": "main", "git_root": "/repo",
         })
         .to_string();
         let created = route(&d, "POST", "/api/guardians", &body);
@@ -31238,7 +31301,7 @@ remediation_attempts = 1
         let mut ids = Vec::new();
         for name in ["one", "two"] {
             let body = serde_json::json!({
-                "name": name, "base_branch": "main", "git_root": "/repo",
+                "name": name, "upstream_remote": ".", "upstream_branch": "main", "git_root": "/repo",
             })
             .to_string();
             let created = route(&d, "POST", "/api/guardians", &body);
@@ -31331,7 +31394,7 @@ remediation_attempts = 1
         let d = daemon();
         let _troot = isolated_terminal_root();
         let body =
-            serde_json::json!({"name":"r","base_branch":"main","git_root":"/repo"}).to_string();
+            serde_json::json!({"name":"r","upstream_remote": ".", "upstream_branch": "main","git_root":"/repo"}).to_string();
         route(&d, "POST", "/api/guardians", &body);
         let gid = "guardian-000000000001";
         let name = crate::tmux::session_name(
@@ -31356,7 +31419,7 @@ remediation_attempts = 1
             .unwrap();
         let body = serde_json::json!({
             "name": "r",
-            "base_branch": "main",
+            "upstream_remote": ".", "upstream_branch": "main",
             "project": "ralphus"
         })
         .to_string();
@@ -31372,7 +31435,7 @@ remediation_attempts = 1
     fn guardian_create_with_directory_keeps_project_identity_unset() {
         let d = daemon();
         let body =
-            serde_json::json!({"name":"r","base_branch":"main","git_root":"/repo"}).to_string();
+            serde_json::json!({"name":"r","upstream_remote": ".", "upstream_branch": "main","git_root":"/repo"}).to_string();
 
         let created = route(&d, "POST", "/api/guardians", &body);
         assert_eq!(created.status, 201, "{}", created.body);
@@ -31385,14 +31448,16 @@ remediation_attempts = 1
         let d = daemon();
         let both = serde_json::json!({
             "name":"r",
-            "base_branch":"main",
+            "upstream_remote": ".", "upstream_branch": "main",
             "git_root":"/repo",
             "project":"ralphus"
         })
         .to_string();
         assert_eq!(route(&d, "POST", "/api/guardians", &both).status, 400);
 
-        let neither = serde_json::json!({"name":"r","base_branch":"main"}).to_string();
+        let neither =
+            serde_json::json!({"name":"r","upstream_remote": ".", "upstream_branch": "main"})
+                .to_string();
         assert_eq!(route(&d, "POST", "/api/guardians", &neither).status, 400);
     }
 
@@ -31400,7 +31465,7 @@ remediation_attempts = 1
     fn guardian_create_rejects_an_unknown_project() {
         let d = daemon();
         let body =
-            serde_json::json!({"name":"r","base_branch":"main","project":"missing"}).to_string();
+            serde_json::json!({"name":"r","upstream_remote": ".", "upstream_branch": "main","project":"missing"}).to_string();
         assert_eq!(route(&d, "POST", "/api/guardians", &body).status, 404);
     }
 
@@ -33424,7 +33489,7 @@ remediation_attempts=1
 
     fn make_guardian(d: &Daemon) -> String {
         let body =
-            serde_json::json!({"name":"r","base_branch":"main","git_root":"/repo"}).to_string();
+            serde_json::json!({"name":"r","upstream_remote": ".", "upstream_branch": "main","git_root":"/repo"}).to_string();
         route(d, "POST", "/api/guardians", &body);
         "guardian-000000000001".to_string()
     }
@@ -33654,7 +33719,7 @@ remediation_attempts=1
         let d = daemon();
         let body = serde_json::json!({
             "name": "r",
-            "base_branch": "main",
+            "upstream_remote": ".", "upstream_branch": "main",
             "git_root": repo.to_str().unwrap(),
         })
         .to_string();
@@ -34345,7 +34410,7 @@ remediation_attempts=1
         let gid = make_guardian(&d);
         let body = serde_json::json!({
             "name": "renamed via details",
-            "base_branch": "develop",
+            "upstream_remote": ".", "upstream_branch": "develop",
         })
         .to_string();
         let r = route(&d, "POST", &format!("/api/guardians/{gid}/details"), &body);
@@ -34362,7 +34427,8 @@ remediation_attempts=1
             .set_guardian_status(&gid, crate::guardian::GuardianStatus::Merged, None)
             .unwrap();
 
-        let frozen = serde_json::json!({"base_branch": "develop"}).to_string();
+        let frozen =
+            serde_json::json!({"upstream_remote": ".", "upstream_branch": "develop"}).to_string();
         let r = route(
             &d,
             "POST",
@@ -35058,7 +35124,15 @@ remediation_attempts=1
         {
             let store = d.lock();
             store
-                .record_triage_pool_cell(project, triage_type, &squad_id, 0, 0, branch, "main")
+                .record_triage_pool_cell(
+                    project,
+                    triage_type,
+                    &squad_id,
+                    0,
+                    0,
+                    branch,
+                    &ralphus_core::schema::UpstreamRef::new("origin", "main"),
+                )
                 .unwrap();
             store
                 .set_cell_state(&squad_id, 0, 0, crate::store::NodeState::Done)

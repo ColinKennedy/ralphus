@@ -99,11 +99,14 @@ fn fixture_toml(project: &str, remote: bool) -> String {
         )
     };
     // A review branch is always a fresh worktree, local or remote.
-    let first_cwd = "<<ralphus:new-worktree/review-first?upstream=<<default>>>>";
-    let second_cwd = "<<ralphus:new-worktree/review-second?upstream=<<default>>>>";
+    let first_cwd =
+        "<<ralphus:new-worktree/review-first?upstream_remote=origin&upstream_branch=<<default>>>>";
+    let second_cwd =
+        "<<ralphus:new-worktree/review-second?upstream_remote=origin&upstream_branch=<<default>>>>";
     let review_machine = &machine;
     format!(
-        "[[task]]\nname = \"first\"\nproject = {project:?}\n{machine}\n[[task.cell]]\ncwd = {first_cwd:?}\ncommand = {first:?}\nmode = \"raw\"\nreview = \"<<ralphus:new-review/exercise>>\"\n\n[[task]]\nname = \"second\"\nproject = {project:?}\n{machine}depends_on = [\"first\"]\n\n[[task.cell]]\ncwd = {second_cwd:?}\ncommand = {second:?}\nmode = \"raw\"\nreview = \"<<ralphus:new-review/exercise>>\"\n\n[[review]]\nid = \"ralphus:new-review/exercise\"\nupstream = \"main\"\n{review_machine}proof_scope = \"nothing\"\nskip_manual_checks = true\n"
+        "[[task]]\nname = \"first\"\nproject = {project:?}\n{machine}\n[[task.cell]]\ncwd = {first_cwd:?}\ncommand = {first:?}\nmode = \"raw\"\nreview = \"<<ralphus:new-review/exercise>>\"\n\n[[task]]\nname = \"second\"\nproject = {project:?}\n{machine}depends_on = [\"first\"]\n\n[[task.cell]]\ncwd = {second_cwd:?}\ncommand = {second:?}\nmode = \"raw\"\nreview = \"<<ralphus:new-review/exercise>>\"\n\n[[review]]\nid = \"ralphus:new-review/exercise\"\nupstream_remote = \".\"
+upstream_branch = \"main\"\n{review_machine}proof_scope = \"nothing\"\nskip_manual_checks = true\n"
     )
 }
 

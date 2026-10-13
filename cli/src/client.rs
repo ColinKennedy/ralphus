@@ -1854,14 +1854,16 @@ impl DaemonClient {
     pub fn guardian_create(
         &self,
         name: &str,
-        base_branch: &str,
+        upstream_remote: &str,
+        upstream_branch: &str,
         git_root: &str,
         checks: Option<&[String]>,
         skip_worktrees: bool,
         review_type: Option<&str>,
     ) -> Result<Value, DaemonError> {
         let mut body = json!({
-            "name": name, "base_branch": base_branch, "git_root": git_root,
+            "name": name, "upstream_remote": upstream_remote,
+            "upstream_branch": upstream_branch, "git_root": git_root,
             "skip_worktrees": skip_worktrees,
         });
         set_if_some(&mut body, "checks", checks.map(|c| json!(c)));
@@ -1897,8 +1899,13 @@ impl DaemonClient {
         );
         set_if_some(
             &mut body,
-            "base_branch",
-            settings.base_branch.map(str::to_string),
+            "upstream_remote",
+            settings.upstream_remote.map(str::to_string),
+        );
+        set_if_some(
+            &mut body,
+            "upstream_branch",
+            settings.upstream_branch.map(str::to_string),
         );
         set_if_some(&mut body, "auto_pr_feedback", settings.auto_pr_feedback);
         set_if_some(
@@ -2023,11 +2030,12 @@ impl DaemonClient {
     pub fn guardian_change_base(
         &self,
         guardian_id: &str,
-        branch: &str,
+        upstream_remote: &str,
+        upstream_branch: &str,
     ) -> Result<Value, DaemonError> {
         self.post(
             &format!("/api/guardians/{guardian_id}/base"),
-            Some(json!({"branch": branch})),
+            Some(json!({"upstream_remote": upstream_remote, "upstream_branch": upstream_branch})),
         )
     }
 
@@ -2515,7 +2523,8 @@ pub struct GuardianSettings<'a> {
     pub skip_worktrees: Option<bool>,
     pub resolver_agent: Option<&'a str>,
     pub resolver_model: Option<&'a str>,
-    pub base_branch: Option<&'a str>,
+    pub upstream_remote: Option<&'a str>,
+    pub upstream_branch: Option<&'a str>,
     pub auto_pr_feedback: Option<bool>,
     pub proof_scope: Option<&'a str>,
     /// Which PRs/MRs in the review's stack run the full CI suite: `every`,

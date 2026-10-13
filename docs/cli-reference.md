@@ -357,7 +357,7 @@ the daemon's hourly Free-tier background sweep
 | `review logs <selector>` | State-transition audit log |
 | `review status <selector>` | Per-branch `merge_status`/`ready`/detail + a summary verdict — "is this review ready?" |
 | `review worktrees <selector>` | Worktrees/branches this review consumes, with source cell |
-| `review create <name> <base_branch> <git_root> [--checks] [--skip-checks] [--skip-worktrees] [--review-type]` | Create a review |
+| `review create <name> <upstream_remote> <upstream_branch> <git_root> [--checks] [--skip-checks] [--skip-worktrees] [--review-type]` | Create a review |
 | `forge pool list` | List the daemon-wide forge poll tokens (label and masked tail only) |
 | `forge pool add <kind> <label> --token <t> [--host <h>]` | Add a poll token for `github`/`gitlab` (host defaults to `github.com`/`gitlab.com`); admin-only |
 | `forge pool remove <kind> <label> [--host <h>]` | Remove a poll token; admin-only |
@@ -371,7 +371,7 @@ the daemon's hourly Free-tier background sweep
 | `review followup accept <selector>` | Draft a follow-up squad from the offer (held unless `[followup] auto_start`) |
 | `review followup decline <selector>` | Decline the offer; nothing is created and the review never offers again |
 | `review delete <selector> [--yes]` | Delete + purge worktrees |
-| `review settings <selector> [--skip-checks] [--skip-worktrees] [--resolver-agent] [--resolver-model] [--base-branch]` | Update opt-out settings |
+| `review settings <selector> [--skip-checks] [--skip-worktrees] [--resolver-agent] [--resolver-model] [--upstream-remote --upstream-branch]` | Update opt-out settings |
 | `review add-branch <selector> <branch>` | Add a branch |
 | `review link-cell <selector#branch> <cell_selector>` | Link a cell/task to an already-attached branch, so its readiness follows that cell finishing instead of staying `pending` forever (RAL-392) |
 | `review reorder <selector> <b1,b2,...> [--disable b,b] [--enable b,b]` | Reorder branches + rebase, atomically |
@@ -388,8 +388,8 @@ the daemon's hourly Free-tier background sweep
 | `review dismiss-reenable <selector#branch>` | Dismiss the "can re-enable" notice |
 | `review extract-branch <selector#branch>` | Move a branch into a new review of its own + rebuild both (RAL-641) |
 | `review move-branch <selector#branch> <to_review>` | Move a branch to another review + rebuild both (RAL-118) |
-| `review upstream list <selector>` | Candidate upstream branches |
-| `review upstream set <selector> <branch>` | Change upstream branch + rebuild |
+| `review upstream list <selector>` | Candidate upstream (remote, branch) pairs |
+| `review upstream set <selector> <upstream_remote> <upstream_branch>` | Change upstream remote and branch + rebuild (remote `.` = local branch) |
 | `review checks list <selector>` | List LLM-synthesized manual review-verification commands |
 | `review checks run <selector> [--index N...] [--all] [--input NAME=VALUE...]` | Print command(s) + cwd for one/some/all checks (not run by the daemon — see below) |
 | `review action list <selector>` | List user-declared `[[review.action]]` hints |
@@ -859,7 +859,7 @@ use; see `READ_ONLY_NOTE`.
             - (read-only-safe) list selector [uri]  {List the manual checks.}
             - (read-only-safe) run selector [uri] --all --index [integer...] --input [name=value...]  {Print the command(s) + cwd to run one/some/all manual checks yourself.}
             - terminal selector [uri] --mode [open|readonly]  {Print the command to resume the manual-checks-generation agent conversation locally.}
-        - create name [str] base_branch [str] git_root [str] --checks [list] --review-type [label] --skip-worktrees  {Create a new review.}
+        - create name [str] upstream_remote [str] upstream_branch [str] git_root [str] --checks [list] --review-type [label] --skip-worktrees  {Create a new review.}
         - delete selector [uri] --yes  {Delete a review and its worktrees.}
         - dismiss-reenable selector [uri]  {Dismiss the 're-enable' notification for a branch.}
         - (read-only-safe) env selector [uri] --scope [build|tests|manual-checks|worktree]  {List a review surface's resolved environment variables, read-only (RAL-324): the auto-build step, the check gates, manual checks, or one branch's review worktree.}
@@ -896,15 +896,15 @@ use; see `READ_ONLY_NOTE`.
         - reopen selector [uri]  {Reopen a cancelled or merged review and immediately stage in whatever branches are already ready, without waiting for the rest.}
         - reorder selector [uri] order [str] --disable [names] --enable [names]  {Set the branch order and kick off the rebase.}
         - restart-merge selector [uri]  {Cancel an in-progress rebase and start a fresh one.}
-        - settings selector [uri] --auto-cancel-outdated-pr-pipelines/--no-auto-cancel-outdated-pr-pipelines --auto-fix-pr-errors/--no-auto-fix-pr-errors --auto-fix-prompt-template [str] --auto-pr-feedback/--no-auto-pr-feedback --auto-run/--no-auto-run --auto-submit-pr-stack/--no-auto-submit-pr-stack --base-branch [branch] --cache-manual-checks/--no-cache-manual-checks --ci-deferral [every|top|bottom+top] --discourage-tests-during-auto-pr-fixes/--no-discourage-tests-during-auto-pr-fixes --dual-root-pr/--no-dual-root-pr --followup [on|off|inherit] --followup-auto-start [on|off|inherit] --match-pr-branch-name/--no-match-pr-branch-name --post-appraisals/--no-post-appraisals --proof-scope [each_branch|final_branch|nothing] --rebuild-on [none|inherit|rebase|feedback|auto_fix...] --resolver-agent [name] --resolver-model [name] --separate-pr-branch/--no-separate-pr-branch --skip-auto-clean/--no-skip-auto-clean --skip-base-updates/--no-skip-base-updates --skip-manual-checks/--no-skip-manual-checks --skip-worktrees/--no-skip-worktrees  {Update per-review opt-out settings.}
+        - settings selector [uri] --auto-cancel-outdated-pr-pipelines/--no-auto-cancel-outdated-pr-pipelines --auto-fix-pr-errors/--no-auto-fix-pr-errors --auto-fix-prompt-template [str] --auto-pr-feedback/--no-auto-pr-feedback --auto-run/--no-auto-run --auto-submit-pr-stack/--no-auto-submit-pr-stack --cache-manual-checks/--no-cache-manual-checks --ci-deferral [every|top|bottom+top] --discourage-tests-during-auto-pr-fixes/--no-discourage-tests-during-auto-pr-fixes --dual-root-pr/--no-dual-root-pr --followup [on|off|inherit] --followup-auto-start [on|off|inherit] --match-pr-branch-name/--no-match-pr-branch-name --post-appraisals/--no-post-appraisals --proof-scope [each_branch|final_branch|nothing] --rebuild-on [none|inherit|rebase|feedback|auto_fix...] --resolver-agent [name] --resolver-model [name] --separate-pr-branch/--no-separate-pr-branch --skip-auto-clean/--no-skip-auto-clean --skip-base-updates/--no-skip-base-updates --skip-manual-checks/--no-skip-manual-checks --skip-worktrees/--no-skip-worktrees --upstream-branch [branch] --upstream-remote [remote]  {Update per-review opt-out settings.}
         - (read-only-safe) show selector [uri]  {Show a single review's detail.}
         - squash selector [uri] project [str] --off --on  {Enable/disable squashing one git project's task branches to a single commit each in the review worktree.}
         - (read-only-safe) status selector [uri]  {Per-branch readiness + a summary verdict ('is this review ready?').}
         - stop-merge selector [uri]  {Stop an in-progress rebase at the next checkpoint, leaving the review resumable instead of cancelled.}
         - sync-pr selector [uri]  {Check the forge for a stack reorder made outside ralphus and apply it if found.}
-        - upstream  {Inspect/change a review's upstream branch.}
-            - (read-only-safe) list selector [uri]  {List candidate upstream branches.}
-            - set selector [uri] branch [str]  {Change the upstream branch.}
+        - upstream  {Inspect/change a review's upstream remote and branch.}
+            - (read-only-safe) list selector [uri]  {List candidate upstream (remote, branch) pairs on the review's upstream remote.}
+            - set selector [uri] upstream_remote [str] upstream_branch [str]  {Change the upstream remote and branch (remote "." names a local branch).}
         - (read-only-safe) worktree-retirements --state [scheduled|eligible|claimed|failed|deferred|opted_out|retired]  {List review worktrees across every review by retirement state -- scheduled, eligible, claimed, failed, deferred, opted_out, retired -- with failure context and the eligible-at timestamp. Repeat --state to filter (no --state lists everything).}
         - (read-only-safe) worktrees selector [uri]  {The worktrees/branches this review consumes.}
     - show  {Print machine-readable views of ralphus itself.}

@@ -17,8 +17,8 @@ on GitHub, or open the file locally). This page is the quick table.
 | Trigger | Applies to | What it does |
 |---|---|---|
 | `<<task:<name>>` | cell `upstream` | rebases the cell's branch onto that dependency task's branch tip at squad time |
-| `<<ralphus:new-worktree/<branch>?upstream=<upstream>>>` | cell `cwd` | materializes (or reuses) a worktree for `<branch>` under the task's `project`; the stored `cwd` is rewritten to the real path |
-| `<<default>>` / `<<current_branch>>` | the placeholder's `?upstream=` value | the branch the new worktree tracks: the repo's default branch (recommended), or whatever the project has checked out (changes between runs) |
+| `<<ralphus:new-worktree/<branch>?upstream_remote=origin&upstream_branch=<upstream>>>` | cell `cwd` | materializes (or reuses) a worktree for `<branch>` under the task's `project`; the stored `cwd` is rewritten to the real path |
+| `<<default>>` / `<<current_branch>>` | the placeholder's `?upstream_branch=` value | the branch the new worktree tracks: the repo's default branch (recommended), or whatever the project has checked out (changes between runs) |
 | `<<review:<id>>>` / `<<ralphus:new-review/<key>>>` | `[[task.cell]].review` | attaches the cell to an existing review, or mints a fresh review per submission (`<key>` groups cells into one) |
 | `<<ralphus:review/<id>>>` / `<<ralphus:squad/<id>>>` / `<<ralphus:new-review/<key>>>` / `<<ralphus:new-squad>>` | `[[waypoint]].roster` and `.affected` | names an existing review or squad, a same-file review, or the squad this submission itself creates (no `<key>` — one file makes exactly one squad). `roster` is the completion list that releases the hold; a bare id is a validation error. The older `<<review:<id>>>` / `<<squad:<id>>>` forms are still accepted |
 | `task/cell/proof?on=pass\|fail\|both` | proof step `restart_on` | when the named proof step fires with that verdict, this cell's proof cursor re-runs from the start |

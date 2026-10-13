@@ -753,8 +753,7 @@ pub fn collect_remote_upstream_prefetch_targets(
     let tasks_by_idx: BTreeMap<i64, &TaskRow> = tasks.iter().map(|t| (t.idx, t)).collect();
     for (pos, (_, rev_id_opt)) in cell_info.iter().enumerate() {
         let Some(rev_id) = rev_id_opt else { continue };
-        let Some(upstream) = review_map.get(rev_id).copied().and_then(declared_upstream)
-        else {
+        let Some(upstream) = review_map.get(rev_id).copied().and_then(declared_upstream) else {
             continue;
         };
         // A local base is never fetched.
@@ -2842,7 +2841,7 @@ mod tests {
             .unwrap();
         let file: ralphus_core::schema::TaskFile = toml::from_str(
             "[[task]]\nname=\"a\"\nproject=\"fx\"\nmachine=\"loopback:lb\"\n\
-             [[task.cell]]\ncwd=\"<<ralphus:new-worktree/l2-a?upstream=main>>\"\ncommand=\"echo\"\nmode=\"raw\"\n",
+             [[task.cell]]\ncwd=\"<<ralphus:new-worktree/l2-a?upstream_remote=.&upstream_branch=main>>\"\ncommand=\"echo\"\nmode=\"raw\"\n",
         )
         .unwrap();
         let squad_id = store.insert_squad(&file, None, false).unwrap();
@@ -3304,7 +3303,7 @@ mod tests {
             project: PathBuf::from("/repo"),
             registered_project: None,
             branch: "feat".to_string(),
-            upstream: "main".to_string(),
+            upstream: ralphus_core::schema::UpstreamRef::new("origin", "main"),
             name: "r".to_string(),
             order: 0,
             link_key: None,
@@ -3510,7 +3509,7 @@ mod tests {
     fn link_review_toml(review_toml: &str) -> String {
         format!(
             "[[task]]\nname=\"t\"\nproject=\"proj\"\n\n  [[task.cell]]\n  \
-             cwd=\"<<ralphus:new-worktree/feat-x?upstream=main>>\"\n  prompt=\"p\"\n  \
+             cwd=\"<<ralphus:new-worktree/feat-x?upstream_remote=.&upstream_branch=main>>\"\n  prompt=\"p\"\n  \
              review=\"<<ralphus:new-review/k>>\"\n\n[[review]]\nid=\"ralphus:new-review/k\"\n{review_toml}\n"
         )
     }
@@ -3904,11 +3903,27 @@ print(json.dumps(result))
         let squad_2 = completed_pool_cell(&mut store.lock());
         store
             .lock()
-            .record_triage_pool_cell("proj", "security", &squad_1, 0, 0, "b1", "main")
+            .record_triage_pool_cell(
+                "proj",
+                "security",
+                &squad_1,
+                0,
+                0,
+                "b1",
+                &ralphus_core::schema::UpstreamRef::new("origin", "main"),
+            )
             .unwrap();
         store
             .lock()
-            .record_triage_pool_cell("proj", "security", &squad_2, 0, 0, "b2", "main")
+            .record_triage_pool_cell(
+                "proj",
+                "security",
+                &squad_2,
+                0,
+                0,
+                "b2",
+                &ralphus_core::schema::UpstreamRef::new("origin", "main"),
+            )
             .unwrap();
 
         let gid = create_review_from_triage_pool(&store, "proj", "security", |_| None)
@@ -3946,15 +3961,39 @@ print(json.dumps(result))
         let squad_3 = completed_pool_cell(&mut store.lock());
         store
             .lock()
-            .record_triage_pool_cell("proj", "security", &squad_1, 0, 0, "b1", "main")
+            .record_triage_pool_cell(
+                "proj",
+                "security",
+                &squad_1,
+                0,
+                0,
+                "b1",
+                &ralphus_core::schema::UpstreamRef::new("origin", "main"),
+            )
             .unwrap();
         store
             .lock()
-            .record_triage_pool_cell("proj", "security", &squad_2, 0, 0, "b2", "main")
+            .record_triage_pool_cell(
+                "proj",
+                "security",
+                &squad_2,
+                0,
+                0,
+                "b2",
+                &ralphus_core::schema::UpstreamRef::new("origin", "main"),
+            )
             .unwrap();
         store
             .lock()
-            .record_triage_pool_cell("proj", "security", &squad_3, 0, 0, "b3", "main")
+            .record_triage_pool_cell(
+                "proj",
+                "security",
+                &squad_3,
+                0,
+                0,
+                "b3",
+                &ralphus_core::schema::UpstreamRef::new("origin", "main"),
+            )
             .unwrap();
         let gid = create_review_from_triage_pool(
             &store,
@@ -3988,11 +4027,27 @@ print(json.dumps(result))
         let squad_2 = completed_pool_cell(&mut store.lock());
         store
             .lock()
-            .record_triage_pool_cell("proj", "security", &squad_1, 0, 0, "b1", "main")
+            .record_triage_pool_cell(
+                "proj",
+                "security",
+                &squad_1,
+                0,
+                0,
+                "b1",
+                &ralphus_core::schema::UpstreamRef::new("origin", "main"),
+            )
             .unwrap();
         store
             .lock()
-            .record_triage_pool_cell("proj", "security", &squad_2, 0, 0, "b2", "main")
+            .record_triage_pool_cell(
+                "proj",
+                "security",
+                &squad_2,
+                0,
+                0,
+                "b2",
+                &ralphus_core::schema::UpstreamRef::new("origin", "main"),
+            )
             .unwrap();
         let gid = create_review_from_triage_pool(
             &store,
@@ -4115,7 +4170,15 @@ prompt=\"a\"
             .unwrap();
         store
             .lock()
-            .record_triage_pool_cell("proj", "security", &squad_id, 0, 0, "b-work", "main")
+            .record_triage_pool_cell(
+                "proj",
+                "security",
+                &squad_id,
+                0,
+                0,
+                "b-work",
+                &ralphus_core::schema::UpstreamRef::new("origin", "main"),
+            )
             .unwrap();
         let gid = create_review_from_triage_pool(&store, "proj", "security", |cands| {
             assert_eq!(cands.len(), 1, "one pooled cell, one candidate");
@@ -4149,7 +4212,7 @@ prompt=\"a\"
             task_idx: t,
             idx: i,
             branch: branch.to_string(),
-            upstream: "main".to_string(),
+            upstream: ralphus_core::schema::UpstreamRef::new("origin", "main"),
         };
         let drained = vec![
             row(("squad-1", 0, 0, "b1")),
@@ -4219,12 +4282,28 @@ prompt=\"a\"
 
         store
             .lock()
-            .record_triage_pool_cell("proj", "security", &failed_squad, 0, 0, "b-failed", "main")
+            .record_triage_pool_cell(
+                "proj",
+                "security",
+                &failed_squad,
+                0,
+                0,
+                "b-failed",
+                &ralphus_core::schema::UpstreamRef::new("origin", "main"),
+            )
             .unwrap();
         let ok_squad = completed_pool_cell(&mut store.lock());
         store
             .lock()
-            .record_triage_pool_cell("proj", "security", &ok_squad, 0, 0, "b-ok", "main")
+            .record_triage_pool_cell(
+                "proj",
+                "security",
+                &ok_squad,
+                0,
+                0,
+                "b-ok",
+                &ralphus_core::schema::UpstreamRef::new("origin", "main"),
+            )
             .unwrap();
 
         let gid = create_review_from_triage_pool(&store, "proj", "security", |_| None)
@@ -4307,7 +4386,15 @@ prompt=\"a\"
         let squad_id = completed_pool_cell(&mut store.lock());
         store
             .lock()
-            .record_triage_pool_cell("proj", "security", &squad_id, 0, 0, "b1", "main")
+            .record_triage_pool_cell(
+                "proj",
+                "security",
+                &squad_id,
+                0,
+                0,
+                "b1",
+                &ralphus_core::schema::UpstreamRef::new("origin", "main"),
+            )
             .unwrap();
 
         let gid = create_review_from_triage_pool(&store, "proj", "security", |_| None)
@@ -4398,7 +4485,15 @@ prompt=\"a\"
         let squad_id = completed_pool_cell(&mut store.lock());
         store
             .lock()
-            .record_triage_pool_cell("proj", "security", &squad_id, 0, 0, "b1", "main")
+            .record_triage_pool_cell(
+                "proj",
+                "security",
+                &squad_id,
+                0,
+                0,
+                "b1",
+                &ralphus_core::schema::UpstreamRef::new("origin", "main"),
+            )
             .unwrap();
 
         let gid = create_review_from_triage_pool(&store, "proj", "security", |_| None)
@@ -4622,7 +4717,15 @@ prompt=\"a\"
         let squad_id = completed_pool_cell(&mut store.lock());
         store
             .lock()
-            .record_triage_pool_cell(&stale_key, "bug", &squad_id, 0, 0, "b1", "main")
+            .record_triage_pool_cell(
+                &stale_key,
+                "bug",
+                &squad_id,
+                0,
+                0,
+                "b1",
+                &ralphus_core::schema::UpstreamRef::new("origin", "main"),
+            )
             .unwrap();
         store
             .lock()
@@ -4683,7 +4786,15 @@ prompt=\"a\"
         let stale_key = root.to_string_lossy().replace('\\', "/");
         store
             .lock()
-            .record_triage_pool_cell(&stale_key, "bug", &squad_id, 0, 0, "b1", "main")
+            .record_triage_pool_cell(
+                &stale_key,
+                "bug",
+                &squad_id,
+                0,
+                0,
+                "b1",
+                &ralphus_core::schema::UpstreamRef::new("origin", "main"),
+            )
             .unwrap();
 
         repair_triage_pool_keys(&store);

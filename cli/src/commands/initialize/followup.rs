@@ -313,7 +313,7 @@ fn expect(condition: bool, what: &str, context: &dyn std::fmt::Debug) -> Result<
 fn original_toml(project: &str) -> String {
     format!(
         "[[task]]\nname = \"feature\"\nproject = {project:?}\n\n[[task.cell]]\n\
-         cwd = \"<<ralphus:new-worktree/followup-feature?upstream=<<default>>>>\"\n\
+         cwd = \"<<ralphus:new-worktree/followup-feature?upstream_remote=origin&upstream_branch=<<default>>>>\"\n\
          prompt = \"Add feature.txt. (The exercise's stub agent ignores this text.)\"\n\
          agent = {STUB_AGENT_PROFILE:?}\nreview = \"<<ralphus:new-review/original>>\"\n\n\
          [[task.cell.proof]]\ncommand = {ORIGINAL_PROOF:?}\nmode = \"raw\"\n\n\
@@ -321,7 +321,8 @@ fn original_toml(project: &str) -> String {
          remediation_attempts = {REMEDIATION_ATTEMPTS}\nagent = {STUB_AGENT_PROFILE:?}\n\n\
          [[task.cell.proof]]\nprompt = {PROMPT_PROOF:?}\npass_score = {PASS_SCORE}\n\
          agent = {STUB_AGENT_PROFILE:?}\n\n\
-         [[review]]\nid = \"ralphus:new-review/original\"\nupstream = \"main\"\n\
+         [[review]]\nid = \"ralphus:new-review/original\"\nupstream_remote = \".\"
+upstream_branch = \"main\"\n\
          proof_scope = \"nothing\"\nskip_manual_checks = true\n"
     )
 }

@@ -6766,54 +6766,6 @@ mod tests {
         String::from_utf8_lossy(&out.stdout).trim().to_string()
     }
 
-    #[test]
-    fn remote_from_base_branch_detects_a_real_configured_remote() {
-        let root = tmp_dir("remote-detect");
-        g(&root, &["init", "--initial-branch", "main"]);
-        g(
-            &root,
-            &["remote", "add", "origin", "https://example.com/a/b.git"],
-        );
-        g(
-            &root,
-            &["remote", "add", "gitlab", "https://gitlab.com/a/b.git"],
-        );
-
-        assert_eq!(
-            remote_from_base_branch(&root, "gitlab/main"),
-            Some("gitlab".to_string())
-        );
-        assert_eq!(
-            remote_from_base_branch(&root, "origin/main"),
-            Some("origin".to_string())
-        );
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn remote_from_base_branch_is_none_for_a_plain_branch_or_unknown_remote() {
-        let root = tmp_dir("remote-detect-none");
-        g(&root, &["init", "--initial-branch", "main"]);
-        g(
-            &root,
-            &["remote", "add", "origin", "https://example.com/a/b.git"],
-        );
-
-        assert_eq!(remote_from_base_branch(&root, "main"), None);
-        assert_eq!(
-            remote_from_base_branch(&root, "colin/feature"),
-            None,
-            "a personal branch name that happens to contain a slash must not be mistaken for a remote"
-        );
-        assert_eq!(
-            remote_from_base_branch(&root, "features/foo/bar"),
-            None,
-            "a slash-namespaced branch name (e.g. features/foo/bar) whose leading segment isn't a \
-             configured remote must not be mistaken for one either"
-        );
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
     /// RAL-338 follow-up: `resolve_remote_for_as`'s whole reason to exist --
     /// a fork's own forge REST API client must authenticate as the fork's
     /// owning user, via their stored token, not whatever the daemon's
@@ -7014,7 +6966,7 @@ mod tests {
 
         let cfg = ForgeConfig::default();
         assert_eq!(
-            resolve_remote_name(&root, "features/foo/bar", &cfg),
+            resolve_remote_name(&root, &UpstreamRef::local("features/foo/bar"), &cfg),
             "origin",
             "the leading segment ('features') isn't a real remote, and 'features/foo/bar' has no \
              @{{u}} of its own either, so this must fall back to the config/origin default"
@@ -7037,12 +6989,12 @@ mod tests {
 
         let cfg = ForgeConfig::default();
         assert_eq!(
-            resolve_remote_name(&root, "gitlab/main", &cfg),
+            resolve_remote_name(&root, &UpstreamRef::new("gitlab", "main"), &cfg),
             "gitlab",
             "the base branch's own remote prefix must win over the project config default"
         );
         assert_eq!(
-            resolve_remote_name(&root, "main", &cfg),
+            resolve_remote_name(&root, &UpstreamRef::local("main"), &cfg),
             "origin",
             "falls back to the config/origin default when base_branch names no remote and has no \
              @{{u}} of its own"
@@ -7067,13 +7019,18 @@ mod tests {
         // Without exclusion, the base branch's own remote prefix (the
         // registered fork) would win, same as `resolve_remote_name`.
         assert_eq!(
-            resolve_remote_name_excluding(&root, "fork/main", &cfg, None),
+            resolve_remote_name_excluding(&root, &UpstreamRef::new("fork", "main"), &cfg, None),
             "fork"
         );
         // With the fork excluded, it falls through to the config/origin
         // default instead of ever resolving to the excluded remote.
         assert_eq!(
-            resolve_remote_name_excluding(&root, "fork/main", &cfg, Some("fork")),
+            resolve_remote_name_excluding(
+                &root,
+                &UpstreamRef::new("fork", "main"),
+                &cfg,
+                Some("fork")
+            ),
             "origin"
         );
         let _ = std::fs::remove_dir_all(&root);
@@ -7099,7 +7056,7 @@ mod tests {
         let cfg = ForgeConfig::default();
         let resolved = resolve_parent_remote_name(
             &root,
-            "staging",
+            &UpstreamRef::local("staging"),
             &cfg,
             Some("https://github.com/acme/widget.git"),
             None,
@@ -7119,7 +7076,7 @@ mod tests {
         let cfg = ForgeConfig::default();
         let resolved = resolve_parent_remote_name(
             &root,
-            "staging",
+            &UpstreamRef::local("staging"),
             &cfg,
             Some("https://github.com/acme/widget.git"),
             None,
@@ -7159,7 +7116,7 @@ mod tests {
         let cfg = ForgeConfig::default();
         let resolved = resolve_parent_remote_name(
             &root,
-            "staging",
+            &UpstreamRef::local("staging"),
             &cfg,
             Some("https://github.com/acme/widget.git"),
             Some("fork"),
@@ -7183,7 +7140,13 @@ mod tests {
         // Byte-identical to `resolve_remote_name_excluding` when there is no
         // registered project/clone_url to match against at all.
         assert_eq!(
-            resolve_parent_remote_name(&root, "gitlab/main", &cfg, None, None),
+            resolve_parent_remote_name(
+                &root,
+                &UpstreamRef::new("gitlab", "main"),
+                &cfg,
+                None,
+                None
+            ),
             "gitlab"
         );
         let _ = std::fs::remove_dir_all(&root);
@@ -7216,12 +7179,17 @@ mod tests {
         // `ensure_remote_for_url`, which -- finding no existing "origin" --
         // would happily create a brand-new one pointing at `clone_url`.
         let clone_url = "https://github.com/acme/widget.git";
-        let resolved =
-            resolve_parent_remote_name(&root, "feature-branch", &cfg, Some(clone_url), None);
+        let resolved = resolve_parent_remote_name(
+            &root,
+            &UpstreamRef::local("feature-branch"),
+            &cfg,
+            Some(clone_url),
+            None,
+        );
 
         assert_eq!(
             resolved,
-            resolve_remote_name_excluding(&root, "feature-branch", &cfg, None),
+            resolve_remote_name_excluding(&root, &UpstreamRef::local("feature-branch"), &cfg, None),
             "a failed probe must fall all the way through to the heuristic, not invent a remote"
         );
         assert!(
@@ -7262,7 +7230,7 @@ mod tests {
         let cfg = ForgeConfig::default();
         let resolved = resolve_parent_remote_name(
             &root,
-            "source/beta",
+            &UpstreamRef::new("source", "beta"),
             &cfg,
             Some("https://github.com/acme/widget.git"),
             None,
@@ -7315,7 +7283,7 @@ mod tests {
 
         let cfg = ForgeConfig::default();
         assert_eq!(
-            resolve_remote_name(&root, "foo_branch_name", &cfg),
+            resolve_remote_name(&root, &UpstreamRef::local("foo_branch_name"), &cfg),
             "alt",
             "a bare local branch name with no remote prefix must still resolve via its own @{{u}} \
              upstream rather than falling straight through to the config/origin default"
@@ -7355,8 +7323,12 @@ mod tests {
     fn resolve_remote_resolves_the_forge_host_from_a_remote_prefixed_base_branch() {
         let root = two_forge_repo("forge-host-prefix", "alternativeremote");
 
-        let client = resolve_remote(&root, "alternativeremote/foo", &ForgeConfig::default())
-            .expect("resolve");
+        let client = resolve_remote(
+            &root,
+            &UpstreamRef::new("alternativeremote", "foo"),
+            &ForgeConfig::default(),
+        )
+        .expect("resolve");
         assert_eq!(
             client.kind,
             ForgeKind::GitLab,
@@ -7387,8 +7359,12 @@ mod tests {
             &["update-ref", "refs/remotes/alt/foo_branch_name", sha.trim()],
         );
 
-        let client =
-            resolve_remote(&root, "foo_branch_name", &ForgeConfig::default()).expect("resolve");
+        let client = resolve_remote(
+            &root,
+            &UpstreamRef::local("foo_branch_name"),
+            &ForgeConfig::default(),
+        )
+        .expect("resolve");
         assert_eq!(
             client.kind,
             ForgeKind::GitLab,
@@ -7406,48 +7382,19 @@ mod tests {
             remote: Some("alt".to_string()),
             ..ForgeConfig::default()
         };
-        let client = resolve_remote(&root, "main", &cfg).expect("resolve");
+        let client = resolve_remote(&root, &UpstreamRef::local("main"), &cfg).expect("resolve");
         assert_eq!(
             client.kind,
             ForgeKind::GitLab,
             "with no remote prefix and no @{{u}} upstream on \"main\", [forge].remote still decides"
         );
 
-        let client = resolve_remote(&root, "main", &ForgeConfig::default()).expect("resolve");
+        let client = resolve_remote(&root, &UpstreamRef::local("main"), &ForgeConfig::default())
+            .expect("resolve");
         assert_eq!(
             client.kind,
             ForgeKind::GitHub,
             "and with nothing configured at all it lands on origin"
-        );
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn remote_from_branch_upstream_never_reads_the_current_checkouts_upstream() {
-        let root = two_forge_repo("at-u-empty-guard", "alt");
-        g(&root, &["commit", "--allow-empty", "--message", "init"]);
-        // Give the *checked-out* branch an upstream on `alt`. An empty
-        // base_branch must not pick that up: `format!("{base_branch}@{{u}}")`
-        // would otherwise degrade to a bare `@{u}`.
-        g(&root, &["config", "branch.main.remote", "alt"]);
-        g(&root, &["config", "branch.main.merge", "refs/heads/main"]);
-        let sha = g(&root, &["rev-parse", "main"]);
-        g(&root, &["update-ref", "refs/remotes/alt/main", sha.trim()]);
-        assert_eq!(
-            remote_from_branch_upstream(&root, "main"),
-            Some("alt".to_string()),
-            "sanity: main really does track alt, so a bare @{{u}} here would resolve"
-        );
-
-        assert_eq!(
-            remote_from_branch_upstream(&root, ""),
-            None,
-            "an empty base_branch must resolve to nothing rather than silently adopting\n             whatever the shared guardian repo happens to have checked out"
-        );
-        assert_eq!(
-            resolve_remote_name(&root, "", &ForgeConfig::default()),
-            "origin",
-            "and it therefore falls through to the config/origin default"
         );
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -7476,7 +7423,7 @@ mod tests {
             ..ForgeConfig::default()
         };
         assert_eq!(
-            resolve_remote_name(&root, "main", &cfg),
+            resolve_remote_name(&root, &UpstreamRef::local("main"), &cfg),
             "configured",
             "with no remote prefix and no @{{u}} upstream, [forge].remote is still the fallback \
              before origin"

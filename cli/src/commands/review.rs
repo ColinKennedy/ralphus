@@ -65,7 +65,8 @@ pub enum ReviewCommand {
     },
     Create {
         name: String,
-        base_branch: String,
+        upstream_remote: String,
+        upstream_branch: String,
         git_root: String,
         checks: Option<String>,
         skip_worktrees: bool,
@@ -90,7 +91,8 @@ pub enum ReviewCommand {
         skip_worktrees: Option<bool>,
         resolver_agent: Option<String>,
         resolver_model: Option<String>,
-        base_branch: Option<String>,
+        upstream_remote: Option<String>,
+        upstream_branch: Option<String>,
         auto_pr_feedback: Option<bool>,
         proof_scope: Option<String>,
         /// Which PRs/MRs in the stack run the full CI suite (`every`, `top`,
@@ -253,8 +255,14 @@ pub struct GuardianEnvArgs {
 #[derive(Debug, Clone)]
 pub enum ReviewUpstreamCommand {
     Help,
-    List { selector: String },
-    Set { selector: String, branch: String },
+    List {
+        selector: String,
+    },
+    Set {
+        selector: String,
+        upstream_remote: String,
+        upstream_branch: String,
+    },
     UsageError(String),
 }
 
@@ -427,17 +435,19 @@ pub fn parse(args: &[String]) -> ReviewCommand {
             let skip_worktrees = scanner.take_bool("--skip-worktrees");
             let review_type = scanner.take_value("--review-type").ok().flatten();
             let rest = scanner.remaining();
-            match (rest.first(), rest.get(1), rest.get(2)) {
-                (Some(name), Some(base_branch), Some(git_root)) => ReviewCommand::Create {
+            match (rest.first(), rest.get(1), rest.get(2), rest.get(3)) {
+                (Some(name), Some(remote), Some(branch), Some(git_root)) => ReviewCommand::Create {
                     name: name.clone(),
-                    base_branch: base_branch.clone(),
+                    upstream_remote: remote.clone(),
+                    upstream_branch: branch.clone(),
                     git_root: git_root.clone(),
                     checks,
                     skip_worktrees,
                     review_type,
                 },
                 _ => ReviewCommand::UsageError(
-                    "create requires <name> <base_branch> <git_root>".to_string(),
+                    "create requires <name> <upstream_remote> <upstream_branch> <git_root>"
+                        .to_string(),
                 ),
             }
         }
@@ -461,7 +471,14 @@ pub fn parse(args: &[String]) -> ReviewCommand {
             let skip_worktrees = take_tri_bool(&mut scanner, "--skip-worktrees");
             let resolver_agent = scanner.take_value("--resolver-agent").ok().flatten();
             let resolver_model = scanner.take_value("--resolver-model").ok().flatten();
-            let base_branch = scanner.take_value("--base-branch").ok().flatten();
+            let upstream_remote = scanner.take_value("--upstream-remote").ok().flatten();
+            let upstream_branch = scanner.take_value("--upstream-branch").ok().flatten();
+            if upstream_remote.is_some() != upstream_branch.is_some() {
+                return ReviewCommand::UsageError(
+                    "--upstream-remote and --upstream-branch are set together (use remote \".\" for a local branch)"
+                        .to_string(),
+                );
+            }
             let auto_pr_feedback = take_tri_bool(&mut scanner, "--auto-pr-feedback");
             let proof_scope = scanner.take_value("--proof-scope").ok().flatten();
             let ci_deferral = scanner.take_value("--ci-deferral").ok().flatten();
@@ -502,7 +519,8 @@ pub fn parse(args: &[String]) -> ReviewCommand {
                 skip_worktrees,
                 resolver_agent,
                 resolver_model,
-                base_branch,
+                upstream_remote,
+                upstream_branch,
                 auto_pr_feedback,
                 proof_scope,
                 ci_deferral,
@@ -786,13 +804,14 @@ fn parse_upstream(args: &[String]) -> ReviewUpstreamCommand {
         }
         Some("set") => {
             let rest = scanner.remaining();
-            match (rest.first(), rest.get(1)) {
-                (Some(selector), Some(branch)) => ReviewUpstreamCommand::Set {
+            match (rest.first(), rest.get(1), rest.get(2)) {
+                (Some(selector), Some(remote), Some(branch)) => ReviewUpstreamCommand::Set {
                     selector: selector.clone(),
-                    branch: branch.clone(),
+                    upstream_remote: remote.clone(),
+                    upstream_branch: branch.clone(),
                 },
                 _ => ReviewUpstreamCommand::UsageError(
-                    "set requires <selector> <branch>".to_string(),
+                    "set requires <selector> <upstream_remote> <upstream_branch>".to_string(),
                 ),
             }
         }
@@ -1469,7 +1488,8 @@ pub fn dispatch(cmd: ReviewCommand, opts: &GlobalOpts) -> i32 {
         }),
         ReviewCommand::Create {
             name,
-            base_branch,
+            upstream_remote,
+            upstream_branch,
             git_root,
             checks,
             skip_worktrees,
@@ -1485,7 +1505,8 @@ pub fn dispatch(cmd: ReviewCommand, opts: &GlobalOpts) -> i32 {
                 .collect();
             let result = client.guardian_create(
                 &name,
-                &base_branch,
+                &upstream_remote,
+                &upstream_branch,
                 &git_root,
                 Some(&checks_vec),
                 skip_worktrees,
@@ -1536,7 +1557,8 @@ pub fn dispatch(cmd: ReviewCommand, opts: &GlobalOpts) -> i32 {
             skip_worktrees,
             resolver_agent,
             resolver_model,
-            base_branch,
+            upstream_remote,
+            upstream_branch,
             auto_pr_feedback,
             proof_scope,
             ci_deferral,
@@ -1563,7 +1585,8 @@ pub fn dispatch(cmd: ReviewCommand, opts: &GlobalOpts) -> i32 {
                 skip_worktrees,
                 resolver_agent: resolver_agent.as_deref(),
                 resolver_model: resolver_model.as_deref(),
-                base_branch: base_branch.as_deref(),
+                upstream_remote: upstream_remote.as_deref(),
+                upstream_branch: upstream_branch.as_deref(),
                 auto_pr_feedback,
                 proof_scope: proof_scope.as_deref(),
                 ci_deferral: ci_deferral.as_deref(),
@@ -1950,16 +1973,30 @@ fn dispatch_upstream(cmd: ReviewUpstreamCommand, opts: &GlobalOpts, client: &Dae
                     return;
                 }
                 for b in &bs {
-                    println!("{}", b.as_str().unwrap_or_default());
+                    println!(
+                        "{}	{}",
+                        b["remote"].as_str().unwrap_or_default(),
+                        b["branch"].as_str().unwrap_or_default()
+                    );
                 }
             });
             Ok(())
         }),
-        ReviewUpstreamCommand::Set { selector, branch } => run_and_report(opts, None, || {
+        ReviewUpstreamCommand::Set {
+            selector,
+            upstream_remote,
+            upstream_branch,
+        } => run_and_report(opts, None, || {
             let resolved = resolve_guardian_selector(client, &selector, DEFAULT_REVIEW_LIST_HINT)?;
-            let result = client.guardian_change_base(&resolved.guardian_id, &branch)?;
+            let result = client.guardian_change_base(
+                &resolved.guardian_id,
+                &upstream_remote,
+                &upstream_branch,
+            )?;
             emit(opts, &result, |_| {
-                println!("{selector} upstream branch -> '{branch}'")
+                println!(
+                    "{selector} upstream -> remote '{upstream_remote}', branch '{upstream_branch}'"
+                )
             });
             Ok(())
         }),
@@ -2767,11 +2804,21 @@ fn render_review_list(guardians: &Value) {
                 g["id"].as_str().unwrap_or_default().to_string(),
                 g["name"].as_str().unwrap_or_default().to_string(),
                 g["status"].as_str().unwrap_or_default().to_string(),
-                g["base_branch"].as_str().unwrap_or_default().to_string(),
+                g["upstream_remote"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string(),
+                g["upstream_branch"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string(),
             ]
         })
         .collect();
-    crate::output::print_table(&["ID", "NAME", "STATUS", "BASE_BRANCH"], &rows);
+    crate::output::print_table(
+        &["ID", "NAME", "STATUS", "UPSTREAM_REMOTE", "UPSTREAM_BRANCH"],
+        &rows,
+    );
 }
 
 #[allow(clippy::too_many_lines)] // One flat field-by-field kv render, mirroring `_cmd_review_show`'s own `_render`; splitting it up would just scatter one view across artificial helper fns.
@@ -2799,8 +2846,18 @@ fn render_review_detail(g: &Value) {
             .to_string(),
     ));
     rows.push((
-        "base_branch",
-        g["base_branch"].as_str().unwrap_or_default().to_string(),
+        "upstream_remote",
+        g["upstream_remote"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string(),
+    ));
+    rows.push((
+        "upstream_branch",
+        g["upstream_branch"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string(),
     ));
     rows.push((
         "review_branch",
@@ -3281,6 +3338,7 @@ mod tests {
         match parse(&v(&[
             "create",
             "my review",
+            "origin",
             "main",
             "/repo",
             "--checks",
@@ -3290,14 +3348,16 @@ mod tests {
         ])) {
             ReviewCommand::Create {
                 name,
-                base_branch,
+                upstream_remote,
+                upstream_branch,
                 git_root,
                 checks,
                 review_type,
                 ..
             } => {
                 assert_eq!(name, "my review");
-                assert_eq!(base_branch, "main");
+                assert_eq!(upstream_remote, "origin");
+                assert_eq!(upstream_branch, "main");
                 assert_eq!(git_root, "/repo");
                 assert_eq!(checks.as_deref(), Some("fmt,test"));
                 assert_eq!(review_type.as_deref(), Some("hotfix"));
@@ -3307,7 +3367,7 @@ mod tests {
     }
 
     #[test]
-    fn create_requires_three_positionals() {
+    fn create_requires_four_positionals() {
         matches!(
             parse(&v(&["create", "name", "main"])),
             ReviewCommand::UsageError(_)
@@ -3895,10 +3955,15 @@ mod tests {
 
     #[test]
     fn parses_upstream_set() {
-        match parse(&v(&["upstream", "set", "g1", "main"])) {
-            ReviewCommand::Upstream(ReviewUpstreamCommand::Set { selector, branch }) => {
+        match parse(&v(&["upstream", "set", "g1", "origin", "main"])) {
+            ReviewCommand::Upstream(ReviewUpstreamCommand::Set {
+                selector,
+                upstream_remote,
+                upstream_branch,
+            }) => {
                 assert_eq!(selector, "g1");
-                assert_eq!(branch, "main");
+                assert_eq!(upstream_remote, "origin");
+                assert_eq!(upstream_branch, "main");
             }
             other => panic!("unexpected: {other:?}"),
         }

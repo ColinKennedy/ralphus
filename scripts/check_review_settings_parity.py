@@ -41,8 +41,12 @@ MAPPING = {
     "rebuild_on": "rebuild_on",
 }
 EXEMPT = {
-    "base_branch": (
-        "TOML surface is [[review]] upstream: guardian base_branch is minted "
+    "upstream_remote": (
+        "TOML surface is [[review]] upstream: guardian upstream_remote and upstream_branch are minted "
+        "from the declared or inferred upstream when the review is created."
+    ),
+    "upstream_branch": (
+        "TOML surface is [[review]] upstream: guardian upstream_branch is minted "
         "from the declared or inferred upstream when the review is created."
     ),
 }

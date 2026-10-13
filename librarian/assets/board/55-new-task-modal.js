@@ -196,6 +196,7 @@
        * @property {string} agent
        * @property {string} model
        * @property {string} project
+       * @property {string} upstreamRemote
        * @property {string} upstreamBranch
        * @property {boolean} proofs
        * @property {NtReviewMode} reviewMode
@@ -240,7 +241,7 @@
           templateName: ntTemplates.length ? ntTemplates[0].name : NT_FALLBACK_TEMPLATE.name,
           label: "",
           prompt: "", fieldValues: {}, agent: "", model: "",
-          project: "", upstreamBranch: "", proofs: true, reviewMode: "auto", generateManualChecks: true,
+          project: "", upstreamRemote: "", upstreamBranch: "", proofs: true, reviewMode: "auto", generateManualChecks: true,
           generateAutoBuild: true,
           proofShell: "", proofItems: [], checkItems: [], buildItems: [], generating: false, confirmStep: false,
           fieldErrors: [], activeGenerationIds: [], generationJobIds: [],
@@ -253,7 +254,7 @@
       function ntSimpleReset() { ntSimple = ntFreshSimpleState(); }
       /**
        * Resets the Simple tab to its defaults, but carries forward
-       * `templateName`/`agent`/`model`/`project`/`upstreamBranch` from the
+       * `templateName`/`agent`/`model`/`project`/`upstreamRemote`/`upstreamBranch` from the
        * current state first -- the only fields worth remembering across
        * submissions. Everything else (prompt, review mode, the proofs/
        * manual-checks/auto-build generation choices and their item lists,
@@ -273,6 +274,7 @@
           ntSimple.agent = prev.agent;
           ntSimple.model = prev.model;
           ntSimple.project = prev.project;
+          ntSimple.upstreamRemote = prev.upstreamRemote;
           ntSimple.upstreamBranch = prev.upstreamBranch;
         }
       }
@@ -684,16 +686,17 @@
       async function ntSimpleValidateUpstream() {
         const branch = ntSimple.upstreamBranch.trim();
         if (!branch) return null;
+        const remote = ntSimple.upstreamRemote.trim() || "origin";
         const project = projects.find((p) => p.name === ntSimple.project);
         if (!project || project.vcs !== "git") return null;
         try {
           const resp = await fetch(`/api/projects/${encodeURIComponent(ntSimple.project)}/branches`);
           if (!resp.ok) return null;
           const data = await resp.json();
-          /** @type {string[]} */
+          /** @type {{remote: string, branch: string}[]} */
           const branches = data.branches || [];
-          if (!branches.includes(branch) && !branches.includes(`origin/${branch}`)) {
-            return `Upstream branch "${branch}" was not found in project "${ntSimple.project}".`;
+          if (!branches.some((b) => b.remote === remote && b.branch === branch)) {
+            return `Upstream branch "${branch}" was not found on remote "${remote}" in project "${ntSimple.project}".`;
           }
         } catch (e) { return null; }
         return null;
@@ -775,10 +778,11 @@
         const branch = `simple-${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`;
         // `parse_worktree_placeholder_upstream` (core/src/schema.rs) does raw
         // string splitting on this query suffix, not URL-decoding -- percent-
-        // encoding `upstream` here would corrupt the `<<default>>` sentinel
+        // encoding the upstream branch here would corrupt the `<<default>>` sentinel
         // into a literal (and invalid) branch name, so it's embedded as-is.
-        const upstream = ntSimple.upstreamBranch.trim() || "<<default>>";
-        const cwd = `<<ralphus:new-worktree/${branch}?upstream=${upstream}>>`;
+        const upstreamRemote = ntSimple.upstreamRemote.trim() || "origin";
+        const upstreamBranch = ntSimple.upstreamBranch.trim() || "<<default>>";
+        const cwd = `<<ralphus:new-worktree/${branch}?upstream_remote=${upstreamRemote}&upstream_branch=${upstreamBranch}>>`;
         const prompt = ntSimpleEffectivePrompt();
         // RAL-398: the task's display `name` is resolved independently of
         // `branch` (which stays the fast, always-unique, purely internal
@@ -1123,9 +1127,13 @@
               ${ntFieldErrorHtml("project")}
             </label>
             ${showUpstream ? `
-            <label style="flex:1;font-size:12px;color:var(--muted)" data-tip="The branch the fresh worktree starts from. Leave blank to use the project's default branch. Checked against the project's real branches when you submit.">
+            <label style="flex:1;font-size:12px;color:var(--muted)" data-tip="The remote the fresh worktree's upstream branch lives on. Leave blank for origin; type . for a local branch of the project's checkout.">
+              Upstream remote (optional)
+              <input style="${NT_INPUT_STYLE}" value="${esc(ntSimple.upstreamRemote)}" oninput="ntSimple.upstreamRemote=this.value" placeholder="origin">
+            </label>
+            <label style="flex:1;font-size:12px;color:var(--muted)" data-tip="The branch on the upstream remote the fresh worktree starts from. Leave blank to use that remote's default branch. Checked against the project's real branches when you submit.">
               Upstream branch (optional)
-              <input style="${NT_INPUT_STYLE}" value="${esc(ntSimple.upstreamBranch)}" oninput="ntSimple.upstreamBranch=this.value" placeholder="(project default)">
+              <input style="${NT_INPUT_STYLE}" value="${esc(ntSimple.upstreamBranch)}" oninput="ntSimple.upstreamBranch=this.value" placeholder="(remote default)">
             </label>` : ""}
           </div>
           <label style="display:block;font-size:12px;color:var(--muted);margin-top:10px" data-tip="When checked, the selected agent/model is asked to propose proof step(s) — commands that must pass — against this project's codebase before you submit, shown to you for edit/removal first. You can also add proof steps by hand regardless of this checkbox.">

@@ -842,10 +842,7 @@ impl Store {
                         task_idx: r.get(3)?,
                         idx: r.get(4)?,
                         branch: r.get(5)?,
-                        upstream: UpstreamRef::new(
-                            r.get::<_, String>(6)?,
-                            r.get::<_, String>(7)?,
-                        ),
+                        upstream: UpstreamRef::new(r.get::<_, String>(6)?, r.get::<_, String>(7)?),
                     },
                 ))
             })?
@@ -1722,12 +1719,36 @@ mod tests {
     fn pool_retains_scheduled_cells_without_draining_them() {
         let s = store();
         assert_eq!(s.triage_pool_count("proj", "security").unwrap(), 0);
-        s.record_triage_pool_cell("proj", "security", "squad-1", 0, 0, "b1", "main")
-            .unwrap();
-        s.record_triage_pool_cell("proj", "security", "squad-2", 0, 0, "b2", "main")
-            .unwrap();
-        s.record_triage_pool_cell("proj", "perf", "squad-3", 0, 0, "b3", "main")
-            .unwrap();
+        s.record_triage_pool_cell(
+            "proj",
+            "security",
+            "squad-1",
+            0,
+            0,
+            "b1",
+            &ralphus_core::schema::UpstreamRef::new("origin", "main"),
+        )
+        .unwrap();
+        s.record_triage_pool_cell(
+            "proj",
+            "security",
+            "squad-2",
+            0,
+            0,
+            "b2",
+            &ralphus_core::schema::UpstreamRef::new("origin", "main"),
+        )
+        .unwrap();
+        s.record_triage_pool_cell(
+            "proj",
+            "perf",
+            "squad-3",
+            0,
+            0,
+            "b3",
+            &ralphus_core::schema::UpstreamRef::new("origin", "main"),
+        )
+        .unwrap();
         assert_eq!(s.triage_pool_count("proj", "security").unwrap(), 0);
         assert_eq!(
             s.triage_pool_keys().unwrap(),
@@ -1749,8 +1770,16 @@ mod tests {
         let mut s = store();
         let file: TaskFile = toml::from_str(POOL_CELL_FIXTURE).unwrap();
         let squad_id = s.insert_squad(&file, None, false).unwrap();
-        s.record_triage_pool_cell("proj", "bug", &squad_id, 0, 0, "b1", "main")
-            .unwrap();
+        s.record_triage_pool_cell(
+            "proj",
+            "bug",
+            &squad_id,
+            0,
+            0,
+            "b1",
+            &ralphus_core::schema::UpstreamRef::new("origin", "main"),
+        )
+        .unwrap();
         assert_eq!(
             s.triage_pool_count("proj", "bug").unwrap(),
             0,
@@ -1839,12 +1868,36 @@ prompt=\"y\"
         let failed_squad = s.insert_squad(&file, None, false).unwrap();
         let ok_squad = s.insert_squad(&file, None, false).unwrap();
         let pending_squad = s.insert_squad(&file, None, false).unwrap();
-        s.record_triage_pool_cell("proj", "bug", &failed_squad, 0, 0, "b1", "main")
-            .unwrap();
-        s.record_triage_pool_cell("proj", "bug", &ok_squad, 0, 0, "b2", "main")
-            .unwrap();
-        s.record_triage_pool_cell("proj", "bug", &pending_squad, 0, 0, "b3", "main")
-            .unwrap();
+        s.record_triage_pool_cell(
+            "proj",
+            "bug",
+            &failed_squad,
+            0,
+            0,
+            "b1",
+            &ralphus_core::schema::UpstreamRef::new("origin", "main"),
+        )
+        .unwrap();
+        s.record_triage_pool_cell(
+            "proj",
+            "bug",
+            &ok_squad,
+            0,
+            0,
+            "b2",
+            &ralphus_core::schema::UpstreamRef::new("origin", "main"),
+        )
+        .unwrap();
+        s.record_triage_pool_cell(
+            "proj",
+            "bug",
+            &pending_squad,
+            0,
+            0,
+            "b3",
+            &ralphus_core::schema::UpstreamRef::new("origin", "main"),
+        )
+        .unwrap();
 
         s.set_cell_state(&failed_squad, 0, 0, crate::store::NodeState::Done)
             .unwrap();
@@ -1962,7 +2015,15 @@ prompt=\"y\"
             let mut guard = store.lock();
             let squad_id = completed_pool_cell(&mut guard);
             guard
-                .record_triage_pool_cell("proj", "security", &squad_id, 0, 0, "b1", "main")
+                .record_triage_pool_cell(
+                    "proj",
+                    "security",
+                    &squad_id,
+                    0,
+                    0,
+                    "b1",
+                    &ralphus_core::schema::UpstreamRef::new("origin", "main"),
+                )
                 .unwrap();
             // Anchored a few seconds in the past so this "every second" cron
             // is already due without needing to catch up decades of history
@@ -2001,20 +2062,52 @@ prompt=\"y\"
             // none of which individually reached any count threshold.
             let squad_1 = completed_pool_cell(&mut guard);
             guard
-                .record_triage_pool_cell("proj", "bug", &squad_1, 0, 0, "b1", "main")
+                .record_triage_pool_cell(
+                    "proj",
+                    "bug",
+                    &squad_1,
+                    0,
+                    0,
+                    "b1",
+                    &ralphus_core::schema::UpstreamRef::new("origin", "main"),
+                )
                 .unwrap();
             let squad_2 = completed_pool_cell(&mut guard);
             guard
-                .record_triage_pool_cell("proj::core", "bug", &squad_2, 0, 0, "b2", "main")
+                .record_triage_pool_cell(
+                    "proj::core",
+                    "bug",
+                    &squad_2,
+                    0,
+                    0,
+                    "b2",
+                    &ralphus_core::schema::UpstreamRef::new("origin", "main"),
+                )
                 .unwrap();
             let squad_3 = completed_pool_cell(&mut guard);
             guard
-                .record_triage_pool_cell("proj::utils", "bug", &squad_3, 0, 0, "b3", "main")
+                .record_triage_pool_cell(
+                    "proj::utils",
+                    "bug",
+                    &squad_3,
+                    0,
+                    0,
+                    "b3",
+                    &ralphus_core::schema::UpstreamRef::new("origin", "main"),
+                )
                 .unwrap();
             // A different project's pool must never be swept in.
             let squad_4 = completed_pool_cell(&mut guard);
             guard
-                .record_triage_pool_cell("other", "bug", &squad_4, 0, 0, "b4", "main")
+                .record_triage_pool_cell(
+                    "other",
+                    "bug",
+                    &squad_4,
+                    0,
+                    0,
+                    "b4",
+                    &ralphus_core::schema::UpstreamRef::new("origin", "main"),
+                )
                 .unwrap();
             guard
                 .add_triage_schedule("proj", "bug", "* * * * * *", now_ms() - 5_000, 1)
@@ -2051,7 +2144,15 @@ prompt=\"y\"
         {
             let guard = store.lock();
             guard
-                .record_triage_pool_cell("proj", "security", "squad-1", 0, 0, "b1", "main")
+                .record_triage_pool_cell(
+                    "proj",
+                    "security",
+                    "squad-1",
+                    0,
+                    0,
+                    "b1",
+                    &ralphus_core::schema::UpstreamRef::new("origin", "main"),
+                )
                 .unwrap();
             // Yearly on Jan 1st, anchored at "now" -- no occurrence has
             // passed yet.
@@ -2367,18 +2468,58 @@ prompt=\"y\"
     #[test]
     fn project_pool_keys_enumerates_the_plain_key_and_every_subproject_key() {
         let s = store();
-        s.record_triage_pool_cell("proj", "bug", "squad-1", 0, 0, "b1", "main")
-            .unwrap();
-        s.record_triage_pool_cell("proj::core", "bug", "squad-2", 0, 0, "b2", "main")
-            .unwrap();
-        s.record_triage_pool_cell("proj::utils", "bug", "squad-3", 0, 0, "b3", "main")
-            .unwrap();
+        s.record_triage_pool_cell(
+            "proj",
+            "bug",
+            "squad-1",
+            0,
+            0,
+            "b1",
+            &ralphus_core::schema::UpstreamRef::new("origin", "main"),
+        )
+        .unwrap();
+        s.record_triage_pool_cell(
+            "proj::core",
+            "bug",
+            "squad-2",
+            0,
+            0,
+            "b2",
+            &ralphus_core::schema::UpstreamRef::new("origin", "main"),
+        )
+        .unwrap();
+        s.record_triage_pool_cell(
+            "proj::utils",
+            "bug",
+            "squad-3",
+            0,
+            0,
+            "b3",
+            &ralphus_core::schema::UpstreamRef::new("origin", "main"),
+        )
+        .unwrap();
         // A different project must never leak in.
-        s.record_triage_pool_cell("other", "bug", "squad-4", 0, 0, "b4", "main")
-            .unwrap();
+        s.record_triage_pool_cell(
+            "other",
+            "bug",
+            "squad-4",
+            0,
+            0,
+            "b4",
+            &ralphus_core::schema::UpstreamRef::new("origin", "main"),
+        )
+        .unwrap();
         // A different triage type under the same project must never leak in.
-        s.record_triage_pool_cell("proj::core", "feature", "squad-5", 0, 0, "b5", "main")
-            .unwrap();
+        s.record_triage_pool_cell(
+            "proj::core",
+            "feature",
+            "squad-5",
+            0,
+            0,
+            "b5",
+            &ralphus_core::schema::UpstreamRef::new("origin", "main"),
+        )
+        .unwrap();
         let mut keys = project_pool_keys(&s, "proj", "bug");
         keys.sort();
         assert_eq!(

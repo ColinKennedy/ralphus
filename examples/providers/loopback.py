@@ -17,7 +17,7 @@ Register it, then point a task at it:
     # project = "ralphus"
     # machine = "loopback:sandbox"
     #   [[task.cell]]
-    #   cwd    = "<<ralphus:new-worktree/demo-branch?upstream=<<default>>>>"
+    #   cwd    = "<<ralphus:new-worktree/demo-branch?upstream_remote=origin&upstream_branch=<<default>>>>"
     #   prompt = "..."
 
 A git project provisioned onto a machine needs a `[machine.targets.*]` entry
