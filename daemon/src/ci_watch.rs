@@ -1297,12 +1297,15 @@ fn write_ci_failure_log(path: &Path, log_text: &str) -> Option<PathBuf> {
 /// 'build' failed") or one of several (in which case a generic "'name'
 /// failed" is used, since the specific noun -- check/job/status -- isn't
 /// carried per-check). `log_index` names this check's log file -- see
-/// [`ci_failure_log_path`].
+/// [`ci_failure_log_path`]. `pr_url` is the URL the paragraph names when the
+/// check has no job URL of its own, so every paragraph carries a URL to look
+/// the failure up at.
 fn describe_failing_check(
     worktree: Option<&str>,
     check: &FailedCheck,
     reason_line: &str,
     log_index: Option<usize>,
+    pr_url: &str,
 ) -> String {
     // RAL-<new>: a job's name alone can be misleadingly broad -- see
     // `FailedCheck::failing_step`'s doc comment for the incident this
@@ -1319,21 +1322,26 @@ fn describe_failing_check(
              different, similarly-named step/check under the same job is the problem.\n"
             )
         });
-    let job_note = check
-        .job_url
-        .as_deref()
-        .map_or_else(String::new, |url| format!("Failing job: {url}\n"));
-    // With no log on disk, the job URL is where the failure lives: tell the
-    // agent to go read it, rather than that a log is missing -- agents read
-    // "no log" as "no information" and stop looking.
-    let look_up_note = match check.job_url.as_deref() {
-        Some(url) => format!(
-            "Look up {url} to find out what the error was: read that job's output (or query \
-             the forge's API for its log) before changing anything."
+    // With no log on disk, the job URL -- or, without one, the PR's own URL
+    // -- is where the failure lives: tell the agent to go read it, rather
+    // than that a log is missing -- agents read "no log" as "no information"
+    // and stop looking.
+    let (job_note, look_up_note) = match check.job_url.as_deref() {
+        Some(url) => (
+            format!("Failing job: {url}\n"),
+            format!(
+                "Look up {url} to find out what the error was: read that job's output (or \
+                 query the forge's API for its log) before changing anything."
+            ),
         ),
-        None => "Look up this pull request's CI checks on the forge to find out what the \
-                 error was before changing anything."
-            .to_string(),
+        None => (
+            format!("Pull request: {pr_url}\n"),
+            format!(
+                "Look up {pr_url} to find out what the error was: open its failing CI checks \
+                 and read their output (or query the forge's API for their logs) before \
+                 changing anything."
+            ),
+        ),
     };
     let log_note = match (worktree, &check.log_text) {
         (Some(worktree), Some(log_text)) => {
@@ -1770,6 +1778,10 @@ fn run_pr_fix(
     // that failed before any job could be attributed), fall back to a single
     // paragraph built from the summary fields, same as before per-check
     // breakdown existed.
+    let pr_url = pr
+        .pr_url
+        .clone()
+        .unwrap_or_else(|| format!("{} PR/MR #{}", pr.forge, pr.pr_number.unwrap_or_default()));
     let only_one = failure.checks.len() <= 1;
     let paragraphs: Vec<String> = if failure.checks.is_empty() {
         vec![describe_failing_check(
@@ -1782,6 +1794,7 @@ fn run_pr_fix(
             },
             &failure.reason,
             None,
+            &pr_url,
         )]
     } else {
         failure
@@ -1829,6 +1842,7 @@ fn run_pr_fix(
                     &enriched,
                     &reason_line,
                     (!only_one).then_some(index),
+                    &pr_url,
                 )
             })
             .collect()
@@ -1855,11 +1869,6 @@ fn run_pr_fix(
             cell_prompts.join("\n\n---\n\n")
         },
     );
-
-    let pr_url = pr
-        .pr_url
-        .clone()
-        .unwrap_or_else(|| format!("{} PR/MR #{}", pr.forge, pr.pr_number.unwrap_or_default()));
 
     // RAL-505: use the discourage-tests wording when this review's own
     // override says so, else fall back to the project/global default --
@@ -2138,7 +2147,13 @@ mod tests {
             log_text: None,
             failing_step: Some("cargo nextest run --workspace".to_string()),
         };
-        let text = describe_failing_check(None, &check, "check 'build' failed", None);
+        let text = describe_failing_check(
+            None,
+            &check,
+            "check 'build' failed",
+            None,
+            "https://forge.example/pr/7",
+        );
         assert!(
             text.contains("the exact command this failing step ran"),
             "must instruct the agent to find the step's own command: {text}"
@@ -2162,7 +2177,13 @@ mod tests {
             log_text: None,
             failing_step: None,
         };
-        let text = describe_failing_check(None, &check, "check 'build' failed", None);
+        let text = describe_failing_check(
+            None,
+            &check,
+            "check 'build' failed",
+            None,
+            "https://forge.example/pr/7",
+        );
         assert!(
             text.contains("Look up https://ci.example/job/1 to find out what the error was"),
             "{text}"
@@ -2173,9 +2194,19 @@ mod tests {
             job_url: None,
             ..check
         };
-        let text = describe_failing_check(None, &no_url, "check 'build' failed", None);
+        let text = describe_failing_check(
+            None,
+            &no_url,
+            "check 'build' failed",
+            None,
+            "https://forge.example/pr/7",
+        );
         assert!(
-            text.contains("Look up this pull request's CI checks"),
+            text.contains("Pull request: https://forge.example/pr/7"),
+            "{text}"
+        );
+        assert!(
+            text.contains("Look up https://forge.example/pr/7 to find out what the error was"),
             "{text}"
         );
     }
@@ -2218,7 +2249,13 @@ mod tests {
             log_text: Some("boom\n".to_string()),
             failing_step: None,
         };
-        let text = describe_failing_check(root.to_str(), &check, "check 'build' failed", None);
+        let text = describe_failing_check(
+            root.to_str(),
+            &check,
+            "check 'build' failed",
+            None,
+            "https://forge.example/pr/7",
+        );
         assert!(text.contains("Look up https://ci.example/job/1"), "{text}");
         assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
         std::fs::remove_dir_all(&root).ok();
@@ -2269,7 +2306,13 @@ mod tests {
             log_text: None,
             failing_step: None,
         };
-        let text = describe_failing_check(None, &check, "check 'test' failed", None);
+        let text = describe_failing_check(
+            None,
+            &check,
+            "check 'test' failed",
+            None,
+            "https://forge.example/pr/7",
+        );
         assert!(
             text.contains("the exact command this failing step ran"),
             "instruction must not depend on a resolved failing_step: {text}"
