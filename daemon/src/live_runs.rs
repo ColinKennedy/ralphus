@@ -705,6 +705,10 @@ pub fn drain_queue(
 ) {
     let mut claim = Some(claim);
     loop {
+        // Commits are carried only once the queue is empty: carrying one
+        // run's fix rebuilds the review, which would move the checkout out
+        // from under the next queued run. Every queued run tests the same tip.
+        let mut to_integrate = Vec::new();
         loop {
             // Bound first: a `while let` scrutinee would keep the store lock
             // held for the whole run.
@@ -712,7 +716,13 @@ pub fn drain_queue(
             let Ok(Some(run)) = next else {
                 break;
             };
-            execute_queued_run(store, runners, &run);
+            if execute_queued_run(store, runners, &run) {
+                to_integrate.push(run.run_id.clone());
+            }
+        }
+        for run_id in to_integrate {
+            let runner = runners(store);
+            integrate_run(store, runner.as_ref(), &run_id);
         }
         drop(claim.take());
         let more = store
@@ -786,23 +796,24 @@ fn resolve_target(
     }
 }
 
-/// Execute one queued run to completion and record it.
+/// Execute one queued run to completion and record it. `true` when its
+/// commits are waiting to be carried into the review.
 fn execute_queued_run(
     store: &crate::store_lock::StoreHandle,
     runners: &LiveRunnerFactory,
     run: &LiveRunRow,
-) {
+) -> bool {
     let (guardian, target, checkout) = {
         let guard = store.lock();
         let Ok(g) = guard.get_guardian(&run.guardian_id) else {
             let _ = guard.fail_queued_live_run(&run.run_id, "the review no longer exists");
-            return;
+            return false;
         };
         let target = match resolve_target(&guard, &g, run) {
             Ok(t) => t,
             Err(e) => {
                 let _ = guard.fail_queued_live_run(&run.run_id, &e);
-                return;
+                return false;
             }
         };
         let checkout = guard.live_checkout(&g.id).unwrap_or_default();
@@ -822,7 +833,7 @@ fn execute_queued_run(
                 &run.run_id,
                 "the review's build has not been prepared yet; run it after preparation finishes",
             );
-            return;
+            return false;
         }
     };
     let prompt = match &checkout.preparation_failure {
@@ -864,10 +875,7 @@ fn execute_queued_run(
         .lock()
         .finish_live_run(&run.run_id, &outcome, integration);
     post_report(store, &guardian, &target.label, &outcome);
-    if integration == "pending" {
-        let runner = runners(store);
-        integrate_run(store, runner.as_ref(), &run.run_id);
-    }
+    integration == "pending"
 }
 
 /// Most patch text handed to the resolver when a live run's commits do not
