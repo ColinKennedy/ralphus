@@ -561,6 +561,185 @@
         return rows.join("");
       }
       /**
+       * @typedef {object} ForgeQuota
+       * @property {number} limit
+       * @property {number} remaining
+       * @property {number} reset_at_ms
+       * @property {number} observed_at_ms
+       */
+      /**
+       * @typedef {object} ForgeStatusPr
+       * @property {string} pr_id
+       * @property {number|null} pr_number
+       * @property {string} state
+       * @property {number|null} ci_checked_at_ms
+       * @property {string|null} ci_check_error
+       * @property {string|null} drift_check_error
+       * @property {string|null} comments_check_error
+       */
+      /**
+       * @typedef {object} ForgeStatus
+       * @property {number} now_ms
+       * @property {boolean} client_resolved
+       * @property {string|null} forge
+       * @property {string|null} repo
+       * @property {boolean} quota_tracked
+       * @property {ForgeQuota|null} quota
+       * @property {{active: boolean, resume_at_ms: number|null, remaining_ms: number|null}} backoff
+       * @property {{ci_standing: {interval_ms: number, next_due_at_ms: number|null}, fast_watch_active: boolean, forge_cache: {enabled: boolean, interval_ms: number}, next_attempt_at_ms: number|null}} checks
+       * @property {ForgeStatusPr[]} pull_requests
+       */
+      // RALPHUS-FORGE-RATE-LIMIT:BEGIN
+      /**
+       * The rows of the branch inspector's "forge rate limit" section. Pure:
+       * everything comes from the daemon's `forge-status` reply and `now`.
+       * @param {ForgeStatus} st - The daemon's forge-status reply.
+       * @param {number} now - Current epoch milliseconds (the browser's clock).
+       * @returns {string}
+       */
+      function forgeRateLimitRowsHtml(st, now) {
+        /**
+         * @param {string} text - Row text (escaped here).
+         * @param {string} tip - Tooltip text (escaped here).
+         * @param {string} [colour] - A CSS variable, e.g. `var(--failed)`.
+         * @returns {string}
+         */
+        const row = (text, tip, colour) =>
+          `<div class="insp-pr-sub"${colour ? ` style="color:${colour}"` : ""} data-tip="${esc(tip)}">${esc(text)}</div>`;
+        const when = (/** @type {number} */ ms) => new Date(ms).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+        const rows = [];
+        if (!st.client_resolved) {
+          rows.push(row(
+            "no forge client could be resolved for this review's repo",
+            "The daemon could not work out which forge (GitHub/GitLab) and token this review's repo uses, so there is no quota to show. Check the project's remote and your forge token. It does not call the forge to find out.",
+            "var(--failed)",
+          ));
+        } else {
+          rows.push(row(
+            `${st.forge || "forge"} · ${st.repo || "—"}`,
+            "The forge and repository whose API quota this branch's PR checks draw on. Every review on the same token shares that one quota.",
+          ));
+          if (st.quota) {
+            const q = st.quota;
+            const low = q.remaining <= q.limit * 0.1;
+            const resets = q.reset_at_ms > now ? `resets in ${fmtRelativeAge(q.reset_at_ms - now)} (${when(q.reset_at_ms)})` : "window has reopened";
+            rows.push(row(
+              `${q.remaining} of ${q.limit} calls left · ${resets}`,
+              `The quota the forge reported on the daemon's last call, ${fmtRelativeAge(Math.max(0, now - q.observed_at_ms))} ago. The quota is per token, so other reviews and other tools using it spend from the same pool. A reading older than the reset time is stale.`,
+              low ? "var(--delayed)" : "",
+            ));
+          } else if (st.quota_tracked) {
+            rows.push(row(
+              "no quota reading yet",
+              "The daemon records the forge's remaining-calls header on each response. None has arrived since the daemon started; one appears after the next poll.",
+              "var(--muted)",
+            ));
+          } else {
+            rows.push(row(
+              "quota readings are not available for this forge",
+              "Only GitHub's rate-limit headers are tracked so far. This forge's polling is not rate-limit aware yet.",
+              "var(--muted)",
+            ));
+          }
+        }
+        const b = st.backoff;
+        if (b.active && b.resume_at_ms) {
+          rows.push(row(
+            `paused: quota exhausted · resumes in ${fmtRelativeAge(Math.max(0, b.resume_at_ms - now))} (${when(b.resume_at_ms)})`,
+            "The forge said this token is out of calls, so the daemon stopped polling CI for this repo until the window reopens instead of retrying into the limit. Nothing is lost; checks resume on their own.",
+            "var(--delayed)",
+          ));
+        } else {
+          rows.push(row("not rate-limited", "The daemon is free to poll the forge for this branch.", "var(--muted)"));
+        }
+        const c = st.checks;
+        const next = c.next_attempt_at_ms;
+        const nextText = next === null
+          ? "next CI check: not scheduled yet (this daemon has not polled the review since it started)"
+          : (next > now ? `next CI check in ${fmtRelativeAge(next - now)} (${when(next)})` : "next CI check: due now");
+        rows.push(row(
+          nextText,
+          `The earliest the daemon will next ask the forge for CI status on this review. CI is polled at most every ${fmtRelativeAge(c.ci_standing.interval_ms)}${b.active ? ", pushed back to the end of the pause above" : ""}.`,
+        ));
+        if (c.fast_watch_active) {
+          rows.push(row(
+            "watching closely after a push",
+            "A short-interval CI watch is running for this branch (every 5-60s) because it was just pushed or opened. It stops when CI reaches a final result.",
+          ));
+        }
+        rows.push(row(
+          c.forge_cache.enabled
+            ? `PR comments and branch drift refresh every ${fmtRelativeAge(c.forge_cache.interval_ms)}`
+            : "PR comments and branch drift refresh is off",
+          "How often the background poller re-reads this review's PR comments and checks whether the PR's base moved. Set by [pr_cache] in the daemon config.",
+          "var(--muted)",
+        ));
+        for (const p of st.pull_requests) {
+          const label = p.pr_number === null ? "PR" : `#${p.pr_number}`;
+          const errs = [
+            p.ci_check_error ? `CI: ${p.ci_check_error}` : "",
+            p.drift_check_error ? `drift: ${p.drift_check_error}` : "",
+            p.comments_check_error ? `comments: ${p.comments_check_error}` : "",
+          ].filter(Boolean);
+          const last = p.ci_checked_at_ms ? `${fmtRelativeAge(Math.max(0, now - p.ci_checked_at_ms))} ago` : "never";
+          rows.push(row(
+            `${label} (${p.state}): last CI check ${last}${errs.length ? ` · ${errs.join(" · ")}` : ""}`,
+            errs.length
+              ? "The last forge poll for this PR failed. The daemon retries on its next pass; a rate-limit error here clears once the pause above ends."
+              : "When the daemon last successfully checked this PR's CI.",
+            errs.length ? "var(--failed)" : "var(--muted)",
+          ));
+        }
+        return rows.join("");
+      }
+      // RALPHUS-FORGE-RATE-LIMIT:END
+      /**
+       * Forge status per `guardianId:branchId`, loaded when the branch is
+       * selected and refetched once older than `FORGE_STATUS_TTL_MS`.
+       * @type {{[key: string]: {at: number, status: ForgeStatus|null, loading: boolean}}}
+       */
+      const branchForgeStatus = {};
+      const FORGE_STATUS_TTL_MS = 15000;
+      /**
+       * Fetches `GET /api/guardians/{id}/branches/{branch}/forge-status`.
+       * @param {string} gid - The review id.
+       * @param {string} bid - The branch id.
+       * @returns {Promise<void>}
+       */
+      async function loadBranchForgeStatus(gid, bid) {
+        const key = `${gid}:${bid}`;
+        const prior = branchForgeStatus[key];
+        branchForgeStatus[key] = { at: Date.now(), status: prior ? prior.status : null, loading: true };
+        /** @type {ForgeStatus|null} */
+        let status = null;
+        try {
+          const r = await fetch(`/api/guardians/${encodeURIComponent(gid)}/branches/${encodeURIComponent(bid)}/forge-status`);
+          if (r.ok) status = await r.json();
+        } catch {
+          status = null;
+        }
+        branchForgeStatus[key] = { at: Date.now(), status, loading: false };
+        renderReviewInspector();
+      }
+      /**
+       * The "forge rate limit" section for the selected branch. Shown whether
+       * or not the branch has a PR, so a branch whose PR failed still explains
+       * why. Requests data only when rendered for a selected branch.
+       * @param {GuardianView} g - The review.
+       * @param {GuardianBranch} b - The selected branch.
+       * @returns {string}
+       */
+      function branchForgeStatusHtml(g, b) {
+        const key = `${g.id}:${b.id}`;
+        const entry = branchForgeStatus[key];
+        if (!entry || (!entry.loading && Date.now() - entry.at > FORGE_STATUS_TTL_MS)) loadBranchForgeStatus(g.id, b.id);
+        const st = entry ? entry.status : null;
+        const body = st
+          ? forgeRateLimitRowsHtml(st, Date.now())
+          : `<div class="insp-pr-sub" data-tip="The daemon's forge status for this branch.">${entry && !entry.loading ? "unavailable" : "loading…"}</div>`;
+        return `<h3 class="section" style="margin-top:16px" data-tip="Forge API quota, the pause when it runs out, and when CI is next checked for this branch. Useful when a PR looks stuck or a check failed: it shows whether the cause is a rate limit.">forge rate limit</h3>${body}`;
+      }
+      /**
        * Overview: identity, stack position, source, and PR status.
        * @param {GuardianView} g - The review.
        * @param {GuardianBranch} b - The selected branch.
@@ -602,7 +781,8 @@
                 ${prPollStatusHtml(p.id)}
                 ${p.state === "open" ? prAutoFixBudgetHtml(p.id) : ""}
               </div>`).join("")
-            : `<div class="empty" style="padding:8px 0" data-tip="Submitting folds this branch into the review's existing PR stack — it is never submitted on its own, which is what keeps the stack's base chain intact.">Not submitted yet.</div>`}`;
+            : `<div class="empty" style="padding:8px 0" data-tip="Submitting folds this branch into the review's existing PR stack — it is never submitted on its own, which is what keeps the stack's base chain intact.">Not submitted yet.</div>`}
+          ${branchForgeStatusHtml(g, b)}`;
       }
       /**
        * Worktree: the on-disk tree for this branch and its own env layer.

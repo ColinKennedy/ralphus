@@ -331,6 +331,12 @@ scheduler down-time window — a different entity and a different cause);
 elapses and execution resumes, or once repeated rate limits exhaust the
 retry budget and the owning call fails outright instead of retrying again.
 
+The board's forge rate-limit section (review inspector, Overview tab) reuses
+`--delayed` for the same role: the daemon itself is waiting out a timer, here
+a forge API quota pause or a nearly spent quota, and will resume with no human
+action. A failed poll in that section uses `--failed`; neutral facts use
+`--muted`.
+
 ### Runner-less running cell — `--warn` (RAL-626)
 A task cell's status pill grows a `⚠ no runner` badge (`.p-warn`) while it
 reads `running` but the daemon's runner watchdog has found no live runner and

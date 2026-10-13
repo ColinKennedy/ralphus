@@ -3219,6 +3219,7 @@ impl ForgeClient {
             .set("Content-Type", "application/json")
             .send_string(&payload.to_string())
             .map_err(|e| self.describe_evicting(e))?;
+        self.record_quota_headers(&resp);
         parse_body(resp)
     }
 
@@ -3226,6 +3227,7 @@ impl ForgeClient {
     /// why every read call in this file routes through this.
     fn get(&self, req: ureq::Request) -> Result<serde_json::Value, String> {
         let resp = req.call().map_err(|e| self.describe_evicting(e))?;
+        self.record_quota_headers(&resp);
         parse_body(resp)
     }
 
@@ -3249,8 +3251,12 @@ impl ForgeClient {
             req = req.set("If-None-Match", etag);
         }
         match req.call() {
-            Ok(resp) if resp.status() == 304 => Ok(ConditionalGet::NotModified),
+            Ok(resp) if resp.status() == 304 => {
+                self.record_quota_headers(&resp);
+                Ok(ConditionalGet::NotModified)
+            }
             Ok(resp) => {
+                self.record_quota_headers(&resp);
                 let etag = resp.header("ETag").map(str::to_string);
                 let body = resp
                     .into_string()
@@ -3303,6 +3309,51 @@ impl ForgeClient {
                 Ok(value)
             }
         }
+    }
+
+    /// Remember the `X-RateLimit-*` reading on `resp` (GitHub only; a response
+    /// missing any of the three headers is ignored). Responses can finish out
+    /// of order, so within one window a reading never replaces a lower
+    /// `remaining` with a higher one.
+    fn record_quota_headers(&self, resp: &ureq::Response) {
+        if self.kind != ForgeKind::GitHub {
+            return;
+        }
+        let number = |name: &str| resp.header(name)?.trim().parse::<u64>().ok();
+        let (Some(limit), Some(remaining), Some(reset)) = (
+            number("X-RateLimit-Limit"),
+            number("X-RateLimit-Remaining"),
+            number("X-RateLimit-Reset"),
+        ) else {
+            return;
+        };
+        let snapshot = QuotaSnapshot {
+            limit,
+            remaining,
+            reset_at_ms: i64::try_from(reset.saturating_mul(1000)).unwrap_or(i64::MAX),
+            observed_at_ms: crate::store::now_ms(),
+        };
+        let mut map = QUOTA_SNAPSHOTS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let key = self.rate_limit_key();
+        let stale = map.get(&key).is_some_and(|prior| {
+            prior.reset_at_ms == snapshot.reset_at_ms && prior.remaining < snapshot.remaining
+        });
+        if !stale {
+            map.insert(key, snapshot);
+        }
+    }
+
+    /// The last quota reading seen for this client's token, if any. `None`
+    /// on GitLab and before the first GitHub response.
+    #[must_use]
+    pub fn quota_snapshot(&self) -> Option<QuotaSnapshot> {
+        QUOTA_SNAPSHOTS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&self.rate_limit_key())
+            .copied()
     }
 
     /// Registry key for the quota this client draws on: GitHub's primary limit
@@ -3372,6 +3423,9 @@ impl ForgeClient {
     /// on its own; with it, the very next resolve re-checks the CLI live
     /// instead of waiting.
     fn describe_evicting(&self, e: ureq::Error) -> ForgeError {
+        if let ureq::Error::Status(_, resp) = &e {
+            self.record_quota_headers(resp);
+        }
         if let ureq::Error::Status(401 | 403, _) = &e {
             if let Some(host) = &self.cli_token_host {
                 evict_cli_token(self.kind, host);
@@ -3508,6 +3562,23 @@ const CI_ETAG_CACHE_MAX_ENTRIES: usize = 2048;
 /// [`ForgeClient::rate_limit_key`] plus the request URL. Lives in memory only:
 /// losing it on restart costs one unconditional fetch per URL.
 static CI_ETAG_CACHE: std::sync::LazyLock<Mutex<HashMap<String, (String, serde_json::Value)>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// The most recent `X-RateLimit-*` reading for a GitHub token: what the board
+/// shows as "N of M calls left, resets at ...".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QuotaSnapshot {
+    pub limit: u64,
+    pub remaining: u64,
+    /// When the window reopens, epoch milliseconds.
+    pub reset_at_ms: i64,
+    /// When this reading was taken, epoch milliseconds.
+    pub observed_at_ms: i64,
+}
+
+/// Latest [`QuotaSnapshot`] by [`ForgeClient::rate_limit_key`]. In memory only:
+/// empty after a restart until the next response arrives.
+static QUOTA_SNAPSHOTS: std::sync::LazyLock<Mutex<HashMap<String, QuotaSnapshot>>> =
     std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// How long a `429` with no wait header holds a token off.
@@ -7928,6 +7999,73 @@ mod tests {
         assert!(client.check_pr_ci_status(4).is_err());
         let left = client.rate_limit_backoff_remaining().unwrap();
         assert!(left <= Duration::from_secs(30), "{left:?}");
+        mock.finish();
+    }
+
+    fn respond_200_with_quota_headers(
+        server: &crate::mock_forge::MockForgeServer,
+        remaining: u64,
+        reset: u64,
+    ) {
+        let req = server.recv();
+        let mut resp = tiny_http::Response::from_string(r#"{"mergeable_state": "dirty"}"#)
+            .with_status_code(200);
+        for (name, value) in [
+            ("X-RateLimit-Limit", "5000".to_string()),
+            ("X-RateLimit-Remaining", remaining.to_string()),
+            ("X-RateLimit-Reset", reset.to_string()),
+        ] {
+            resp = resp.with_header(
+                tiny_http::Header::from_bytes(name.as_bytes(), value.as_bytes()).unwrap(),
+            );
+        }
+        req.respond(resp).unwrap();
+    }
+
+    #[test]
+    fn a_github_response_records_its_quota_reading() {
+        let reset = epoch_now() + 600;
+        let mock = MockForge::start(move |server| {
+            respond_200_with_quota_headers(server, 4321, reset);
+        });
+        let client = mock.client(ForgeKind::GitHub, "acme/widget");
+        assert_eq!(client.quota_snapshot(), None);
+        client.check_pr_ci_status(4).unwrap();
+        let snapshot = client.quota_snapshot().expect("a reading was recorded");
+        assert_eq!(snapshot.limit, 5000);
+        assert_eq!(snapshot.remaining, 4321);
+        assert_eq!(snapshot.reset_at_ms, i64::try_from(reset * 1000).unwrap());
+        mock.finish();
+    }
+
+    #[test]
+    fn a_rate_limited_github_403_records_a_zero_remaining_reading() {
+        let reset = epoch_now() + 120;
+        let mock = MockForge::start(move |server| {
+            respond_403_with_headers(
+                server,
+                &[
+                    ("X-RateLimit-Limit", "5000".to_string()),
+                    ("X-RateLimit-Remaining", "0".to_string()),
+                    ("X-RateLimit-Reset", reset.to_string()),
+                ],
+            );
+        });
+        let client = mock.client(ForgeKind::GitHub, "acme/widget");
+        assert!(client.check_pr_ci_status(4).is_err());
+        assert_eq!(client.quota_snapshot().unwrap().remaining, 0);
+        mock.finish();
+    }
+
+    #[test]
+    fn a_gitlab_response_records_no_quota_reading() {
+        let reset = epoch_now() + 600;
+        let mock = MockForge::start(move |server| {
+            respond_200_with_quota_headers(server, 10, reset);
+        });
+        let client = mock.client(ForgeKind::GitLab, "acme%2Fwidget");
+        let _ = client.check_pr_ci_status(9);
+        assert_eq!(client.quota_snapshot(), None);
         mock.finish();
     }
 
