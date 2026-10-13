@@ -4298,6 +4298,31 @@ pub fn start_resync_pr_bases(store: crate::store_lock::StoreHandle, id: &str) {
     });
 }
 
+/// Reviews whose latest [`check_pr_merges`] could not learn every open PR's
+/// forge state (rate limit, unreachable forge, no client). Their stored `open`
+/// rows may already be merged on the forge, so passes that act on what an
+/// open PR implies wait on [`merge_state_unknown`].
+fn merge_state_unknown_reviews() -> &'static parking_lot::Mutex<std::collections::HashSet<String>> {
+    static UNKNOWN: std::sync::OnceLock<parking_lot::Mutex<std::collections::HashSet<String>>> =
+        std::sync::OnceLock::new();
+    UNKNOWN.get_or_init(Default::default)
+}
+
+fn set_merge_state_unknown(id: &str, unknown: bool) {
+    let mut reviews = merge_state_unknown_reviews().lock();
+    if unknown {
+        reviews.insert(id.to_string());
+    } else {
+        reviews.remove(id);
+    }
+}
+
+/// Whether the last merge check for `id` left some open PR's forge state
+/// unanswered.
+fn merge_state_unknown(id: &str) -> bool {
+    merge_state_unknown_reviews().lock().contains(id)
+}
+
 /// Poll every PR/MR linked to `id` for a live "merged" state and settle the
 /// review accordingly (RAL-300).
 ///
@@ -4340,12 +4365,14 @@ pub fn check_pr_merges(store: &crate::store_lock::StoreHandle, id: &str) -> bool
         .list_pull_requests_for_guardian(id)
         .unwrap_or_default();
     if prs.is_empty() {
+        set_merge_state_unknown(id, false);
         return false;
     }
     if prs
         .iter()
         .all(|pull_request| pull_request.state == "merged")
     {
+        set_merge_state_unknown(id, false);
         return settle_pr_merge_states(store, id, &[]);
     }
 
@@ -4358,6 +4385,7 @@ pub fn check_pr_merges(store: &crate::store_lock::StoreHandle, id: &str) -> bool
         client: crate::forge::ForgeClient,
     }
     let mut jobs = Vec::new();
+    let mut unknown = false;
     for pr in prs
         .iter()
         .filter(|pull_request| pull_request.state == "open")
@@ -4392,7 +4420,7 @@ pub fn check_pr_merges(store: &crate::store_lock::StoreHandle, id: &str) -> bool
             // asked again until its backoff window ends: re-asking only
             // extends the limit. The outage notice was raised when the limit
             // was first seen ([`crate::forge_health::report_failure`]).
-            Some(client) if is_backed_off(client) => {}
+            Some(client) if is_backed_off(client) => unknown = true,
             Some(client) if client.kind().as_str() == pr.forge => {
                 jobs.push(MergeCheckJob {
                     pr,
@@ -4400,6 +4428,7 @@ pub fn check_pr_merges(store: &crate::store_lock::StoreHandle, id: &str) -> bool
                 });
             }
             Some(client) => {
+                unknown = true;
                 log_pr_merge_check_failure(
                     store,
                     id,
@@ -4414,6 +4443,7 @@ pub fn check_pr_merges(store: &crate::store_lock::StoreHandle, id: &str) -> bool
                 );
             }
             None => {
+                unknown = true;
                 log_pr_merge_check_failure(
                     store,
                     id,
@@ -4445,6 +4475,7 @@ pub fn check_pr_merges(store: &crate::store_lock::StoreHandle, id: &str) -> bool
     let mut freshly_merged = Vec::new();
     for (job, result) in jobs.iter().zip(fetched) {
         if let Some(Err(error)) = &result {
+            unknown = true;
             let status = crate::forge_health::status_from_message(error);
             if crate::forge_health::classify(status, error)
                 == Some(crate::forge_health::Problem::RateLimited)
@@ -4454,6 +4485,7 @@ pub fn check_pr_merges(store: &crate::store_lock::StoreHandle, id: &str) -> bool
         }
         apply_pr_merge_state(store, id, job.pr, result, &mut freshly_merged);
     }
+    set_merge_state_unknown(id, unknown);
     // RAL-338: react to a freshly-observed cross-repository root merge
     // before settling merge states, so a newly-promoted successor's row
     // already exists when `settle_pr_merge_states` re-reads this guardian's
@@ -5675,6 +5707,14 @@ pub fn verify_and_repair_stack_ancestry(
         return false;
     }
     if !guardian.effective_auto_submit_pr_stack {
+        return false;
+    }
+    // A stored `open` PR may already be merged on the forge when the last
+    // merge check could not reach it. A merged predecessor's tip is not an
+    // ancestor of its rebased successor, which reads as a broken stack and
+    // would restack a review that has in fact landed. Wait for a definite
+    // answer.
+    if merge_state_unknown(id) {
         return false;
     }
     let root = PathBuf::from(&guardian.git_root);
@@ -14429,6 +14469,103 @@ mod tests {
         assert_eq!(
             pr_b_after.last_pushed_sha.as_deref(),
             Some(remote_b.as_str())
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&remote_dir);
+    }
+
+    /// A merge check that could not reach the forge (rate limit) leaves
+    /// already-merged PRs stored as `open`; their tips then look like a broken
+    /// stack. The repair must wait for a definite answer instead of
+    /// restacking a review that has landed.
+    #[test]
+    fn stack_ancestry_repair_waits_while_the_merge_state_is_unknown() {
+        let (root, remote_dir, store, gid, (bid_a, bid_b), (rev_a, wt_b), (sha_a, _sha_b)) =
+            ancestry_stack_fixture("ancestry-unknown");
+        let pr_a = store
+            .lock()
+            .create_pull_request(
+                &gid,
+                Some(&bid_a),
+                "github",
+                "acme/w",
+                "pr-a",
+                "main",
+                "T",
+                "",
+                Some(1),
+                None,
+            )
+            .unwrap();
+        let pr_b = store
+            .lock()
+            .create_pull_request(
+                &gid,
+                Some(&bid_b),
+                "github",
+                "acme/w",
+                "pr-b",
+                "main",
+                "T",
+                "",
+                Some(2),
+                None,
+            )
+            .unwrap();
+        store
+            .lock()
+            .update_pull_request_ex(
+                &pr_a,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(Some(&sha_a)),
+                None,
+            )
+            .unwrap();
+        g(&root, &["checkout", "-b", "a-ghost", "main"]);
+        g(&root, &["cherry-pick", &rev_a]);
+        g(&root, &["checkout", "main"]);
+        g(Path::new(&wt_b), &["rebase", "--onto", "a-ghost", &rev_a]);
+        let ghost_b = g(Path::new(&wt_b), &["rev-parse", "HEAD"])
+            .trim()
+            .to_string();
+        g(
+            &root,
+            &["push", "--force", "origin", &format!("{ghost_b}:pr-b")],
+        );
+        store
+            .lock()
+            .update_pull_request_ex(
+                &pr_b,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(Some(&ghost_b)),
+                None,
+            )
+            .unwrap();
+
+        set_merge_state_unknown(&gid, true);
+        let repaired = verify_and_repair_stack_ancestry(&store, &NoopRunner, &gid);
+        assert!(!repaired, "must not restack while PR states are unknown");
+        assert_eq!(
+            store.lock().get_guardian(&gid).unwrap().status,
+            "in_review",
+            "must not have moved the guardian"
+        );
+        let remote_b = g(&remote_dir, &["rev-parse", "pr-b"]).trim().to_string();
+        assert_eq!(remote_b, ghost_b, "pr-b must be left untouched");
+
+        set_merge_state_unknown(&gid, false);
+        assert!(
+            verify_and_repair_stack_ancestry(&store, &NoopRunner, &gid),
+            "once the states are known the break is repaired as usual"
         );
 
         let _ = std::fs::remove_dir_all(&root);
