@@ -3304,13 +3304,14 @@ Press Accept on the note to create it.">Squad pending</span>`;
        * Moves a branch out of its review into a brand-new review of its own, after confirmation.
        * @param {string} gid
        * @param {string} branchId
+       * @param {boolean} [confirmed] - True when the caller already asked (the Unblock popup), so no second prompt.
        * @returns {Promise<void>}
        */
-      async function extractBranch(gid, branchId) {
+      async function extractBranch(gid, branchId, confirmed) {
         closeSquadMenu();
         const g = guardians.find((x) => x.id === gid);
         const branch = (g && (g.branches.find((b) => b.id === branchId) || {}).branch) || branchId;
-        if (!confirm(`Extract branch "${branch}" into a new review? Both reviews will rebuild. This cannot be undone.`)) return;
+        if (!confirmed && !confirm(`Extract branch "${branch}" into a new review? Both reviews will rebuild. This cannot be undone.`)) return;
         await guardianAction(`/api/guardians/${gid}/branches/${branchId}/extract`);
         tick();
       }

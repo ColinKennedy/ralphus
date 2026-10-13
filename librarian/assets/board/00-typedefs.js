@@ -10,6 +10,13 @@
        * @property {[string, string]|null} [branch] - `[review id, branch]` this cell's branch sits in, if any.
        */
       /**
+       * @typedef {object} UnblockOption
+       * @property {"ignore"|"extract"|"copy"|"copy-branch"} key - Which action the option runs.
+       * @property {string} title - Short name of the action.
+       * @property {string} effect - Plain-language account of what happens when it is chosen.
+       * @property {boolean} addOn - True for an optional retry that goes with a main option rather than a way out of its own.
+       */
+      /**
        * @typedef {object} AppraisalSection
        * @property {string} title
        * @property {string} body - Markdown.

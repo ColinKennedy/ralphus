@@ -201,6 +201,8 @@
       CLICK_HANDLERS.openGenerationCosts = (e, ds) => openGenerationCosts(e, ds.squadId || "");
       CLICK_HANDLERS.gotoReviewBranch = (e, ds) => gotoReviewBranch(ds.guardianId || "", ds.branch || "");
       CLICK_HANDLERS.restartCell = (e, ds) => restartCell(ds.squadId || "", Number(ds.ti), Number(ds.si));
+      CLICK_HANDLERS.openUnblockCell = (e, ds) => openUnblockCell(ds.squadId || "", Number(ds.ti), Number(ds.si));
+      CLICK_HANDLERS.unblockPick = (e, ds) => unblockPick(ds.option || "", ds.squadId || "", Number(ds.ti), Number(ds.si));
       CLICK_HANDLERS.ignoreCell = (e, ds) => ignoreCell(ds.squadId || "", Number(ds.ti), Number(ds.si));
       CLICK_HANDLERS.gotoSquad = (e, ds) => { e.preventDefault(); selectSquad(ds.squadId || ""); };
       CLICK_HANDLERS.copyCell = (e, ds) => copyCell(ds.squadId || "", Number(ds.ti), Number(ds.si), ds.fromBranch === "1");

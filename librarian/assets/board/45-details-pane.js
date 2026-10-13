@@ -1171,7 +1171,7 @@
           ${s.name ? `<div class="kv-row"><span class="k">name</span><span class="v">${esc(s.name)}</span></div>` : ""}
           <div class="kv-row"><span class="k">id</span><span class="v mono">${esc(s.id)}${copyBtn(s.id)}</span></div>
           <div class="kv-row"><span class="k">task</span><span class="v">${esc(t.name)}</span></div>
-          <div class="kv-row"><span class="k">state</span><span class="v">${pill(s.state)}${blockingBadge(s.blocking)}${detachedBadge(s.detached_at_ms)}${delayedBadge(s.delayed_until_ms)}${runnerStalledBadge(s.runner_stalled_at_ms)}${outOfDateBadge(s.env_out_of_date)}${subprojectBadge(s)}${["pending","queued"].includes(s.state) ? "" : squadLogsBtn(r.id)}${s.error ? failLogBtn(s.error) : ""}</span></div>
+          <div class="kv-row"><span class="k">state</span><span class="v">${pill(s.state)}${blockingBadge(s.blocking)}${s.blocking ? unblockButton(r.id, sel.taskIdx, sel.cellIdx) : ""}${detachedBadge(s.detached_at_ms)}${delayedBadge(s.delayed_until_ms)}${runnerStalledBadge(s.runner_stalled_at_ms)}${outOfDateBadge(s.env_out_of_date)}${subprojectBadge(s)}${["pending","queued"].includes(s.state) ? "" : squadLogsBtn(r.id)}${s.error ? failLogBtn(s.error) : ""}</span></div>
           ${timingRows(s.started_at_ms, s.finished_at_ms, s.duration_ms ?? 0, s.active_duration_intervals ?? 0)}
           <div class="kv-row"><span class="k">agent</span>${detailValueHtml(s.agent, agentTip)}</div>
           <div class="kv-row"><span class="k">model</span>${detailValueHtml(s.model || "—", modelTip)}</div>

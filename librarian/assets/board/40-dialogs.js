@@ -384,15 +384,131 @@
        * @param {string} squadId
        * @param {number} ti
        * @param {number} si
+       * @param {boolean} [confirmed] - True when the caller already asked (the Unblock popup), so no second prompt.
        * @returns {Promise<void>}
        */
-      async function ignoreCell(squadId, ti, si) {
-        if (!confirm("Ignore this cell and continue? Its dependents that were blocked by it will run without it.")) return;
+      async function ignoreCell(squadId, ti, si, confirmed) {
+        if (!confirmed && !confirm("Ignore this cell and continue? Its dependents that were blocked by it will run without it.")) return;
         await post(`/api/squads/${squadId}/set-status`, {
           kind: "cell", task_idx: ti, cell_idx: si, proof_idx: -1, proof_scope: "", state: "ignored"
         }, { success: "Cell ignored; its dependents continue.", errorLabel: "ignore cell" });
         tick();
         if (tab === "queue") pollQueue();
+      }
+      // RALPHUS-UNBLOCK-OPTIONS:BEGIN
+      /**
+       * The options the Unblock popup offers for a blocking cell (RAL-641):
+       * two ways out (ignore; extract its branch) and copy as an optional
+       * retry that goes with either. Ignoring a cell already disables its
+       * review branch, so disabling the branch is not a separate option.
+       * @param {CellBlocking} blocking
+       * @param {boolean} hasProject - Whether the cell's task belongs to a project (copy-from-branch needs one).
+       * @returns {UnblockOption[]}
+       */
+      function unblockOptions(blocking, hasProject) {
+        const hasBranch = !!blocking.branch;
+        /** @type {UnblockOption[]} */
+        const out = [{
+          key: "ignore",
+          title: "Ignore the cell and continue",
+          effect: "Marks the cell ignored and re-runs the cells that failed only because of it"
+            + (hasBranch ? ", and takes its review branch out of the review so the review stops waiting on it" : "")
+            + ". Reversible: Restart cell runs it again.",
+          addOn: false,
+        }];
+        if (hasBranch) {
+          out.push({
+            key: "extract",
+            title: "Extract its branch to a new review",
+            effect: "Moves the branch out of this review into a review of its own, so the rest of this review can finish. The cell is left as it is, so the same cell can be retried there.",
+            addOn: false,
+          });
+        }
+        out.push({
+          key: "copy",
+          title: "Copy the cell to a new squad",
+          effect: "Makes a one-task squad with the same definition for a separate retry, starting from the latest main code. The original cell is not changed.",
+          addOn: true,
+        });
+        if (hasProject) {
+          out.push({
+            key: "copy-branch",
+            title: "Copy the cell to a new squad, from its own work",
+            effect: "Same, but the new squad starts from this cell's own saved work instead of the latest main code.",
+            addOn: true,
+          });
+        }
+        return out;
+      }
+      // RALPHUS-UNBLOCK-OPTIONS:END
+      /**
+       * Opens the Unblock popup (RAL-641) for a blocking cell: what is held
+       * up, then each option with what it will do.
+       * @param {string} squadId
+       * @param {number} ti
+       * @param {number} si
+       * @returns {void}
+       */
+      function openUnblockCell(squadId, ti, si) {
+        const r = findSquad(squadId);
+        const task = r && r.tasks[ti];
+        const cell = task && task.cells[si];
+        const blocking = cell && cell.blocking;
+        if (!r || !task || !cell || !blocking) { notify("error", "This cell is not blocking anything any more."); return; }
+        const options = unblockOptions(blocking, !!task.project);
+        const branch = blocking.branch;
+        const optionHtml = (/** @type {UnblockOption} */ o) =>
+          `<div style="padding:8px 0;border-top:1px solid var(--border)">
+            <div style="display:flex;gap:10px;align-items:flex-start">
+              <div style="flex:1"><div style="font-weight:600">${esc(o.title)}</div><div style="font-size:12px;color:var(--muted);margin-top:2px">${esc(o.effect)}</div></div>
+              <button class="btn${o.addOn ? "" : " primary"}" data-click="unblockPick" data-option="${o.key}" data-squad-id="${esc(squadId)}" data-ti="${ti}" data-si="${si}" data-tip="${esc(o.title + ".\n" + o.effect)}">${o.addOn ? "Copy" : "Do this"}</button>
+            </div>
+          </div>`;
+        const main = options.filter((o) => !o.addOn).map(optionHtml).join("");
+        const addOns = options.filter((o) => o.addOn).map(optionHtml).join("");
+        const heldUp = `${blocking.blocked_cells} cell(s) and ${blocking.blocked_branches} review branch(es)`;
+        byId("modal-root").innerHTML = `
+          <div class="modal-bg" onclick="if(event.target===this)closeModal()"><div class="modal" style="width:640px;max-width:94vw">
+            <h2>Unblock ${esc(cell.name || cell.id)}</h2>
+            <p style="font-size:13px;margin:0 0 10px;color:var(--muted)">This cell has failed ${blocking.failure_count} times and is holding up ${heldUp}. Pick one of these to get it out of the way${branch ? "" : " (it has no review branch, so there is no branch to extract)"}.</p>
+            <div data-tip="The ways out. Each one says what it will do.">${main}</div>
+            <p style="font-size:12px;color:var(--muted);margin:12px 0 0">Optional: retry the work separately, alongside either option above.</p>
+            <div data-tip="Optional retries in a new squad. They do not unblock this cell by themselves.">${addOns}</div>
+            <div class="btn-row">
+              <button class="btn" onclick="closeModal()" data-tip="Close this popup without changing anything.">Cancel</button>
+            </div>
+          </div></div>`;
+      }
+      /**
+       * Runs the option picked in the Unblock popup (RAL-641) through the same
+       * actions the other buttons use, without asking a second time.
+       * @param {string} option
+       * @param {string} squadId
+       * @param {number} ti
+       * @param {number} si
+       * @returns {Promise<void>}
+       */
+      async function unblockPick(option, squadId, ti, si) {
+        const blocking = findSquad(squadId)?.tasks[ti]?.cells[si]?.blocking;
+        closeModal();
+        if (option === "ignore") { await ignoreCell(squadId, ti, si, true); return; }
+        if (option === "copy" || option === "copy-branch") { await copyCell(squadId, ti, si, option === "copy-branch"); return; }
+        if (option !== "extract") return;
+        const branch = blocking && blocking.branch;
+        const guardianId = branch ? branch[0] : "";
+        const branchName = branch ? branch[1] : "";
+        // The board's review list is the lean index (no branches until a
+        // review's detail has been opened), so ask the daemon for this
+        // review's branches rather than rely on what is already loaded.
+        /** @type {{branches?: {id: string, branch: string}[]}|null} */
+        let detail = null;
+        try {
+          const resp = await fetch(`/api/guardians/${encodeURIComponent(guardianId)}`);
+          detail = resp.ok ? await resp.json() : null;
+        } catch (_) { detail = null; }
+        const entry = detail && (detail.branches || []).find((b) => b.branch === branchName);
+        if (!entry) { notify("error", "Could not find this cell's review branch to extract."); return; }
+        await extractBranch(guardianId, entry.id, true);
       }
       /**
        * Copies one cell into a new one-task squad (RAL-641) and selects the
