@@ -498,7 +498,9 @@ fn fetch(
     configured: &[(bool, String, String)],
 ) -> Result<Attempt, git2::Error> {
     let deadline = Instant::now() + FETCH_DEADLINE;
-    let mut remote = repo.remote_anonymous(transport.url())?;
+    let Some(mut remote) = unrewritten_remote(repo, transport)? else {
+        return Ok(Attempt::Fallback);
+    };
     let first: Vec<String> = {
         let mut conn = remote.connect_auth(
             git2::Direction::Fetch,
@@ -555,6 +557,45 @@ fn fetch(
     Ok(Attempt::Done(
         crate::vcs_refs::success_output(String::new()),
     ))
+}
+
+/// An anonymous remote for `transport`'s URL that libgit2 has not rewritten.
+///
+/// libgit2 applies `url.<base>.insteadOf` to an anonymous remote, and a
+/// common rule rewrites `https://github.com/` to ssh, which this build cannot
+/// speak. Such a rule matches by prefix, so the same HTTPS URL with the port
+/// spelled out is tried next; if that is rewritten too, the fetch is left to
+/// git.
+fn unrewritten_remote<'r>(
+    repo: &'r git2::Repository,
+    transport: &Transport,
+) -> Result<Option<git2::Remote<'r>>, git2::Error> {
+    let url = transport.url();
+    let mut candidates = vec![url.to_string()];
+    if let Transport::Https { .. } = transport {
+        if let Some(explicit) = with_default_https_port(url) {
+            candidates.push(explicit);
+        }
+    }
+    for candidate in candidates {
+        let remote = repo.remote_anonymous(&candidate)?;
+        if remote.url().ok() == Some(candidate.as_str()) {
+            return Ok(Some(remote));
+        }
+    }
+    Ok(None)
+}
+
+/// `https://host/path` as `https://host:443/path`, or `None` when the URL
+/// already names a port.
+fn with_default_https_port(url: &str) -> Option<String> {
+    let rest = url.strip_prefix("https://")?;
+    let (authority, path) = rest.split_once('/')?;
+    let host = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+    if host.contains(':') {
+        return None;
+    }
+    Some(format!("https://{authority}:443/{path}"))
 }
 
 /// Whether `refname` is the branch checked out in the repository or any of
@@ -1031,6 +1072,82 @@ mod tests {
                 String::from_utf8_lossy(&inproc.stderr).trim(),
                 String::from_utf8_lossy(&real.stderr).trim()
             );
+        }
+
+        /// A real GitHub fetch over HTTPS, authenticated with the daemon's
+        /// token chain (`RALPHUS_GITHUB_TOKEN` or the `gh` login), checked
+        /// against `git ls-remote`. Needs the network and a token, so it only
+        /// runs on request:
+        /// `cargo nextest run -p ralphus-daemon --lib live_https_fetch --run-ignored only`.
+        #[test]
+        #[ignore = "needs network access and a GitHub token"]
+        fn live_https_fetch_from_github_matches_ls_remote() {
+            if !git2::Version::get().https() {
+                return;
+            }
+            let remote = std::env::var("RALPHUS_LIVE_FETCH_REMOTE")
+                .unwrap_or_else(|_| "git@github.com:rust-lang/git2-rs.git".to_string());
+            let tmp = Tmp(temp_dir());
+            let repo = tmp.path().join("repo");
+            std::fs::create_dir(&repo).unwrap();
+            git(&repo, &["init", "-q"]);
+            git(&repo, &["remote", "add", "origin", &remote]);
+            let args = [
+                "fetch",
+                "--no-write-fetch-head",
+                "origin",
+                "+HEAD:refs/x/head",
+            ];
+            let out = try_fetch_with(&repo, &args, |kind, host, _| {
+                crate::forge::daemon_forge_token(kind, host, None)
+            })
+            .expect("answered in-process");
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let fetched = git(&repo, &["rev-parse", "refs/x/head"]);
+            let listed = git(&repo, &["ls-remote", "origin", "HEAD"]);
+            assert_eq!(listed.split_whitespace().next(), Some(fetched.as_str()));
+        }
+
+        #[test]
+        fn an_insteadof_rule_on_the_https_url_is_sidestepped_or_left_to_git() {
+            assert_eq!(
+                with_default_https_port("https://github.com/acme/w.git").as_deref(),
+                Some("https://github.com:443/acme/w.git")
+            );
+            assert_eq!(with_default_https_port("https://h:8443/acme/w.git"), None);
+            let (_tmp, _upstream, _a, b) = fixture();
+            let repo = git2::Repository::open(&b).unwrap();
+            let transport = Transport::Https {
+                url: "https://github.com/acme/w.git".to_string(),
+                kind: ForgeKind::GitHub,
+                host: "github.com".to_string(),
+                path: "acme/w".to_string(),
+                token: "tok".to_string(),
+            };
+            git(
+                &b,
+                &[
+                    "config",
+                    "url.ssh://git@github.com/.insteadOf",
+                    "https://github.com/",
+                ],
+            );
+            let remote = unrewritten_remote(&repo, &transport).unwrap().unwrap();
+            assert_eq!(remote.url().unwrap(), "https://github.com:443/acme/w.git");
+            git(
+                &b,
+                &[
+                    "config",
+                    "url.ssh://git@github.com.insteadOf",
+                    "https://github.com",
+                ],
+            );
+            let repo = git2::Repository::open(&b).unwrap();
+            assert!(unrewritten_remote(&repo, &transport).unwrap().is_none());
         }
 
         #[test]
