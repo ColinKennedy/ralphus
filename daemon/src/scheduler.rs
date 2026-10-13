@@ -10317,6 +10317,7 @@ mod tests {
             summaries: vec![None; cells.len()],
             failed: HashSet::new(),
             task_finalized: HashSet::new(),
+            halted_tasks: HashSet::new(),
         });
 
         create_claimed_worktrees_in_background(

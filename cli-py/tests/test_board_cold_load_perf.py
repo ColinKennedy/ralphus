@@ -340,4 +340,3 @@ def test_projects_tab_cold_load_under_budget(browser: Browser) -> None:
             browser, base_url, "#/projects", "#projects .proj-table", "projects"
         )
     assert elapsed_ms < BUDGET_MS, _failure_message("projects", fixture_size, elapsed_ms, timing)
-
