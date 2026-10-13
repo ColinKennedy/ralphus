@@ -3209,7 +3209,7 @@ fn resolve_conflicts_with_agent(
                         break;
                     }
                 }
-                std::thread::sleep(std::time::Duration::from_millis(500));
+                sleep_unless_stopped(&stop_clone, std::time::Duration::from_millis(500));
             }
         });
 
@@ -3229,7 +3229,7 @@ fn resolve_conflicts_with_agent(
         let marker_branch_id = branch_id.to_string();
         let marker_watcher = std::thread::spawn(move || {
             while !marker_stop_clone.load(Ordering::Relaxed) {
-                std::thread::sleep(std::time::Duration::from_millis(2000));
+                sleep_unless_stopped(&marker_stop_clone, std::time::Duration::from_millis(2000));
                 if marker_stop_clone.load(Ordering::Relaxed) {
                     break;
                 }
@@ -5096,6 +5096,21 @@ pub(crate) fn kickoff_merge(
     // Claim and its Cartographer row share one acquisition -- the row records
     // the outcome of the claim that just happened under this same guard, so
     // splitting them only adds a second chance to queue behind a slow holder.
+    // A resume after Stop (or any non-`merging` start) may find the previous
+    // worker still unwinding: Stop does not wait for it. Registering a second
+    // token under the same key while it lives would let the old worker's
+    // cleanup unregister the new one and let both touch the same worktrees, so
+    // wait it out here -- off the Stop path -- and ask for a retry if it stays.
+    let worker_key = format!("guardian:{id}");
+    let status_is_merging = store
+        .lock()
+        .guardian_status_str(id)
+        .is_ok_and(|status| status == GuardianStatus::Merging.as_str());
+    if !status_is_merging && !wait_for_merge_worker_stop(&cancellations, &worker_key) {
+        return Err(StartMergeError::Preflight(
+            "the previous merge is still stopping; retry shortly".to_string(),
+        ));
+    }
     let claimed = {
         let guard = lock_timed(&store, id, "claim");
         let claimed = match guard.claim_guardian_merge(id) {
@@ -5176,6 +5191,22 @@ pub(crate) fn kickoff_merge(
     Ok(StartMergeOutcome::Merging)
 }
 
+/// Sleep for `total`, returning early once `stop` is set. The resolver's
+/// helper threads are joined as soon as the agent call returns (including on
+/// cancellation), so a single long sleep would hold the merge worker -- and
+/// the review's cancellation registration -- for the whole interval.
+fn sleep_unless_stopped(stop: &AtomicBool, total: std::time::Duration) {
+    const SLICE: std::time::Duration = std::time::Duration::from_millis(50);
+    let started = std::time::Instant::now();
+    while !stop.load(Ordering::Relaxed) {
+        let elapsed = started.elapsed();
+        if elapsed >= total {
+            return;
+        }
+        std::thread::sleep(SLICE.min(total - elapsed));
+    }
+}
+
 /// Bounded wait for a merge worker registered under `guardian:{id}` to
 /// actually exit, mirroring `server::wait_for_worker_stop`'s doc comment
 /// (same double-dispatch race, same 5s/50ms budget) for the guardian-merge
@@ -5183,11 +5214,22 @@ pub(crate) fn kickoff_merge(
 /// takes a `&Daemon`, which this module has no handle to (only the
 /// individual `store`/`cancellations`/`runner`/`sem` handles it needs).
 fn wait_for_merge_worker_stop(cancellations: &Cancellations, key: &str) -> bool {
-    const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
-    const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
+    wait_for_merge_worker_stop_within(cancellations, key, std::time::Duration::from_secs(5))
+}
+
+/// How long [`stop_guardian_merge`] waits for the worker before acknowledging
+/// anyway.
+const STOP_ACK_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+
+fn wait_for_merge_worker_stop_within(
+    cancellations: &Cancellations,
+    key: &str,
+    timeout: std::time::Duration,
+) -> bool {
+    const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(20);
     let started = std::time::Instant::now();
     while cancellations.is_active(key) {
-        if started.elapsed() >= TIMEOUT {
+        if started.elapsed() >= timeout {
             return false;
         }
         std::thread::sleep(POLL_INTERVAL);
@@ -5439,14 +5481,23 @@ pub fn reopen_guardian_merge(
 /// Halt an in-flight merge for `id` at its next checkpoint, leaving the review
 /// in the recoverable `merge_stopped` state (RAL-249) rather than cancelled.
 ///
-/// Distinct from [`restart_guardian_merge`]: it stops the live worker the same
-/// way (cancel token + bounded wait) but then leaves the review and branches
-/// alone instead of resetting to `collecting` and starting fresh — the next
+/// Distinct from [`restart_guardian_merge`]: it signals the live worker the
+/// same way (cancel token) but then leaves the review and branches alone
+/// instead of resetting to `collecting` and starting fresh — the next
 /// `start_merge` (the board's "Merge / rebase" on a `merge_stopped` review)
 /// resumes from the first review worktree, and the next merge's own setup phase
 /// handles whatever leftovers this halt left behind. The store write is atomic
-/// on `status='merging'`, so a merge that actually completed before the wait
-/// gave up is left in `in_review` rather than mis-labelled.
+/// on `status='merging'`, so a merge that actually completed first is left in
+/// `in_review` rather than mis-labelled.
+///
+/// The acknowledgement is bounded. Agent-session teardown runs on its own
+/// thread, and the wait for the worker to unwind is capped at
+/// [`STOP_ACK_WAIT`]: a worker mid-git-subprocess can take longer than that, and
+/// a Stop that answered `409 still stopping` left the review `merging` with
+/// nothing running. When the worker is still unwinding at the cap the review is
+/// moved to `merge_stopped` anyway -- `Store::set_guardian_status` keeps a late
+/// worker write from reviving it -- and [`kickoff_merge`] waits out the
+/// lingering worker before a resume claims the review.
 pub fn stop_guardian_merge(
     store: crate::store_lock::StoreHandle,
     cancellations: Cancellations,
@@ -5454,8 +5505,12 @@ pub fn stop_guardian_merge(
 ) -> Reply {
     let key = format!("guardian:{id}");
     cancellations.cancel(&key);
-    kill_guardian_agent_sessions(&store, id);
-    if !wait_for_merge_worker_stop(&cancellations, &key) {
+    {
+        let store = store.clone();
+        let id = id.to_string();
+        std::thread::spawn(move || kill_guardian_agent_sessions(&store, &id));
+    }
+    if !wait_for_merge_worker_stop_within(&cancellations, &key, STOP_ACK_WAIT) {
         let guard = store.lock();
         crate::cartographer::Note::new("guardian")
             .level(crate::logging::LogLevel::WARNING)
@@ -5463,16 +5518,9 @@ pub fn stop_guardian_merge(
             .guardian(id)
             .emit(
                 &guard,
-                format!("review {id} stop not yet confirmed: merge worker is still stopping"),
+                format!("review {id} stop acknowledged while the merge worker is still unwinding"),
                 serde_json::json!({"outcome": "merge_still_stopping"}),
             );
-        return reply(
-            409,
-            &error_body(
-                "merge_still_stopping",
-                "the review is still stopping; retry Stop shortly",
-            ),
-        );
     }
     let stopped = store.lock().stop_guardian_merge(id);
     match stopped {
@@ -10293,6 +10341,97 @@ pub fn rebase_on_manual_push(
     )
 }
 
+/// Whether merging `rev` into `base_sha` would change nothing: every change
+/// the review ref carries is already present in the base's tree.
+///
+/// A squash- or rebase-merged PR never makes its review ref an ancestor of the
+/// base -- the forge writes new commits -- so the ancestry test alone reads a
+/// fully merged stack as unlanded and the base-shift sweep rebuilds a review
+/// whose work is already upstream. A three-way merge of the two tips is the
+/// content-level equivalent: it yields exactly the base's tree when the ref
+/// adds nothing the base lacks, and tolerates unrelated commits landed since.
+/// Any failure (a conflict, an old git without `merge-tree --write-tree`, an
+/// unresolvable ref) answers `false` -- an unanswerable comparison must never
+/// read as "safe to skip".
+fn review_content_is_in_base(root: &Workspace, rev: &str, base_sha: &str) -> bool {
+    let Ok(merged) = root.git(&["merge-tree", "--write-tree", base_sha, rev]) else {
+        return false;
+    };
+    let Some(merged_tree) = merged
+        .lines()
+        .next()
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+    else {
+        return false;
+    };
+    let base_tree_spec = format!("{base_sha}^{{tree}}");
+    root.git(&["rev-parse", &base_tree_spec])
+        .is_ok_and(|base_tree| base_tree.trim() == merged_tree)
+}
+
+/// Whether `branch`'s review-branch tip is already in `base_sha`, by ancestry
+/// or by content ([`review_content_is_in_base`]). `false` for a branch with no
+/// review-branch tip yet.
+fn review_ref_landed(
+    root: &Workspace,
+    branch: &crate::guardian::BranchView,
+    base_sha: &str,
+) -> bool {
+    branch
+        .review_branch
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .is_some_and(|rev| {
+            root.git(&["merge-base", "--is-ancestor", rev, base_sha])
+                .is_ok()
+                || review_content_is_in_base(root, rev, base_sha)
+        })
+}
+
+/// Mark the landed prefix of each project's stack `merged` when only part of
+/// the stack has reached the base (e.g. the first four of six PRs squash-merged).
+///
+/// A review ref carries every branch beneath it, so the highest-position
+/// branch whose ref is already in the base landed together with everything
+/// below it; those branches are flagged `merged` and the rest keep their
+/// status. Only built branches count (a branch without a review-branch tip is
+/// never evidence), and an unanswerable comparison marks nothing.
+fn mark_landed_prefix_merged(
+    store: &crate::store_lock::StoreHandle,
+    id: &str,
+    guardian: &crate::guardian::GuardianView,
+    bases: &std::collections::BTreeMap<String, String>,
+) {
+    for (project, base_sha) in bases {
+        let root = Workspace::for_guardian(store, id, Path::new(project));
+        let mut branches: Vec<&crate::guardian::BranchView> = guardian
+            .branches
+            .iter()
+            .filter(|b| b.enabled)
+            .filter(|b| b.project.as_deref().unwrap_or(guardian.git_root.as_str()) == project)
+            .collect();
+        branches.sort_by_key(|b| b.position);
+        let Some(top) = branches
+            .iter()
+            .rposition(|b| review_ref_landed(&root, b, base_sha))
+        else {
+            continue;
+        };
+        for branch in &branches[..=top] {
+            if branch.merge_status == MergeStatus::Merged.as_str() {
+                continue;
+            }
+            let _ = store.lock().set_branch_status(
+                id,
+                &branch.id,
+                MergeStatus::Merged,
+                Some("base branch already contains this branch's commits"),
+            );
+        }
+    }
+}
+
 /// Whether every enabled branch under `project` already has its review-branch
 /// tip as an ancestor of `base_sha` (RAL-300) -- i.e. the base already
 /// contains that branch's work, so rebasing onto it would have nothing left
@@ -10315,14 +10454,7 @@ fn project_already_in_base(
         return false;
     }
     branches.iter().all(|b| {
-        let review_ref_is_in_base = b
-            .review_branch
-            .as_deref()
-            .filter(|s| !s.is_empty())
-            .is_some_and(|rev| {
-                root.git(&["merge-base", "--is-ancestor", rev, base_sha])
-                    .is_ok()
-            });
+        let review_ref_is_in_base = review_ref_landed(root, b, base_sha);
         // RAL-300 bug fix: this must check the worktree's HEAD against
         // `base_sha` (the guardian's actual base branch), not against the
         // worktree's own `@{upstream}` -- for a review/PR worktree that
@@ -10405,6 +10537,21 @@ fn approve_base_already_landed(store: &crate::store_lock::StoreHandle, id: &str)
         // `retire_dual_root_branch_for_guardian`'s own `store.lock()`
         // deadlocks against this still-held guard.
         let guardian = store.lock().get_guardian(id).ok();
+        if let Some(guardian) = &guardian {
+            // The review is merged, so its branches are too -- left at
+            // `done`/`conflict_resolved` they read as unfinished work.
+            for branch in guardian.branches.iter().filter(|b| b.enabled) {
+                if branch.merge_status == MergeStatus::Merged.as_str() {
+                    continue;
+                }
+                let _ = store.lock().set_branch_status(
+                    id,
+                    &branch.id,
+                    MergeStatus::Merged,
+                    Some("base branch already contains this branch's commits"),
+                );
+            }
+        }
         if let Some(guardian) = guardian {
             crate::pr::retire_dual_root_branch_for_guardian(
                 store,
@@ -10602,6 +10749,11 @@ pub fn rebuild_on_base_shift_with_debounce(
         ..
     } = settled;
 
+    // A partially landed stack still rebuilds below, but the branches that did
+    // land are marked `merged` first so they read correctly right away.
+    if !fully_landed {
+        mark_landed_prefix_merged(store, id, &guardian, &shift_targets);
+    }
     // RAL-300: a base shift alone doesn't mean this review has new upstream
     // work to rebase onto -- if the shift itself is every project absorbing
     // this review's own branches (already-ancestor for all of them), then the
