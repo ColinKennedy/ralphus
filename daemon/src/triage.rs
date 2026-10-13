@@ -1302,8 +1302,12 @@ pub fn advance_schedule(
 /// concurrent submission's own count-threshold check (both ultimately drain
 /// through `Store::drain_triage_pool`, which no-ops on an already-empty
 /// pool).
-pub fn run_schedule_tick(store: &crate::store_lock::StoreHandle) {
+///
+/// Returns the id of each review the tick created, so the caller can start
+/// any whose stack is already buildable.
+pub fn run_schedule_tick(store: &crate::store_lock::StoreHandle) -> Vec<String> {
     let now = now_ms();
+    let mut created = Vec::new();
     let schedules = {
         let guard = store.lock();
         match guard.list_triage_schedules(None) {
@@ -1366,6 +1370,7 @@ pub fn run_schedule_tick(store: &crate::store_lock::StoreHandle) {
                 },
             ) {
                 Ok(Some(gid)) => {
+                    created.push(gid.clone());
                     let guard = store.lock();
                     crate::cartographer::Note::new("scheduler")
                         .guardian(&gid)
@@ -1398,6 +1403,7 @@ pub fn run_schedule_tick(store: &crate::store_lock::StoreHandle) {
             }
         }
     }
+    created
 }
 
 // ── Submit-time registry validation ──────────────────────────────────────────
