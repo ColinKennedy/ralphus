@@ -814,7 +814,7 @@
           lines.push("[[task.cell.proof]]");
           if (it.label.trim()) lines.push(`id = ${tomlStr(it.label.trim())}`);
           lines.push(`command = ${tomlStr(it.value.trim())}`);
-          if (ntSimple.proofShell.trim()) lines.push(`shell = ${tomlStr(ntSimple.proofShell.trim())}`);
+          if (ntSimple.proofShell?.trim()) lines.push(`shell = ${tomlStr(ntSimple.proofShell.trim())}`);
           // A `command` with no `mode` is a remediating command, which the
           // validator requires a retry budget for (`core/src/validate.rs`
           // `check_command_mode`).
