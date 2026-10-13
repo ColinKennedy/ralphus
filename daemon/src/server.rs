@@ -12428,13 +12428,19 @@ fn resolver_task_and_cell_id(
 
 /// The session to show while a branch is `actioning`. Feedback actioning runs
 /// two agents back to back under the same status: the feedback resolver
-/// (`reviewer-{branch}`) and then the commit step (`reviewer-{branch}-commit`,
-/// see `guardian_merge::run_commit_step`). Pointing at the first one only
-/// leaves Live View on its finished transcript while the commit agent works.
+/// (`feedback-{branch}-{ms}`, its latest pass recorded by
+/// `guardian_merge::latest_feedback_cell`) and then the commit step
+/// (`reviewer-{branch}-commit`, see `guardian_merge::run_commit_step`).
+/// Pointing at the first one only leaves Live View on its finished transcript
+/// while the commit agent works.
 fn actioning_session(id: &str, branch_id: &str) -> (&'static str, String) {
     let squad = format!("guardian-{id}");
-    let feedback_cell = crate::guardian_merge::feedback_cell_id(branch_id);
-    let commit_cell = format!("{feedback_cell}-commit");
+    let commit_cell = format!(
+        "{}-commit",
+        crate::guardian_merge::feedback_cell_id(branch_id)
+    );
+    let feedback_cell = crate::guardian_merge::latest_feedback_cell(id, branch_id)
+        .unwrap_or_else(|| crate::guardian_merge::feedback_cell_id(branch_id));
     let task = crate::guardian_merge::FEEDBACK_TASK;
     let commit_live = crate::tmux::Tmux::resolve()
         .map(|t| t.has_session(&crate::tmux::session_name(&squad, task, &commit_cell)))
@@ -12474,7 +12480,8 @@ fn freshest_resolver_or_feedback(id: &str, branch_id: &str) -> (&'static str, St
     );
     let feedback = (
         crate::guardian_merge::FEEDBACK_TASK,
-        crate::guardian_merge::feedback_cell_id(branch_id),
+        crate::guardian_merge::latest_feedback_cell(id, branch_id)
+            .unwrap_or_else(|| crate::guardian_merge::feedback_cell_id(branch_id)),
     );
     let squad = format!("guardian-{id}");
     let resolver_mtime =
@@ -28052,6 +28059,30 @@ remediation_attempts=1
         let (task, cell_id) = resolver_task_and_cell_id(&d, &id, &branch_id).unwrap();
         assert_eq!(task, crate::guardian_merge::FEEDBACK_TASK);
         assert_eq!(cell_id, crate::guardian_merge::feedback_cell_id(&branch_id));
+    }
+
+    #[test]
+    fn resolver_task_and_cell_id_follows_the_running_feedback_pass() {
+        // Each feedback pass runs under its own timestamped cell; Live View
+        // must find that one, not a name no feedback agent runs under.
+        let d = daemon();
+        let id = d.lock().create_guardian("g", "main", "/r").unwrap();
+        d.lock().add_guardian_branch(&id, "a").unwrap();
+        let branch_id = d.lock().guardian_branches(&id).unwrap()[0].id.clone();
+        d.lock()
+            .set_branch_status(
+                &id,
+                &branch_id,
+                crate::guardian::MergeStatus::Actioning,
+                Some("applying reviewer feedback"),
+            )
+            .unwrap();
+        let running = format!("feedback-{branch_id}-1234");
+        crate::guardian_merge::record_latest_feedback_cell(&id, &branch_id, &running);
+
+        let (task, cell_id) = resolver_task_and_cell_id(&d, &id, &branch_id).unwrap();
+        assert_eq!(task, crate::guardian_merge::FEEDBACK_TASK);
+        assert_eq!(cell_id, running);
     }
 
     #[test]

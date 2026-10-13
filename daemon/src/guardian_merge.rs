@@ -248,6 +248,36 @@ pub(crate) fn feedback_cell_id(branch_id: &str) -> String {
     format!("reviewer-{branch_id}")
 }
 
+/// The cell id of the most recent feedback pass started for each
+/// `(guardian, branch)` in this process. Each pass runs under its own
+/// timestamped `feedback-{branch}-{ms}` cell, so the board's default Live
+/// View for an actioning branch cannot derive the name; it reads it from here.
+/// Process-local: a restart drops it, and the agent it named died with the
+/// process.
+static LATEST_FEEDBACK_CELLS: parking_lot::Mutex<
+    Option<std::collections::HashMap<(String, String), String>>,
+> = parking_lot::Mutex::new(None);
+
+pub(crate) fn record_latest_feedback_cell(guardian_id: &str, branch_id: &str, cell_id: &str) {
+    LATEST_FEEDBACK_CELLS
+        .lock()
+        .get_or_insert_with(Default::default)
+        .insert(
+            (guardian_id.to_string(), branch_id.to_string()),
+            cell_id.to_string(),
+        );
+}
+
+/// The cell id of the most recent feedback pass started for this branch in
+/// this process, if any.
+pub(crate) fn latest_feedback_cell(guardian_id: &str, branch_id: &str) -> Option<String> {
+    LATEST_FEEDBACK_CELLS.lock().as_ref().and_then(|cells| {
+        cells
+            .get(&(guardian_id.to_string(), branch_id.to_string()))
+            .cloned()
+    })
+}
+
 /// Fallback delay for [`run_agent_with_rate_limit_retry`] when a recognized
 /// rate limit carries no provider-suggested delay -- mirrors
 /// `scheduler::DEFAULT_RATE_LIMIT_RETRY`.
@@ -8277,6 +8307,7 @@ fn run_feedback_pass(
          Ralphus pushes it to the pull request for you."
     );
     let feedback_run_cell_id = format!("feedback-{branch_id}-{}", crate::store::now_ms());
+    record_latest_feedback_cell(id, branch_id, &feedback_run_cell_id);
     {
         let guard = store.lock();
         let _ = guard.cartographer_log(crate::cartographer::CartographerEntry {
