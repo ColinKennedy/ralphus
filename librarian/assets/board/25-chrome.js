@@ -1112,7 +1112,7 @@
        */
       function renderReviewResolverFilters() {
         syncReviewResolverDefault();
-        renderStatusDropdown("review-resolver-filters", reviewAgentDropdownConfig());
+        renderStatusDropdown("review-agent-filter", reviewAgentDropdownConfig());
       }
       /**
        * Toggles one resolver agent in/out of the visible-reviews filter.

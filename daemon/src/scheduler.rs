@@ -10249,6 +10249,130 @@ mod tests {
         assert_eq!(messages[0].task.as_deref(), Some("build"));
     }
 
+    /// RAL-612: a background worktree creation that fails for good fails only
+    /// the cells still `Pending` on that worktree (a cell already past
+    /// `Pending` reports its own failure from its worker), and the mailbox
+    /// message for the failed cell carries remediation.
+    #[test]
+    fn failing_background_worktree_claim_fails_only_pending_cells_with_remediation() {
+        let root = std::env::temp_dir().join(format!(
+            "ral612-bg-claim-fail-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let mut opts = git2::RepositoryInitOptions::new();
+        opts.initial_head("main");
+        let repo = git2::Repository::init_opts(&root, &opts).unwrap();
+        std::fs::write(root.join("base.txt"), "base\n").unwrap();
+        let mut index = repo.index().unwrap();
+        index.add_path(std::path::Path::new("base.txt")).unwrap();
+        index.write().unwrap();
+        let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+        let sig = git2::Signature::now("t", "t@t").unwrap();
+        repo.commit(Some("HEAD"), &sig, &sig, "base", &tree, &[])
+            .unwrap();
+
+        // A creation marker whose upstream does not exist: the claim is
+        // recognised as pending, but creating it cannot succeed.
+        let ralphus_dir = crate::short_paths::ralphus_root(&root);
+        let marker_dir = ralphus_dir.join("creating");
+        std::fs::create_dir_all(&marker_dir).unwrap();
+        std::fs::write(
+            marker_dir.join("bgfail"),
+            "feat-bgfail\nupstream=no-such-upstream-ref\n",
+        )
+        .unwrap();
+        let wt = ralphus_dir.join("w").join("bgfail");
+        assert!(crate::worktrees::pending_worktree_at(&wt).is_some());
+
+        let toml = "[[task]]\nname=\"t\"\n[[task.cell]]\nid=\"a\"\ncwd=\".\"\ncommand=\"x\"\n[[task.cell]]\nid=\"b\"\ncwd=\".\"\ncommand=\"y\"\n";
+        let (store, id) = store_with(toml);
+        let cells = store.lock().cells_of(&id).unwrap();
+        let a = cells.iter().position(|c| c.cell_id == "a").unwrap();
+        let b = cells.iter().position(|c| c.cell_id == "b").unwrap();
+        // Both cells share the one claimed worktree; `b` has already moved on.
+        let claims = WorktreeClaims {
+            by_cell: [a, b]
+                .into_iter()
+                .map(|i| {
+                    (
+                        i,
+                        WorktreeClaim {
+                            wt: wt.clone(),
+                            project: None,
+                        },
+                    )
+                })
+                .collect(),
+        };
+        let mut status = vec![CellState::Pending; cells.len()];
+        status[b] = CellState::Done;
+        let progress = Mutex::new(Progress {
+            status,
+            summaries: vec![None; cells.len()],
+            failed: HashSet::new(),
+            task_finalized: HashSet::new(),
+            halted_tasks: HashSet::new(),
+        });
+
+        create_claimed_worktrees_in_background(
+            &store,
+            &id,
+            &CancelToken::new(),
+            &cells,
+            &progress,
+            &claims,
+        );
+
+        {
+            let prog = progress.lock().unwrap();
+            assert!(matches!(prog.status[a], CellState::Failed));
+            assert!(
+                matches!(prog.status[b], CellState::Done),
+                "a non-Pending cell is left alone"
+            );
+            assert!(prog.failed.contains(&cells[a].task_idx));
+        }
+        let guard = store.lock();
+        let squad = guard.get_squad(&id).unwrap();
+        let cell = |cid: &str| squad.tasks[0].cells.iter().find(|c| c.id == cid).unwrap();
+        assert_eq!(cell("a").state, "failed");
+        assert!(
+            cell("a")
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("could not create the cell's worktree")),
+            "{:?}",
+            cell("a").error
+        );
+        assert_ne!(
+            cell("b").state,
+            "failed",
+            "b was never failed by the creator"
+        );
+
+        let client_id = guard.register_mailbox_client().unwrap();
+        let messages = guard
+            .mailbox_messages_for_client(&client_id, true, None)
+            .unwrap();
+        assert_eq!(messages.len(), 1, "one message, for cell a only");
+        assert_eq!(messages[0].cell_id.as_deref(), Some("a"));
+        assert!(
+            messages[0]
+                .message
+                .contains("Suggested next step: run `ralphus cell restart"),
+            "message must carry remediation (RAL-502): {}",
+            messages[0].message
+        );
+        drop(guard);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     // `a`'s own body succeeds, but it carries a cell-scope proof that
     // always fails; `b` depends on `a`.
     const CELL_WITH_FAILING_PROOF_HAS_DEPENDENT: &str = "[[task]]\nname=\"t\"\n[[task.cell]]\nid=\"a\"\ncwd=\".\"\ncommand=\"cmd-a\"\n[[task.cell.proof]]\ncommand=\"exit 1\"\n[[task.cell]]\nid=\"b\"\ncwd=\".\"\ncommand=\"cmd-b\"\ndepends_on=[\"a\"]\n";

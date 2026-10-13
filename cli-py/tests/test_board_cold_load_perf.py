@@ -110,6 +110,11 @@ def _empty_board() -> fixtures.Json:
 
 #: Squads tab (default, `#/`) -- the rich `/api/tasks` `SquadView` shape at 250x4 scale.
 SQUADS_ROUTES: fixtures.Routes = {
+    "/api/whoami": {"name": "test-user", "is_admin": False},
+    "/api/hidden": [],
+    "/api/watches": [],
+    "/api/config/live-view": {"enabled": False},
+    "/api/projects": {"projects": []},
     "/api/tasks": {"daemon": _daemon_status(), "squads": list(_HEAVY_SQUADS)},
     "/api/guardians": [],
     "/api/guardian-index": [],
@@ -121,6 +126,10 @@ SQUADS_ROUTES: fixtures.Routes = {
 #: derived from the SAME 250x4 fixture as SQUADS_ROUTES (see
 #: `fixtures.task_index_squads_from`'s docstring for why the wire shapes differ).
 TASKS_ROUTES: fixtures.Routes = {
+    "/api/whoami": {"name": "test-user", "is_admin": False},
+    "/api/hidden": [],
+    "/api/watches": [],
+    "/api/config/live-view": {"enabled": False},
     "/api/tasks": _empty_board(),
     "/api/task-index": {"daemon": _daemon_status(), "squads": list(_TASK_INDEX_SQUADS)},
     "/api/pull-requests/index": [],
@@ -134,6 +143,9 @@ TASKS_ROUTES: fixtures.Routes = {
 #: Retirements tab (`#/retirement`) -- 650 rows.
 WORKTREE_RETIREMENT_ROUTES: fixtures.Routes = {
     "/api/whoami": {"name": "test-user", "is_admin": True},
+    "/api/hidden": [],
+    "/api/watches": [],
+    "/api/config/live-view": {"enabled": False},
     "/api/forge/kinds": ["github", "gitlab"],
     "/api/tasks": _empty_board(),
     "/api/task-index": {"daemon": _daemon_status(), "squads": []},
@@ -150,6 +162,10 @@ WORKTREE_RETIREMENT_ROUTES: fixtures.Routes = {
 #: the same way it would against a real daemon, instead of every row failing
 #: validation just because this stub never heard of `/validate`.
 PROJECTS_ROUTES: fixtures.Routes = {
+    "/api/whoami": {"name": "test-user", "is_admin": True},
+    "/api/hidden": [],
+    "/api/watches": [],
+    "/api/config/live-view": {"enabled": False},
     "/api/tasks": _empty_board(),
     "/api/guardians": [],
     "/api/guardian-index": [],
