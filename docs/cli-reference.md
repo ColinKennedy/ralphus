@@ -857,7 +857,6 @@ use; see `READ_ONLY_NOTE`.
         - delete selector [uri] --yes  {Delete a review and its worktrees.}
         - dismiss-reenable selector [uri]  {Dismiss the 're-enable' notification for a branch.}
         - (read-only-safe) env selector [uri] --scope [build|tests|manual-checks|worktree]  {List a review surface's resolved environment variables, read-only (RAL-324): the auto-build step, the check gates, manual checks, or one branch's review worktree.}
-        - extract-branch selector [uri]  {Move a branch into a new review of its own, then rebuild both.}
         - feedback selector [uri] text [str] --author [name]  {Post feedback on one branch, triggering a resolver re-attempt. --author attributes the feedback to a different registered user than the one submitting it (RAL-379); defaults to the submitter when omitted.}
         - followup  {Follow-up work offered when a review merges with deferred prophecies.}
             - accept selector [uri]  {Accept a follow-up offer: draft a follow-up squad from the deferred items. The squad starts at once unless auto-start is off for the review (`review settings --followup-auto-start`, else `[followup] auto_start`).}
