@@ -583,6 +583,8 @@ ${state.restartNote}` : state.text;
       const RALPHUS_TAPE_DONE_PREFIX = "RALPHUS_TMUX_DONE:";
       /** Cartographer event marker, trailing space included. Matches runner/src/cartographer.rs::EVENT_MARKER. */
       const RALPHUS_TAPE_EVENT_PREFIX = "RALPHUS_EVENT: ";
+      /** Structured tool-record marker, trailing space included. Matches runner/src/tool_record.rs::TOOL_MARKER. Only the Agent Log tab reads these; the terminal tape drops them. */
+      const RALPHUS_TAPE_TOOL_PREFIX = "RALPHUS_TOOL: ";
       /** Model thinking/reasoning marker, tagging one line of reasoning (RAL-434); matches runner/src/pi_backend.rs::THINKING_MARKER and daemon/src/runner.rs::THINKING_MARKER minus their trailing space. The space is deliberately not matched on: tmux trims each captured row's trailing whitespace, so a line of *empty* reasoning arrives as a bare "RALPHUS_THINKING:" that a space-carrying prefix misses -- which rendered the raw marker into the pane. unprefixThinkingLine drops the space when the row kept one. */
       const RALPHUS_TAPE_THINKING_TAG = "RALPHUS_THINKING:";
       /** Trailing byte tmux writes on a row it had to wrap at the pane width (`-x 500`, daemon/src/tmux.rs). The overflow continues on the next captured row, which carries no marker of its own -- see tapeLineWrapped. */
@@ -753,6 +755,7 @@ ${state.restartNote}` : state.text;
       function classifyTapeLine(line, showDebug, showThinking) {
         const clean = line.replace(/\r$/, "");
         if (clean.startsWith(RALPHUS_TAPE_DONE_PREFIX)) return null;
+        if (clean.startsWith(RALPHUS_TAPE_TOOL_PREFIX)) return null;
         if (clean.startsWith(RALPHUS_TAPE_EVENT_PREFIX)) {
           if (!showDebug) return null;
           return formatInlineTapeEvent(clean.slice(RALPHUS_TAPE_EVENT_PREFIX.length));
@@ -818,6 +821,8 @@ ${state.restartNote}` : state.text;
         // continuation output as part of that line.
         /** @type {boolean} */
         let wrapTypeExcluded = false;
+        /** @type {boolean} */
+        let wrapIsTool = false;
         for (const raw of lines) {
           const clean = renderPaneLine(raw).replace(/\r$/, "");
           /** @type {boolean} */
@@ -836,8 +841,11 @@ ${state.restartNote}` : state.text;
             ? wrapTypeExcluded
             : typeFilter !== undefined && liveViewTypeIsExcluded(clean, typeFilter);
           wrapTypeExcluded = typeExcluded;
+          /** @type {boolean} */
+          const isTool = inWrap ? wrapIsTool : clean.startsWith(RALPHUS_TAPE_TOOL_PREFIX);
+          wrapIsTool = isTool;
           inWrap = tapeLineWrapped(raw);
-          if (typeExcluded) continue;
+          if (typeExcluded || isTool) continue;
           if (rendered === null) continue;
           if (rendered === THINKING_FOLDED) {
             if (folding) continue;

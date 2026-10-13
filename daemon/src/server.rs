@@ -10901,7 +10901,9 @@ fn strip_ralphus_pane_markers(text: &str) -> String {
     text.lines()
         .filter(|line| {
             let trimmed = line.trim_start();
-            !(trimmed.starts_with("RALPHUS_EVENT: ") || trimmed.starts_with("RALPHUS_TMUX_DONE"))
+            !(trimmed.starts_with("RALPHUS_EVENT: ")
+                || trimmed.starts_with("RALPHUS_TOOL: ")
+                || trimmed.starts_with("RALPHUS_TMUX_DONE"))
         })
         .map(unprefix_thinking_line)
         .collect::<Vec<_>>()
@@ -22779,6 +22781,7 @@ mod tests {
             store
                 .set_cell_state("squad-000000000001", 0, 0, NodeState::Running)
                 .unwrap();
+            // allow-lock-io: 20ms bounded sleep to measure elapsed time for test assertion
             std::thread::sleep(Duration::from_millis(20));
             store
                 .set_cell_state("squad-000000000001", 0, 0, NodeState::Done)
@@ -23584,6 +23587,7 @@ mod tests {
         std::thread::scope(|scope| {
             let holder = scope.spawn(|| {
                 let _guard = d.lock();
+                // allow-lock-io: 3s intentional lock-hold for race condition test assertion
                 std::thread::sleep(std::time::Duration::from_secs(3));
             });
             // Give the holder thread a moment to actually acquire the lock
@@ -32047,6 +32051,18 @@ after"
     }
 
     #[test]
+    fn strip_ralphus_pane_markers_drops_structured_tool_records() {
+        let text = "[tool.Bash.ls] Bash(command=\"ls\")
+RALPHUS_TOOL: {\"id\":\"t1\"}
+next";
+        assert_eq!(
+            strip_ralphus_pane_markers(text),
+            "[tool.Bash.ls] Bash(command=\"ls\")
+next"
+        );
+    }
+
+    #[test]
     fn strip_ralphus_pane_markers_matches_only_a_line_start_not_a_mid_line_occurrence() {
         // An agent quoting/grepping these exact strings in its own output
         // must not have that output misclassified as a ralphus marker.
@@ -34598,7 +34614,12 @@ remediation_attempts=1
 
         // The same key submit-time pooling would use for a cell whose
         // worktree root is this project's path.
-        let expected_key = crate::triage::pool_key_for_path(&d.lock(), &dir);
+        // Scoped so the guard drops before `route` below re-locks the store;
+        // `StoreMutex` is not reentrant and a held guard deadlocks the test.
+        let expected_key = {
+            let store = d.lock();
+            crate::triage::pool_key_for_path(&store, &dir)
+        };
         assert_eq!(expected_key, "proj");
 
         // Set the threshold via the raw path, exactly what the CLI's

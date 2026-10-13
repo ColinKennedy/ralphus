@@ -622,6 +622,16 @@ fn drive_thread_events(
                         let command = item["command"].as_str().unwrap_or("");
                         let status = item["status"].as_str().unwrap_or("");
                         eprintln!("{}", format_tool_event(command, status));
+                        let failed = status == "failed"
+                            || item["exit_code"].as_i64().is_some_and(|code| code != 0);
+                        crate::tool_record::emit(&crate::tool_record::complete_record(
+                            "codex",
+                            item["id"].as_str().unwrap_or(""),
+                            &tool_event_tag(command),
+                            command,
+                            item["aggregated_output"].as_str().unwrap_or(""),
+                            failed,
+                        ));
                     }
                     Some("reasoning") => {
                         // RAL-598: Codex's reasoning item carries the
@@ -827,11 +837,15 @@ fn record_agent_message(
     }
 }
 
-fn format_tool_event(command: &str, status: &str) -> String {
-    let tag = match exec_command_label(command) {
+fn tool_event_tag(command: &str) -> String {
+    match exec_command_label(command) {
         Some(name) => format!("tool.exec.{name}"),
         None => "tool.exec".to_string(),
-    };
+    }
+}
+
+fn format_tool_event(command: &str, status: &str) -> String {
+    let tag = tool_event_tag(command);
     format!("[{tag}] exec({command:?}) status={status}")
 }
 
