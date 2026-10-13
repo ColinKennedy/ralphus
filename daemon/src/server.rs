@@ -8305,7 +8305,11 @@ fn squad_timeline(daemon: &Daemon, id: &str) -> Reply {
         crate::timeline::gather_squad_timeline(&store, id)
     };
     match gathered {
-        Ok(g) => json(200, &crate::timeline::finish_squad_timeline(g)),
+        Ok(g) => {
+            let mut timeline = crate::timeline::finish_squad_timeline(g);
+            crate::timeline::finalize_timeline_file(&mut timeline);
+            json(200, &timeline)
+        }
         Err(e) => store_error(&e),
     }
 }
@@ -13070,19 +13074,21 @@ fn cell_system_prompt(daemon: &Daemon, id: &str, ti: &str, si: &str) -> Reply {
             vec![],
         );
     };
-    match daemon.lock().get_cell_id(id, task_idx, cell_idx) {
+    let guard = daemon.lock();
+    match guard.get_cell_id(id, task_idx, cell_idx) {
         Ok(_) => {}
         Err(e) => return store_error(&e),
     }
-    let prompt = match daemon
-        .lock()
-        .get_cell_effective_system_prompt(id, task_idx, cell_idx)
-    {
+    let prompt = match guard.get_cell_effective_system_prompt(id, task_idx, cell_idx) {
         Ok(v) => v,
         Err(e) => return store_error(&e),
     };
+    let restart_note = guard
+        .get_cell_dispatched_restart_note(id, task_idx, cell_idx)
+        .unwrap_or(None);
     system_prompt_reply(
         prompt,
+        restart_note,
         "cell has no system prompt (a command cell, or one never dispatched)",
     )
 }
@@ -13118,7 +13124,8 @@ fn proof_system_prompt(
     if let Err(e) = daemon.lock().get_task_name(id, task_idx_n) {
         return store_error(&e);
     }
-    let prompt = match daemon.lock().get_proof_effective_system_prompt(
+    let guard = daemon.lock();
+    let prompt = match guard.get_proof_effective_system_prompt(
         id,
         task_idx_n,
         scope,
@@ -13128,8 +13135,12 @@ fn proof_system_prompt(
         Ok(v) => v,
         Err(e) => return store_error(&e),
     };
+    let restart_note = guard
+        .get_proof_dispatched_restart_note(id, task_idx_n, scope, cell_idx_n, proof_idx_n)
+        .unwrap_or(None);
     system_prompt_reply(
         prompt,
+        restart_note,
         "proof step has no system prompt (a command step, or one never dispatched)",
     )
 }
@@ -13145,10 +13156,11 @@ fn proof_system_prompt(
 /// is derived, not stored -- the derivation is exact for whatever phase the
 /// branch is in right now. Admin-gated at the route.
 fn guardian_branch_system_prompt(daemon: &Daemon, id: &str, branch_id: &str) -> Reply {
-    if let Err(e) = daemon.lock().get_guardian(id) {
+    let guard = daemon.lock();
+    if let Err(e) = guard.get_guardian(id) {
         return store_error(&e);
     }
-    let merge_status = match daemon.lock().get_branch_merge_status(id, branch_id) {
+    let merge_status = match guard.get_branch_merge_status(id, branch_id) {
         Ok(v) => v,
         Err(e) => return store_error(&e),
     };
@@ -13223,11 +13235,19 @@ fn guardian_manual_checks_system_prompt(daemon: &Daemon, id: &str) -> Reply {
 /// One `.../system-prompt` reply body's common shape (RAL-428): the loaded
 /// prompt text, or the `{"available": false, "reason": ...}` form for a step
 /// that has none.
-fn system_prompt_reply(prompt: Option<String>, reason: &str) -> Reply {
+///
+/// `restart_note` (RAL-639) is the restart note the latest attempt was
+/// dispatched with, if any; it rides along so the Prompt tab can show it as
+/// part of the prompt the agent received.
+fn system_prompt_reply(
+    prompt: Option<String>,
+    restart_note: Option<String>,
+    reason: &str,
+) -> Reply {
     match prompt {
         Some(p) => json(
             200,
-            &serde_json::json!({"available": true, "system_prompt": p}),
+            &serde_json::json!({"available": true, "system_prompt": p, "restart_note": restart_note}),
         ),
         None => json(
             200,
@@ -32305,6 +32325,77 @@ after"
         let v: serde_json::Value = serde_json::from_str(&r.body).unwrap();
         assert_eq!(v["available"], true, "{v}");
         assert_eq!(v["system_prompt"], "custom cell prompt");
+    }
+
+    #[test]
+    fn cell_system_prompt_reply_carries_the_dispatched_restart_note() {
+        let _guard = crate::timeline::TIMELINE_FILE_TEST_LOCK.lock().unwrap();
+        let d = daemon();
+        route(&d, "POST", "/api/squads", &submit_body(GOOD));
+        let reply = |d: &Daemon| {
+            let r = route(
+                d,
+                "GET",
+                "/api/squads/squad-000000000001/cells/0/0/system-prompt",
+                "",
+            );
+            serde_json::from_str::<serde_json::Value>(&r.body).unwrap()
+        };
+        {
+            let g = d.lock();
+            g.set_cell_effective_system_prompt("squad-000000000001", 0, 0, Some("sys"))
+                .unwrap();
+            g.set_cell_dispatched_restart_note(
+                "squad-000000000001",
+                0,
+                0,
+                Some("don't run any tests"),
+            )
+            .unwrap();
+        }
+        assert_eq!(reply(&d)["restart_note"], "don't run any tests");
+        d.lock()
+            .set_cell_dispatched_restart_note("squad-000000000001", 0, 0, None)
+            .unwrap();
+        assert!(reply(&d)["restart_note"].is_null());
+    }
+
+    #[test]
+    fn proof_system_prompt_reply_carries_the_dispatched_restart_note() {
+        let _guard = crate::timeline::TIMELINE_FILE_TEST_LOCK.lock().unwrap();
+        let d = daemon();
+        let toml = "[[task]]
+name=\"t\"
+[[task.cell]]
+cwd=\"/r\"
+prompt=\"p\"
+[[task.cell.proof]]
+command=\"c\"
+remediation_attempts=1
+";
+        route(&d, "POST", "/api/squads", &submit_body(toml));
+        {
+            let g = d.lock();
+            g.set_proof_effective_system_prompt("squad-000000000001", 0, "cell", 0, 0, Some("sys"))
+                .unwrap();
+            g.set_proof_dispatched_restart_note(
+                "squad-000000000001",
+                0,
+                "cell",
+                0,
+                0,
+                Some("look at the fixture"),
+            )
+            .unwrap();
+        }
+        let r = route(
+            &d,
+            "GET",
+            "/api/squads/squad-000000000001/proofs/0/cell/0/0/system-prompt",
+            "",
+        );
+        let v: serde_json::Value = serde_json::from_str(&r.body).unwrap();
+        assert_eq!(v["restart_note"], "look at the fixture", "{v}");
     }
 
     #[test]
