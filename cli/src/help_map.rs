@@ -425,6 +425,36 @@ const REVIEW_FOLLOWUP_CHILDREN: &[HelpNode] = &[
     ),
 ];
 
+const REVIEW_LIVE_CHILDREN: &[HelpNode] = &[
+    node(
+        "list",
+        &["selector [str]"],
+        &[],
+        "List the review's live actions (agent-run live tests from its cells' handoffs) and their runs.",
+        false,
+        true, // ("review", "live", "list")
+        &[],
+    ),
+    node(
+        "run",
+        &["selector [str]"],
+        &["--index [integer]"],
+        "Queue a run of one live action (--index) or all of them; generates the review's live actions from its finished cells' handoffs first if it has none.",
+        false,
+        false,
+        &[],
+    ),
+    node(
+        "cancel",
+        &["selector [str]", "run_id [str]"],
+        &[],
+        "Cancel a queued or running live run.",
+        false,
+        false,
+        &[],
+    ),
+];
+
 const REVIEW_ACTION_CHILDREN: &[HelpNode] = &[
     node(
         "list",
@@ -455,6 +485,15 @@ const REVIEW_CHILDREN: &[HelpNode] = &[
         false,
         false,
         REVIEW_ACTION_CHILDREN,
+    ),
+    node(
+        "live",
+        &[],
+        &[],
+        "Live actions: agent-run live tests of the review's tip, generated from its cells' RALPHUS_LIVE_ACTION handoffs.",
+        false,
+        false,
+        REVIEW_LIVE_CHILDREN,
     ),
     node(
         "add-branch",

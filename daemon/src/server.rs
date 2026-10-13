@@ -2217,6 +2217,33 @@ fn route_for_user(
         ("POST", ["api", "guardians", id, "manual-checks", "open-terminal"]) => {
             open_guardian_manual_checks_terminal(daemon, id, query)
         }
+        ("GET", ["api", "guardians", id, "live-actions"]) => guardian_live_actions_view(daemon, id),
+        ("POST", ["api", "guardians", id, "live-actions", "run"]) => {
+            guardian_run_live_actions(daemon, id, body)
+        }
+        ("POST", ["api", "guardians", id, "live-runs", run_id, "cancel"]) => {
+            guardian_cancel_live_run(daemon, id, run_id)
+        }
+        // ralphus[ignore-endpoint-cli]: board Live View of one live run's agent session
+        ("GET", ["api", "guardians", id, "live-runs", run_id, "pane"]) => {
+            guardian_live_run_pane(daemon, id, run_id, query)
+        }
+        // ralphus[ignore-endpoint-cli]: board Live View scrollback of one live run's agent session
+        (
+            "GET",
+            [
+                "api",
+                "guardians",
+                id,
+                "live-runs",
+                run_id,
+                "pane-transcript",
+            ],
+        ) => guardian_live_run_pane_transcript(daemon, id, run_id, query),
+        // ralphus[ignore-endpoint-cli]: board transcript of one live run's agent session
+        ("GET", ["api", "guardians", id, "live-runs", run_id, "terminal-log"]) => {
+            guardian_live_run_terminal_log(daemon, id, run_id)
+        }
         // ralphus[ignore-endpoint-cli]: board manual-checks pane view
         ("GET", ["api", "guardians", id, "manual-checks", "pane"]) => {
             guardian_manual_checks_pane(daemon, id, query)
@@ -13174,6 +13201,153 @@ fn open_guardian_manual_checks_terminal(daemon: &Daemon, id: &str, query: &str) 
     )
 }
 
+/// `GET /api/guardians/{id}/live-actions`: the review's live actions, its
+/// live runs (newest first), and whether the opt-in is on.
+fn guardian_live_actions_view(daemon: &Daemon, id: &str) -> Reply {
+    #[derive(Serialize)]
+    struct LiveActionsView {
+        enabled: bool,
+        own_setting: Option<bool>,
+        auto_ran_at_ms: Option<i64>,
+        checkout: Option<String>,
+        preparation_failure: Option<String>,
+        actions: Vec<crate::live_actions::LiveAction>,
+        runs: Vec<crate::live_runs::LiveRunRow>,
+    }
+    let guardian = match daemon.lock().get_guardian(id) {
+        Ok(g) => g,
+        Err(e) => return store_error(&e),
+    };
+    let loaded = daemon.with_read_snapshot(|conn| {
+        Ok((
+            crate::live_actions::guardian_live_actions_conn(conn, id)?,
+            crate::live_runs::guardian_live_runs_conn(conn, id)?,
+            crate::live_runs::live_checkout_conn(conn, id)?,
+        ))
+    });
+    match loaded {
+        Ok((actions, runs, checkout)) => json(
+            200,
+            &LiveActionsView {
+                enabled: guardian.effective_live_actions,
+                own_setting: guardian.live_actions,
+                auto_ran_at_ms: guardian.live_actions_auto_ran_at_ms,
+                checkout: checkout.path,
+                preparation_failure: checkout.preparation_failure,
+                actions,
+                runs,
+            },
+        ),
+        Err(e) => store_error(&e),
+    }
+}
+
+/// `POST /api/guardians/{id}/live-actions/run`, body `{"index": N}` for one
+/// live action or `{}` for all: queue manual live runs. The review's live
+/// actions are generated from its cells' handoffs first if it has none yet,
+/// so this may take as long as one agent call; the runs themselves execute in
+/// the background, one at a time.
+fn guardian_run_live_actions(daemon: &Daemon, id: &str, body: &str) -> Reply {
+    #[derive(Deserialize, Default)]
+    struct Body {
+        index: Option<i64>,
+    }
+    let req: Body = if body.trim().is_empty() {
+        Body::default()
+    } else {
+        match serde_json::from_str(body) {
+            Ok(req) => req,
+            Err(_) => return error(400, "bad_request", "body must be {index?}", vec![]),
+        }
+    };
+    if let Err(e) = daemon.lock().get_guardian(id) {
+        return store_error(&e);
+    }
+    match crate::live_runs::queue_manual_runs(
+        &daemon.store_handle(),
+        &crate::live_runs::default_runner_factory(),
+        id,
+        req.index,
+    ) {
+        Ok(run_ids) => json(200, &serde_json::json!({"queued": run_ids})),
+        Err(message) => error(409, "no_live_actions", &message, vec![]),
+    }
+}
+
+/// `POST /api/guardians/{id}/live-runs/{run_id}/cancel`: drop a queued run, or
+/// stop a running one.
+fn guardian_cancel_live_run(daemon: &Daemon, id: &str, run_id: &str) -> Reply {
+    let belongs = daemon
+        .with_read_snapshot(|conn| crate::live_runs::live_run_conn(conn, run_id))
+        .is_ok_and(|run| run.guardian_id == id);
+    if !belongs {
+        return error(404, "not_found", "no such live run", vec![]);
+    }
+    match crate::live_runs::cancel_run(&daemon.store_handle(), run_id) {
+        Ok(()) => json(200, &serde_json::json!({"ok": true})),
+        Err(message) => error(409, "not_running", &message, vec![]),
+    }
+}
+
+/// The tmux cell a live run's agent ran under, when the run belongs to the
+/// review and has started.
+fn live_run_cell(daemon: &Daemon, id: &str, run_id: &str) -> std::result::Result<String, Reply> {
+    match daemon.with_read_snapshot(|conn| crate::live_runs::live_run_conn(conn, run_id)) {
+        Ok(run) if run.guardian_id == id => run
+            .cell_id
+            .ok_or_else(|| error(409, "not_started", "this live run has not started", vec![])),
+        Ok(_) | Err(crate::store::StoreError::NotFound) => {
+            Err(error(404, "not_found", "no such live run", vec![]))
+        }
+        Err(e) => Err(store_error(&e)),
+    }
+}
+
+/// Live pane content of one live run's agent session (board Live View).
+fn guardian_live_run_pane(daemon: &Daemon, id: &str, run_id: &str, query: &str) -> Reply {
+    match live_run_cell(daemon, id, run_id) {
+        Ok(cell) => capture_pane_reply(
+            daemon,
+            &crate::live_actions::live_run_squad_id(id),
+            crate::live_actions::LIVE_ACTION_TASK,
+            &cell,
+            query,
+        ),
+        Err(reply) => reply,
+    }
+}
+
+/// Raw transcript range of one live run's agent session (Live View
+/// scrollback), see [`pane_transcript_range_reply`].
+fn guardian_live_run_pane_transcript(
+    daemon: &Daemon,
+    id: &str,
+    run_id: &str,
+    query: &str,
+) -> Reply {
+    match live_run_cell(daemon, id, run_id) {
+        Ok(cell) => pane_transcript_range_reply(
+            &crate::live_actions::live_run_squad_id(id),
+            crate::live_actions::LIVE_ACTION_TASK,
+            &cell,
+            query,
+        ),
+        Err(reply) => reply,
+    }
+}
+
+/// The persisted terminal-log attempts of one finished live run.
+fn guardian_live_run_terminal_log(daemon: &Daemon, id: &str, run_id: &str) -> Reply {
+    match live_run_cell(daemon, id, run_id) {
+        Ok(cell) => terminal_log_attempts_reply(
+            &crate::live_actions::live_run_squad_id(id),
+            crate::live_actions::LIVE_ACTION_TASK,
+            &cell,
+        ),
+        Err(reply) => reply,
+    }
+}
+
 /// The live pane content of a review's manual-checks generation tmux session,
 /// for the auto-refreshing "read-only terminal" peek view (RAL-88 follow-up).
 fn guardian_manual_checks_pane(daemon: &Daemon, id: &str, query: &str) -> Reply {
@@ -16018,9 +16192,22 @@ fn guardian_settings(daemon: &Daemon, id: &str, body: &str) -> Reply {
     if req.skip_manual_checks.is_some() {
         crate::guardian_merge::maybe_generate_manual_checks_for_settled(&daemon.store_handle(), id);
     }
+    start_live_actions_if_turned_on(daemon, id, req.live_actions);
     match daemon.lock().get_guardian(id) {
         Ok(g) => json(200, &g),
         Err(e) => store_error(&e),
+    }
+}
+
+/// Turning live actions on for a review that is already prepared starts its
+/// one automatic run now, rather than at the next maintenance pass.
+fn start_live_actions_if_turned_on(daemon: &Daemon, id: &str, live_actions: Option<bool>) {
+    if live_actions == Some(true) {
+        let _ = crate::live_runs::maybe_start_automatic_run(
+            &daemon.store_handle(),
+            &crate::live_runs::default_runner_factory(),
+            id,
+        );
     }
 }
 
@@ -16490,6 +16677,7 @@ fn guardian_details(daemon: &Daemon, id: &str, body: &str) -> Reply {
     if req.skip_manual_checks.is_some() {
         crate::guardian_merge::maybe_generate_manual_checks_for_settled(&daemon.store_handle(), id);
     }
+    start_live_actions_if_turned_on(daemon, id, req.live_actions);
     match daemon.lock().get_guardian(id) {
         Ok(g) => json(
             200,
@@ -19492,6 +19680,21 @@ fn guardian_run_action_hint(daemon: &Daemon, id: &str, body: &str) -> Reply {
         &g.input_values,
     ) {
         return reply;
+    }
+
+    // A `prompt` action is run by an agent, as a live run: queued, one at a
+    // time per review, followed in the board's Live View.
+    if hint.command.is_none() && hint.prompt.is_some() {
+        return match crate::live_runs::queue_action_prompt_run(
+            &daemon.store_handle(),
+            &crate::live_runs::default_runner_factory(),
+            id,
+            req.index,
+            "manual",
+        ) {
+            Ok(run_id) => json(200, &serde_json::json!({"ok": true, "live_run": run_id})),
+            Err(message) => error(409, "action_not_runnable", &message, vec![]),
+        };
     }
 
     // Same reasoning as guardian_run_manual_commands, including the RAL-203

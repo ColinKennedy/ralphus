@@ -2674,6 +2674,33 @@ impl Store {
                 created_at_ms INTEGER NOT NULL,
                 PRIMARY KEY (guardian_id, idx)
             );
+            -- Every execution of a live action (or of an agent-run user
+            -- action), queued and run one at a time per review
+            -- (`crate::live_runs`). `commits` is a JSON array, oldest first.
+            CREATE TABLE IF NOT EXISTS guardian_live_runs (
+                run_id             TEXT PRIMARY KEY,
+                guardian_id        TEXT NOT NULL REFERENCES guardians(id) ON DELETE CASCADE,
+                kind               TEXT NOT NULL,
+                action_idx         INTEGER NOT NULL,
+                label              TEXT NOT NULL,
+                trigger            TEXT NOT NULL,
+                state              TEXT NOT NULL,
+                cwd                TEXT,
+                base_tip           TEXT,
+                live_ref           TEXT,
+                commits            TEXT,
+                report             TEXT,
+                error              TEXT,
+                cost_usd           REAL,
+                cell_id            TEXT,
+                integration        TEXT NOT NULL DEFAULT 'none',
+                integration_detail TEXT,
+                queued_at_ms       INTEGER NOT NULL,
+                started_at_ms      INTEGER,
+                finished_at_ms     INTEGER
+            );
+            CREATE INDEX IF NOT EXISTS idx_guardian_live_runs_guardian
+                ON guardian_live_runs(guardian_id, state);
             -- Prophecy subsystem (docs/prophecy-design.md): a durable,
             -- append-only record of what an agent learned while it worked.
             -- Unlike ghosts, this is NOT one row per owner -- every write is
@@ -4196,6 +4223,11 @@ impl Store {
             // review's one automatic live-action run.
             "ALTER TABLE guardians ADD COLUMN live_actions INTEGER",
             "ALTER TABLE guardians ADD COLUMN live_actions_auto_ran_at_ms INTEGER",
+            // Live actions: the checkout the review's latest preparation
+            // produced (where live runs execute) and that preparation's
+            // failure detail, if it failed.
+            "ALTER TABLE guardians ADD COLUMN live_actions_checkout TEXT",
+            "ALTER TABLE guardians ADD COLUMN live_actions_checkout_note TEXT",
             // Per-review overrides of the global `[followup]` config: whether
             // this review offers follow-up work when it merges, and whether an
             // accepted follow-up squad starts at once. NULL inherits the

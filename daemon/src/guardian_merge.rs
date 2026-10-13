@@ -11717,6 +11717,7 @@ pub fn run_guardian_post_merge_for(
         }
     });
 
+    let mut prepared_checkout = None;
     let outcome = post_merge_jobs_inner(
         store,
         runner,
@@ -11726,6 +11727,7 @@ pub fn run_guardian_post_merge_for(
         jobs,
         trigger,
         &cancel,
+        &mut prepared_checkout,
     );
 
     // Stop the supersede watcher: the run is over, one way or the other. The
@@ -11802,6 +11804,19 @@ pub fn run_guardian_post_merge_for(
     );
     let _ = watcher.join();
     memory.finish_guardian_preparation(id, generation);
+    // Live actions run against the checkout this generation prepared. A
+    // failed preparation still counts: the build failing is exactly the kind
+    // of thing a live test should look at, so the failure is handed to the
+    // live run instead of withholding it.
+    if let (Some(checkout), false) = (prepared_checkout.as_deref(), was_superseded) {
+        crate::live_runs::on_preparation_finished(
+            store,
+            &crate::live_runs::default_runner_factory(),
+            id,
+            checkout,
+            (!ok).then_some(detail.unwrap_or("preparation failed")),
+        );
+    }
 }
 
 /// Send the terminal, watcher-visible outcome of one manual-preparation pass.
@@ -11867,6 +11882,7 @@ fn post_merge_jobs_inner(
     jobs: PostMergeJobs,
     trigger: RebuildTrigger,
     cancel: &CancelToken,
+    prepared_checkout: &mut Option<String>,
 ) -> std::result::Result<Option<String>, String> {
     let combined_path = PathBuf::from(combined_str);
     // Project root of the combined worktree: `<proj>/.git/.ralphus/g/<short>/review`.
@@ -12008,6 +12024,7 @@ fn post_merge_jobs_inner(
     let pm_dir = claim_post_merge_checkout(&ws_root, &combined_ws, &pm_parent, &tip)?;
     let pm_ws = ws_root.at(&pm_dir);
     let pm_str = pm_dir.to_string_lossy().to_string();
+    *prepared_checkout = Some(pm_str.clone());
 
     // First prepare the author-declared action surface. It must not wait on
     // optional AI discovery of additional manual checks: an unavailable model
@@ -12575,10 +12592,10 @@ fn claim_post_merge_checkout_with(
 }
 
 /// Whether an action needs no preparation at all: it declares a verbatim
-/// command and nothing to build, transfer or publish, so it is runnable as soon
-/// as the checkout exists.
+/// command (or an agent prompt) and nothing to build, transfer or publish, so
+/// it is runnable as soon as the checkout exists.
 fn action_needs_no_preparation(hint: &crate::guardian::GuardianCheck) -> bool {
-    hint.command.is_some()
+    (hint.command.is_some() || hint.prompt.is_some())
         && hint.prepare.is_empty()
         && hint.artifacts.is_empty()
         && hint.shared_store.is_none()
@@ -12765,24 +12782,6 @@ fn prepare_action_hints(
                         shared_root.display()
                     )
                 })?;
-            }
-            if hints[index].command.is_none() {
-                if let Some(prompt) = hints[index].prompt.as_deref() {
-                    hints[index].command = Some(expand_action_prompt(
-                        store,
-                        runner,
-                        id,
-                        root,
-                        combined_str,
-                        prompt,
-                        &action_env,
-                        cancel,
-                    )?);
-                    store
-                        .lock()
-                        .set_guardian_action_hints(id, &hints)
-                        .map_err(|e| e.to_string())?;
-                }
             }
             if has_new_preparation {
                 for step in &hints[index].prepare {
@@ -13037,86 +13036,6 @@ fn prepare_generated_manual_checks(
             failures.join("; ")
         ))
     }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn expand_action_prompt(
-    store: &crate::store_lock::StoreHandle,
-    runner: &dyn Runner,
-    id: &str,
-    root: &Workspace,
-    combined_str: &str,
-    prompt: &str,
-    env: &std::collections::BTreeMap<String, String>,
-    cancel: &CancelToken,
-) -> std::result::Result<String, String> {
-    let (stored_agent, stored_model) = {
-        let guardian = store.lock().get_guardian(id).map_err(|e| e.to_string())?;
-        (guardian.resolver_agent, guardian.resolver_model)
-    };
-    let resolved = resolve_resolver_agent(
-        stored_agent.as_deref(),
-        stored_model.as_deref(),
-        store,
-        Path::new(combined_str),
-    )
-    .map_err(|e| format!("could not resolve prompt-action agent: {e}"))?;
-    let mut spec = RunnerSpec {
-        squad_id: format!("guardian-{id}"),
-        task: "expand-review-action".to_string(),
-        cell_id: "expand-review-action".to_string(),
-        cwd: combined_str.to_string(),
-        prompt: Some(format!(
-            "Turn this authored manual-test instruction into one runnable shell command. Do not run it. Return only JSON shaped {{\"manual_commands\":[\"command\"]}}. Instruction:\n\n{prompt}"
-        )),
-        command: None,
-        shell: None,
-        agent: resolved.backend.clone(),
-        executable: resolved.executable.clone(),
-        model: resolved.model.clone(),
-        system_prompt: None,
-        system_prompt_position: None,
-        timeout_sec: None,
-        budget_tokens: None,
-        maximum_budget_usd: None,
-        maximum_context: None,
-        auto_compact_threshold: None,
-        maximum_tool_output_tokens: None,
-        effort: None,
-        temperature: None,
-        proof: false,
-        trace_context: None,
-        resume_agent_session_id: None,
-        assigned_agent_session_id: None,
-        env_overrides: {
-            let mut resolved_env = resolved.env;
-            resolved_env.extend(env.clone());
-            resolved_env
-        },
-        machine: root.machine().map(str::to_string),
-        tool_arg_truncate_chars: None,
-        thrash_max_compactions: None,
-        thrash_min_turn_gap: None,
-        allow_personal_settings: false,
-        allow_personal_memory: false,
-        waypoint_context: false,
-        retry_attempt: 0,
-        retry_after_unknown_default_seconds: crate::config::resolve(Path::new(combined_str))
-            .retry_after_unknown_default_seconds(),
-        maximum_timeout: None,
-        pass_score: None,
-    };
-    let result = run_agent_with_stall_recovery(store, &mut spec, runner, cancel, None);
-    if !result.is_done() {
-        return Err(format!(
-            "prompt action expansion failed: {}",
-            result.error.as_deref().unwrap_or("agent did not finish")
-        ));
-    }
-    parse_manual_commands_response(&result.summary)
-        .into_iter()
-        .find_map(|check| check.command)
-        .ok_or_else(|| "prompt action expansion returned no runnable command".to_string())
 }
 
 /// Resolve a V1 shared-store namespace on this machine. Remote providers will

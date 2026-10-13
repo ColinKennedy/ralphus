@@ -194,6 +194,32 @@ impl Drop for LiveRunnerGuard {
     }
 }
 
+/// Live actions: which reviews have a live-run worker draining their queue,
+/// and a cancel token per running live run. One lock: a worker registers its
+/// run's token while it holds the review's slot, and nothing else spans them.
+#[derive(Default)]
+struct LiveRunState {
+    workers: HashSet<String>,
+    cancels: HashMap<String, CancelToken>,
+}
+
+/// The right to drain one review's live-run queue. Dropping it -- including by
+/// a panic in the worker -- frees the slot.
+pub struct LiveRunWorkerClaim {
+    memory: std::sync::Arc<StoreMemory>,
+    guardian_id: String,
+}
+
+impl Drop for LiveRunWorkerClaim {
+    fn drop(&mut self) {
+        self.memory
+            .live_runs
+            .lock()
+            .workers
+            .remove(&self.guardian_id);
+    }
+}
+
 /// One `Store`'s non-database state. Cloning the `Arc` is cheap and touches no
 /// lock, so a caller can hold a handle to this without holding the store.
 #[derive(Default)]
@@ -238,12 +264,68 @@ pub struct StoreMemory {
     /// and no entry here has no runner behind it. Independent of every other
     /// group.
     live_runners: Mutex<HashMap<String, usize>>,
+    /// Live actions: per-review queue workers and per-run cancel tokens, see
+    /// [`LiveRunState`]. Independent of every other group.
+    live_runs: Mutex<LiveRunState>,
 }
 
 impl StoreMemory {
     #[must_use]
     pub fn new() -> std::sync::Arc<Self> {
         std::sync::Arc::new(Self::default())
+    }
+
+    // ---- live-run workers (live actions) ----
+
+    /// Claim the right to drain review `guardian_id`'s live-run queue, or
+    /// `None` when a worker already holds it.
+    #[must_use]
+    pub fn try_claim_live_run_worker(
+        self: &std::sync::Arc<Self>,
+        guardian_id: &str,
+    ) -> Option<LiveRunWorkerClaim> {
+        if !self
+            .live_runs
+            .lock()
+            .workers
+            .insert(guardian_id.to_string())
+        {
+            return None;
+        }
+        Some(LiveRunWorkerClaim {
+            memory: std::sync::Arc::clone(self),
+            guardian_id: guardian_id.to_string(),
+        })
+    }
+
+    /// Whether a worker is draining this review's live-run queue.
+    #[must_use]
+    pub fn has_live_run_worker(&self, guardian_id: &str) -> bool {
+        self.live_runs.lock().workers.contains(guardian_id)
+    }
+
+    /// Record the cancel token of a running live run.
+    pub fn register_live_run_cancel(&self, run_id: &str, token: CancelToken) {
+        self.live_runs
+            .lock()
+            .cancels
+            .insert(run_id.to_string(), token);
+    }
+
+    /// Forget a finished live run's cancel token.
+    pub fn clear_live_run_cancel(&self, run_id: &str) {
+        self.live_runs.lock().cancels.remove(run_id);
+    }
+
+    /// Cancel a running live run. `false` when it is not running here.
+    pub fn cancel_live_run(&self, run_id: &str) -> bool {
+        match self.live_runs.lock().cancels.get(run_id) {
+            Some(token) => {
+                token.cancel();
+                true
+            }
+            None => false,
+        }
     }
 
     // ---- live runner registry (RAL-626) ----

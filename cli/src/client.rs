@@ -1783,6 +1783,39 @@ impl DaemonClient {
         self.get("/api/guardians")
     }
 
+    /// A review's live actions and live runs.
+    pub fn guardian_live_actions(&self, guardian_id: &str) -> Result<Value, DaemonError> {
+        self.get(&format!("/api/guardians/{guardian_id}/live-actions"))
+    }
+
+    /// Queue live runs: one live action (`Some(index)`) or all of them.
+    pub fn guardian_run_live_actions(
+        &self,
+        guardian_id: &str,
+        index: Option<i64>,
+    ) -> Result<Value, DaemonError> {
+        let body = match index {
+            Some(i) => serde_json::json!({ "index": i }),
+            None => serde_json::json!({}),
+        };
+        self.post(
+            &format!("/api/guardians/{guardian_id}/live-actions/run"),
+            Some(body),
+        )
+    }
+
+    /// Cancel a queued or running live run.
+    pub fn guardian_cancel_live_run(
+        &self,
+        guardian_id: &str,
+        run_id: &str,
+    ) -> Result<Value, DaemonError> {
+        self.post(
+            &format!("/api/guardians/{guardian_id}/live-runs/{run_id}/cancel"),
+            None,
+        )
+    }
+
     pub fn guardian_get(&self, guardian_id: &str) -> Result<Value, DaemonError> {
         self.get(&format!("/api/guardians/{guardian_id}"))
     }
