@@ -14550,6 +14550,13 @@ fn set_status(daemon: &Daemon, id: &str, body: &str) -> Reply {
     if let Err(e) = result {
         return store_error(&e);
     }
+    // RAL-641: ignoring a cell also releases the dependents its failure
+    // cascaded onto, so the rest of the squad keeps moving.
+    if req.kind == "cell" && req.state == "ignored" {
+        if let Err(e) = store.repend_dependents_of_ignored_cell(id, req.task_idx, req.cell_idx) {
+            return store_error(&e);
+        }
+    }
     if accepted_failed_proof {
         note_manual_failed_proof_acceptance(&store, id, &req);
     }

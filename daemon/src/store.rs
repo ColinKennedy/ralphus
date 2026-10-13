@@ -4205,6 +4205,11 @@ impl Store {
             // RAL-626: when the runner watchdog flagged this running cell as
             // having no live runner -- see `CellView::runner_stalled_at_ms`.
             "ALTER TABLE cells ADD COLUMN runner_stalled_at_ms INTEGER",
+            // RAL-641: why a `failed` cell failed -- `'dependency'` when the
+            // scheduler cascaded a failed prerequisite onto it, `'own'` when
+            // its own run failed. NULL on rows written before this column
+            // existed and on cells that are not failed.
+            "ALTER TABLE cells ADD COLUMN failed_reason TEXT",
             // RAL-400: `1` when this affected entry was auto-enrolled by the
             // daemon (submit-time scope overlap, or the survey sweep's own
             // discovery) rather than declared explicitly by a human/agent.
@@ -5412,7 +5417,7 @@ impl Store {
         // into `running` (the "next run") or a manual `Set Status` call to
         // any state -- clears this cell's cosmetic "out of date" badge.
         self.conn.execute(
-            "UPDATE cells SET state=?, env_out_of_date=0,
+            "UPDATE cells SET state=?, env_out_of_date=0, failed_reason=NULL,
                  started_at_ms = CASE WHEN ?=1 THEN COALESCE(started_at_ms, ?) ELSE started_at_ms END,
                  finished_at_ms = CASE WHEN ?=1 THEN ? ELSE finished_at_ms END,
                  completed_active_duration_ms = completed_active_duration_ms +
@@ -11559,6 +11564,17 @@ impl Store {
                 outcome.state.as_str(),
             ],
         )?;
+        if updated > 0 {
+            self.conn.execute(
+                "UPDATE cells SET failed_reason = ? WHERE squad_id=? AND task_idx=? AND idx=?",
+                params![
+                    (outcome.state == NodeState::Failed).then_some(FAILED_REASON_OWN),
+                    squad_id,
+                    task_idx,
+                    idx
+                ],
+            )?;
+        }
         let Some(old) = old.as_deref() else {
             return Ok(());
         };
@@ -12647,6 +12663,114 @@ impl Store {
             .ok_or(StoreError::NotFound)
     }
 
+    /// RAL-641: mark a `failed` cell as failed only because a prerequisite
+    /// failed, so ignoring that prerequisite can tell it from a real failure.
+    pub fn mark_cell_failed_by_dependency(
+        &self,
+        squad_id: &str,
+        task_idx: i64,
+        idx: i64,
+    ) -> Result<()> {
+        self.conn.execute(
+            "UPDATE cells SET failed_reason = ? WHERE squad_id=? AND task_idx=? AND idx=? AND state='failed'",
+            params![FAILED_REASON_DEPENDENCY, squad_id, task_idx, idx],
+        )?;
+        Ok(())
+    }
+
+    /// RAL-641: after `(task_idx, idx)` is set to `ignored`, put the work it was
+    /// holding back in motion again.
+    ///
+    /// Every downstream cell that is `failed` because of a failed prerequisite
+    /// (`failed_reason = 'dependency'`) returns to `pending`, along with its
+    /// owning task; a downstream failure with its own reason is left alone. A
+    /// `failed` row with no recorded reason predates the column, so it is
+    /// revived too -- the same blunt treatment
+    /// [`Self::revive_failed_downstream_cells`] gives every failed dependent. The
+    /// ignored cell's own task is reset when it was `failed`, so it finalizes
+    /// again. A squad that already finished as `failed` goes back to `pending`
+    /// so the scheduler claims it; a `running` squad is left for its live
+    /// dispatcher to reconcile.
+    ///
+    /// Returns the `(task_idx, idx)` of each cell put back to `pending`.
+    pub fn repend_dependents_of_ignored_cell(
+        &self,
+        squad_id: &str,
+        task_idx: i64,
+        idx: i64,
+    ) -> Result<Vec<(i64, i64)>> {
+        let impact = self.compute_cell_restart_impact(squad_id, task_idx, idx)?;
+        let mut revived: Vec<(i64, i64)> = Vec::new();
+        for s in &impact.cells {
+            if (s.task_idx, s.idx) == (task_idx, idx) {
+                continue;
+            }
+            let revivable: Option<bool> = self
+                .conn
+                .query_row(
+                    "SELECT state='failed' AND (failed_reason IS NULL OR failed_reason=?)
+                     FROM cells WHERE squad_id=? AND task_idx=? AND idx=?",
+                    params![FAILED_REASON_DEPENDENCY, squad_id, s.task_idx, s.idx],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            if revivable != Some(true) {
+                continue;
+            }
+            self.conn.execute(
+                "UPDATE cells SET state='pending', restart_count=restart_count+1, error=NULL, failed_reason=NULL WHERE squad_id=? AND task_idx=? AND idx=?",
+                params![squad_id, s.task_idx, s.idx],
+            )?;
+            self.conn.execute(
+                "UPDATE proofs SET state='pending', restart_note=NULL WHERE squad_id=? AND task_idx=? AND scope='cell' AND cell_idx=?",
+                params![squad_id, s.task_idx, s.idx],
+            )?;
+            revived.push((s.task_idx, s.idx));
+        }
+        let revived_tasks: HashSet<i64> = revived.iter().map(|&(t, _)| t).collect();
+        for &t in &revived_tasks {
+            self.conn.execute(
+                "UPDATE tasks SET state='pending', error=NULL WHERE squad_id=? AND idx=?",
+                params![squad_id, t],
+            )?;
+        }
+        if !revived_tasks.contains(&task_idx) {
+            // The ignored cell's own task finalizes again, unless another of
+            // its cells is still genuinely failed.
+            self.conn.execute(
+                "UPDATE tasks SET state='pending', error=NULL
+                 WHERE squad_id=?1 AND idx=?2 AND state='failed'
+                   AND NOT EXISTS (SELECT 1 FROM cells WHERE squad_id=?1 AND task_idx=?2 AND state='failed')",
+                params![squad_id, task_idx],
+            )?;
+        }
+        let repended_squad = self.squad_state(squad_id).ok() == Some(SquadState::Failed);
+        if repended_squad {
+            self.conn.execute(
+                "UPDATE squads SET state='pending', updated_at_ms=?, finished_at_ms=NULL WHERE id=?",
+                params![now_ms(), squad_id],
+            )?;
+        }
+        crate::cartographer::Note::new("state")
+            .scope("cell")
+            .squad(squad_id)
+            .emit(
+                self,
+                format!(
+                    "cell {squad_id}/t{task_idx}/s{idx} ignored: {} dependency-failed dependent(s) set back to pending{}",
+                    revived.len(),
+                    if repended_squad { ", squad set back to pending" } else { "" }
+                ),
+                serde_json::json!({
+                    "task_idx": task_idx,
+                    "cell_idx": idx,
+                    "revived": revived.iter().map(|&(t, c)| format!("{t}/{c}")).collect::<Vec<_>>(),
+                    "squad_repended": repended_squad,
+                }),
+            );
+        Ok(revived)
+    }
+
     /// Reset every cell downstream of any of `roots` (but not the roots
     /// themselves) within `squad_id` that is currently `Failed` back to
     /// Pending — clearing its error, resetting its own cell-level
@@ -13395,6 +13519,12 @@ impl From<&crate::runner::RunnerResult> for RecordedUsage {
         }
     }
 }
+
+/// `cells.failed_reason` for a cell whose own run failed.
+pub const FAILED_REASON_OWN: &str = "own";
+/// `cells.failed_reason` for a cell failed by the scheduler because a
+/// prerequisite failed.
+pub const FAILED_REASON_DEPENDENCY: &str = "dependency";
 
 /// The recorded outcome of running a cell.
 #[derive(Debug, Clone)]
@@ -15823,6 +15953,55 @@ command = "y"
         assert!(done.contains(&(0, 0)), "s1 stays done");
         assert!(!done.contains(&(0, 1)) && !done.contains(&(0, 2)));
         assert_eq!(store.squad_state(&dependent).unwrap(), SquadState::Pending);
+    }
+
+    /// RAL-641: ignoring a failed cell sets its dependency-failed dependents
+    /// (and the finished squad) back to pending, leaves a dependent that
+    /// failed on its own alone, and revives a pre-migration (NULL reason)
+    /// failed dependent.
+    #[test]
+    fn repend_dependents_of_ignored_cell_revives_only_cascade_failures() {
+        let mut store = Store::open_in_memory().unwrap();
+        let toml = "[[task]]\nname=\"t\"\n\
+            [[task.cell]]\nid=\"s1\"\ncwd=\"/r\"\nprompt=\"p\"\n\
+            [[task.cell]]\nid=\"s2\"\ncwd=\"/r\"\nprompt=\"p\"\ndepends_on=[\"s1\"]\n\
+            [[task.cell]]\nid=\"s3\"\ncwd=\"/r\"\nprompt=\"p\"\ndepends_on=[\"s1\"]\n\
+            [[task.cell]]\nid=\"s4\"\ncwd=\"/r\"\nprompt=\"p\"\ndepends_on=[\"s1\"]\n";
+        let squad = store.insert_squad(&parse(toml), Some("r"), false).unwrap();
+        for idx in 0..4 {
+            store
+                .set_cell_state(&squad, 0, idx, NodeState::Failed)
+                .unwrap();
+        }
+        // s2: cascade failure; s3: its own failure; s4: pre-migration row.
+        store.mark_cell_failed_by_dependency(&squad, 0, 1).unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE cells SET failed_reason=? WHERE squad_id=? AND idx=2",
+                params![FAILED_REASON_OWN, squad],
+            )
+            .unwrap();
+        store.set_task_state(&squad, 0, NodeState::Failed).unwrap();
+        store.set_squad_state(&squad, SquadState::Failed).unwrap();
+
+        store
+            .set_cell_state(&squad, 0, 0, NodeState::Ignored)
+            .unwrap();
+        let revived = store
+            .repend_dependents_of_ignored_cell(&squad, 0, 0)
+            .unwrap();
+        assert_eq!(revived, vec![(0, 1), (0, 3)]);
+
+        let view = store.get_squad(&squad).unwrap();
+        let states: Vec<&str> = view.tasks[0]
+            .cells
+            .iter()
+            .map(|c| c.state.as_str())
+            .collect();
+        assert_eq!(states, vec!["ignored", "pending", "failed", "pending"]);
+        assert_eq!(view.tasks[0].state, "pending");
+        assert_eq!(store.squad_state(&squad).unwrap(), SquadState::Pending);
     }
 
     #[test]

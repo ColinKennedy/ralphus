@@ -377,6 +377,24 @@
         if (tab === "queue") pollQueue();
       }
       /**
+       * Sets one cell to ignored and lets its dependents continue (RAL-641):
+       * dependents that were only blocked by this cell go back to pending
+       * and run from the ignored cell's own upstream. Same endpoint as
+       * Set Status → ignored.
+       * @param {string} squadId
+       * @param {number} ti
+       * @param {number} si
+       * @returns {Promise<void>}
+       */
+      async function ignoreCell(squadId, ti, si) {
+        if (!confirm("Ignore this cell and continue? Its dependents that were blocked by it will run without it.")) return;
+        await post(`/api/squads/${squadId}/set-status`, {
+          kind: "cell", task_idx: ti, cell_idx: si, proof_idx: -1, proof_scope: "", state: "ignored"
+        }, { success: "Cell ignored; its dependents continue.", errorLabel: "ignore cell" });
+        tick();
+        if (tab === "queue") pollQueue();
+      }
+      /**
        * Deletes a squad permanently after confirmation. Applies to every
        * selected squad when the clicked one is part of a multi-selection
        * (RAL-508) via bulkDelete instead.

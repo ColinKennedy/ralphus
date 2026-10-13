@@ -2001,8 +2001,7 @@ fn execute_squad_inner(
                             .effective_state_for_cell(squad_id, cells[i].task_idx, cells[i].idx)
                             .ok()
                             .flatten()
-                            .as_deref()
-                            == Some("done")
+                            .is_some_and(|state| matches!(state.as_str(), "done" | "ignored"))
                     })
                     .collect()
             };
@@ -2183,6 +2182,12 @@ fn execute_squad_inner(
                     squad_id,
                     "record_cell_result",
                     guard.record_cell_result(squad_id, row.task_idx, row.idx, &outcome),
+                );
+                store_ok(
+                    &guard,
+                    squad_id,
+                    "mark_cell_failed_by_dependency",
+                    guard.mark_cell_failed_by_dependency(squad_id, row.task_idx, row.idx),
                 );
             }
 
@@ -2410,24 +2415,84 @@ fn rebase_resumed_cell_onto_upstream(row: &crate::store::CellRow) -> bool {
     true
 }
 
-fn try_upstream_rebase(
-    row: &crate::store::CellRow,
-    cells: &[crate::store::CellRow],
-) -> Option<String> {
-    let upstream = row.upstream.as_deref()?;
-    let ref_str = ralphus_core::schema::parse_upstream_task_ref(upstream)?;
-
+/// Find the cell an `upstream = "<<task:...>>"` ref names.
+fn find_upstream_dep<'a>(
+    ref_str: &str,
+    cells: &'a [crate::store::CellRow],
+) -> Option<&'a crate::store::CellRow> {
     // Split "task-name" or "task-name/cell-id".
     let (task_name, cell_id_filter) = ref_str
         .split_once('/')
         .map_or((ref_str, None), |(t, s)| (t, Some(s)));
-
-    let dep = cells
+    cells
         .iter()
-        .find(|s| s.task_name == task_name && cell_id_filter.is_none_or(|sid| s.cell_id == sid))?;
+        .find(|s| s.task_name == task_name && cell_id_filter.is_none_or(|sid| s.cell_id == sid))
+}
 
+/// The worktree and branch `row` should rebase onto for its `upstream` ref.
+///
+/// An ignored cell's branch is never a valid base: its partial commits are what
+/// ignoring it set aside, and its worktree may be gone. Resolution looks
+/// through it to the base the ignored cell itself was built on -- its own
+/// `upstream` cell (which, when that cell sat on a merge of several
+/// dependencies, already carries that combined base) or, for a cell with no
+/// `upstream` cell, its worktree's tracking branch.
+///
+/// `Ok(None)` means there is nothing to rebase onto.
+fn resolve_upstream_base(
+    upstream: &str,
+    cells: &[crate::store::CellRow],
+    ignored: &HashSet<(i64, i64)>,
+) -> std::result::Result<Option<(PathBuf, String)>, String> {
+    let Some(ref_str) = ralphus_core::schema::parse_upstream_task_ref(upstream) else {
+        return Ok(None);
+    };
+    let Some(mut dep) = find_upstream_dep(ref_str, cells) else {
+        return Ok(None);
+    };
+    for _ in 0..=cells.len() {
+        let Some(dep_cwd) = dep.cwd.as_deref().map(PathBuf::from) else {
+            return Ok(None);
+        };
+        if !ignored.contains(&(dep.task_idx, dep.idx)) {
+            return match crate::reviews::worktree_branch(&dep_cwd) {
+                Ok(branch) => Ok(Some((dep_cwd, branch))),
+                Err(e) => Err(format!(
+                    "upstream rebase: could not read branch of '{}': {e}",
+                    dep_cwd.display()
+                )),
+            };
+        }
+        let next = dep
+            .upstream
+            .as_deref()
+            .and_then(ralphus_core::schema::parse_upstream_task_ref)
+            .and_then(|r| find_upstream_dep(r, cells));
+        match next {
+            Some(next) => dep = next,
+            None => {
+                return Ok(crate::reviews::worktree_upstream(&dep_cwd)
+                    .ok()
+                    .map(|branch| (dep_cwd, branch)));
+            }
+        }
+    }
+    Ok(None)
+}
+
+fn try_upstream_rebase(
+    row: &crate::store::CellRow,
+    cells: &[crate::store::CellRow],
+    ignored: &HashSet<(i64, i64)>,
+) -> Option<String> {
+    let upstream = row.upstream.as_deref()?;
     let b_cwd = std::path::Path::new(row.cwd.as_deref()?);
-    let a_cwd = std::path::Path::new(dep.cwd.as_deref()?);
+    let (a_cwd, a_branch) = match resolve_upstream_base(upstream, cells, ignored) {
+        Ok(Some(base)) => base,
+        Ok(None) => return None,
+        Err(e) => return Some(e),
+    };
+    let a_cwd = a_cwd.as_path();
 
     if !crate::reviews::same_git_repo(a_cwd, b_cwd) {
         // ralphus[ignore-rlog-pair]: this low-level helper has no Store; its Store-owning caller records the structured workflow outcome
@@ -2441,16 +2506,6 @@ fn try_upstream_rebase(
         );
         return None;
     }
-
-    let a_branch = match crate::reviews::worktree_branch(a_cwd) {
-        Ok(b) => b,
-        Err(e) => {
-            return Some(format!(
-                "upstream rebase: could not read branch of '{}': {e}",
-                a_cwd.display()
-            ));
-        }
-    };
 
     if let Err(e) = crate::reviews::rebase_onto(b_cwd, &a_branch) {
         // A rebase conflict is transient: `rebase_onto` already aborted and left
@@ -4194,7 +4249,12 @@ fn run_cell_worker(
 
     // If this cell declares an upstream task ref, rebase its branch onto
     // the dependency's current branch tip before handing off to the runner.
-    if let Some(rebase_err) = try_upstream_rebase(row, cells) {
+    let ignored_cells = if row.upstream.is_some() {
+        store.lock().ignored_cells(squad_id).unwrap_or_default()
+    } else {
+        HashSet::new()
+    };
+    if let Some(rebase_err) = try_upstream_rebase(row, cells, &ignored_cells) {
         let outcome = crate::store::CellOutcome {
             state: crate::store::NodeState::Failed,
             usage: crate::store::RecordedUsage::default(),
@@ -5113,7 +5173,7 @@ fn run_task_finalizer(
             let all_done = cells.iter().filter(|s| s.task_idx == task_idx).all(|s| {
                 let effective_done = matches!(
                     guard.effective_state_for_cell(squad_id, task_idx, s.idx),
-                    Ok(Some(state)) if state == "done"
+                    Ok(Some(state)) if state == "done" || state == "ignored"
                 );
                 let no_cancelled_proof = guard
                     .cell_proof_states(squad_id, task_idx, s.idx)
@@ -11826,7 +11886,7 @@ mod tests {
     fn try_upstream_rebase_noop_when_upstream_is_none() {
         let row = make_cell_row_no_cwd(0);
         // upstream is None — must return None without calling git.
-        let result = try_upstream_rebase(&row, &[]);
+        let result = try_upstream_rebase(&row, &[], &HashSet::new());
         assert!(result.is_none(), "no upstream → no rebase attempt");
     }
 
@@ -11836,7 +11896,7 @@ mod tests {
         row.upstream = Some("<<task:nonexistent-task>>".to_string());
         // The referenced task doesn't exist in the cell list; returns None
         // (can't rebase something that doesn't exist, graceful skip).
-        let result = try_upstream_rebase(&row, &[]);
+        let result = try_upstream_rebase(&row, &[], &HashSet::new());
         assert!(result.is_none(), "missing dep → skip without error");
     }
 
@@ -11847,7 +11907,7 @@ mod tests {
         let dep = make_cell_row_no_cwd(0); // cwd is None
         // Neither has a cwd; parse_upstream_task_ref returns Some but the cwd
         // check returns None early — treated as skip (None return).
-        let result = try_upstream_rebase(&row, &[dep]);
+        let result = try_upstream_rebase(&row, &[dep], &HashSet::new());
         assert!(result.is_none(), "no cwd on B → silent skip");
     }
 
@@ -11957,7 +12017,7 @@ mod tests {
 
         // Before the fix this returned Some(error) and permanently failed the
         // cell.  After the fix it must return None so the cell can run.
-        let result = try_upstream_rebase(&cells[1], &cells);
+        let result = try_upstream_rebase(&cells[1], &cells, &HashSet::new());
         assert!(
             result.is_none(),
             "rebase conflict must not permanently fail the cell; got: {result:?}"
@@ -11973,6 +12033,94 @@ mod tests {
         assert!(
             status_out.stdout.is_empty(),
             "work worktree must be clean after rebase conflict abort"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// RAL-641: a cell whose upstream is an ignored cell rebases onto that
+    /// cell's own upstream, never onto the ignored cell's branch.
+    #[test]
+    fn try_upstream_rebase_skips_an_ignored_cell_and_uses_its_upstream() {
+        use std::process::Command as Cmd;
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static N: AtomicU32 = AtomicU32::new(0);
+        let n = N.fetch_add(1, Ordering::Relaxed);
+        let root =
+            std::env::temp_dir().join(format!("ralphus-up-ignored-{}-{n}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("mkdir temp root");
+
+        let git_in = |dir: &std::path::Path, args: &[&str]| {
+            let out = Cmd::new("git")
+                .args(args)
+                .current_dir(dir)
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@t.com")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@t.com")
+                .env("GIT_EDITOR", "true")
+                .output()
+                .expect("run git");
+            assert!(
+                out.status.success(),
+                "git {:?}: {}",
+                args,
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        let git = |args: &[&str]| git_in(&root, args);
+
+        git(&["init", "--initial-branch", "main"]);
+        std::fs::write(root.join("seed.txt"), "seed\n").expect("write");
+        git(&["add", "seed.txt"]);
+        git(&["commit", "--message", "seed"]);
+        // base: the ignored cell's own upstream; mid: the ignored cell's
+        // partial work on top of base; work: the dependent, forked from main.
+        git(&["checkout", "-b", "base"]);
+        std::fs::write(root.join("base.txt"), "base\n").expect("write");
+        git(&["add", "base.txt"]);
+        git(&["commit", "--message", "base work"]);
+        git(&["checkout", "-b", "mid"]);
+        std::fs::write(root.join("mid.txt"), "mid\n").expect("write");
+        git(&["add", "mid.txt"]);
+        git(&["commit", "--message", "ignored partial work"]);
+        git(&["checkout", "main"]);
+        git(&["checkout", "-b", "work"]);
+        git(&["checkout", "main"]);
+
+        let base_wt = root.join("wt-base");
+        let mid_wt = root.join("wt-mid");
+        let work_wt = root.join("wt-work");
+        git(&["worktree", "add", base_wt.to_str().unwrap(), "base"]);
+        git(&["worktree", "add", mid_wt.to_str().unwrap(), "mid"]);
+        git(&["worktree", "add", work_wt.to_str().unwrap(), "work"]);
+
+        let mut base_row = make_cell_row_no_cwd(0);
+        base_row.task_name = "base-task".into();
+        base_row.cwd = Some(base_wt.to_str().unwrap().into());
+        let mut mid_row = make_cell_row_no_cwd(1);
+        mid_row.task_idx = 1;
+        mid_row.task_name = "mid-task".into();
+        mid_row.cwd = Some(mid_wt.to_str().unwrap().into());
+        mid_row.upstream = Some("<<task:base-task>>".into());
+        let mut work_row = make_cell_row_no_cwd(2);
+        work_row.task_idx = 2;
+        work_row.task_name = "work-task".into();
+        work_row.cwd = Some(work_wt.to_str().unwrap().into());
+        work_row.upstream = Some("<<task:mid-task>>".into());
+        let cells = [base_row, mid_row, work_row];
+        let ignored = HashSet::from([(1, 0)]);
+
+        let result = try_upstream_rebase(&cells[2], &cells, &ignored);
+        assert!(result.is_none(), "rebase must succeed; got: {result:?}");
+        assert!(
+            work_wt.join("base.txt").exists(),
+            "the dependent must be rebased onto the ignored cell's upstream"
+        );
+        assert!(
+            !work_wt.join("mid.txt").exists(),
+            "the ignored cell's own commits must not be pulled in"
         );
 
         let _ = std::fs::remove_dir_all(&root);
