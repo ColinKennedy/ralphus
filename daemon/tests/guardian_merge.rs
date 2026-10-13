@@ -64,11 +64,9 @@ fn temp_repo() -> PathBuf {
 /// instruction. Every `Runner` double used with `run_feedback` or
 /// `dispatch_pr_auto_fix` must call this first and return its result when
 /// `Some`, falling through to its own resolver-editing behavior otherwise --
-/// the fixer prompt itself (RAL-456) tells the resolver it may inspect the
-/// worktree with read-only git commands but must not commit or push, so
-/// without this the worktree would never actually get committed and every
-/// such test would see `committed: false` regardless of what the resolver
-/// wrote.
+/// these doubles' resolvers only edit files and never commit, so without
+/// this the worktree would never actually get committed and every such test
+/// would see `committed: false` regardless of what the resolver wrote.
 fn maybe_run_commit_step(spec: &RunnerSpec) -> Option<RunnerResult> {
     if !spec.cell_id.ends_with("-commit") {
         return None;
@@ -2278,10 +2276,10 @@ fn auto_fix_dispatch_gives_every_failing_check_its_own_log_file_and_prompt_parag
     let git_dir = std::path::PathBuf::from(
         git(Path::new(&worktree), &["rev-parse", "--absolute-git-dir"]).trim(),
     );
-    let build_log = std::fs::read_to_string(git_dir.join(".ralphus-ci-failure-build.log"))
+    let build_log = std::fs::read_to_string(git_dir.join(".ralphus-ci-failure-1-build.log"))
         .expect("build check's own log file written");
     assert_eq!(build_log, "build broke\n");
-    let test_log = std::fs::read_to_string(git_dir.join(".ralphus-ci-failure-test.log"))
+    let test_log = std::fs::read_to_string(git_dir.join(".ralphus-ci-failure-2-test.log"))
         .expect("test check's own log file written");
     assert_eq!(test_log, "test failed\n");
     assert!(
@@ -2302,6 +2300,10 @@ fn auto_fix_dispatch_gives_every_failing_check_its_own_log_file_and_prompt_parag
     );
     assert!(text.contains("'build' failed"), "{text}");
     assert!(text.contains("'test' failed"), "{text}");
+    assert!(
+        text.contains("this round must end with a code change that fixes it"),
+        "the prompt must require a change, not just passing local checks: {text}"
+    );
 
     let _ = std::fs::remove_dir_all(&root);
     let _ = std::fs::remove_dir_all(&remote_dir);
