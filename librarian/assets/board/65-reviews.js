@@ -3263,54 +3263,122 @@ Press Accept on the note to create it.">Squad pending</span>`;
       function moveBranchTargets(reviews, gid) {
         return reviews.filter((x) => x.id !== gid && !["merged", "approved", "cancelled", "deployed"].includes(x.status));
       }
-      // RALPHUS-MOVE-BRANCH-TARGETS:END
       /**
-       * Opens the "Move or extract branch" popup: pick an existing review to
-       * move the branch into, or a new review of its own.
+       * The rows of the "Move or extract branch" picker: "New review…" always
+       * first, then every review the branch can move into whose name or id
+       * contains `query`.
+       * @param {{id: string, name: string, status: string}[]} reviews
+       * @param {string} gid - The branch's current review.
+       * @param {string} query
+       * @returns {MoveBranchPickerItem[]}
+       */
+      function moveBranchPickerItems(reviews, gid, query) {
+        const needle = String(query || "").trim().toLowerCase();
+        /** @type {MoveBranchPickerItem[]} */
+        const items = [{ id: "__new__", title: "New review…", detail: "A new review named after the branch, on the same base branch and project as this one. It opens its PR as soon as the branch builds." }];
+        for (const r of moveBranchTargets(reviews, gid)) {
+          if (needle && !r.name.toLowerCase().includes(needle) && !r.id.toLowerCase().includes(needle)) continue;
+          items.push({ id: r.id, title: r.name, detail: `Existing review · ${r.status}` });
+        }
+        return items;
+      }
+      // RALPHUS-MOVE-BRANCH-TARGETS:END
+      /** What the open "Move or extract branch" picker is moving, its query and its selected row. */
+      let moveBranchPicker = { gid: "", branchId: "", query: "", selected: 0 };
+      /**
+       * Opens the "Move or extract branch" picker: a searchable list with
+       * "New review…" at the top and every open review below it (same look
+       * and keys as Go To Task).
        * @param {string} gid
        * @param {string} branchId
        * @returns {void}
        */
       function openMoveOrExtractBranch(gid, branchId) {
         closeSquadMenu();
+        moveBranchPicker = { gid, branchId, query: "", selected: 0 };
         const g = guardians.find((x) => x.id === gid);
         const branch = (g && g.branches && (g.branches.find((x) => x.id === branchId) || {}).branch) || branchId;
-        const targets = moveBranchTargets(guardians, gid);
-        const row = (/** @type {string} */ value, /** @type {string} */ title, /** @type {string} */ detail, /** @type {string} */ tip, /** @type {boolean} */ checked) =>
-          `<label style="display:flex;gap:10px;align-items:flex-start;padding:8px 0;border-top:1px solid var(--border);cursor:pointer" data-tip="${esc(tip)}">
-            <input type="radio" name="move-branch-target" value="${esc(value)}"${checked ? " checked" : ""} data-tip="${esc(tip)}">
-            <span><span style="font-weight:600">${esc(title)}</span><br><span style="font-size:12px;color:var(--muted)">${esc(detail)}</span></span>
-          </label>`;
-        const rows = [row("__new__", "New review",
-          `A new review named after the branch, on the same base branch and project as this one. It opens its PR as soon as the branch builds.`,
-          "Move the branch into a brand-new review of its own.\nWho/when: this review is stalled or blocked by another branch, but this branch should ship on its own.", true)]
-          .concat(targets.map((t) => row(t.id, t.name, `Existing review · ${t.status}`,
-            `Move the branch into "${t.name}".\nBlocked if either review has an active merge/rebase.`, false)));
         byId("modal-root").innerHTML = `
-          <div class="modal-bg" onclick="if(event.target===this)closeModal()"><div class="modal" style="width:560px;max-width:94vw">
+          <div class="modal-bg" onclick="if(event.target===this)closeModal()"><div class="modal goto-search-modal">
             <h2>Move or extract ${esc(branch)}</h2>
-            <p style="font-size:13px;margin:0 0 10px;color:var(--muted)">Take this branch out of this review and put it in another one. Both reviews rebuild afterward.</p>
-            <div data-tip="Where the branch goes: a new review of its own, or one of the open reviews.
-Scroll to see every open review." style="max-height:50vh;overflow:auto">${rows.join("")}</div>
-            <p style="font-size:12px;color:var(--failed);margin:10px 0 2px">This cannot be undone.</p>
+            <input type="text" id="move-branch-input" class="goto-search-input" placeholder="search reviews…" oninput="moveBranchPickerInput(this.value)" onkeydown="moveBranchPickerKeydown(event)" data-tip="Filter the open reviews by name or id.\nNew review… always stays at the top.\nArrow keys move the selection · Enter moves the branch there." />
+            <div id="move-branch-summary" class="goto-search-summary"></div>
+            <div id="move-branch-list" class="goto-search-list" data-tip="Where the branch goes: a new review of its own, or one of the open reviews.\nClick once to select a row; double-click or press Enter to move the branch there."></div>
+            <p style="font-size:12px;color:var(--failed);margin:10px 0 2px">Both reviews rebuild afterward. This cannot be undone.</p>
             <div class="btn-row">
               <button class="btn" onclick="closeModal()" data-tip="Close this popup without moving anything.">Cancel</button>
-              <button class="btn primary" data-click="confirmMoveOrExtractBranch" data-guardian-id="${esc(gid)}" data-branch-id="${esc(branchId)}" data-tip="Move the branch to the review picked above.\nBoth reviews rebuild afterward.\nThis cannot be undone.">⇄ Move branch</button>
+              <button class="btn primary" data-click="confirmMoveOrExtractBranch" data-tip="Move the branch to the selected row: a new review, or the chosen existing review.\nBoth reviews rebuild afterward.\nThis cannot be undone.">⇄ Move branch</button>
             </div>
           </div></div>`;
+        const input = /** @type {HTMLInputElement|null} */ (document.getElementById("move-branch-input"));
+        if (input) input.focus();
+        renderMoveBranchPicker();
       }
       /**
-       * Moves the branch to whatever the "Move or extract branch" popup has
-       * selected: a new review, or an existing one.
-       * @param {string} gid
-       * @param {string} branchId
+       * Re-renders the picker's rows and summary for the current query.
+       * @returns {void}
+       */
+      function renderMoveBranchPicker() {
+        const list = document.getElementById("move-branch-list");
+        const summary = document.getElementById("move-branch-summary");
+        if (!list || !summary) return;
+        const items = moveBranchPickerItems(guardians, moveBranchPicker.gid, moveBranchPicker.query);
+        moveBranchPicker.selected = Math.max(0, Math.min(items.length - 1, moveBranchPicker.selected));
+        const reviews = items.length - 1;
+        summary.textContent = `New review, or ${reviews} open review${reviews === 1 ? "" : "s"}${moveBranchPicker.query.trim() ? " matching the search" : ""}.`;
+        list.innerHTML = items.map((item, index) =>
+          `<button type="button" id="move-branch-row-${index}" class="goto-search-row${index === moveBranchPicker.selected ? " selected" : ""}" data-click="selectMoveBranchPickerRow" data-index="${index}" ondblclick="confirmMoveOrExtractBranch()" data-tip="${esc(item.id === "__new__" ? "Move the branch into a brand-new review of its own.\nWho/when: this review is stalled or blocked by another branch, but this branch should ship on its own." : `Move the branch into "${item.title}".\nBlocked if either review has an active merge/rebase.`)}"><span style="font-weight:600">${esc(item.title)}</span><br><span style="font-size:12px;color:var(--muted)">${esc(item.detail)}</span></button>`).join("");
+        document.getElementById(`move-branch-row-${moveBranchPicker.selected}`)?.scrollIntoView({ block: "nearest" });
+      }
+      /**
+       * Applies a new search query to the picker.
+       * @param {string} value
+       * @returns {void}
+       */
+      function moveBranchPickerInput(value) {
+        moveBranchPicker.query = value;
+        moveBranchPicker.selected = 0;
+        renderMoveBranchPicker();
+      }
+      /**
+       * Selects one picker row.
+       * @param {number} index
+       * @returns {void}
+       */
+      function selectMoveBranchPickerRow(index) {
+        moveBranchPicker.selected = index;
+        renderMoveBranchPicker();
+      }
+      /**
+       * Keyboard navigation for the picker's search box.
+       * @param {KeyboardEvent} event
+       * @returns {void}
+       */
+      function moveBranchPickerKeydown(event) {
+        const count = moveBranchPickerItems(guardians, moveBranchPicker.gid, moveBranchPicker.query).length;
+        if (event.key === "ArrowDown") {
+          event.preventDefault();
+          moveBranchPicker.selected = Math.min(count - 1, moveBranchPicker.selected + 1);
+          renderMoveBranchPicker();
+        } else if (event.key === "ArrowUp") {
+          event.preventDefault();
+          moveBranchPicker.selected = Math.max(0, moveBranchPicker.selected - 1);
+          renderMoveBranchPicker();
+        } else if (event.key === "Enter") {
+          event.preventDefault();
+          confirmMoveOrExtractBranch();
+        }
+      }
+      /**
+       * Moves the branch to the picker's selected row: a new review, or an
+       * existing one.
        * @returns {Promise<void>}
        */
-      async function confirmMoveOrExtractBranch(gid, branchId) {
-        const picked = /** @type {HTMLInputElement|null} */ (document.querySelector('input[name="move-branch-target"]:checked'));
-        const target = picked ? picked.value : "";
+      async function confirmMoveOrExtractBranch() {
+        const { gid, branchId, query, selected } = moveBranchPicker;
+        const target = (moveBranchPickerItems(guardians, gid, query)[selected] || { id: "" }).id;
         closeModal();
-        if (!target) return;
+        if (!target || !gid || !branchId) return;
         if (target === "__new__") await extractBranch(gid, branchId);
         else await moveBranchTo(gid, branchId, target);
       }

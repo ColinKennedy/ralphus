@@ -10,6 +10,12 @@
        * @property {[string, string]|null} [branch] - `[review id, branch]` this cell's branch sits in, if any.
        */
       /**
+       * @typedef {object} MoveBranchPickerItem
+       * @property {string} id - A review id, or `__new__` for a new review.
+       * @property {string} title - The row's name.
+       * @property {string} detail - The row's second line.
+       */
+      /**
        * @typedef {object} CellMenuAction
        * @property {"unblock"|"edit"|"restart"|"ignore"|"copy"|"copy-branch"} key - Which action the item runs.
        * @property {string} label - Menu text.

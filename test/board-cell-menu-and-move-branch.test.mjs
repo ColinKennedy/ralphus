@@ -38,6 +38,7 @@ function slice(marker, name) {
 
 const cellMenuActions = slice("RALPHUS-CELL-MENU-ACTIONS", "cellMenuActions");
 const moveBranchTargets = slice("RALPHUS-MOVE-BRANCH-TARGETS", "moveBranchTargets");
+const moveBranchPickerItems = slice("RALPHUS-MOVE-BRANCH-TARGETS", "moveBranchPickerItems");
 
 const blocking = { failure_count: 2, threshold: 2, blocked_cells: 1, blocked_branches: 1, branch: ["g-1", "b"] };
 const keys = (actions) => actions.map((a) => a.key);
@@ -101,14 +102,36 @@ test("a review branch has one Move or extract action instead of two", () => {
   assert.doesNotMatch(html, /openMoveBranchMenu/);
 });
 
-test("the Move or extract popup offers a new review first, then the open reviews", () => {
+const reviews = [
+  { id: "g-1", name: "here", status: "collecting" },
+  { id: "g-2", name: "frontend", status: "in_review" },
+  { id: "g-3", name: "backend", status: "collecting" },
+  { id: "g-4", name: "old", status: "merged" },
+];
+
+test("the picker lists New review… first, then every open review", () => {
+  const items = moveBranchPickerItems(reviews, "g-1", "");
+  assert.deepEqual(items.map((i) => i.id), ["__new__", "g-2", "g-3"]);
+  assert.equal(items[0].title, "New review…");
+  assert.match(items[0].detail, /same base branch and project/);
+  assert.match(items[1].detail, /Existing review · in_review/);
+});
+
+test("searching narrows the reviews but always keeps New review… on top", () => {
+  assert.deepEqual(moveBranchPickerItems(reviews, "g-1", "front").map((i) => i.id), ["__new__", "g-2"]);
+  assert.deepEqual(moveBranchPickerItems(reviews, "g-1", "G-3").map((i) => i.id), ["__new__", "g-3"]);
+  assert.deepEqual(moveBranchPickerItems(reviews, "g-1", "nothing like it").map((i) => i.id), ["__new__"]);
+});
+
+test("the picker uses the Go To Task list styling and keys", () => {
   const start = html.indexOf("function openMoveOrExtractBranch(");
-  const end = html.indexOf("async function confirmMoveOrExtractBranch(", start);
-  assert.ok(start !== -1 && end > start, "could not find openMoveOrExtractBranch");
+  const end = html.indexOf("function renderMoveBranchPicker(", start);
   const body = html.slice(start, end);
-  assert.match(body, /row\("__new__", "New review"/);
-  assert.match(body, /moveBranchTargets\(guardians, gid\)/);
-  assert.match(body, /same base branch and project/);
+  assert.match(body, /class="modal goto-search-modal"/);
+  assert.match(body, /class="goto-search-input"/);
+  assert.match(body, /class="goto-search-list"/);
+  assert.match(html, /class="goto-search-row\$\{index === moveBranchPicker\.selected \? " selected" : ""\}"/);
+  assert.match(html, /function moveBranchPickerKeydown\(event\)/);
 });
 
 test("confirming sends a new review to extract and an existing one to move", () => {

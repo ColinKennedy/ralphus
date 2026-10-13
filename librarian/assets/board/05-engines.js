@@ -250,7 +250,8 @@
       CLICK_HANDLERS.toggleBranchEnabled = (e, ds) => { e.stopPropagation(); toggleBranchEnabled(ds.guardianId || "", ds.branch || ""); };
       CLICK_HANDLERS.dismissReenable = (e, ds) => { e.stopPropagation(); dismissReenable(ds.guardianId || "", ds.branchId || ""); };
       CLICK_HANDLERS.openMoveOrExtractBranch = (e, ds) => { e.stopPropagation(); openMoveOrExtractBranch(ds.guardianId || "", ds.branchId || ""); };
-      CLICK_HANDLERS.confirmMoveOrExtractBranch = (e, ds) => confirmMoveOrExtractBranch(ds.guardianId || "", ds.branchId || "");
+      CLICK_HANDLERS.confirmMoveOrExtractBranch = () => confirmMoveOrExtractBranch();
+      CLICK_HANDLERS.selectMoveBranchPickerRow = (e, ds) => selectMoveBranchPickerRow(Number(ds.index));
       CLICK_HANDLERS.selectBranchRow = (e, ds) => selectBranchRow(e, ds.guardianId || "", ds.branch || "", ds.branchId || "");
       CLICK_HANDLERS.setInspectorTab = (e, ds) => setInspectorTab(ds.tab || "overview");
       CLICK_HANDLERS.toggleReviewDock = () => toggleReviewDock();
