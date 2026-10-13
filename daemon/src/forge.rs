@@ -77,6 +77,18 @@ pub(crate) fn bounded_http_agent(read_timeout: Duration) -> ureq::Agent {
         .build()
 }
 
+/// The Actions job id in a GitHub job URL
+/// (`https://github.com/o/r/actions/runs/{run}/job/{id}`).
+fn github_job_id(job_url: &str) -> Option<i64> {
+    job_url
+        .split("/job/")
+        .nth(1)?
+        .split(['/', '?', '#'])
+        .next()?
+        .parse()
+        .ok()
+}
+
 /// The shared agent for forge API calls. Memoized so every request reuses
 /// one connection pool rather than building a new agent (and pool) per call.
 #[must_use]
@@ -1674,13 +1686,7 @@ impl ForgeClient {
         if self.kind != ForgeKind::GitHub {
             return None;
         }
-        let job_id: i64 = job_url
-            .split("/job/")
-            .nth(1)?
-            .split(['/', '?', '#'])
-            .next()?
-            .parse()
-            .ok()?;
+        let job_id = github_job_id(job_url)?;
         let token = self.require_token().ok()?;
         let url = format!(
             "{}/repos/{}/actions/jobs/{job_id}",
@@ -1705,6 +1711,42 @@ impl ForgeClient {
             })
             .and_then(|s| s["name"].as_str())
             .map(str::to_string)
+    }
+
+    /// Raw text of a GitHub Actions job's log, given that job's `job_url` --
+    /// the GitHub counterpart of [`Self::gitlab_job_trace`]. GitHub's
+    /// check-run `output.text` is almost always empty for an Actions job, so
+    /// without this the auto-fix agent gets no log at all. `GET
+    /// .../actions/jobs/{id}/logs` answers with a redirect to a short-lived
+    /// signed URL, which ureq follows without forwarding the token -- that
+    /// signed URL expires within minutes, which is why the text itself is
+    /// fetched here rather than any link being handed to the fixer. A log
+    /// over ureq's 10 MB `into_string` cap also yields `None`. The
+    /// browser-facing `.../commit/{sha}/checks/{id}/logs` page is no
+    /// substitute: it needs a signed-in web session and answers 404 to an API
+    /// token.
+    ///
+    /// No-op (`None`) for a non-GitHub client, an unparseable `job_url`, or any
+    /// forge-call failure -- the agent is then told to look the job URL up.
+    pub fn github_job_log(&self, job_url: &str) -> Option<String> {
+        if self.kind != ForgeKind::GitHub {
+            return None;
+        }
+        let job_id = github_job_id(job_url)?;
+        let token = self.require_token().ok()?;
+        let url = format!(
+            "{}/repos/{}/actions/jobs/{job_id}/logs",
+            self.api_base, self.repo_path
+        );
+        let text = http_agent()
+            .get(&url)
+            .set("Authorization", &format!("Bearer {token}"))
+            .set("Accept", "application/vnd.github+json")
+            .call()
+            .ok()?
+            .into_string()
+            .ok()?;
+        (!text.trim().is_empty()).then_some(text)
     }
 
     /// Raw text of a GitLab job's trace log (`GET .../jobs/{id}/trace`) --
@@ -8377,6 +8419,44 @@ mod tests {
                 ..Default::default()
             })
         );
+        mock.finish();
+    }
+
+    /// GitHub's job-log endpoint redirects to a signed blob URL: the log text
+    /// must come back through that redirect, and the token must not follow it.
+    #[test]
+    fn github_job_log_follows_the_signed_redirect_without_the_token() {
+        let mock = MockForge::start(move |server| {
+            let req = server.recv();
+            assert_eq!(req.url(), "/repos/o/r/actions/jobs/115032855534/logs");
+            assert!(req.headers().iter().any(|h| h.field.equiv("Authorization")));
+            req.respond(
+                tiny_http::Response::empty(302).with_header(
+                    "Location: /blob/job-logs.txt?sig=abc"
+                        .parse::<tiny_http::Header>()
+                        .unwrap(),
+                ),
+            )
+            .unwrap();
+            let req = server.recv();
+            assert_eq!(req.url(), "/blob/job-logs.txt?sig=abc");
+            assert!(
+                !req.headers().iter().any(|h| h.field.equiv("Authorization")),
+                "the token must not be forwarded to the signed URL"
+            );
+            req.respond(
+                tiny_http::Response::from_string("error[E0308]: mismatched types\n")
+                    .with_status_code(200),
+            )
+            .unwrap();
+        });
+        let client = mock.client(ForgeKind::GitHub, "o/r");
+        assert_eq!(
+            client
+                .github_job_log("https://github.com/o/r/actions/runs/38316063837/job/115032855534"),
+            Some("error[E0308]: mismatched types\n".to_string())
+        );
+        assert_eq!(client.github_job_log("https://github.com/o/r/pull/1"), None);
         mock.finish();
     }
 

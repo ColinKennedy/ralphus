@@ -1282,8 +1282,8 @@ fn write_ci_failure_log(path: &Path, log_text: &str) -> Option<PathBuf> {
 
 /// Render one failing check/job as a self-contained paragraph for the
 /// auto-fix prompt (RAL-<new>): its reason, its own job URL (when the forge
-/// gave one), where its own log ended up (or a note that none was
-/// available), and (RAL-533) an instruction to reproduce/verify against the
+/// gave one), where its own log ended up (or, without one, an instruction to
+/// look the failure up at that job URL), and (RAL-533) an instruction to reproduce/verify against the
 /// exact command that step ran rather than a reconstructed guess --
 /// everything [`dispatch_pr_auto_fix`] joins one of these per failing check
 /// into the final prompt, so an agent facing several failures at once gets
@@ -1319,6 +1319,18 @@ fn describe_failing_check(
         .job_url
         .as_deref()
         .map_or_else(String::new, |url| format!("Failing job: {url}\n"));
+    // With no log on disk, the job URL is where the failure lives: tell the
+    // agent to go read it, rather than that a log is missing -- agents read
+    // "no log" as "no information" and stop looking.
+    let look_up_note = match check.job_url.as_deref() {
+        Some(url) => format!(
+            "Look up {url} to find out what the error was: read that job's output (or query \
+             the forge's API for its log) before changing anything."
+        ),
+        None => "Look up this pull request's CI checks on the forge to find out what the \
+                 error was before changing anything."
+            .to_string(),
+    };
     let log_note = match (worktree, &check.log_text) {
         (Some(worktree), Some(log_text)) => {
             let line_count = log_text.lines().count();
@@ -1341,17 +1353,10 @@ fn describe_failing_check(
                         path.display()
                     )
                 }
-                None => "The CI failure log could not be written to disk; \
-                         only the failure summary below is available."
-                    .to_string(),
+                None => look_up_note,
             }
         }
-        (_, Some(_)) => {
-            "A CI failure log is available from the forge, but this branch has no known \
-             worktree path to write it into."
-                .to_string()
-        }
-        (_, None) => "The forge did not provide a CI failure log for this job.".to_string(),
+        (_, _) => look_up_note,
     };
     // RAL-533: agents were reconstructing a plausible-looking but wrong
     // reproduction command (e.g. `cargo test` when this repo's CI actually
@@ -1798,6 +1803,19 @@ fn run_pr_fix(
                         .job_url
                         .as_deref()
                         .and_then(|url| client.github_failing_step(url)),
+                    // GitHub's check-run rarely carries the log itself; fetch
+                    // the job's raw log so the fixer gets it on disk, the same
+                    // way a GitLab job's trace already arrives.
+                    log_text: check
+                        .log_text
+                        .clone()
+                        .filter(|text| !text.trim().is_empty())
+                        .or_else(|| {
+                            check
+                                .job_url
+                                .as_deref()
+                                .and_then(|url| client.github_job_log(url))
+                        }),
                     ..check.clone()
                 };
                 describe_failing_check(
@@ -2124,6 +2142,35 @@ mod tests {
                 "not a similar-looking one reconstructed from memory or project convention"
             ),
             "must warn against guessing an equivalent command: {text}"
+        );
+    }
+
+    /// Without a log on disk the agent must be sent to the job URL, never
+    /// told the log is missing -- fixers read "no log" as "nothing to go on"
+    /// and declared the branch fine without ever opening the job.
+    #[test]
+    fn describe_failing_check_without_a_log_says_to_look_up_the_job_url() {
+        let check = FailedCheck {
+            name: "build".to_string(),
+            job_url: Some("https://ci.example/job/1".to_string()),
+            log_text: None,
+            failing_step: None,
+        };
+        let text = describe_failing_check(None, &check, "check 'build' failed", true);
+        assert!(
+            text.contains("Look up https://ci.example/job/1 to find out what the error was"),
+            "{text}"
+        );
+        assert!(!text.contains("did not provide"), "{text}");
+
+        let no_url = FailedCheck {
+            job_url: None,
+            ..check
+        };
+        let text = describe_failing_check(None, &no_url, "check 'build' failed", true);
+        assert!(
+            text.contains("Look up this pull request's CI checks"),
+            "{text}"
         );
     }
 
