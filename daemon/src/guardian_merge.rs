@@ -12460,13 +12460,33 @@ const FEEDBACK_LOG_TEXT_CHARS: usize = 2000;
 /// cleared where possible, and when it still cannot be reused the next sibling
 /// (`review-postmerge-1`, ...) is claimed instead. Actions record the directory
 /// they were prepared in, so they follow whichever one this returns.
+///
+/// RAL-642: a directory an action or live run still holds
+/// ([`crate::checkout_hold`]) is never removed, reset or cleaned -- the next
+/// sibling is claimed instead, and the running work finishes against the
+/// checkout it started in.
 fn claim_post_merge_checkout(
     ws_root: &Workspace,
     combined_ws: &Workspace,
     parent: &Path,
     tip: &str,
 ) -> std::result::Result<PathBuf, String> {
+    claim_post_merge_checkout_with(ws_root, combined_ws, parent, tip, &|dir| {
+        crate::checkout_hold::is_held(&dir.to_string_lossy())
+    })
+}
+
+/// [`claim_post_merge_checkout`] with the "is this directory held" check
+/// supplied by the caller.
+fn claim_post_merge_checkout_with(
+    ws_root: &Workspace,
+    combined_ws: &Workspace,
+    parent: &Path,
+    tip: &str,
+    is_held: &dyn Fn(&Path) -> bool,
+) -> std::result::Result<PathBuf, String> {
     let mut last_error = String::new();
+    let mut held = Vec::new();
     for attempt in 0..POST_MERGE_CHECKOUT_ATTEMPTS {
         let dir = if attempt == 0 {
             parent.join(POST_MERGE_WORKTREE_DIR)
@@ -12475,6 +12495,10 @@ fn claim_post_merge_checkout(
         };
         let ws = ws_root.at(&dir);
         let dir_str = dir.to_string_lossy().to_string();
+        if is_held(&dir) {
+            held.push(dir_str);
+            continue;
+        }
         if ws.root().exists() {
             let _ = combined_ws.git(&["worktree", "remove", "--force", &dir_str]);
         }
@@ -12508,6 +12532,13 @@ fn claim_post_merge_checkout(
         last_error = format!(
             "post-merge scratch directory {dir_str} is not a worktree and could not be cleared"
         );
+    }
+    if held.len() == POST_MERGE_CHECKOUT_ATTEMPTS {
+        return Err(format!(
+            "every prepared checkout directory is in use by a running action or live run ({}); \
+             wait for those runs to finish (or close their terminals) and rebuild",
+            held.join(", ")
+        ));
     }
     Err(last_error)
 }
@@ -23194,6 +23225,104 @@ mod tests {
         assert_eq!(dir, parent.join(format!("{POST_MERGE_WORKTREE_DIR}-1")));
         assert!(is_valid_linked_worktree(&Workspace::local(&dir)));
         assert_eq!(head_of(&dir), tip);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A new commit on `repo`, returning its hash.
+    fn commit_empty(repo: &Path, message: &str) -> String {
+        Workspace::local(repo)
+            .git(&[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@example.com",
+                "commit",
+                "--allow-empty",
+                "-m",
+                message,
+            ])
+            .unwrap();
+        head_of(repo)
+    }
+
+    /// RAL-642: a checkout an action is still running in keeps its files and
+    /// its commit while a newer generation is prepared in a sibling.
+    #[test]
+    fn claiming_the_post_merge_checkout_never_resets_a_held_one() {
+        let (base, repo, _fwt) = make_repo("claim-held");
+        let root = Workspace::local(&repo);
+        let parent = base.join("pm-parent");
+        std::fs::create_dir_all(&parent).unwrap();
+        let first_tip = head_of(&repo);
+        let first =
+            claim_post_merge_checkout_with(&root, &root, &parent, &first_tip, &|_| false).unwrap();
+        std::fs::write(first.join("build-output.txt"), "in use").unwrap();
+
+        let next_tip = commit_empty(&repo, "newer review tip");
+        let held = first.clone();
+        let second =
+            claim_post_merge_checkout_with(&root, &root, &parent, &next_tip, &|dir| dir == held)
+                .unwrap();
+
+        assert_eq!(second, parent.join(format!("{POST_MERGE_WORKTREE_DIR}-1")));
+        assert_eq!(head_of(&second), next_tip);
+        assert_eq!(
+            head_of(&first),
+            first_tip,
+            "the held checkout must not be moved to the newer tip"
+        );
+        assert_eq!(
+            std::fs::read_to_string(first.join("build-output.txt")).unwrap(),
+            "in use",
+            "the held checkout must not be cleaned"
+        );
+
+        // Released, the usual directory is reused again rather than leaving
+        // siblings to pile up.
+        let third =
+            claim_post_merge_checkout_with(&root, &root, &parent, &next_tip, &|_| false).unwrap();
+        assert_eq!(third, first);
+        assert_eq!(head_of(&third), next_tip);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn claiming_the_post_merge_checkout_fails_clearly_when_every_candidate_is_held() {
+        let (base, repo, _fwt) = make_repo("claim-all-held");
+        let root = Workspace::local(&repo);
+        let parent = base.join("pm-parent");
+        std::fs::create_dir_all(&parent).unwrap();
+        let tip = head_of(&repo);
+        let error = claim_post_merge_checkout_with(&root, &root, &parent, &tip, &|_| true)
+            .expect_err("nothing may be reset when every directory is in use");
+        assert!(error.contains("in use by a running action"), "{error}");
+        assert!(
+            !parent.join(POST_MERGE_WORKTREE_DIR).exists(),
+            "no checkout is created or touched"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The production claim consults the real hold records.
+    #[test]
+    fn claiming_the_post_merge_checkout_respects_a_recorded_hold() {
+        let (base, repo, _fwt) = make_repo("claim-recorded-hold");
+        let root = Workspace::local(&repo);
+        let parent = base.join("pm-parent");
+        std::fs::create_dir_all(&parent).unwrap();
+        let first_tip = head_of(&repo);
+        let first = claim_post_merge_checkout(&root, &root, &parent, &first_tip).unwrap();
+        let hold = crate::checkout_hold::hold(
+            &first.to_string_lossy(),
+            "test",
+            std::time::Duration::from_secs(60),
+        )
+        .unwrap();
+        let next_tip = commit_empty(&repo, "newer review tip");
+        let second = claim_post_merge_checkout(&root, &root, &parent, &next_tip).unwrap();
+        assert_ne!(second, first);
+        assert_eq!(head_of(&first), first_tip);
+        drop(hold);
         let _ = std::fs::remove_dir_all(&base);
     }
 

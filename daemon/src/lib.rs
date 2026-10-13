@@ -22,6 +22,7 @@ pub mod cell_blocking;
 pub mod cell_copy;
 pub mod channel;
 pub mod chat_client;
+pub mod checkout_hold;
 pub mod ci_watch;
 pub mod config;
 pub mod cpu_stall;

@@ -19050,6 +19050,12 @@ fn check_run_note(
 ///
 /// `kind` is `"manual"` for a generated manual check and `"action"` for a
 /// `[[review.action]]` hint; `index` is the check's position in that list.
+///
+/// `hold` (RAL-642) is the run's hold on its working directory, taken by the
+/// caller before the terminal was spawned. The watcher keeps it until the run
+/// reports or times out, so a newer preparation generation never resets the
+/// checkout under a running check.
+#[allow(clippy::too_many_arguments)]
 fn watch_check_run(
     store: crate::store_lock::StoreHandle,
     guardian_id: &str,
@@ -19057,6 +19063,7 @@ fn watch_check_run(
     index: usize,
     prepared: &PreparedCheck,
     auto: bool,
+    hold: Option<crate::checkout_hold::CheckoutHold>,
 ) -> std::thread::JoinHandle<Option<i32>> {
     let result_path = check_run_result_path(guardian_id, kind, index);
     // The previous run's recorded result would otherwise be served as this
@@ -19080,6 +19087,7 @@ fn watch_check_run(
     let marker_path = prepared.marker_path.clone();
     let log_path = prepared.log_path.clone();
     std::thread::spawn(move || {
+        let _hold = hold;
         let started = std::time::Instant::now();
         let exit_code = loop {
             if let Some(code) = read_check_run_marker(&marker_path) {
@@ -19128,6 +19136,31 @@ fn watch_check_run(
     })
 }
 
+/// RAL-642: hold a check run's working directory before its terminal is
+/// spawned. A failure to write the hold only loses the protection, so it is
+/// logged and the run still goes ahead.
+fn hold_check_run_cwd(
+    guardian_id: &str,
+    kind: &str,
+    index: usize,
+    cwd: &str,
+) -> Option<crate::checkout_hold::CheckoutHold> {
+    match crate::checkout_hold::hold(
+        cwd,
+        &format!("check-run:{guardian_id}:{kind}:{index}"),
+        CHECK_RUN_MARKER_TIMEOUT,
+    ) {
+        Ok(hold) => Some(hold),
+        Err(e) => {
+            crate::rlog!(
+                WARNING,
+                "ralphus [guardian] review {guardian_id} could not record that {kind} check {index} is using {cwd}: {e}"
+            );
+            None
+        }
+    }
+}
+
 /// RAL-565: run one ready check unattended, in the same visible terminal a
 /// click would open, and wait for it. Returns the check's exit code, `Some(None)`
 /// when the watcher gave up waiting for one, or `None` when no terminal could be
@@ -19161,6 +19194,7 @@ pub(crate) fn run_check_unattended(
         &marker,
         &log,
     )?;
+    let hold = hold_check_run_cwd(id, kind, index, &cwd);
     if let Err(e) = spawn_in_terminal(None, "cmd", &prepared.args, &g.manual_checks_env) {
         crate::rlog!(
             WARNING,
@@ -19169,7 +19203,7 @@ pub(crate) fn run_check_unattended(
         return None;
     }
     Some(
-        watch_check_run(store.clone(), id, kind, index, &prepared, true)
+        watch_check_run(store.clone(), id, kind, index, &prepared, true, hold)
             .join()
             .unwrap_or(None),
     )
@@ -19230,9 +19264,10 @@ fn guardian_run_manual_commands(daemon: &Daemon, id: &str, body: &str) -> Reply 
         return reply;
     }
 
-    // Run against the built review worktree (e.g. `<id>-review`), not the
-    // original repo — that's the checkout the commands are meant to verify
-    // Fall back to git_root only if the review hasn't been built yet.
+    // Run in the checkout this check was prepared in (the review's prepared
+    // checkout, `review-postmerge`, or a directory its own preparation
+    // returned), then the combined worktree, and the original repo root only
+    // if the review hasn't been built yet.
     let mut errors: Vec<String> = Vec::new();
     for (index, check) in &to_run {
         if check.preparation_state.as_deref() != Some("ready") {
@@ -19278,6 +19313,7 @@ fn guardian_run_manual_commands(daemon: &Daemon, id: &str, body: &str) -> Reply 
             };
             prepared
         };
+        let hold = hold_check_run_cwd(id, "manual", *index, &cwd);
         match spawn_in_terminal(None, "cmd", &prepared.args, &g.manual_checks_env) {
             Ok(()) => {
                 watch_check_run(
@@ -19287,6 +19323,7 @@ fn guardian_run_manual_commands(daemon: &Daemon, id: &str, body: &str) -> Reply 
                     *index,
                     &prepared,
                     false,
+                    hold,
                 );
             }
             Err(e) => errors.push(e),
@@ -19403,9 +19440,9 @@ fn guardian_run_action_hint(daemon: &Daemon, id: &str, body: &str) -> Reply {
     }
 
     // Same reasoning as guardian_run_manual_commands, including the RAL-203
-    // manual-checks environment -- action hints run in the same combined
-    // worktree via the same terminal-spawning mechanism, so they inherit it
-    // too: prefer the built review worktree over the original repo root.
+    // manual-checks environment -- action hints run in the same prepared
+    // checkout via the same terminal-spawning mechanism, so they inherit it
+    // too.
     let cwd = hint
         .prepared_cwd
         .clone()
@@ -19440,6 +19477,7 @@ fn guardian_run_action_hint(daemon: &Daemon, id: &str, body: &str) -> Reply {
         )
     };
     if let Some(prepared) = prepared {
+        let hold = hold_check_run_cwd(id, "action", req.index, &cwd);
         let result = spawn_in_terminal(None, "cmd", &prepared.args, &g.manual_checks_env);
         if !req.inputs.is_empty() {
             let _ = daemon.lock().merge_guardian_input_values(id, &req.inputs);
@@ -19453,6 +19491,7 @@ fn guardian_run_action_hint(daemon: &Daemon, id: &str, body: &str) -> Reply {
                     req.index,
                     &prepared,
                     false,
+                    hold,
                 );
                 json(200, &OpenTerminalResponse { ok: true })
             }
