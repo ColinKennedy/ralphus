@@ -249,6 +249,9 @@
       CLICK_HANDLERS.dismissReenable = (e, ds) => { e.stopPropagation(); dismissReenable(ds.guardianId || "", ds.branchId || ""); };
       CLICK_HANDLERS.openMoveOrExtractBranch = (e, ds) => { e.stopPropagation(); openMoveOrExtractBranch(ds.guardianId || "", ds.branchId || ""); };
       CLICK_HANDLERS.confirmMoveOrExtractBranch = () => confirmMoveOrExtractBranch();
+      CLICK_HANDLERS.moveBranchPlacementStep = (e, ds) => moveBranchPlacementStep(Number(ds.delta));
+      CLICK_HANDLERS.moveBranchPlacementBack = () => moveBranchPlacementBack();
+      CLICK_HANDLERS.confirmMoveBranchPlacement = () => confirmMoveBranchPlacement();
       CLICK_HANDLERS.selectMoveBranchPickerRow = (e, ds) => selectMoveBranchPickerRow(Number(ds.index));
       CLICK_HANDLERS.selectBranchRow = (e, ds) => selectBranchRow(e, ds.guardianId || "", ds.branch || "", ds.branchId || "");
       CLICK_HANDLERS.setInspectorTab = (e, ds) => setInspectorTab(ds.tab || "overview");

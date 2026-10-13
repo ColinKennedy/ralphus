@@ -2507,10 +2507,15 @@ from worktrees belonging to other reviews"). `branch_id` is the branch's
 stable id (RAL-122, e.g. `branch-000000000042`) — not its stack position,
 which changes under reorder and isn't a valid addressing key. Body:
 ```json
-{ "to_guardian_id": "guardian-000000000002" }
+{ "to_guardian_id": "guardian-000000000002", "position": 1 }
 ```
+`position` is optional (RAL-641): where the branch lands in `to_guardian_id`'s
+stack, `0` being the bottom (built first). The branches from that position up
+shift up by one. Without it, or with a position at or past the end, the branch
+is appended to the top of the stack.
+
 This is a **move, not a copy** (see "Future: copy mode" below): the branch leaves `{id}`'s stack entirely and is
-appended to the end of `to_guardian_id`'s stack. `{id}`'s remaining branches
+placed in `to_guardian_id`'s stack as above. `{id}`'s remaining branches
 are renumbered to stay contiguous, but the moved branch's `branch_id` itself
 is unchanged by the move — the same id continues to address it in its new
 review. The moved branch's merge state is reset to

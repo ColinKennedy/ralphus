@@ -40,6 +40,7 @@ function slice(marker, name) {
 const cellMenuActions = slice("RALPHUS-CELL-MENU-ACTIONS", "cellMenuActions");
 const moveBranchTargets = slice("RALPHUS-MOVE-BRANCH-TARGETS", "moveBranchTargets");
 const moveBranchPickerItems = slice("RALPHUS-MOVE-BRANCH-TARGETS", "moveBranchPickerItems");
+const moveBranchPlacementRows = slice("RALPHUS-MOVE-BRANCH-PLACEMENT", "moveBranchPlacementRows");
 
 const blocking = { failure_count: 2, threshold: 2, blocked_cells: 1, blocked_branches: 1, branch: ["g-1", "b"] };
 const keys = (actions) => actions.map((a) => a.key);
@@ -139,12 +140,42 @@ test("the picker uses the Go To Task list styling and keys", () => {
   assert.match(html, /function moveBranchPickerKeydown\(event\)/);
 });
 
-test("confirming sends a new review to extract and an existing one to move", () => {
+test("confirming extracts for a new review and opens the placement step for an existing one", () => {
   const start = html.indexOf("async function confirmMoveOrExtractBranch(");
+  const end = html.indexOf("async function openMoveBranchPlacement(", start);
+  assert.ok(start !== -1 && end > start, "could not find confirmMoveOrExtractBranch");
+  const body = html.slice(start, end);
+  assert.match(body, /if \(target === "__new__"\) \{ closeModal\(\); await extractBranch\(gid, branchId\); return; \}/);
+  assert.match(body, /await openMoveBranchPlacement\(target\);/);
+  assert.doesNotMatch(body, /moveBranchTo\(/, "an existing review is never moved into without placing the branch first");
+});
+
+test("the placement step starts with the moved branch at the top of the list", () => {
+  const rows = moveBranchPlacementRows(["x", "y", "z"], "m", 0);
+  assert.deepEqual(rows, [
+    { branch: "m", moving: true },
+    { branch: "x", moving: false },
+    { branch: "y", moving: false },
+    { branch: "z", moving: false },
+  ]);
+  assert.match(html, /dest: \(detail\.branches \|\| \[\]\)\.map\(\(b\) => b\.branch\),\s*index: 0,/);
+});
+
+test("placing the branch keeps the other branches in their order", () => {
+  const names = (rows) => rows.map((r) => r.branch);
+  assert.deepEqual(names(moveBranchPlacementRows(["x", "y", "z"], "m", 2)), ["x", "y", "m", "z"]);
+  assert.deepEqual(names(moveBranchPlacementRows(["x", "y", "z"], "m", 3)), ["x", "y", "z", "m"]);
+  assert.deepEqual(names(moveBranchPlacementRows(["x", "y", "z"], "m", 99)), ["x", "y", "z", "m"], "clamped to the top of the stack");
+  assert.deepEqual(names(moveBranchPlacementRows(["x", "y", "z"], "m", -4)), ["m", "x", "y", "z"], "clamped to the bottom of the stack");
+  assert.deepEqual(names(moveBranchPlacementRows([], "m", 0)), ["m"], "an empty review gets just the moved branch");
+});
+
+test("the placement step sends the chosen position with the move", () => {
+  const start = html.indexOf("async function confirmMoveBranchPlacement(");
   const end = html.indexOf("async function moveBranchTo(", start);
   const body = html.slice(start, end);
-  assert.match(body, /if \(target === "__new__"\) await extractBranch\(gid, branchId\);/);
-  assert.match(body, /else await moveBranchTo\(gid, branchId, target\);/);
+  assert.match(body, /await moveBranchTo\(gid, branchId, toId, index\);/);
+  assert.match(html, /\{ to_guardian_id: toId, position \}/);
 });
 
 test("a review branch row has no inline Ignore and continue button", () => {

@@ -2514,6 +2514,20 @@ impl Store {
         branch_id: &str,
         to_guardian_id: &str,
     ) -> Result<i64> {
+        self.move_guardian_branch_at(from_guardian_id, branch_id, to_guardian_id, None)
+    }
+
+    /// [`Self::move_guardian_branch`], placing the branch at `position` in the
+    /// destination's stack (0 is the bottom, built first) and shifting the
+    /// branches from there up by one. `None`, or a position at or past the end
+    /// of the destination's stack, appends.
+    pub fn move_guardian_branch_at(
+        &mut self,
+        from_guardian_id: &str,
+        branch_id: &str,
+        to_guardian_id: &str,
+        position: Option<usize>,
+    ) -> Result<i64> {
         if from_guardian_id == to_guardian_id {
             return Err(StoreError::InvalidTransition(
                 "source and destination review are the same".to_string(),
@@ -2597,11 +2611,30 @@ impl Store {
                 )?;
             }
         }
-        let new_position: i64 = tx.query_row(
+        let end: i64 = tx.query_row(
             "SELECT COALESCE(MAX(position) + 1, 0) FROM guardian_branches WHERE guardian_id=?",
             params![to_guardian_id],
             |r| r.get(0),
         )?;
+        let new_position = position
+            .and_then(|p| i64::try_from(p).ok())
+            .filter(|&p| p < end)
+            .unwrap_or(end);
+        if new_position < end {
+            // Open a slot at `new_position`: move the branches from there up
+            // by one, through the same out-of-range shift as the source
+            // compaction so no two rows share a position mid-transaction.
+            tx.execute(
+                "UPDATE guardian_branches SET position = position + ?1
+                 WHERE guardian_id=?2 AND position >= ?3",
+                params![SHIFT, to_guardian_id, new_position],
+            )?;
+            tx.execute(
+                "UPDATE guardian_branches SET position = position - ?1 + 1
+                 WHERE guardian_id=?2 AND position >= ?1",
+                params![SHIFT, to_guardian_id],
+            )?;
+        }
         tx.execute(
             // RAL-378: a moved branch is a fresh row under a different
             // review, and the move already discards its old review ref, so it
@@ -10355,6 +10388,91 @@ mod tests {
         let moved = &dest_view.branches[1];
         assert_eq!(moved.moved_from_guardian_id.as_deref(), Some(src.as_str()));
         assert_eq!(moved.merge_status, "pending");
+    }
+
+    /// Destination `(position, branch)` pairs after moving source branch "m"
+    /// into a destination holding x, y, z at `position`.
+    fn dest_order_after_move_at(position: Option<usize>) -> Vec<(i64, String)> {
+        let mut store = Store::open_in_memory().unwrap();
+        let src = store.create_guardian("r1", "main", "/repo").unwrap();
+        let dst = store.create_guardian("r2", "main", "/repo").unwrap();
+        store.add_guardian_branch(&src, "m").unwrap();
+        for b in ["x", "y", "z"] {
+            store.add_guardian_branch(&dst, b).unwrap();
+        }
+        let bid = store.get_guardian(&src).unwrap().branches[0].id.clone();
+        let ids_before: Vec<(String, String)> = store
+            .get_guardian(&dst)
+            .unwrap()
+            .branches
+            .iter()
+            .map(|b| (b.branch.clone(), b.id.clone()))
+            .collect();
+        let placed = store
+            .move_guardian_branch_at(&src, &bid, &dst, position)
+            .unwrap();
+        let view = store.get_guardian(&dst).unwrap();
+        let moved = view.branches.iter().find(|b| b.branch == "m").unwrap();
+        assert_eq!(
+            moved.position, placed,
+            "returned position is where it landed"
+        );
+        assert_eq!(moved.id, bid, "the moved branch keeps its id");
+        for (branch, id) in ids_before {
+            let row = view.branches.iter().find(|b| b.branch == branch).unwrap();
+            assert_eq!(row.id, id, "{branch} keeps its id when shifted");
+        }
+        view.branches
+            .iter()
+            .map(|b| (b.position, b.branch.clone()))
+            .collect()
+    }
+
+    #[test]
+    fn move_guardian_branch_at_places_the_branch_and_keeps_the_stack_contiguous() {
+        let expect = |names: [&str; 4]| -> Vec<(i64, String)> {
+            (0..).zip(names.iter().map(|n| n.to_string())).collect()
+        };
+        assert_eq!(
+            dest_order_after_move_at(Some(0)),
+            expect(["m", "x", "y", "z"]),
+            "position 0 puts the branch at the bottom of the stack"
+        );
+        assert_eq!(
+            dest_order_after_move_at(Some(2)),
+            expect(["x", "y", "m", "z"]),
+            "a middle position shifts only the branches above it"
+        );
+        assert_eq!(
+            dest_order_after_move_at(Some(3)),
+            expect(["x", "y", "z", "m"]),
+            "the end position appends"
+        );
+        assert_eq!(
+            dest_order_after_move_at(Some(99)),
+            expect(["x", "y", "z", "m"]),
+            "a position past the end appends"
+        );
+        assert_eq!(
+            dest_order_after_move_at(None),
+            expect(["x", "y", "z", "m"]),
+            "no position appends, as move_guardian_branch always has"
+        );
+    }
+
+    #[test]
+    fn move_guardian_branch_at_into_an_empty_review_lands_at_zero() {
+        let mut store = Store::open_in_memory().unwrap();
+        let src = store.create_guardian("r1", "main", "/repo").unwrap();
+        let dst = store.create_guardian("r2", "main", "/repo").unwrap();
+        store.add_guardian_branch(&src, "m").unwrap();
+        let bid = store.get_guardian(&src).unwrap().branches[0].id.clone();
+        assert_eq!(
+            store
+                .move_guardian_branch_at(&src, &bid, &dst, Some(5))
+                .unwrap(),
+            0
+        );
     }
 
     #[test]

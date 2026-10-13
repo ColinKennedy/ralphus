@@ -3283,8 +3283,27 @@ Press Accept on the note to create it.">Squad pending</span>`;
         return items;
       }
       // RALPHUS-MOVE-BRANCH-TARGETS:END
+      // RALPHUS-MOVE-BRANCH-PLACEMENT:BEGIN
+      /**
+       * The destination review's stack as the placement step shows it: its
+       * branches in stack order (bottom first), with the branch being moved
+       * inserted at `index` (clamped to the stack).
+       * @param {string[]} destBranches - The destination's branch names, bottom of the stack first.
+       * @param {string} moving - The name of the branch being moved.
+       * @param {number} index - Where the moved branch goes; 0 is the bottom of the stack.
+       * @returns {{branch: string, moving: boolean}[]}
+       */
+      function moveBranchPlacementRows(destBranches, moving, index) {
+        const at = Math.max(0, Math.min(destBranches.length, Math.trunc(index)));
+        const rows = destBranches.map((branch) => ({ branch, moving: false }));
+        rows.splice(at, 0, { branch: moving, moving: true });
+        return rows;
+      }
+      // RALPHUS-MOVE-BRANCH-PLACEMENT:END
       /** What the open "Move or extract branch" picker is moving, its query and its selected row. */
-      let moveBranchPicker = { gid: "", branchId: "", query: "", selected: 0 };
+      let moveBranchPicker = { gid: "", branchId: "", branchName: "", query: "", selected: 0 };
+      /** The placement step: the chosen review, its branches (bottom first) and where the moved branch sits. */
+      let moveBranchPlacement = { toId: "", toName: "", dest: /** @type {string[]} */ ([]), index: 0 };
       /**
        * Opens the "Move or extract branch" picker: a searchable list with
        * "New review…" at the top and every open review below it (same look
@@ -3295,9 +3314,9 @@ Press Accept on the note to create it.">Squad pending</span>`;
        */
       function openMoveOrExtractBranch(gid, branchId) {
         closeSquadMenu();
-        moveBranchPicker = { gid, branchId, query: "", selected: 0 };
         const g = guardians.find((x) => x.id === gid);
         const branch = (g && g.branches && (g.branches.find((x) => x.id === branchId) || {}).branch) || branchId;
+        moveBranchPicker = { gid, branchId, branchName: branch, query: "", selected: 0 };
         byId("modal-root").innerHTML = `
           <div class="modal-bg" onclick="if(event.target===this)closeModal()"><div class="modal goto-search-modal">
             <h2>Move or extract ${esc(branch)}</h2>
@@ -3370,17 +3389,118 @@ Press Accept on the note to create it.">Squad pending</span>`;
         }
       }
       /**
-       * Moves the branch to the picker's selected row: a new review, or an
-       * existing one.
+       * Acts on the picker's selected row: a new review extracts the branch
+       * straight away; an existing review opens the placement step, where the
+       * branch is put where it belongs in that review's stack.
        * @returns {Promise<void>}
        */
       async function confirmMoveOrExtractBranch() {
         const { gid, branchId, query, selected } = moveBranchPicker;
         const target = (moveBranchPickerItems(guardians, gid, query)[selected] || { id: "" }).id;
+        if (!target || !gid || !branchId) { closeModal(); return; }
+        if (target === "__new__") { closeModal(); await extractBranch(gid, branchId); return; }
+        await openMoveBranchPlacement(target);
+      }
+      /**
+       * Opens the placement step for moving the picked branch into review
+       * `toId`: that review's stack with the branch at the top of the list,
+       * to drag (or step with ↑/↓) into place. The review's branches are
+       * fetched now, when the step opens.
+       * @param {string} toId
+       * @returns {Promise<void>}
+       */
+      async function openMoveBranchPlacement(toId) {
+        /** @type {{name?: string, branches?: {branch: string}[]}|null} */
+        let detail = null;
+        try {
+          const resp = await fetch(`/api/guardians/${encodeURIComponent(toId)}`);
+          detail = resp.ok ? await resp.json() : null;
+        } catch (_) { detail = null; }
+        if (!detail) { closeModal(); notify("error", "Could not load that review's branches."); return; }
+        moveBranchPlacement = {
+          toId,
+          toName: detail.name || toId,
+          dest: (detail.branches || []).map((b) => b.branch),
+          index: 0,
+        };
+        byId("modal-root").innerHTML = `
+          <div class="modal-bg" onclick="if(event.target===this)closeModal()"><div class="modal goto-search-modal">
+            <h2>Place ${esc(moveBranchPicker.branchName)} in ${esc(moveBranchPlacement.toName)}</h2>
+            <p class="goto-search-summary" style="margin-top:0">Drag ${esc(moveBranchPicker.branchName)} to where it belongs, or use ↑ and ↓. Branch 1 is the bottom of the stack and is built first; each branch builds on the one before it.</p>
+            <div id="move-branch-placement-list" class="goto-search-list" data-tip="This review's stack once the branch is moved in, in the same order as the review page: branch 1 is built first.\nOnly the branch being moved can be dragged; the others keep their order."></div>
+            <p style="font-size:12px;color:var(--failed);margin:10px 0 2px">Both reviews rebuild afterward. This cannot be undone.</p>
+            <div class="btn-row">
+              <button class="btn" data-click="moveBranchPlacementBack" data-tip="Go back and pick a different review.">← Back</button>
+              <button class="btn" onclick="closeModal()" data-tip="Close this popup without moving anything.">Cancel</button>
+              <button class="btn primary" data-click="confirmMoveBranchPlacement" data-tip="Move the branch into this review at the position shown.\nBoth reviews rebuild afterward.\nThis cannot be undone.">⇄ Move branch here</button>
+            </div>
+          </div></div>`;
+        renderMoveBranchPlacement();
+      }
+      /**
+       * Re-renders the placement step's stack.
+       * @returns {void}
+       */
+      function renderMoveBranchPlacement() {
+        const list = document.getElementById("move-branch-placement-list");
+        if (!list) return;
+        const rows = moveBranchPlacementRows(moveBranchPlacement.dest, moveBranchPicker.branchName, moveBranchPlacement.index);
+        const last = rows.length - 1;
+        list.innerHTML = rows.map((row, i) => row.moving
+          ? `<div class="goto-search-row selected" draggable="true" ondragstart="event.dataTransfer.setData('text/plain','move-branch')" ondragover="event.preventDefault()" ondrop="moveBranchPlacementDrop(event, ${i})" style="display:flex;align-items:center;gap:10px;cursor:grab" data-tip="The branch being moved. Drag it up or down the stack, or use the arrows.">
+              <span class="mono" style="color:var(--muted);width:20px">${i + 1}</span><span style="color:var(--muted)">⋮⋮</span>
+              <span style="flex:1;font-weight:600">${esc(row.branch)} <span style="font-size:12px;color:var(--accent);font-weight:400">· moving here</span></span>
+              <button class="icon-btn" data-click="moveBranchPlacementStep" data-delta="-1"${i === 0 ? " disabled" : ""} data-tip="Move it one place down the stack (earlier in the build order).">↑</button>
+              <button class="icon-btn" data-click="moveBranchPlacementStep" data-delta="1"${i === last ? " disabled" : ""} data-tip="Move it one place up the stack (later in the build order).">↓</button>
+            </div>`
+          : `<div class="goto-search-row" ondragover="event.preventDefault()" ondrop="moveBranchPlacementDrop(event, ${i})" style="display:flex;align-items:center;gap:10px;cursor:default" data-tip="Already in this review. Drop the moving branch here to put it in this place.">
+              <span class="mono" style="color:var(--muted);width:20px">${i + 1}</span><span style="flex:1">${esc(row.branch)}</span>
+            </div>`).join("");
+      }
+      /**
+       * Steps the moved branch one place along the stack.
+       * @param {number} delta - -1 toward the bottom of the stack, +1 toward the top.
+       * @returns {void}
+       */
+      function moveBranchPlacementStep(delta) {
+        const max = moveBranchPlacement.dest.length;
+        moveBranchPlacement.index = Math.max(0, Math.min(max, moveBranchPlacement.index + delta));
+        renderMoveBranchPlacement();
+      }
+      /**
+       * Drops the moved branch onto row `index` of the placement list.
+       * @param {DragEvent} event
+       * @param {number} index
+       * @returns {void}
+       */
+      function moveBranchPlacementDrop(event, index) {
+        event.preventDefault();
+        moveBranchPlacement.index = Math.max(0, Math.min(moveBranchPlacement.dest.length, index));
+        renderMoveBranchPlacement();
+      }
+      /**
+       * Returns from the placement step to the review picker, keeping its search.
+       * @returns {void}
+       */
+      function moveBranchPlacementBack() {
+        const { gid, branchId, query, selected } = moveBranchPicker;
+        openMoveOrExtractBranch(gid, branchId);
+        moveBranchPicker.query = query;
+        moveBranchPicker.selected = selected;
+        const input = /** @type {HTMLInputElement|null} */ (document.getElementById("move-branch-input"));
+        if (input) input.value = query;
+        renderMoveBranchPicker();
+      }
+      /**
+       * Moves the branch into the chosen review at the position the placement step shows.
+       * @returns {Promise<void>}
+       */
+      async function confirmMoveBranchPlacement() {
+        const { gid, branchId } = moveBranchPicker;
+        const { toId, index } = moveBranchPlacement;
         closeModal();
-        if (!target || !gid || !branchId) return;
-        if (target === "__new__") await extractBranch(gid, branchId);
-        else await moveBranchTo(gid, branchId, target);
+        if (!gid || !branchId || !toId) return;
+        await moveBranchTo(gid, branchId, toId, index);
       }
       /**
        * Moves a branch out of one review's stack and into another. Callers
@@ -3388,10 +3508,11 @@ Press Accept on the note to create it.">Squad pending</span>`;
        * @param {string} gid
        * @param {string} branchId
        * @param {string} toId
+       * @param {number} position - Where the branch lands in `toId`'s stack; 0 is the bottom.
        * @returns {Promise<void>}
        */
-      async function moveBranchTo(gid, branchId, toId) {
-        await guardianAction(`/api/guardians/${gid}/branches/${branchId}/move`, { to_guardian_id: toId });
+      async function moveBranchTo(gid, branchId, toId, position) {
+        await guardianAction(`/api/guardians/${gid}/branches/${branchId}/move`, { to_guardian_id: toId, position });
         tick();
       }
 

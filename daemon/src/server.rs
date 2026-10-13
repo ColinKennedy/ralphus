@@ -19763,12 +19763,17 @@ fn guardian_link_cell(daemon: &Daemon, id: &str, branch_id: &str, body: &str) ->
 #[derive(Deserialize)]
 struct MoveBranchBody {
     to_guardian_id: String,
+    /// Where the branch lands in the destination's stack (0 is the bottom);
+    /// absent, or at/past the end, appends.
+    #[serde(default)]
+    position: Option<usize>,
 }
 
 /// Move a branch from this guardian to another review (RAL-118: "compose a
 /// review from worktrees belonging to other reviews"). This is a move, not a
-/// copy (RAL-118 Q3): the branch leaves this guardian's stack and is
-/// appended to the destination's. `Store::move_guardian_branch` blocks the
+/// copy (RAL-118 Q3): the branch leaves this guardian's stack and lands in the
+/// destination's at `position`, or on top of it when no position is given
+/// (RAL-641). `Store::move_guardian_branch_at` blocks the
 /// move (409) while either review has a merge/rebase in flight (RAL-118 Q4),
 /// and renumbers/records provenance (RAL-118 Q2) as part of the same call.
 ///
@@ -19798,9 +19803,10 @@ fn guardian_move_branch(daemon: &Daemon, id: &str, branch_id: &str, body: &str) 
         Err(reply) => return reply,
     };
 
-    if let Err(e) = daemon
-        .lock()
-        .move_guardian_branch(id, branch_id, &to_guardian_id)
+    if let Err(e) =
+        daemon
+            .lock()
+            .move_guardian_branch_at(id, branch_id, &to_guardian_id, req.position)
     {
         return store_error(&e);
     }
@@ -29976,6 +29982,59 @@ remediation_attempts = 1
         let moved = dest_branches.iter().find(|b| b["branch"] == "a").unwrap();
         assert_eq!(moved["position"], 1);
         assert_eq!(moved["moved_from_guardian_id"], src);
+    }
+
+    #[test]
+    fn guardian_move_branch_route_places_the_branch_at_the_given_position() {
+        // RAL-641: `position` puts the moved branch inside the destination's
+        // stack instead of on top of it; the rest keep their relative order.
+        let d = daemon();
+        for name in ["r1", "r2"] {
+            let body = serde_json::json!({"name":name,"base_branch":"main","git_root":"/repo"})
+                .to_string();
+            route(&d, "POST", "/api/guardians", &body);
+        }
+        let src = "guardian-000000000001";
+        let dst = "guardian-000000000002";
+        route(
+            &d,
+            "POST",
+            &format!("/api/guardians/{src}/branches"),
+            &serde_json::json!({ "branch": "a" }).to_string(),
+        );
+        for br in ["x", "y"] {
+            let body = serde_json::json!({ "branch": br }).to_string();
+            route(&d, "POST", &format!("/api/guardians/{dst}/branches"), &body);
+        }
+        let src_json: serde_json::Value =
+            serde_json::from_str(&route(&d, "GET", &format!("/api/guardians/{src}"), "").body)
+                .unwrap();
+        let branch_id_a = src_json["branches"][0]["id"].as_str().unwrap().to_string();
+
+        let move_body = serde_json::json!({"to_guardian_id": dst, "position": 0}).to_string();
+        let r = route(
+            &d,
+            "POST",
+            &format!("/api/guardians/{src}/branches/{branch_id_a}/move"),
+            &move_body,
+        );
+        assert_ne!(r.status, 400, "move itself must succeed: {}", r.body);
+
+        let dest_json: serde_json::Value =
+            serde_json::from_str(&route(&d, "GET", &format!("/api/guardians/{dst}"), "").body)
+                .unwrap();
+        let order: Vec<(i64, &str)> = dest_json["branches"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|b| {
+                (
+                    b["position"].as_i64().unwrap(),
+                    b["branch"].as_str().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(order, vec![(0, "a"), (1, "x"), (2, "y")]);
     }
 
     #[test]
