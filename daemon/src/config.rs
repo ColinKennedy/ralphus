@@ -3423,20 +3423,84 @@ pub fn env_overrides_from_toml_str(s: &str) -> EnvOverridesConfig {
 /// (current-dir-based) rather than [`resolve`]/[`resolve_forge`]
 /// (explicit-cwd, used where a specific review/worktree root is already in
 /// hand).
+///
+/// Layers, lowest to highest: the global `config.toml`, each
+/// `$RALPHUS_CONFIGURATION_PATH` entry in listed order (later entries'
+/// allowlist entries are appended after earlier ones'), then the project
+/// `.ralphus.toml`. A malformed `$RALPHUS_CONFIGURATION_PATH` file is logged
+/// as an ERROR and skipped here because every caller is infallible; use
+/// [`try_load_env_overrides_config_with`] to get the error.
 #[must_use]
 pub fn load_env_overrides_config() -> EnvOverridesConfig {
-    let global = global_config_path()
+    let cwd = std::env::current_dir().ok();
+    let raw = std::env::var("RALPHUS_CONFIGURATION_PATH").ok();
+    let (config, errors) = load_env_overrides_layers(cwd.as_deref(), raw.as_deref());
+    for e in errors {
+        if config_log_changed(&format!("env-overrides-error:{e}"), 0) {
+            // ralphus[ignore-rlog-pair]: config accessors run without a Store and before one exists at startup
+            crate::rlog!(ERROR, "ralphus [config] {e}");
+        }
+    }
+    config
+}
+
+/// [`load_env_overrides_config`], but a malformed
+/// `$RALPHUS_CONFIGURATION_PATH` file is an `Err` naming the file and the
+/// parser's detail instead of being skipped.
+///
+/// # Errors
+/// Returns the first malformed `$RALPHUS_CONFIGURATION_PATH` file's error.
+pub fn try_load_env_overrides_config_with(
+    cwd: Option<&Path>,
+    configuration_path_env: Option<&str>,
+) -> Result<EnvOverridesConfig, String> {
+    let (config, errors) = load_env_overrides_layers(cwd, configuration_path_env);
+    match errors.into_iter().next() {
+        Some(e) => Err(e),
+        None => Ok(config),
+    }
+}
+
+/// Merges the env-override layers, returning the config built from every
+/// well-formed layer plus one message per malformed `$RALPHUS_CONFIGURATION_PATH`
+/// file. A missing listed file is warned about and skipped.
+fn load_env_overrides_layers(
+    cwd: Option<&Path>,
+    configuration_path_env: Option<&str>,
+) -> (EnvOverridesConfig, Vec<String>) {
+    let mut merged = global_config_path()
         .and_then(|p| read_config_text(&p))
         .map(|s| env_overrides_from_toml_str(&s))
         .unwrap_or_default();
-    let local = std::env::current_dir()
-        .ok()
-        .as_deref()
+    let mut errors = Vec::new();
+    for path in configuration_path_entries(configuration_path_env) {
+        let display = path.display().to_string();
+        match std::fs::read_to_string(&path) {
+            Ok(text) => match toml::from_str::<ConfigFile>(&text) {
+                Ok(cfg) => merged = merged.merge(cfg.env_overrides.unwrap_or_default()),
+                Err(e) => errors.push(format!(
+                    "config file failed to parse path={display} error={}",
+                    e.to_string().replace('\n', " ")
+                )),
+            },
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                if config_log_changed(&format!("missing:{display}"), 0) {
+                    // ralphus[ignore-rlog-pair]: config accessors run without a Store and before one exists at startup
+                    crate::rlog!(
+                        WARNING,
+                        "ralphus [config] RALPHUS_CONFIGURATION_PATH file not found; skipping path={display}"
+                    );
+                }
+            }
+            Err(e) => errors.push(format!("config file unreadable path={display} error={e}")),
+        }
+    }
+    let local = cwd
         .and_then(find_project_config)
         .and_then(|p| read_config_text(&p))
         .map(|s| env_overrides_from_toml_str(&s))
         .unwrap_or_default();
-    global.merge(local)
+    (merged.merge(local), errors)
 }
 
 /// Parse a `[[templates]]` list from the given TOML text (RAL-297). Absent
@@ -5407,6 +5471,81 @@ fail_after_minutes = 5
     fn env_overrides_malformed_toml_is_default() {
         let c = env_overrides_from_toml_str("not = = valid");
         assert!(c.allowlist.is_empty());
+    }
+
+    fn env_layer_dir(tag: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("ralphus-envlayers-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn join_paths(paths: &[PathBuf]) -> String {
+        std::env::join_paths(paths)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    #[test]
+    fn env_overrides_configuration_path_merges_in_order_and_dedupes() {
+        let dir = env_layer_dir("order");
+        let a = dir.join("a.toml");
+        let b = dir.join("b.toml");
+        let empty = dir.join("empty.toml");
+        std::fs::write(&a, "[env_overrides]\nallowlist = [\"A\", \"DUP\"]\n").unwrap();
+        std::fs::write(&b, "[env_overrides]\nallowlist = [\"DUP\", \"B\"]\n").unwrap();
+        std::fs::write(&empty, "").unwrap();
+        let raw = join_paths(&[a, empty, b]);
+        let c = try_load_env_overrides_config_with(None, Some(&raw)).unwrap();
+        let globals = global_config_path()
+            .and_then(|p| std::fs::read_to_string(p).ok())
+            .map(|s| env_overrides_from_toml_str(&s).allowlist)
+            .unwrap_or_default();
+        let ours: Vec<_> = c
+            .allowlist
+            .iter()
+            .filter(|k| !globals.contains(k))
+            .cloned()
+            .collect();
+        assert_eq!(ours, ["A", "DUP", "B"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn env_overrides_configuration_path_missing_file_is_skipped() {
+        let dir = env_layer_dir("missing");
+        let present = dir.join("present.toml");
+        std::fs::write(&present, "[env_overrides]\nallowlist = [\"ONLY_ME\"]\n").unwrap();
+        let raw = join_paths(&[dir.join("absent.toml"), present]);
+        let c = try_load_env_overrides_config_with(None, Some(&raw)).unwrap();
+        assert!(c.is_allowed("ONLY_ME"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn env_overrides_configuration_path_malformed_file_is_an_error() {
+        let dir = env_layer_dir("malformed");
+        let good = dir.join("good.toml");
+        let bad = dir.join("bad.toml");
+        std::fs::write(&good, "[env_overrides]\nallowlist = [\"G\"]\n").unwrap();
+        std::fs::write(&bad, "not = = valid").unwrap();
+        let raw = join_paths(&[good, bad.clone()]);
+        let err = try_load_env_overrides_config_with(None, Some(&raw)).unwrap_err();
+        assert!(err.contains("bad.toml"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn env_overrides_configuration_path_single_entry_matches_unset_shape() {
+        let dir = env_layer_dir("single");
+        let one = dir.join("one.toml");
+        std::fs::write(&one, "[env_overrides]\nallowlist = [\"X\"]\n").unwrap();
+        let raw = join_paths(&[one]);
+        let c = try_load_env_overrides_config_with(None, Some(&raw)).unwrap();
+        assert!(c.is_allowed("X"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
