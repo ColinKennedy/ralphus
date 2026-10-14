@@ -67,6 +67,20 @@ test("preview skips leading cd but expanded input keeps it", () => {
   assert.equal(agentLogPreview(other), "path=a");
 });
 
+test("preview skips PowerShell Set-Location / sl prefixes", () => {
+  const prev = (command) => agentLogPreview({ tool: "Bash", input: command, args: [{ key: "command", value: command }] });
+  assert.equal(prev("Set-Location C:\\foo; cargo test"), "cargo test");
+  assert.equal(prev('set-location "C:\\a b" && cargo test'), "cargo test");
+  assert.equal(prev("SET-LOCATION 'C:\\a b'; cargo test"), "cargo test");
+  assert.equal(prev("Set-Location -Path C:\\foo; cargo test"), "cargo test");
+  assert.equal(prev('Set-Location -LiteralPath "C:\\a b"\ncargo test'), "cargo test");
+  assert.equal(prev("cd C:\\foo; Set-Location bar && sl baz; cargo test"), "cargo test");
+  assert.equal(prev("sl C:\\foo; cargo test"), "cargo test");
+  assert.equal(prev("Set-Location C:\\foo"), "Set-Location C:\\foo");
+  assert.equal(prev("sl -x"), "sl -x");
+  assert.equal(prev("slow build; x"), "slow build; x");
+});
+
 test("structured records merge call and result by tool-use id", () => {
   const rec = (o) => `RALPHUS_TOOL: ${JSON.stringify(o)}`;
   const e = parseAgentLog([
