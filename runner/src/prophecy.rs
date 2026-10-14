@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 /// The marker every standalone prophecy line starts with. Must be matched as
 /// the start of a trimmed line, never a substring scan -- the same
 /// false-positive hazard `daemon/src/runner.rs::pane_shows_done_sentinel`
-/// documents for `RALPHUS_TMUX_DONE`: an agent whose *work* is about this
+/// documents for `RALPHUS_EVENT`: an agent whose *work* is about this
 /// exact mechanism (ralphus agents develop ralphus) can otherwise trip the
 /// parser reading its own output. Kept in sync with
 /// `docs/special-syntax.md`.

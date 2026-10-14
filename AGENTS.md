@@ -83,18 +83,16 @@ alternatives to reach for are in
   (add `--run-ignored only` for the `soak_*` tests). Run a single scenario
   that way when you change review/PR/guardian code it covers; never the whole
   file mid-edit.
-- **Never launch a second daemon or tmux server from inside a ralphus cell or
+- **Never launch a second daemon from inside a ralphus cell or
   feedback pass** (dogfooding) — no `scripts/check-initialize-exercises.sh`, no
   `ralphus initialize <exercise>`. Its startup reap kills every `ralphus_`
   tmux server machine-wide, including your own pane, and the run is lost.
   Read the code, verify with fmt/clippy/`--lib` tests, and report the exercise
   as unverified. See [`.agent/agent-conduct.md`](.agent/agent-conduct.md).
-- **Never use tmux/psmux for anything new.** tmux is being removed. Run
-  processes through the runner's tmux-free path (`daemon/src/runner/direct.rs`:
-  a plain child process plus a durable transcript), and build Live View on
-  that transcript rather than a pane. Don't add new `crate::tmux` calls,
-  sessions, panes or `RALPHUS_RUNNER_MODE=tmux` dependencies. See
-  [`.agent/agent-conduct.md`](.agent/agent-conduct.md).
+- **tmux/psmux are gone.** Cells run through the runner's tmux-free path
+  (`daemon/src/runner/direct.rs`: a plain child process plus a durable
+  transcript). Don't reintroduce a multiplexer, pane, `crate::tmux` module or
+  `RALPHUS_RUNNER_MODE=tmux`; build Live View on the transcript.
 - **GitHub and GitLab must stay at feature parity, and forge calls go
   through each provider's REST API directly, never the `gh`/`glab` CLIs**
   (the one sanctioned exception is `resolve_cli_token`'s best-effort token
@@ -143,7 +141,7 @@ Twelve Rust workspace members; `cli-py/` is a Python project kept only for `docs
 - `core/src/schema.rs` — `TaskFile`/`TaskDef`/`CellDef`/`ProofStep`, `ResolvedAgent` inheritance. Cell `prompt` XOR `command`. Also owns `RESERVED_AGENT_NAMES` (the built-in agent backend names + aliases, e.g. `claude-code`/`codex`/`ollama`) — **whenever a new agent backend/harness is added, update this list too** (`daemon/src/agent_profiles.rs` reuses it as the reserved set custom `[agent.profiles.*]` names can't collide with, and `core/src/validate.rs`'s `system_prompt` check uses it to decide which agent names it can classify offline vs. must defer to the daemon).
 - `core/src/validate.rs` — raw-`toml::Value` validator: unknown keys, required fields, types, proof one-of, `restart_on` grammar, within-task dep cycles, 1-based line numbers.
 - `daemon/src/store.rs` — `Store` (the only place SQL lives), `SquadState`/`NodeState`, board views.
-- `daemon/src/store_memory.rs` — the `Store`'s **non**-SQL state (worktree leases, restack bookkeeping, tmux liveness, stall debounce, secret-name cache) behind its own small locks, so reaching it never needs the global `StoreMutex`. **Do not add a non-SQL collection to `Store`** — anything there can only be reached through that one lock. The lock grouping is by invariant, not one per field; read the module doc before adding a field.
+- `daemon/src/store_memory.rs` — the `Store`'s **non**-SQL state (worktree leases, restack bookkeeping, run liveness, stall debounce, secret-name cache) behind its own small locks, so reaching it never needs the global `StoreMutex`. **Do not add a non-SQL collection to `Store`** — anything there can only be reached through that one lock. The lock grouping is by invariant, not one per field; read the module doc before adding a field.
 - `daemon/src/server.rs` — `route()` (pure, unit-testable) + `serve()` (tiny_http; starts the scheduler thread).
 - `daemon/src/scheduler.rs` — claims Pending squads, worker threads run cells + proofs. Subprocess waits happen OUTSIDE the store lock.
 - `daemon/src/runner.rs` — `Runner` trait + `SubprocessRunner` (spawns `RALPHUS_RUNNER_CMD`).
@@ -160,7 +158,7 @@ Twelve Rust workspace members; `cli-py/` is a Python project kept only for `docs
 - `daemon/src/config.rs` — layered config (global + per-project `.ralphus.toml`).
 - `daemon/src/cartographer.rs` — Cartographer: the unified, structured, cross-system event log — see [`.agent/logging-policy.md`](.agent/logging-policy.md).
 - `daemon/src/logging.rs` — the `rlog!` file/stderr sink (RAL-83); see [`.agent/logging-policy.md`](.agent/logging-policy.md).
-- `daemon/src/terminal_log.rs` — durable, per-attempt tmux pane transcript capture (RAL-154); see the tmux/psmux gotcha in [`.agent/gotchas.md`](.agent/gotchas.md).
+- `daemon/src/terminal_log.rs` — durable, per-attempt terminal transcript capture (RAL-154); see [`.agent/gotchas.md`](.agent/gotchas.md).
 - `runner/src/git_inproc.rs` — read-only git answered in-process with libgit2 instead of a `git` subprocess: the runner's live diff watcher (`worktree_diff.rs`) and, through `GitVcs::exec_raw`'s early returns, `log --format=%s A..B`, `rev-list --count A..B`, `ls-tree -r -z --name-only`, `symbolic-ref`, `for-each-ref`, `rev-parse --abbrev-ref HEAD` / `@{upstream}`, `status --porcelain` (revertable — see its doc comment), `config --get`, `remote get-url`, `remote -v` and three `config --get-regexp` patterns. The checkout-layout answers (`worktree list --porcelain`, `rev-parse --git-dir/--git-common-dir/--show-toplevel/--git-path hooks`) are file-based in `daemon/src/vcs_refs.rs`. Every path falls back to real git when it cannot answer exactly (including whenever `GIT_CONFIG_COUNT`/`GIT_CONFIG_PARAMETERS` inject config); `RALPHUS_GIT_INPROC=0` disables it. Mutations/network/hooks/credentials never go through it — see [`.agent/gotchas.md`](.agent/gotchas.md).
 - `daemon/src/git_fetch_inproc.rs` — the daemon's one fetch shape (`fetch --no-write-fetch-head <remote> +src:dst...`) answered in-process with libgit2, also from `GitVcs::exec_raw`: a local remote directly, a GitHub/GitLab remote over HTTPS (WinHTTP, Windows-only build feature) with the token that repo's forge client resolved, even when the configured URL is ssh. Git's short-name resolution, `couldn't find remote ref` error and opportunistic remote-tracking update are reproduced. The ref list comes from the remote repo itself (local) or a smart-HTTP `info/refs` request, never git2 0.19's `Remote::list` (undefined behavior on a remote with no refs); refs are written directly because libgit2's `update_tips` truncates `FETCH_HEAD`. Falls back to real git for anything else (checked-out destination branch, shallow/partial clone, `reference-transaction` hook, no token, ...) and keeps a URL on git for 10 minutes after an in-process failure. Same `RALPHUS_GIT_INPROC=0` kill switch.
 - `daemon/src/entity_uri.rs` — RAL-155: the single-string, index-based `EntityUri` grammar, mirrored in `cli/src/entity_uri.rs`.
@@ -277,7 +275,7 @@ unless `OTEL_EXPORTER_OTLP_ENDPOINT` is set. Full design:
 ## Gotchas learned the hard way
 
 Cross-component pitfalls (bind-address exposure, cell `cwd` path format, the
-tmux/psmux reattach mitigation, port clashes, submit-goes-to-Pending, ...)
+port clashes, submit-goes-to-Pending, ...)
 are collected in [`.agent/gotchas.md`](.agent/gotchas.md) — read it before
 debugging anything that looks like "this used to work."
 

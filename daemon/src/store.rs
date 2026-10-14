@@ -613,7 +613,7 @@ pub struct CellView {
     pub agent_session_id: Option<String>,
     /// The `machine` this cell is routed to (RAL-185), if any -- `None`
     /// means the daemon's own host. Exposed so the board can tell a cell
-    /// running on a remote machine provider (no local tmux session to
+    /// running on a remote machine provider (no local cell session to
     /// detach yet, RAL-288) apart from one that simply hasn't started.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub machine: Option<String>,
@@ -647,19 +647,10 @@ pub struct CellView {
     /// it; the board shows it as a "blocking N" badge.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub blocking: Option<CellBlocking>,
-    /// RAL-288: when this cell was cleanly stopped ("Open Agent" on a
-    /// still-running cell) for a real interactive agent session to take
-    /// over. `None` while not detached. `state` stays `"running"`
-    /// throughout — this is an additive signal so the board can tell
-    /// "paused for a human" apart from "actively executing headlessly"
-    /// without a new terminal `NodeState`. Cleared automatically the next
-    /// time the cell is dispatched (a restart, or resume-automation).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub detached_at_ms: Option<i64>,
     /// RAL-435: when this cell is waiting out a Pi rate limit's suggested
     /// retry delay (Unix epoch milliseconds it will resume at). `None`
     /// while not delayed. `state` stays `"running"` throughout -- an
-    /// additive signal, mirroring [`Self::detached_at_ms`], so the board
+    /// additive signal, so the board
     /// can tell "waiting on a provider rate limit" apart from "actively
     /// executing" without a new terminal `NodeState`. Cleared the moment
     /// the cell resumes (a successful retry) or gives up (thrash).
@@ -668,10 +659,8 @@ pub struct CellView {
     /// RAL-400 Phase 3: when this cell was halted because its squad-kind
     /// affected entry became `mode=block` on an open waypoint (Unix epoch
     /// milliseconds). `None` while not halted. `state` stays `"running"`
-    /// throughout -- an additive signal, mirroring [`Self::detached_at_ms`],
-    /// distinct from it because a waypoint halt resumes automatically (once
-    /// the waypoint closes or de-escalates) rather than waiting for a human
-    /// resume-automation call. Cleared the moment the cell is next
+    /// throughout -- an additive signal, a waypoint halt resumes automatically (once
+    /// the waypoint closes or de-escalates). Cleared the moment the cell is next
     /// dispatched.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub waypoint_halted_at_ms: Option<i64>,
@@ -703,8 +692,6 @@ pub struct RunningCellProbe {
     pub started_at_ms: Option<i64>,
     /// Rate-limit wait deadline; set while the cell is delayed.
     pub delayed_until_ms: Option<i64>,
-    /// Set while the cell is detached for a manual takeover.
-    pub detached_at_ms: Option<i64>,
     /// Set while a waypoint holds the cell.
     pub waypoint_halted_at_ms: Option<i64>,
     /// Set once the watchdog has flagged the cell.
@@ -1178,8 +1165,8 @@ pub(crate) struct WorktreeClaim {
 
 /// One persisted cell or proof session whose `cwd` may belong to a
 /// worktree, carrying enough identity to reconstruct the
-/// tmux/pane-snapshot/terminal-log session name that session used (see
-/// `tmux::session_name`). Used by
+/// pane-snapshot/terminal-log session name that session used (see
+/// `cell_session::session_name`). Used by
 /// `crate::worktree_transcript_retirement::retire_session_artifacts_for_worktree`
 /// to find every transcript/pane snapshot a retiring worktree's cells and
 /// proofs ever produced, across every attempt and restart (RAL-348).
@@ -1233,7 +1220,7 @@ pub struct Store {
     /// [`Store::cartographer_log`]. See `crate::events`.
     event_bus: crate::events::EventBus,
     /// WS-E.1: every piece of this store's state that is not in SQLite --
-    /// worktree leases, restack bookkeeping, tmux liveness, stall debounce and
+    /// worktree leases, restack bookkeeping, cell liveness, stall debounce and
     /// the secret-name cache -- behind its own small locks rather than this
     /// one. See `crate::store_memory` for why they are grouped the way they
     /// are, and why having them here was blocking the read-path migration.
@@ -1700,7 +1687,7 @@ impl Store {
 
     /// This store's non-database state (WS-E.1). Cloning the `Arc` is cheap and
     /// takes no lock, so a caller can hold it independently of the store --
-    /// which is the point: worktree leases, tmux liveness and the rest no
+    /// which is the point: worktree leases, cell liveness and the rest no
     /// longer require the global `StoreMutex` to reach.
     #[must_use]
     pub fn memory(&self) -> std::sync::Arc<crate::store_memory::StoreMemory> {
@@ -3741,8 +3728,8 @@ impl Store {
             // thread) -- those rows simply never match a branch-scoped query,
             // which is fine since this ticket doesn't migrate old history.
             "ALTER TABLE guardian_messages ADD COLUMN branch_id TEXT",
-            // RAL-288 Stage 6: set by `resume_automation` (an explicit human
-            // trigger, never by a generic `restart_cell`) right before it
+            // RAL-288 Stage 6: set by a waypoint resume (never by a generic
+            // `restart_cell`) right before it
             // resets the cell to `pending`, so the scheduler's next dispatch
             // of this specific cell resumes the *cell's own* previously
             // recorded `agent_session_id` instead of starting a fresh
@@ -3752,16 +3739,6 @@ impl Store {
             // `run_cell_worker` the moment it's read, so it can never leak
             // into a later, unrelated restart of the same cell.
             "ALTER TABLE cells ADD COLUMN force_resume_own_session INTEGER NOT NULL DEFAULT 0",
-            // RAL-288: when this cell was cleanly stopped ("Open Agent" on a
-            // still-running cell) for a real interactive agent session to
-            // take over. NULL means not detached. The cell's own `state`
-            // stays `running` throughout -- this is a separate, additive
-            // signal so the board can tell "paused for a human" apart from
-            // "actively executing headlessly" without a new NodeState.
-            // Cleared the moment the cell is next dispatched (a restart, or
-            // the explicit resume-automation trigger), at the same point
-            // `state` is set back to `Running` for a fresh attempt.
-            "ALTER TABLE cells ADD COLUMN detached_at_ms INTEGER",
             // Cross-cell session sharing (RAL-248) used to be implicit in any
             // `depends_on` link with no opt-out; this makes it opt-in. Resolved
             // at submit from the cell's/task's `share_session` TOML field --
@@ -4038,7 +4015,7 @@ impl Store {
             // RAL-435: when this cell is waiting out a Pi rate limit's
             // suggested retry delay (Unix epoch milliseconds it will resume
             // at). `NULL` while not delayed. `state` stays `"running"`
-            // throughout -- an additive signal, mirroring `detached_at_ms`,
+            // throughout -- an additive signal,
             // so the board can tell "waiting on a provider rate limit" apart
             // from "actively executing" without a new terminal `NodeState`.
             // Cleared the moment the cell resumes (a successful retry) or
@@ -4785,13 +4762,13 @@ impl Store {
     /// deterministic sequential one. A fresh in-memory `Store` always
     /// assigns the same first id (`squad-000000000001`), which is identical
     /// across every worktree's identical test — fine for a DB-only
-    /// assertion, but a collision risk for a live-tmux test whose fixture
-    /// squad_id also seeds a *real*, machine-wide tmux session name
+    /// assertion, but a collision risk for a live test whose fixture
+    /// squad_id also seeds a *real*, machine-wide cell session name
     /// (`ralphus_{squad_id}_...`) or feeds a prefix-scoped kill
-    /// (`kill_run_tmux_sessions`/`kill_guardian_tmux_sessions` in
-    /// `server.rs`) against the same shared psmux server. Letting such a
+    /// (`kill_squad_cell_sessions`/`kill_guardian_cell_sessions` in
+    /// `server.rs`) against the same shared runner server. Letting such a
     /// test supply its own per-process-unique id (see
-    /// `crate::tmux::unique_test_tag`) closes that gap without touching the
+    /// the direct runner) closes that gap without touching the
     /// production id-assignment path or any of `insert_squad`'s existing
     /// callers. `pub(crate)`, not `pub`, since only this crate's own tests
     /// need direct access to the id.
@@ -6552,7 +6529,7 @@ impl Store {
         db_profiles: &HashMap<String, crate::agent_profile_store::AgentProfileView>,
     ) -> Result<HashMap<i64, Vec<CellView>>> {
         let mut stmt = conn.prepare(
-            "SELECT task_idx, idx, sid, name, cwd, agent, model, state, tokens_in, tokens_out, cost_usd, error, prompt, command, effective_system_prompt, depends_on, review_branch, agent_session_id, maximum_budget_usd, env_overrides, proof_env_overrides, started_at_ms, finished_at_ms, env_out_of_date, machine, detached_at_ms, maximum_context, auto_compact_threshold, cache_creation_tokens, cache_read_tokens, cost_is_estimated, maximum_tool_output_tokens, compaction_input_tokens, compaction_count, delayed_until_ms, completed_active_duration_ms, CASE WHEN state='running' THEN active_started_at_ms END, turns, waypoint_halted_at_ms, runner_stalled_at_ms, effort, temperature, init_commands, init_source, init_timeout_sec, init_state, init_duration_ms, init_exit_status, init_output, init_finished_at_ms
+            "SELECT task_idx, idx, sid, name, cwd, agent, model, state, tokens_in, tokens_out, cost_usd, error, prompt, command, effective_system_prompt, depends_on, review_branch, agent_session_id, maximum_budget_usd, env_overrides, proof_env_overrides, started_at_ms, finished_at_ms, env_out_of_date, machine, maximum_context, auto_compact_threshold, cache_creation_tokens, cache_read_tokens, cost_is_estimated, maximum_tool_output_tokens, compaction_input_tokens, compaction_count, delayed_until_ms, completed_active_duration_ms, CASE WHEN state='running' THEN active_started_at_ms END, turns, waypoint_halted_at_ms, runner_stalled_at_ms, effort, temperature, init_commands, init_source, init_timeout_sec, init_state, init_duration_ms, init_exit_status, init_output, init_finished_at_ms
              FROM cells WHERE squad_id=? ORDER BY task_idx, idx",
         )?;
         let rows = stmt
@@ -6580,7 +6557,7 @@ impl Store {
                     CellView {
                         worktree_init: {
                             let commands: Vec<String> = r
-                                .get::<_, Option<String>>(42)?
+                                .get::<_, Option<String>>(41)?
                                 .map(|j| from_json(&j))
                                 .unwrap_or_default();
                             if commands.is_empty() {
@@ -6588,15 +6565,15 @@ impl Store {
                             } else {
                                 Some(CellInitView {
                                     commands,
-                                    source: r.get::<_, Option<String>>(43)?,
+                                    source: r.get::<_, Option<String>>(42)?,
                                     timeout_sec: r
-                                        .get::<_, Option<i64>>(44)?
+                                        .get::<_, Option<i64>>(43)?
                                         .unwrap_or_else(default_init_timeout_sec),
-                                    status: r.get::<_, Option<String>>(45)?,
-                                    duration_ms: r.get::<_, Option<i64>>(46)?,
-                                    exit_status: r.get::<_, Option<String>>(47)?,
-                                    output: r.get::<_, Option<String>>(48)?,
-                                    finished_at_ms: r.get::<_, Option<i64>>(49)?,
+                                    status: r.get::<_, Option<String>>(44)?,
+                                    duration_ms: r.get::<_, Option<i64>>(45)?,
+                                    exit_status: r.get::<_, Option<String>>(46)?,
+                                    output: r.get::<_, Option<String>>(47)?,
+                                    finished_at_ms: r.get::<_, Option<i64>>(48)?,
                                 })
                             }
                         },
@@ -6607,11 +6584,11 @@ impl Store {
                         thinking_capable,
                         model: r.get::<_, Option<String>>(6)?,
                         state: r.get::<_, String>(7)?,
-                        duration_ms: r.get::<_, i64>(35)?
-                            + r.get::<_, Option<i64>>(36)?
+                        duration_ms: r.get::<_, i64>(34)?
+                            + r.get::<_, Option<i64>>(35)?
                                 .map_or(0, |start| (now_ms() - start).max(0)),
                         active_duration_intervals: i64::from(
-                            r.get::<_, Option<i64>>(36)?.is_some(),
+                            r.get::<_, Option<i64>>(35)?.is_some(),
                         ),
                         tokens_in: r.get::<_, i64>(8)?,
                         tokens_out: r.get::<_, i64>(9)?,
@@ -6635,21 +6612,20 @@ impl Store {
                         env_out_of_date: r.get::<_, bool>(23)?,
                         blocking: None,
                         machine: r.get::<_, Option<String>>(24)?,
-                        detached_at_ms: r.get::<_, Option<i64>>(25)?,
-                        maximum_context: r.get::<_, Option<i64>>(26)?,
-                        auto_compact_threshold: r.get::<_, Option<i64>>(27)?,
-                        cache_creation_tokens: r.get::<_, i64>(28)?,
-                        cache_read_tokens: r.get::<_, i64>(29)?,
-                        cost_is_estimated: r.get::<_, bool>(30)?,
-                        maximum_tool_output_tokens: r.get::<_, Option<i64>>(31)?,
-                        compaction_input_tokens: r.get::<_, i64>(32)?,
-                        compaction_count: r.get::<_, i64>(33)?,
-                        delayed_until_ms: r.get::<_, Option<i64>>(34)?,
-                        turns: r.get::<_, Option<i64>>(37)?,
-                        waypoint_halted_at_ms: r.get::<_, Option<i64>>(38)?,
-                        runner_stalled_at_ms: r.get::<_, Option<i64>>(39)?,
-                        effort: r.get::<_, Option<String>>(40)?,
-                        temperature: r.get::<_, Option<f64>>(41)?,
+                        maximum_context: r.get::<_, Option<i64>>(25)?,
+                        auto_compact_threshold: r.get::<_, Option<i64>>(26)?,
+                        cache_creation_tokens: r.get::<_, i64>(27)?,
+                        cache_read_tokens: r.get::<_, i64>(28)?,
+                        cost_is_estimated: r.get::<_, bool>(29)?,
+                        maximum_tool_output_tokens: r.get::<_, Option<i64>>(30)?,
+                        compaction_input_tokens: r.get::<_, i64>(31)?,
+                        compaction_count: r.get::<_, i64>(32)?,
+                        delayed_until_ms: r.get::<_, Option<i64>>(33)?,
+                        turns: r.get::<_, Option<i64>>(36)?,
+                        waypoint_halted_at_ms: r.get::<_, Option<i64>>(37)?,
+                        runner_stalled_at_ms: r.get::<_, Option<i64>>(38)?,
+                        effort: r.get::<_, Option<String>>(39)?,
+                        temperature: r.get::<_, Option<f64>>(40)?,
                     },
                 ))
             })?
@@ -10842,8 +10818,8 @@ impl Store {
     /// agent session, plus every cell-scope proof step still hanging off it,
     /// keyed exactly the way `handle_thinking_stall_attempt` and the
     /// cell-scope proof runner build those keys
-    /// (`crate::tmux::session_name(squad_id, task_name, cell_id)` /
-    /// `crate::tmux::session_name(squad_id, task_name, "proof-cell-{idx}")`).
+    /// (`crate::cell_session::session_name(squad_id, task_name, cell_id)` /
+    /// `crate::cell_session::session_name(squad_id, task_name, "proof-cell-{idx}")`).
     /// Called from every restart path that puts one or more of `cells` back
     /// to Pending (`restart_cell`, `restart_task`, `restart_squad`) — per the
     /// RAL-536 interview, a human-initiated restart always resets the limit,
@@ -10852,7 +10828,7 @@ impl Store {
     fn reset_thinking_stall_strikes_for_cells(&self, squad_id: &str, cells: &[RestartImpactCell]) {
         let memory = self.memory();
         for c in cells {
-            memory.reset_thinking_stall_strikes(&crate::tmux::session_name(
+            memory.reset_thinking_stall_strikes(&crate::cell_session::session_name(
                 squad_id,
                 &c.task_name,
                 &c.cell_id,
@@ -10871,7 +10847,7 @@ impl Store {
                 })
                 .unwrap_or_default();
             for idx in proof_idxs {
-                memory.reset_thinking_stall_strikes(&crate::tmux::session_name(
+                memory.reset_thinking_stall_strikes(&crate::cell_session::session_name(
                     squad_id,
                     &c.task_name,
                     &format!("proof-cell-{idx}"),
@@ -10884,7 +10860,7 @@ impl Store {
     /// [`Store::reset_thinking_stall_strikes_for_cells`] — clears the strike
     /// counter for every task-scope proof step still hanging off each of
     /// `tasks`, keyed the way the task-scope proof runner builds it
-    /// (`crate::tmux::session_name(squad_id, task_name, "proof-task-{idx}")`).
+    /// (`crate::cell_session::session_name(squad_id, task_name, "proof-task-{idx}")`).
     /// Called from `restart_task` and `restart_squad`, which are the only
     /// restart paths that put task-scope proofs back to Pending.
     fn reset_thinking_stall_strikes_for_tasks(&self, squad_id: &str, tasks: &[RestartImpactTask]) {
@@ -10902,7 +10878,7 @@ impl Store {
                 })
                 .unwrap_or_default();
             for idx in proof_idxs {
-                memory.reset_thinking_stall_strikes(&crate::tmux::session_name(
+                memory.reset_thinking_stall_strikes(&crate::cell_session::session_name(
                     squad_id,
                     &t.name,
                     &format!("proof-task-{idx}"),
@@ -11751,7 +11727,7 @@ impl Store {
     /// recorded a real cell/thread id, but a failed outcome always carries
     /// `agent_session_id: None` (`RunnerResult::failure`) — a plain
     /// overwrite would clobber that good value back to `NULL` on every
-    /// failure, permanently disabling "Open Agent" for a cell that really
+    /// failure, permanently losing the session id of a cell that really
     /// did start one.
     ///
     /// RAL-163: a manual `set-status` override (via
@@ -11886,11 +11862,11 @@ impl Store {
         Ok(())
     }
 
-    /// Fetch a cell's declared id (`sid`, e.g. `"s0"`) for the tmux
-    /// capture-pane/attach endpoints (RAL-102). The daemon derives the tmux
+    /// Fetch a cell's declared id (`sid`, e.g. `"s0"`) for the session
+    /// capture-pane/attach endpoints (RAL-102). The daemon derives the session
     /// session name from `(squad_id, task, cell_id)` the same way the
     /// scheduler does when building a `RunnerSpec` (see
-    /// `crate::tmux::session_name`), so this — paired with
+    /// `crate::cell_session::session_name`), so this — paired with
     /// [`Store::get_task_name`] — lets those HTTP handlers recompute the same
     /// name without any new bookkeeping.
     ///
@@ -11919,7 +11895,7 @@ impl Store {
     }
 
     /// Whether a cell has reached a final state (`done`, `failed`,
-    /// `cancelled` or `ignored`) -- i.e. no tmux session is running for it
+    /// `cancelled` or `ignored`) -- i.e. no cell session is running for it
     /// until something restarts it.
     pub(crate) fn cell_is_final_conn(
         conn: &Connection,
@@ -12021,7 +11997,7 @@ impl Store {
 
     /// Fetch every cell's `(idx, sid)` pair for a task, ordered by idx.
     /// Used by manual status-set stop-and-capture (RAL-163) to find every
-    /// tmux pane that might be running under a task-scope status change,
+    /// cell transcript that might be running under a task-scope status change,
     /// since a task can have more than one cell — unlike
     /// [`Store::get_cell_id`], which addresses exactly one.
     ///
@@ -12038,7 +12014,7 @@ impl Store {
         Ok(rows)
     }
 
-    /// Fetch a task's declared name for the tmux capture-pane/attach
+    /// Fetch a task's declared name for the transcript/attach
     /// endpoints (RAL-102) — see [`Store::get_cell_id`]'s doc comment for
     /// why the caller needs this alongside the cell id.
     ///
@@ -12065,12 +12041,7 @@ impl Store {
     }
 
     /// Fetch a cell's cwd, agent, and (if any) recorded CLI-agent session
-    /// id, for the "Open Agent" terminal action — resuming the real CLI
-    /// (`claude --resume <id>` or `codex resume <id>`, depending on
-    /// which agent the cell actually ran under) rather than re-attaching
-    /// to the runner's tmux wrapper, which only shows its log/event stream
-    /// (see `crate::server::open_agent_terminal`). The `agent` column is
-    /// what lets `open_agent_terminal` pick the right resume command.
+    /// id, so a cell can resume its own agent session.
     ///
     /// Returns `Err(StoreError::NotFound)` when the squad or cell row does
     /// not exist; `agent_session_id` is `None` when the cell hasn't
@@ -12098,32 +12069,6 @@ impl Store {
             .ok_or(StoreError::NotFound)
     }
 
-    /// Records that a cell was just cleanly stopped for a real interactive
-    /// agent session to take over (RAL-288 Stage 6) -- called from
-    /// `scheduler::run_cell_worker`'s detached-outcome branch, right where
-    /// `record_cell_result` persists the (still-`Running`) `NodeState`. See
-    /// [`CellView::detached_at_ms`] for what this drives on the board.
-    pub fn mark_cell_detached(&self, squad_id: &str, task_idx: i64, idx: i64) -> Result<()> {
-        self.conn.execute(
-            "UPDATE cells SET detached_at_ms=? WHERE squad_id=? AND task_idx=? AND idx=?",
-            params![now_ms(), squad_id, task_idx, idx],
-        )?;
-        Ok(())
-    }
-
-    /// Clears a cell's `detached_at_ms`, called at the same point
-    /// `run_cell_worker` sets the cell's `NodeState` back to `Running` for a
-    /// fresh dispatch -- a restart, or a resume-automation-triggered one.
-    /// Unconditional (no-op if it was already clear) so every fresh dispatch
-    /// clears any stale flag regardless of how the cell got here.
-    pub fn clear_cell_detached(&self, squad_id: &str, task_idx: i64, idx: i64) -> Result<()> {
-        self.conn.execute(
-            "UPDATE cells SET detached_at_ms=NULL WHERE squad_id=? AND task_idx=? AND idx=?",
-            params![squad_id, task_idx, idx],
-        )?;
-        Ok(())
-    }
-
     /// Records that a cell's in-flight run was just halted because its
     /// squad-kind affected entry became `mode=block` on an open waypoint
     /// (RAL-400 Phase 3) -- called from `scheduler::run_cell_worker`'s
@@ -12147,7 +12092,7 @@ impl Store {
         let mut stmt = self.conn.prepare(
             "SELECT c.squad_id, c.task_idx, c.idx, t.name, c.sid,
                     c.active_started_at_ms, c.started_at_ms, c.delayed_until_ms,
-                    c.detached_at_ms, c.waypoint_halted_at_ms, c.runner_stalled_at_ms
+                    c.waypoint_halted_at_ms, c.runner_stalled_at_ms
              FROM cells c
              JOIN tasks t ON t.squad_id = c.squad_id AND t.idx = c.task_idx
              WHERE c.state='running'",
@@ -12163,9 +12108,8 @@ impl Store {
                     active_started_at_ms: r.get(5)?,
                     started_at_ms: r.get(6)?,
                     delayed_until_ms: r.get(7)?,
-                    detached_at_ms: r.get(8)?,
-                    waypoint_halted_at_ms: r.get(9)?,
-                    runner_stalled_at_ms: r.get(10)?,
+                    waypoint_halted_at_ms: r.get(8)?,
+                    runner_stalled_at_ms: r.get(9)?,
                 })
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -12244,7 +12188,7 @@ impl Store {
     /// Clears a cell's `waypoint_halted_at_ms`, called at the same point
     /// `run_cell_worker` sets the cell's `NodeState` back to `Running` for a
     /// fresh dispatch. Unconditional (no-op if it was already clear),
-    /// mirroring [`Store::clear_cell_detached`].
+    /// mirroring [`Store::clear_cell_delayed`].
     pub fn clear_cell_waypoint_halted(
         &self,
         squad_id: &str,
@@ -12282,7 +12226,7 @@ impl Store {
     /// Clears a cell's `delayed_until_ms`, called the moment
     /// `run_cell_worker` either reacquires a permit to retry after the delay
     /// or gives up on the cell entirely (thrash) -- unconditional (no-op if
-    /// already clear), mirroring [`Store::clear_cell_detached`].
+    /// already clear), mirroring [`Store::clear_cell_waypoint_halted`].
     pub fn clear_cell_delayed(&self, squad_id: &str, task_idx: i64, idx: i64) -> Result<()> {
         self.conn.execute(
             "UPDATE cells SET delayed_until_ms=NULL WHERE squad_id=? AND task_idx=? AND idx=?",
@@ -12404,49 +12348,11 @@ impl Store {
         Ok(())
     }
 
-    /// Hands a `Detached` cell back to headless automation
-    /// (`server::resume_automation`, RAL-288 Stage 6) by resetting *only*
-    /// that cell's own row to `pending` -- deliberately not
-    /// [`Store::restart_cell`]'s squad/task/downstream-impact machinery,
-    /// which exists for a genuine restart-from-scratch and would incorrectly
-    /// touch sibling tasks, the squad's own row, and cross-squad dependents
-    /// for what is really just handing a still-in-progress conversation back
-    /// to automation. A detach never reaches `run_proofs` or records an
-    /// `error`, so neither needs resetting here; `detached_at_ms` is cleared
-    /// separately, at actual re-dispatch time (see
-    /// [`Store::clear_cell_detached`]).
-    pub fn resume_detached_cell(&self, squad_id: &str, task_idx: i64, idx: i64) -> Result<()> {
-        let exists: Option<i64> = self
-            .conn
-            .query_row(
-                "SELECT idx FROM cells WHERE squad_id=? AND task_idx=? AND idx=?",
-                params![squad_id, task_idx, idx],
-                |r| r.get(0),
-            )
-            .optional()?;
-        if exists.is_none() {
-            return Err(StoreError::NotFound);
-        }
-        self.conn.execute(
-            "UPDATE cells SET state='pending' WHERE squad_id=? AND task_idx=? AND idx=?",
-            params![squad_id, task_idx, idx],
-        )?;
-        let _ = self.log_event(
-            Some(squad_id),
-            None,
-            "cell",
-            Some(&format!("{task_idx}/{idx}")),
-            "resumed (resume-automation)",
-        );
-        Ok(())
-    }
-
     /// Hands a waypoint-halted cell back to headless automation once its
     /// blocking waypoint has closed or de-escalated (RAL-400 Phase 3),
     /// resetting *only* that cell's own row to `pending` -- deliberately not
-    /// [`Store::restart_cell`]'s squad/task/downstream-impact machinery, for
-    /// the same reason [`Store::resume_detached_cell`] avoids it: this is a
-    /// still-in-progress conversation resuming, not a restart-from-scratch.
+    /// [`Store::restart_cell`]'s squad/task/downstream-impact machinery,
+    /// because this is a still-in-progress conversation resuming, not a restart-from-scratch.
     /// `waypoint_halted_at_ms` is cleared separately, at actual re-dispatch
     /// time (see [`Store::clear_cell_waypoint_halted`]).
     pub fn resume_waypoint_halted_cell(
@@ -12484,7 +12390,7 @@ impl Store {
     /// recorded `agent_session_id` instead of starting fresh (RAL-288 Stage
     /// 6) -- see `force_resume_own_session`'s migration comment for why this
     /// needs to be explicit rather than a blanket change to how every
-    /// restart behaves. Set by `server::resume_automation` right before it
+    /// restart behaves. Set by the waypoint resume path right before it
     /// resets the cell to `pending`; a cell without an `agent_session_id` at
     /// all has nothing to resume, so the caller is expected to check that
     /// first (`get_cell_agent_resume`) rather than this method silently
@@ -12529,47 +12435,6 @@ impl Store {
             );
         }
         was_set
-    }
-
-    /// The three pieces of a cell row `server::open_agent_terminal`'s
-    /// `mode=agent` path (RAL-288 Stage 6) needs to decide whether a still-
-    /// running cell can be cleanly detached at all, gathered in one query
-    /// rather than three round trips: `machine` (RAL-185 routing; `Some`
-    /// means a remote provider, which has no local tmux session to detach
-    /// yet -- see FIX_AGENT.local.md's open decision on this), whether this
-    /// is a `command`-kind cell (which never reaches `ClaudeCodeBackend::run`
-    /// at all, so there is no live agent session to hand off), and its
-    /// current run [`NodeState`] (detach only makes sense while genuinely
-    /// `Running` -- a finished cell has no process left to detach).
-    ///
-    /// Returns `Err(StoreError::NotFound)` when the squad or cell row does
-    /// not exist, matching [`Self::get_cell_agent_resume`]'s convention.
-    pub fn get_cell_input_gate(
-        &self,
-        squad_id: &str,
-        task_idx: i64,
-        cell_idx: i64,
-    ) -> Result<(Option<String>, bool, NodeState)> {
-        self.conn
-            .query_row(
-                "SELECT machine, command IS NOT NULL, state FROM cells \
-                 WHERE squad_id=? AND task_idx=? AND idx=?",
-                params![squad_id, task_idx, cell_idx],
-                |r| {
-                    let machine: Option<String> = r.get(0)?;
-                    let is_command_cell: bool = r.get(1)?;
-                    let state_raw: Option<String> = r.get(2)?;
-                    Ok((machine, is_command_cell, state_raw))
-                },
-            )
-            .optional()?
-            .ok_or(StoreError::NotFound)
-            .map(|(machine, is_command_cell, state_raw)| {
-                let state = state_raw
-                    .and_then(|s| NodeState::parse(&s))
-                    .unwrap_or(NodeState::Pending);
-                (machine, is_command_cell, state)
-            })
     }
 
     /// Resolve `(squad_id, task_name, cell_sid)` into a `cell:...`
@@ -12655,7 +12520,7 @@ impl Store {
     }
 
     /// Persist a cell's CLI-agent session/thread id as soon as it's known —
-    /// before the cell finishes — so "Open Agent" activates immediately
+    /// before the cell finishes — so a later resume can find it
     /// rather than only once the whole cell completes. Called from
     /// `runner::forward_runner_event` for any event whose payload carries an
     /// `agent_session_id`, whichever backend emitted it (RAL-102 follow-up;
@@ -12722,25 +12587,25 @@ impl Store {
         Ok(())
     }
 
-    /// Record that fresh pane output was just observed for the tmux-wrapped
+    /// Record that fresh pane output was just observed for the direct
     /// session named `session_name` (RAL-170) — the liveness signal behind
     /// the Live View's "last activity" timestamp. Called from
-    /// `SubprocessRunner::run_via_tmux_attempt`'s poll loop every time a
+    /// `SubprocessRunner::run_direct_attempt`'s poll loop every time a
     /// pane capture shows more lines than the previous poll, i.e. it
     /// piggybacks on work the daemon already does continuously for every
-    /// running tmux-wrapped session (task cell, proof step, or Guardian
+    /// running direct session (task cell, proof step, or Guardian
     /// resolver/manual-check alike — all share the same deterministic
-    /// `crate::tmux::session_name` key), rather than being computed only
+    /// `crate::cell_session::session_name` key), rather than being computed only
     /// when a Live View happens to be open.
     ///
     /// Deliberately **in-memory only, never a DB column**: at the existing
-    /// 500ms tmux-poll cadence, a SQLite `UPDATE` per cell per tick would
+    /// 500ms transcript-poll cadence, a SQLite `UPDATE` per cell per tick would
     /// scale with concurrently-running cells (fine at "hundreds", a real
     /// contention/write-amplification risk at "thousands" sharing the one
     /// `Store` mutex) for a value nobody needs once the process exits. A
     /// plain in-process `HashMap` entry costs a pointer-sized insert instead
     /// of a WAL write, and [`Self::clear_live_activity`] removes it as soon
-    /// as the owning `run_via_tmux` call returns, so memory stays bounded by
+    /// as the owning `run_direct` call returns, so memory stays bounded by
     /// *currently running* cells rather than growing across the daemon's
     /// lifetime.
     pub fn note_live_activity(&self, session_name: &str, at_ms: i64) {
@@ -12756,7 +12621,7 @@ impl Store {
     }
 
     /// Drop the liveness entry for `session_name` once its owning
-    /// `run_via_tmux` call has returned for good (not on an intermediate
+    /// `run_direct` call has returned for good (not on an intermediate
     /// reattach kill — see the call site's doc comment). Best-effort: a
     /// missing entry (cell never produced output, or was already
     /// cleared) is not an error.
@@ -12788,7 +12653,7 @@ impl Store {
 
     /// Drop the RAL-241 stall-escalation bookkeeping for `session_name`,
     /// mirroring [`Self::clear_live_activity`] — called from the same site,
-    /// once the owning `run_via_tmux` call has a terminal result for good.
+    /// once the owning `run_direct` call has a terminal result for good.
     pub fn clear_stall_escalated(&self, session_name: &str) {
         self.memory.clear_stall_escalated(session_name);
     }
@@ -12883,57 +12748,6 @@ impl Store {
     /// tick when generation is failing for some other reason.
     pub fn claim_final_summary_repair(&self, id: &str) -> bool {
         self.memory.claim_final_summary_repair(id)
-    }
-
-    /// Fetch a task's first (lowest-`idx`) cell's cwd — the cwd a
-    /// task-scope proof step's "Open Agent" action resumes into, mirroring
-    /// how `scheduler.rs::run_proofs` itself picks a cwd for a task-scope
-    /// step (`cells.iter().find(|s| s.task_idx == task_idx)`).
-    ///
-    /// Returns `Err(StoreError::NotFound)` when the squad/task has no cells.
-    pub fn get_task_first_cell_cwd(&self, squad_id: &str, task_idx: i64) -> Result<String> {
-        self.conn
-            .query_row(
-                "SELECT cwd FROM cells WHERE squad_id=? AND task_idx=? ORDER BY idx LIMIT 1",
-                params![squad_id, task_idx],
-                |r| r.get::<_, Option<String>>(0),
-            )
-            .optional()?
-            .map(|c| c.unwrap_or_default())
-            .ok_or(StoreError::NotFound)
-    }
-
-    /// Fetch a `prompt`-kind proof step's agent and recorded CLI-agent
-    /// cell id, for its "Open Agent" terminal action — see
-    /// [`Store::get_cell_agent_resume`]'s doc comment for the same idea
-    /// (including why `agent` is needed alongside the id) applied to a plain
-    /// cell.
-    ///
-    /// Returns `Err(StoreError::NotFound)` when the proof row does not
-    /// exist; the id itself is `None` when the step hasn't run yet (or ran
-    /// under an agent with no resume mechanism) rather than an error.
-    pub fn get_proof_agent_session_id(
-        &self,
-        squad_id: &str,
-        task_idx: i64,
-        scope: &str,
-        cell_idx: i64,
-        idx: i64,
-    ) -> Result<(String, Option<String>)> {
-        self.conn
-            .query_row(
-                "SELECT agent, agent_session_id FROM proofs
-                 WHERE squad_id=? AND task_idx=? AND scope=? AND cell_idx=? AND idx=?",
-                params![squad_id, task_idx, scope, cell_idx, idx],
-                |r| {
-                    Ok((
-                        r.get::<_, Option<String>>(0)?.unwrap_or_default(),
-                        r.get::<_, Option<String>>(1)?,
-                    ))
-                },
-            )
-            .optional()?
-            .ok_or(StoreError::NotFound)
     }
 
     /// RAL-641: mark a `failed` cell as failed only because a prerequisite
@@ -13164,7 +12978,7 @@ impl Store {
                 .unwrap_or_default();
             let memory = self.memory();
             for idx in proof_idxs {
-                memory.reset_thinking_stall_strikes(&crate::tmux::session_name(
+                memory.reset_thinking_stall_strikes(&crate::cell_session::session_name(
                     squad_id,
                     &task_name,
                     &format!("proof-cell-{idx}"),
@@ -13253,7 +13067,7 @@ impl Store {
                 .unwrap_or_default();
             let memory = self.memory();
             for idx in proof_idxs {
-                memory.reset_thinking_stall_strikes(&crate::tmux::session_name(
+                memory.reset_thinking_stall_strikes(&crate::cell_session::session_name(
                     squad_id,
                     &task_name,
                     &format!("proof-task-{idx}"),
@@ -18582,8 +18396,8 @@ command = "cargo test"
         store.set_cell_state(&id, 0, 0, NodeState::Failed).unwrap();
 
         let memory = store.memory();
-        let cell_key = crate::tmux::session_name(&id, "build", "worker");
-        let proof_key = crate::tmux::session_name(&id, "build", "proof-cell-0");
+        let cell_key = crate::cell_session::session_name(&id, "build", "worker");
+        let proof_key = crate::cell_session::session_name(&id, "build", "proof-cell-0");
         memory.record_thinking_stall_strike(&cell_key);
         memory.record_thinking_stall_strike(&cell_key);
         memory.record_thinking_stall_strike(&proof_key);
@@ -18601,9 +18415,9 @@ command = "cargo test"
         store.set_cell_state(&id, 0, 0, NodeState::Failed).unwrap();
 
         let memory = store.memory();
-        let cell_key = crate::tmux::session_name(&id, "build", "worker");
-        let cell_proof_key = crate::tmux::session_name(&id, "build", "proof-cell-0");
-        let task_proof_key = crate::tmux::session_name(&id, "build", "proof-task-0");
+        let cell_key = crate::cell_session::session_name(&id, "build", "worker");
+        let cell_proof_key = crate::cell_session::session_name(&id, "build", "proof-cell-0");
+        let task_proof_key = crate::cell_session::session_name(&id, "build", "proof-task-0");
         memory.record_thinking_stall_strike(&cell_key);
         memory.record_thinking_stall_strike(&cell_proof_key);
         memory.record_thinking_stall_strike(&task_proof_key);
@@ -18623,9 +18437,9 @@ command = "cargo test"
         store.set_squad_state(&id, SquadState::Failed).unwrap();
 
         let memory = store.memory();
-        let cell_key = crate::tmux::session_name(&id, "build", "worker");
-        let cell_proof_key = crate::tmux::session_name(&id, "build", "proof-cell-0");
-        let task_proof_key = crate::tmux::session_name(&id, "build", "proof-task-0");
+        let cell_key = crate::cell_session::session_name(&id, "build", "worker");
+        let cell_proof_key = crate::cell_session::session_name(&id, "build", "proof-cell-0");
+        let task_proof_key = crate::cell_session::session_name(&id, "build", "proof-task-0");
         memory.record_thinking_stall_strike(&cell_key);
         memory.record_thinking_stall_strike(&cell_proof_key);
         memory.record_thinking_stall_strike(&task_proof_key);
@@ -18680,7 +18494,7 @@ command = "cargo test"
             .unwrap();
 
         let memory = store.memory();
-        let proof_key = crate::tmux::session_name(&id, "build", "proof-cell-0");
+        let proof_key = crate::cell_session::session_name(&id, "build", "proof-cell-0");
         memory.record_thinking_stall_strike(&proof_key);
         memory.record_thinking_stall_strike(&proof_key);
 
@@ -18699,7 +18513,7 @@ command = "cargo test"
             .unwrap();
 
         let memory = store.memory();
-        let proof_key = crate::tmux::session_name(&id, "build", "proof-task-0");
+        let proof_key = crate::cell_session::session_name(&id, "build", "proof-task-0");
         memory.record_thinking_stall_strike(&proof_key);
 
         store.restart_task_proof(&id, 0, 0).unwrap();

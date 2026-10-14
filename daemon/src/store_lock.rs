@@ -205,7 +205,7 @@ impl StoreMutex {
     /// the store lock.
     ///
     /// `StoreMemory` has its own small locks, so nothing here needs the global
-    /// one -- worktree leases, tmux liveness, stall debounce and the secret-name
+    /// one -- worktree leases, cell liveness, stall debounce and the secret-name
     /// cache are not database state and never were. Several of the callers are
     /// hot (`note_live_activity` fires on every observed pane growth for every
     /// running cell, `check_stall_escalation` on every stall poll), and making

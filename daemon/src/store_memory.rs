@@ -4,7 +4,7 @@
 //! # Why this is a prerequisite for the rest of WS-E
 //!
 //! `Store` owned seven collections that never touch SQLite -- worktree leases,
-//! restack bookkeeping, tmux liveness, stall debounce, a secret-name cache.
+//! restack bookkeeping, cell liveness, stall debounce, a secret-name cache.
 //! Because they lived on `Store`, every method that read one had to be reached
 //! through the global `StoreMutex`, even though none of them is database state
 //! at all. That is the `Store`-as-god-object problem the plan calls RC-8, and it
@@ -62,12 +62,12 @@ struct RestackState {
     running: HashSet<String>,
 }
 
-/// Per-session tmux liveness and stall-escalation debounce.
+/// Per-session liveness and stall-escalation debounce.
 #[derive(Default)]
 struct ActivityState {
-    /// Liveness signal (RAL-170): last time fresh pane output was observed for a
-    /// running tmux-wrapped session, keyed by `crate::tmux::session_name`.
-    /// Entries are removed once the owning `run_via_tmux` call returns, so this
+    /// Liveness signal (RAL-170): last time fresh transcript output was observed for a
+    /// running cell session, keyed by `crate::cell_session::session_name`.
+    /// Entries are removed once the owning direct run returns, so this
     /// stays bounded by the number of *currently running* sessions rather than
     /// lifetime history.
     live: HashMap<String, i64>,
@@ -236,13 +236,13 @@ pub struct StoreMemory {
     secret_env_names: RwLock<Option<BTreeSet<String>>>,
     /// RAL-536: consecutive automatic restarts a [`crate::thinking_stall`]
     /// trip has triggered for one unit of work, keyed by
-    /// `crate::tmux::session_name(run_id, task, session_id)` -- the same
+    /// `crate::cell_session::session_name(run_id, task, session_id)` -- the same
     /// deterministic key [`ActivityState`] already uses, so an automatic
     /// retry of the same cell/proof/review-agent operation (which reuses
     /// that triple) keeps accumulating against the same counter, while a
     /// genuinely different unit of work starts fresh. Independent of every
     /// other group here: nothing else reads or writes it, and it does not
-    /// share an invariant with the tmux-liveness/stall-escalation state
+    /// share an invariant with the liveness/stall-escalation state
     /// despite both being about "is this session stalled" -- this counter
     /// tracks completed automatic restarts, not liveness.
     thinking_stall_strikes: Mutex<HashMap<String, u32>>,
@@ -260,7 +260,7 @@ pub struct StoreMemory {
     survey: Mutex<SurveyState>,
     /// RAL-626: cells whose runner is executing in this process right now,
     /// keyed by [`StoreMemory::cell_diff_key`], with a registration count.
-    /// Deliberately independent of tmux liveness: a cell with a `running` row
+    /// Deliberately independent of cell liveness: a cell with a `running` row
     /// and no entry here has no runner behind it. Independent of every other
     /// group.
     live_runners: Mutex<HashMap<String, usize>>,
@@ -579,7 +579,7 @@ impl StoreMemory {
         self.restack.lock().running.remove(guardian_id);
     }
 
-    // ---- tmux liveness / stall escalation ----
+    // ---- cell liveness / stall escalation ----
 
     pub fn note_live_activity(&self, session_name: &str, at_ms: i64) {
         self.activity
@@ -705,7 +705,7 @@ impl StoreMemory {
     // automatic restart of the affected cell/proof/review-agent, injecting
     // recovery context so the agent takes a different approach. This counter
     // tracks how many such automatic restarts have happened *in a row* for
-    // one unit of work (keyed by `crate::tmux::session_name(run_id, task,
+    // one unit of work (keyed by `crate::cell_session::session_name(run_id, task,
     // session_id)`), independent of the low-diversity streak the detector
     // itself tracks -- that streak lives inside the detector, is scoped to
     // one running attempt, and is gone once the attempt ends. This counter
@@ -752,10 +752,10 @@ impl StoreMemory {
     /// (`guardian-{id}`) but use call-site-specific task/session ids that
     /// aren't practical to enumerate the way a cell/task/proof restart's
     /// exact keys are, so a human restart or reopen of the whole review
-    /// clears everything under its prefix (`crate::tmux::session_name_run_prefix`)
+    /// clears everything under its prefix (`crate::cell_session::session_name_run_prefix`)
     /// at once rather than key-by-key.
     pub fn reset_thinking_stall_strikes_for_run(&self, run_id: &str) {
-        let prefix = crate::tmux::session_name_run_prefix(run_id);
+        let prefix = crate::cell_session::session_name_run_prefix(run_id);
         self.thinking_stall_strikes
             .lock()
             .retain(|k, _| !k.starts_with(&prefix));
@@ -1137,9 +1137,11 @@ mod tests {
     #[test]
     fn reset_thinking_stall_strikes_for_run_clears_only_that_runs_keys() {
         let mem = StoreMemory::new();
-        let branch_key = crate::tmux::session_name("guardian-g1", "AUTO_BUILD", "branch-a");
-        let resolver_key = crate::tmux::session_name("guardian-g1", "resolver", "conflict-1");
-        let unrelated_key = crate::tmux::session_name("guardian-g2", "AUTO_BUILD", "branch-a");
+        let branch_key = crate::cell_session::session_name("guardian-g1", "AUTO_BUILD", "branch-a");
+        let resolver_key =
+            crate::cell_session::session_name("guardian-g1", "resolver", "conflict-1");
+        let unrelated_key =
+            crate::cell_session::session_name("guardian-g2", "AUTO_BUILD", "branch-a");
         mem.record_thinking_stall_strike(&branch_key);
         mem.record_thinking_stall_strike(&branch_key);
         mem.record_thinking_stall_strike(&resolver_key);

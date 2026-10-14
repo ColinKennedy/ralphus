@@ -105,7 +105,7 @@ impl Drop for CancellationCleanup {
 
 /// The `RunnerSpec.task` value used for every conflict-resolver invocation
 /// (RAL-102). `server.rs`'s guardian-branch terminal/pane endpoints must pass
-/// this exact string into `crate::tmux::session_name` to recompute the tmux
+/// this exact string into `crate::cell_session::session_name` to recompute the session
 /// session name the resolver actually runs under — kept as a shared constant
 /// rather than a literal duplicated in both files so the two can never drift.
 pub(crate) const RESOLVER_TASK: &str = "resolve";
@@ -119,7 +119,7 @@ pub(crate) const RESOLVER_PROOF_TASK: &str = "resolve-proof";
 /// The `RunnerSpec.task`/`cell_id` values used for every manual-checks
 /// generation invocation (RAL-88 follow-up). Mirrors [`RESOLVER_TASK`]'s
 /// rationale: `server.rs`'s manual-checks terminal/pane endpoints must pass
-/// these exact strings into `crate::tmux::session_name` to recompute the tmux
+/// these exact strings into `crate::cell_session::session_name` to recompute the session
 /// session name `generate_manual_commands` actually runs under.
 pub(crate) const MANUAL_COMMANDS_TASK: &str = "manual_commands";
 pub(crate) const MANUAL_COMMANDS_SESSION: &str = "manual-reviewer";
@@ -132,7 +132,7 @@ pub(crate) const RESOLVE_INPUT_TASK: &str = "resolve_input";
 /// The `RunnerSpec.task` value used for every reviewer-feedback-actioning
 /// invocation ([`run_feedback`], RAL-298). Mirrors [`RESOLVER_TASK`]'s
 /// rationale -- `server.rs`'s `resolver_task_and_cell_id` must pass this
-/// exact string into `crate::tmux::session_name` to recompute the tmux
+/// exact string into `crate::cell_session::session_name` to recompute the session
 /// session name a feedback pass actually runs under, both live and after
 /// the fact.
 pub(crate) const FEEDBACK_TASK: &str = "feedback";
@@ -241,7 +241,7 @@ pub(crate) const FINAL_PROOF_SYSTEM_PROMPT: &str = "You are running the dedicate
 /// The `RunnerSpec.cell_id` for one branch's feedback-actioning session --
 /// branch-scoped (RAL-298) the same way [`RESOLVER_TASK`]'s `resolver-
 /// {branch_id}` is, so two branches under the same guardian actioning
-/// feedback concurrently don't collide on the same tmux session (the
+/// feedback concurrently don't collide on the same cell session (the
 /// squad_id `guardian-{id}` alone is shared by every branch in the
 /// guardian).
 pub(crate) fn feedback_cell_id(branch_id: &str) -> String {
@@ -2542,10 +2542,10 @@ fn synthesize_proof_instructions(
         crate::config::resolve(std::path::Path::new(&git_root))
             .retry_after_unknown_default_seconds();
     let mut spec = RunnerSpec {
-        // RAL-102: squad_id/cell_id together key the tmux session name
-        // (see `crate::tmux::session_name`) — must be unique per guardian so
+        // RAL-102: squad_id/cell_id together key the cell session name
+        // (see `crate::cell_session::session_name`) — must be unique per guardian so
         // concurrent guardians' agent invocations never collide on the same
-        // tmux session.
+        // cell session.
         squad_id: format!("guardian-{id}"),
         task: "proof-synthesis".to_string(),
         cell_id: format!("synthesizer-{}", branch.replace(['/', '.'], "-")),
@@ -3156,8 +3156,8 @@ fn resolve_conflicts_with_agent(
             crate::config::resolve(std::path::Path::new(&resolver_cwd))
                 .retry_after_unknown_default_seconds();
         let mut spec = RunnerSpec {
-            // RAL-102: unique per (guardian, branch) so the tmux session this
-            // resolves through (see `crate::tmux::session_name`) never
+            // RAL-102: unique per (guardian, branch) so the cell session this
+            // resolves through (see `crate::cell_session::session_name`) never
             // collides with another guardian's or branch's resolver.
             // RAL-192: keyed on the branch's stable id, not its mutable stack
             // position, so the Review tab's capture-pane endpoint (and the
@@ -3601,11 +3601,11 @@ fn run_final_proof(
             .retry_after_unknown_default_seconds();
     let mut spec = RunnerSpec {
         // RAL-192: keyed on the branch's stable id (not its mutable stack
-        // position -- see `crate::tmux::session_name`'s doc comment) so a
+        // position -- see `crate::cell_session::session_name`'s doc comment) so a
         // reorder/add/remove elsewhere in the review never breaks the
         // historical-record lookup for this cell. Mirrors the fix pass's
         // `resolver-{branch_id}` cell id (RAL-102) -- distinct so the two
-        // calls never collide on the same tmux session.
+        // calls never collide on the same cell session.
         squad_id: format!("guardian-{id}"),
         task: RESOLVER_PROOF_TASK.to_string(),
         cell_id: proof_cell_id.clone(),
@@ -5267,20 +5267,13 @@ fn wait_for_merge_worker_stop_within(
     true
 }
 
-/// Terminate every agent session (headless or tmux-backed) belonging to this
-/// review.
+/// Terminate every agent session belonging to this review.
 ///
 /// The cancellation token remains the ordinary cooperative stop path. This is
-/// the immediate path for an agent already inside a blocking invocation: on
-/// Windows, [`crate::tmux::Tmux::kill_session`] also closes the confined job
-/// object, terminating the pane's entire process tree rather than merely
-/// removing the tmux session name.
+/// the immediate path for an agent already inside a blocking invocation.
 pub(crate) fn kill_guardian_agent_sessions(store: &crate::store_lock::StoreHandle, id: &str) {
     let prefix = format!("ralphus_guardian-{id}_");
-    let count = crate::runner::direct_request_stop_with_any_prefix(std::slice::from_ref(&prefix))
-        + crate::tmux::Tmux::resolve()
-            .map(|tmux| tmux.kill_sessions_with_prefix(&prefix))
-            .unwrap_or(0);
+    let count = crate::runner::direct_request_stop_with_any_prefix(std::slice::from_ref(&prefix));
     if count == 0 {
         return;
     }
@@ -8686,7 +8679,7 @@ fn run_feedback_pass(
     );
     let mut spec = RunnerSpec {
         // RAL-102: unique per guardian — a bare "guardian" squad_id collides
-        // with every other guardian's tmux session name (see the identical
+        // with every other guardian's cell session name (see the identical
         // fix on `generate_final_summary`'s spec).
         squad_id: format!("guardian-{id}"),
         task: FEEDBACK_TASK.to_string(),
@@ -16510,9 +16503,9 @@ fn generate_final_summary(
         crate::config::resolve(ws_root.root()).retry_after_unknown_default_seconds();
     let spec = RunnerSpec {
         // RAL-102: unique per guardian — a bare "guardian" squad_id collides
-        // with every other guardian's tmux session name (observed in CI as
+        // with every other guardian's cell session name (observed in CI as
         // cross-test contamination when two live-Ollama tests generate a
-        // summary concurrently and clobber each other's tmux session).
+        // summary concurrently and clobber each other's cell session).
         squad_id: format!("guardian-{id}"),
         task: "summary".to_string(),
         cell_id: "summarizer".to_string(),
@@ -17036,7 +17029,7 @@ fn generate_manual_commands(
     let mut spec = RunnerSpec {
         // RAL-102/RAL-88 follow-up: unique per guardian (see the comment on
         // the resolver `RunnerSpec` in `resolve_conflicts_with_agent`) so this
-        // generation's tmux session never collides with another guardian's.
+        // generation's cell session never collides with another guardian's.
         squad_id: format!("guardian-{id}"),
         task: MANUAL_COMMANDS_TASK.to_string(),
         cell_id: MANUAL_COMMANDS_SESSION.to_string(),
@@ -17078,9 +17071,8 @@ fn generate_manual_commands(
 
     // Side-channel file where the Python backend writes the claude session ID as
     // soon as the stream-json init event arrives — before generation completes.
-    // Mirrors `resolve_conflicts_with_agent`'s watcher, so the "Open Agent"
-    // terminal action becomes available while generation is still running,
-    // not only once it finishes.
+    // Mirrors `resolve_conflicts_with_agent`'s watcher, so the session id is
+    // known while generation is still running, not only once it finishes.
     let sid_path = std::env::temp_dir()
         .join("ralphus")
         .join(format!("guardian-{id}-manual.live_session"));
@@ -17338,7 +17330,7 @@ pub(crate) fn resolve_check_input(
     let spec = RunnerSpec {
         // Unique per (guardian, input) so concurrent resolutions for
         // different inputs on the same guardian -- or the guardian's own
-        // manual-commands generation -- never collide on one tmux session.
+        // manual-commands generation -- never collide on one cell session.
         squad_id: format!("guardian-{guardian_id}-input-{}", input.name),
         task: RESOLVE_INPUT_TASK.to_string(),
         cell_id: format!("resolve-input-{}", input.name),

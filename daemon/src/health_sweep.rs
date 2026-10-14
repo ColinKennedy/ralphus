@@ -4,8 +4,7 @@
 //! (`GET /api/health/report`) to serve without re-probing on every request.
 //!
 //! Deliberately scoped to checks whose probe is self-contained inside the
-//! daemon process: binary-on-`PATH`/reachability checks (`git`, `tmux`/
-//! psmux, the runner binary, `gh`/`glab`, ripgrep, `nvidia-smi`, Ollama). The CLI's
+//! daemon process: binary-on-`PATH`/reachability checks (`git`, the runner binary, `gh`/`glab`, ripgrep, `nvidia-smi`, Ollama). The CLI's
 //! own `.ralphus.toml`-shape checks (`config`, `templates`, `thrash-*`,
 //! `pull-request-branch-convention`, ...) need the CLI process's own
 //! config-loading context (`ralphus_cli::config::load_config`, keyed off
@@ -29,7 +28,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use ralphus_core::health_catalog::{
     ID_CLAUDE_CODE_LOGIN, ID_CLAUDE_COMMAND, ID_CODEX_COMMAND, ID_CODEX_LOGIN, ID_GH, ID_GIT,
-    ID_GLAB, ID_NVIDIA_SMI, ID_OLLAMA, ID_PI_COMMAND, ID_RG, ID_RUNNER, ID_TMUX,
+    ID_GLAB, ID_NVIDIA_SMI, ID_OLLAMA, ID_PI_COMMAND, ID_RG, ID_RUNNER,
 };
 use ralphus_core::process::which;
 use ralphus_runner::cli_agent_common::{self, BackendCommandHealth};
@@ -49,7 +48,6 @@ const FAIL: &str = "fail";
 /// catalog entry.
 const SWEEP_CATALOG_IDS: &[&str] = &[
     ID_GIT,
-    ID_TMUX,
     ID_RUNNER,
     ID_GH,
     ID_GLAB,
@@ -238,52 +236,6 @@ fn check_git() -> SweepCheck {
             PASS
         },
         detail: probe.detail("git"),
-    }
-}
-
-/// RAL-546: resolves the tmux-compatible binary the same way a real cell
-/// dispatch would (`resolve_tmux_program_with_source`), then additionally
-/// probes its version with `-V` -- real tmux and the vendored psmux both
-/// self-report their first line as `"tmux <version>"`. Skips the version
-/// probe for a compound `RALPHUS_TMUX_CMD` override (shell syntax, not a
-/// directly-invokable program) the same way [`cli_agent_common::diagnose_command`]
-/// skips a compound agent command; the embedded-psmux and PATH cases are
-/// always a single invokable program.
-fn check_tmux() -> SweepCheck {
-    match crate::tmux::resolve_tmux_program_with_source() {
-        Ok((program, source)) => {
-            if cli_agent_common::is_compound_command(&program) {
-                return SweepCheck {
-                    id: ID_TMUX,
-                    status: PASS,
-                    detail: format!("{program} (source: {source})"),
-                };
-            }
-            let probe = version_probe::probe_version_at(
-                &program,
-                &["-V"],
-                version_probe::DEFAULT_VERSION_PROBE_TIMEOUT,
-                |out| version_probe::first_token_after_prefix(out, "tmux "),
-            );
-            let detail = if let VersionProbe::Ok { version, .. } = &probe {
-                format!("{program} (source: {source}, version {version})")
-            } else {
-                format!(
-                    "{program} (source: {source}); version probe: {}",
-                    probe.detail(&program)
-                )
-            };
-            SweepCheck {
-                id: ID_TMUX,
-                status: PASS,
-                detail,
-            }
-        }
-        Err(e) => SweepCheck {
-            id: ID_TMUX,
-            status: FAIL,
-            detail: e.to_string(),
-        },
     }
 }
 
@@ -621,7 +573,6 @@ pub fn run_sweep(store: &StoreHandle) -> SweepReport {
     let overrides = AgentCommandOverrides::load(&store.lock());
     let mut checks = vec![
         check_git(),
-        check_tmux(),
         check_runner(),
         check_gh(),
         check_glab(),
@@ -853,7 +804,7 @@ mod tests {
         }
     }
 
-    // ── RAL-546: version-probed git/tmux/gh/glab and claude-code/codex ─────
+    // ── RAL-546: version-probed git/gh/glab and claude-code/codex ─────
 
     #[test]
     fn git_check_never_fails_when_git_is_actually_on_path() {
@@ -862,26 +813,6 @@ mod tests {
         let check = check_git();
         assert_eq!(check.status, PASS, "{check:?}");
         assert!(check.detail.contains("version"), "{check:?}");
-    }
-
-    #[test]
-    fn tmux_check_names_a_source_whatever_the_resolution_outcome() {
-        // Can't assume a real tmux/psmux is installed in every test
-        // environment. When resolution succeeds the detail must say which
-        // source it came from; when it fails (no tmux anywhere) the detail is
-        // the resolver's error, which has no single source to name.
-        let check = check_tmux();
-        if check.status == FAIL {
-            assert!(
-                check.detail.contains("tmux"),
-                "expected the resolver error, got {check:?}"
-            );
-        } else {
-            assert!(
-                check.detail.contains("source:"),
-                "expected a source label, got {check:?}"
-            );
-        }
     }
 
     #[test]

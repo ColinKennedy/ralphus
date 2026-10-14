@@ -22,7 +22,7 @@ use ralphus_core::process::which;
 
 /// The program name the probe resolves. No override env var exists for this
 /// one: ripgrep is a convenience, not a load-bearing binary, so unlike
-/// `tmux`/the runner binary there is no `RALPHUS_*_CMD` escape hatch to
+/// the runner binary there is no `RALPHUS_*_CMD` escape hatch to
 /// honor.
 pub const RG_PROGRAM: &str = "rg";
 

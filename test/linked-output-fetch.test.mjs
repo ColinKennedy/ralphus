@@ -1,7 +1,7 @@
 // Coverage for `fetchLinkedOutputText` (RAL-295), the function behind the
 // cells/proofs-tab output button's "linking to pane/terminal-log-attempts"
 // behaviour: it prefers a durably-persisted terminal-log attempt (the
-// fuller, final record) and only falls back to the live/last tmux pane
+// fuller, final record) and only falls back to the live/last pane
 // snapshot when no attempt is available, returning `null` when neither
 // backend has ever captured anything for the key.
 //

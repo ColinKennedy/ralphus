@@ -99,10 +99,6 @@ where one exists.
 | POST | `/api/squads/{id}/tasks/{ti}/unsolo` | [Un-solo a task](#post-apisquadsidtaskstiunsolo) (RAL-157) — resumes its paused siblings |
 | POST | `/api/squads/{id}/tasks/{ti}/rename` | [Rename a task](#post-apisquadsidtaskstirename) (RAL-398) — purely cosmetic, unlike a `"task"`-kind edit |
 | POST | `/api/squads/{id}/tasks/{ti}/suggest-name` | [Auto-name a task/squad in the background](#post-apisquadsidtaskstisuggest-name) (RAL-398) — the Simple tab's naming fallback |
-| POST | `/api/squads/{id}/cells/{ti}/{si}/open-terminal` | `?mode=open\|readonly`: spawn a resume terminal (`claude --resume`, `codex resume`, or `pi --session`, depending on the cell's agent) **on the daemon host**. `?mode=agent` on a **finished** cell does the same; on a **still-running** cell (RAL-288 Stage 6) it detaches the cell cleanly first, waits for it to genuinely stop, then opens the real agent inside a tmux session that survives closing the terminal — see [below](#post-apisquadsidcellstisiopen-terminalmodeagent) |
-| POST | `/api/squads/{id}/cells/{ti}/{si}/terminal-ticket` | [Mint a one-shot ticket for the **remote** Open Agent terminal relay](#post-apisquadsidcellstisiterminal-ticket) (RAL-355 Phase 10) — a WebSocket alternative to `open-terminal?mode=agent` for cells running on a `machine`, since that route only ever spawns a window on the daemon's own desktop |
-| POST | `/api/squads/{id}/cells/{ti}/{si}/resume-automation` | Hand a detached cell back to unattended execution, continuing its exact same agent session rather than starting fresh (RAL-288 Stage 6) — see [below](#post-apisquadsidcellstisiresume-automation) |
-| POST | `/api/squads/{id}/proofs/{task_idx}/{scope}/{cell_idx}/{proof_idx}/open-terminal` | Same, for a proof step's resolved cell |
 | GET | `/api/squads/{id}/cells/{ti}/{si}/debug-events` | [This cell's current-attempt debug stream](#get-apisquadsidcellstisidebug-events-and-its-proofguardian-siblings-ral-296) (RAL-296) |
 | GET | `/api/squads/{id}/proofs/{task_idx}/{scope}/{cell_idx}/{proof_idx}/debug-events` | Same, for a proof step's resolved cell |
 | GET | `/api/squads/{id}/cells/{ti}/{si}/system-prompt` | [This cell's exact effective system prompt](#get-apisquadsidcellstisisi-system-prompt-and-its-siblings-ral-428) (RAL-428, admin) |
@@ -147,11 +143,9 @@ where one exists.
 | GET | `/api/guardians/{id}/branches/{branch_id}/diff-summary` | [Files/lines changed](#get-apiguardiansidbranchesbranch_iddiff-summary) in a branch worktree against its nearest enabled upstream (RAL-634) |
 | GET | `/api/guardians/{id}/branches/{branch_id}/appraisals` | [Stored appraisals of one review branch](#get-apiguardiansidbranchesbranch_idappraisals) for the board's inspector Appraisals tab (RAL-588) |
 | GET | `/api/guardians/{id}/branches/{branch_id}/forge-status` | [Forge rate-limit and polling status of one review branch](#get-apiguardiansidbranchesbranch_idforge-status) for the board's inspector |
-| POST | `/api/guardians/{id}/branches/{branch_id}/open-terminal` | Spawn a resolver terminal **on the daemon host** |
 | GET | `/api/guardians/{id}/branches/{branch_id}/debug-events` | [The resolver's current-attempt debug stream](#get-apisquadsidcellstisidebug-events-and-its-proofguardian-siblings-ral-296) (RAL-296) |
 | GET | `/api/guardians/{id}/branches/{branch_id}/system-prompt` | [The branch resolver's exact effective system prompt](#get-apisquadsidcellstisisi-system-prompt-and-its-siblings-ral-428) (RAL-428, admin) |
 | GET | `/api/guardians/{id}/manual-checks/system-prompt` | Same, for the manual-checks generation pass |
-| POST | `/api/guardians/{id}/manual-checks/open-terminal` | Spawn a manual-checks-generation terminal **on the daemon host** (`?mode=open\|agent`) |
 | GET | `/api/guardians/{id}/manual-checks/debug-events` | Same, for the manual-checks generation pass |
 | POST | `/api/guardians/{id}/merge` | Start/continue the stacked rebase |
 | POST | `/api/guardians/{id}/manual-checks/regenerate` | [Regenerate the review's manual checks on demand, with optional steering text](#post-apiguardiansidmanual-checksregenerate-ral-520) (RAL-520) |
@@ -210,18 +204,6 @@ against its input's declared `type` before substitution — including a value
 already sitting in `input_values` from before `type` existed on that input —
 and a mismatch fails the whole call with `400 invalid_check_input` naming
 which input(s) failed and why, rather than substituting it.
-
-**Read-only terminal-log viewer (RAL-153).** When `open-terminal`'s target
-tmux session has already ended, the daemon degrades to a read-only path
-instead of attaching: it copies the session's persisted last-pane snapshot
-(`crate::tmux::read_pane_snapshot`) to a disposable per-click temp file and
-opens that copy with the user's preferred external viewer — `$VISUAL`, then
-`$EDITOR`, then the OS's own default handler for the file type
-(`start`/`open`/`xdg-open`) — rather than spawning a terminal window running
-`Get-Content`. The copy lives under a dedicated OS-temp subdirectory (not
-`pane_snapshots/` under `state_dir()`, which remains the durable record) and
-is pruned after an hour; `409` if the session never ran under tmux or
-produced no pane output.
 
 **Pull requests (RAL-117)**
 | Method | Path | What |
@@ -1621,76 +1603,6 @@ shape. A non-integer index is a `400`; an unknown task index is a `404`.
 Accepts the optional `note`/`apply_to_all` body documented under
 [`POST /api/squads/{id}/restart`](#post-apisquadsidrestart) above (RAL-174) — here
 the exact target is the task's own (directly-owned) cells.
-
-### `POST /api/squads/{id}/cells/{ti}/{si}/open-terminal?mode=agent`
-On a **finished** cell, spawns a resume terminal (`claude --resume`, `codex
-resume`, or `pi --session`, depending on the cell's agent) on the daemon
-host — unchanged from before RAL-288 Stage 6.
-
-On a cell that is **still running**, this instead (RAL-288 Stage 6):
-1. Requests a clean detach — the cell's live process is stopped without
-   reporting it as `Done` or `Failed`; it stays paused (still `Running`),
-   not resolved.
-2. Blocks (bounded, a few seconds) until the cell's tmux session is
-   confirmed genuinely gone. "Detach requested" is not the same guarantee
-   as "detach happened" — a second process touching the same conversation
-   before the first one has actually released it is what corrupts a
-   session, so this wait is not optional.
-3. Opens the *real* interactive agent — the actual CLI, not a relay — inside
-   a new, named tmux session, so closing the terminal window doesn't kill
-   it; reattach later the same way as any other tmux-backed session.
-
-A `409 still_running`-style response (surfaced via whatever the daemon's
-error path returns) means the detach didn't complete in time; retry. A
-`409 no_claude_session` means the cell has no recorded agent session to
-resume from yet. Backend-agnostic — the same flow applies to claude, codex,
-and pi. Cell-scoped only, same as before — no equivalent route reaches a
-proof step or a review branch resolver.
-
-### `POST /api/squads/{id}/cells/{ti}/{si}/terminal-ticket`
-Mints a short-lived, single-use ticket for the **remote** Open Agent terminal
-relay (RAL-355 Phase 10) — the WebSocket-based counterpart to
-`open-terminal?mode=agent` for cells that run on a `machine`, since that
-route only ever spawns a terminal window on the daemon's own desktop, which
-makes no sense for a cell that isn't running there. No body.
-
-Eligibility is checked at mint time (and re-checked, independently, when the
-WebSocket connection actually opens — see below): the cell must carry a
-`machine`, its `agent` must be Claude Code-family, and it must have a
-recorded `agent_session_id` to resume. `400 not_remote` /
-`400 unsupported_agent` / `409 no_claude_session` cover those three cases in
-order. `503 relay_unavailable` means the daemon's terminal-relay listener
-itself never came up (its own port was unavailable when the daemon started —
-this disables *only* the remote terminal relay, not the rest of the daemon).
-
-On success:
-```json
-{ "ticket": "<opaque, single-use, short-lived>", "port": 7891, "path": "/terminal" }
-```
-`port` is the daemon-host port the relay listens on (the main API port + 1,
-same host). A client connects a WebSocket to
-`ws://<daemon-host>:<port><path>?ticket=<ticket>&squad_id=<id>&task_idx=<ti>&cell_idx=<si>&cols=<n>&lines=<n>`
-(`cols`/`lines` optional, default `80`/`24`). The ticket is consumed on the
-first connection attempt regardless of outcome — a rejected connection (bad
-ticket, cell no longer eligible, relay busy) still burns it; mint a fresh one
-to retry. Once connected, the relay sends/receives raw bytes as WebSocket
-binary frames — this is a byte-for-byte terminal, not a JSON API, matching
-the provider-side `terminal` verb's own raw-passthrough contract (see
-`docs/machine-providers.md`). The session ends the moment the connection
-closes — there is no reattach; open a fresh ticket + connection to resume
-(see `docs/machine-providers.md`'s "Session lifecycle" note).
-
-### `POST /api/squads/{id}/cells/{ti}/{si}/resume-automation`
-Hands a detached cell (see above) back to unattended execution, continuing
-the *exact same* agent conversation rather than starting fresh — unlike a
-generic `restart_cell`. No body.
-
-Marks the cell to resume its own recorded `agent_session_id` on its next
-dispatch, then resets it to `pending` the same way `restart_cell` does. A
-`409 no_claude_session` means there's no recorded session to resume. A
-`409 still_running` means the cell's own tmux session is still alive —
-calling this on a genuinely still-running cell would start a second process
-racing the live one, so it's rejected rather than attempted.
 
 ### `POST /api/squads/{id}/env`
 Set (`set`) and/or remove (`unset`) persistent environment-variable overrides

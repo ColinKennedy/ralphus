@@ -2648,7 +2648,7 @@ Press Accept on the note to create it.">Squad pending</span>`;
       // re-fetches with the new remote scope.
       /** @type {{[key: string]: string[]}} */
       let baseBranchCache = {};
-      // RAL-139: persists the user-dragged height of live tmux pane peek boxes
+      // RAL-139: persists the user-dragged height of live pane peek boxes
       // across re-renders and tab navigation within this browser session.
       let peekPaneHeight = 320;
       // RAL-272: per-branch read-only feedback thread, keyed by `${gid}:${branchId}`.

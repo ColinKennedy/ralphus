@@ -58,37 +58,6 @@ fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         }
-        Command::Mux(mux_args) => {
-            let command_line = match ralphus_daemon::tmux::resolve_tmux_program() {
-                Ok(p) => p,
-                Err(e) => {
-                    eprintln!("error: {e}");
-                    return ExitCode::FAILURE;
-                }
-            };
-            // `command_line` may be a bare program or a program plus leading
-            // arguments (e.g. `RALPHUS_TMUX_CMD="wsl.exe tmux"`) -- go
-            // through `Tmux` just for its program()/prefix_args() split
-            // rather than duplicating that parsing here.
-            let tmux = ralphus_daemon::tmux::Tmux::from_program(command_line);
-            match std::process::Command::new(tmux.program())
-                .args(tmux.prefix_args())
-                .args(&mux_args)
-                .status()
-            {
-                Ok(status) => {
-                    if status.success() {
-                        ExitCode::SUCCESS
-                    } else {
-                        ExitCode::FAILURE
-                    }
-                }
-                Err(e) => {
-                    eprintln!("error: could not run '{}': {e}", tmux.program());
-                    ExitCode::FAILURE
-                }
-            }
-        }
         Command::Stop { port, auto_cancel } => {
             let url = format!("http://127.0.0.1:{port}/api/daemon/shutdown");
             let body = serde_json::json!({ "auto_cancel": auto_cancel }).to_string();

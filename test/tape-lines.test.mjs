@@ -233,7 +233,7 @@ test("stripThinkingPrefixes untags a whole block of text, leaving other lines al
 // 1. tmux trims each captured row's trailing whitespace, so a line of *empty*
 //    reasoning arrives as a bare "RALPHUS_THINKING:" -- which the old
 //    space-carrying prefix missed, rendering the raw marker as agent output.
-// 2. The pane is 500 columns wide (daemon/src/tmux.rs `-x 500`, a deliberate
+// 2. The pane is 500 columns wide (a deliberate
 //    memory cap), so a longer reasoning line is wrapped across rows and only
 //    the FIRST row carries the marker. The tail rows were classified as agent
 //    output and shown verbatim -- mid-word, which is how this was spotted

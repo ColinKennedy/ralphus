@@ -401,15 +401,9 @@
     <!--
       Vendored: xterm.js v5.3.0 (core/lib/xterm.js) + xterm-addon-fit v0.8.0,
       both MIT-licensed (https://github.com/xtermjs/xterm.js/blob/master/LICENSE).
-      RAL-355 Phase 10's remote Open Agent terminal relay needs real
-      VT100/cursor-positioning rendering -- Claude Code's interactive TUI
-      relies on it heavily, and raw text passthrough renders as garbled
-      noise -- and no meaningfully smaller battle-tested alternative exists.
       Served from /vendor/* rather than a CDN, matching this page's
       no-external-network-dependency convention. Registers `Terminal` (core)
-      and `FitAddon` (auto-fit-to-container) as globals; the chunk scripts
-      read them as `/** @type {any} */ (window).Terminal` / `.FitAddon`
-      (see board/30-live-view.js).
+      and `FitAddon` as globals; no board chunk currently uses them.
     -->
     <script src="/vendor/xterm.js"></script>
     <script src="/vendor/xterm-fit.js"></script>

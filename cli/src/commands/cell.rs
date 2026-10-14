@@ -63,15 +63,6 @@ pub enum CellCommand {
         selector: String,
         mode: String,
     },
-    RemoteTerminal {
-        selector: String,
-    },
-    OpenAgent {
-        selector: String,
-    },
-    ResumeAutomation {
-        selector: String,
-    },
     /// RAL-324: read-only listing of this cell's resolved environment.
     /// `scope` is `cell` (what the cell's own subprocess runs with) or
     /// `proof` (what its proof steps inherit).
@@ -186,15 +177,6 @@ pub fn parse(args: &[String]) -> CellCommand {
             };
             with_selector(scanner, |selector| CellCommand::Terminal { selector, mode })
         }
-        Some("remote-terminal") => {
-            with_selector(scanner, |selector| CellCommand::RemoteTerminal { selector })
-        }
-        Some("open-agent") => {
-            with_selector(scanner, |selector| CellCommand::OpenAgent { selector })
-        }
-        Some("resume-automation") => with_selector(scanner, |selector| {
-            CellCommand::ResumeAutomation { selector }
-        }),
         Some(other) => CellCommand::UsageError(format!("unknown cell subcommand: {other}")),
     }
 }
@@ -234,9 +216,7 @@ pub fn with_uri(mut payload: Value, uri: String) -> Value {
 
 /// Builds the local CLI command that resumes `agent_session_id`, delegating
 /// to [`ralphus_core::agent_resume::agent_resume_argv`] (shared with
-/// `cli/src/commands/review.rs` and, for the daemon's own spawn path,
-/// `daemon/src/server.rs::open_agent_terminal`) so this printed command
-/// matches what "Open Agent" itself would actually run.
+/// `cli/src/commands/review.rs`).
 ///
 /// `claude_program`/`codex_program`/`pi_program` are resolved from the
 /// `RALPHUS_CLAUDE_COMMAND`/`RALPHUS_CODEX_COMMAND`/`RALPHUS_PI_COMMAND` env
@@ -482,40 +462,6 @@ pub fn dispatch(cmd: CellCommand, opts: &GlobalOpts) -> i32 {
             });
             Ok(())
         }),
-        CellCommand::RemoteTerminal { selector } => run_and_report(opts, None, || {
-            let resolved = resolve_scoped(&client, &selector, "cell")?;
-            crate::terminal_relay::run(
-                &client,
-                &resolved.squad_id,
-                resolved.task_idx,
-                resolved.cell_idx,
-            )
-            .map_err(|e| CommandError::Selector(SelectorError(e)))
-        }),
-        CellCommand::OpenAgent { selector } => run_and_report(opts, None, || {
-            let resolved = resolve_scoped(&client, &selector, "cell")?;
-            let result = client.open_agent_terminal(
-                &resolved.squad_id,
-                resolved.task_idx,
-                resolved.cell_idx,
-            )?;
-            emit(opts, &result, |_| {
-                println!("{selector}: agent terminal opened")
-            });
-            Ok(())
-        }),
-        CellCommand::ResumeAutomation { selector } => run_and_report(opts, None, || {
-            let resolved = resolve_scoped(&client, &selector, "cell")?;
-            let result = client.resume_automation(
-                &resolved.squad_id,
-                resolved.task_idx,
-                resolved.cell_idx,
-            )?;
-            emit(opts, &result, |_| {
-                println!("{selector}: automation resumed")
-            });
-            Ok(())
-        }),
     }
 }
 
@@ -655,30 +601,6 @@ mod tests {
         }
         match parse(&v(&["diff", "--summary", "squad-1/build/0"])) {
             CellCommand::Diff { summary, .. } => assert!(summary),
-            other => panic!("unexpected: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn parses_open_agent_with_selector() {
-        match parse(&v(&["open-agent", "squad-1/build/0"])) {
-            CellCommand::OpenAgent { selector } => assert_eq!(selector, "squad-1/build/0"),
-            other => panic!("unexpected: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn open_agent_without_selector_is_usage_error() {
-        match parse(&v(&["open-agent"])) {
-            CellCommand::UsageError(_) => {}
-            other => panic!("unexpected: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn parses_resume_automation_with_selector() {
-        match parse(&v(&["resume-automation", "squad-1/build/0"])) {
-            CellCommand::ResumeAutomation { selector } => assert_eq!(selector, "squad-1/build/0"),
             other => panic!("unexpected: {other:?}"),
         }
     }
@@ -893,24 +815,6 @@ mod tests {
             parse(&v(&["terminal", "squad-1/build/0", "--mode", "bogus"])),
             CellCommand::UsageError(_)
         );
-    }
-
-    #[test]
-    fn parses_remote_terminal() {
-        match parse(&v(&["remote-terminal", "squad-1/build/0"])) {
-            CellCommand::RemoteTerminal { selector } => {
-                assert_eq!(selector, "squad-1/build/0");
-            }
-            other => panic!("unexpected: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn remote_terminal_requires_a_selector() {
-        assert!(matches!(
-            parse(&v(&["remote-terminal"])),
-            CellCommand::UsageError(_)
-        ));
     }
 
     #[test]

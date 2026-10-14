@@ -16,7 +16,7 @@
 //! millisecond still sort deterministically and in emission order. A
 //! terminal-log excerpt is anchored at its owning Cartographer row's `at_ms`
 //! (when the attempt file was last written), not reconstructed line-by-line —
-//! tmux pane captures carry no reliable per-line timestamps, so this is a
+//! transcript captures carry no reliable per-line timestamps, so this is a
 //! documented, deliberate approximation rather than an attempt at more
 //! precision than the data supports.
 //!
@@ -222,7 +222,7 @@ pub fn finalize_timeline_file(timeline: &mut SquadTimeline) {
 /// Terminal Log" attempt-history popup (RAL-296), for one cell, proof step,
 /// guardian branch resolver, or guardian manual-checks run -- the four
 /// entity kinds that already share the exact `(squad_id, task, cell_id)` key
-/// convention their tmux session naming uses (see
+/// convention their session naming uses (see
 /// `server.rs::terminal_log_attempts_reply`'s doc comment, and this
 /// function's own callers in `server.rs`, one per kind).
 ///
@@ -232,10 +232,10 @@ pub fn finalize_timeline_file(timeline: &mut SquadTimeline) {
 /// filter directly, rather than fetching the whole squad's rows and
 /// filtering client-side. Unlike `build_squad_timeline`, this also trims to
 /// the most recent attempt: every runner/scheduler lifecycle event for any
-/// of these four entity kinds is logged around a `"tmux session started"`
-/// row (`Runner::emit_tmux_note`, entity-kind-agnostic -- see
-/// `runner.rs::run_via_tmux`), so the *last* such row's position is a
-/// reliable, kind-agnostic "this attempt started here" boundary. A detach +
+/// of these four entity kinds is logged around a `"direct run started"`
+/// row (`Runner::emit_direct_note`, entity-kind-agnostic -- see
+/// `runner/direct.rs`), so the *last* such row's position is a
+/// reliable, kind-agnostic "this attempt started here" boundary. A
 /// restart cycle's earlier attempt(s) are trimmed off rather than stitched
 /// in, matching the ticket's "current-attempt-only" design decision --
 /// browsing *past* attempts remains the separate Attempt History box's job
@@ -271,7 +271,7 @@ pub fn entity_debug_timeline(
 
     let attempt_start = rows
         .iter()
-        .rposition(|r| r.message == "tmux session started")
+        .rposition(|r| r.message == "direct run started")
         .unwrap_or(0);
     rows.drain(..attempt_start);
 
@@ -649,22 +649,13 @@ prompt = "make it build"
             .squad(&squad_id)
             .task("build")
             .cell("worker")
-            .emit(&store, "tmux session started", serde_json::json!({}));
+            .emit(&store, "direct run started", serde_json::json!({}));
         Note::new("runner")
             .squad(&squad_id)
             .task("build")
             .cell("worker")
             .emit(&store, "invoked", serde_json::json!({}));
-        // Detach + restart: a second attempt begins.
-        Note::new("scheduler")
-            .squad(&squad_id)
-            .task("build")
-            .cell("worker")
-            .emit(
-                &store,
-                "cell detached for manual takeover",
-                serde_json::json!({}),
-            );
+        // Restart: a second attempt begins.
         Note::new("scheduler")
             .squad(&squad_id)
             .task("build")
@@ -674,7 +665,7 @@ prompt = "make it build"
             .squad(&squad_id)
             .task("build")
             .cell("worker")
-            .emit(&store, "tmux session started", serde_json::json!({}));
+            .emit(&store, "direct run started", serde_json::json!({}));
         Note::new("runner")
             .squad(&squad_id)
             .task("build")
@@ -684,9 +675,9 @@ prompt = "make it build"
         let entries = entity_debug_timeline(&store, &squad_id, "build", "worker").unwrap();
         let messages: Vec<&str> = entries.iter().map(|e| e.message.as_str()).collect();
         // Only the second attempt's own boundary onward -- the first
-        // attempt's "cell start"/"invoked" and the intervening detach
-        // event are trimmed off, not stitched into the same stream.
-        assert_eq!(messages, vec!["tmux session started", "session-id known"]);
+        // attempt's "cell start"/"invoked" are trimmed off, not stitched into
+        // the same stream.
+        assert_eq!(messages, vec!["direct run started", "session-id known"]);
     }
 
     #[test]
@@ -704,7 +695,7 @@ prompt = "make it build"
             .squad(&squad_id)
             .task("build")
             .cell("worker")
-            .emit(&store, "tmux session started", serde_json::json!({}));
+            .emit(&store, "direct run started", serde_json::json!({}));
         Note::new("runner")
             .squad(&squad_id)
             .task("build")

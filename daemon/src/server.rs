@@ -44,11 +44,6 @@ pub struct Daemon {
     /// Cancel tokens of in-flight squads, shared with the scheduler's workers so a
     /// `cancel` request can stop the running worker and its subprocess.
     cancellations: Cancellations,
-    /// Per-cell detach tokens (RAL-288 Stage 6), shared with the scheduler's
-    /// `SubprocessRunner` so the `open-terminal?mode=agent` handler can stop
-    /// exactly one running cell -- without touching the rest of its squad --
-    /// so a real interactive resume session can safely take over.
-    detachments: crate::cancel::Detachments,
     /// Per-squad waypoint-halt tokens (RAL-400 Phase 3), shared with the
     /// scheduler's `SubprocessRunner` so a squad-kind affected entry
     /// transitioning to `mode=block` can stop every currently-running cell
@@ -90,28 +85,6 @@ pub struct Daemon {
     /// other route) and consumed by `run_http_loop` before it hands a
     /// connection off to `serve_events_stream`.
     events_tickets: crate::token::TicketStore,
-    /// Short-lived, single-use tickets gating the terminal-relay WebSocket
-    /// listener (RAL-355 Phase 10) -- same rationale as `events_tickets`
-    /// (`?ticket=...` on a URL a browser `WebSocket` constructor cannot
-    /// attach a bearer header to), kept in a separate namespace so a ticket
-    /// minted for one purpose is never usable for the other.
-    terminal_tickets: crate::token::TicketStore,
-    /// The terminal-relay WebSocket listener's bound port (RAL-355 Phase
-    /// 10), set once by `serve()` after a successful bind. `0` means "not
-    /// started" -- `route()`'s own ~100 in-process unit tests and
-    /// `serve_with`/`serve_with_token` never start this listener, so ticket
-    /// minting there correctly reports it as unavailable rather than
-    /// claiming a port nothing is actually listening on.
-    terminal_relay_port: std::sync::atomic::AtomicU16,
-    /// `(squad_id, task_idx, cell_idx)` of every remote terminal session
-    /// currently attached (RAL-355 Phase 10) -- guards against two WebSocket
-    /// clients independently minting tickets and connecting to the same
-    /// idle cell at once, which would spawn two separate `claude --resume
-    /// <same-session-id>` processes racing to write the same conversation
-    /// transcript on the remote machine. Purely in-memory (a daemon restart
-    /// drops it, same as the WS listener itself not surviving a restart) --
-    /// there is nothing to reconcile it against on startup.
-    active_terminal_sessions: Mutex<std::collections::HashSet<(String, i64, i64)>>,
     /// Decides which agents a user can see/select (`GET /api/agents`) --
     /// always [`crate::agent_access::DefaultAgentAccess`] today, since there
     /// is no real per-user auth to key a different implementation off of yet.
@@ -236,7 +209,6 @@ impl Daemon {
             read_pool,
             max_concurrent,
             cancellations: Cancellations::new(),
-            detachments: crate::cancel::Detachments::new(),
             waypoint_halts: crate::cancel::WaypointHalts::new(),
             arbiter_stops: crate::cancel::ArbiterStops::new(),
             procs: ProcRegistry::new(),
@@ -245,9 +217,6 @@ impl Daemon {
             shutdown: Arc::new(AtomicBool::new(false)),
             token: None,
             events_tickets: crate::token::TicketStore::new(),
-            terminal_tickets: crate::token::TicketStore::new(),
-            terminal_relay_port: std::sync::atomic::AtomicU16::new(0),
-            active_terminal_sessions: Mutex::new(std::collections::HashSet::new()),
             agent_access: Arc::new(crate::agent_access::DefaultAgentAccess),
             generation_jobs: crate::generation::GenerationJobs::new(),
             background: BackgroundWork::Immediate,
@@ -314,66 +283,6 @@ impl Daemon {
         ticket.is_some_and(|t| self.events_tickets.consume(t))
     }
 
-    /// Mint a short-lived, single-use terminal-relay ticket (RAL-355
-    /// Phase 10). Called from the `POST .../terminal-ticket` route handler,
-    /// itself gated by [`Daemon::authorized`] like every other route.
-    pub(crate) fn mint_terminal_ticket(&self) -> String {
-        self.terminal_tickets.mint()
-    }
-
-    /// Validate and consume a terminal-relay ticket -- `true` if `ticket` was
-    /// a valid, unexpired, not-yet-used ticket this daemon minted. Mirrors
-    /// [`Daemon::consume_events_ticket`]'s "always true when no bearer token
-    /// is configured" rule.
-    pub(crate) fn consume_terminal_ticket(&self, ticket: Option<&str>) -> bool {
-        if self.token.is_none() {
-            return true;
-        }
-        ticket.is_some_and(|t| self.terminal_tickets.consume(t))
-    }
-
-    /// Record the terminal-relay listener's bound port after `serve()`
-    /// starts it, so ticket-mint responses can tell a client where to
-    /// connect.
-    pub(crate) fn set_terminal_relay_port(&self, port: u16) {
-        self.terminal_relay_port
-            .store(port, std::sync::atomic::Ordering::Relaxed);
-    }
-
-    /// The terminal-relay listener's bound port, or `0` if it was never
-    /// started (see the field's own doc comment).
-    pub(crate) fn terminal_relay_port(&self) -> u16 {
-        self.terminal_relay_port
-            .load(std::sync::atomic::Ordering::Relaxed)
-    }
-
-    /// Claim the terminal-relay slot for one cell -- `true` if it was free
-    /// and is now held by this call, `false` if another session already
-    /// holds it. Pair with [`Daemon::release_terminal_session`] once the
-    /// session ends (see `terminal_relay.rs`'s `SessionSlot` guard, which
-    /// does this via `Drop` so every exit path releases it).
-    pub(crate) fn try_acquire_terminal_session(
-        &self,
-        squad_id: &str,
-        task_idx: i64,
-        cell_idx: i64,
-    ) -> bool {
-        self.active_terminal_sessions
-            .lock()
-            .expect("active_terminal_sessions mutex poisoned")
-            .insert((squad_id.to_string(), task_idx, cell_idx))
-    }
-
-    /// Release a slot claimed by [`Daemon::try_acquire_terminal_session`].
-    /// A no-op if it was not held (defensive -- should never happen given
-    /// the RAII guard, but a double-release must never panic).
-    pub(crate) fn release_terminal_session(&self, squad_id: &str, task_idx: i64, cell_idx: i64) {
-        self.active_terminal_sessions
-            .lock()
-            .expect("active_terminal_sessions mutex poisoned")
-            .remove(&(squad_id.to_string(), task_idx, cell_idx));
-    }
-
     /// A cloned handle to the shared store (for the scheduler thread).
     #[must_use]
     pub fn store_handle(&self) -> StoreHandle {
@@ -384,13 +293,6 @@ impl Daemon {
     #[must_use]
     pub fn cancellations_handle(&self) -> Cancellations {
         self.cancellations.clone()
-    }
-
-    /// A cloned handle to the per-cell detach registry (RAL-288 Stage 6),
-    /// for the scheduler's `SubprocessRunner`.
-    #[must_use]
-    pub fn detachments_handle(&self) -> crate::cancel::Detachments {
-        self.detachments.clone()
     }
 
     /// A cloned handle to the per-squad waypoint-halt registry (RAL-400
@@ -1841,15 +1743,6 @@ fn route_for_user(
         ("POST", ["api", "squads", id, "tasks", ti, "solo"]) => solo_task(daemon, id, ti),
         // ralphus[ignore-endpoint-cli]: board Solo toggle for one-off task runs
         ("POST", ["api", "squads", id, "tasks", ti, "unsolo"]) => unsolo_task(daemon, id, ti),
-        ("POST", ["api", "squads", id, "cells", ti, si, "open-terminal"]) => {
-            open_terminal(daemon, id, ti, si, query)
-        }
-        ("POST", ["api", "squads", id, "cells", ti, si, "terminal-ticket"]) => {
-            mint_terminal_ticket_route(daemon, id, ti, si)
-        }
-        ("POST", ["api", "squads", id, "cells", ti, si, "resume-automation"]) => {
-            resume_automation(daemon, id, ti, si)
-        }
         ("GET", ["api", "squads", id, "cells", ti, si, "pane"]) => {
             cell_pane(daemon, id, ti, si, query)
         }
@@ -1897,21 +1790,6 @@ fn route_for_user(
                 attempt,
             ],
         ) => cell_terminal_log_attempt(daemon, id, ti, si, attempt),
-        // ralphus[ignore-endpoint-cli]: daemon-host GUI terminal spawn; the CLI is deliberately headless
-        (
-            "POST",
-            [
-                "api",
-                "squads",
-                id,
-                "proofs",
-                task_idx,
-                scope,
-                cell_idx,
-                proof_idx,
-                "open-terminal",
-            ],
-        ) => open_proof_terminal(daemon, id, task_idx, scope, cell_idx, proof_idx, query),
         (
             "GET",
             [
@@ -2085,18 +1963,6 @@ fn route_for_user(
         ("POST", ["api", "guardians", id, "branches", branch_id, "link_cell"]) => {
             guardian_link_cell(daemon, id, branch_id, body)
         }
-        // ralphus[ignore-endpoint-cli]: daemon-host GUI terminal spawn; the CLI is deliberately headless
-        (
-            "POST",
-            [
-                "api",
-                "guardians",
-                id,
-                "branches",
-                branch_id,
-                "open-terminal",
-            ],
-        ) => open_guardian_branch_terminal(daemon, id, branch_id, query),
         ("POST", ["api", "guardians", id, "branches", branch_id, "env"]) => {
             set_guardian_branch_env(daemon, id, branch_id, body)
         }
@@ -2218,10 +2084,6 @@ fn route_for_user(
                 attempt,
             ],
         ) => guardian_branch_terminal_log_attempt(daemon, id, branch_id, attempt),
-        // ralphus[ignore-endpoint-cli]: daemon-host GUI terminal spawn for manual checks; CLI is deliberately headless
-        ("POST", ["api", "guardians", id, "manual-checks", "open-terminal"]) => {
-            open_guardian_manual_checks_terminal(daemon, id, query)
-        }
         ("GET", ["api", "guardians", id, "live-actions"]) => guardian_live_actions_view(daemon, id),
         ("POST", ["api", "guardians", id, "live-actions", "run"]) => {
             guardian_run_live_actions(daemon, id, body)
@@ -9563,8 +9425,8 @@ struct EnvOverridesBody {
 /// Every key in `set`/`unset` must be a valid environment-variable
 /// identifier (`[A-Za-z_][A-Za-z0-9_]*`) — rejected with 400 otherwise, both
 /// to catch obvious typos early and because
-/// `crate::tmux::build_command_line_with_env` relies on this same validation
-/// as a shell-injection backstop for the tmux-wrapped runner path.
+/// the direct runner relies on this same validation
+/// as a shell-injection backstop for the direct runner path.
 ///
 /// Logs a Cartographer record with the changed key names in the clear but
 /// **values redacted unless the key is in the project's
@@ -10369,15 +10231,15 @@ fn apply_proof_restart_note(
 /// bounded so a wedged worker can never hang the HTTP thread forever.
 ///
 /// `Cancellations::cancel` only flips a flag the worker polls at the top of
-/// its dispatcher loop (~25ms) and its tmux capture-pane loop (`runner.rs`'s
-/// `TMUX_POLL_INTERVAL`, 500ms) — cancelling alone does not make the worker
+/// its dispatcher loop (~25ms) and its transcript loop (`runner.rs`'s
+/// `DIRECT_POLL_INTERVAL`, 500ms) — cancelling alone does not make the worker
 /// stop *before this function returns*. Without waiting here, a restart that
 /// only calls `cancel()` and immediately resets the squad to `Pending` still
 /// leaves a window (up to ~500ms) where the scheduler's next tick claims the
 /// squad and spawns a *second* worker while the first is still mid-poll,
-/// holding its own tmux session open — reproducing the exact double-dispatch
+/// holding its own cell session open — reproducing the exact double-dispatch
 /// race `cancel()` was meant to close (two workers racing on the same
-/// deterministic tmux/spec-file names; one's "kill stale cell before
+/// deterministic session/spec-file names; one's "kill stale cell before
 /// resuming" cleanup tears down the other's still-live cell out from under
 /// it, which then reports "runner produced no result file" since its python
 /// process never got to finish). `Cancellations::remove` — called
@@ -10524,7 +10386,7 @@ fn restart_squad_preview(daemon: &Daemon, id: &str) -> Reply {
 /// `Store::restart_cell` resets the squad to `Pending` too, and without
 /// stopping a still-in-flight worker for the *restarted cell itself*
 /// first, a restart mid-squad causes a double-dispatch race on the
-/// deterministic per-cell tmux/spec-file names.
+/// deterministic per-cell session/spec-file names.
 ///
 /// That cancellation is scoped to whether the restart target is actually
 /// still running, though — not unconditional. A squad's worker thread drives
@@ -11108,14 +10970,14 @@ fn agent_catalog_reply(daemon: &Daemon) -> Reply {
 }
 
 /// A pane's current content for the live "read-only terminal" peek view
-/// (RAL-102). `active` is `false` once the underlying tmux session has ended
+/// (RAL-102). `active` is `false` once the underlying cell session has ended
 /// (the cell/proof/resolver finished and the daemon tore it down, or it was
 /// never started) — the board is expected to degrade gracefully in that case
 /// rather than treat it as an error. When inactive, `content` is the
-/// persisted last-pane-content snapshot (`crate::tmux::read_pane_snapshot`,
-/// written by `SubprocessRunner::run_via_tmux_attempt` as each attempt ends)
+/// persisted last-pane-content snapshot (`crate::cell_session::read_pane_snapshot`,
+/// written by `SubprocessRunner::run_direct_attempt` as each attempt ends)
 /// if one exists — a read-only historical record of what the pane last
-/// showed, not fresh output — or empty if the cell never ran under tmux
+/// showed, not fresh output — or empty if the cell never ran as a direct run
 /// at all. The board distinguishes the two by whether `content` is non-empty.
 ///
 /// `last_activity_ms` (RAL-170) is the Unix-epoch-milliseconds time the
@@ -11123,7 +10985,7 @@ fn agent_catalog_reply(daemon: &Daemon) -> Reply {
 /// poll) for this cell — the liveness signal that lets the Live View
 /// distinguish "still working, just quiet" from "hasn't produced a line in
 /// a suspiciously long time". Tracked continuously and in-memory by
-/// `SubprocessRunner::run_via_tmux_attempt` for every running tmux-wrapped
+/// `SubprocessRunner::run_direct_attempt` for every running direct
 /// cell regardless of whether a Live View is open (see
 /// `Store::note_live_activity`'s doc comment for the scale tradeoff behind
 /// that decision) — so this is always fresh at the moment it's read, never
@@ -11150,14 +11012,14 @@ fn inactive_pane_reply(session_name: &str) -> Reply {
         &PaneResponse {
             active: false,
             content: strip_ralphus_pane_markers(
-                &crate::tmux::read_pane_snapshot(session_name).unwrap_or_default(),
+                &crate::cell_session::read_pane_snapshot(session_name).unwrap_or_default(),
             ),
             last_activity_ms: None,
         },
     )
 }
 
-/// Strips ralphus's own `RALPHUS_EVENT:`/`RALPHUS_TMUX_DONE` marker lines out
+/// Strips ralphus's own `RALPHUS_EVENT:`/`RALPHUS_EVENT` marker lines out
 /// of raw Live View pane text (RAL-288 Stage 5), so the board's peek pane is
 /// pure agent output unconditionally, by construction — rather than the
 /// previous design of serving the raw (marker-included) text and relying on
@@ -11183,9 +11045,7 @@ fn strip_ralphus_pane_markers(text: &str) -> String {
     text.lines()
         .filter(|line| {
             let trimmed = line.trim_start();
-            !(trimmed.starts_with("RALPHUS_EVENT: ")
-                || trimmed.starts_with("RALPHUS_TOOL: ")
-                || trimmed.starts_with("RALPHUS_TMUX_DONE"))
+            !(trimmed.starts_with("RALPHUS_EVENT: ") || trimmed.starts_with("RALPHUS_TOOL: "))
         })
         .map(unprefix_thinking_line)
         .collect::<Vec<_>>()
@@ -11210,7 +11070,7 @@ fn strip_ralphus_pane_markers(text: &str) -> String {
 #[must_use]
 fn unprefix_thinking_line(line: &str) -> &str {
     let trimmed = line.trim_start();
-    // Matched without the marker's trailing space: tmux trims each captured
+    // Matched without the marker's trailing space: trailing whitespace is trimmed in each captured
     // row's trailing whitespace, so a line of *empty* reasoning arrives as a
     // bare `RALPHUS_THINKING:`, which a space-carrying prefix misses -- and
     // the raw marker then leaks into the pane. The space is dropped below
@@ -11222,16 +11082,16 @@ fn unprefix_thinking_line(line: &str) -> &str {
     }
 }
 
-/// Capture-pane content for the tmux session keyed by `(squad_id, task,
-/// cell_id)` (see `crate::tmux::session_name`), or an inactive
-/// [`PaneResponse`] if no such cell currently exists. A tmux resolution
+/// Capture-pane content for the cell session keyed by `(squad_id, task,
+/// cell_id)` (see `crate::cell_session::session_name`), or an inactive
+/// [`PaneResponse`] if no such cell currently exists. A session resolution
 /// failure (no binary available at all) is the only case reported as a real
 /// error, since that reflects a daemon configuration problem rather than
 /// "this squad finished".
 ///
 /// Deliberately skips a separate `has_session` probe before calling
-/// `capture_pane` — each is its own `tmux`/psmux client subprocess spawn
-/// (`Tmux::run`), and on Windows that cost is real and highly variable
+/// `capture_pane` — each is its own `session`/runner client subprocess spawn
+/// (the transcript writer), and on Windows that cost is real and highly variable
 /// (process creation, AV/EDR scanning a fresh `.exe` launch), so this board
 /// poll (every 2s per open Live View box, RAL-167/`pollOpenPeeks`) was
 /// paying it twice for no behavioral difference: `capture_pane`'s own `Err`
@@ -11248,9 +11108,9 @@ fn capture_pane_reply(
     let lines: u32 = query_param(query, "lines")
         .and_then(|s| s.parse().ok())
         .unwrap_or(2000);
-    let name = crate::tmux::session_name(squad_id, task, cell_id);
-    // A cell running without tmux has no pane: its live view is the tail of
-    // the transcript its output is teed into.
+    let name = crate::cell_session::session_name(squad_id, task, cell_id);
+    // A running cell's live view is the tail of the transcript its output is
+    // teed into.
     if crate::runner::direct_session_active(&name) {
         let content = crate::runner::direct_live_tail(&name, lines as usize).unwrap_or_default();
         return json(
@@ -11267,33 +11127,7 @@ fn capture_pane_reply(
             },
         );
     }
-    let tmux = match crate::tmux::Tmux::resolve() {
-        Ok(t) => t,
-        Err(e) => return error(500, "tmux_error", &e.to_string(), vec![]),
-    };
-    match tmux.capture_pane(&name, lines) {
-        Ok(content) => json(
-            200,
-            &PaneResponse {
-                active: true,
-                // RAL-247: scrub credential env-var values before serving the
-                // live pane to the board/CLI. (A live pane is served before
-                // it's ever persisted, so this is the one read path the
-                // snapshot/terminal-log write-time redaction can't cover.)
-                // RAL-288 Stage 5: also strip ralphus's own event/done marker
-                // lines -- see `strip_ralphus_pane_markers`'s doc comment.
-                content: strip_ralphus_pane_markers(&ralphus_core::redact::redact_secrets(
-                    &content,
-                )),
-                // In-memory liveness (WS-E.1) -- no store lock needed.
-                last_activity_ms: daemon
-                    .store_handle()
-                    .lock_free_memory()
-                    .live_activity_ms(&name),
-            },
-        ),
-        Err(_) => inactive_pane_reply(&name),
-    }
+    inactive_pane_reply(&name)
 }
 
 /// A default byte-range request size for [`pane_transcript_range_reply`] —
@@ -11305,10 +11139,10 @@ const DEFAULT_TRANSCRIPT_RANGE_LIMIT: u64 = 64 * 1024;
 /// Composed depth for the board's Live View (RAL-397 Phase 2F): a byte range
 /// of a cell's raw pipe-pane transcript, sourced from disk rather than pane
 /// scrollback — so scrolling back further than the pane's own in-memory
-/// `history-limit` (`daemon/src/tmux.rs::TMUX_HISTORY_LIMIT`) is possible
+/// `history-limit` (`daemon/src/`cell_session.rs`::the live window`) is possible
 /// without raising that limit (and its RAM cost) at all. Because the
 /// transcript file is written continuously for the cell's whole lifetime
-/// (`Tmux::pipe_pane` via Phase 2C), a request against a still-running cell
+/// (the transcript writer via Phase 2C), a request against a still-running cell
 /// simply reads whatever has been captured so far — there is no separate
 /// "live tail" source to compose with; the file already *is* live.
 ///
@@ -11323,7 +11157,7 @@ const DEFAULT_TRANSCRIPT_RANGE_LIMIT: u64 = 64 * 1024;
 /// pane-snapshot fallback [`capture_pane_reply`] uses, since a transcript
 /// range has no equivalent "last known snapshot" to fall back to.
 fn pane_transcript_range_reply(squad_id: &str, task: &str, cell_id: &str, query: &str) -> Reply {
-    let name = crate::tmux::session_name(squad_id, task, cell_id);
+    let name = crate::cell_session::session_name(squad_id, task, cell_id);
     let attempt = match query_param(query, "attempt").and_then(|s| s.parse::<u32>().ok()) {
         Some(a) => a,
         None => match crate::terminal_log::latest_attempt(&name) {
@@ -11362,22 +11196,22 @@ fn pane_transcript_range_reply(squad_id: &str, task: &str, cell_id: &str, query:
     }
 }
 
-/// List of persisted terminal-log attempts for a tmux session, for the
+/// List of persisted terminal-log attempts for a cell session, for the
 /// board's "historical attempts" picker (RAL-154).
 #[derive(Serialize)]
 struct TerminalLogAttemptsResponse {
     attempts: Vec<crate::terminal_log::AttemptMeta>,
 }
 
-/// List every durably-persisted terminal-log attempt for the tmux session
-/// keyed by `(squad_id, task, cell_id)` (see `crate::tmux::session_name`),
+/// List every durably-persisted terminal-log attempt for the cell session
+/// keyed by `(squad_id, task, cell_id)` (see `crate::cell_session::session_name`),
 /// ascending by attempt number. Empty (never an error) when the cell never
-/// ran under tmux, or no attempt has finished writing its log yet. Shared by
+/// ran as a direct run, or no attempt has finished writing its log yet. Shared by
 /// every "Open Terminal Log" context (task cell, proof step, guardian
 /// branch resolver, guardian manual-checks) the same way [`capture_pane_reply`]
 /// already is.
 fn terminal_log_attempts_reply(squad_id: &str, task: &str, cell_id: &str) -> Reply {
-    let name = crate::tmux::session_name(squad_id, task, cell_id);
+    let name = crate::cell_session::session_name(squad_id, task, cell_id);
     json(
         200,
         &TerminalLogAttemptsResponse {
@@ -11395,7 +11229,7 @@ struct TerminalLogAttemptContentResponse {
     content: String,
 }
 
-/// Content of one persisted terminal-log attempt for the tmux session keyed
+/// Content of one persisted terminal-log attempt for the cell session keyed
 /// by `(squad_id, task, cell_id)`. `404` when that attempt was never
 /// written, or has since been pruned/deleted (`crate::terminal_log::prune`,
 /// or the owning squad/guardian's deletion).
@@ -11413,7 +11247,7 @@ fn terminal_log_attempt_content_reply(
             vec![],
         );
     };
-    let name = crate::tmux::session_name(squad_id, task, cell_id);
+    let name = crate::cell_session::session_name(squad_id, task, cell_id);
     match crate::terminal_log::read_attempt(&name, attempt_n) {
         Some(content) => json(
             200,
@@ -11431,467 +11265,7 @@ fn terminal_log_attempt_content_reply(
     }
 }
 
-/// Open an interactive terminal attached to the tmux session keyed by
-/// `(squad_id, task, cell_id)` — the "open terminal" button (RAL-102). When
-/// the cell is currently live, attaches to it directly. Otherwise
-/// degrades to [`open_readonly_snapshot_terminal`] — a finished
-/// cell/proof/resolver has already had its tmux session torn down (see
-/// `crate::runner::SubprocessRunner::run_via_tmux`), but its last pane
-/// content may still be available as a persisted, read-only historical
-/// record.
-fn attach_tmux_terminal(squad_id: &str, task: &str, cell_id: &str) -> Reply {
-    let tmux = match crate::tmux::Tmux::resolve() {
-        Ok(t) => t,
-        Err(e) => return error(500, "tmux_error", &e.to_string(), vec![]),
-    };
-    let name = crate::tmux::session_name(squad_id, task, cell_id);
-    if !tmux.has_session(&name) {
-        return open_readonly_snapshot_terminal(&name);
-    }
-    let program = tmux.program().to_string();
-    let mut args: Vec<String> = tmux.prefix_args().to_vec();
-    args.extend(["attach-session".to_string(), "-t".to_string(), name]);
-    match spawn_in_terminal(None, &program, &args, &std::collections::BTreeMap::new()) {
-        Ok(()) => json(200, &OpenTerminalResponse { ok: true }),
-        Err(msg) => error(500, "terminal_error", &msg, vec![]),
-    }
-}
-
-/// Degraded fallback for [`attach_tmux_terminal`] once the live tmux session
-/// for `session_name` is gone: if a persisted pane snapshot exists
-/// (`crate::tmux::read_pane_snapshot`, written as each attempt of
-/// `SubprocessRunner::run_via_tmux_attempt` ends), copy it to a disposable
-/// temp file and open that copy with the user's preferred external viewer
-/// (RAL-153) — instead of hard-failing. Still reports `409` when there is
-/// genuinely nothing to show: the cell never ran under tmux at all, or
-/// produced no pane output before ending.
-///
-/// RAL-153: this used to spawn a `pwsh -NoExit -Command "...Get-Content..."`
-/// string through [`spawn_in_terminal`], which on the `wt.exe` path
-/// re-tokenizes that whole quoted string a second time (the same class of
-/// bug [`spawn_in_terminal`]'s own doc comment describes for cwd/semicolon
-/// handling) — the result was a terminal window that opened but failed to
-/// find/display the file. Writing a plain file and handing its *path* to a
-/// viewer sidesteps that class of bug entirely: there is no complex string
-/// for any layer to re-tokenize.
-///
-/// The viewer is resolved in order: `$VISUAL`, then `$EDITOR` (each split on
-/// whitespace so e.g. `code -w` works, not just a bare command), then the
-/// OS's own default handler for the file type (`start`/`open`/`xdg-open`).
-/// A fresh, uniquely-named copy is written per click into its own directory
-/// under the OS temp dir — distinct from the durable, authoritative
-/// `pane_snapshots/<cell>.txt` under `state_dir()` — so a stray edit in
-/// the viewer can never corrupt the real log, and
-/// [`prune_stale_readonly_viewer_copies`] can freely delete old copies from
-/// that directory without ever touching the persisted record.
-fn open_readonly_snapshot_terminal(session_name: &str) -> Reply {
-    // A cell running without tmux has no pane snapshot yet: its record is the
-    // transcript it is writing right now.
-    let headless_tail = crate::runner::direct_session_active(session_name)
-        .then(|| crate::runner::direct_live_tail(session_name, 2000))
-        .flatten();
-    let Some(content) = headless_tail.or_else(|| crate::tmux::read_pane_snapshot(session_name))
-    else {
-        return error(
-            409,
-            "no_tmux_session",
-            "no live tmux session, and no historical pane record was saved for it",
-            vec![],
-        );
-    };
-    let dir = readonly_viewer_dir();
-    if let Err(e) = std::fs::create_dir_all(&dir) {
-        return error(
-            500,
-            "terminal_error",
-            &format!("could not create terminal-log viewer directory: {e}"),
-            vec![],
-        );
-    }
-    prune_stale_readonly_viewer_copies(&dir);
-    let snapshot_file = readonly_viewer_copy_path(&dir, session_name);
-    if let Err(e) = std::fs::write(&snapshot_file, &content) {
-        return error(
-            500,
-            "terminal_error",
-            &format!("could not write snapshot file: {e}"),
-            vec![],
-        );
-    }
-    let result = if let Some((program, args)) = resolve_preferred_editor() {
-        std::process::Command::new(&program)
-            .args(&args)
-            .arg(&snapshot_file)
-            .spawn()
-            .map(|_| ())
-            .map_err(|e| format!("could not open viewer '{program}': {e}"))
-    } else {
-        open_with_os_default(&snapshot_file)
-    };
-    match result {
-        Ok(()) => json(200, &OpenTerminalResponse { ok: true }),
-        Err(msg) => error(500, "terminal_error", &msg, vec![]),
-    }
-}
-
-/// Directory disposable per-click terminal-log viewer copies live under
-/// (RAL-153) — kept separate from `crate::tmux::pane_snapshot_dir` (the
-/// durable, authoritative snapshot under `state_dir()`) so pruning this
-/// directory can never touch that record.
-fn readonly_viewer_dir() -> std::path::PathBuf {
-    std::env::temp_dir().join("ralphus-terminal-logs")
-}
-
-/// How long a disposable per-click viewer copy is kept before
-/// [`prune_stale_readonly_viewer_copies`] deletes it (RAL-153 Q2) — long
-/// enough that a slow-to-open `$EDITOR`/OS handler still finds the file,
-/// short enough that repeated "Open Terminal Log" clicks over a project's
-/// lifetime don't leak files into the OS temp directory indefinitely.
-const READONLY_VIEWER_COPY_MAX_AGE: Duration = Duration::from_secs(3600);
-
-/// Best-effort cleanup of [`readonly_viewer_dir`]: delete every file older
-/// than [`READONLY_VIEWER_COPY_MAX_AGE`]. Called each time a fresh copy is
-/// written rather than on a timer, so cleanup happens without the daemon
-/// needing a background sweep thread; a failure to read the directory or
-/// remove any one file is silently ignored — this is disk-space hygiene,
-/// never load-bearing for the current click's own copy.
-fn prune_stale_readonly_viewer_copies(dir: &std::path::Path) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    let now = std::time::SystemTime::now();
-    for entry in entries.flatten() {
-        let Ok(metadata) = entry.metadata() else {
-            continue;
-        };
-        let Ok(modified) = metadata.modified() else {
-            continue;
-        };
-        if is_stale(modified, now, READONLY_VIEWER_COPY_MAX_AGE) {
-            let _ = std::fs::remove_file(entry.path());
-        }
-    }
-}
-
-/// Whether a file last modified at `modified` counts as stale as of `now`,
-/// given `max_age` — pulled out of [`prune_stale_readonly_viewer_copies`] so
-/// the staleness rule itself is unit-testable without touching real
-/// filesystem timestamps. `modified` at or after `now` (freshly written, or
-/// clock skew) is never stale.
-fn is_stale(
-    modified: std::time::SystemTime,
-    now: std::time::SystemTime,
-    max_age: Duration,
-) -> bool {
-    now.duration_since(modified).is_ok_and(|age| age > max_age)
-}
-
-/// A fresh, unique path for this click's disposable viewer copy of
-/// `session_name`'s snapshot within `dir` — unique per call (not reused
-/// across clicks like the old fixed `{session_name}.readonly.txt` path) so
-/// two "Open Terminal Log" clicks in a row, or a slow viewer still holding
-/// the first copy open, never race each other over the same file.
-fn readonly_viewer_copy_path(dir: &std::path::Path, session_name: &str) -> std::path::PathBuf {
-    let unique = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    dir.join(format!("{session_name}-{unique}.txt"))
-}
-
-/// Resolve the user's preferred external viewer for a read-only terminal-log
-/// copy (RAL-153): `$VISUAL`, then `$EDITOR`, each split on whitespace (the
-/// same convention `RALPHUS_RUNNER_CMD`/`RALPHUS_TMUX_CMD` already use — see
-/// `crate::tmux`'s `split_command`) so e.g. `code -w` or a bare `vim` both
-/// resolve to a program plus its fixed leading arguments. `None` when
-/// neither is set (or set to blank), so the caller falls back to the OS's
-/// own default file-type handler.
-fn resolve_preferred_editor() -> Option<(String, Vec<String>)> {
-    resolve_preferred_editor_from(std::env::var("VISUAL").ok(), std::env::var("EDITOR").ok())
-}
-
-/// Implementation behind [`resolve_preferred_editor`], taking the two env
-/// values explicitly so it's unit-testable without mutating real process
-/// environment.
-fn resolve_preferred_editor_from(
-    visual: Option<String>,
-    editor: Option<String>,
-) -> Option<(String, Vec<String>)> {
-    for value in [visual, editor].into_iter().flatten() {
-        let trimmed = value.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        let mut parts = trimmed.split_whitespace().map(str::to_string);
-        let program = parts.next()?;
-        return Some((program, parts.collect()));
-    }
-    None
-}
-
-/// Open `path` with the OS's default handler for its file type — the
-/// fallback when neither `$VISUAL` nor `$EDITOR` is set (RAL-153).
-#[cfg(target_os = "windows")]
-fn open_with_os_default(path: &std::path::Path) -> std::result::Result<(), String> {
-    // `start` is a `cmd.exe` builtin, not its own executable. The empty ""
-    // argument is the (usually-omitted) window-title parameter -- required
-    // here because `start` treats a leading quoted argument as the title,
-    // which would otherwise try to "start" the file path as a window title
-    // instead of opening it.
-    std::process::Command::new("cmd")
-        .args(["/C", "start", "", &path.to_string_lossy()])
-        .spawn()
-        .map(|_| ())
-        .map_err(|e| format!("could not open default viewer: {e}"))
-}
-
-/// See the Windows overload's doc comment.
-#[cfg(target_os = "macos")]
-fn open_with_os_default(path: &std::path::Path) -> std::result::Result<(), String> {
-    std::process::Command::new("open")
-        .arg(path)
-        .spawn()
-        .map(|_| ())
-        .map_err(|e| format!("could not open default viewer: {e}"))
-}
-
-/// See the Windows overload's doc comment.
-#[cfg(all(unix, not(target_os = "macos")))]
-fn open_with_os_default(path: &std::path::Path) -> std::result::Result<(), String> {
-    std::process::Command::new("xdg-open")
-        .arg(path)
-        .spawn()
-        .map(|_| ())
-        .map_err(|e| format!("could not open default viewer: {e}"))
-}
-
-/// Resolves the environment overrides an interactive terminal/agent session
-/// should launch with (RAL-489) -- the same overrides a check-gate/manual-
-/// command run already sees in the same worktree, so a human working in a
-/// plain shell or a resumed agent session there doesn't quietly disagree
-/// with what automation ran.
-///
-/// `guardian_branch` is `Some((guardian_id, branch_id))` for a review
-/// branch's own worktree: the branch's resolved env
-/// (`Store::resolve_guardian_branch_env`, itself that branch's source
-/// cell's `squad < task < cell` env with the branch's own overrides layered
-/// on top) gets the guardian's `build_env_overrides` layered on top of
-/// that -- the same precedence `GuardianView::build_env` uses for the
-/// combined worktree's tip branch, applied here to the one branch actually
-/// being opened. `cell` is `Some((squad_id, task_idx, cell_idx))` for a
-/// plain task cell (no guardian/review context), resolving just that
-/// cell's own inherited env. Callers pass exactly one of the two.
-fn resolve_terminal_env(
-    daemon: &Daemon,
-    cell: Option<(&str, i64, i64)>,
-    guardian_branch: Option<(&str, &str)>,
-) -> std::result::Result<std::collections::BTreeMap<String, String>, StoreError> {
-    if let Some((guardian_id, branch_id)) = guardian_branch {
-        let branch_env = daemon
-            .lock()
-            .resolve_guardian_branch_env(guardian_id, branch_id)?;
-        let build_overrides = daemon
-            .lock()
-            .get_guardian_build_env_overrides(guardian_id)?;
-        Ok(crate::guardian::apply_branch_env(
-            &branch_env,
-            &build_overrides,
-        ))
-    } else if let Some((squad_id, task_idx, cell_idx)) = cell {
-        daemon
-            .lock()
-            .resolve_cell_env_overrides(squad_id, task_idx, cell_idx)
-    } else {
-        Ok(std::collections::BTreeMap::new())
-    }
-}
-
-/// Open a terminal for a task cell — the "Open Terminal Log" / "Open
-/// Agent" actions (RAL-102 follow-up).
-///
-/// `mode` (query param):
-/// - `"open"` (default) — attach to the runner's tmux-wrapped cell, which
-///   shows its log/event stream (this is the original RAL-102 behavior,
-///   itself a replacement for the old `claude --resume` spawn).
-/// - `"agent"` — spawn a real, interactive `claude --resume <id>` cell,
-///   for actually continuing the conversation rather than watching its log.
-fn open_terminal(daemon: &Daemon, id: &str, ti: &str, si: &str, query: &str) -> Reply {
-    let (Ok(task_idx), Ok(cell_idx)) = (ti.parse::<i64>(), si.parse::<i64>()) else {
-        return error(
-            400,
-            "bad_request",
-            "task/cell index must be integers",
-            vec![],
-        );
-    };
-    if query_param(query, "mode") == Some("agent") {
-        let (cwd, agent, agent_session_id) =
-            match daemon.lock().get_cell_agent_resume(id, task_idx, cell_idx) {
-                Ok(v) => v,
-                Err(e) => return store_error(&e),
-            };
-        let env = match resolve_terminal_env(daemon, Some((id, task_idx, cell_idx)), None) {
-            Ok(v) => v,
-            Err(e) => return store_error(&e),
-        };
-        // RAL-288 Stage 6: while the cell is still genuinely running (local
-        // host, a real prompt cell, a session id already pre-assigned -- see
-        // `scheduler::assign_agent_session_id`), detach it cleanly first,
-        // then open the *real* resume session -- safe now, since the
-        // detach-and-wait below guarantees the original process is
-        // genuinely gone before a second one touches the same conversation.
-        // Backend-agnostic: the detach mechanism (killing the cell's tmux
-        // session) and the resume command both already exist for
-        // claude/codex/pi alike.
-        let (machine, is_command_cell, state) =
-            match daemon.lock().get_cell_input_gate(id, task_idx, cell_idx) {
-                Ok(v) => v,
-                Err(e) => return store_error(&e),
-            };
-        if state == crate::store::NodeState::Running && machine.is_none() && !is_command_cell {
-            let Some(session_id) = agent_session_id.clone() else {
-                return error(
-                    409,
-                    "no_claude_session",
-                    "no resumable agent session recorded yet for this still-running cell",
-                    vec![],
-                );
-            };
-            let task = match daemon.lock().get_task_name(id, task_idx) {
-                Ok(v) => v,
-                Err(e) => return store_error(&e),
-            };
-            let cell_id = match daemon.lock().get_cell_id(id, task_idx, cell_idx) {
-                Ok(v) => v,
-                Err(e) => return store_error(&e),
-            };
-            return detach_and_open_agent(
-                daemon,
-                id,
-                &cwd,
-                &task,
-                &cell_id,
-                &agent,
-                &session_id,
-                &env,
-            );
-        }
-        return open_agent_terminal(
-            &cwd,
-            Some(agent.as_str()),
-            agent_session_id.as_deref(),
-            &env,
-        );
-    }
-    let cell_id = match daemon.lock().get_cell_id(id, task_idx, cell_idx) {
-        Ok(v) => v,
-        Err(e) => return store_error(&e),
-    };
-    let task = match daemon.lock().get_task_name(id, task_idx) {
-        Ok(v) => v,
-        Err(e) => return store_error(&e),
-    };
-    attach_tmux_terminal(id, &task, &cell_id)
-}
-
-/// RAL-288 Stage 6: "resume automation" -- called once a human is done with
-/// the real interactive session a detach opened, to hand the cell back to
-/// unattended execution. Unlike a generic `restart_cell` (which always
-/// starts fresh), this specifically continues the *same* conversation: it
-/// marks the cell to resume its own recorded `agent_session_id` on its next
-/// dispatch (`Store::set_force_resume_own_session`, consumed by
-/// `scheduler::run_cell_worker`) before resetting it to `pending`, so the
-/// human's work in the real session isn't silently discarded. A cell with
-/// no recorded session has nothing to resume, and is rejected rather than
-/// silently falling through to a fresh run.
-fn resume_automation(daemon: &Daemon, id: &str, ti: &str, si: &str) -> Reply {
-    let (Ok(task_idx), Ok(cell_idx)) = (ti.parse::<i64>(), si.parse::<i64>()) else {
-        return error(
-            400,
-            "bad_request",
-            "task/cell index must be integers",
-            vec![],
-        );
-    };
-    let agent_session_id = match daemon.lock().get_cell_agent_resume(id, task_idx, cell_idx) {
-        Ok((_, _, sid)) => sid,
-        Err(e) => return store_error(&e),
-    };
-    if agent_session_id.is_none() {
-        return error(
-            409,
-            "no_claude_session",
-            "this cell has no recorded agent session to resume",
-            vec![],
-        );
-    }
-    // Safety guard: this must only ever fire on a genuinely detached cell,
-    // never one that's still actively running headlessly -- calling
-    // `restart_cell` on a live cell would start a second process racing the
-    // one already touching this exact conversation/worktree, the same
-    // corruption risk `detach_and_open_agent`'s wait loop exists to avoid.
-    let task = match daemon.lock().get_task_name(id, task_idx) {
-        Ok(v) => v,
-        Err(e) => return store_error(&e),
-    };
-    let cell_id = match daemon.lock().get_cell_id(id, task_idx, cell_idx) {
-        Ok(v) => v,
-        Err(e) => return store_error(&e),
-    };
-    let tmux = match crate::tmux::Tmux::resolve() {
-        Ok(t) => t,
-        Err(e) => return error(500, "tmux_error", &e.to_string(), vec![]),
-    };
-    let session_name = crate::tmux::session_name(id, &task, &cell_id);
-    if tmux.has_session(&session_name) || crate::runner::direct_session_active(&session_name) {
-        return error(
-            409,
-            "still_running",
-            "this cell is still actively running -- detach it first",
-            vec![],
-        );
-    }
-    // RAL-288: the human may not have closed the interactive resume session
-    // (they clicked "Resume Automation" instead of exiting the CLI, or just
-    // forgot it's open) -- kill it before handing the conversation back to a
-    // fresh headless dispatch, or both processes would touch the exact same
-    // `agent_session_id` at once, the same corruption risk `detach_and_open_
-    // agent`'s wait loop exists to avoid on the way in. Best-effort: a
-    // missing/already-gone session is not an error here.
-    let resume_session_name = crate::tmux::session_name(id, &task, &format!("{cell_id}-resume"));
-    let _ = tmux.kill_session(&resume_session_name);
-    if let Err(e) = daemon
-        .lock()
-        .set_force_resume_own_session(id, task_idx, cell_idx)
-    {
-        return store_error(&e);
-    }
-    // Deliberately `resume_detached_cell`, not `restart_cell`: this is
-    // handing one still-in-progress cell back to automation, not restarting
-    // a squad. It must never touch the squad's own row, sibling tasks, or
-    // cross-squad dependents -- none of that is relevant to "let this exact
-    // conversation continue."
-    if let Err(e) = daemon.lock().resume_detached_cell(id, task_idx, cell_idx) {
-        return store_error(&e);
-    }
-    // The common case: this squad's own dispatcher worker is still alive
-    // (driving this cell's siblings, or just polling) -- its own loop
-    // reclaims a cell that goes back to `pending` under it without any
-    // squad-level signal (see `scheduler::execute_squad_inner`'s Detached
-    // revival). Only when that worker has already exited entirely (e.g. this
-    // was the squad's last live cell) does nothing remain to notice the
-    // reset cell at all, so the squad needs to be handed back to
-    // `scheduler::tick` the same way `restart_cell` would -- but only that,
-    // never the cell/task-level resets `restart_cell` also does.
-    if !daemon.cancellations.is_active(id) {
-        if let Err(e) = daemon.lock().set_squad_state(id, SquadState::Pending) {
-            return store_error(&e);
-        }
-    }
-    json(200, &OpenTerminalResponse { ok: true })
-}
-
-/// The live pane content of a task cell's tmux session, for the
+/// The live pane content of a task cell's cell session, for the
 /// auto-refreshing "read-only terminal" peek view (RAL-102).
 fn cell_pane(daemon: &Daemon, id: &str, ti: &str, si: &str, query: &str) -> Reply {
     let (Ok(task_idx), Ok(cell_idx)) = (ti.parse::<i64>(), si.parse::<i64>()) else {
@@ -11914,9 +11288,9 @@ fn cell_pane(daemon: &Daemon, id: &str, ti: &str, si: &str, query: &str) -> Repl
     // The board keeps polling an ended cell's box every 2 s so it can revive
     // on a restart. A cell in a final state with no live activity has no
     // session to capture, so answer from the stored snapshot without
-    // spawning a `tmux capture-pane` that can only fail; a restart moves the
+    // spawning a `transcript` that can only fail; a restart moves the
     // cell out of its final state and live capture resumes.
-    let name = crate::tmux::session_name(id, &task, &cell_id);
+    let name = crate::cell_session::session_name(id, &task, &cell_id);
     if is_final
         && daemon
             .store_handle()
@@ -11929,7 +11303,17 @@ fn cell_pane(daemon: &Daemon, id: &str, ti: &str, si: &str, query: &str) -> Repl
     capture_pane_reply(daemon, id, &task, &cell_id, query)
 }
 
-/// A task cell's `(cell id, task name)` -- the pair its tmux session name is
+/// The `(squad_id, cell_id)` a `prompt`-kind proof step's session name is
+/// keyed by -- mirrors how `scheduler.rs::squad_proofs` builds the
+/// `RunnerSpec` for the same proof step (`cell_id` is
+/// `proof-{scope}-{proof_idx}`). The third leg of the key, `task`, is fetched
+/// separately by each caller since `proof_idx` alone repeats across sibling
+/// tasks.
+fn proof_session_keys(squad_id: &str, scope: &str, proof_idx: &str) -> (String, String) {
+    (squad_id.to_string(), format!("proof-{scope}-{proof_idx}"))
+}
+
+/// A task cell's `(cell id, task name)` -- the pair its cell session name is
 /// derived from. The Live View polls both pane endpoints every couple of
 /// seconds for every open pane, so callers read this from the pool rather
 /// than queueing behind the scheduler or a guardian-merge worker holding the
@@ -12055,98 +11439,7 @@ fn cell_terminal_log_attempt(
     terminal_log_attempt_content_reply(id, &task, &cell_id, attempt)
 }
 
-/// The `(squad_id, cell_id)` pair a `prompt`-kind proof step's tmux session
-/// is keyed by — mirrors exactly how `scheduler.rs::squad_proofs` builds the
-/// `RunnerSpec` for the same proof step (`squad_id` is the owning squad;
-/// `cell_id` is `proof-{scope}-{proof_idx}`, matching the proof step's
-/// own position within its `(task_idx, scope, cell_idx)` group — see the
-/// doc comment on `Store::proof_specs`). The third leg of the key, `task`,
-/// is fetched separately by each caller via `Store::get_task_name` since
-/// `proof_idx` alone repeats across sibling tasks (RAL-102 collision bug —
-/// see `crate::tmux::session_name`'s doc comment).
-fn proof_tmux_keys(squad_id: &str, scope: &str, proof_idx: &str) -> (String, String) {
-    (squad_id.to_string(), format!("proof-{scope}-{proof_idx}"))
-}
-
-/// Open a terminal for a `prompt`-kind proof step — the "Open Terminal Log"
-/// / "Open Agent" actions (RAL-102 follow-up). `mode` query param semantics
-/// mirror `open_terminal`'s doc comment.
-#[allow(clippy::too_many_arguments)]
-fn open_proof_terminal(
-    daemon: &Daemon,
-    id: &str,
-    task_idx: &str,
-    scope: &str,
-    cell_idx: &str,
-    proof_idx: &str,
-    query: &str,
-) -> Reply {
-    let (Ok(task_idx_n), Ok(cell_idx_n), Ok(proof_idx_n)) = (
-        task_idx.parse::<i64>(),
-        cell_idx.parse::<i64>(),
-        proof_idx.parse::<i64>(),
-    ) else {
-        return error(
-            400,
-            "bad_request",
-            "task/cell/proof index must be integers",
-            vec![],
-        );
-    };
-    if let Err(e) = daemon.lock().proof_specs(id, task_idx_n, scope, cell_idx_n) {
-        return store_error(&e);
-    }
-    if query_param(query, "mode") == Some("agent") {
-        let (agent, agent_session_id) = match daemon.lock().get_proof_agent_session_id(
-            id,
-            task_idx_n,
-            scope,
-            cell_idx_n,
-            proof_idx_n,
-        ) {
-            Ok(v) => v,
-            Err(e) => return store_error(&e),
-        };
-        // A task-scope step's cwd is its task's first cell's (see
-        // `Store::get_task_first_cell_cwd`'s doc comment); a cell-scope
-        // step's cwd is that exact cell's. Its env matches the same cell
-        // (idx 0 for task scope, since cells are enumerated from 0).
-        let (cwd, env_cell_idx) = if scope == "task" {
-            (daemon.lock().get_task_first_cell_cwd(id, task_idx_n), 0)
-        } else {
-            (
-                daemon
-                    .lock()
-                    .get_cell_agent_resume(id, task_idx_n, cell_idx_n)
-                    .map(|(cwd, _, _)| cwd),
-                cell_idx_n,
-            )
-        };
-        let cwd = match cwd {
-            Ok(v) => v,
-            Err(e) => return store_error(&e),
-        };
-        let env = match resolve_terminal_env(daemon, Some((id, task_idx_n, env_cell_idx)), None) {
-            Ok(v) => v,
-            Err(e) => return store_error(&e),
-        };
-        return open_agent_terminal(
-            &cwd,
-            Some(agent.as_str()),
-            agent_session_id.as_deref(),
-            &env,
-        );
-    }
-    let task = match daemon.lock().get_task_name(id, task_idx_n) {
-        Ok(v) => v,
-        Err(e) => return store_error(&e),
-    };
-    let (squad_id, cell_id) = proof_tmux_keys(id, scope, proof_idx);
-    let cell_id = with_run_variant(&cell_id, query);
-    attach_tmux_terminal(&squad_id, &task, &cell_id)
-}
-
-/// The live pane content of a `prompt`-kind proof step's tmux session, for
+/// The live pane content of a `prompt`-kind proof step's cell session, for
 /// the auto-refreshing "read-only terminal" peek view (RAL-102).
 #[allow(clippy::too_many_arguments)]
 fn proof_pane(
@@ -12177,7 +11470,7 @@ fn proof_pane(
         Ok(v) => v,
         Err(e) => return store_error(&e),
     };
-    let (squad_id, cell_id) = proof_tmux_keys(id, scope, proof_idx);
+    let (squad_id, cell_id) = proof_session_keys(id, scope, proof_idx);
     let cell_id = with_run_variant(&cell_id, query);
     capture_pane_reply(daemon, &squad_id, &task, &cell_id, query)
 }
@@ -12214,7 +11507,7 @@ fn proof_pane_transcript(
         Ok(v) => v,
         Err(e) => return store_error(&e),
     };
-    let (squad_id, cell_id) = proof_tmux_keys(id, scope, proof_idx);
+    let (squad_id, cell_id) = proof_session_keys(id, scope, proof_idx);
     let cell_id = with_run_variant(&cell_id, query);
     pane_transcript_range_reply(&squad_id, &task, &cell_id, query)
 }
@@ -12249,7 +11542,7 @@ fn proof_terminal_log_attempts(
         Ok(v) => v,
         Err(e) => return store_error(&e),
     };
-    let (squad_id, cell_id) = proof_tmux_keys(id, scope, proof_idx);
+    let (squad_id, cell_id) = proof_session_keys(id, scope, proof_idx);
     let cell_id = with_run_variant(&cell_id, query);
     terminal_log_attempts_reply(&squad_id, &task, &cell_id)
 }
@@ -12284,7 +11577,7 @@ fn proof_debug_events(
         Ok(v) => v,
         Err(e) => return store_error(&e),
     };
-    let (squad_id, cell_id) = proof_tmux_keys(id, scope, proof_idx);
+    let (squad_id, cell_id) = proof_session_keys(id, scope, proof_idx);
     let cell_id = with_run_variant(&cell_id, query);
     debug_events_reply(daemon, &squad_id, &task, &cell_id)
 }
@@ -12321,7 +11614,7 @@ fn proof_terminal_log_attempt(
         Ok(v) => v,
         Err(e) => return store_error(&e),
     };
-    let (squad_id, cell_id) = proof_tmux_keys(id, scope, proof_idx);
+    let (squad_id, cell_id) = proof_session_keys(id, scope, proof_idx);
     let cell_id = with_run_variant(&cell_id, query);
     terminal_log_attempt_content_reply(&squad_id, &task, &cell_id, attempt)
 }
@@ -12387,8 +11680,8 @@ fn proof_runs(
         Ok(v) => v,
         Err(e) => return store_error(&e),
     };
-    let (squad_id, cell_id) = proof_tmux_keys(id, scope, proof_idx);
-    let name = crate::tmux::session_name(&squad_id, &task, &cell_id);
+    let (squad_id, cell_id) = proof_session_keys(id, scope, proof_idx);
+    let name = crate::cell_session::session_name(&squad_id, &task, &cell_id);
     let runs = crate::terminal_log::list_run_variants(&name)
         .into_iter()
         .map(|(variant, kind, n)| StepRun { variant, kind, n })
@@ -12403,117 +11696,8 @@ fn proof_runs(
     )
 }
 
-/// Open a terminal for a review branch.
-///
-/// `mode` (query param):
-/// - `"open"` (default) — attach to the conflict-resolver's live tmux
-///   cell (RAL-102 — replaces the old `claude --resume` spawn; `409` if
-///   the resolver isn't currently running)
-/// - `"worktree"` — open a plain shell in the branch's review worktree
-///   directory; available as soon as the worktree exists, even before the
-///   first resolver pass
-/// - `"agent"` — spawn a real, interactive `claude --resume <id>` cell
-///   resuming the conflict resolver's own conversation (RAL-102 follow-up)
-fn open_guardian_branch_terminal(daemon: &Daemon, id: &str, branch_id: &str, query: &str) -> Reply {
-    let mode = query_param(query, "mode").unwrap_or("open");
-    if mode != "open" && mode != "worktree" && mode != "agent" {
-        return error(
-            400,
-            "bad_request",
-            "mode must be 'open', 'worktree', or 'agent'",
-            vec![],
-        );
-    }
-
-    // Worktree mode: open a plain shell in the branch's review worktree directory.
-    // This is available as soon as the worktree exists, before any cell ID.
-    if mode == "worktree" {
-        let worktree = match daemon.lock().get_branch_worktree(id, branch_id) {
-            Ok(v) => v,
-            Err(e) => return store_error(&e),
-        };
-        let Some(wt_path) = worktree else {
-            return error(
-                409,
-                "no_worktree",
-                "no worktree available for this branch yet",
-                vec![],
-            );
-        };
-        let safe_path = wt_path.replace('\'', "''");
-        let shell_cmd = std::env::var("RALPHUS_SHELL_CMD").unwrap_or_else(|_| "pwsh".to_string());
-        let shell_args = vec![
-            "-NoExit".to_string(),
-            "-NoProfile".to_string(),
-            "-Command".to_string(),
-            format!("Set-Location -LiteralPath '{safe_path}'"),
-        ];
-        let env = match resolve_terminal_env(daemon, None, Some((id, branch_id))) {
-            Ok(v) => v,
-            Err(e) => return store_error(&e),
-        };
-        return match spawn_in_terminal(None, &shell_cmd, &shell_args, &env) {
-            Ok(()) => json(200, &OpenTerminalResponse { ok: true }),
-            Err(msg) => error(500, "terminal_error", &msg, vec![]),
-        };
-    }
-
-    if mode == "agent" {
-        let worktree = match daemon.lock().get_branch_worktree(id, branch_id) {
-            Ok(v) => v,
-            Err(e) => return store_error(&e),
-        };
-        let Some(wt_path) = worktree else {
-            return error(
-                409,
-                "no_worktree",
-                "no worktree available for this branch yet",
-                vec![],
-            );
-        };
-        let agent_session_id = match daemon
-            .lock()
-            .get_branch_resolver_agent_session_id(id, branch_id)
-        {
-            Ok(v) => v,
-            Err(e) => return store_error(&e),
-        };
-        let env = match resolve_terminal_env(daemon, None, Some((id, branch_id))) {
-            Ok(v) => v,
-            Err(e) => return store_error(&e),
-        };
-        // The guardian's resolver agent is set once for the whole guardian
-        // (not per-branch) -- see `guardians.resolver_agent`.
-        let resolver_agent = daemon
-            .lock()
-            .get_guardian(id)
-            .ok()
-            .and_then(|g| g.resolver_agent);
-        return open_agent_terminal(
-            &wt_path,
-            resolver_agent.as_deref(),
-            agent_session_id.as_deref(),
-            &env,
-        );
-    }
-
-    // open: attach to the conflict-resolver's tmux session (RAL-102). Keyed the
-    // same way `guardian_merge.rs::resolve_conflicts_with_agent` builds its
-    // `RunnerSpec` for this exact branch -- RAL-192: the tmux session name is
-    // derived from the branch's stable id (not its mutable stack position),
-    // so it stays resolvable here even after a later reorder/add/remove.
-    // RAL-149: while the branch is `proof_pending`, the live cell is the
-    // dedicated final-proof call, not the fix pass -- attach to that one
-    // instead.
-    let (task, cell_id) = match resolver_task_and_cell_id(daemon, id, branch_id) {
-        Ok(v) => v,
-        Err(e) => return e,
-    };
-    attach_tmux_terminal(&format!("guardian-{id}"), task, &cell_id)
-}
-
 /// The `(task, cell_id)` pair addressing a review branch's conflict-resolver
-/// tmux session -- live or historical (RAL-102, extended for RAL-149's
+/// cell session -- live or historical (RAL-102, extended for RAL-149's
 /// fix/proof split, RAL-192's stable-id keying, and RAL-298's
 /// feedback-actioning session) -- shared by [`open_guardian_branch_terminal`]
 /// (attach) and [`guardian_branch_pane`] (read-only peek) so the two never
@@ -12577,14 +11761,11 @@ fn actioning_session(id: &str, branch_id: &str) -> (&'static str, String) {
     let feedback_cell = crate::guardian_merge::latest_feedback_cell(id, branch_id)
         .unwrap_or_else(|| crate::guardian_merge::feedback_cell_id(branch_id));
     let task = crate::guardian_merge::FEEDBACK_TASK;
-    let commit_live = crate::tmux::Tmux::resolve()
-        .map(|t| t.has_session(&crate::tmux::session_name(&squad, task, &commit_cell)))
-        .unwrap_or(false)
-        || crate::runner::direct_session_active(&crate::tmux::session_name(
-            &squad,
-            task,
-            &commit_cell,
-        ));
+    let commit_live = crate::runner::direct_session_active(&crate::cell_session::session_name(
+        &squad,
+        task,
+        &commit_cell,
+    ));
     (
         task,
         pick_actioning_cell(commit_live, feedback_cell, commit_cell),
@@ -12619,10 +11800,16 @@ fn freshest_resolver_or_feedback(id: &str, branch_id: &str) -> (&'static str, St
             .unwrap_or_else(|| crate::guardian_merge::feedback_cell_id(branch_id)),
     );
     let squad = format!("guardian-{id}");
-    let resolver_mtime =
-        pane_snapshot_mtime(&crate::tmux::session_name(&squad, resolver.0, &resolver.1));
-    let feedback_mtime =
-        pane_snapshot_mtime(&crate::tmux::session_name(&squad, feedback.0, &feedback.1));
+    let resolver_mtime = pane_snapshot_mtime(&crate::cell_session::session_name(
+        &squad,
+        resolver.0,
+        &resolver.1,
+    ));
+    let feedback_mtime = pane_snapshot_mtime(&crate::cell_session::session_name(
+        &squad,
+        feedback.0,
+        &feedback.1,
+    ));
     pick_freshest(resolver, feedback, resolver_mtime, feedback_mtime)
 }
 
@@ -12646,374 +11833,13 @@ fn pick_freshest<T>(
     }
 }
 
-/// Last-modified time of a tmux session's persisted pane snapshot (see
-/// `crate::tmux::write_pane_snapshot`), or `None` when that session never
-/// wrote one (never ran under tmux, or every attempt produced no output).
+/// Last-modified time of a cell session's persisted pane snapshot (see
+/// `crate::cell_session::write_pane_snapshot`), or `None` when that session never
+/// wrote one (never ran as a direct run, or every attempt produced no output).
 fn pane_snapshot_mtime(session_name: &str) -> Option<std::time::SystemTime> {
-    std::fs::metadata(crate::tmux::pane_snapshot_path(session_name))
+    std::fs::metadata(crate::cell_session::pane_snapshot_path(session_name))
         .and_then(|m| m.modified())
         .ok()
-}
-
-/// Spawn a real, interactive resumed CLI cell (`claude --resume <id>
-/// --dangerously-skip-permissions` or `codex resume <id>
-/// --dangerously-bypass-approvals-and-sandbox`, depending on which agent the
-/// cell actually ran under) in a new terminal window, rooted at `cwd` —
-/// the "Open Agent" terminal action (RAL-102 follow-up). Unlike
-/// `attach_tmux_terminal` (which re-attaches to the runner's own
-/// tmux-wrapped subprocess and only shows its log/event stream — see
-/// `claude_code_backend.py`/`codex_backend.py`'s streaming-JSON parsing),
-/// this launches the actual CLI so a human can keep the conversation going
-/// interactively, exactly as the pre-RAL-102 "resume" flow did. Permission
-/// prompts are bypassed unconditionally, matching each backend's own
-/// headless invocation, so the resumed conversation doesn't immediately
-/// stall on a prompt the human has to notice and click through.
-// Shared with `cli`'s cell/review-terminal commands, so both sides
-// build the exact same resume command line -- see `ralphus_core::agent_resume`
-// for the logic and its tests.
-use ralphus_core::agent_resume::{
-    is_codex_agent, is_pi_agent, resume_agent_command, resume_codex_agent_command,
-    resume_pi_agent_command,
-};
-
-/// Builds the `pwsh -Command <resume line>` invocation shared by
-/// [`open_agent_terminal`] (bare window, finished cell) and
-/// [`open_agent_terminal_via_tmux`] (RAL-288 Stage 6: tmux-wrapped, just
-/// detached from a live cell) -- both ultimately run the exact same real
-/// CLI resume command, just handed to a different spawn mechanism.
-fn resume_shell_invocation(agent: Option<&str>, agent_session_id: &str) -> (String, Vec<String>) {
-    resume_shell_invocation_with_overrides(
-        agent,
-        agent_session_id,
-        &ResumeCommandOverrides::from_env(),
-    )
-}
-
-/// The `RALPHUS_SHELL_CMD`/`RALPHUS_CLAUDE_COMMAND`/`RALPHUS_CODEX_COMMAND`/
-/// `RALPHUS_PI_COMMAND` overrides [`resume_shell_invocation`] reads, threaded
-/// explicitly (rather than read from `std::env` inline) so a test can exercise
-/// a compound override end-to-end without mutating real process environment --
-/// `std::env::set_var`/`remove_var` are `unsafe fn`s and this workspace
-/// forbids `unsafe_code` outright.
-#[derive(Debug, Clone, Default)]
-struct ResumeCommandOverrides {
-    shell_cmd: Option<String>,
-    claude_command: Option<String>,
-    codex_command: Option<String>,
-    pi_command: Option<String>,
-}
-
-impl ResumeCommandOverrides {
-    fn from_env() -> Self {
-        Self {
-            shell_cmd: std::env::var("RALPHUS_SHELL_CMD").ok(),
-            claude_command: std::env::var("RALPHUS_CLAUDE_COMMAND").ok(),
-            codex_command: std::env::var("RALPHUS_CODEX_COMMAND").ok(),
-            pi_command: std::env::var("RALPHUS_PI_COMMAND").ok(),
-        }
-    }
-}
-
-/// Pure core of [`resume_shell_invocation`] -- see that function's docstring.
-/// Split out so a RAL-468 regression test can pass a compound
-/// `RALPHUS_CLAUDE_COMMAND`-equivalent override (e.g. `foo bar -- claude`)
-/// directly and assert the resulting command line is shell-routed, without
-/// touching real process environment.
-fn resume_shell_invocation_with_overrides(
-    agent: Option<&str>,
-    agent_session_id: &str,
-    overrides: &ResumeCommandOverrides,
-) -> (String, Vec<String>) {
-    let shell_cmd = overrides
-        .shell_cmd
-        .clone()
-        .unwrap_or_else(|| "pwsh".to_string());
-    let command = if is_codex_agent(agent) {
-        // Mirrors `RALPHUS_CODEX_COMMAND` in `codex_backend.py` — the same
-        // override point resolves both the headless squad and this resumed
-        // one to the same binary.
-        let program = overrides
-            .codex_command
-            .clone()
-            .unwrap_or_else(|| "codex".to_string());
-        resume_codex_agent_command(&program, agent_session_id)
-    } else if is_pi_agent(agent) {
-        let program = overrides
-            .pi_command
-            .clone()
-            .unwrap_or_else(|| "pi".to_string());
-        resume_pi_agent_command(&program, agent_session_id)
-    } else {
-        // Mirrors `RALPHUS_CLAUDE_COMMAND` in `claude_code_backend.py` — the
-        // same override point resolves both the headless squad and this
-        // resumed one to the same binary.
-        let program = overrides
-            .claude_command
-            .clone()
-            .unwrap_or_else(|| "claude".to_string());
-        resume_agent_command(&program, agent_session_id)
-    };
-    let shell_args = vec![
-        "-NoExit".to_string(),
-        "-NoProfile".to_string(),
-        "-Command".to_string(),
-        command,
-    ];
-    (shell_cmd, shell_args)
-}
-
-/// `POST /api/squads/{id}/cells/{ti}/{si}/terminal-ticket` (RAL-355 Phase
-/// 10): mint a short-lived ticket for the terminal-relay WebSocket listener,
-/// after checking eligibility up front so a client gets an actionable error
-/// immediately rather than only after opening (and being refused by) the WS
-/// connection itself.
-///
-/// Eligibility, checked in this order: the cell must be resolved (a real
-/// squad/task/cell), its `machine` must be a *remote* one (this relay never
-/// handles local cells -- "Open Agent" already works for those, and a
-/// browser client has no way to see a window popped open on the daemon's own
-/// desktop for a local cell anyway), its agent must be Claude Code (this
-/// pass's only supported harness), and it must carry a resumable
-/// `agent_session_id`.
-fn mint_terminal_ticket_route(daemon: &Daemon, id: &str, ti: &str, si: &str) -> Reply {
-    let (Ok(task_idx), Ok(cell_idx)) = (ti.parse::<i64>(), si.parse::<i64>()) else {
-        return error(
-            400,
-            "bad_request",
-            "task/cell index must be integers",
-            vec![],
-        );
-    };
-    let guard = daemon.lock();
-    let (cwd, agent, agent_session_id) = match guard.get_cell_agent_resume(id, task_idx, cell_idx) {
-        Ok(v) => v,
-        Err(e) => return store_error(&e),
-    };
-    let (machine, _is_command_cell, state) = match guard.get_cell_input_gate(id, task_idx, cell_idx)
-    {
-        Ok(v) => v,
-        Err(e) => return store_error(&e),
-    };
-    drop(guard);
-    let _ = cwd;
-    let Some(machine) = machine else {
-        return error(
-            400,
-            "not_remote",
-            "this cell runs locally -- use the existing Open Agent action instead of the \
-             remote terminal relay",
-            vec![],
-        );
-    };
-    // Remote cells have no detach mechanism yet (unlike local `open-agent`'s
-    // RAL-288 Stage 6 dance) -- a `Running` remote cell may still have a
-    // live headless process writing to this exact `agent_session_id`
-    // conversation, so opening a second interactive resume against it now
-    // would race the same way a local cell's still-running branch exists to
-    // prevent. Reject rather than risk corrupting the session; retry once
-    // the cell finishes.
-    if state == crate::store::NodeState::Running {
-        return error(
-            409,
-            "still_running",
-            "this cell is still running remotely -- wait for it to finish before opening a \
-             terminal (the remote terminal relay has no detach mechanism yet)",
-            vec![],
-        );
-    }
-    if !ralphus_core::agent_resume::is_claude_agent(Some(agent.as_str())) {
-        return error(
-            400,
-            "unsupported_agent",
-            &format!(
-                "the remote terminal relay only supports Claude Code cells this release; \
-                 this cell's agent is {agent:?}"
-            ),
-            vec![],
-        );
-    }
-    let Some(session_id) = agent_session_id else {
-        return error(
-            409,
-            "no_claude_session",
-            "no resumable agent session recorded yet for this cell",
-            vec![],
-        );
-    };
-    let port = daemon.terminal_relay_port();
-    if port == 0 {
-        return error(
-            503,
-            "relay_unavailable",
-            "the terminal-relay listener is not running",
-            vec![],
-        );
-    }
-    let ticket = daemon.mint_terminal_ticket();
-    let _ = session_id; // the WS connection itself re-derives it from the cell, not the ticket
-    let _ = machine;
-    json(
-        200,
-        &serde_json::json!({"ticket": ticket, "port": port, "path": "/terminal"}),
-    )
-}
-
-fn open_agent_terminal(
-    cwd: &str,
-    agent: Option<&str>,
-    agent_session_id: Option<&str>,
-    env: &std::collections::BTreeMap<String, String>,
-) -> Reply {
-    let Some(cell_id) = agent_session_id else {
-        return error(
-            409,
-            "no_claude_session",
-            "no CLI-agent cell id recorded yet — it may not have started, \
-             or didn't run under an agent that supports resume",
-            vec![],
-        );
-    };
-    // No leading `Set-Location ...;` here -- `cwd` is passed as its own
-    // argument below so it goes through wt's `-d` flag / `current_dir`
-    // instead of a semicolon `wt.exe` can't pass through to the agent (see
-    // `spawn_in_terminal`'s doc comment).
-    let (shell_cmd, shell_args) = resume_shell_invocation(agent, cell_id);
-    match spawn_in_terminal(Some(cwd), &shell_cmd, &shell_args, env) {
-        Ok(()) => json(200, &OpenTerminalResponse { ok: true }),
-        Err(msg) => error(500, "terminal_error", &msg, vec![]),
-    }
-}
-
-/// RAL-288 Stage 6: the real interactive resume session, launched *inside a
-/// named tmux session* rather than a bare terminal window, once a
-/// just-detached cell has been confirmed genuinely stopped (see
-/// `detach_and_open_agent`, this function's only caller). tmux, not this
-/// code, is what makes "close the client terminal, everything the human did
-/// is still there on reattach" work -- it's tmux's own core behavior, not
-/// something built for this. The session name is the cell's own
-/// deterministic name with a `-resume` suffix, so it never collides with
-/// the (now-dead) original cell session and `attach_tmux_terminal`'s
-/// existing "attach a local terminal to a named session" mechanism can
-/// reattach to it later exactly the way it already does for a plain cell.
-/// Idempotent: if the resume session is already alive (a second "Open Agent"
-/// click, or the human closed only their terminal window and not the tmux
-/// session itself), this skips straight to spawning another local terminal
-/// attached to it instead of trying to create a duplicate.
-fn open_agent_terminal_via_tmux(
-    cwd: &str,
-    squad_id: &str,
-    task: &str,
-    cell_id: &str,
-    agent: Option<&str>,
-    agent_session_id: &str,
-    env: &std::collections::BTreeMap<String, String>,
-) -> Reply {
-    let tmux = match crate::tmux::Tmux::resolve() {
-        Ok(t) => t,
-        Err(e) => return error(500, "tmux_error", &e.to_string(), vec![]),
-    };
-    let resume_session_name =
-        crate::tmux::session_name(squad_id, task, &format!("{cell_id}-resume"));
-    // RAL-288: idempotent by design -- a second "Open Agent" click on an
-    // already-detached cell (the human never closed the resume session, or
-    // just wants another terminal attached to it) must reattach to the
-    // existing live session rather than trying to create a duplicate, which
-    // psmux/tmux both reject outright.
-    if !tmux.has_session(&resume_session_name) {
-        let (shell_cmd, shell_args) = resume_shell_invocation(agent, agent_session_id);
-        if let Err(e) = tmux.new_detached_session_with_command(
-            &resume_session_name,
-            cwd,
-            env,
-            &shell_cmd,
-            &shell_args,
-            None,
-        ) {
-            return error(500, "tmux_error", &e.to_string(), vec![]);
-        }
-    }
-    let tmux_program = tmux.program().to_string();
-    let mut attach_args: Vec<String> = tmux.prefix_args().to_vec();
-    attach_args.extend([
-        "attach-session".to_string(),
-        "-t".to_string(),
-        resume_session_name,
-    ]);
-    match spawn_in_terminal(
-        None,
-        &tmux_program,
-        &attach_args,
-        &std::collections::BTreeMap::new(),
-    ) {
-        Ok(()) => json(200, &OpenTerminalResponse { ok: true }),
-        Err(msg) => error(500, "terminal_error", &msg, vec![]),
-    }
-}
-
-/// How long [`detach_and_open_agent`] waits for a just-requested detach to
-/// actually finish (the runner's poll loop notices within
-/// `TMUX_POLL_INTERVAL` and kills the tmux session almost immediately, so
-/// this is a generous upper bound, not an expected wait) before giving up
-/// and telling the caller to retry, rather than opening a second session
-/// against a conversation that might still be live.
-const DETACH_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
-const DETACH_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(150);
-/// Live-observed (RAL-288): creating a new tmux session immediately after
-/// `has-session` first reports the old one gone can still transiently fail
-/// ("psmux: failed to create session") -- psmux needs a beat to finish
-/// releasing whatever it was still holding. A short unconditional settle
-/// delay before creating the resume session clears this reliably; a bare
-/// retry a few seconds later also worked when this was hit live, which is
-/// roughly this order of magnitude.
-const DETACH_SETTLE_DELAY: std::time::Duration = std::time::Duration::from_millis(400);
-
-/// RAL-288 Stage 6: the "Open Agent" action for a cell that's still
-/// genuinely running. Requests a clean detach via the shared
-/// [`crate::cancel::Detachments`] registry, then blocks -- bounded by
-/// [`DETACH_WAIT_TIMEOUT`], since this daemon's HTTP loop is otherwise
-/// synchronous -- until the original tmux session is confirmed gone, before
-/// opening the real resume session. "Detach requested" is not the same
-/// guarantee as "detach happened"; two processes on one conversation
-/// transcript is exactly what corrupts it, so the wait is not optional.
-#[allow(clippy::too_many_arguments)]
-fn detach_and_open_agent(
-    daemon: &Daemon,
-    squad_id: &str,
-    cwd: &str,
-    task: &str,
-    cell_id: &str,
-    agent: &str,
-    agent_session_id: &str,
-    env: &std::collections::BTreeMap<String, String>,
-) -> Reply {
-    let tmux = match crate::tmux::Tmux::resolve() {
-        Ok(t) => t,
-        Err(e) => return error(500, "tmux_error", &e.to_string(), vec![]),
-    };
-    let session_name = crate::tmux::session_name(squad_id, task, cell_id);
-    daemon.detachments_handle().cancel(&session_name);
-    let deadline = std::time::Instant::now() + DETACH_WAIT_TIMEOUT;
-    while tmux.has_session(&session_name) || crate::runner::direct_session_active(&session_name) {
-        if std::time::Instant::now() >= deadline {
-            return error(
-                503,
-                "detach_in_progress",
-                "still shutting down the live session -- try again in a moment",
-                vec![],
-            );
-        }
-        std::thread::sleep(DETACH_POLL_INTERVAL);
-    }
-    std::thread::sleep(DETACH_SETTLE_DELAY);
-    open_agent_terminal_via_tmux(
-        cwd,
-        squad_id,
-        task,
-        cell_id,
-        Some(agent),
-        agent_session_id,
-        env,
-    )
 }
 
 /// The specific run a Live View request names via `?task=…&cell_id=…`, after
@@ -13055,11 +11881,11 @@ fn requested_branch_run<'q>(
     Ok(Some((task, cell_id)))
 }
 
-/// The live pane content of a review branch's conflict-resolver tmux
+/// The live pane content of a review branch's conflict-resolver session
 /// cell, for the auto-refreshing "read-only terminal" peek view in the
 /// Review tab (RAL-102).
 fn guardian_branch_pane(daemon: &Daemon, id: &str, branch_id: &str, query: &str) -> Reply {
-    // RAL-192: the tmux session name is keyed on the branch's stable id (see
+    // RAL-192: the cell session name is keyed on the branch's stable id (see
     // `resolver_task_and_cell_id`), so it resolves correctly here even if
     // the branch's stack position has since changed -- including falling
     // back to the persisted historical snapshot (`inactive_pane_reply`, via
@@ -13237,44 +12063,6 @@ fn guardian_branch_debug_events(daemon: &Daemon, id: &str, branch_id: &str) -> R
         &format!("guardian-{id}"),
         crate::guardian_merge::RESOLVER_TASK,
         &format!("resolver-{position}"),
-    )
-}
-
-/// Open a terminal for a review's manual-checks generation pass (RAL-88
-/// follow-up). `mode` (query param) mirrors `open_guardian_branch_terminal`'s:
-/// - `"open"` (default) — attach to the generation run's live tmux session;
-///   `409` if it isn't currently running.
-/// - `"agent"` — spawn a real, interactive resumed cell resuming that
-///   generation's own conversation, if it ran under an agent that supports
-///   resume (see `open_agent_terminal`'s doc comment).
-fn open_guardian_manual_checks_terminal(daemon: &Daemon, id: &str, query: &str) -> Reply {
-    let mode = query_param(query, "mode").unwrap_or("open");
-    if mode != "open" && mode != "agent" {
-        return error(400, "bad_request", "mode must be 'open' or 'agent'", vec![]);
-    }
-    let (cwd, agent, agent_session_id) =
-        match daemon.lock().get_guardian_manual_commands_agent_resume(id) {
-            Ok(v) => v,
-            Err(e) => return store_error(&e),
-        };
-    if mode == "agent" {
-        // RAL-489: this resumes the manual-checks generation pass's own
-        // agent conversation in the combined worktree, so it should see the
-        // same `manual_checks_env` (RAL-203) that pass itself ran under --
-        // not the per-branch/build env used elsewhere in this file.
-        let env = daemon
-            .lock()
-            .get_guardian(id)
-            .map(|g| g.manual_checks_env)
-            .unwrap_or_default();
-        return open_agent_terminal(&cwd, agent.as_deref(), agent_session_id.as_deref(), &env);
-    }
-    // open: attach to the generation pass's tmux session — keyed the same way
-    // `guardian_merge.rs::generate_manual_commands` builds its `RunnerSpec`.
-    attach_tmux_terminal(
-        &format!("guardian-{id}"),
-        crate::guardian_merge::MANUAL_COMMANDS_TASK,
-        crate::guardian_merge::MANUAL_COMMANDS_SESSION,
     )
 }
 
@@ -13485,7 +12273,7 @@ fn guardian_live_run_terminal_log(daemon: &Daemon, id: &str, run_id: &str) -> Re
     }
 }
 
-/// The live pane content of a review's manual-checks generation tmux session,
+/// The live pane content of a review's manual-checks generation cell session,
 /// for the auto-refreshing "read-only terminal" peek view (RAL-88 follow-up).
 fn guardian_manual_checks_pane(daemon: &Daemon, id: &str, query: &str) -> Reply {
     if daemon.lock().get_guardian(id).is_err() {
@@ -13919,8 +12707,7 @@ fn system_prompt_reply(
 /// environment via `Command::envs` -- both the `wt.exe` and PowerShell-console
 /// fallback paths spawn the actual command as a *child* of the process this
 /// starts, so variables set here propagate down to it either way. Empty for
-/// callers with nothing to add (e.g. attaching to an already-running tmux
-/// cell, whose environment was fixed at spawn time).
+/// callers with nothing to add.
 #[cfg(target_os = "windows")]
 fn spawn_in_terminal(
     cwd: Option<&str>,
@@ -13999,63 +12786,39 @@ fn which_program(name: &str) -> Option<String> {
         })
 }
 
-/// Directly, synchronously kill every live tmux session belonging to
+/// Directly, synchronously stop every live cell session belonging to
 /// `squad_id`, as a robust backstop alongside `Cancellations::cancel`.
 ///
 /// `Cancellations::cancel` only trips a flag a worker's polling loop checks
-/// on its own schedule (up to `TMUX_POLL_INTERVAL`, currently 500ms) — and
-/// is a silent no-op if that squad's worker thread isn't currently alive at
-/// all (already finished, or never started). Either way, a tmux pane that's
-/// actually still running would be left orphaned, alive, and unresponsive to
-/// "cancelled" until something else notices. This call doesn't wait on any
-/// worker at all: it asks psmux directly what's running under this squad's
-/// deterministic `ralphus_<squad_id>_...` cell-name prefix and kills it
-/// immediately, regardless of whether the token mechanism is working.
-fn kill_squad_tmux_sessions(squad_id: &str) -> usize {
+/// on its own schedule, and is a silent no-op if that squad's worker thread
+/// isn't currently alive. This call doesn't wait on any worker: it asks the
+/// direct runner to stop whatever is registered under this squad's
+/// deterministic `ralphus_<squad_id>_...` cell-name prefix.
+fn kill_squad_cell_sessions(squad_id: &str) -> usize {
     let prefix = format!("ralphus_{squad_id}_");
-    let headless =
-        crate::runner::direct_request_stop_with_any_prefix(std::slice::from_ref(&prefix));
-    let Ok(tmux) = crate::tmux::Tmux::resolve() else {
-        return headless;
-    };
-    headless + tmux.kill_sessions_with_prefix(&prefix)
+    crate::runner::direct_request_stop_with_any_prefix(std::slice::from_ref(&prefix))
 }
 
-/// The cascade counterpart to [`kill_squad_tmux_sessions`]: kills every live
-/// tmux session belonging to any squad in `squad_ids`, sharing one
-/// `list-sessions` round trip across the whole cascade
-/// (`Tmux::kill_sessions_with_any_prefix`, RAL-407) instead of resolving tmux
-/// and listing sessions once per squad. A cancel that cascades to several
-/// dependent squads previously paid one full discovery round trip per squad
-/// before this ran (and used to do so synchronously on the request thread —
-/// see [`cancel`]'s doc comment for why it doesn't anymore).
-fn kill_squads_tmux_sessions(squad_ids: &[String]) -> usize {
+/// The cascade counterpart to [`kill_squad_cell_sessions`]: stops every live
+/// cell session belonging to any squad in `squad_ids` in one registry pass.
+fn kill_squads_cell_sessions(squad_ids: &[String]) -> usize {
     let prefixes: Vec<String> = squad_ids
         .iter()
         .map(|id| format!("ralphus_{id}_"))
         .collect();
-    let headless = crate::runner::direct_request_stop_with_any_prefix(&prefixes);
-    let Ok(tmux) = crate::tmux::Tmux::resolve() else {
-        return headless;
-    };
-    headless + tmux.kill_sessions_with_any_prefix(&prefixes)
+    crate::runner::direct_request_stop_with_any_prefix(&prefixes)
 }
 
-/// The guardian-cell counterpart to [`kill_squad_tmux_sessions`]: kills
-/// every live tmux session belonging to guardian `guardian_id`. Guardian
+/// The guardian-cell counterpart to [`kill_squad_cell_sessions`]: stops
+/// every live cell session belonging to guardian `guardian_id`. Guardian
 /// resolver/PR-description/summary cells are named via
-/// `tmux::session_name(&format!("guardian-{guardian_id}"), ...)` (see the
+/// `cell_session::session_name(&format!("guardian-{guardian_id}"), ...)` (see the
 /// `RunnerSpec` construction sites in `guardian_merge.rs`), so the same
-/// `ralphus_{squad_id}_` scoping `kill_squad_tmux_sessions` uses applies here
+/// `ralphus_{squad_id}_` scoping `kill_squad_cell_sessions` uses applies here
 /// with that formatted id in place of a plain squad id.
-fn kill_guardian_tmux_sessions(guardian_id: &str) -> usize {
+fn kill_guardian_cell_sessions(guardian_id: &str) -> usize {
     let prefix = format!("ralphus_guardian-{guardian_id}_");
-    let headless =
-        crate::runner::direct_request_stop_with_any_prefix(std::slice::from_ref(&prefix));
-    let Ok(tmux) = crate::tmux::Tmux::resolve() else {
-        return headless;
-    };
-    headless + tmux.kill_sessions_with_prefix(&prefix)
+    crate::runner::direct_request_stop_with_any_prefix(std::slice::from_ref(&prefix))
 }
 
 #[derive(Serialize)]
@@ -14073,8 +12836,8 @@ struct CancelResponse {
 /// Returns as soon as cancellation is durable: the store write above and
 /// `Cancellations::cancel` below are both fast, in-memory-or-single-write
 /// operations, and the response already reflects every affected squad's
-/// final `cancelled` state at that point. The tmux/psmux teardown
-/// (`kill_squads_tmux_sessions`) is *not* awaited before replying — it
+/// final `cancelled` state at that point. The runner teardown
+/// (`kill_squads_cell_sessions`) is *not* awaited before replying — it
 /// shells out per session and, on a cascade spanning several squads, used to
 /// make this endpoint itself take several seconds (RAL-407), even though
 /// cancellation was already effectively decided. It runs in the background
@@ -14085,7 +12848,7 @@ fn cancel(daemon: &Daemon, id: &str) -> Reply {
     // Bound before the `match`: as a scrutinee the guard stays alive for the
     // whole match body, which includes the `background().spawn` below -- and
     // under `BackgroundWork::Immediate` that closure runs *inline*, shelling
-    // out to tmux per session with the daemon's one global store lock held.
+    // out to session per session with the daemon's one global store lock held.
     // The WS-B.3 guard watchdog catches this at 129 ms on a single-squad
     // cancel; a cascade spanning several squads is far worse.
     //
@@ -14103,7 +12866,7 @@ fn cancel(daemon: &Daemon, id: &str) -> Reply {
             }
             let teardown_ids = squad_ids.clone();
             daemon.background().spawn(move || {
-                kill_squads_tmux_sessions(&teardown_ids);
+                kill_squads_cell_sessions(&teardown_ids);
             });
             json(
                 200,
@@ -14149,27 +12912,27 @@ struct ShutdownResponse {
 }
 
 /// Kill every process this daemon has spawned — cell/proof/review/summary
-/// subprocesses, tmux panes, everything — and request that the daemon exit
+/// subprocesses, cell transcripts, everything — and request that the daemon exit
 /// once this response is sent.
 ///
 /// Unconditionally (regardless of `auto_cancel`): trips every registered
 /// cancellation token (stops scheduler-squad cells' subprocesses via their
-/// existing polling loop) and kills every tmux session belonging to a
+/// existing polling loop) and kills every cell session belonging to a
 /// currently-known squad or guardian, one entity at a time, via
-/// [`kill_squad_tmux_sessions`] / [`kill_guardian_tmux_sessions`] — each
+/// [`kill_squad_cell_sessions`] / [`kill_guardian_cell_sessions`] — each
 /// scoped to that single entity's own deterministic cell-name prefix
-/// (see `tmux::session_name`). With `auto_cancel: true`, also
+/// (see `cell_session::session_name`). With `auto_cancel: true`, also
 /// cascade-cancels every non-terminal squad and cancellable guardian so their
 /// DB state reflects an intentional stop rather than being left for
 /// crash-recovery to resume.
 ///
-/// Previously called `tmux::reap_orphaned_sessions_at_startup` here instead
-/// — a machine-wide, unscoped kill of *every* `ralphus_`-prefixed tmux.exe
+/// Previously called `session::reap_orphaned_sessions_at_startup` here instead
+/// — a machine-wide, unscoped kill of *every* `ralphus_`-prefixed session.exe
 /// process, sound only at actual daemon startup (its own doc comment says
 /// so). Called from this live endpoint, it matches — and kills — the very
 /// pane this handler happens to be running in whenever that pane's own
 /// cell name starts with `ralphus_` (which every real daemon-spawned
-/// cell's name does, by construction). See `PSMUX_CRASH_NOTES.local.md`'s
+/// cell's name does, by construction). See `the crash notes`'s
 /// "SOLVED" section for the full incident.
 ///
 /// Never terminates the process itself — see the `shutdown` field's doc
@@ -14196,13 +12959,13 @@ fn shutdown(daemon: &Daemon, body: &str) -> Reply {
             failures.push(format!("list reviews: {e}"));
             Vec::new()
         });
-    let tmux_killed: usize = squads
+    let sessions_killed: usize = squads
         .iter()
-        .map(|r| kill_squad_tmux_sessions(&r.id))
+        .map(|r| kill_squad_cell_sessions(&r.id))
         .sum::<usize>()
         + guardians
             .iter()
-            .map(|(id, _status)| kill_guardian_tmux_sessions(id))
+            .map(|(id, _status)| kill_guardian_cell_sessions(id))
             .sum::<usize>();
 
     let mut cancelled_squads = Vec::new();
@@ -14252,7 +13015,7 @@ fn shutdown(daemon: &Daemon, body: &str) -> Reply {
             log_path: None,
             payload: serde_json::json!({
                 "auto_cancel": req.auto_cancel,
-                "tmux_killed": tmux_killed,
+                "sessions_killed": sessions_killed,
                 "cancelled_squads": cancelled_squads.len(),
                 "cancelled_guardians": cancelled_guardians.len(),
                 "failures": failures,
@@ -14261,7 +13024,7 @@ fn shutdown(daemon: &Daemon, body: &str) -> Reply {
         });
     crate::rlog!(
         WARNING,
-        "ralphus [daemon] shutdown requested: auto_cancel={} tmux_killed={tmux_killed} \
+        "ralphus [daemon] shutdown requested: auto_cancel={} sessions_killed={sessions_killed} \
          cancelled_squads={} cancelled_guardians={} failures={}",
         req.auto_cancel,
         cancelled_squads.len(),
@@ -14586,7 +13349,7 @@ fn apply_stop_cascade(
     Ok(())
 }
 
-/// The tmux pane name(s) and owning cell that a manual status-set
+/// The cell transcript name(s) and owning cell that a manual status-set
 /// (RAL-163) on a task/cell/proof step must capture and stop, or `None`
 /// if the target doesn't resolve to a real node.
 fn stop_targets_for_status_change_full(
@@ -14603,7 +13366,7 @@ fn stop_targets_for_status_change_full(
                 return Vec::new();
             };
             vec![StopTarget {
-                pane_name: crate::tmux::session_name(squad_id, &task, &sid),
+                pane_name: crate::cell_session::session_name(squad_id, &task, &sid),
                 ghost_task_idx: req.task_idx,
                 ghost_cell_idx: req.cell_idx,
             }]
@@ -14613,7 +13376,7 @@ fn stop_targets_for_status_change_full(
             .unwrap_or_default()
             .into_iter()
             .map(|(idx, sid)| StopTarget {
-                pane_name: crate::tmux::session_name(squad_id, &task, &sid),
+                pane_name: crate::cell_session::session_name(squad_id, &task, &sid),
                 ghost_task_idx: req.task_idx,
                 ghost_cell_idx: idx,
             })
@@ -14633,9 +13396,9 @@ fn stop_targets_for_status_change_full(
                 return Vec::new();
             };
             let (vsquad_id, vcell_id) =
-                proof_tmux_keys(squad_id, &req.proof_scope, &req.proof_idx.to_string());
+                proof_session_keys(squad_id, &req.proof_scope, &req.proof_idx.to_string());
             vec![StopTarget {
-                pane_name: crate::tmux::session_name(&vsquad_id, &task, &vcell_id),
+                pane_name: crate::cell_session::session_name(&vsquad_id, &task, &vcell_id),
                 ghost_task_idx: req.task_idx,
                 ghost_cell_idx,
             }]
@@ -14645,7 +13408,7 @@ fn stop_targets_for_status_change_full(
 }
 
 #[cfg(test)]
-/// The tmux pane name(s) and owning-cell index that a manual status-set
+/// The cell transcript name(s) and owning-cell index that a manual status-set
 /// (RAL-163) on a task/cell/proof step must capture and stop. Kept as the
 /// compact `(pane_name, ghost_cell_idx)` shape for the existing unit tests.
 fn stop_targets_for_status_change(
@@ -14671,16 +13434,14 @@ fn stop_targets_for_status_change(
 ///
 /// Best-effort throughout, and never blocks the status change itself: most
 /// of the time there's no live agent to capture (the common case is
-/// overriding an already-finished node), and even a tmux resolution failure
-/// shouldn't stop a user from being able to force a status.
+/// overriding an already-finished node).
 /// Takes the [`StoreHandle`] rather than a live guard: the loop below runs
-/// `tmux has-session`, `tmux capture-pane` and `git rev-parse` per target, and
+/// a transcript read and `git rev-parse` per target, and
 /// the caller (`set_status`) used to hold the daemon's one global store lock
 /// across all of it. Targets are resolved under a single brief lock, then every
 /// store touch inside the loop takes its own short-lived one, so no subprocess
 /// ever runs with the lock held.
 fn capture_and_stop_nodes(store: &StoreHandle, squad_id: &str, reqs: &[SetStatusBody]) {
-    let tmux = crate::tmux::Tmux::resolve().ok();
     let targets = {
         let guard = store.lock();
         let mut seen = HashSet::new();
@@ -14695,37 +13456,12 @@ fn capture_and_stop_nodes(store: &StoreHandle, squad_id: &str, reqs: &[SetStatus
         targets
     };
     for target in targets {
-        // A cell running without tmux has no pane: its checkpoint is the
-        // tail of its transcript, and stopping it is a flag its run loop
-        // honors.
-        let headless = crate::runner::direct_session_active(&target.pane_name);
-        let pane = tmux
-            .as_ref()
-            .filter(|t| !headless && t.has_session(&target.pane_name));
-        if !headless && pane.is_none() {
+        // A running cell's checkpoint is the tail of its transcript, and
+        // stopping it is a flag its run loop honors.
+        if !crate::runner::direct_session_active(&target.pane_name) {
             continue;
         }
-        // psmux can briefly reject `capture-pane` immediately after its
-        // session server becomes visible. Retrying that transport race before
-        // the terminal kill preserves the checkpoint without delaying a pane
-        // that was genuinely empty.
-        let mut capture = None;
-        if headless {
-            capture = crate::runner::direct_live_tail(&target.pane_name, 2000);
-        } else if let Some(tmux) = pane {
-            for attempt in 0..3 {
-                match tmux.capture_pane(&target.pane_name, 2000) {
-                    Ok(content) => {
-                        capture = Some(content);
-                        break;
-                    }
-                    Err(_) if attempt < 2 => {
-                        std::thread::sleep(std::time::Duration::from_millis(100));
-                    }
-                    Err(_) => break,
-                }
-            }
-        }
+        let capture = crate::runner::direct_live_tail(&target.pane_name, 2000);
         if let Some(content) = capture {
             // RAL-247: scrub credential env-var values before folding the pane
             // capture into the cell's ghost (which is later served back and
@@ -14771,11 +13507,7 @@ fn capture_and_stop_nodes(store: &StoreHandle, squad_id: &str, reqs: &[SetStatus
                 drop(guard);
             }
         }
-        if headless {
-            crate::runner::direct_request_stop(&target.pane_name);
-        } else if let Some(tmux) = pane {
-            let _ = tmux.kill_session(&target.pane_name);
-        }
+        crate::runner::direct_request_stop(&target.pane_name);
     }
 }
 
@@ -14894,10 +13626,10 @@ fn set_status(daemon: &Daemon, id: &str, body: &str) -> Reply {
     // cascading RAL-181 stop, stop every impacted pane in that branch; for any
     // other manual status change, keep the old single-node behavior.
     // The guard is released for the capture pass and re-taken after it. Every
-    // target costs a `tmux has-session`, a `tmux capture-pane` and a
+    // target costs a `session has-session`, a `transcript` and a
     // `git rev-parse`, and this used to run with the guard live from the top of
     // the handler -- one manual cancel of a multi-cell branch stalled every
-    // other request the daemon served for as long as tmux took to answer.
+    // other request the daemon served for as long as session took to answer.
     // Re-reading state afterwards is correct: the code below looks up whatever
     // it needs itself, and this handler already drops and re-acquires the lock
     // further down for `fire_ready_triage_thresholds` for the same reason.
@@ -14937,7 +13669,7 @@ fn set_status(daemon: &Daemon, id: &str, body: &str) -> Reply {
                         daemon.cancellations.cancel(squad_id);
                     }
                     daemon.background().spawn(move || {
-                        kill_squads_tmux_sessions(&squad_ids);
+                        kill_squads_cell_sessions(&squad_ids);
                     });
                 })
             } else {
@@ -15215,7 +13947,7 @@ fn delete_squad(daemon: &Daemon, id: &str) -> Reply {
         Ok(()) => {
             // RAL-154: a deleted squad's durable terminal logs must not outlive
             // the squad itself — same `ralphus_<squad_id>_` prefix scoping
-            // `kill_squad_tmux_sessions` already uses to find its live tmux
+            // `kill_squad_cell_sessions` already uses to find its live session
             // cells.
             crate::terminal_log::delete_with_prefix(&format!("ralphus_{id}_"));
             json(200, &StateResponse { state: "deleted" })
@@ -18606,7 +17338,7 @@ fn delete_guardian_and_defer_cleanup(daemon: &Daemon, id: &str) -> Result<(), St
                 crate::guardian_merge::purge_worktrees(&store_handle, root, &id);
             }
         }
-        // RAL-154: same scoping as `kill_guardian_tmux_sessions` — a
+        // RAL-154: same scoping as `kill_guardian_cell_sessions` — a
         // deleted guardian's durable terminal logs (resolver/manual-checks
         // cells) must not outlive it.
         crate::terminal_log::delete_with_prefix(&format!("ralphus_guardian-{id}_"));
@@ -18810,7 +17542,7 @@ fn guardian_cancel(daemon: &Daemon, id: &str) -> Reply {
                     "review cancelled",
                 );
             }
-            // Tmux teardown can require a process query. It belongs to the
+            // Session teardown can require a process query. It belongs to the
             // cancellation cleanup path, not the HTTP acknowledgement path.
             let store = daemon.store_handle();
             let id = id.to_string();
@@ -19149,48 +17881,10 @@ fn build_check_command_body(
     Some((resolved, body))
 }
 
-#[allow(clippy::too_many_arguments)]
-fn build_remote_check_command_line(
-    daemon: &Daemon,
-    guardian: &crate::guardian::GuardianView,
-    check: &crate::guardian::GuardianCheck,
-    submitted_inputs: &std::collections::HashMap<String, String>,
-    run_cleanup: bool,
-    marker_path: &std::path::Path,
-    log_path: &std::path::Path,
-) -> Result<PreparedCheck, String> {
-    let machine = guardian
-        .machine
-        .as_deref()
-        .ok_or_else(|| "action requested review_machine but this review is local".to_string())?;
-    let cwd = check
-        .prepared_cwd
-        .as_deref()
-        .or(guardian.combined_worktree.as_deref())
-        .ok_or_else(|| "review has no prepared worktree".to_string())?;
-    let (resolved, body) =
-        build_check_command_body(check, submitted_inputs, &guardian.input_values, run_cleanup)
-            .ok_or_else(|| "prepared action has no runnable command".to_string())?;
-    let remote_command = format!("cd '{}' && {body}", cwd.replace('\'', "'\\''"));
-    let provider = {
-        let store = daemon.lock();
-        crate::remote_runner::provider_from_store(&store, machine)?
-    }
-    .ok_or_else(|| format!("review machine {machine:?} resolved to the daemon host"))?;
-    let (program, args) = provider.terminal_invocation(&remote_command, 120, 40);
-    let invocation = ralphus_core::shellcmd::build_program_command_line("cmd", &program, &args);
-    let marker = marker_path.display();
-    let log = log_path.display();
-    let line = format!(
-        "({invocation}) > \"{log}\" 2>&1 & echo !ERRORLEVEL!>\"{marker}\" & type \"{log}\""
-    );
-    Ok(PreparedCheck {
-        resolved_command: resolved,
-        args: vec!["/V:ON".to_string(), "/K".to_string(), line],
-        marker_path: marker_path.to_path_buf(),
-        log_path: log_path.to_path_buf(),
-    })
-}
+/// Why a board-launched check cannot run on the review's machine: that path
+/// relied on a provider terminal relay, which no longer exists.
+const REMOTE_CHECK_UNSUPPORTED: &str =
+    "running a check on the review machine is not supported; run it locally";
 
 /// Gap between polls of a launched check's exit-code marker file. Short enough
 /// that a quick check's recorded duration is accurate to well under a second,
@@ -19673,21 +18367,8 @@ fn guardian_run_manual_commands(daemon: &Daemon, id: &str, body: &str) -> Reply 
         let run_remote = check.run_on.as_deref() == Some("review_machine")
             || (check.run_on.is_none() && g.machine.is_some());
         let prepared = if run_remote {
-            match build_remote_check_command_line(
-                daemon,
-                &g,
-                check,
-                &req.inputs,
-                req.run_cleanup,
-                &marker,
-                &log,
-            ) {
-                Ok(prepared) => prepared,
-                Err(error) => {
-                    errors.push(error);
-                    continue;
-                }
-            }
+            errors.push(REMOTE_CHECK_UNSUPPORTED.to_string());
+            continue;
         } else {
             let Some(prepared) = build_check_command_line(
                 &cwd,
@@ -19857,18 +18538,7 @@ fn guardian_run_action_hint(daemon: &Daemon, id: &str, body: &str) -> Reply {
     let run_remote = hint.run_on.as_deref() == Some("review_machine")
         || (hint.run_on.is_none() && g.machine.is_some());
     let prepared = if run_remote {
-        match build_remote_check_command_line(
-            daemon,
-            &g,
-            &hint,
-            &req.inputs,
-            req.run_cleanup,
-            &marker,
-            &log,
-        ) {
-            Ok(prepared) => Some(prepared),
-            Err(message) => return error(500, "terminal_error", &message, vec![]),
-        }
+        return error(500, "terminal_error", REMOTE_CHECK_UNSUPPORTED, vec![]);
     } else {
         build_check_command_line(
             &cwd,
@@ -20988,41 +19658,12 @@ pub fn serve<A: ToSocketAddrs>(
     // Arbiter reviews before review recovery starts scheduling work.
     crate::reviews::repair_arbiter_review_project_roots(&store);
     crate::reviews::repair_review_project_identities(&store);
-    // Zombie tmux.exe reaping: on the Windows tmux-alternative (psmux) this
-    // project targets, `kill-session` frees a cell's *name* but never
-    // actually terminates the backing OS process (see
-    // PSMUX_CRASH_NOTES.local.md's "kill-session leaks the underlying OS
-    // process" finding) -- every cell ever run, cancelled, or restarted
-    // across this machine's history can leave one behind, and they persist
-    // across daemon restarts. Safe to force-kill all `ralphus_`-named ones
-    // unconditionally here, and only here: nothing has been dispatched yet
-    // (same invariant `recover_orphaned_squads` above relies on), so anything
-    // found is guaranteed orphaned. Never touches psmux's own `__warm__`
-    // pool -- see `tmux::reap_orphaned_sessions_at_startup`'s doc comment.
-    let reap_started = Instant::now();
-    let reaped = crate::tmux::reap_orphaned_sessions_at_startup();
-    crate::daemon_health::report_startup_reap(reaped);
-    let reap_ms = reap_started.elapsed().as_millis();
-    // RAL-234: this whole block (recovery + reap) runs after the port is
-    // bound but before `run_http_loop` starts accepting/processing requests
-    // below, so a request that lands right at daemon start queues behind it
-    // -- this is what showed up as "Reviews page load is slow, especially
-    // right after the daemon starts". `reap_ms` used to isolate a large,
-    // reliably-reproducible cost here: `reap_orphaned_sessions_at_startup`
-    // shelled out to `powershell -Command "Get-CimInstance Win32_Process
-    // ..."`, whose own CLR startup + WMI COM query routinely ran several
-    // hundred ms to multiple seconds, on every single restart, unconditional
-    // on there being anything to reap. `force_kill_tmux_processes` (see its
-    // doc comment) has since been switched to a direct `sysinfo` process-
-    // table scan, the same fix already proven for `find_server_pid_windows`;
-    // this instrumentation is kept so a regression back to something equally
-    // slow -- or a new cost elsewhere in this block -- shows up in the
-    // numbers instead of only as a vague future bug report. Logged
-    // unconditionally (not just when slow) so restarts are comparable.
+    // Recovery above runs after the port is bound but before the HTTP loop
+    // accepts requests, so its cost is logged on every start.
     let total_startup_ms = startup_started.elapsed().as_millis();
     crate::rlog!(
         INFO,
-        "ralphus [scheduler] daemon startup recovery completed in {total_startup_ms}ms (schema_open={schema_open_ms}ms, tmux_reap={reap_ms}ms) before serving requests"
+        "ralphus [scheduler] daemon startup recovery completed in {total_startup_ms}ms (schema_open={schema_open_ms}ms) before serving requests"
     );
     let _ = store.cartographer_log(crate::cartographer::CartographerEntry {
         level: crate::logging::LogLevel::INFO,
@@ -21037,29 +19678,9 @@ pub fn serve<A: ToSocketAddrs>(
         payload: serde_json::json!({
             "total_startup_ms": total_startup_ms,
             "schema_open_ms": schema_open_ms,
-            "tmux_reap_ms": reap_ms,
         }),
         admin_only: false,
     });
-    if reaped > 0 {
-        crate::rlog!(
-            WARNING,
-            "ralphus [recovery] force-killed {reaped} orphaned tmux.exe process(es) from before this daemon startup"
-        );
-        let _ = store.cartographer_log(crate::cartographer::CartographerEntry {
-            level: crate::logging::LogLevel::WARNING,
-            source: "recovery",
-            message: "orphaned tmux.exe processes force-killed at startup",
-            scope: None,
-            squad_id: None,
-            guardian_id: None,
-            cell_id: None,
-            task: None,
-            log_path: None,
-            payload: serde_json::json!({"count": reaped}),
-            admin_only: false,
-        });
-    }
     // RAL-219: every route requires this token (`Authorization: Bearer
     // <token>`), generated once and persisted to `state_dir()/daemon.token`
     // so restarts and other local processes (CLI, librarian) keep working
@@ -21092,34 +19713,6 @@ pub fn serve<A: ToSocketAddrs>(
     // thread below starts scheduling work.
     crate::reviews::repair_triage_pool_keys(&daemon.store_handle());
 
-    // The remote Open Agent terminal relay (RAL-355 Phase 10) listens one
-    // port above the main API, on the same host it bound to -- so a remote
-    // browser client reaches it exactly as it reaches the daemon API itself.
-    // Deliberately non-fatal: a bind failure here (port already taken by
-    // something else) disables *only* the remote terminal relay, not the
-    // whole daemon -- `mint_terminal_ticket_route` already reports
-    // `503 relay_unavailable` when `terminal_relay_port()` is still `0`.
-    match server.server_addr().to_ip() {
-        Some(bound) => {
-            let relay_port = bound.port().saturating_add(1);
-            if let Err(e) =
-                crate::terminal_relay::start(bound.ip(), relay_port, Arc::clone(&daemon))
-            {
-                crate::rlog!(
-                    WARNING,
-                    "ralphus [terminal] could not start the terminal-relay listener on {}:{relay_port}: {e}",
-                    bound.ip()
-                );
-            }
-        }
-        None => {
-            crate::rlog!(
-                WARNING,
-                "ralphus [terminal] daemon is not bound to an IP socket; the remote terminal relay is disabled"
-            );
-        }
-    }
-
     // Scheduler runs on its own thread, sharing the store via Arc<Mutex> and the
     // cancellation registry so a `cancel` request can reach its workers. The
     // runner shares the daemon's PID registry so `/api/resources` can attribute
@@ -21128,7 +19721,6 @@ pub fn serve<A: ToSocketAddrs>(
         SubprocessRunner::from_env()
             .with_registry(daemon.procs_handle())
             .with_cartographer(daemon.store_handle())
-            .with_detachments(daemon.detachments_handle())
             .with_waypoint_halts(daemon.waypoint_halts_handle())
             .with_arbiter_stops(daemon.arbiter_stops_handle()),
     );
@@ -21237,8 +19829,7 @@ pub fn serve<A: ToSocketAddrs>(
 
     crate::daemon_health::emit(
         crate::daemon_health::HealthEvent::ok("daemon.startup")
-            .attr("total_startup_ms", total_startup_ms as i64)
-            .attr("reaped", reaped as i64),
+            .attr("total_startup_ms", total_startup_ms as i64),
     );
 
     // tiny_http 0.12 treats any accept() error as fatal: its accept thread
@@ -22459,44 +21050,6 @@ mod tests {
         drop(guard);
     }
 
-    /// RAL-468: a `RALPHUS_CLAUDE_COMMAND` wrapper like `foo bar -- claude`
-    /// (e.g. `rez-env`, a launcher that execs into the real agent binary) is
-    /// a compound shell line, not a single executable. "Open Agent" must
-    /// shell-route it end-to-end -- program name, resume flags, and all --
-    /// rather than quoting the whole compound string as one literal program
-    /// name (which would try to exec a file literally named `foo bar --
-    /// claude`).
-    #[test]
-    fn resume_shell_invocation_shell_routes_a_compound_claude_override() {
-        let overrides = ResumeCommandOverrides {
-            claude_command: Some("foo bar -- claude".to_string()),
-            ..ResumeCommandOverrides::default()
-        };
-        let (shell_cmd, shell_args) =
-            resume_shell_invocation_with_overrides(None, "abc-123", &overrides);
-        assert_eq!(shell_cmd, "pwsh");
-        let command = shell_args.last().expect("command is the last -Command arg");
-        assert_eq!(
-            command,
-            "foo bar -- claude '--resume' 'abc-123' '--dangerously-skip-permissions'"
-        );
-        assert!(!command.starts_with("& '"));
-    }
-
-    /// A plain (non-compound) override keeps the exact quoting this path
-    /// always used, unaffected by the RAL-468 compound-routing branch.
-    #[test]
-    fn resume_shell_invocation_keeps_plain_override_unaffected() {
-        let overrides = ResumeCommandOverrides {
-            codex_command: Some("codex".to_string()),
-            ..ResumeCommandOverrides::default()
-        };
-        let (_, shell_args) =
-            resume_shell_invocation_with_overrides(Some("codex"), "thread-1", &overrides);
-        let command = shell_args.last().expect("command is the last -Command arg");
-        assert!(command.starts_with("& 'codex'"));
-    }
-
     fn submit_body(toml: &str) -> String {
         serde_json::to_string(&serde_json::json!({ "toml": toml })).unwrap()
     }
@@ -22532,10 +21085,10 @@ mod tests {
         // ranks candidates by pane-snapshot recency reading the developer's
         // real `~/.ralphus` — where `guardian-000000000001` is a real guardian
         // with real snapshots, not the in-memory one this test just made. See
-        // `tmux::set_pane_snapshot_test_root`.
+        // `cell_session::set_pane_snapshot_test_root`.
         let snapshots = dir.join("pane_snapshots");
         std::fs::create_dir_all(&snapshots).expect("create isolated pane-snapshot root");
-        crate::tmux::set_pane_snapshot_test_root(snapshots);
+        crate::cell_session::set_pane_snapshot_test_root(snapshots);
         dir
     }
 
@@ -27069,160 +25622,7 @@ agent=\"claude-code\"
         );
     }
 
-    #[test]
-    fn resume_agent_command_always_skips_permissions() {
-        // "Open Agent" is only reachable for a cell that actually ran
-        // under an agent with a resume mechanism (a agent_session_id is
-        // required to get here at all -- see open_agent_terminal), so the
-        // resumed conversation should never immediately stall on a
-        // permission prompt a human has to notice and click through.
-        let cmd = resume_agent_command("claude", "abc-123");
-        assert!(cmd.contains("--dangerously-skip-permissions"));
-        assert!(cmd.contains("--resume 'abc-123'"));
-        assert!(cmd.contains("& 'claude'"));
-    }
-
-    #[test]
-    fn resume_agent_command_escapes_single_quotes() {
-        let cmd = resume_agent_command("my'claude", "sess'123");
-        assert!(cmd.contains("my''claude"));
-        assert!(cmd.contains("sess''123"));
-    }
-
     // ── RAL-153: read-only terminal-log viewer copy ─────────────────────────
-
-    #[test]
-    fn resolve_preferred_editor_prefers_visual_over_editor() {
-        let resolved =
-            resolve_preferred_editor_from(Some("code -w".to_string()), Some("vim".to_string()));
-        assert_eq!(resolved, Some(("code".to_string(), vec!["-w".to_string()])));
-    }
-
-    #[test]
-    fn resolve_preferred_editor_falls_back_to_editor_when_visual_unset() {
-        let resolved = resolve_preferred_editor_from(None, Some("vim".to_string()));
-        assert_eq!(resolved, Some(("vim".to_string(), vec![])));
-    }
-
-    #[test]
-    fn resolve_preferred_editor_skips_a_blank_visual() {
-        let resolved =
-            resolve_preferred_editor_from(Some("   ".to_string()), Some("vim".to_string()));
-        assert_eq!(resolved, Some(("vim".to_string(), vec![])));
-    }
-
-    #[test]
-    fn resolve_preferred_editor_none_when_both_unset_or_blank() {
-        assert_eq!(resolve_preferred_editor_from(None, None), None);
-        assert_eq!(
-            resolve_preferred_editor_from(Some(String::new()), Some("  ".to_string())),
-            None
-        );
-    }
-
-    #[test]
-    fn resolve_preferred_editor_splits_multi_word_command() {
-        let resolved = resolve_preferred_editor_from(None, Some("subl -w -n".to_string()));
-        assert_eq!(
-            resolved,
-            Some(("subl".to_string(), vec!["-w".to_string(), "-n".to_string()]))
-        );
-    }
-
-    #[test]
-    fn readonly_viewer_copy_path_is_unique_per_call_and_scoped_to_dir() {
-        let dir = std::path::Path::new("dummy-dir");
-        let a = readonly_viewer_copy_path(dir, "my-cell");
-        let b = readonly_viewer_copy_path(dir, "my-cell");
-        assert_ne!(a, b, "each click's copy must get its own path");
-        assert!(a.starts_with(dir));
-        assert!(a.to_string_lossy().contains("my-cell"));
-    }
-
-    #[test]
-    fn is_stale_true_once_past_max_age() {
-        let modified = std::time::SystemTime::UNIX_EPOCH;
-        let now = modified + Duration::from_secs(3601);
-        assert!(is_stale(modified, now, Duration::from_secs(3600)));
-    }
-
-    #[test]
-    fn is_stale_false_within_max_age() {
-        let modified = std::time::SystemTime::UNIX_EPOCH;
-        let now = modified + Duration::from_secs(3599);
-        assert!(!is_stale(modified, now, Duration::from_secs(3600)));
-    }
-
-    #[test]
-    fn is_stale_false_when_modified_is_not_before_now() {
-        // Clock skew (or a file written during this exact instant) must never
-        // be treated as a reason to delete.
-        let now = std::time::SystemTime::UNIX_EPOCH;
-        let modified = now + Duration::from_secs(5);
-        assert!(!is_stale(modified, now, Duration::from_secs(0)));
-    }
-
-    #[test]
-    fn prune_stale_readonly_viewer_copies_leaves_a_freshly_written_file() {
-        let dir = std::env::temp_dir().join(format!(
-            "ralphus-test-readonly-viewer-{}-{}",
-            std::process::id(),
-            line!()
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let fresh = dir.join("fresh.txt");
-        std::fs::write(&fresh, "new").unwrap();
-
-        prune_stale_readonly_viewer_copies(&dir);
-
-        assert!(fresh.exists(), "a just-written copy must not be pruned");
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn open_readonly_snapshot_terminal_reports_409_with_no_snapshot() {
-        let r = open_readonly_snapshot_terminal("definitely-not-a-real-ralphus-cell-xyz");
-        assert_eq!(r.status, 409);
-        assert!(r.body.contains("no_tmux_session"));
-    }
-
-    #[test]
-    fn resume_codex_agent_command_always_bypasses_approvals() {
-        let cmd = resume_codex_agent_command("codex", "thread-abc-123");
-        assert!(cmd.contains("--dangerously-bypass-approvals-and-sandbox"));
-        assert!(cmd.contains("resume 'thread-abc-123'"));
-        assert!(!cmd.contains("exec"));
-        assert!(cmd.contains("& 'codex'"));
-    }
-
-    #[test]
-    fn resume_codex_agent_command_escapes_single_quotes() {
-        let cmd = resume_codex_agent_command("my'codex", "sess'123");
-        assert!(cmd.contains("my''codex"));
-        assert!(cmd.contains("sess''123"));
-    }
-
-    #[test]
-    fn is_codex_agent_matches_both_aliases() {
-        assert!(is_codex_agent(Some("codex")));
-        assert!(is_codex_agent(Some("codex-cli")));
-    }
-
-    #[test]
-    fn is_codex_agent_false_for_claude_and_unset() {
-        assert!(!is_codex_agent(Some("claude-code")));
-        assert!(!is_codex_agent(Some("claude-cli")));
-        assert!(!is_codex_agent(Some("ollama")));
-        assert!(!is_codex_agent(None));
-    }
-
-    #[test]
-    fn resume_pi_agent_command_uses_pi_flags() {
-        let cmd = resume_pi_agent_command("pi", "sess-123");
-        assert!(cmd.contains("--session 'sess-123'"));
-        assert!(cmd.contains("--approve"));
-    }
 
     #[test]
     fn edit_squad_label_does_not_reset_squad_state() {
@@ -28616,118 +27016,6 @@ remediation_attempts=1
         );
     }
 
-    #[cfg_attr(windows, ignore = "CI-only on Windows: exercises a real psmux server")]
-    #[test]
-    fn live_tmux_shutdown_without_auto_cancel_leaves_squad_state_alone_but_requests_shutdown() {
-        // Real production code kills each known squad/guardian's own
-        // ralphus_{id}_-prefixed tmux.exe cells (see
-        // `kill_squad_tmux_sessions`) — serialize against `tmux.rs`'s live
-        // tests anyway, since a real `tmux list-sessions`/`kill-session`
-        // round trip still happens. The squad_id itself is also given a
-        // per-invocation-unique suffix (RAL-177), not just serialized:
-        // `kill_squad_tmux_sessions` kills by `ralphus_{squad_id}_` *prefix*, so
-        // a deterministic literal id here would let this shutdown call reach
-        // — and kill — a same-prefixed real cell created by an identical
-        // test running concurrently in a sibling worktree against the same
-        // shared, machine-wide psmux server, even with a fully unique task
-        // name on that other cell (the prefix kill never looks at the
-        // task portion at all). See `Store::insert_squad_with_id`'s doc
-        // comment.
-        let _tmux_guard = crate::tmux::LIVE_TMUX_TEST_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        crate::tmux::sweep_dead_test_sessions_once();
-        let d = daemon();
-        let squad_id = crate::tmux::unique_test_tag("shutdown-no-auto-cancel");
-        d.lock()
-            .insert_squad_with_id(&squad_id, &parse(GOOD), None, false)
-            .unwrap();
-        d.lock()
-            .set_squad_state(&squad_id, SquadState::Running)
-            .unwrap();
-
-        assert!(!d.shutdown_requested());
-        let r = route(&d, "POST", "/api/daemon/shutdown", "");
-        assert_eq!(r.status, 200, "body={}", r.body);
-        assert!(r.body.contains("\"state\":\"stopping\""));
-        assert!(r.body.contains("\"auto_cancel\":false"));
-        assert!(d.shutdown_requested());
-
-        // Left running for crash-recovery to resume on next `serve()` startup.
-        assert!(
-            route(&d, "GET", &format!("/api/squads/{squad_id}"), "")
-                .body
-                .contains("\"state\":\"running\"")
-        );
-    }
-
-    #[cfg_attr(windows, ignore = "CI-only on Windows: exercises a real psmux server")]
-    #[test]
-    fn live_tmux_shutdown_with_auto_cancel_cancels_active_squads_and_guardians() {
-        // See `live_tmux_shutdown_without_auto_cancel_leaves_squad_state_alone_but_requests_shutdown`'s
-        // comment for why each squad_id here is per-invocation-unique
-        // (RAL-177), not just the literal deterministic id.
-        let _tmux_guard = crate::tmux::LIVE_TMUX_TEST_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        crate::tmux::sweep_dead_test_sessions_once();
-        let d = daemon();
-        let squad_id_1 = crate::tmux::unique_test_tag("shutdown-auto-cancel-1");
-        let squad_id_2 = crate::tmux::unique_test_tag("shutdown-auto-cancel-2");
-        d.lock()
-            .insert_squad_with_id(&squad_id_1, &parse(GOOD), None, false)
-            .unwrap(); // pending
-        d.lock()
-            .insert_squad_with_id(&squad_id_2, &parse(GOOD), None, false)
-            .unwrap();
-        d.lock()
-            .set_squad_state(&squad_id_2, SquadState::Done)
-            .unwrap();
-
-        let gbody =
-            serde_json::json!({"name":"r","base_branch":"main","git_root":"/repo"}).to_string();
-        route(&d, "POST", "/api/guardians", &gbody);
-        let gid = "guardian-000000000001";
-
-        let body = serde_json::to_string(&serde_json::json!({ "auto_cancel": true })).unwrap();
-        let r = route(&d, "POST", "/api/daemon/shutdown", &body);
-        assert_eq!(r.status, 200, "body={}", r.body);
-        assert!(r.body.contains("\"auto_cancel\":true"));
-        assert!(r.body.contains(&squad_id_1));
-        assert!(!r.body.contains(&squad_id_2)); // already terminal — left alone
-        assert!(r.body.contains(gid));
-        assert!(d.shutdown_requested());
-
-        assert!(
-            route(&d, "GET", &format!("/api/squads/{squad_id_1}"), "")
-                .body
-                .contains("\"state\":\"cancelled\"")
-        );
-        assert!(
-            route(&d, "GET", &format!("/api/squads/{squad_id_2}"), "")
-                .body
-                .contains("\"state\":\"done\"")
-        );
-        assert!(
-            route(&d, "GET", &format!("/api/guardians/{gid}"), "")
-                .body
-                .contains("\"status\":\"cancelled\"")
-        );
-    }
-
-    #[cfg_attr(windows, ignore = "CI-only on Windows: exercises a real psmux server")]
-    #[test]
-    fn live_tmux_shutdown_body_defaults_auto_cancel_to_false() {
-        let _tmux_guard = crate::tmux::LIVE_TMUX_TEST_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        crate::tmux::sweep_dead_test_sessions_once();
-        let d = daemon();
-        let r = route(&d, "POST", "/api/daemon/shutdown", "");
-        assert_eq!(r.status, 200, "body={}", r.body);
-        assert!(r.body.contains("\"auto_cancel\":false"));
-    }
-
     #[test]
     fn cancel_squad_preview_reports_impact_without_mutating() {
         let d = daemon();
@@ -28813,11 +27101,11 @@ remediation_attempts=1
         );
         assert_eq!(missing.status, 404);
 
-        // Seed a couple of attempts the same way `SubprocessRunner::run_via_tmux_attempt`
+        // Seed a couple of attempts the same way `SubprocessRunner::run_direct_attempt`
         // would persist them, keyed by the same deterministic cell name.
         let task = d.lock().get_task_name(squad_id, 0).unwrap();
         let cell_id = d.lock().get_cell_id(squad_id, 0, 0).unwrap();
-        let name = crate::tmux::session_name(squad_id, &task, &cell_id);
+        let name = crate::cell_session::session_name(squad_id, &task, &cell_id);
         crate::terminal_log::write_attempt(&name, 0, "first attempt output", 100);
         crate::terminal_log::write_attempt(&name, 1, "second attempt output", 100);
 
@@ -28879,7 +27167,7 @@ remediation_attempts=1
 
         let task = d.lock().get_task_name(squad_id, 0).unwrap();
         let cell_id = d.lock().get_cell_id(squad_id, 0, 0).unwrap();
-        let name = crate::tmux::session_name(squad_id, &task, &cell_id);
+        let name = crate::cell_session::session_name(squad_id, &task, &cell_id);
         let raw_path = crate::terminal_log::raw_transcript_path(&name, 0);
         std::fs::create_dir_all(raw_path.parent().unwrap()).unwrap();
         std::fs::write(&raw_path, "0123456789").unwrap();
@@ -28967,10 +27255,10 @@ remediation_attempts=1
         );
         assert_eq!(missing.status, 404);
 
-        // The proof step's tmux session is keyed the same way `proof_tmux_keys`
+        // The proof step's cell session is keyed the same way `proof_session_keys`
         // builds it: `(squad_id, "proof-{scope}-{proof_idx}")` with the task name.
         let task = d.lock().get_task_name(squad_id, 0).unwrap();
-        let name = crate::tmux::session_name(squad_id, &task, "proof-cell-0");
+        let name = crate::cell_session::session_name(squad_id, &task, "proof-cell-0");
         let raw_path = crate::terminal_log::raw_transcript_path(&name, 0);
         std::fs::create_dir_all(raw_path.parent().unwrap()).unwrap();
         std::fs::write(&raw_path, "0123456789").unwrap();
@@ -29044,7 +27332,7 @@ remediation_attempts=1
 
         // A freshly-added branch resolves to the merge/rebase resolver session
         // (`resolver_task_and_cell_id` -> `freshest_resolver_or_feedback`).
-        let name = crate::tmux::session_name(
+        let name = crate::cell_session::session_name(
             &format!("guardian-{id}"),
             crate::guardian_merge::RESOLVER_TASK,
             &format!("resolver-{branch_id}"),
@@ -29079,7 +27367,7 @@ remediation_attempts=1
         // A review pass has its own cell identity, so a walk-back request
         // reads that pass rather than the branch's currently selected session.
         let run_cell_id = format!("resolver-{branch_id}-123");
-        let run_name = crate::tmux::session_name(
+        let run_name = crate::cell_session::session_name(
             &format!("guardian-{id}"),
             crate::guardian_merge::RESOLVER_TASK,
             &run_cell_id,
@@ -29119,7 +27407,7 @@ remediation_attempts=1
         );
         assert_eq!(missing.status, 404);
 
-        let name = crate::tmux::session_name(
+        let name = crate::cell_session::session_name(
             &format!("guardian-{id}"),
             crate::guardian_merge::MANUAL_COMMANDS_TASK,
             crate::guardian_merge::MANUAL_COMMANDS_SESSION,
@@ -29162,7 +27450,7 @@ remediation_attempts=1
         let squad_id = "squad-000000000001";
         let task = d.lock().get_task_name(squad_id, 0).unwrap();
         let cell_id = d.lock().get_cell_id(squad_id, 0, 0).unwrap();
-        let name = crate::tmux::session_name(squad_id, &task, &cell_id);
+        let name = crate::cell_session::session_name(squad_id, &task, &cell_id);
         crate::terminal_log::write_attempt(&name, 0, "will be deleted", 100);
         assert!(!crate::terminal_log::list_attempts(&name).is_empty());
 
@@ -29999,7 +28287,7 @@ remediation_attempts = 1
         let sid = guard.get_cell_id(squad_id, 0, 0).unwrap();
         assert_eq!(
             targets,
-            vec![(crate::tmux::session_name(squad_id, &task, &sid), 0)]
+            vec![(crate::cell_session::session_name(squad_id, &task, &sid), 0)]
         );
     }
 
@@ -30017,8 +28305,8 @@ remediation_attempts = 1
         assert_eq!(
             targets,
             vec![
-                (crate::tmux::session_name(squad_id, "t", "s1"), 0),
-                (crate::tmux::session_name(squad_id, "t", "s2"), 1),
+                (crate::cell_session::session_name(squad_id, "t", "s1"), 0),
+                (crate::cell_session::session_name(squad_id, "t", "s2"), 1),
             ]
         );
     }
@@ -30037,7 +28325,7 @@ remediation_attempts = 1
         assert_eq!(
             targets,
             vec![(
-                crate::tmux::session_name(squad_id, &task, "proof-cell-3"),
+                crate::cell_session::session_name(squad_id, &task, "proof-cell-3"),
                 0
             )]
         );
@@ -30061,7 +28349,10 @@ remediation_attempts = 1
             // Pane is keyed by the task-scope proof's own name, but the
             // ghost is attributed to cell idx 0 (the task's first
             // cell) -- mirroring `Store::get_task_first_cell_cwd`.
-            vec![(crate::tmux::session_name(squad_id, "t", "proof-task-1"), 0)]
+            vec![(
+                crate::cell_session::session_name(squad_id, "t", "proof-task-1"),
+                0
+            )]
         );
     }
 
@@ -30081,7 +28372,7 @@ remediation_attempts = 1
     #[test]
     fn stop_targets_empty_for_squad_kind() {
         // "squad" isn't handled by capture_and_stop_node at all -- the squad-wide
-        // cancel cascade (`kill_squad_tmux_sessions`) already covers it.
+        // cancel cascade (`kill_squad_cell_sessions`) already covers it.
         let d = daemon();
         route(&d, "POST", "/api/squads", &submit_body(GOOD));
         let squad_id = "squad-000000000001";
@@ -30090,276 +28381,6 @@ remediation_attempts = 1
         assert_eq!(
             stop_targets_for_status_change(&guard, squad_id, &req),
             vec![]
-        );
-    }
-
-    fn tmux_available() -> bool {
-        crate::tmux::Tmux::resolve().is_ok()
-    }
-
-    /// A one-task-one-cell TOML fixture like `GOOD`, but with a caller-
-    /// chosen task name, so each live-tmux test below gets its own
-    /// distinguishable task in the (already per-invocation-unique, via
-    /// [`submit_unique_squad`]) `crate::tmux::session_name` it derives,
-    /// instead of every test sharing `GOOD`'s fixed task name.
-    fn good_with_task(task: &str) -> String {
-        format!("[[task]]\nname=\"{task}\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\n")
-    }
-
-    fn parse(src: &str) -> ralphus_core::schema::TaskFile {
-        toml::from_str(src).expect("valid toml")
-    }
-
-    /// Submit `good_with_task(task_label)` directly through the store
-    /// (bypassing the HTTP `/api/squads` route, which always assigns the
-    /// store's deterministic sequential id) with a per-invocation-unique
-    /// squad_id instead (RAL-177) — see [`Store::insert_squad_with_id`]'s doc
-    /// comment. A fresh in-memory `Store`'s first squad is always
-    /// `squad-000000000001`, identical across every worktree's identical
-    /// test; a live-tmux test below both builds a real tmux session name
-    /// from this squad_id *and* can trigger a `ralphus_{squad_id}_`-prefix-
-    /// scoped kill (`kill_squad_tmux_sessions`/`kill_guardian_tmux_sessions`)
-    /// against the same shared, machine-wide psmux server, so a deterministic
-    /// literal here is a collision risk on both counts, not just the exact
-    /// cell name. Returns the squad_id actually used.
-    fn submit_unique_squad(d: &Daemon, task_label: &str) -> String {
-        let squad_id = crate::tmux::unique_test_tag(task_label);
-        d.lock()
-            .insert_squad_with_id(&squad_id, &parse(&good_with_task(task_label)), None, false)
-            .unwrap();
-        squad_id
-    }
-
-    /// Create a real, detached tmux session named for `(squad_id, task,
-    /// cell_id)` that echoes `marker` into its pane, then polls until the
-    /// echo actually shows up in `capture-pane` — mirrors
-    /// `tmux.rs::live_tmux_new_session_capture_and_kill_roundtrip`'s idiom, so
-    /// the RAL-163 tests below have a real, non-racy pane to capture from.
-    fn spawn_marker_session(name: &str, marker: &str) -> crate::tmux::Tmux {
-        let tmux = crate::tmux::Tmux::resolve().unwrap();
-        let _ = tmux.kill_session(name);
-        let cwd = std::env::temp_dir().to_string_lossy().into_owned();
-        // A bare `echo` prints and exits almost immediately, which races the
-        // test's own HTTP-triggered capture: real tmux repaints a dead pane
-        // with a "Pane is dead (status N, <date>)" banner shortly after its
-        // command exits, and on a loaded CI runner that repaint can beat the
-        // capture to the punch and erase the marker before anyone reads it.
-        // Every caller of this helper is specifically testing "while the
-        // agent is still running" behavior, so the marker process must
-        // actually still be alive for the whole test, not just have
-        // recently printed something -- sleeping well past any test's own
-        // runtime removes the race outright instead of narrowing it.
-        let (program, args) = if cfg!(windows) {
-            (
-                "powershell",
-                vec![
-                    "-NoProfile".to_string(),
-                    "-Command".to_string(),
-                    format!("Write-Output {marker}; Start-Sleep -Seconds 60"),
-                ],
-            )
-        } else {
-            (
-                "sh",
-                vec!["-c".to_string(), format!("echo {marker}; sleep 60")],
-            )
-        };
-        tmux.new_detached_session_with_command(
-            name,
-            &cwd,
-            &std::collections::BTreeMap::new(),
-            program,
-            &args,
-            None,
-        )
-        .unwrap();
-        let mut captured = String::new();
-        for _ in 0..50 {
-            std::thread::sleep(std::time::Duration::from_millis(200));
-            captured = tmux.capture_pane(name, 50).unwrap_or_default();
-            if captured.contains(marker) {
-                break;
-            }
-        }
-        assert!(
-            captured.contains(marker),
-            "marker process did not become visible in the live tmux pane: {captured}"
-        );
-        tmux
-    }
-
-    #[cfg_attr(windows, ignore = "CI-only on Windows: exercises a real psmux server")]
-    #[test]
-    fn live_tmux_set_status_cell_captures_pane_into_ghost_and_kills_it() {
-        // RAL-163: setting a cell to a terminal status while its agent is
-        // still running must capture the pane's in-progress output into that
-        // cell's ghost, then stop (kill) the pane -- turning the manual
-        // override into a recoverable checkpoint instead of an orphaned
-        // background process.
-        if !tmux_available() {
-            println!("SKIP: tmux not found on PATH");
-            return;
-        }
-        let _guard = crate::tmux::LIVE_TMUX_TEST_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        crate::tmux::sweep_dead_test_sessions_once();
-        let d = daemon();
-        let squad_id = submit_unique_squad(&d, "ral163-captures");
-
-        let (task, sid) = {
-            let guard = d.lock();
-            (
-                guard.get_task_name(&squad_id, 0).unwrap(),
-                guard.get_cell_id(&squad_id, 0, 0).unwrap(),
-            )
-        };
-        let name = crate::tmux::session_name(&squad_id, &task, &sid);
-        let marker = "ral-163-in-progress-marker";
-        spawn_marker_session(&name, marker);
-        let _cleanup = crate::tmux::KillSessionOnDrop(name.clone());
-
-        let body = serde_json::json!({
-            "kind": "cell", "task_idx": 0, "cell_idx": 0, "state": "done"
-        })
-        .to_string();
-        let r = route(
-            &d,
-            "POST",
-            &format!("/api/squads/{squad_id}/set-status"),
-            &body,
-        );
-        assert_eq!(r.status, 200, "body={}", r.body);
-        let v: serde_json::Value = serde_json::from_str(&r.body).unwrap();
-        assert_eq!(
-            v["tasks"][0]["cells"][0]["state"].as_str(),
-            Some("done"),
-            "the manually-set status must be applied: {}",
-            r.body
-        );
-
-        let tmux = crate::tmux::Tmux::resolve().unwrap();
-        assert!(
-            !tmux.has_session(&name),
-            "the agent's tmux pane must be stopped"
-        );
-
-        let uri = crate::ghost::cell_uri(&squad_id, 0, 0);
-        let ghost = d.lock().get_ghost(&uri).unwrap();
-        let ghost = ghost.expect("captured pane output must be saved to the cell's ghost");
-        assert!(
-            ghost.content.contains(marker),
-            "ghost must contain the captured in-progress output: {}",
-            ghost.content
-        );
-    }
-
-    #[cfg_attr(windows, ignore = "CI-only on Windows: exercises a real psmux server")]
-    #[test]
-    fn live_tmux_set_status_pending_does_not_stop_a_running_agent() {
-        // Per the ticket: "pending" is the only status that does not imply
-        // "stop running" -- setting it must leave a live agent's pane alone.
-        if !tmux_available() {
-            println!("SKIP: tmux not found on PATH");
-            return;
-        }
-        let _guard = crate::tmux::LIVE_TMUX_TEST_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        crate::tmux::sweep_dead_test_sessions_once();
-        let d = daemon();
-        let squad_id = submit_unique_squad(&d, "ral163-pending");
-
-        let (task, sid) = {
-            let guard = d.lock();
-            (
-                guard.get_task_name(&squad_id, 0).unwrap(),
-                guard.get_cell_id(&squad_id, 0, 0).unwrap(),
-            )
-        };
-        let name = crate::tmux::session_name(&squad_id, &task, &sid);
-        let marker = "ral-163-pending-marker";
-        let tmux = spawn_marker_session(&name, marker);
-        let _cleanup = crate::tmux::KillSessionOnDrop(name.clone());
-
-        let body = serde_json::json!({
-            "kind": "cell", "task_idx": 0, "cell_idx": 0, "state": "pending"
-        })
-        .to_string();
-        let r = route(
-            &d,
-            "POST",
-            &format!("/api/squads/{squad_id}/set-status"),
-            &body,
-        );
-        assert_eq!(r.status, 200, "body={}", r.body);
-
-        assert!(
-            tmux.has_session(&name),
-            "setting status to pending must not stop a running agent"
-        );
-        let uri = crate::ghost::cell_uri(&squad_id, 0, 0);
-        assert!(
-            d.lock().get_ghost(&uri).unwrap().is_none(),
-            "nothing should have been captured for a pending status change"
-        );
-
-        tmux.kill_session(&name).unwrap();
-    }
-
-    #[cfg_attr(windows, ignore = "CI-only on Windows: exercises a real psmux server")]
-    #[test]
-    fn live_tmux_set_status_ignored_still_captures_and_stops() {
-        // Q1 of the ticket's interview: `ignored` is deliberately non-terminal
-        // in the state machine (reversible back to `pending`), but the trigger
-        // condition for stop-and-capture is "any status but pending" -- a user
-        // sets `ignored` specifically to skip past bad-looking output, and
-        // losing that context would defeat the point.
-        if !tmux_available() {
-            println!("SKIP: tmux not found on PATH");
-            return;
-        }
-        let _guard = crate::tmux::LIVE_TMUX_TEST_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        crate::tmux::sweep_dead_test_sessions_once();
-        let d = daemon();
-        let squad_id = submit_unique_squad(&d, "ral163-ignored");
-
-        let (task, sid) = {
-            let guard = d.lock();
-            (
-                guard.get_task_name(&squad_id, 0).unwrap(),
-                guard.get_cell_id(&squad_id, 0, 0).unwrap(),
-            )
-        };
-        let name = crate::tmux::session_name(&squad_id, &task, &sid);
-        let marker = "ral-163-ignored-marker";
-        spawn_marker_session(&name, marker);
-        let _cleanup = crate::tmux::KillSessionOnDrop(name.clone());
-
-        let body = serde_json::json!({
-            "kind": "cell", "task_idx": 0, "cell_idx": 0, "state": "ignored"
-        })
-        .to_string();
-        let r = route(
-            &d,
-            "POST",
-            &format!("/api/squads/{squad_id}/set-status"),
-            &body,
-        );
-        assert_eq!(r.status, 200, "body={}", r.body);
-
-        let tmux = crate::tmux::Tmux::resolve().unwrap();
-        assert!(
-            !tmux.has_session(&name),
-            "ignored must still stop the running agent"
-        );
-        let uri = crate::ghost::cell_uri(&squad_id, 0, 0);
-        let ghost = d.lock().get_ghost(&uri).unwrap();
-        assert!(
-            ghost.is_some_and(|g| g.content.contains(marker)),
-            "ignored must still capture the agent's in-progress output"
         );
     }
 
@@ -31828,7 +29849,7 @@ remediation_attempts = 1
             serde_json::json!({"name":"r","base_branch":"main","git_root":"/repo"}).to_string();
         route(&d, "POST", "/api/guardians", &body);
         let gid = "guardian-000000000001";
-        let name = crate::tmux::session_name(
+        let name = crate::cell_session::session_name(
             &format!("guardian-{gid}"),
             crate::guardian_merge::RESOLVER_TASK,
             "resolver-0",
@@ -32333,83 +30354,6 @@ remediation_attempts = 1
         );
     }
 
-    /// RAL-489 regression: opening a review branch's worktree shell (or its
-    /// resumed resolver-agent session) must see the same layered env a
-    /// check-gate/manual-command run in that worktree already sees -- the
-    /// branch's resolved env (source cell's `squad < task < cell` env with
-    /// the branch's own overrides on top) with the guardian's
-    /// `build_env_overrides` layered on top of that. Before this fix, the
-    /// worktree-shell path hardcoded an empty env map and silently dropped
-    /// all of this.
-    #[test]
-    fn resolve_terminal_env_merges_cell_branch_and_build_overrides_for_a_review_branch() {
-        let d = daemon();
-        let squad_id = submit_squad(&d);
-        route(
-            &d,
-            "POST",
-            &format!("/api/squads/{squad_id}/cells/0/0/env"),
-            &serde_json::json!({"set": {"CELL_ONLY": "from-cell", "SHARED": "from-cell"}})
-                .to_string(),
-        );
-        d.lock()
-            .set_cell_review_branch(&squad_id, 0, 0, "feat")
-            .unwrap();
-
-        let gid = make_guardian(&d);
-        d.lock().add_guardian_branch(&gid, "feat").unwrap();
-        let bid = d.lock().get_guardian(&gid).unwrap().branches[0].id.clone();
-        route(
-            &d,
-            "POST",
-            &format!("/api/guardians/{gid}/branches/{bid}/env"),
-            &serde_json::json!({"set": {"SHARED": "from-branch"}}).to_string(),
-        );
-        route(
-            &d,
-            "POST",
-            &format!("/api/guardians/{gid}/build-env"),
-            &serde_json::json!({"set": {"SHARED": "from-build"}}).to_string(),
-        );
-
-        let env = resolve_terminal_env(&d, None, Some((&gid, &bid))).unwrap();
-        assert_eq!(
-            env.get("CELL_ONLY").map(String::as_str),
-            Some("from-cell"),
-            "{env:?}"
-        );
-        assert_eq!(
-            env.get("SHARED").map(String::as_str),
-            Some("from-build"),
-            "the guardian's build-env layer must win over both the cell's \
-             and the branch's own layers: {env:?}"
-        );
-    }
-
-    /// RAL-489: the plain-cell path (no guardian/review context -- e.g. the
-    /// cell-level "Open Agent" button) resolves exactly the cell's own
-    /// `squad < task < cell` env, matching `resolve_cell_env_overrides`
-    /// directly rather than the branch/build-env precedence used above.
-    #[test]
-    fn resolve_terminal_env_for_a_plain_cell_matches_its_resolved_cell_env() {
-        let d = daemon();
-        let squad_id = submit_squad(&d);
-        route(
-            &d,
-            "POST",
-            &format!("/api/squads/{squad_id}/cells/0/0/env"),
-            &serde_json::json!({"set": {"FROM_CELL": "2"}}).to_string(),
-        );
-
-        let env = resolve_terminal_env(&d, Some((&squad_id, 0, 0)), None).unwrap();
-        let expected = d
-            .lock()
-            .resolve_cell_env_overrides(&squad_id, 0, 0)
-            .unwrap();
-        assert_eq!(env, expected);
-        assert_eq!(env.get("FROM_CELL").map(String::as_str), Some("2"));
-    }
-
     #[test]
     fn set_squad_env_sets_and_is_reflected_on_get() {
         let d = daemon();
@@ -32461,7 +30405,7 @@ remediation_attempts = 1
     // `build_command_line_with_env` -- on Windows it's delivered via
     // `send-keys` typed into a live pty, where an embedded newline acts like
     // pressing Enter mid-command. Rejected here at the same boundary as an
-    // invalid key, before it ever reaches the store or the tmux layer.
+    // invalid key, before it ever reaches the store or the runner layer.
     #[test]
     fn set_squad_env_rejects_newline_in_value() {
         let d = daemon();
@@ -33127,7 +31071,7 @@ remediation_attempts = 1
         );
     }
 
-    /// tmux trims each captured row's trailing whitespace, so a line of
+    /// trailing whitespace is trimmed in each captured row's trailing whitespace, so a line of
     /// *empty* reasoning reaches this fallback as a bare `RALPHUS_THINKING:`
     /// with no space after the colon. Matching on the marker's full
     /// space-carrying form missed exactly those lines and leaked the raw
@@ -33158,7 +31102,7 @@ after"
         let text = "Claude Code · model=sonnet\n\
              RALPHUS_EVENT: {\"source\":\"claude-code\",\"message\":\"hi\"}\n\
              [tool] Bash(command=\"ls\")\n\
-             RALPHUS_TMUX_DONE: done\n\
+             RALPHUS_EVENT: {}\n\
              final assistant text";
         assert_eq!(
             strip_ralphus_pane_markers(text),
@@ -35921,173 +33865,6 @@ remediation_attempts=1
     // (`arbiter.rs`) already cover the cap-reached and unsupported-backend
     // paths without touching the network; this endpoint is a thin,
     // one-line `match` over that function.
-
-    // ── Remote terminal-relay ticket minting (RAL-355 Phase 10) ─────────────
-
-    /// `machine="incredibuild:A"`, `agent="claude-code"`, `id="a"` -- submits
-    /// and returns the deterministic first-squad id, so callers only need to
-    /// layer in an `agent_session_id` (via `set_cell_agent_session_id_live`)
-    /// and/or a relay port before minting a ticket.
-    fn submit_remote_claude_cell(d: &Daemon) -> String {
-        route(
-            d,
-            "POST",
-            "/api/machines",
-            &machine_body("incredibuild", "/opt/ib.sh"),
-        );
-        let toml = "[[task]]\nname=\"t\"\nmachine=\"incredibuild:A\"\n\
-                     [[task.cell]]\nid=\"a\"\ncwd=\".\"\nagent=\"claude-code\"\nprompt=\"p\"\n";
-        let r = route(d, "POST", "/api/squads", &submit_body(toml));
-        assert_eq!(r.status, 201, "{}", r.body);
-        "squad-000000000001".to_string()
-    }
-
-    #[test]
-    fn terminal_session_slot_rejects_a_second_concurrent_holder_but_allows_reacquire_after_release()
-    {
-        let d = daemon();
-        assert!(d.try_acquire_terminal_session("squad-1", 0, 0));
-        assert!(!d.try_acquire_terminal_session("squad-1", 0, 0));
-        // A different cell is independent -- not blocked by the first hold.
-        assert!(d.try_acquire_terminal_session("squad-1", 0, 1));
-        d.release_terminal_session("squad-1", 0, 0);
-        assert!(d.try_acquire_terminal_session("squad-1", 0, 0));
-    }
-
-    #[test]
-    fn terminal_ticket_rejects_a_still_running_cell() {
-        let d = daemon();
-        let squad_id = submit_remote_claude_cell(&d);
-        d.lock()
-            .set_cell_agent_session_id_live(&squad_id, "t", "a", "sess-123")
-            .unwrap();
-        let r = route(
-            &d,
-            "POST",
-            &format!("/api/squads/{squad_id}/set-status"),
-            &serde_json::json!({
-                "state": "running", "kind": "cell", "task_idx": 0,
-                "cell_idx": 0, "proof_idx": -1, "proof_scope": "",
-            })
-            .to_string(),
-        );
-        assert_eq!(r.status, 200, "{}", r.body);
-        let r = route(
-            &d,
-            "POST",
-            &format!("/api/squads/{squad_id}/cells/0/0/terminal-ticket"),
-            "",
-        );
-        assert_eq!(r.status, 409, "{}", r.body);
-        assert!(r.body.contains("still_running"), "{}", r.body);
-    }
-
-    #[test]
-    fn terminal_ticket_rejects_a_local_cell() {
-        let d = daemon();
-        let r = route(&d, "POST", "/api/squads", &submit_body(GOOD));
-        assert_eq!(r.status, 201, "{}", r.body);
-        let r = route(
-            &d,
-            "POST",
-            "/api/squads/squad-000000000001/cells/0/0/terminal-ticket",
-            "",
-        );
-        assert_eq!(r.status, 400, "{}", r.body);
-        assert!(r.body.contains("not_remote"), "{}", r.body);
-    }
-
-    #[test]
-    fn terminal_ticket_rejects_a_non_claude_agent() {
-        let d = daemon();
-        route(
-            &d,
-            "POST",
-            "/api/machines",
-            &machine_body("incredibuild", "/opt/ib.sh"),
-        );
-        let toml = "[[task]]\nname=\"t\"\nmachine=\"incredibuild:A\"\n\
-                     [[task.cell]]\nid=\"a\"\ncwd=\".\"\nagent=\"codex\"\nprompt=\"p\"\n";
-        let r = route(&d, "POST", "/api/squads", &submit_body(toml));
-        assert_eq!(r.status, 201, "{}", r.body);
-        let r = route(
-            &d,
-            "POST",
-            "/api/squads/squad-000000000001/cells/0/0/terminal-ticket",
-            "",
-        );
-        assert_eq!(r.status, 400, "{}", r.body);
-        assert!(r.body.contains("unsupported_agent"), "{}", r.body);
-    }
-
-    #[test]
-    fn terminal_ticket_requires_a_resumable_session() {
-        let d = daemon();
-        let squad_id = submit_remote_claude_cell(&d);
-        let r = route(
-            &d,
-            "POST",
-            &format!("/api/squads/{squad_id}/cells/0/0/terminal-ticket"),
-            "",
-        );
-        assert_eq!(r.status, 409, "{}", r.body);
-        assert!(r.body.contains("no_claude_session"), "{}", r.body);
-    }
-
-    #[test]
-    fn terminal_ticket_reports_relay_unavailable_when_the_listener_never_started() {
-        let d = daemon();
-        let squad_id = submit_remote_claude_cell(&d);
-        d.lock()
-            .set_cell_agent_session_id_live(&squad_id, "t", "a", "sess-123")
-            .unwrap();
-        let r = route(
-            &d,
-            "POST",
-            &format!("/api/squads/{squad_id}/cells/0/0/terminal-ticket"),
-            "",
-        );
-        assert_eq!(r.status, 503, "{}", r.body);
-        assert!(r.body.contains("relay_unavailable"), "{}", r.body);
-    }
-
-    #[test]
-    fn terminal_ticket_mints_once_every_check_passes() {
-        let d = daemon();
-        let squad_id = submit_remote_claude_cell(&d);
-        d.lock()
-            .set_cell_agent_session_id_live(&squad_id, "t", "a", "sess-123")
-            .unwrap();
-        d.set_terminal_relay_port(7891);
-        let r = route(
-            &d,
-            "POST",
-            &format!("/api/squads/{squad_id}/cells/0/0/terminal-ticket"),
-            "",
-        );
-        assert_eq!(r.status, 200, "{}", r.body);
-        assert!(r.body.contains("\"port\":7891"), "{}", r.body);
-        assert!(r.body.contains("\"path\":\"/terminal\""), "{}", r.body);
-        let parsed: serde_json::Value = serde_json::from_str(&r.body).unwrap();
-        assert!(
-            parsed["ticket"].as_str().is_some_and(|t| !t.is_empty()),
-            "{}",
-            r.body
-        );
-    }
-
-    #[test]
-    fn terminal_ticket_rejects_a_bad_task_or_cell_index() {
-        let d = daemon();
-        let squad_id = submit_remote_claude_cell(&d);
-        let r = route(
-            &d,
-            "POST",
-            &format!("/api/squads/{squad_id}/cells/nope/0/terminal-ticket"),
-            "",
-        );
-        assert_eq!(r.status, 400, "{}", r.body);
-    }
 
     // ── Monitor watches + notification preferences ─────────────────────────
 

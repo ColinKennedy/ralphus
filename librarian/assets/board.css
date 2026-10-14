@@ -15,7 +15,6 @@
         --incomplete: #db6d28;
         --toast-warn: #d29922;
         --out-of-date: #d4a72c;
-        --detached: #d2a8ff;
         --delayed: #79c0ff;
         --arbiter: #7c3aed;
         --terminal-bg: #000000; --terminal-fg: #b9c4d0; --terminal-cursor: #ffffff;
@@ -412,7 +411,6 @@
       .p-warn { color: var(--warn); border-color: var(--warn); }
       .p-solo { color: var(--solo); border-color: var(--solo); }
       .p-out-of-date { color: var(--out-of-date); border-color: var(--out-of-date); }
-      .p-detached { color: var(--detached); border-color: var(--detached); }
       .p-delayed { color: var(--delayed); border-color: var(--delayed); }
       .p-conflict_resolved { color: var(--queued); border-color: var(--queued); }
       .p-proof_pending { color: var(--running); border-color: var(--running); }
@@ -451,7 +449,7 @@
       .cmd-line { padding: 5px 8px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-size: 12px; font-family: ui-monospace, monospace; border-bottom: 1px solid var(--border); cursor: pointer; }
       .cmd-line:last-child { border-bottom: none; }
       .cmd-line:hover { background: var(--panel-2); }
-      /* Live tmux pane peek (RAL-102): the "Read-only terminal" auto-refreshing view. */
+      /* Live pane peek (RAL-102): the "Read-only terminal" auto-refreshing view. */
       .peek-box { margin-top: 8px; border: 1px solid var(--border); border-radius: 6px; background: var(--bg); overflow: hidden; }
       .peek-head { display: flex; align-items: center; justify-content: space-between; padding: 5px 8px; background: var(--panel-2); border-bottom: 1px solid var(--border); font-size: 11px; color: var(--muted); }
       /* RAL-428: the peek box's Terminal / System Prompt tab strip (admin-only
@@ -491,7 +489,7 @@
       .peek-debug-toggle input { margin: 0; cursor: pointer; }
       .peek-type-filter { width: 165px; padding: 2px 5px; border: 1px solid var(--border); border-radius: 3px; background: var(--panel); color: var(--text); font: inherit; }
       /* Durable terminal-log attempt history (RAL-154): lists every persisted
-         attempt for a cell/proof/resolver's tmux pane, independent of and
+         attempt for a cell/proof/resolver's pane, independent of and
          alongside the live peek box above. */
       .history-box { margin-top: 8px; border: 1px solid var(--border); border-radius: 6px; background: var(--bg); overflow: hidden; }
       .history-head { display: flex; align-items: center; justify-content: space-between; padding: 5px 8px; background: var(--panel-2); border-bottom: 1px solid var(--border); font-size: 11px; color: var(--muted); }

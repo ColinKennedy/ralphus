@@ -24,33 +24,15 @@ comes back (a validation message, a 4xx body), that is proof the daemon is
 reachable — don't let an earlier flaky probe override it. Plain git operations
 on worktrees are not "touching the daemon" and are fine.
 
-## Never launch a second daemon or tmux server from inside a ralphus run
+## Never launch a second daemon from inside a ralphus run
 
 When ralphus itself is driving the work (a cell, a proof step, or a Guardian
 feedback/auto-fix pass developing ralphus), do not run anything that starts
-another daemon sharing the host's psmux instance: `scripts/check-initialize-exercises.sh`,
+another daemon next to the host's: `scripts/check-initialize-exercises.sh`,
 `ralphus initialize <exercise>` (every guided exercise starts its own throwaway
-daemon), or a hand-launched `ralphus-daemon serve` on another port.
-
-Every daemon start calls `tmux::reap_orphaned_sessions_at_startup`
-(`daemon/src/tmux.rs`), which force-kills every `ralphus_`-prefixed tmux
-server **in the daemon's own psmux instance** -- the servers whose
-`PSMUX_DATA_DIR` equals the daemon's (unset equals unset). It is *not* scoped by
-state root, database or port. A daemon that leaves `PSMUX_DATA_DIR` unset shares
-the default instance with the host daemon, so its live sessions go with it,
-including the pane your agent is running in. The symptom is a branch/cell that
-fails with `runner produced no result file ... os error 2` and a pane tail
-ending in `tmux server process exit code: unknown`, repeating on every retry
-because the retry re-runs the same command.
-
-A daemon with its own `PSMUX_DATA_DIR` cannot reach the host's sessions
-(verified 2026-10-10: three starts of an isolated daemon on port 7899 with
-`PSMUX_DATA_DIR=~/.ralphus/psmux-7899` left the host daemon's live tmux session
-running). `scripts/build-debug.sh --daemon-port N` and the initialize exercises
-set one; a hand-launched `ralphus-daemon serve` does not unless you export it.
-The rule above therefore stands for any daemon you cannot show has a private
-`PSMUX_DATA_DIR` -- and when you do start one on purpose, snapshot the
-`ralphus_` tmux PIDs before and after. See [`gotchas.md`](gotchas.md).
+daemon), or a hand-launched `ralphus-daemon serve` on another port. A second
+daemon's startup reaps and restarts work that belongs to the host daemon, and
+the run driving the work can be lost.
 
 Do this instead:
 
@@ -88,27 +70,16 @@ Reach for one of these instead:
 
 Treat typing `git stash` as a stop-and-ask trigger.
 
-## Never use tmux for anything new
+## tmux and psmux are gone
 
-tmux (psmux on Windows) is being removed from ralphus. New work must not add
-to what has to be unwound:
-
-- **Running a process** (an agent, a command, a check): go through the
-  runner's tmux-free path, `daemon/src/runner/direct.rs`. It is already the
-  default for every spec (`RALPHUS_RUNNER_MODE` unset). It runs a plain child
-  process, tees its output into the durable `.raw` transcript, and kills the
-  whole process tree on cancel. Don't create tmux sessions or panes, and don't
-  depend on `RALPHUS_RUNNER_MODE=tmux`.
-- **Showing it live**: build Live View on that transcript (the `pane` /
-  `pane-transcript` endpoints already serve it for a direct run), never on
-  capturing a tmux pane.
-- **Naming**: the `squad / task / cell` triple that `crate::tmux::session_name`
-  formats is only a key, so reusing it to name a session or transcript is fine.
-  A new `Tmux::resolve()`, `has_session`, `kill_session` or pane capture call is
-  not.
-
-When existing tmux-specific code is in the way, leave it untouched rather than
-extending it, and say so in your report.
+Cells, proofs and checks run through the runner's tmux-free path,
+`daemon/src/runner/direct.rs`: a plain child process whose output is teed into
+the durable `.raw` transcript, with the whole process tree killed on cancel.
+Live View is built on that transcript (the `pane` / `pane-transcript` endpoints
+serve it). Don't reintroduce a terminal multiplexer, a `crate::tmux` module,
+panes or `RALPHUS_RUNNER_MODE=tmux`. The `squad / task / cell` key
+`cell_session::session_name` formats is only a key, so reusing it to name a
+transcript is fine.
 
 ## Extend agent backends through their existing abstractions
 

@@ -257,7 +257,7 @@ fn short_sha256(data: &[u8]) -> String {
 }
 
 /// A side-channel file the daemon polls to learn the agent's session/thread
-/// id before the session finishes (enables "Watch Live"/"Open Agent" early).
+/// id before the session finishes (enables "Watch Live" early).
 #[must_use]
 pub fn live_session_path(workspace_root: &Path) -> PathBuf {
     let basename = workspace_root

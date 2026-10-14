@@ -20,6 +20,7 @@ pub mod cancel;
 pub mod cartographer;
 pub mod cell_blocking;
 pub mod cell_copy;
+pub mod cell_session;
 pub mod channel;
 pub mod chat_client;
 pub mod checkout_hold;
@@ -65,7 +66,6 @@ pub mod procreg;
 pub mod project_forks;
 pub mod proof;
 pub mod prophecy;
-pub mod psmux_client;
 pub mod redact;
 pub mod remediation;
 pub mod remote_failure;
@@ -85,11 +85,9 @@ pub mod store_memory;
 pub mod store_pool;
 pub mod summary_worker;
 pub mod terminal_log;
-pub mod terminal_relay;
 pub mod thinking_stall;
 pub mod thread_health;
 pub mod timeline;
-pub mod tmux;
 pub mod token;
 pub mod triage;
 pub mod user_forge_tokens;
@@ -165,7 +163,6 @@ pub fn token_path() -> PathBuf {
 pub enum HelpCommand {
     Serve,
     Validate,
-    Mux,
     Stop,
     License,
     Version,
@@ -177,7 +174,6 @@ impl HelpCommand {
         match self {
             Self::Serve => "serve",
             Self::Validate => "validate",
-            Self::Mux => "mux",
             Self::Stop => "stop",
             Self::License => "license",
             Self::Version => "version",
@@ -211,9 +207,6 @@ pub enum Command {
     },
     /// Validate a task TOML file offline (no server, no database).
     Validate(String),
-    /// Forward arguments raw to the resolved tmux binary (RAL-102). CLI-only —
-    /// never exposed over the HTTP API.
-    Mux(Vec<String>),
     /// Ask a running daemon to kill every process it has spawned (cells,
     /// proofs, reviews, chats, summaries — everything) and exit.
     Stop {
@@ -252,7 +245,6 @@ pub fn parse_args(args: &[String]) -> Command {
             Command::Serve { port, db, log_path }
         }
         Some(HelpCommand::Validate) => Command::Validate(args.get(1).cloned().unwrap_or_default()),
-        Some(HelpCommand::Mux) => Command::Mux(args[1..].to_vec()),
         Some(HelpCommand::Stop) => {
             let tail = &args[1..];
             let port = parse_port_flag(tail).unwrap_or(DEFAULT_PORT);
@@ -267,7 +259,6 @@ fn registered_command(name: &str) -> Option<HelpCommand> {
     match name {
         "serve" => Some(HelpCommand::Serve),
         "validate" => Some(HelpCommand::Validate),
-        "mux" => Some(HelpCommand::Mux),
         "stop" => Some(HelpCommand::Stop),
         "license" => Some(HelpCommand::License),
         "version" => Some(HelpCommand::Version),
@@ -279,7 +270,6 @@ fn registered_command(name: &str) -> Option<HelpCommand> {
 const HELP_COMMANDS: &[HelpCommand] = &[
     HelpCommand::Serve,
     HelpCommand::Validate,
-    HelpCommand::Mux,
     HelpCommand::Stop,
     HelpCommand::License,
     HelpCommand::Version,
@@ -337,7 +327,7 @@ fn parse_log_path_flag(tail: &[String]) -> Option<PathBuf> {
 #[must_use]
 pub fn usage() -> String {
     format!(
-        "ralphus-daemon {}\n\nUSAGE:\n    ralphus-daemon <COMMAND>\n\nCOMMANDS:\n    serve [--port {DEFAULT_PORT}] [--db <path>]   Run the daemon and serve the HTTP/JSON API\n    validate <file>   Validate a task TOML file offline (no server needed)\n    mux <args...>     Forward arguments raw to tmux (CLI-only; never exposed over HTTP)\n    stop [--port {DEFAULT_PORT}] [--auto-cancel]   Kill every process the daemon spawned and exit\n    license           Print the embedded LICENSE text\n    version           Print version and exit\n    help              Print this message\n\nOPTIONS:\n    -h, --help        Print help and exit\n",
+        "ralphus-daemon {}\n\nUSAGE:\n    ralphus-daemon <COMMAND>\n\nCOMMANDS:\n    serve [--port {DEFAULT_PORT}] [--db <path>]   Run the daemon and serve the HTTP/JSON API\n    validate <file>   Validate a task TOML file offline (no server needed)\n    stop [--port {DEFAULT_PORT}] [--auto-cancel]   Kill every process the daemon spawned and exit\n    license           Print the embedded LICENSE text\n    version           Print version and exit\n    help              Print this message\n\nOPTIONS:\n    -h, --help        Print help and exit\n",
         ralphus_core::version()
     )
 }
@@ -360,11 +350,6 @@ pub fn command_usage(command: Option<HelpCommand>) -> String {
             "Validate one task TOML file offline.",
             "ralphus-daemon validate <file>",
             "    <file>              Task TOML path to validate\n".to_string(),
-        ),
-        HelpCommand::Mux => (
-            "Forward arguments to the configured tmux-compatible program.",
-            "ralphus-daemon mux <args...>",
-            "    <args...>           Arguments forwarded verbatim to tmux\n".to_string(),
         ),
         HelpCommand::Stop => (
             "Ask a running daemon to stop.",
@@ -532,20 +517,6 @@ mod tests {
     }
 
     #[test]
-    fn parses_mux_with_trailing_args() {
-        assert_eq!(
-            parse_args(&args(&["mux", "capture-pane", "-p", "-t", "foo"])),
-            Command::Mux(vec![
-                "capture-pane".to_string(),
-                "-p".to_string(),
-                "-t".to_string(),
-                "foo".to_string(),
-            ])
-        );
-        assert_eq!(parse_args(&args(&["mux"])), Command::Mux(vec![]));
-    }
-
-    #[test]
     fn validate_file_missing_is_false() {
         assert!(!validate_file("/no/such/ralphus/file.toml"));
     }
@@ -616,8 +587,8 @@ mod tests {
     #[test]
     fn help_after_separator_is_forwarded() {
         assert_eq!(
-            parse_args(&args(&["mux", "--", "--help"])),
-            Command::Mux(args(&["--", "--help"]))
+            parse_args(&args(&["validate", "--", "--help"])),
+            Command::Validate("--".to_string())
         );
     }
 

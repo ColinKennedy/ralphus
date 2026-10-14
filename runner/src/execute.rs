@@ -335,7 +335,7 @@ fn short_prompt_hash(data: &[u8]) -> String {
 
 /// RAL-288 Stage 5: emitted via Cartographer only, not a plain `eprintln!` —
 /// this information had no Cartographer counterpart before Stage 5 (an
-/// `eprintln!` alone only ever existed in the live tmux pane, gone the
+/// `eprintln!` alone only ever existed in the live transcript, gone the
 /// moment the pane closes), so simply removing the print to clean up the
 /// pane would have silently lost it rather than just relocating it. Uses
 /// the same `RALPHUS_EVENT:` marker/context shape every other runner

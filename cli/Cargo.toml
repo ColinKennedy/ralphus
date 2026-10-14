@@ -22,14 +22,12 @@ workspace = true
 shell-syntax = ["ralphus-core/shell-syntax"]
 
 [dependencies]
-crossterm = { workspace = true }
 ralphus-core = { workspace = true }
 ralphus-daemon = { path = "../daemon" }
 ralphus-runner = { path = "../runner" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 toml = { workspace = true }
-tungstenite = { workspace = true }
 ureq = { workspace = true, features = ["tls"] }
 
 [dev-dependencies]

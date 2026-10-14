@@ -20,7 +20,7 @@ use ralphus_daemon::store::{SquadState, Store};
 use ralphus_daemon::store_lock::StoreMutex;
 
 /// Both tests below build a fresh in-memory `Store` and therefore get the
-/// same deterministic squad/task/cell ids, which collapse to the same tmux
+/// same deterministic squad/task/cell ids, which collapse to the same session
 /// session name (`session_name` only keys on those ids). Run them one at a
 /// time so two "new-session" calls for that identical name can't race.
 fn test_lock() -> &'static Mutex<()> {
@@ -90,11 +90,11 @@ fn run_one_claim(model: &str, claim: &str, tag: &str) -> (String, Option<String>
     let base = temp_base(tag);
     let cwd = base.to_string_lossy().replace('\\', "/");
 
-    // The task name feeds `tmux::session_name(squad_id, task, cell_id)`, and
+    // The task name feeds `cell_session::session_name(squad_id, task, cell_id)`, and
     // `squad_id` is deterministic per fresh in-memory Store (always
     // "squad-000000000001"). Since cargo runs tests in the same binary
     // concurrently by default, two tests both named "t" would race on the
-    // *same* tmux session name — one test's setup can kill/overwrite the
+    // *same* session session name — one test's setup can kill/overwrite the
     // other's live session mid-run, so a test can read back its sibling's
     // pane output instead of its own. `tag` keeps the two tests' sessions
     // distinct.

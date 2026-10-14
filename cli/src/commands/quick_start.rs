@@ -11,8 +11,8 @@
 //! -- Codex and Pi still get the original "run `ralphus mailbox check` after
 //! every user turn" convention until they get their own push integration.
 //!
-//! Despite the "interactive" framing, this does **not** touch tmux/psmux at
-//! all -- that mechanism is for tracking a *scheduled task's* session, a
+//! Despite the "interactive" framing, this does **not** touch the daemon's
+//! cell runner at all -- that is for scheduled tasks, a
 //! completely different code path. Quick-start just resolves a shell/program
 //! (reusing `ralphus_runner::shellcmd`, already ported and shared with the
 //! runner), writes a system-prompt temp file, and does one plain foreground

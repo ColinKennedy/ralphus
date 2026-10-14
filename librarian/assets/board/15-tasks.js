@@ -1389,7 +1389,7 @@
       let expandedBranches = new Set();
       /** @type {{[key: string]: boolean}} gid -> whether the manual-checks dropdown is open */
       let manualMenuOpen = {};
-      /** @type {{[key: string]: boolean}} peek-key -> whether the terminal actions dropdown ("Open Terminal Log" / "Open Agent") is open */
+      /** @type {{[key: string]: boolean}} peek-key -> whether the terminal actions dropdown ("View Attempt History") is open */
       let terminalMenuOpen = {};
       /** @type {Set<string>} */
       let dismissedReady = new Set(JSON.parse(localStorage.getItem("ralphus-dismissed-ready") || "[]"));
@@ -1627,7 +1627,7 @@
       let cellDiffs = {};
       /** @type {{[key: string]: boolean}} "gid:pos" -> bool, worktree cells dropdown open (RAL-71) */
       let worktreeMenuOpen = {};
-      /** @type {{[key: string]: boolean}} peek key -> bool, live tmux pane "Read-only terminal" boxes currently expanded (RAL-102) */
+      /** @type {{[key: string]: boolean}} peek key -> bool, live pane "Read-only terminal" boxes currently expanded (RAL-102) */
       let peekOpen = {};
       /** @type {{[key: string]: string}} peek key -> last-rendered Live View text (the transcript tape run through the ANSI-strip/classify pipeline, RAL-397 Phase 2G-A), so a full pane re-render redisplays the last content instead of flashing back to "Loading…" (RAL-102 follow-up) */
       let peekContent = {};

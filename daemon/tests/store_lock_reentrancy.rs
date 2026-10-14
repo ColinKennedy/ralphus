@@ -28,10 +28,10 @@
 //!
 //! That is not a hypothetical gap. `server.rs`'s `cancel` handler held its
 //! guard as a `match` scrutinee across a `background().spawn(...)` whose
-//! closure kills tmux sessions. Nothing on those lines looks like I/O: the
+//! closure kills session sessions. Nothing on those lines looks like I/O: the
 //! spawn reads as "hand this to another thread", and under the deferred
 //! `BackgroundWork` it is. Under `BackgroundWork::Immediate` -- every
-//! `Daemon::new()`-built test daemon -- the closure runs inline, so the tmux
+//! `Daemon::new()`-built test daemon -- the closure runs inline, so the session
 //! subprocesses ran with the global store lock held.
 //!
 //! What caught it was the WS-B.3 runtime guard watchdog in

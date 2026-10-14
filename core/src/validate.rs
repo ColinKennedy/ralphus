@@ -1516,11 +1516,8 @@ fn check_subprojects(ctx: &mut Ctx, table: &toml::Table, path: &str, header: Opt
 /// (`[A-Za-z_][A-Za-z0-9_]*`). Mirrors `daemon::config::is_valid_env_key`
 /// exactly (`core` cannot depend on `daemon`, so the check is duplicated
 /// rather than shared) -- both exist to stop an env-override key from
-/// smuggling shell metacharacters into the `$env:KEY = ...;` prefix the
-/// daemon's tmux delivery embeds: the `-e KEY=value` flag passed to
-/// `new-session` on Windows (RAL-247) and the `KEY='...'` assignment prefix
-/// [`daemon::tmux::build_command_line_with_env`] inlines for POSIX RAL-150
-/// (RAL-172, RAL-150).
+/// smuggling shell metacharacters into an inlined `$env:KEY = ...;` or
+/// `KEY='...'` assignment prefix.
 fn is_valid_env_key(key: &str) -> bool {
     let mut chars = key.chars();
     match chars.next() {

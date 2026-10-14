@@ -19,14 +19,6 @@ workspace = true
 
 [features]
 secure-dist = ["ralphus-auth/secure-dist"]
-# Bundles a tmux-compatible binary via `include_bytes!` so users never need to
-# install tmux themselves, and so the daemon prefers a known-good build over
-# whatever happens to be named `tmux` on PATH (RAL-102, supply-chain
-# hardening in RAL-347). Off by default so a plain `cargo build` never needs
-# the vendor/psmux submodule built -- run scripts/build-vendored-tmux.ps1 to
-# populate daemon/assets/tmux/windows/tmux.exe before enabling. See
-# docs/tmux-embedding.md.
-embedded-tmux = []
 # RAL-644: tree-sitter Bash/PowerShell parse that lets the board's agent log
 # show a shell command as highlighted rows. Display-only and optional (needs a
 # C compiler); see docs/shell-syntax.md.
@@ -55,7 +47,6 @@ toml = { workspace = true }
 rusqlite = { workspace = true }
 parking_lot = { workspace = true }
 tiny_http = { workspace = true }
-tungstenite = { workspace = true }
 ureq = { workspace = true, features = ["tls"] }
 opentelemetry = { workspace = true }
 opentelemetry_sdk = { workspace = true }

@@ -1462,60 +1462,6 @@ impl DaemonClient {
         )
     }
 
-    /// `POST .../cells/{ti}/{si}/open-terminal?mode=agent` (RAL-288 Stage
-    /// 6): while the cell is running, cleanly detaches it and opens the
-    /// real interactive agent in a new terminal (tmux-wrapped, survives
-    /// closing this window); once finished, resumes it the old way. Same
-    /// endpoint either way -- the daemon decides which based on the cell's
-    /// current state.
-    pub fn open_agent_terminal(
-        &self,
-        squad_id: &str,
-        task_idx: i64,
-        cell_idx: i64,
-    ) -> Result<Value, DaemonError> {
-        self.post(
-            &format!("/api/squads/{squad_id}/cells/{task_idx}/{cell_idx}/open-terminal?mode=agent"),
-            None,
-        )
-    }
-
-    /// `POST .../cells/{ti}/{si}/terminal-ticket` (RAL-355 Phase 10): mints a
-    /// one-shot ticket for the remote Open Agent terminal relay -- the
-    /// WebSocket counterpart to [`Self::open_agent_terminal`] for a cell
-    /// running on a `machine`, since that route only ever spawns a terminal
-    /// window on the daemon's own desktop. Returns `{"ticket", "port",
-    /// "path"}`; the caller connects the actual WebSocket itself (see
-    /// `commands/terminal_relay.rs`) -- this client has no WS transport of
-    /// its own, matching every other method here being plain HTTP/JSON.
-    pub fn mint_terminal_ticket(
-        &self,
-        squad_id: &str,
-        task_idx: i64,
-        cell_idx: i64,
-    ) -> Result<Value, DaemonError> {
-        self.post(
-            &format!("/api/squads/{squad_id}/cells/{task_idx}/{cell_idx}/terminal-ticket"),
-            None,
-        )
-    }
-
-    /// `POST .../cells/{ti}/{si}/resume-automation` (RAL-288 Stage 6): hands
-    /// a detached cell back to unattended execution, continuing the exact
-    /// same agent conversation rather than starting fresh. Rejected if the
-    /// cell is actually still live (not detached), rather than racing it.
-    pub fn resume_automation(
-        &self,
-        squad_id: &str,
-        task_idx: i64,
-        cell_idx: i64,
-    ) -> Result<Value, DaemonError> {
-        self.post(
-            &format!("/api/squads/{squad_id}/cells/{task_idx}/{cell_idx}/resume-automation"),
-            None,
-        )
-    }
-
     pub fn restart_cell_proof(
         &self,
         squad_id: &str,

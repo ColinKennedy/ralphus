@@ -51,7 +51,6 @@ to_win_path() {
 }
 
 runner_path="$root/bin/ralphus-runner.exe"
-tmux_path="$root/tmux/tmux.exe"
 daemon_exe="$root/bin/ralphus-daemon.exe"
 librarian_exe="$root/bin/ralphus-librarian.exe"
 hello_template="$root/examples/hello.toml"
@@ -59,7 +58,7 @@ log_dir="$root/logs"
 daemon_log="$log_dir/daemon.log"
 librarian_log="$log_dir/librarian.log"
 
-for required in "$daemon_exe" "$librarian_exe" "$runner_path" "$tmux_path"; do
+for required in "$daemon_exe" "$librarian_exe" "$runner_path"; do
   if [[ ! -f "$required" ]]; then
     echo "required file missing: $required" >&2
     exit 1
@@ -76,12 +75,10 @@ mkdir -p "$log_dir"
 : > "$librarian_log"
 
 export RALPHUS_RUNNER_CMD="$(to_win_path "$runner_path")"
-export RALPHUS_TMUX_CMD="$(to_win_path "$tmux_path")"
 export RALPHUS_DAEMON_URL="http://127.0.0.1:${daemon_port}"
 
 echo "== starting ralphus bundle =="
 echo "   runner    -> $RALPHUS_RUNNER_CMD"
-echo "   tmux      -> $RALPHUS_TMUX_CMD"
 echo "   daemon    -> $RALPHUS_DAEMON_URL"
 if [[ -n "$db_path" ]]; then
   echo "   db        -> $db_path"

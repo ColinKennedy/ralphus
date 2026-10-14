@@ -128,7 +128,7 @@ pub struct RunOptions<'a> {
     /// accepts this but not that).
     pub auto_compact_threshold: Option<u64>,
     /// RAL-303: how many characters of a `tool_use` argument value to render
-    /// into the Live View tmux pane before truncating, resolved daemon-side
+    /// into the Live View transcript before truncating, resolved daemon-side
     /// from `[live_view] tool_arg_truncate_chars`. Support is optional per
     /// backend -- only the claude-code backend reads this today; others
     /// ignore it, mirroring `assigned_agent_session_id`'s "hand-rolled
@@ -200,7 +200,7 @@ pub struct RunOptions<'a> {
 /// RAL-292: the sole turn content sent by [`ModelBackend::nudge`]'s default
 /// caller-facing convention -- deliberately generic (not the cell's own task
 /// text, which the resumed session already has), same principle as
-/// `daemon/src/scheduler.rs::RESUME_AUTOMATION_PROMPT` (RAL-288).
+/// `daemon/src/scheduler.rs::RESUME_AUTOMATION_PROMPT`.
 pub const BACKGROUND_JOB_NUDGE_PROMPT: &str = "You ended your last turn with an unresolved backgrounded job -- \
     something you launched as a background/async process without ever \
     checking its actual result. Check that job's real result now (e.g. the \

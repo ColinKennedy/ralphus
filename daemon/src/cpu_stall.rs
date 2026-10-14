@@ -2,7 +2,7 @@
 //! still-running cell/proof subprocess whose cumulative CPU time hasn't
 //! moved across several repeated samples -- a real hang, as opposed to the
 //! existing RAL-241 pane-quiet check (`SubprocessRunner::check_stall_escalation`),
-//! which only knows a tmux pane hasn't printed anything and can be
+//! which only knows a cell transcript hasn't printed anything and can be
 //! (correctly) silent for a long time during genuinely CPU-bound work.
 //!
 //! This sweep never kills anything -- it only enqueues a `high`-priority
@@ -41,7 +41,7 @@ const CPU_STALL_MIN_SPAN_MS: i64 = 5 * 60 * 1000;
 /// `proof-<scope>-<idx>` id.
 struct Entry {
     /// The PID this reading belongs to. A changed PID for the same session
-    /// key (e.g. a tmux auto-reattach spawning a fresh subprocess) means a
+    /// key (e.g. a auto-reattach spawning a fresh subprocess) means a
     /// fresh CPU-time clock, so any existing streak is discarded rather than
     /// compared across processes.
     pid: u32,

@@ -949,7 +949,7 @@ mod tests {
     /// `GET`s -- one at a time on its single accept-loop thread. In practice
     /// a browser tab left open on the board keeps several connections alive
     /// concurrently, and any one request that's slow to answer (a forge
-    /// PR-sync check, a tmux pane capture, ...) serialized every other
+    /// PR-sync check, a transcript read, ...) serialized every other
     /// request behind it, including an unrelated page's own load. Spins up a
     /// real `serve_with` loop against a fake daemon that deliberately sleeps
     /// on one path, fires a slow and a fast request concurrently, and asserts

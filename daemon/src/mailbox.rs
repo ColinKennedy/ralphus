@@ -11,7 +11,7 @@
 //! visible to every registered client, and "unread" is tracked per
 //! `(message_id, client_id)` pair rather than per-message — see
 //! `mailbox_drains` in `Store::init_schema`. There is no per-run/per-project
-//! subscription model yet, and direct-push delivery into a live tmux-tracked
+//! subscription model yet, and direct-push delivery into a live tracked
 //! session is out of scope here (see the ticket's Q&A) — only turn-boundary
 //! polling is implemented.
 
@@ -124,7 +124,7 @@ impl Remediation {
 /// the proof-level retry loop in `scheduler.rs::run_proof_with_rate_limit_retries`,
 /// and the guardian-merge retry loop in
 /// `guardian_merge.rs::run_agent_with_rate_limit_retry`), plus the runner's
-/// tmux-session reattach loop (`runner.rs::Runner::run_via_tmux`, reason
+/// cell-session reattach loop (`runner.rs::Runner::run_direct`, reason
 /// `"reattach attempts exhausted"` once `MAX_REATTACH_ATTEMPTS` is hit). All
 /// of these produce a message containing one of the substrings below, so
 /// this is detected by string match rather than a dedicated `RunnerResult`

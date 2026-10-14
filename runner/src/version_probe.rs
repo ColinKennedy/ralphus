@@ -1,6 +1,6 @@
 //! RAL-546: a generic `<program> <version-args>` probe shared by every
 //! external-tool health check that only needs "run it, read a version out of
-//! its output" (git, gh, glab, tmux, Claude Code, Codex) -- one spawn/drain/
+//! its output" (git, gh, glab, Claude Code, Codex) -- one spawn/drain/
 //! timeout/classify implementation parameterized by program, version flag(s),
 //! and an extraction closure, instead of a bespoke module per tool. Generalizes
 //! the exact shape [`crate::ripgrep`]'s `probe_version`/`probe_version_at`
@@ -10,7 +10,7 @@
 //! Like ripgrep's probe, this never reports a hard failure of its own --
 //! [`VersionProbe::status`] is a clean pass or a `warn`. Each tool-specific
 //! call site (`daemon/src/health_sweep.rs`) decides whether a `NotFound`
-//! should sink its own check to `fail` (git, tmux -- load-bearing) or stay a
+//! should sink its own check to `fail` (git -- load-bearing) or stay a
 //! `pass` (gh, glab -- optional, agents fall back without them), the same
 //! per-tool judgment call ripgrep's callers already make.
 
@@ -44,7 +44,7 @@ pub enum VersionProbe {
 impl VersionProbe {
     /// The check status this outcome reports -- a clean pass or a `warn`,
     /// never a `fail`. Callers that want a given tool's absence to sink the
-    /// whole check to `fail` (e.g. git, tmux) decide that themselves from
+    /// whole check to `fail` (e.g. git) decide that themselves from
     /// `matches!(probe, VersionProbe::NotFound)`, rather than this type
     /// hard-coding that judgment for every tool.
     #[must_use]
@@ -97,7 +97,7 @@ pub fn probe_version(
 /// Runs `<resolved_path> <version_args>` with `timeout` and classifies the
 /// result via `extract`. Split out from [`probe_version`] so tests and callers
 /// that already have a resolved path (e.g. a backend's configured command, or
-/// tmux's env-override/embedded-psmux path) can exercise every failure shape
+/// an env-override path) can exercise every failure shape
 /// without going through a second PATH resolution.
 #[must_use]
 pub fn probe_version_at(
@@ -341,8 +341,8 @@ mod tests {
             Some("1.114.0".to_string())
         );
         assert_eq!(
-            first_token_after_prefix("tmux 3.3.8\npsmux 3.3.8 (66cf613 2026-08-18)\n", "tmux "),
-            Some("3.3.8".to_string())
+            first_token_after_prefix("rg 14.1.1\nextra 1.0\n", "rg "),
+            Some("14.1.1".to_string())
         );
     }
 
@@ -381,7 +381,7 @@ mod tests {
             ("ripgrep 14.1.1\n-PCRE2 10.39", "14.1.1"),
             ("Claude Code 2.1.229\n", "2.1.229"),
             ("codex-cli v0.157.0 (build abc)\n", "0.157.0"),
-            ("tmux 3.3.8\n", "3.3.8"),
+            ("rg 14.1.1\n", "14.1.1"),
             ("git version 2.44.0.windows.1\n", "2.44.0.windows.1"),
             ("gh version 2.93.0 (2026-05-27)\n", "2.93.0"),
             ("glab 1.114.0 (4d7c6cd)\n", "1.114.0"),
