@@ -584,6 +584,28 @@
       function agentLogScrolled(el) {
         agentLogScroll[el.dataset.key || ""] = el.scrollTop;
       }
+      /** @type {Set<string>} Agent Log keys whose refresh was skipped because the user was selecting text. */
+      const agentLogDeferred = new Set();
+      /**
+       * Records the live scroll offset of every mounted Agent Log list, so a
+       * repaint of an enclosing pane can put them back.
+       * @returns {void}
+       */
+      function snapshotAgentLogScroll() {
+        document.querySelectorAll(".alog[data-key]").forEach((el0) => {
+          agentLogScrolled(/** @type {HTMLElement} */ (el0));
+        });
+      }
+      /**
+       * Runs the Agent Log refreshes that were deferred while a selection was
+       * active, once that selection is gone.
+       * @returns {void}
+       */
+      function flushDeferredAgentLogs() {
+        if (agentLogDeferred.size === 0) return;
+        for (const key of [...agentLogDeferred]) refreshAgentLog(key);
+      }
+      document.addEventListener("selectionchange", flushDeferredAgentLogs);
       /**
        * Re-applies remembered scroll offsets after a live-view widget repainted.
        * @returns {void}
@@ -629,6 +651,9 @@
         if (!host) return;
         const entries = agentLogEntries(key);
         if (entries === null) return;
+        // A repaint would destroy the user's drag-selection; defer it until the selection clears.
+        if (selectionWithin(host)) { agentLogDeferred.add(key); return; }
+        agentLogDeferred.delete(key);
         const f = agentLogFilter[key] || { tool: "", status: "", q: "" };
         const redraw = full || f.q !== "" || f.tool !== "" || f.status !== "" || (!agentLogAll[key] && entries.length > AGENT_LOG_PAGE);
         if (redraw) {
