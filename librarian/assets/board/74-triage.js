@@ -1362,10 +1362,12 @@
         const thresholdText = confirm.threshold === null || confirm.threshold === undefined
           ? "no threshold is configured"
           : `the configured threshold of ${confirm.threshold}`;
+        const draining = !!triageDrainsPending[triagePreviewKey(confirm.project, confirm.triage_type)];
+        const dis = draining ? " disabled" : "";
         return `<div class="row" style="gap:4px;margin:4px 0 0;max-width:440px" data-tip="Bypasses only this pool's count threshold -- every other review-creation invariant (Arbiter origin, project defaults, only completed cells) stays the same as an automatic drain, and no cron schedule is needed.">
             <span style="color:var(--muted);font-size:11px">Create 1 review from ${confirm.count} candidate(s) now, bypassing ${thresholdText}.</span>
-            <button class="btn primary" style="padding:2px 8px;font-size:11px" data-click="confirmDrainTriagePool" data-project="${esc(confirm.project)}" data-triage-type="${esc(confirm.triage_type)}" data-tip="Create the review now.">Confirm & drain</button>
-            <button class="btn" style="padding:2px 8px;font-size:11px" data-click="cancelDrainTriagePool" data-project="${esc(confirm.project)}" data-triage-type="${esc(confirm.triage_type)}" data-tip="Discard; nothing was changed.">Cancel</button>
+            <button class="btn primary" style="padding:2px 8px;font-size:11px"${dis} data-click="confirmDrainTriagePool" data-project="${esc(confirm.project)}" data-triage-type="${esc(confirm.triage_type)}" data-tip="${draining ? "The review is being created (the Arbiter is ordering the candidates); this can take several seconds." : "Create the review now."}">${draining ? "Draining…" : "Confirm & drain"}</button>
+            <button class="btn" style="padding:2px 8px;font-size:11px"${dis} data-click="cancelDrainTriagePool" data-project="${esc(confirm.project)}" data-triage-type="${esc(confirm.triage_type)}" data-tip="${draining ? "Unavailable while the drain is running; it cannot be stopped once started." : "Discard; nothing was changed."}">Cancel</button>
           </div>`;
       }
       /**
@@ -1396,15 +1398,35 @@
        */
       async function confirmDrainTriagePool(project, triageType) {
         const key = triagePreviewKey(project, triageType);
-        if (!triageDrainConfirms[key]) return;
+        if (!triageDrainConfirms[key] || triageDrainsPending[key]) return;
+        const label = `${project}/${triageType}`;
+        triageDrainsPending[key] = true;
+        renderTriage();
+        notify("info", `Drain started for ${label}`);
         try {
           const r = await fetch("/api/triage/pools/drain", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ project, triage_type: triageType }),
           });
-          triageError = r.ok ? "" : await responseError(r, "drain failed");
-        } catch (err) { triageError = "daemon unreachable"; }
+          if (r.ok) {
+            const body = await r.json().catch(() => ({}));
+            const gid = typeof body.guardian_id === "string" ? body.guardian_id : "";
+            triageError = "";
+            notify("success", gid ? `Drain of ${label} created review ${gid}` : `Drain of ${label} created a review`,
+              gid ? { action: { label: "Open review", run: async () => { gotoReview(gid); } } } : undefined);
+          } else if (r.status === 409) {
+            triageError = "";
+            notify("warn", `Drain of ${label}: pool was already drained (no eligible candidates)`);
+          } else {
+            triageError = await responseError(r, "drain failed");
+            notify("error", `Drain of ${label} failed: ${triageError}`);
+          }
+        } catch (err) {
+          triageError = "daemon unreachable";
+          notify("error", `Drain of ${label} failed: daemon unreachable`);
+        }
+        delete triageDrainsPending[key];
         delete triageDrainConfirms[key];
         await pollTriage();
       }
@@ -1415,6 +1437,7 @@
        * @returns {void}
        */
       function cancelDrainTriagePool(project, triageType) {
+        if (triageDrainsPending[triagePreviewKey(project, triageType)]) return;
         delete triageDrainConfirms[triagePreviewKey(project, triageType)];
         renderTriage();
       }
