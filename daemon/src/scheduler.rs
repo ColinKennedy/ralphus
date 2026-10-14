@@ -4001,6 +4001,16 @@ fn run_cell_worker(
             None => guidance,
         });
     }
+    // A git-backed task fails with "no commits since baseline" when its cells
+    // leave their work uncommitted (`check_task_no_commits_guard`), and the
+    // review only ever sees committed work -- so a prompt cell is told to
+    // commit exactly when that guard applies to it.
+    if spec.prompt.is_some() && task_requires_commits(store, squad_id, row.task_idx) {
+        spec.system_prompt = Some(match spec.system_prompt {
+            Some(existing) => format!("{existing}\n\n{CELL_COMMIT_SYSTEM_PROMPT}"),
+            None => CELL_COMMIT_SYSTEM_PROMPT.to_string(),
+        });
+    }
     spec.agent = selection.backend.clone();
     spec.executable = selection.executable.clone();
     spec.prompt = spec
@@ -5087,6 +5097,35 @@ fn run_proof_only_worker(
 /// human needing to open the Logs modal. `git` subprocess/provider calls run
 /// outside the store lock, matching this module's "subprocess waits happen
 /// outside the store lock" rule.
+/// Told to every prompt cell of a task [`check_task_no_commits_guard`] applies
+/// to: its work only counts once it is committed.
+pub(crate) const CELL_COMMIT_SYSTEM_PROMPT: &str = "## Committing\n\
+When your change is complete, commit it in this worktree: stage the files you \
+changed (never build output or scratch files) and `git commit` with a short, \
+descriptive message. Ralphus reviews and merges only committed work -- edits \
+left uncommitted are not seen, and the task fails for having no commits. Do \
+not push; ralphus does that.";
+
+/// Whether [`check_task_no_commits_guard`] will require this task's cells to
+/// have committed: a git project, and the task does not opt out with
+/// `no_commit_required`.
+fn task_requires_commits(
+    store: &crate::store_lock::StoreHandle,
+    squad_id: &str,
+    task_idx: i64,
+) -> bool {
+    let guard = store.lock();
+    let Ok(Some(info)) = guard.task_commit_guard_info(squad_id, task_idx) else {
+        return false;
+    };
+    !info.no_commit_required
+        && info
+            .project
+            .as_deref()
+            .and_then(|name| guard.get_project(name).ok().flatten())
+            .is_some_and(|p| p.vcs == "git")
+}
+
 fn check_task_no_commits_guard(
     store: &crate::store_lock::StoreHandle,
     squad_id: &str,
@@ -5094,19 +5133,7 @@ fn check_task_no_commits_guard(
     task_name: &str,
     cells: &[crate::store::CellRow],
 ) -> bool {
-    let (info, is_git) = {
-        let guard = store.lock();
-        let Ok(Some(info)) = guard.task_commit_guard_info(squad_id, task_idx) else {
-            return true;
-        };
-        let is_git = info
-            .project
-            .as_deref()
-            .and_then(|name| guard.get_project(name).ok().flatten())
-            .is_some_and(|p| p.vcs == "git");
-        (info, is_git)
-    };
-    if info.no_commit_required || !is_git {
+    if !task_requires_commits(store, squad_id, task_idx) {
         return true;
     }
     let workspaces: Vec<crate::workspace::Workspace> = cells
@@ -7148,6 +7175,50 @@ mod tests {
     use super::*;
     use crate::runner::{RunnerResult, RunnerSpec};
     use std::collections::BTreeMap;
+
+    #[test]
+    fn prompt_cells_are_told_to_commit_exactly_when_the_no_commits_guard_applies() {
+        let mut raw = crate::store::Store::open_in_memory().unwrap();
+        raw.register_project("gitproj", "", "/repo", "git").unwrap();
+        let file: ralphus_core::schema::TaskFile = toml::from_str(
+            r#"
+[[task]]
+name = "needs-commit"
+project = "gitproj"
+[[task.cell]]
+cwd = "/repo"
+prompt = "add a label"
+
+[[task]]
+name = "opted-out"
+project = "gitproj"
+no_commit_required = true
+[[task.cell]]
+cwd = "/repo"
+prompt = "look around"
+
+[[task]]
+name = "no-project"
+[[task.cell]]
+cwd = "/repo"
+prompt = "anything"
+"#,
+        )
+        .unwrap();
+        let squad = raw.insert_squad(&file, None, false).unwrap();
+        let store: crate::store_lock::StoreHandle =
+            Arc::new(crate::store_lock::StoreMutex::new(raw));
+        assert!(task_requires_commits(&store, &squad, 0));
+        assert!(
+            !task_requires_commits(&store, &squad, 1),
+            "no_commit_required opts out"
+        );
+        assert!(
+            !task_requires_commits(&store, &squad, 2),
+            "no git project, no guard"
+        );
+        assert!(CELL_COMMIT_SYSTEM_PROMPT.contains("git commit"));
+    }
 
     #[test]
     fn earlier_proofs_text_no_prior_proofs() {
