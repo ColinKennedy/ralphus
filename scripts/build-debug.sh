@@ -84,7 +84,7 @@ root="$(cd "$(dirname "$0")/.." && pwd)"
 # 1. Build all four Rust bins in debug (fast incremental rebuild picks up
 #    any CLI/runner/librarian source edit alike).
 echo "== cargo build (debug) daemon + librarian + runner + cli =="
-cargo build --package ralphus-daemon --package ralphus-librarian --package ralphus-runner --package ralphus-cli --manifest-path "$root/Cargo.toml"
+cargo build --package ralphus-daemon --package ralphus-librarian --package ralphus-runner --package ralphus-cli --features ralphus-daemon/shell-syntax --manifest-path "$root/Cargo.toml"
 
 ext=""; [ -f "$root/target/debug/ralphus-daemon.exe" ] && ext=".exe"
 

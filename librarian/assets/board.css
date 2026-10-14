@@ -20,6 +20,7 @@
         --arbiter: #7c3aed;
         --terminal-bg: #000000; --terminal-fg: #b9c4d0; --terminal-cursor: #ffffff;
         --terminal-selection: rgba(255,255,255,.3);
+        --sh-cmd: #79c0ff; --sh-flag: #d2a8ff; --sh-string: #a5d6a7; --sh-var: #ffa657; --sh-op: #ff7b72; --sh-comment: #8b949e;
         --ansi-black: #2e3436; --ansi-red: #cc0000; --ansi-green: #4e9a06; --ansi-yellow: #c4a000;
         --ansi-blue: #3465a4; --ansi-magenta: #75507b; --ansi-cyan: #06989a; --ansi-white: #d3d7cf;
         --ansi-bright-black: #555753; --ansi-bright-red: #ef2929; --ansi-bright-green: #8ae234;
@@ -61,6 +62,7 @@
         /* Terminal palette on a light ground; every ANSI slot is >= 4.5:1 on --terminal-bg. */
         --terminal-bg: #f6f8fa; --terminal-fg: #1f2328; --terminal-cursor: #1f2328;
         --terminal-selection: rgba(9,105,218,.25);
+        --sh-cmd: #0550ae; --sh-flag: #8250df; --sh-string: #116329; --sh-var: #953800; --sh-op: #cf222e; --sh-comment: #57606a;
         --ansi-black: #24292f; --ansi-red: #cf222e; --ansi-green: #116329; --ansi-yellow: #7d4e00;
         --ansi-blue: #0969da; --ansi-magenta: #8250df; --ansi-cyan: #1b7c83; --ansi-white: #57606a;
         --ansi-bright-black: #46505a; --ansi-bright-red: #a40e26; --ansi-bright-green: #1a7f37;
@@ -727,6 +729,21 @@
       .alog-kv { display: flex; align-items: baseline; gap: 6px; padding: 0 8px; }
       .alog-kv .alog-pre { flex: 1; min-width: 0; margin: 2px 0 4px; }
       .alog-k { flex: none; color: var(--accent); font-family: ui-monospace, "Cascadia Code", Consolas, monospace; font-size: 10.5px; }
+      .alog-sh { margin: 2px 8px 6px; padding: 6px 8px; background: var(--terminal-bg); color: var(--text); border-radius: 5px; max-height: 240px; overflow: auto; font-size: 10.5px; font-family: ui-monospace, "Cascadia Code", Consolas, monospace; }
+      .alog-sh-row { white-space: pre-wrap; word-break: break-word; padding: 1px 0; }
+      .alog-sh-row + .alog-sh-row { border-top: 1px dashed var(--border-soft); }
+      .alog-sh-sep { color: var(--sh-op); margin-right: 6px; }
+      .alog-sh-cmd { color: var(--sh-cmd); font-weight: 650; }
+      .alog-sh-flag { color: var(--sh-flag); }
+      .alog-sh-string { color: var(--sh-string); }
+      .alog-sh-var { color: var(--sh-var); }
+      .alog-sh-op { color: var(--sh-op); }
+      .alog-sh-comment { color: var(--sh-comment); font-style: italic; }
+      .alog-sh-heredoc { margin: 2px 0 2px 12px; }
+      .alog-sh-heredoc > summary { cursor: pointer; color: var(--sh-comment); }
+      .alog-sh-heredoc > pre { margin: 2px 0; white-space: pre-wrap; color: var(--muted); }
+      .alog-sh-more { flex: none; color: var(--faint); font-size: 10px; }
+      .alog-sh-raw { margin: 2px 8px 0; padding: 1px 7px; font-size: 10px; }
       .alog-pre { margin: 2px 8px 6px; padding: 6px 8px; background: var(--terminal-bg); color: var(--text); border-radius: 5px; max-height: 240px; overflow: auto; white-space: pre-wrap; word-break: break-word; font-size: 10.5px; font-family: ui-monospace, "Cascadia Code", Consolas, monospace; }
       .runterm {
         background: var(--terminal-bg); border: 1px solid var(--border); border-radius: 7px;

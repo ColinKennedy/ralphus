@@ -52,6 +52,12 @@ role in the table below, then use it.
 | `--detached` | `#d2a8ff` | *(shared)* | semantic (a cell cleanly stopped mid-task for a real interactive agent session to take over, not Done/Failed/Cancelled, RAL-288) |
 | `--delayed` | `#79c0ff` | *(shared)* | semantic (a cell waiting out a recognized, retryable provider rate limit before automatically resuming, RAL-435) |
 | `--arbiter` | `#7c3aed` | *(shared)* | semantic (a review automatically created by the Arbiter/Triage subsystem rather than an authored `[[review]]`, RAL-318) |
+| `--sh-cmd` | `#79c0ff` | `#0550ae` | semantic (shell-syntax highlight: command name, RAL-644) |
+| `--sh-flag` | `#d2a8ff` | `#8250df` | semantic (shell-syntax highlight: flags/parameters) |
+| `--sh-string` | `#a5d6a7` | `#116329` | semantic (shell-syntax highlight: string literals) |
+| `--sh-var` | `#ffa657` | `#953800` | semantic (shell-syntax highlight: variables/expansions) |
+| `--sh-op` | `#ff7b72` | `#cf222e` | semantic (shell-syntax highlight: operators: `&&`, pipe, redirects) |
+| `--sh-comment` | `#8b949e` | `#57606a` | semantic (shell-syntax highlight: comments, heredoc stub) |
 | `--terminal-bg` | `#000000` | `#f6f8fa` | surface (terminal background: Live tab transcript and remote xterm.js panel; full palette in "Terminal surface") |
 | `--roster-block` | `#e8590c` | *(shared)* | semantic (a unit of work a cross-squad waypoint affects in `block` mode — can halt in-flight cells, RAL-400) |
 | `--faint` | `#6e7681` | `#818b98` | chrome (tertiary text — metadata that annotates a value without competing with it) |
@@ -518,3 +524,12 @@ an inline `style="color:#rrggbb"`. This is the only sanctioned hardcoded-hex
 exception. Every generated color is clamped to at least 4.5:1 WCAG contrast
 against the active theme's `--bg`, and the "Color turn types in transcripts"
 preference (Preferences page, on by default) turns it off.
+
+### Shell-syntax highlighting — `--sh-*` (RAL-644)
+
+The Agent Log's optional parsed view of a Bash/PowerShell call colors command
+names (`--sh-cmd`), flags (`--sh-flag`), strings (`--sh-string`), variables
+(`--sh-var`), operators (`--sh-op`) and comments (`--sh-comment`). The colors
+carry no status meaning and the view is display-only: the raw text is one
+click away and is what the agent actually ran. See
+[`shell-syntax.md`](shell-syntax.md).

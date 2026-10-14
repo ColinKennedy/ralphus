@@ -271,6 +271,11 @@ produced no pane output.
 | DELETE | `/api/projects/{name}/forks/{user}` | Remove one user's fork row |
 | GET | `/api/health/project-forks` | [Advisory health checks](#fork-registration-ral-338) for every registered fork row |
 
+**Shell syntax (RAL-644)**
+| Method | Path | What |
+|---|---|---|
+| POST | `/api/shell-syntax/parse` | [Split a shell tool call's command into rows and highlight spans](shell-syntax.md); display-only, always HTTP 200 with a `status` |
+
 **Forge poll-token pool (RAL-635, admin-only)**
 | Method | Path | What |
 |---|---|---|
@@ -428,8 +433,19 @@ later via `POST /api/squads/{id}/activate`.
 Health/version probe. Never requires the DB to be writable.
 
 ```json
-{ "name": "ralphus-daemon", "version": "0.1.0", "status": "ok", "db": "ok" }
+{ "name": "ralphus-daemon", "version": "0.1.0", "status": "ok", "db": "ok", "shell_syntax": false }
 ```
+
+`shell_syntax` (RAL-644) reports whether the optional [`shell-syntax`](shell-syntax.md) feature is built in.
+
+### `POST /api/shell-syntax/parse` (RAL-644)
+Body `{"tool": "Bash", "command": "cargo fmt && cargo test"}`. Returns
+`{"status", "commands": [{text,start,end,sep}], "spans": [{kind,start,end}]}`
+with byte offsets into `command`. `status` is `ok`, `unparsed`, `unsupported`,
+`too_long`, `timeout` or `unavailable` (feature not built); always HTTP 200
+for a well-formed body, 400 otherwise. Display-only helper: no CLI/MCP command
+exists for it (`mcp/tests/parity.rs` does not apply). The daemon logs only the
+length and status, never the command text. See [`shell-syntax.md`](shell-syntax.md).
 
 ### `POST /api/daemon/shutdown`
 Kill every process this daemon has spawned — every cell, proof,

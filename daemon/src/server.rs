@@ -888,6 +888,9 @@ struct DaemonHealth<'a> {
     version: &'a str,
     status: &'a str,
     db: &'a str,
+    /// RAL-644: whether the optional `shell-syntax` feature is built in.
+    /// Display-only; false just means the agent log shows raw commands.
+    shell_syntax: bool,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     warnings: Vec<&'a str>,
     /// RAL-393: process-lifetime store-lock acquisition wait (p50/p95/max),
@@ -1537,6 +1540,8 @@ fn route_for_user(
         ("GET", ["api", "health", "agent-profiles"]) => agent_profiles_health(daemon, query),
         ("GET", ["api", "health", "project-forks"]) => project_forks_health(daemon),
         ("POST", ["api", "health", "arbiter"]) => health_arbiter(daemon),
+        // ralphus[ignore-endpoint-cli]: display-only syntax split for the board's agent log (RAL-644); nothing for a CLI user to call
+        ("POST", ["api", "shell-syntax", "parse"]) => shell_syntax_parse(body),
         // RAL-416: catalog-driven health administration -- read-only, admin
         // gated like the other machine/health board surfaces above. Mapped to
         // `check catalog` in check_endpoint_cli_parity.py's manifest.
@@ -2549,6 +2554,7 @@ fn health(daemon: &Daemon) -> Reply {
             version: ralphus_core::version(),
             status: "ok",
             db,
+            shell_syntax: ralphus_shell_syntax::available(),
             warnings,
             lock_wait: crate::store_lock::store_lock_wait_snapshot(),
             guard_hold: crate::store_lock::guard_hold_snapshot(),
@@ -4536,6 +4542,48 @@ fn list_agent_profiles_for_backend(daemon: &Daemon, backend: &str) -> Reply {
 /// User-triggered only -- never polled -- so no caching/rate-limiting of its
 /// own cost is needed; it still respects the Arbiter's `maximum_budget_usd`
 /// cap like any other Arbiter call.
+/// Request body of `POST /api/shell-syntax/parse`.
+#[derive(Deserialize)]
+struct ShellSyntaxBody {
+    tool: String,
+    command: String,
+}
+
+/// Which grammar an `exec` tool call (Codex) is parsed with: the host OS the
+/// daemon runs on. A cell on a remote machine of another OS is still parsed
+/// with the daemon host's grammar.
+const SHELL_SYNTAX_HOST_IS_WINDOWS: bool = cfg!(windows);
+
+/// `POST /api/shell-syntax/parse` (RAL-644): splits one shell tool call's
+/// command into rows and highlight spans. Display-only; HTTP 200 for every
+/// outcome, with the reason in `status` (`unavailable` when the `shell-syntax`
+/// feature is not built). Only the length and status are logged, never the
+/// command text.
+fn shell_syntax_parse(body: &str) -> Reply {
+    let Ok(req) = serde_json::from_str::<ShellSyntaxBody>(body) else {
+        return error(
+            400,
+            "bad_request",
+            "body must be {\"tool\": \"...\", \"command\": \"...\"}",
+            vec![],
+        );
+    };
+    let parsed = match ralphus_shell_syntax::shell_for_tool(&req.tool, SHELL_SYNTAX_HOST_IS_WINDOWS)
+    {
+        Some(shell) => ralphus_shell_syntax::parse(shell, &req.command),
+        None => ralphus_shell_syntax::Parsed::empty(ralphus_shell_syntax::Status::Unsupported),
+    };
+    // ralphus[ignore-rlog-pair]: shell-syntax parse is display-only infrastructure, not a notable business event
+    crate::rlog!(
+        DEBUG,
+        "ralphus [shell-syntax] parse tool={} len={} status={:?}",
+        req.tool,
+        req.command.len(),
+        parsed.status
+    );
+    json(200, &parsed)
+}
+
 fn health_arbiter(daemon: &Daemon) -> Reply {
     let arbiter = crate::arbiter::Arbiter::current();
     match crate::arbiter::health_check(&daemon.store_handle(), &arbiter) {
@@ -36976,5 +37024,30 @@ remediation_attempts=1
         let d = daemon();
         let r = route(&d, "GET", "/api/waypoints/waypoint-999/deliveries", "");
         assert_eq!(r.status, 404, "{}", r.body);
+    }
+}
+
+#[cfg(test)]
+mod shell_syntax_route_tests {
+    use super::*;
+
+    #[test]
+    fn non_shell_tool_is_unsupported_and_bad_body_is_400() {
+        let r = shell_syntax_parse(r#"{"tool":"Read","command":"x"}"#);
+        assert_eq!(r.status, 200, "{}", r.body);
+        assert!(r.body.contains("\"unsupported\""), "{}", r.body);
+        assert_eq!(shell_syntax_parse("{").status, 400);
+    }
+
+    #[test]
+    fn shell_tool_reports_the_build_configuration() {
+        let r = shell_syntax_parse(r#"{"tool":"Bash","command":"ls -la && pwd"}"#);
+        assert_eq!(r.status, 200, "{}", r.body);
+        let want = if ralphus_shell_syntax::available() {
+            "\"ok\""
+        } else {
+            "\"unavailable\""
+        };
+        assert!(r.body.contains(want), "{}", r.body);
     }
 }

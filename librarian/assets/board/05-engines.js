@@ -106,6 +106,7 @@
         jumpToLatestLiveRun: (e, ds) => jumpToLatestLiveRun(ds.scope || ""),
         setLiveSub: (e, ds) => setLiveSub(ds.scope || "", ds.sub || "terminal"),
         agentLogShowEarlier: (e, ds) => agentLogShowEarlier(ds.key || ""),
+        agentLogToggleRaw: (e, ds) => agentLogToggleRaw(ds.key || "", Number(ds.idx)),
         stepFeedbackReply: (e, ds) => stepFeedbackReply(ds.key || "", Number(ds.to)),
         regenerateSummary: (e, ds) => regenerateSummary(ds.guardianId || ""),
         // The live-view widget draws these as pill toggles whose on/off

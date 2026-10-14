@@ -123,6 +123,12 @@ jobs:
         # (`default-filter`); it runs on a schedule instead, in
         # `race-soak-nightly.yml`.
         run: cargo "+${{ matrix.toolchain }}" nextest run --workspace --all-targets --no-fail-fast
+      # RAL-644: the optional tree-sitter shell-syntax feature (see
+      # docs/shell-syntax.md). The default run above covers the feature-off
+      # build; this leg builds the C grammars and runs the parser tests.
+      - name: Test (shell-syntax feature)
+        if: matrix.suite == 'full' && !contains(github.event.pull_request.labels.*.name, 'ralphus:defer-full-ci')
+        run: cargo "+${{ matrix.toolchain }}" nextest run -p ralphus-shell-syntax --features parser
       - name: Doctests
         if: ${{ !cancelled() && matrix.suite == 'full' && !contains(github.event.pull_request.labels.*.name, 'ralphus:defer-full-ci') }}
         run: cargo "+${{ matrix.toolchain }}" test --doc --workspace
