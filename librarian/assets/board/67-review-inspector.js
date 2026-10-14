@@ -776,6 +776,10 @@
       function renderReviewInspector() {
         const host = document.getElementById("review-inspector");
         if (!host) return;
+        // A repaint would destroy the user's drag-selection; defer it until the selection clears.
+        if (selectionWithin(host)) { inspectorRenderDeferred = true; return; }
+        inspectorRenderDeferred = false;
+        snapshotAgentLogScroll();
         const snap = snapshotInspectorUiState();
         const g = guardians.find((x) => x.id === selectedGuardian);
         if (!g || !g.branches) {
@@ -827,7 +831,13 @@
         // The rewrite above recreated any live `.runterm` at scrollTop 0.
         restorePeekScrollPositions();
         restorePromptBoxScroll();
+        restoreAgentLogScroll();
       }
+      /** @type {boolean} Whether a repaint was skipped because the user was selecting text. */
+      let inspectorRenderDeferred = false;
+      document.addEventListener("selectionchange", () => {
+        if (inspectorRenderDeferred) renderReviewInspector();
+      });
       /**
        * @typedef {object} InspectorUiSnapshot
        * @property {number} scrollTop - The body's scroll offset.
