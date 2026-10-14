@@ -81,8 +81,11 @@
       }
       /**
        * The one-line text shown on a collapsed row. A shell command's leading
-       * `cd <dir> &&` / `cd <dir>;` prefixes are skipped so the command that
-       * matters shows; a call that is only `cd` keeps showing it.
+       * `cd <dir> &&` / `cd <dir>;` prefixes (and PowerShell's `Set-Location`
+       * / `sl`, with an optional `-Path` / `-LiteralPath`, case-insensitive)
+       * are skipped so the command that matters shows; a call that is only a
+       * directory change keeps showing it. The `sl` alias is only stripped
+       * when a path and a separator follow it.
        * @param {AgentLogEntry} e
        * @returns {string}
        */
@@ -91,7 +94,8 @@
         if (AGENT_LOG_SHELL_TOOLS.includes(e.tool)) {
           const cmd = e.args.find((a) => a.key === "command" || a.key === "cmd");
           if (cmd !== undefined) text = cmd.value;
-          const cd = /^\s*cd\s+(?:"[^"]*"|'[^']*'|[^\s&;|]+)\s*(?:&&|;|\n)\s*/;
+          const cd =
+            /^\s*(?:cd|set-location|sl)\s+(?:-(?:literalpath|path)\s+)?(?:"[^"]*"|'[^']*'|[^\s&;|]+)\s*(?:&&|;|\n)\s*/i;
           let rest = text;
           while (cd.test(rest)) rest = rest.replace(cd, "");
           if (rest.trim() !== "") text = rest;
