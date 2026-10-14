@@ -1160,6 +1160,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         git(&dir, &["init", "-q", "-b", "main"]);
+        // Repo-local identity: the daemon commits leftover edits with plain git,
+        // and a CI runner has no global one.
+        git(&dir, &["config", "user.name", "t"]);
+        git(&dir, &["config", "user.email", "t@example.com"]);
         std::fs::write(dir.join("app.txt"), "v1\n").unwrap();
         git(&dir, &["add", "."]);
         git(&dir, &["commit", "-q", "-m", "init"]);

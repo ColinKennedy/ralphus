@@ -19483,6 +19483,7 @@ fn hold_check_run_cwd(
     ) {
         Ok(hold) => Some(hold),
         Err(e) => {
+            // ralphus[ignore-rlog-pair]: store-less best-effort diagnostic; the check run it guards records its own Cartographer start/finish rows
             crate::rlog!(
                 WARNING,
                 "ralphus [guardian] review {guardian_id} could not record that {kind} check {index} is using {cwd}: {e}"

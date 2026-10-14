@@ -1365,6 +1365,13 @@ fn retire_orphan_live_refs(store: &crate::store_lock::StoreHandle) {
                 INFO,
                 "ralphus [guardian] deleted orphan live ref {name} in {root} (its review no longer exists)"
             );
+            crate::cartographer::Note::new("guardian")
+                .scope("live_action")
+                .emit(
+                    &store.lock(),
+                    "orphan live ref retired",
+                    serde_json::json!({"live_ref": name, "repository": root, "review": owner}),
+                );
         }
     }
 }
@@ -1525,6 +1532,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         git(&dir, &["init", "-q", "-b", "main"]);
+        git(&dir, &["config", "user.name", "t"]);
+        git(&dir, &["config", "user.email", "t@example.com"]);
         std::fs::write(dir.join("app.txt"), "v1\n").unwrap();
         git(&dir, &["add", "."]);
         git(&dir, &["commit", "-q", "-m", "init"]);
