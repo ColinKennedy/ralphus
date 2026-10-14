@@ -674,7 +674,7 @@
             "var(--delayed)",
           ));
         } else {
-          rows.push(row("not rate-limited", "The daemon is free to poll the forge for this branch.", "var(--muted)"));
+          rows.push(row("You are currently not being rate-limited", "The daemon is free to poll the forge for this branch.", "var(--muted)"));
         }
         const c = st.checks;
         const next = c.next_attempt_at_ms;

@@ -74,7 +74,7 @@ test("shows remaining calls, the limit and the reset", () => {
   assert.match(out, /github · acme\/widget/);
   assert.match(out, /4000 of 5000 calls left/);
   assert.match(out, /resets in 600s/);
-  assert.match(out, /not rate-limited/);
+  assert.match(out, /You are currently not being rate-limited/);
   assert.match(out, /next CI check in 30s/);
 });
 
@@ -104,7 +104,7 @@ test("an active backoff shows the pause, its resume, and the pushed-back next ch
   assert.match(out, /paused: quota exhausted · resumes in 900s/);
   assert.match(out, /next CI check in 900s/);
   assert.match(out, /pushed back to the end of the pause above/);
-  assert.doesNotMatch(out, /not rate-limited/);
+  assert.doesNotMatch(out, /You are currently not being rate-limited/);
 });
 
 test("an overdue next check reads 'due now' and an unscheduled one explains why", () => {
