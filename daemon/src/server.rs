@@ -13239,7 +13239,7 @@ fn guardian_live_actions_view(daemon: &Daemon, id: &str) -> Reply {
         auto_ran_at_ms: Option<i64>,
         checkout: Option<String>,
         preparation_failure: Option<String>,
-        /// The tmux cell of the agent that generated the live actions, when
+        /// The session cell of the agent that generated the live actions, when
         /// one ran; its session is served under `.../live-actions/generation/`.
         generation_cell: Option<String>,
         actions: Vec<crate::live_actions::LiveAction>,
@@ -13322,7 +13322,7 @@ fn guardian_cancel_live_run(daemon: &Daemon, id: &str, run_id: &str) -> Reply {
     }
 }
 
-/// The tmux cell a live run's agent ran under, when the run belongs to the
+/// The session cell a live run's agent ran under, when the run belongs to the
 /// review and has started.
 fn live_run_cell(daemon: &Daemon, id: &str, run_id: &str) -> std::result::Result<String, Reply> {
     match daemon.with_read_snapshot(|conn| crate::live_runs::live_run_conn(conn, run_id)) {
@@ -13336,7 +13336,7 @@ fn live_run_cell(daemon: &Daemon, id: &str, run_id: &str) -> std::result::Result
     }
 }
 
-/// The live-actions generation agent's tmux cell, when one ran.
+/// The live-actions generation agent's session cell, when one ran.
 fn live_generation_cell(daemon: &Daemon, id: &str) -> std::result::Result<String, Reply> {
     match daemon
         .with_read_snapshot(|conn| crate::live_runs::live_actions_generation_cell_conn(conn, id))

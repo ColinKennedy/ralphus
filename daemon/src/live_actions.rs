@@ -8,7 +8,8 @@
 //! ("live action", "live run", "live ref").
 //!
 //! This module owns one live run's execution: holding the checkout, running
-//! the agent in tmux (so the board's Live View can follow it), recording its
+//! the agent through the review's runner (a plain child process whose durable
+//! transcript the board's Live View follows), recording its
 //! cost, committing anything it left uncommitted, and pinning its commits on a
 //! live ref so they survive the checkout being reset later.
 
@@ -20,7 +21,7 @@ use crate::guardian::GuardianView;
 use crate::runner::{Runner, RunnerSpec};
 use crate::workspace::Workspace;
 
-/// The task name every live run's tmux session and transcript live under,
+/// The task name every live run's agent session and transcript live under,
 /// inside the review's `guardian-{id}` squad namespace.
 pub const LIVE_ACTION_TASK: &str = "live-action";
 
@@ -725,13 +726,13 @@ pub fn live_ref_name(guardian_id: &str, run_id: &str) -> String {
     )
 }
 
-/// The tmux cell id one live run executes under.
+/// The cell id one live run's agent session (and its transcript) is keyed by.
 #[must_use]
 pub fn live_run_cell_id(action_index: usize, run_id: &str) -> String {
     format!("live-{action_index}-{}", ref_safe(run_id))
 }
 
-/// The tmux squad namespace for a review's agent runs.
+/// The squad namespace a review's agent sessions are keyed under.
 #[must_use]
 pub fn live_run_squad_id(guardian_id: &str) -> String {
     format!("guardian-{guardian_id}")
@@ -802,7 +803,7 @@ pub struct LiveRunOutcome {
     pub commits: Vec<String>,
     /// The live ref the commits are pinned on, when there are any.
     pub live_ref: Option<String>,
-    /// The tmux cell id the agent ran under.
+    /// The cell id the agent's session and transcript are keyed by.
     pub cell_id: String,
 }
 
@@ -1197,7 +1198,7 @@ mod tests {
     }
 
     #[test]
-    fn a_live_run_runs_the_prompt_in_tmux_shape_and_records_its_report() {
+    fn a_live_run_runs_the_prompt_as_a_review_agent_and_records_its_report() {
         let (store, g, dir) = setup("report");
         let agent = ScriptedAgent {
             act: Box::new(|_| {}),

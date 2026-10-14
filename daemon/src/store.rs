@@ -4228,7 +4228,7 @@ impl Store {
             // failure detail, if it failed.
             "ALTER TABLE guardians ADD COLUMN live_actions_checkout TEXT",
             "ALTER TABLE guardians ADD COLUMN live_actions_checkout_note TEXT",
-            // Live actions: the tmux cell of the agent that generated the
+            // Live actions: the session cell of the agent that generated the
             // review's live actions (its deduplication pass).
             "ALTER TABLE guardians ADD COLUMN live_actions_generation_cell TEXT",
             // Per-review overrides of the global `[followup]` config: whether

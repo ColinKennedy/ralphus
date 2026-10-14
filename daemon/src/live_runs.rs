@@ -84,7 +84,7 @@ pub struct LiveRunRow {
     pub report: Option<String>,
     pub error: Option<String>,
     pub cost_usd: Option<f64>,
-    /// The tmux cell id the agent ran under (Live View / transcript key).
+    /// The cell id the agent's session ran under (Live View / transcript key).
     pub cell_id: Option<String>,
     /// What happened to the run's commits: `none` (nothing to carry),
     /// `pending`, `integrated`, `failed` or `skipped` -- see
@@ -372,7 +372,7 @@ impl crate::store::Store {
         )?)
     }
 
-    /// Record the tmux cell of the agent generating a review's live actions
+    /// Record the session cell of the agent generating a review's live actions
     /// (the deduplication pass), so its session can be followed and read back.
     ///
     /// # Errors
@@ -434,7 +434,7 @@ impl crate::store::Store {
     }
 }
 
-/// The tmux cell of the agent that generated a review's live actions, if one
+/// The session cell of the agent that generated a review's live actions, if one
 /// ran (a single handoff needs no generation agent).
 ///
 /// # Errors

@@ -5409,9 +5409,10 @@ on for an already prepared review starts it at once.
 
 *Runs.* Each execution is a live run, queued and run one at a time per review
 in the review's prepared checkout, which is held for the run's duration (a newer
-preparation goes to a sibling directory). The agent runs in tmux under
-`guardian-{id}` / task `live-action` / cell `live-{index}-{run_id}`, so the
-board's Live View follows it. `GET /api/guardians/{id}/live-actions` returns:
+preparation goes to a sibling directory). The agent runs as a plain child
+process (the runner's tmux-free path), keyed `guardian-{id}` / task
+`live-action` / cell `live-{index}-{run_id}`; the board's Live View follows its
+durable transcript. `GET /api/guardians/{id}/live-actions` returns:
 
 ```json
 {

@@ -9,8 +9,9 @@
 //! A hold is a small JSON file under `<state dir>/checkout-holds/`, written
 //! when a run starts and deleted when the [`CheckoutHold`] guard drops. It is
 //! a file rather than in-memory state on purpose: a check run is a detached
-//! terminal window and a live run is a tmux session, and both outlive a daemon
-//! restart. A daemon that restarts mid-run must still see the checkout as busy.
+//! terminal window, which outlives a daemon restart, so a daemon that restarts
+//! mid-run must still see the checkout as busy. (A live run's agent is a child
+//! of the daemon and dies with it; its hold simply expires.)
 //! Every hold carries an expiry, so a hold whose owner died without releasing
 //! it (a crashed daemon) stops blocking once its run could no longer be alive.
 

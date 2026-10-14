@@ -397,7 +397,7 @@
        * @property {number|null} auto_ran_at_ms - When the one automatic run started; null until then.
        * @property {string|null} checkout
        * @property {string|null} preparation_failure
-       * @property {string|null} [generation_cell] - The tmux cell of the agent that generated the live actions (their deduplication pass); null when none ran.
+       * @property {string|null} [generation_cell] - The session cell of the agent that generated the live actions (their deduplication pass); null when none ran.
        * @property {LiveAction[]} actions
        * @property {LiveRunRow[]} runs
        */
