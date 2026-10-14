@@ -21013,18 +21013,11 @@ mod tests {
         g(&repo, &["add", "."]);
         g(&repo, &["commit", "--message", "base"]);
 
-        let wt1 = repo
-            .join(".git")
-            .join(".ralphus")
-            .join("g")
-            .join("g1")
-            .join("wt-RAL-121");
-        let wt2 = repo
-            .join(".git")
-            .join(".ralphus")
-            .join("g")
-            .join("g2")
-            .join("wt-RAL-121");
+        // Create worktrees outside .git to avoid Windows path-nesting issues
+        // with nested .git directories. The test is checking that admin_entry_name
+        // can resolve colliding basenames regardless of worktree location.
+        let wt1 = base.join("g1").join("wt-RAL-121");
+        let wt2 = base.join("g2").join("wt-RAL-121");
         std::fs::create_dir_all(wt1.parent().unwrap()).unwrap();
         std::fs::create_dir_all(wt2.parent().unwrap()).unwrap();
         g(
