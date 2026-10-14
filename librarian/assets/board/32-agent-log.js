@@ -27,6 +27,8 @@
        */
       /** Tools whose `command` argument is a shell command line. */
       const AGENT_LOG_SHELL_TOOLS = ["Bash", "bash", "PowerShell", "powershell", "exec"];
+      /** Argument names tried in order for a non-shell call's collapsed row; the first argument is the last resort. */
+      const AGENT_LOG_PREVIEW_KEYS = ["file_path", "path", "pattern", "command", "url", "query"];
       /** How many of the newest entries are drawn before "show earlier" is pressed. */
       const AGENT_LOG_PAGE = 150;
       /** Marker of a structured tool record; matches runner/src/tool_record.rs::TOOL_MARKER. */
@@ -100,7 +102,22 @@
           while (cd.test(rest)) rest = rest.replace(cd, "");
           if (rest.trim() !== "") text = rest;
         }
+        else if (e.args.length > 0) {
+          const picked = AGENT_LOG_PREVIEW_KEYS.map((k) => e.args.find((a) => a.key === k)).find((a) => a !== undefined && a.value.trim() !== "");
+          text = (picked !== undefined ? picked : e.args[0]).value;
+        }
         return text.trimStart().split("\n")[0].slice(0, 120);
+      }
+      /**
+       * Masks the values of an entry's named arguments. A credential-named
+       * argument is masked whole; every other value goes through `redact`.
+       * @param {AgentLogEntry} e
+       * @param {(s: string) => string} redact
+       * @returns {void}
+       */
+      function agentLogRedactArgs(e, redact) {
+        const secretKey = /token|secret|passw(?:or)?d|api[_-]?key|credential|authorization/i;
+        for (const a of e.args) a.value = secretKey.test(a.key) ? "[REDACTED]" : redact(a.value);
       }
       /**
        * Pretty-prints a JSON object/array input; anything else is returned as is.
@@ -156,7 +173,10 @@
             cur.sub = typeof rec.sub === "string" ? rec.sub : "";
             cur.tag = typeof rec.tag === "string" ? rec.tag : `tool.${rec.tool}`;
           }
-          if (typeof rec.input === "string") cur.input = agentLogPrettyInput(rec.input);
+          if (typeof rec.input === "string") {
+            cur.args = splitAgentLogArgs(rec.input);
+            cur.input = agentLogPrettyInput(rec.input);
+          }
           if (typeof rec.output === "string") {
             cur.output = rec.output;
             cur.status = rec.is_error ? "error" : "ok";
@@ -410,6 +430,7 @@
         for (const e of entries) {
           e.input = redactAgentLog(e.input);
           e.output = redactAgentLog(e.output);
+          agentLogRedactArgs(e, redactAgentLog);
         }
         agentLogParsed[key] = { src, entries };
         return entries;

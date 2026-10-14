@@ -64,7 +64,43 @@ test("preview skips leading cd but expanded input keeps it", () => {
   const only = parseAgentLog('[tool.Bash] Bash(command="cd /x")')[0];
   assert.equal(agentLogPreview(only), "cd /x");
   const other = parseAgentLog("[tool.Read] Read(path=a)")[0];
-  assert.equal(agentLogPreview(other), "path=a");
+  assert.equal(agentLogPreview(other), "a");
+});
+
+const { agentLogRedactArgs } = new Function(
+  `${src.slice(a, b)}\nreturn { agentLogRedactArgs };`,
+)();
+
+test("record entries get sorted args and meaningful previews, never `{`", () => {
+  const e = parse(
+    rec({ id: "r", tool: "Read", input: '{"offset":5,"file_path":"/a/b.rs"}' }),
+    rec({ id: "e", tool: "Edit", input: '{"new_string":"y","old_string":"x"}' }),
+    rec({ id: "b", tool: "Bash", input: '{"command":"cd /x && ls -la","description":"d"}' }),
+    rec({ id: "g", tool: "Grep", input: '{"glob":"*.rs","pattern":"foo"}' }),
+  );
+  assert.deepEqual(e[0].args.map((x) => [x.key, x.value]), [["file_path", "/a/b.rs"], ["offset", "5"]]);
+  assert.equal(agentLogPreview(e[0]), "/a/b.rs");
+  assert.equal(agentLogPreview(e[1]), "y");
+  assert.equal(agentLogPreview(e[2]), "ls -la");
+  assert.equal(agentLogPreview(e[3]), "foo");
+  assert.ok(e.every((x) => x.args.length > 0 && agentLogPreview(x) !== "{"));
+});
+
+test("a pending call already has args", () => {
+  const e = parse(rec({ id: "p", tool: "Read", input: '{"path":"x"}' }));
+  assert.equal(e[0].status, "pending");
+  assert.equal(e[0].args[0].value, "x");
+});
+
+test("argument values are redacted per value on record and text paths", () => {
+  const redact = (s) => s.replace(/sk-[a-z0-9]+/g, "[REDACTED]");
+  const e = [
+    ...parse(rec({ id: "r", tool: "Bash", input: '{"command":"curl -H sk-abc123","api_key":"hunter2"}' })),
+    ...parseAgentLog('[tool.Bash] Bash(command="echo sk-abc123", password=hunter2)'),
+  ];
+  for (const x of e) agentLogRedactArgs(x, redact);
+  assert.deepEqual(e[0].args.map((x) => x.value), ["[REDACTED]", "curl -H [REDACTED]"]);
+  assert.deepEqual(e[1].args.map((x) => x.value), ["echo [REDACTED]", "[REDACTED]"]);
 });
 
 test("preview skips PowerShell Set-Location / sl prefixes", () => {
