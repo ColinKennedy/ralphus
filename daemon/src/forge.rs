@@ -407,6 +407,43 @@ pub struct PrCiProbe {
     pub draft: bool,
 }
 
+/// Reduce a commit's check-runs to the newest run of each check.
+///
+/// One commit can carry several runs of the same check: a re-run, or two
+/// workflow runs triggered by the same push (`push` and `pull_request`) where
+/// concurrency cancels the older one. The older run's `cancelled` conclusion
+/// stays on the commit beside the newer run's real verdict, so judging every
+/// listed run reports a failure the newer run already superseded. A check is
+/// identified by its app and name; the highest check-run id is the newest. A
+/// run with no id cannot be ordered, so it is always kept.
+fn latest_check_runs(runs: Vec<serde_json::Value>) -> Vec<serde_json::Value> {
+    let key = |run: &serde_json::Value| {
+        (
+            run["app"]["id"].as_i64(),
+            run["name"].as_str().unwrap_or("check").to_string(),
+        )
+    };
+    let mut newest: std::collections::HashMap<(Option<i64>, String), (i64, usize)> =
+        std::collections::HashMap::new();
+    for (index, run) in runs.iter().enumerate() {
+        let Some(id) = run["id"].as_i64() else {
+            continue;
+        };
+        let slot = newest.entry(key(run)).or_insert((id, index));
+        if id > slot.0 {
+            *slot = (id, index);
+        }
+    }
+    runs.iter()
+        .enumerate()
+        .filter(|(index, run)| {
+            run["id"].as_i64().is_none()
+                || newest.get(&key(run)).map(|(_, kept)| kept) == Some(index)
+        })
+        .map(|(_, run)| run.clone())
+        .collect()
+}
+
 fn pr_object_draft(obj: &serde_json::Value) -> bool {
     obj["draft"]
         .as_bool()
@@ -1613,7 +1650,7 @@ impl ForgeClient {
                 break;
             }
         }
-        Ok(runs)
+        Ok(latest_check_runs(runs))
     }
 
     /// Every failed job of a GitLab pipeline, across all pages (GitLab's
@@ -7957,6 +7994,76 @@ mod tests {
     }
 
     #[test]
+    fn check_pr_ci_status_ignores_a_cancelled_run_superseded_by_a_newer_one() {
+        let mock = MockForge::start(move |server| {
+            let req = server.recv();
+            req.respond(
+                tiny_http::Response::from_string(
+                    r#"{"mergeable_state": "clean", "head": {"sha": "deadbeef"}}"#,
+                )
+                .with_status_code(200),
+            )
+            .unwrap();
+            let req = server.recv();
+            // The older run (id 1) was cancelled by concurrency; the newer
+            // run (id 2) of the same check passed. Listed newest-last and
+            // newest-first across the two checks to cover both orders.
+            req.respond(
+                tiny_http::Response::from_string(
+                    r#"{"check_runs": [
+                        {"id": 1, "name": "build", "app": {"id": 15368}, "status": "completed", "conclusion": "cancelled"},
+                        {"id": 2, "name": "build", "app": {"id": 15368}, "status": "completed", "conclusion": "success"},
+                        {"id": 4, "name": "lint", "app": {"id": 15368}, "status": "completed", "conclusion": "success"},
+                        {"id": 3, "name": "lint", "app": {"id": 15368}, "status": "completed", "conclusion": "cancelled"}
+                    ]}"#,
+                )
+                .with_status_code(200),
+            )
+            .unwrap();
+            let req = server.recv();
+            assert_eq!(req.url(), "/repos/acme/widget/commits/deadbeef/status");
+            req.respond(
+                tiny_http::Response::from_string(r#"{"state": "success"}"#).with_status_code(200),
+            )
+            .unwrap();
+        });
+        let client = mock.client(ForgeKind::GitHub, "acme/widget");
+        assert_eq!(client.check_pr_ci_status(4).unwrap(), PrCiState::Passing);
+        mock.finish();
+    }
+
+    #[test]
+    fn check_pr_ci_status_still_fails_when_the_newest_run_of_a_check_failed() {
+        let mock = MockForge::start(move |server| {
+            let req = server.recv();
+            req.respond(
+                tiny_http::Response::from_string(
+                    r#"{"mergeable_state": "clean", "head": {"sha": "deadbeef"}}"#,
+                )
+                .with_status_code(200),
+            )
+            .unwrap();
+            let req = server.recv();
+            req.respond(
+                tiny_http::Response::from_string(
+                    r#"{"check_runs": [
+                        {"id": 1, "name": "build", "app": {"id": 15368}, "status": "completed", "conclusion": "success"},
+                        {"id": 2, "name": "build", "app": {"id": 15368}, "status": "completed", "conclusion": "failure"}
+                    ]}"#,
+                )
+                .with_status_code(200),
+            )
+            .unwrap();
+        });
+        let client = mock.client(ForgeKind::GitHub, "acme/widget");
+        assert!(matches!(
+            client.check_pr_ci_status(4).unwrap(),
+            PrCiState::Failing(_)
+        ));
+        mock.finish();
+    }
+
+    #[test]
     fn github_quota_reset_wait_needs_zero_remaining_and_a_parsable_reset() {
         assert_eq!(
             github_quota_reset_wait("0", "1100", 1000),
@@ -8673,6 +8780,27 @@ mod tests {
             matches!(&state, PrCiState::Failing(f) if f.generation.as_deref() == Some("55")),
             "{state:?}"
         );
+        mock.finish();
+    }
+
+    #[test]
+    fn check_pr_ci_status_ignores_a_canceled_gitlab_pipeline_superseded_by_a_newer_one() {
+        // Parity with the GitHub check-run de-duplication: auto-cancelling a
+        // redundant pipeline leaves it `canceled` on the MR, but the verdict
+        // comes from `head_pipeline`, the newest one, which passed.
+        let mock = MockForge::start(move |server| {
+            let req = server.recv();
+            assert_eq!(req.url(), "/projects/group%2Fproj/merge_requests/9");
+            req.respond(
+                tiny_http::Response::from_string(
+                    r#"{"merge_status": "can_be_merged", "sha": "head-sha", "pipeline": {"id": 54, "ref": "feature", "sha": "head-sha", "status": "canceled", "web_url": "https://gitlab.example/pipelines/54"}, "head_pipeline": {"id": 55, "ref": "feature", "sha": "head-sha", "status": "success", "web_url": "https://gitlab.example/pipelines/55"}}"#,
+                )
+                .with_status_code(200),
+            )
+            .unwrap();
+        });
+        let client = mock.client(ForgeKind::GitLab, "group%2Fproj");
+        assert_eq!(client.check_pr_ci_status(9).unwrap(), PrCiState::Passing);
         mock.finish();
     }
 
