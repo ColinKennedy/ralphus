@@ -2190,6 +2190,28 @@ fn apply_arbiter_pool_order(
     ordered
 }
 
+/// Group `ordered` by ascending follow-up depth (`depths` is keyed by the
+/// stable candidate id; a missing id counts as depth 0). The sort is stable,
+/// so each depth group keeps the relative order it already had, and the
+/// result is a permutation of the input.
+#[must_use]
+fn stratify_pool_by_depth(
+    mut ordered: Vec<crate::triage::TriagePoolCellRow>,
+    depths: &std::collections::HashMap<String, i64>,
+) -> Vec<crate::triage::TriagePoolCellRow> {
+    ordered.sort_by_key(|c| {
+        depths
+            .get(&crate::arbiter::ordering_candidate_id(
+                &c.squad_id,
+                c.task_idx,
+                c.idx,
+            ))
+            .copied()
+            .unwrap_or(0)
+    });
+    ordered
+}
+
 /// RAL-346: the Arbiter's cron straggler sweep. Unlike
 /// [`create_review_from_triage_pool`] (which fires exactly one pool key --
 /// the coherent, threshold-driven unit of work), this drains *every* pool
@@ -2260,7 +2282,7 @@ fn build_review_from_drained_pool(
     // Defense in depth: `drain_triage_pool` already selects only completed
     // cells. Keep that invariant here in case a future caller supplies rows
     // without going through the drain filter.
-    let (drained, candidates) = {
+    let (drained, candidates, depths) = {
         let store = store.lock();
         let mut viable = Vec::with_capacity(drained.len());
         for cell in drained {
@@ -2303,7 +2325,32 @@ fn build_review_from_drained_pool(
                 }
             })
             .collect();
-        (drained, candidates)
+        // Follow-up depth per candidate, looked up through its squad. A
+        // lookup failure counts as depth 0 (submitted work) with a warning.
+        let mut squad_depths: std::collections::HashMap<&str, i64> =
+            std::collections::HashMap::new();
+        let mut depths = std::collections::HashMap::with_capacity(drained.len());
+        for cell in &drained {
+            let depth = *squad_depths
+                .entry(cell.squad_id.as_str())
+                .or_insert_with(|| {
+                    store
+                        .followup_depth_of_squad(&cell.squad_id)
+                        .unwrap_or_else(|e| {
+                            crate::rlog!(
+                                WARNING,
+                                "ralphus [triage] follow-up depth lookup failed for squad {}: {e}; treating as depth 0",
+                                cell.squad_id
+                            );
+                            0
+                        })
+                });
+            depths.insert(
+                crate::arbiter::ordering_candidate_id(&cell.squad_id, cell.task_idx, cell.idx),
+                depth,
+            );
+        }
+        (drained, candidates, depths)
     };
     // The orderer runs its Arbiter round-trip with NO store guard held
     // (`order_pooled_candidates` re-locks briefly around it as needed) --
@@ -2313,6 +2360,8 @@ fn build_review_from_drained_pool(
         Some(proposed) => apply_arbiter_pool_order(drained, &proposed),
         None => drained,
     };
+    // Follow-up work sorts after submitted work, whatever the Arbiter said.
+    let drained = stratify_pool_by_depth(drained, &depths);
     let upstream = drained
         .first()
         .map(|c| c.upstream.clone())
@@ -2819,9 +2868,10 @@ mod tests {
     use super::{
         Membership, any_workspace_ahead_of_upstream, apply_arbiter_pool_order,
         apply_project_review_defaults, apply_resolver, create_review_from_triage_pool,
-        derive_reviews_with_prefetch, derive_triage_pools, fire_ready_triage_thresholds, plan,
-        rebase_onto, repair_arbiter_review_project_roots, repair_review_project_identities,
-        repair_triage_pool_keys, review_branch_order, set_worktree_commit_baseline,
+        create_review_from_triage_project_sweep, derive_reviews_with_prefetch, derive_triage_pools,
+        fire_ready_triage_thresholds, plan, rebase_onto, repair_arbiter_review_project_roots,
+        repair_review_project_identities, repair_triage_pool_keys, review_branch_order,
+        set_worktree_commit_baseline, stratify_pool_by_depth,
         workspace_has_commits_ahead_of_upstream,
     };
     use crate::store::{Store, TaskRow};
@@ -4019,6 +4069,140 @@ print(json.dumps(result))
                 .collect::<Vec<_>>(),
             vec!["b1".to_string(), "b2".to_string()],
             "an invalid proposal must not drop, duplicate, or reorder a candidate"
+        );
+    }
+
+    /// Pool `n` completed cells (branches `b1..bn`) and mark the squads in
+    /// `followup_depths` (1-based cell number, offer depth) as created by an
+    /// accepted follow-up offer of that generation.
+    fn pool_with_followups(
+        store: &crate::store_lock::StoreHandle,
+        n: usize,
+        followup_depths: &[(usize, i64)],
+    ) {
+        for i in 1..=n {
+            let squad = completed_pool_cell(&mut store.lock());
+            let guard = store.lock();
+            guard
+                .record_triage_pool_cell("proj", "security", &squad, 0, 0, &format!("b{i}"), "main")
+                .unwrap();
+            if let Some((_, depth)) = followup_depths.iter().find(|(c, _)| *c == i) {
+                guard
+                    .conn
+                    .execute(
+                        "INSERT INTO followup_offers(guardian_id, status, items, depth, squad_id, created_at_ms)
+                         VALUES (?1,'accepted','[]',?2,?3,0)",
+                        rusqlite::params![format!("g{i}"), depth, squad],
+                    )
+                    .unwrap();
+            }
+        }
+    }
+
+    fn branch_order(store: &crate::store_lock::StoreHandle, gid: &str) -> Vec<String> {
+        store
+            .lock()
+            .get_guardian(gid)
+            .unwrap()
+            .branches
+            .iter()
+            .map(|b| b.branch.clone())
+            .collect()
+    }
+
+    fn strs(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    /// RAL-652: follow-up cells sort after submitted cells whatever the
+    /// Arbiter proposed, keeping the Arbiter's order inside each depth.
+    #[test]
+    fn create_review_from_triage_pool_stratifies_followups_after_the_arbiter_order() {
+        let store = std::sync::Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
+        // b2 is a follow-up (depth 1), b4 a follow-up of a follow-up (2).
+        pool_with_followups(&store, 5, &[(2, 0), (4, 1)]);
+        let gid = create_review_from_triage_pool(&store, "proj", "security", |cands| {
+            // Arbiter reverses the pool: b5 b4 b3 b2 b1.
+            Some(cands.iter().map(|c| c.id.clone()).rev().collect())
+        })
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            branch_order(&store, &gid),
+            strs(&["b5", "b3", "b1", "b2", "b4"])
+        );
+    }
+
+    /// RAL-652: with no Arbiter order the pool order is kept inside each
+    /// depth group.
+    #[test]
+    fn create_review_from_triage_pool_stratifies_followups_in_pool_order_without_an_arbiter() {
+        let store = std::sync::Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
+        pool_with_followups(&store, 4, &[(1, 0), (3, 1)]);
+        let gid = create_review_from_triage_pool(&store, "proj", "security", |_| None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(branch_order(&store, &gid), strs(&["b2", "b4", "b1", "b3"]));
+    }
+
+    /// RAL-652: a single-depth pool is ordered exactly as before.
+    #[test]
+    fn create_review_from_triage_pool_single_depth_keeps_the_arbiter_order() {
+        let store = std::sync::Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
+        pool_with_followups(&store, 3, &[]);
+        let gid = create_review_from_triage_pool(&store, "proj", "security", |cands| {
+            Some(cands.iter().map(|c| c.id.clone()).rev().collect())
+        })
+        .unwrap()
+        .unwrap();
+        assert_eq!(branch_order(&store, &gid), strs(&["b3", "b2", "b1"]));
+    }
+
+    /// RAL-652: the cron straggler sweep stratifies too.
+    #[test]
+    fn create_review_from_triage_project_sweep_stratifies_followups() {
+        let store = std::sync::Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
+        pool_with_followups(&store, 3, &[(1, 4)]);
+        let gid = create_review_from_triage_project_sweep(&store, "proj", "security", |cands| {
+            Some(cands.iter().map(|c| c.id.clone()).collect())
+        })
+        .unwrap()
+        .unwrap();
+        assert_eq!(branch_order(&store, &gid), strs(&["b2", "b3", "b1"]));
+    }
+
+    /// RAL-652: stratification never drops or duplicates a row and does not
+    /// cap the depth.
+    #[test]
+    fn stratify_pool_by_depth_is_a_stable_uncapped_permutation() {
+        use crate::triage::TriagePoolCellRow;
+        let rows: Vec<TriagePoolCellRow> = (1..=5)
+            .map(|i| TriagePoolCellRow {
+                squad_id: format!("squad-{i}"),
+                task_idx: 0,
+                idx: 0,
+                branch: format!("b{i}"),
+                upstream: "main".to_string(),
+            })
+            .collect();
+        let depths = std::collections::HashMap::from([
+            ("squad-1/t0:c0".to_string(), 99),
+            ("squad-2/t0:c0".to_string(), 1),
+            ("squad-3/t0:c0".to_string(), 99),
+            ("squad-4/t0:c0".to_string(), 0),
+        ]); // squad-5 absent => depth 0
+        let out = stratify_pool_by_depth(rows, &depths);
+        assert_eq!(
+            out.iter().map(|c| c.branch.clone()).collect::<Vec<_>>(),
+            strs(&["b4", "b5", "b2", "b1", "b3"])
         );
     }
 
