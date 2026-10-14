@@ -48,6 +48,12 @@ code or running the unit tests: the point is to catch what only shows up when \
 the thing runs (runtime errors, wiring and setup problems, behaviour that does \
 not match the intent).\n\
 \n\
+Run the program the way the steps say, not a stand-in for it: a GUI is launched \
+as a real, visible window on this machine (never an offscreen, headless or \
+mocked substitute unless the steps ask for one), then checked -- that its window \
+appears and shows what the steps expect, e.g. by inspecting the running window's \
+widgets or taking a screenshot of it -- and then closed.\n\
+\n\
 If the prompt says the action is read-only, change nothing. Otherwise, when you \
 find a real problem you can fix in this repository, fix it, then stage and \
 commit ONLY the files you changed with a normal, descriptive commit message that \
@@ -80,7 +86,9 @@ here. Follow the steps in the prompt for real -- start the program, drive it, \
 run the commands -- and observe what actually happens. Do not stop at reading \
 code or running the unit tests: the point is to catch what only shows up when \
 the thing runs (runtime errors, wiring and setup problems, behaviour that does \
-not match the intent).\n\
+not match the intent). Run the program the way the steps say: a GUI is launched \
+as a real, visible window (never an offscreen or headless substitute unless the \
+steps ask for one), checked, then closed.\n\
 \n\
 This run is read-only: do not edit, stage or commit anything, and never push. \
 Setup and runtime failures are real findings: report them. Before you finish, \
