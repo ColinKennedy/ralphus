@@ -8792,9 +8792,9 @@ fn refresh_open_prs<'a>(
     open_by_branch
         .into_iter()
         .filter(|(_, pr)| {
-            let Some(number) = pr.pr_number else {
+            if pr.pr_number.is_none() {
                 return true;
-            };
+            }
             // A GitLab MR IID is scoped to its project. In fork mode, the
             // parent-project root MR and fork-internal stack MRs can have
             // the same IID, so every row must be queried through the client
@@ -8804,7 +8804,7 @@ fn refresh_open_prs<'a>(
                     &pr.repo,
                     &[&routing.parent_client, &routing.fork_client],
                 ),
-                None => Some(client),
+                None => Some(client).filter(|c| c.repo_label() == pr.repo),
             };
             let Some(state_client) = state_client else {
                 let git_root = store
@@ -8830,7 +8830,9 @@ fn refresh_open_prs<'a>(
                     );
                 return true;
             };
-            match state_client.get_pull_request_state(number) {
+            // The number is only meaningful in the repository that allocated
+            // it; the guarded fetch rejects an answer for another branch's PR.
+            match fetch_pr_merge_state(pr, state_client).unwrap_or_else(|| Ok("open".to_string())) {
                 Ok(state) if state != "open" => {
                     // ralphus[ignore-rlog-pair]: this low-level helper has no Store; its Store-owning caller records the structured workflow outcome
                     crate::rlog!(
@@ -17056,6 +17058,52 @@ mod tests {
     }
 
     #[test]
+    fn refresh_open_prs_ignores_a_closed_mr_of_the_same_number_in_another_project() {
+        // The recorded `repo` is `acme/widget`, but the client is pointed at a
+        // different project whose MR #3 is closed and filed from another
+        // branch: that must neither close this row nor count as an answer.
+        let mock = MockForge::start(move |server| {
+            let req = server.recv();
+            req.respond(
+                tiny_http::Response::from_string(
+                    r#"{"state": "closed", "source_branch": "someone-elses-branch"}"#,
+                )
+                .with_status_code(200),
+            )
+            .unwrap();
+        });
+        let store = Arc::new(crate::store_lock::StoreMutex::new(store()));
+        let gid = store
+            .lock()
+            .create_guardian("demo", "main", "/repo")
+            .unwrap();
+        let pr_id = store
+            .lock()
+            .create_pull_request(
+                &gid,
+                Some("branch-000000000001"),
+                "gitlab",
+                "acme/widget",
+                "feature/foo",
+                "main",
+                "Add foo",
+                "Adds the foo thing.",
+                Some(3),
+                None,
+            )
+            .unwrap();
+        let client = mock.client(crate::forge::ForgeKind::GitLab, "acme/widget");
+        let prs = store.lock().list_pull_requests_for_guardian(&gid).unwrap();
+        let by_branch = open_prs_by_branch(&prs);
+
+        let refreshed = refresh_open_prs(&store, &gid, &client, None, by_branch);
+
+        assert_eq!(refreshed.len(), 1, "an unrelated MR must not close the row");
+        assert_eq!(store.lock().get_pull_request(&pr_id).unwrap().state, "open");
+        mock.finish();
+    }
+
+    #[test]
     fn refresh_open_prs_uses_the_parent_client_for_a_fork_mode_root_gitlab_mr() {
         let mock = MockForge::start(move |server| {
             let req = server.recv();
@@ -18044,6 +18092,18 @@ token_env = "RALPHUS_TEST_FORGE_TOKEN"
             store.lock().get_guardian(&gid).unwrap().status.as_str(),
             "in_review"
         );
+
+        // The submission-time state check must not take B's answer either.
+        let prs = store.lock().list_pull_requests_for_guardian(&gid).unwrap();
+        let refreshed = refresh_open_prs(
+            &store,
+            &gid,
+            &new_client(&b),
+            None,
+            open_prs_by_branch(&prs),
+        );
+        assert_eq!(refreshed.len(), 1, "refresh_open_prs took B's answer");
+        assert_eq!(state_of(), "open");
 
         // Asking the right project keeps it open.
         run(&new_client(&a));
