@@ -130,12 +130,17 @@ mod tests {
     }
 }
 
-#[cfg(all(test, not(feature = "shell-syntax")))]
+#[cfg(test)]
 mod tests_off {
     use super::*;
 
     #[test]
     fn skipped_without_the_feature() {
+        // Cargo feature unification can enable the parser through the
+        // dependency alone, without this crate's `shell-syntax` feature.
+        if ralphus_shell_syntax::available() {
+            return;
+        }
         assert_eq!(check_command("Get-ChildItem", None), None);
         assert_eq!(check_command("if then ((", Some("bash")), None);
     }
