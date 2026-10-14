@@ -26,7 +26,7 @@
        * @property {string} value - The argument value, quotes removed.
        */
       /** Tools whose `command` argument is a shell command line. */
-      const AGENT_LOG_SHELL_TOOLS = ["Bash", "bash", "powershell", "exec"];
+      const AGENT_LOG_SHELL_TOOLS = ["Bash", "bash", "PowerShell", "powershell", "exec"];
       /** How many of the newest entries are drawn before "show earlier" is pressed. */
       const AGENT_LOG_PAGE = 150;
       /** Marker of a structured tool record; matches runner/src/tool_record.rs::TOOL_MARKER. */
@@ -231,6 +231,109 @@
       }
       // RALPHUS-AGENT-LOG:END
 
+      // Optional tree-sitter parse of a shell call (RAL-644). The daemon splits
+      // the command into rows and tags byte ranges; this region only draws that
+      // result. Display-only: the raw text is always one click away.
+      // RALPHUS-SHELL-SYNTAX:BEGIN
+      /**
+       * @typedef {object} ShellSyntaxCommand
+       * @property {string} text - The command's text.
+       * @property {number} start - Start byte (UTF-8) of the command in the input.
+       * @property {number} end - End byte (UTF-8, exclusive).
+       * @property {string} sep - Operator joining it to the previous command (`;`, `&&`, `||`, `&`), or "".
+       */
+      /**
+       * @typedef {object} ShellSyntaxSpan
+       * @property {string} kind - `string`, `flag`, `operator`, `command_name`, `variable`, `comment` or `heredoc`.
+       * @property {number} start - Start byte (UTF-8).
+       * @property {number} end - End byte (UTF-8, exclusive).
+       */
+      /**
+       * @typedef {object} ShellSyntaxParse
+       * @property {string} status - `ok`, `unparsed`, `unsupported`, `too_long`, `timeout` or `unavailable`.
+       * @property {ShellSyntaxCommand[]} commands - Top-level commands in order; empty unless `ok`.
+       * @property {ShellSyntaxSpan[]} spans - Non-overlapping highlighted ranges; empty unless `ok`.
+       */
+      /** @type {{[kind: string]: string}} Span kind to CSS class suffix. */
+      const SHELL_SYNTAX_CLASS = { string: "string", flag: "flag", operator: "op", command_name: "cmd", variable: "var", comment: "comment" };
+      /**
+       * Whether a tool name is a shell tool whose `command` can be parsed.
+       * @param {string} tool
+       * @returns {boolean}
+       */
+      function shellSyntaxTool(tool) {
+        return ["bash", "powershell", "exec"].includes(tool.toLowerCase());
+      }
+      /**
+       * The shell command line among a call's arguments.
+       * @param {{key: string, value: string}[]} args
+       * @returns {string|null} null when the call has no command argument.
+       */
+      function shellCommandText(args) {
+        const a = args.find((x) => x.key === "command" || x.key === "cmd");
+        return a === undefined ? null : a.value;
+      }
+      /**
+       * Whether a cached parse result can be drawn (a clean parse with rows).
+       * @param {ShellSyntaxParse} p
+       * @returns {boolean}
+       */
+      function shellSyntaxUsable(p) {
+        return p.status === "ok" && p.commands.length > 0;
+      }
+      /**
+       * How many rows follow the one a collapsed call shows. Leading
+       * `cd <dir>` rows are skipped, matching `agentLogPreview`.
+       * @param {ShellSyntaxParse} p
+       * @returns {number}
+       */
+      function shellSyntaxMoreCount(p) {
+        let i = 0;
+        while (i < p.commands.length - 1 && /^cd\s/.test(p.commands[i].text)) i++;
+        return Math.max(0, p.commands.length - 1 - i);
+      }
+      /**
+       * Draws a parsed command as one row per command, spans colored, each
+       * heredoc body a collapsed block under its row.
+       * @param {string} text - The exact command text that was parsed.
+       * @param {ShellSyntaxParse} p
+       * @param {(s: string) => string} escFn - HTML escaper.
+       * @returns {string}
+       */
+      function shellSyntaxRowsHtml(text, p, escFn) {
+        const bytes = new TextEncoder().encode(text);
+        const dec = new TextDecoder();
+        /**
+         * @param {number} a
+         * @param {number} b
+         * @returns {string}
+         */
+        const slice = (a, b) => dec.decode(bytes.subarray(a, b));
+        return p.commands.map((c) => {
+          let pos = c.start;
+          let html = "";
+          /** @type {string[]} */
+          const docs = [];
+          for (const sp of p.spans) {
+            if (sp.start < pos || sp.end > c.end) continue;
+            html += escFn(slice(pos, sp.start));
+            const body = slice(sp.start, sp.end);
+            if (sp.kind === "heredoc") {
+              docs.push(body);
+            } else {
+              const cls = SHELL_SYNTAX_CLASS[sp.kind];
+              html += cls ? `<span class="alog-sh-${cls}">${escFn(body)}</span>` : escFn(body);
+            }
+            pos = sp.end;
+          }
+          html += escFn(slice(pos, c.end));
+          const sep = c.sep === "" ? "" : `<span class="alog-sh-sep" data-tip="Joins this command to the previous one.">${escFn(c.sep)}</span>`;
+          const blocks = docs.map((d) => `<details class="alog-sh-heredoc"><summary data-tip="The heredoc / here-string body, kept collapsed and unhighlighted.">heredoc · ${d.split("\n").length} lines</summary><pre>${escFn(d)}</pre></details>`).join("");
+          return `<div class="alog-sh-row">${sep}${html}${blocks}</div>`;
+        }).join("");
+      }
+      // RALPHUS-SHELL-SYNTAX:END
+
       /** @type {{[key: string]: {tool: string, status: string, q: string}}} Per-run filter state; survives repaints. */
       const agentLogFilter = {};
       /** @type {{[key: string]: {[index: number]: boolean}}} Which entries the reader expanded, by call index. */
@@ -241,6 +344,12 @@
       const agentLogScroll = {};
       /** @type {{[key: string]: {src: string, entries: AgentLogEntry[]}}} Parse memo: the log is re-parsed only when its text changed. */
       const agentLogParsed = {};
+      /** @type {{[key: string]: {[index: number]: ShellSyntaxParse|"loading"|"failed"}}} Shell-syntax parse per expanded call; absent until first expanded. */
+      const agentLogShellSyntax = {};
+      /** @type {{[key: string]: {[index: number]: boolean}}} Calls whose raw text the reader chose over the parsed view. */
+      const agentLogShellRaw = {};
+      /** Set once the daemon says shell-syntax is not built, so the board stops asking for the session. */
+      let agentLogShellSyntaxOff = false;
 
       /**
        * Extra masking on top of the daemon's and `scrubSecrets`: bearer tokens,
@@ -312,19 +421,98 @@
         const color = e.status === "error" ? "var(--turn-error)" : typeColor(e.tag, document.documentElement.dataset.theme === "light" ? "light" : "dark");
         const statusTip = e.status === "pending" ? "No result has been logged for this call yet." : (e.status === "error" ? "The tool reported an error." : "The tool returned a result.");
         const preview = agentLogPreview(e);
+        const parse = agentLogShellParse(key, e);
+        const raw = !!(agentLogShellRaw[key] && agentLogShellRaw[key][e.index]);
+        const more = parse !== null ? shellSyntaxMoreCount(parse) : 0;
+        const moreHtml = more > 0
+          ? `<span class="alog-sh-more" data-tip="This call runs ${more} more command${more === 1 ? "" : "s"} after the one shown.\nExpand it to see every row.">+${more} more</span>`
+          : "";
+        const cmdText = shellCommandText(e.args);
         const inputHtml = e.args.length === 0
           ? `<pre class="alog-pre">${esc(e.input) || "(none)"}</pre>`
-          : e.args.map((a) => `<div class="alog-kv"><span class="alog-k" data-tip="The &quot;${esc(a.key)}&quot; argument of this call.">${esc(a.key)}</span><pre class="alog-pre">${esc(a.value)}</pre></div>`).join("");
-        return `<details class="alog-w ${e.status}" data-idx="${e.index}" data-sig="${e.status}|${e.input.length}|${e.output.length}" ${open ? "open" : ""}
+          : e.args.map((a) => {
+            const body = parse !== null && !raw && a.value === cmdText && (a.key === "command" || a.key === "cmd")
+              ? `<div class="alog-sh" data-tip="Syntax-highlighted view of the command. Display-only and optional: it never changes what ran, and the raw text is one click away.">${shellSyntaxRowsHtml(a.value, parse, esc)}</div>`
+              : `<pre class="alog-pre">${esc(a.value)}</pre>`;
+            return `<div class="alog-kv"><span class="alog-k" data-tip="The &quot;${esc(a.key)}&quot; argument of this call.">${esc(a.key)}</span>${body}</div>`;
+          }).join("");
+        const toggle = parse !== null
+          ? `<button class="btn alog-sh-raw" data-click="agentLogToggleRaw" data-key="${esc(key)}" data-idx="${e.index}"
+              data-tip="${raw ? "Show the highlighted, row-per-command view." : "Show the command exactly as logged."}\nThe highlighted view is display-only and optional.">${raw ? "parsed" : "raw"}</button>`
+          : "";
+        return `<details class="alog-w ${e.status}" data-idx="${e.index}" data-sig="${agentLogSig(key, e)}" ${open ? "open" : ""}
             ontoggle="agentLogToggled(this,'${esc(key).replace(/'/g, "&#39;")}')">
           <summary data-tip="Click to expand or collapse this call's input and output.\nValues come from the runner's structured tool records.">
             <span class="alog-tool" style="color:${color}">${esc(e.tool)}</span>${e.sub ? `<span class="alog-sub">${esc(e.sub)}</span>` : ""}
-            <span class="alog-prev">${esc(preview)}</span>
+            <span class="alog-prev">${esc(preview)}</span>${moreHtml}
             <span class="alog-st ${e.status}" data-tip="${esc(statusTip)}">${e.status === "pending" ? "…" : (e.status === "error" ? "error" : "ok")}</span>
           </summary>
-          <div class="alog-lbl">Input</div>${inputHtml}
+          <div class="alog-lbl">Input</div>${toggle}${inputHtml}
           <div class="alog-lbl">Output</div><pre class="alog-pre">${e.output === "" ? (e.status === "pending" ? "(waiting for result)" : "(not logged)") : esc(e.output)}</pre>
         </details>`;
+      }
+      /**
+       * The cached usable parse for a call, or null (never fetches).
+       * @param {string} key
+       * @param {AgentLogEntry} e
+       * @returns {ShellSyntaxParse|null}
+       */
+      function agentLogShellParse(key, e) {
+        const p = agentLogShellSyntax[key] && agentLogShellSyntax[key][e.index];
+        return p !== undefined && typeof p === "object" && shellSyntaxUsable(p) ? p : null;
+      }
+      /**
+       * What `refreshAgentLog` compares to decide a widget needs redrawing:
+       * the call's status and sizes plus its parse state and raw/parsed choice.
+       * @param {string} key
+       * @param {AgentLogEntry} e
+       * @returns {string}
+       */
+      function agentLogSig(key, e) {
+        const p = agentLogShellSyntax[key] && agentLogShellSyntax[key][e.index];
+        const ps = p === undefined ? "-" : (typeof p === "string" ? p : p.status);
+        const raw = agentLogShellRaw[key] && agentLogShellRaw[key][e.index] ? "r" : "p";
+        return `${e.status}|${e.input.length}|${e.output.length}|${ps}${raw}`;
+      }
+      /**
+       * Requests the shell-syntax parse of one call, once, when it is first
+       * expanded. A collapsed call never asks; a cached or in-flight call is
+       * not asked again; after an `unavailable` answer nothing asks again.
+       * @param {string} key
+       * @param {AgentLogEntry} e
+       * @returns {Promise<void>}
+       */
+      async function ensureAgentLogShellSyntax(key, e) {
+        if (agentLogShellSyntaxOff || !shellSyntaxTool(e.tool)) return;
+        const command = shellCommandText(e.args);
+        if (command === null || command.trim() === "") return;
+        const cache = agentLogShellSyntax[key] || (agentLogShellSyntax[key] = {});
+        if (cache[e.index] !== undefined) return;
+        cache[e.index] = "loading";
+        try {
+          const resp = await fetch("/api/shell-syntax/parse", { method: "POST", headers: traceHeaders(), body: JSON.stringify({ tool: e.tool, command }) });
+          const data = resp.ok ? /** @type {ShellSyntaxParse|null} */ (await resp.json()) : null;
+          if (data === null || typeof data.status !== "string") {
+            cache[e.index] = "failed";
+          } else {
+            if (data.status === "unavailable") agentLogShellSyntaxOff = true;
+            cache[e.index] = data;
+          }
+        } catch (_) {
+          cache[e.index] = "failed";
+        }
+        refreshAgentLog(key, false);
+      }
+      /**
+       * Flips one call between the parsed view and the raw text.
+       * @param {string} key
+       * @param {number} index
+       * @returns {void}
+       */
+      function agentLogToggleRaw(key, index) {
+        const m = agentLogShellRaw[key] || (agentLogShellRaw[key] = {});
+        if (m[index]) delete m[index]; else m[index] = true;
+        refreshAgentLog(key, false);
       }
       /**
        * The widget list's inner HTML for the current filter.
@@ -382,6 +570,11 @@
         const idx = Number(el.dataset.idx);
         const open = agentLogOpen[key] || (agentLogOpen[key] = {});
         if (el.open) open[idx] = true; else delete open[idx];
+        if (el.open) {
+          const memo = agentLogParsed[key];
+          const entry = memo === undefined ? undefined : memo.entries.find((x) => x.index === idx);
+          if (entry !== undefined) void ensureAgentLogShellSyntax(key, entry);
+        }
       }
       /**
        * Remembers the list's scroll offset.
@@ -453,7 +646,7 @@
           const n = nodes.get(e.index);
           if (!n) {
             host.insertAdjacentHTML("beforeend", html);
-          } else if (/** @type {HTMLElement} */ (n).dataset.sig !== `${e.status}|${e.input.length}|${e.output.length}`) {
+          } else if (/** @type {HTMLElement} */ (n).dataset.sig !== agentLogSig(key, e)) {
             n.outerHTML = html;
           }
         }

@@ -118,7 +118,7 @@ alternatives to reach for are in
 
 ## Architecture
 
-Eleven Rust workspace members; `cli-py/` is a Python project kept only for `docsgen/` (doc screenshot generation, dev-only, never shipped) and a trimmed `bench/` (renders the Rust bench harness's SVG/HTML graphs) — see `cli-py/AGENTS.md`. The **daemon owns all state**; the CLI and librarian are clients of its HTTP/JSON API (`docs/daemon-api.md`). The SQLite DB is daemon-private.
+Twelve Rust workspace members; `cli-py/` is a Python project kept only for `docsgen/` (doc screenshot generation, dev-only, never shipped) and a trimmed `bench/` (renders the Rust bench harness's SVG/HTML graphs) — see `cli-py/AGENTS.md`. The **daemon owns all state**; the CLI and librarian are clients of its HTTP/JSON API (`docs/daemon-api.md`). The SQLite DB is daemon-private.
 
 | Component | Path | Language | Role | Details |
 |---|---|---|---|---|
@@ -131,6 +131,7 @@ Eleven Rust workspace members; `cli-py/` is a Python project kept only for `docs
 | `ralphus-auth` | `auth/` | Rust lib | Ed25519 license verification (no-op without `--features secure-dist`). | `auth/AGENTS.md` |
 | `ralphus-keygen` | `keygen/` | Rust bin | Author-only tool: generate keypair + sign licenses. Never shipped to users. | `keygen/AGENTS.md` |
 | `ralphus-ssh-provider` | `ssh-provider/` | Rust bin+lib | Machine provider (RAL-185) reaching any host already SSH-accessible; every provider verb except `retire` (RAL-200, RAL-355), including `channel` (one persistent `ssh` session per machine), see `docs/machine-providers.md`. | |
+| `ralphus-shell-syntax` | `shell-syntax/` | Rust lib | Optional (`parser` feature, daemon feature `shell-syntax`) tree-sitter Bash/PowerShell parse that splits an agent-log shell command into rows and highlight spans (RAL-644). Display-only; C toolchain needed only when enabled. | `docs/shell-syntax.md` |
 | `ralphus-bench-types` | `bench-types/` | Rust lib | `BenchMeta` only — kept dependency-free to avoid a cyclic dependency between bench-tagged crates and the harness (RAL-94). | `bench-harness/AGENTS.md` |
 | `ralphus-bench-macros` | `bench-macros/` | Rust proc-macro | `#[ralphus_bench(patience = N)]` attribute (RAL-94). | `bench-harness/AGENTS.md` |
 | `ralphus-bench-harness` | `bench-harness/` | Rust lib+bin | Durable-minimum loop, stats/git/storage, `ralphus-bench-rs` opt-in entry point (RAL-94). | `bench-harness/AGENTS.md` |

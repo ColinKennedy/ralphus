@@ -261,6 +261,9 @@
             rows.push(`<span style="color:var(--warn)" data-tip="Watchdog checks that timed out waiting for the store lock over this daemon's lifetime. Kept after recovery so a resolved incident is still visible.">${esc(String(dog.total_stalls))} stall(s)${dog.consecutive_stalls > 0 ? ` · ${esc(String(dog.consecutive_stalls))} consecutive` : ""}</span>`);
           }
         }
+        if (daemon.shell_syntax !== undefined) {
+          rows.push(`<span style="color:var(--muted)" data-tip="Whether this daemon was built with the optional shell-syntax feature (GET /api/daemon's shell_syntax field). When off, the Agent Log shows shell commands as plain text; nothing else changes. See docs/shell-syntax.md."><span class="dot" style="background:${cvar(daemon.shell_syntax ? "--done" : "--faint")}"></span> shell-syntax: ${daemon.shell_syntax ? "built" : "not built"}</span>`);
+        }
         if (wait) {
           rows.push(`<span style="color:var(--muted)" data-tip="How long store-lock acquisitions waited, over this daemon's whole lifetime. This is wait time only -- query time is not included -- so a high value here is contention, not slow SQL.">wait p50 ${esc(fmtMs(wait.p50_ms))} · p95 ${esc(fmtMs(wait.p95_ms))} · max ${esc(fmtMs(wait.max_ms))} (${esc(String(wait.samples))} samples)</span>`);
         }

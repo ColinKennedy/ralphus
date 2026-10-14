@@ -1250,6 +1250,7 @@
        * @property {StoreLockWaitView} [lock_wait] - store-lock acquisition wait over the daemon's lifetime (RAL-393).
        * @property {StoreGuardHoldView} [guard_hold] - how long the lock has been *held* at worst (WS-D.8/M5). Distinct from `lock_wait`: a long hold is the cause, a long wait is what every other thread feels.
        * @property {StoreWatchdogView} [watchdog] - store-lock liveness (WS-G.1/G.2, `daemon/src/watchdog.rs`).
+       * @property {boolean} [shell_syntax] - whether the optional `shell-syntax` feature (tree-sitter parse behind the Agent Log's highlighted shell view, RAL-644) is built into this daemon.
        * @property {{site: string, held_ms: number}|null} [store_lock_holder] - `file:line` that last acquired the store lock, and how long ago. Absent if the lock has never been taken.
        */
       /**
