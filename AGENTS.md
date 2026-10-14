@@ -79,7 +79,7 @@ alternatives to reach for are in
   CPU-minutes) is excluded from `cargo test` and every `cargo nextest run` --
   including `--workspace --all-targets` -- by `.config/nextest.toml`'s
   its test target requires the `race-suite` feature. It is reachable only through that feature and its own profile:
-  `cargo nextest run -P review-races -p ralphus-daemon --features race-suite [-E 'test(name)']`
+  `cargo nextest run -P review-races -p ralphus-daemon --features race-suite [-E "test(name)"]`
   (add `--run-ignored only` for the `soak_*` tests). Run a single scenario
   that way when you change review/PR/guardian code it covers; never the whole
   file mid-edit.

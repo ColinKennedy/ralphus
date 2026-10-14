@@ -63,6 +63,14 @@
        */
       let triageDrainConfirms = {};
       /**
+       * RAL-648: pools whose "Confirm & drain" request is in flight, keyed
+       * `triagePreviewKey(project, triageType)`. Kept apart from
+       * `triageDrainConfirms` so the "Draining..." state survives the
+       * `pollTriage()` re-renders that run while the request is open.
+       * @type {{[key: string]: boolean}}
+       */
+      let triageDrainsPending = {};
+      /**
        * RAL-421: the same live-preview state for the Projects-tab
        * auto-review-thresholds popup, keyed by triage type (`"__add__"`
        * holds the not-yet-added row's preview). Cleared on Confirm/Cancel

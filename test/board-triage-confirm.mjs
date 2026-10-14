@@ -79,21 +79,30 @@ export function makeTriageConfirm({
     return Promise.resolve({ ok: true, json: async () => body });
   };
   const responseError = async (_r, message) => { calls.responseError++; return message; };
+  const notify = (_kind, _message, _opts) => {
+    // Mock notify stub for testing.
+  };
+  const gotoReview = (_guardianId) => {
+    // Mock gotoReview stub for testing.
+  };
   const deps = {
     esc,
     fetch: fetchImpl,
     renderTriage: () => { calls.renderTriage++; },
     pollTriage: async () => { calls.pollTriage++; },
     responseError,
+    notify,
+    gotoReview,
     pools,
   };
   // eslint-disable-next-line no-new-func -- evaluating the real shipped source is the point; see the header.
   const factory = new Function(
     "deps",
-    `const { esc, fetch, renderTriage, pollTriage, responseError } = deps;
+    `const { esc, fetch, renderTriage, pollTriage, responseError, notify, gotoReview } = deps;
      var triageError = "";
      var triagePools = deps.pools;
      var triageDrainConfirms = {};
+     var triageDrainsPending = {};
      var triageSelKey = null;
      ${sliceRegion(REGIONS.preview)}
      ${sliceRegion(REGIONS.tabHandlers)}

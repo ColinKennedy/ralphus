@@ -11,7 +11,7 @@
 //! CPU-minutes) are excluded from every plain `cargo test` and `cargo nextest run`, including
 //! `--workspace --all-targets`: the test target requires the `race-suite` feature.
 //! Run them only on purpose, through their own profile:
-//! `cargo nextest run -P review-races -p ralphus-daemon --features race-suite [-E 'test(name)']`
+//! `cargo nextest run -P review-races -p ralphus-daemon --features race-suite [-E "test(name)"]`
 //! (add `--run-ignored only` for the `soak_*` tests).
 
 mod common;

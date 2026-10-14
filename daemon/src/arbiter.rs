@@ -1203,13 +1203,10 @@ pub fn parse_ordering_reply(reply: &str, expected_ids: &[&str]) -> Option<Vec<St
 /// unknown ids). Every outcome is logged as a Cartographer `Note` (see
 /// `crate::cartographer`).
 ///
-/// The live call runs while the caller's store lock is held — the shared
-/// tail of the drain paths (`crate::reviews::build_review_from_drained_pool`)
-/// is always invoked from a context that already holds the daemon's single
-/// `Store` mutex across the whole set-and-drain-create sequence, and the
-/// request itself is a single bounded round-trip, on the same footing as
-/// `health_check`'s user-triggered lock-held call (unlike the hot per-cell
-/// `classify` path, which deliberately drops the lock around its call).
+/// The live call runs without the store lock held: the drain paths
+/// (`crate::reviews::create_review_from_triage_pool`) release it around the
+/// orderer callback. The request is a single blocking round-trip, so it is
+/// the dominant latency of a drain with more than one candidate.
 #[must_use]
 pub fn order_pooled_candidates(
     store: &crate::store_lock::StoreHandle,
