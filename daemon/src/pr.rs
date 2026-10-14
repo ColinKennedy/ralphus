@@ -12256,6 +12256,7 @@ mod tests {
             merge_status: "ready".to_string(),
             delayed_until_ms: None,
             delayed_reason: None,
+            auto_fix_paused_at_ms: None,
             detail: None,
             review_branch: None,
             readable_review_branch: true,

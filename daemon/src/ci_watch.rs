@@ -1589,6 +1589,31 @@ pub fn dispatch_pr_auto_fix_cancellable(
         warn_on_pr_store_error(store, &guardian.id, pr, "set_pr_auto_fix_outcome", result);
         return;
     };
+    // RAL-655: a person stopped this branch's actioning; auto-fix stays off
+    // until Action feedback or Merge / rebase clears the latch.
+    let paused = store
+        .lock()
+        .branch_auto_fix_paused(&guardian.id, &branch_id);
+    if paused {
+        log_ci_watch(
+            store,
+            &guardian.id,
+            &branch_id,
+            LogLevel::INFO,
+            format!(
+                "ralphus [ci-watch] review {} pr #{} auto-fix skipped: a person stopped this \
+                 branch's actioning",
+                guardian.id,
+                pr.pr_number.unwrap_or_default()
+            ),
+            serde_json::json!({"pr_number": pr.pr_number, "outcome": "skipped_paused"}),
+        );
+        let result = store
+            .lock()
+            .set_pr_auto_fix_outcome(&pr.id, "skipped_paused");
+        warn_on_pr_store_error(store, &guardian.id, pr, "set_pr_auto_fix_outcome", result);
+        return;
+    }
     let cfg = store
         .lock()
         .resolve_review_config(Path::new(&guardian.git_root));
@@ -1721,6 +1746,11 @@ pub fn dispatch_pr_fix_manual(
     client: &crate::forge::ForgeClient,
     submitted_by: Option<&str>,
 ) {
+    // RAL-655: a person asking for a fix is an explicit action, so it lifts
+    // the branch's auto-fix pause as feedback and Merge / rebase do.
+    let _ = store
+        .lock()
+        .clear_branch_auto_fix_paused(&guardian.id, branch_id);
     let result = store.lock().clear_pr_auto_fix_attempted(&pr.id);
     warn_on_pr_store_error(
         store,

@@ -210,6 +210,9 @@ pub enum ReviewCommand {
     StopMerge {
         selector: String,
     },
+    StopActioning {
+        selector: String,
+    },
     ForceStart {
         selector: String,
     },
@@ -640,6 +643,9 @@ pub fn parse(args: &[String]) -> ReviewCommand {
         Some("stop-merge") => {
             with_selector(scanner, |selector| ReviewCommand::StopMerge { selector })
         }
+        Some("stop-actioning") => with_selector(scanner, |selector| ReviewCommand::StopActioning {
+            selector,
+        }),
         Some("force-start") => {
             with_selector(scanner, |selector| ReviewCommand::ForceStart { selector })
         }
@@ -1789,6 +1795,18 @@ pub fn dispatch(cmd: ReviewCommand, opts: &GlobalOpts) -> i32 {
             let resolved = resolve_guardian_selector(&client, &selector, DEFAULT_REVIEW_LIST_HINT)?;
             let result = client.guardian_stop(&resolved.guardian_id)?;
             emit(opts, &result, |_| println!("{selector} merge stopped"));
+            Ok(())
+        }),
+        ReviewCommand::StopActioning { selector } => run_and_report(opts, None, || {
+            let resolved = resolve_guardian_selector(&client, &selector, DEFAULT_REVIEW_LIST_HINT)?;
+            let result = client.guardian_stop_actioning(&resolved.guardian_id)?;
+            emit(opts, &result, |r| {
+                if r["stopped"].as_bool().unwrap_or(false) {
+                    println!("{selector} actioning stopped; auto-fix paused");
+                } else {
+                    println!("{selector} is not being actioned");
+                }
+            });
             Ok(())
         }),
         ReviewCommand::ForceStart { selector } => run_and_report(opts, None, || {
@@ -3388,6 +3406,18 @@ mod tests {
             ReviewCommand::UsageError(_)
         );
         matches!(parse(&v(&["env"])), ReviewCommand::UsageError(_));
+    }
+
+    #[test]
+    fn parses_stop_actioning() {
+        match parse(&v(&["stop-actioning", "g1"])) {
+            ReviewCommand::StopActioning { selector } => assert_eq!(selector, "g1"),
+            other => panic!("unexpected: {other:?}"),
+        }
+        assert!(matches!(
+            parse(&v(&["stop-actioning"])),
+            ReviewCommand::UsageError(_)
+        ));
     }
 
     #[test]

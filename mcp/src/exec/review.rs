@@ -291,6 +291,10 @@ pub fn execute(cmd: ReviewCommand, client: &DaemonClient) -> ExecResult {
             let resolved = resolve_guardian_selector(client, &selector, DEFAULT_REVIEW_LIST_HINT)?;
             Ok(client.guardian_stop(&resolved.guardian_id)?)
         }
+        ReviewCommand::StopActioning { selector } => {
+            let resolved = resolve_guardian_selector(client, &selector, DEFAULT_REVIEW_LIST_HINT)?;
+            Ok(client.guardian_stop_actioning(&resolved.guardian_id)?)
+        }
         ReviewCommand::ForceStart { selector } => {
             let resolved = resolve_guardian_selector(client, &selector, DEFAULT_REVIEW_LIST_HINT)?;
             Ok(client.guardian_force_start(&resolved.guardian_id)?)

@@ -158,6 +158,7 @@ where one exists.
 | POST | `/api/guardians/{id}/rebuild` | [Tear down and rebuild the review's prepared build now](#post-apiguardiansidrebuild), whatever its `rebuild_on` setting says |
 | POST | `/api/guardians/merge-batch` | [Start/continue the stacked rebase for many reviews in one request](#post-apiguardiansmerge-batch-ral-514) (RAL-514) |
 | POST | `/api/guardians/{id}/cancel_and_merge` | Cancel an in-progress rebase, start fresh |
+| POST | `/api/guardians/{id}/stop-actioning` | [Stop whatever is actioning a review](#post-apiguardiansidstop-actioning) (RAL-655) and pause auto-fix |
 | POST | `/api/guardians/{id}/stop` | [Stop a mid-rebase at the next checkpoint](#post-apiguardiansidstop) (RAL-249), leaving it resumable |
 | POST | `/api/guardians/{id}/approve` | Approve an in_review or merge_stopped guardian (RAL-535) |
 | POST | `/api/guardians/{id}/cancel` | Cancel a review |
@@ -3197,6 +3198,29 @@ the review (RAL-524):
   into it; each failing PR's auto-fix outcome is recorded as
   `skipped_stopped` until the review is resumed. Manual PR feedback/fix
   actions are unaffected — a person acting is the deliberate user action.
+
+### `POST /api/guardians/{id}/stop-actioning`
+
+Stop whatever is currently actioning a review's worktrees (RAL-655): a
+feedback pass, a merge/rebase, or an automatic PR-fix round. Distinct from
+`/stop`, which only halts a `merging` rebase. The live worker is cancelled
+(its agent sessions killed); once it has exited, any branch still `in_progress`,
+`proof_pending` or `actioning` has its worktree reset to the pre-action state
+(`git rebase --abort` if a rebase is mid-flight, then `reset --hard` to the HEAD
+recorded before the action and `clean`), its pending feedback and worktree
+lease released. Git work only happens after the worker is gone, so a worker
+finishing at the same instant is harmless and the call is idempotent.
+
+Each actioned branch gets an **auto-fix paused** latch
+(`guardian_branches.auto_fix_paused_at_ms`, exposed on the branch view) so
+CI auto-fix does not resume by itself (outcome `skipped_paused`). An explicit
+`POST /api/guardians/{id}/feedback`, a manual merge/rebase, or a manual PR fix
+clears it.
+
+Returns `{"stopped":true,"status":...,"branches":[...],"worktrees_reset":bool}`,
+or `{"stopped":false,...}` when nothing was being actioned. A stop that could
+not complete (worker did not exit, reset failed) enqueues a high-priority
+error mailbox message with remediation. `404` for an unknown review.
 
 ### `POST /api/guardians/{id}/reopen`
 

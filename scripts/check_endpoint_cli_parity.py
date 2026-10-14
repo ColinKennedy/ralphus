@@ -263,6 +263,7 @@ ENDPOINT_TO_CLI: dict[str, list[str]] = {
     "POST /api/guardians/{id}/manual-checks-env": ["review manual-checks-env"],
     "POST /api/guardians/{id}/merge": ["review merge"],
     "POST /api/guardians/{id}/stop": ["review stop-merge"],
+    "POST /api/guardians/{id}/stop-actioning": ["review stop-actioning"],
     "POST /api/guardians/{id}/cancel_and_merge": ["review restart-merge"],
     "POST /api/guardians/{id}/approve": ["review approve"],
     "POST /api/guardians/{id}/cancel": ["review cancel"],

@@ -762,6 +762,15 @@ root is reset and its prepare steps run again.",
         &[],
     ),
     node(
+        "stop-actioning",
+        &["selector [str]"],
+        &[],
+        "Stop whatever is actioning a review's worktree (feedback, merge/rebase or auto-fix), abort a mid-rebase and reset the worktree, and pause auto-fix until the next explicit Action feedback or Merge / rebase.",
+        false,
+        false,
+        &[],
+    ),
+    node(
         "settings",
         &["selector [str]"],
         &[

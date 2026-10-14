@@ -566,6 +566,11 @@ pub struct BranchView {
     /// Safe explanation of the current provider delay.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub delayed_reason: Option<String>,
+    /// Epoch milliseconds when a person stopped this branch's actioning
+    /// (`review stop-actioning`); while set, PR auto-fix does not run for the
+    /// branch. Cleared by Action feedback or Merge / rebase.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auto_fix_paused_at_ms: Option<i64>,
     /// Optional detail (e.g. conflict summary).
     pub detail: Option<String>,
     /// The review-owned branch stacked for this feature (copy; never the task's).
@@ -5115,6 +5120,60 @@ impl Store {
         Ok(())
     }
 
+    /// RAL-655: latches PR auto-fix off for one branch after a person stopped
+    /// its actioning. Persisted so a daemon restart does not resume auto-fix.
+    pub fn set_branch_auto_fix_paused(&self, guardian_id: &str, branch_id: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE guardian_branches SET auto_fix_paused_at_ms=? WHERE guardian_id=? AND id=?",
+            params![crate::store::now_ms(), guardian_id, branch_id],
+        )?;
+        Ok(())
+    }
+
+    /// RAL-655: clears one branch's auto-fix pause latch.
+    pub fn clear_branch_auto_fix_paused(&self, guardian_id: &str, branch_id: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE guardian_branches SET auto_fix_paused_at_ms=NULL WHERE guardian_id=? AND id=?",
+            params![guardian_id, branch_id],
+        )?;
+        Ok(())
+    }
+
+    /// RAL-655: clears the auto-fix pause latch on every branch of a review
+    /// (Merge / rebase re-arms the whole review).
+    pub fn clear_guardian_auto_fix_paused(&self, guardian_id: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE guardian_branches SET auto_fix_paused_at_ms=NULL WHERE guardian_id=? AND auto_fix_paused_at_ms IS NOT NULL",
+            params![guardian_id],
+        )?;
+        Ok(())
+    }
+
+    /// RAL-655: whether a person paused PR auto-fix on this branch.
+    pub fn branch_auto_fix_paused(&self, guardian_id: &str, branch_id: &str) -> bool {
+        self.conn
+            .query_row(
+                "SELECT auto_fix_paused_at_ms IS NOT NULL FROM guardian_branches WHERE guardian_id=? AND id=?",
+                params![guardian_id, branch_id],
+                |r| r.get::<_, i64>(0),
+            )
+            .map(|v| v != 0)
+            .unwrap_or(false)
+    }
+
+    /// RAL-655: ids of the branches a worker is currently acting on
+    /// (rebasing, proving, or running feedback / PR auto-fix).
+    pub fn actioning_branch_ids(&self, guardian_id: &str) -> Vec<(String, String)> {
+        let Ok(mut stmt) = self.conn.prepare(
+            "SELECT id, merge_status FROM guardian_branches WHERE guardian_id=? AND merge_status IN ('in_progress','proof_pending','actioning') ORDER BY position",
+        ) else {
+            return Vec::new();
+        };
+        stmt.query_map(params![guardian_id], |r| Ok((r.get(0)?, r.get(1)?)))
+            .map(|rows| rows.filter_map(|r| r.ok()).collect())
+            .unwrap_or_default()
+    }
+
     /// RAL-375: persist feedback text as durably pending on a branch, before
     /// `guardian_merge::run_feedback` does any work -- so an unclean daemon
     /// shutdown mid-run leaves a record startup recovery can find and
@@ -6414,7 +6473,8 @@ impl Store {
                     gb.is_empty, s.machine AS source_cell_machine,
                     gb.env_overrides, gb.started_at_ms, gb.auto_submit_error,
                     gb.readable_review_branch, gb.review_branch_name, gb.finished_at_ms,
-                    gb.delayed_until_ms, gb.delayed_reason, gb.disabled_reason
+                    gb.delayed_until_ms, gb.delayed_reason, gb.disabled_reason,
+                    gb.auto_fix_paused_at_ms
              FROM guardian_branches gb
              LEFT JOIN cells s ON s.rowid = (
                  SELECT s2.rowid FROM cells s2
@@ -6449,6 +6509,7 @@ impl Store {
                     merge_status,
                     delayed_until_ms: r.get(27)?,
                     delayed_reason: r.get(28)?,
+                    auto_fix_paused_at_ms: r.get(30)?,
                     detail: r.get(3)?,
                     review_branch: r.get(4)?,
                     readable_review_branch: r.get::<_, i64>(24)? != 0,
@@ -7680,6 +7741,7 @@ mod tests {
             merge_status: merge_status.to_string(),
             delayed_until_ms: None,
             delayed_reason: None,
+            auto_fix_paused_at_ms: None,
             detail: None,
             review_branch: None,
             readable_review_branch: true,
@@ -9378,6 +9440,47 @@ mod tests {
             .clear_branch_pending_feedback(&id, &branch_id)
             .unwrap();
         assert!(store.branches_with_pending_feedback().unwrap().is_empty());
+    }
+
+    /// RAL-655: the auto-fix pause latch is per branch, surfaces on the
+    /// branch view, and is cleared per branch or for the whole review.
+    #[test]
+    fn auto_fix_paused_latch_sets_and_clears() {
+        let store = Store::open_in_memory().unwrap();
+        let id = store.create_guardian("r", "main", "/repo").unwrap();
+        for b in ["a", "b"] {
+            store.add_guardian_branch(&id, b).unwrap();
+        }
+        let ids: Vec<String> = store
+            .get_guardian(&id)
+            .unwrap()
+            .branches
+            .iter()
+            .map(|b| b.id.clone())
+            .collect();
+        assert!(!store.branch_auto_fix_paused(&id, &ids[0]));
+        assert!(store.actioning_branch_ids(&id).is_empty());
+
+        store.set_branch_auto_fix_paused(&id, &ids[0]).unwrap();
+        store.set_branch_auto_fix_paused(&id, &ids[1]).unwrap();
+        assert!(store.branch_auto_fix_paused(&id, &ids[0]));
+        let view = store.get_guardian(&id).unwrap();
+        assert!(view.branches[0].auto_fix_paused_at_ms.is_some());
+
+        store.clear_branch_auto_fix_paused(&id, &ids[0]).unwrap();
+        assert!(!store.branch_auto_fix_paused(&id, &ids[0]));
+        assert!(store.branch_auto_fix_paused(&id, &ids[1]));
+
+        store.clear_guardian_auto_fix_paused(&id).unwrap();
+        assert!(!store.branch_auto_fix_paused(&id, &ids[1]));
+
+        store
+            .set_branch_status(&id, &ids[1], MergeStatus::Actioning, None)
+            .unwrap();
+        assert_eq!(
+            store.actioning_branch_ids(&id),
+            vec![(ids[1].clone(), "actioning".to_string())]
+        );
     }
 
     #[test]

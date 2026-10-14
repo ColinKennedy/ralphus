@@ -2155,6 +2155,13 @@ impl DaemonClient {
         self.post(&format!("/api/guardians/{guardian_id}/stop"), None)
     }
 
+    pub fn guardian_stop_actioning(&self, guardian_id: &str) -> Result<Value, DaemonError> {
+        self.post(
+            &format!("/api/guardians/{guardian_id}/stop-actioning"),
+            None,
+        )
+    }
+
     pub fn guardian_approve(&self, guardian_id: &str) -> Result<Value, DaemonError> {
         self.post(&format!("/api/guardians/{guardian_id}/approve"), None)
     }

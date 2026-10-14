@@ -5508,6 +5508,246 @@ pub fn reopen_guardian_merge(
     reply(202, "{\"status\":\"merging\"}")
 }
 
+/// Worktree HEAD of a branch just before a feedback / PR auto-fix resolver
+/// agent started editing it, keyed by `(review id, branch id)`. [`stop_actioning`]
+/// resets the worktree to it. Entries are overwritten by the next round and
+/// removed by a stop; a round that finishes normally leaves a small stale
+/// entry that no stop ever reads, because a stop only resets a branch whose
+/// status is still actioning.
+static ACTION_BASELINES: LazyLock<Mutex<HashMap<(String, String), String>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn record_action_baseline(id: &str, branch_id: &str, sha: Option<&str>) {
+    let mut map = ACTION_BASELINES.lock().unwrap_or_else(|e| e.into_inner());
+    let key = (id.to_string(), branch_id.to_string());
+    match sha {
+        Some(sha) => {
+            map.insert(key, sha.to_string());
+        }
+        None => {
+            map.remove(&key);
+        }
+    }
+}
+
+fn take_action_baseline(id: &str, branch_id: &str) -> Option<String> {
+    ACTION_BASELINES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&(id.to_string(), branch_id.to_string()))
+}
+
+/// RAL-655: stop whatever is currently acting on a review's worktrees -- a
+/// feedback round, a Merge / rebase, or a PR auto-fix -- and put the worktrees
+/// back to where they were before that action began.
+///
+/// Distinct from [`stop_guardian_merge`], which only halts a rebase and leaves
+/// the worktrees for the next merge to clean up. This:
+///
+/// 1. latches PR auto-fix off for every actioning branch *before* cancelling,
+///    so the next maintenance tick cannot start another fix;
+/// 2. cancels the worker and its agent sessions and waits (bounded) for it to
+///    leave -- git is only touched once it has, so cleanup never races it;
+/// 3. for each branch still marked active: aborts an in-flight rebase,
+///    resets the worktree to its pre-action state and drops its pending
+///    feedback, then releases its worktree lease;
+/// 4. moves the review to `merge_stopped` after a rebase, or back to
+///    `in_review` after a feedback / auto-fix round.
+///
+/// Idempotent: with nothing actioning it answers `{"stopped":false}`, and a
+/// worker that finished first has already moved its branch off the active
+/// statuses, so its result is left untouched.
+pub fn stop_actioning(
+    store: crate::store_lock::StoreHandle,
+    cancellations: Cancellations,
+    id: &str,
+) -> Reply {
+    let key = format!("guardian:{id}");
+    let (review_status, project_root, active_before, has_leases) = {
+        let guard = store.lock();
+        let Ok(guardian) = guard.get_guardian(id) else {
+            return reply(404, &error_body("not_found", "no such review"));
+        };
+        let active: Vec<(String, String)> = guard.actioning_branch_ids(id);
+        (
+            guardian.status.clone(),
+            guardian.git_root.clone(),
+            active,
+            guard.guardian_has_worktree_leases(id),
+        )
+    };
+    let worker_live = cancellations.is_active(&key);
+    if active_before.is_empty() && !worker_live && !has_leases {
+        return reply(
+            200,
+            &serde_json::json!({
+                "stopped": false,
+                "status": review_status,
+                "detail": "nothing is being actioned on this review",
+            })
+            .to_string(),
+        );
+    }
+    let rebase_stop = active_before
+        .iter()
+        .any(|(_, status)| status == "in_progress" || status == "proof_pending");
+
+    {
+        let guard = store.lock();
+        for (branch_id, _) in &active_before {
+            let _ = guard.set_branch_auto_fix_paused(id, branch_id);
+        }
+    }
+    cancellations.cancel(&key);
+    {
+        let store = store.clone();
+        let id = id.to_string();
+        std::thread::spawn(move || kill_guardian_agent_sessions(&store, &id));
+    }
+    let worker_left = wait_for_merge_worker_stop_within(&cancellations, &key, STOP_ACK_WAIT);
+
+    let mut reset_failures: Vec<String> = Vec::new();
+    let mut restored: Vec<String> = Vec::new();
+    if worker_left {
+        let current = store.lock().get_guardian(id);
+        if let Ok(guardian) = current {
+            for branch in guardian.branches.iter().filter(|b| {
+                active_before.iter().any(|(bid, _)| bid == &b.id)
+                    && matches!(
+                        b.merge_status.as_str(),
+                        "in_progress" | "proof_pending" | "actioning"
+                    )
+            }) {
+                let baseline = take_action_baseline(id, &branch.id);
+                if let Some(wt_str) = branch.worktree.clone() {
+                    let branch_project = branch
+                        .project
+                        .clone()
+                        .unwrap_or_else(|| project_root.clone());
+                    let root = Workspace::for_guardian(&store, id, PathBuf::from(&branch_project));
+                    let wt = root.at(PathBuf::from(&wt_str));
+                    if let Err(e) = reset_worktree_to_pre_action(&wt, baseline.as_deref()) {
+                        reset_failures.push(format!("{}: {e}", branch.branch));
+                    }
+                }
+                let guard = store.lock();
+                let _ = guard.clear_branch_pending_feedback(id, &branch.id);
+                let _ = guard.release_guardian_worktree_lease(
+                    id,
+                    &branch.id,
+                    &format!("feedback:{}", branch.id),
+                );
+                let next = if rebase_stop {
+                    MergeStatus::Stopped
+                } else {
+                    MergeStatus::Done
+                };
+                let _ = guard.set_branch_status(id, &branch.id, next, Some("actioning stopped"));
+                restored.push(branch.id.clone());
+            }
+        }
+    }
+
+    let final_status = if rebase_stop || !worker_left {
+        match store.lock().stop_guardian_merge(id) {
+            Ok(status) => status.as_str().to_string(),
+            Err(_) => store
+                .lock()
+                .guardian_status_str(id)
+                .unwrap_or(review_status),
+        }
+    } else {
+        // A feedback / auto-fix round put the review in `merging` only while
+        // it ran; with the worker gone and the worktrees restored the review
+        // goes back to being reviewable.
+        if store
+            .lock()
+            .guardian_status_str(id)
+            .is_ok_and(|s| s == GuardianStatus::Merging.as_str())
+        {
+            write_merge_status(&store, id, GuardianStatus::InReview, None);
+        }
+        store
+            .lock()
+            .guardian_status_str(id)
+            .unwrap_or_else(|_| GuardianStatus::InReview.as_str().to_string())
+    };
+
+    {
+        let guard = store.lock();
+        crate::cartographer::Note::new("guardian")
+            .scope("guardian")
+            .guardian(id)
+            .emit(
+                &guard,
+                format!("review {id} actioning stopped by a person"),
+                serde_json::json!({
+                    "outcome": "actioning_stopped",
+                    "branches": restored,
+                    "worker_left": worker_left,
+                    "reset_failures": reset_failures,
+                }),
+            );
+        if !worker_left || !reset_failures.is_empty() {
+            let detail = if worker_left {
+                format!(
+                    "Stopping the actioning of review {id} left some worktrees unreset: {}.",
+                    reset_failures.join("; ")
+                )
+            } else {
+                format!(
+                    "Review {id} was told to stop actioning, but its worker was still unwinding \
+                     after {}s, so its worktrees were not reset.",
+                    STOP_ACK_WAIT.as_secs()
+                )
+            };
+            let remediation = crate::mailbox::Remediation::ManualInterventionRequired {
+                guidance: format!(
+                    "inspect the review's worktrees, then press Merge / rebase (or run \
+                     `ralphus review merge {id}`) to rebuild them from the stack"
+                ),
+            };
+            let entity_uri = format!("guardian:{id}");
+            let _ = guard.enqueue_error_mailbox_message(
+                crate::mailbox::MailboxPriority::High,
+                &detail,
+                &remediation,
+                None,
+                None,
+                None,
+                Some(&entity_uri),
+                Some("review"),
+            );
+        }
+    }
+    reply(
+        200,
+        &serde_json::json!({
+            "stopped": true,
+            "status": final_status,
+            "branches": restored,
+            "worktrees_reset": worker_left && reset_failures.is_empty(),
+        })
+        .to_string(),
+    )
+}
+
+/// Abort any in-flight rebase in `wt` and return it to `baseline` (the HEAD
+/// before the stopped action began; the current HEAD when unknown), discarding
+/// uncommitted and untracked changes the action left behind.
+fn reset_worktree_to_pre_action(wt: &Workspace, baseline: Option<&str>) -> Result<(), String> {
+    if rebase_in_progress(wt) {
+        wt.git(&["rebase", "--abort"])
+            .map_err(|e| format!("git rebase --abort failed: {e}"))?;
+    }
+    let target = baseline.unwrap_or("HEAD");
+    wt.git(&["reset", "--hard", target])
+        .map_err(|e| format!("git reset --hard {target} failed: {e}"))?;
+    wt.git(&["clean", "--force", "-d"])
+        .map_err(|e| format!("git clean failed: {e}"))?;
+    Ok(())
+}
+
 /// Halt an in-flight merge for `id` at its next checkpoint, leaving the review
 /// in the recoverable `merge_stopped` state (RAL-249) rather than cancelled.
 ///
@@ -8517,6 +8757,7 @@ fn run_feedback_pass(
         .git(&["rev-parse", "HEAD"])
         .ok()
         .map(|s| s.trim().to_string());
+    record_action_baseline(id, branch_id, before_resolver_sha.as_deref());
     // Live actions: a live run's commits are cherry-picked first; only a
     // conflict hands the change (carried in `feedback`) to the resolver.
     let cleanly_picked = match (live_commits, before_resolver_sha.as_deref()) {
