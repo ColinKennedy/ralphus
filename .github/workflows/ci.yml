@@ -122,9 +122,9 @@ jobs:
         # excluded from this default run by `.config/nextest.toml`
         # (`default-filter`); it runs on a schedule instead, in
         # `race-soak-nightly.yml`.
-        run: cargo "+${{ matrix.toolchain }}" nextest run --workspace --all-targets
+        run: cargo "+${{ matrix.toolchain }}" nextest run --workspace --all-targets --no-fail-fast
       - name: Doctests
-        if: matrix.suite == 'full' && !contains(github.event.pull_request.labels.*.name, 'ralphus:defer-full-ci')
+        if: ${{ !cancelled() && matrix.suite == 'full' && !contains(github.event.pull_request.labels.*.name, 'ralphus:defer-full-ci') }}
         run: cargo "+${{ matrix.toolchain }}" test --doc --workspace
       # MSRV leg: just prove the workspace compiles at the oldest supported
       # toolchain. (Cargo's default resolver is not MSRV-aware, so this is the
@@ -412,7 +412,7 @@ jobs:
       - name: Rust board cold-load perf tests
         env:
           RALPHUS_BOARD_TIMING: "1"
-        run: cargo nextest run -p ralphus-daemon --test board_cold_load_perf --run-ignored only --test-threads 1
+        run: cargo nextest run -p ralphus-daemon --test board_cold_load_perf --run-ignored only --test-threads 1 --no-fail-fast
       # WS-B.4: board reads stay fast while four writers hammer the daemon,
       # over real HTTP against a real `serve_with`. Also gated here (and not
       # in the `rust` job) because its budgets are wall-clock -- see the
@@ -442,25 +442,25 @@ jobs:
       - name: Rust store contention budget
         env:
           RALPHUS_GUARD_HOLD_PANIC_MS: "8000"
-        run: cargo nextest run -p ralphus-daemon --test board_contention --run-ignored only --test-threads 1 --retries 4
+        run: cargo nextest run -p ralphus-daemon --test board_contention --run-ignored only --test-threads 1 --retries 4 --no-fail-fast
       # WS-B.5: the writer's sustained commit rate, batched and unbatched.
       - name: Rust store write-throughput floor
-        run: cargo nextest run -p ralphus-daemon --test store_write_throughput --run-ignored only --test-threads 1
+        run: cargo nextest run -p ralphus-daemon --test store_write_throughput --run-ignored only --test-threads 1 --no-fail-fast
       # WS-B.6: the captured production event mix replayed at its recorded
       # rates -- see daemon/tests/workload_replay.rs's module doc comment for
       # where the mix came from. RALPHUS_REPLAY_SECONDS lengthens the window.
       - name: Rust recorded-workload replay
-        run: cargo nextest run -p ralphus-daemon --test workload_replay --run-ignored only --test-threads 1
+        run: cargo nextest run -p ralphus-daemon --test workload_replay --run-ignored only --test-threads 1 --no-fail-fast
       # WS-D.8: the submit path's worst store-lock hold. Not #[ignore]d -- it
       # runs in the default suite too -- but repeated here so a regression is
       # attributed to the perf job rather than looking like an unrelated flake.
       - name: Rust submit lock-hold budget
-        run: cargo nextest run -p ralphus-daemon --test submit_lock_hold --test-threads 1
+        run: cargo nextest run -p ralphus-daemon --test submit_lock_hold --test-threads 1 --no-fail-fast
       # WS-E.4: how much of the read path is off the writer lock. A source
       # scan, so it is fast and deterministic -- see the module doc comment in
       # daemon/tests/read_path_ratchet.rs for why latency cannot see this.
       - name: Rust read-path ratchet
-        run: cargo nextest run -p ralphus-daemon --test read_path_ratchet
+        run: cargo nextest run -p ralphus-daemon --test read_path_ratchet --no-fail-fast
       - name: Build ralphus-librarian (needed by the browser-side perf test)
         run: cargo build -p ralphus-librarian
       - uses: actions/setup-python@v5
