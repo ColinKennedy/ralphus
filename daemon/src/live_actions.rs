@@ -112,7 +112,9 @@ conversation. When you finish, and before any RALPHUS_GHOST section, say how \
 you would test this change live if you had to: run the real program the way a \
 user would, exercise what you changed, and check the result. Write each test on \
 its own, starting on a new line with the exact marker 'RALPHUS_LIVE_ACTION:' \
-followed by concrete steps -- which program or entry point, the exact commands, \
+followed by a short title for the test (a few words, e.g. 'GUI shows the Ready \
+label') on that same line, then on the next lines concrete steps -- which program \
+or entry point, the exact commands, \
 any setup it needs (ports, data, configuration), what to do, and what correct \
 looks like. Describe the test only: do not pass on your own task's restrictions \
 (files you were told not to touch, things not to commit) -- whoever runs the test \

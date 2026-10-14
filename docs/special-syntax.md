@@ -514,6 +514,9 @@ tool guidance, but without the waypoint section (`waypoint_context` false). The 
   the cell's final reply (`live_actions::parse_live_handoffs`): every marker
   starts one handoff, whose text runs until the next line that starts with a
   `RALPHUS_` marker, so it may span several lines and a cell may post several.
+  Cells are asked to put a short title on the marker line and the steps
+  below it; the first line becomes the live action's label when no
+  deduplication names it.
   Write them **before** `RALPHUS_GHOST:` — the ghost takes everything after its
   marker to the end of the reply. The `(nothing to test live)` answer
   (case-insensitive) records an explicit "no", distinct from no marker at all.
