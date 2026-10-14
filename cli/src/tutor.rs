@@ -70,6 +70,18 @@ Tip: validate before submitting -- `ralphus validate file.toml`
                                  `maximum_context` (or the backend's own default
                                  context window) is, so compaction has room to
                                  trigger before the hard limit.
+ maximum_tool_output_tokens integer  Default cap on how many tokens a single tool
+                                 output (such as a large file read) may inject
+                                 into the agent's context, delivered to the backend
+                                 via its own mechanism (e.g. Claude Code's
+                                 CLAUDE_CODE_FILE_READ_MAX_OUTPUT_TOKENS env var,
+                                 Codex's -c tool_output_token_limit=..., Pi's
+                                 models.json maxTokens). Cells inherit this unless
+                                 they set their own `maximum_tool_output_tokens`.
+                                 Only accepted for backends with a real delivery
+                                 mechanism: "claude-code", "claude-cli", "codex",
+                                 "codex-cli", "pi". Rejected at validation time for
+                                 any other backend (e.g. "ollama" or bare "claude").
  max_retries    integer        Auto-retry count on failure
  priority       integer        Initial Queue priority hint (lower = runs sooner).
                                Seeds this task's starting position in the Queue tab;
@@ -303,6 +315,12 @@ Tip: validate before submitting -- `ralphus validate file.toml`
                                         back to task's `auto_compact_threshold`); see
                                         the [[task]] field reference above. ~80000 is a
                                         reasonable starting point.
+ maximum_tool_output_tokens integer     Per-cell cap on tool output tokens (falls back
+                                        to the task's `maximum_tool_output_tokens`);
+                                        see the [[task]] field reference above. Only
+                                        accepted for backends that support it:
+                                        "claude-code", "claude-cli", "codex",
+                                        "codex-cli", "pi".
  timeout_minutes         integer        Per-cell wall-clock timeout (falls back to task)
  maximum_timeout_seconds integer        Hard maximum runtime, in seconds, for this
                                         cell -- cumulative across the cell itself and
@@ -853,6 +871,12 @@ may embed <<ralphus:new-worktree/BRANCH?upstream=UPSTREAM
                                    Example:
                                      command = "cargo test"
                                      remediation_attempts = 3   # mode defaults to "remediating"
+ pass_score         integer        The minimum pass score for a `prompt` proof
+                                   step. Integer in the range 1-10; unset or 0
+                                   is treated as 1 (any output with PASS/fail
+                                   verdict passes). A proof step with pass_score > 1
+                                   requires that the AI explicitly report a numeric
+                                   score and that it meet or exceed this threshold.
  prompt             string  ONE-OF AI proof prompt -- the check to run. (Works
                                    today.) NOT a backend name: unlike the
                                    cell-level `agent`, this is instruction
