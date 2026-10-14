@@ -58,6 +58,10 @@ pub enum ProphecyKind {
     /// Diagnostic only: it never changes an outcome, and unlike
     /// [`Self::Deferred`] it never becomes a follow-up.
     Refused,
+    /// An optional idea the agent judged useful but out of scope. Unlike
+    /// [`Self::Deferred`] it is not required work and is not offered as a
+    /// follow-up.
+    Suggestion,
 }
 
 impl ProphecyKind {
@@ -70,6 +74,7 @@ impl ProphecyKind {
             Self::Deferred => "deferred",
             Self::Unconfirmed => "unconfirmed",
             Self::Refused => "refused",
+            Self::Suggestion => "suggestion",
         }
     }
 }
@@ -85,6 +90,7 @@ impl std::str::FromStr for ProphecyKind {
             "deferred" => Ok(Self::Deferred),
             "unconfirmed" => Ok(Self::Unconfirmed),
             "refused" => Ok(Self::Refused),
+            "suggestion" => Ok(Self::Suggestion),
             _ => Err(()),
         }
     }
@@ -652,6 +658,8 @@ mod tests {
             ProphecyKind::Hazard,
             ProphecyKind::Deferred,
             ProphecyKind::Unconfirmed,
+            ProphecyKind::Refused,
+            ProphecyKind::Suggestion,
         ] {
             assert_eq!(k.as_str().parse::<ProphecyKind>().unwrap(), k);
         }

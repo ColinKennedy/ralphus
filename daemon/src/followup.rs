@@ -1596,6 +1596,21 @@ mod tests {
     }
 
     #[test]
+    fn a_suggestion_prophecy_is_not_a_pending_followup_item() {
+        use crate::prophecy::ProphecyKind;
+        let s = store();
+        let root = temp_root("suggestion");
+        seed_guardian(&s, "g1", &root);
+        defer(&s, "g1", ProphecyKind::Suggestion, "add a missing test");
+        assert!(s.pending_followup_items("g1").unwrap().is_empty());
+        defer(&s, "g1", ProphecyKind::Deferred, "add the cache");
+        let items = s.pending_followup_items("g1").unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].item.body, "add the cache");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn a_review_without_deferred_prophecies_offers_nothing() {
         use crate::prophecy::ProphecyKind;
         let s = store();
