@@ -21725,7 +21725,9 @@ mod tests {
         let (base, repo, _fwt) = loop {
             let (base, repo, fwt) = make_repo(&"x".repeat(pad_len));
             let root_len = repo.to_string_lossy().len();
-            if root_len + 87 > 260 && root_len + 31 <= 260 {
+            // Ensure the old scheme would fail (87 chars overhead), the new scheme would fit
+            // (31 chars overhead), and git can still write objects (.git/objects/xx/... ~57 chars).
+            if root_len + 87 > 260 && root_len + 57 <= 260 {
                 break (base, repo, fwt);
             }
             let _ = std::fs::remove_dir_all(&base);
