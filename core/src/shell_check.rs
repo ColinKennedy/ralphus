@@ -22,6 +22,7 @@ fn name(shell: Shell) -> &'static str {
     match shell {
         Shell::Bash => "bash",
         Shell::PowerShell => "powershell",
+        Shell::Cmd => "cmd",
     }
 }
 
@@ -72,6 +73,7 @@ pub fn check_command(command: &str, shell: Option<&str>) -> Option<String> {
     let other = match target {
         Shell::Bash => Shell::PowerShell,
         Shell::PowerShell => Shell::Bash,
+        Shell::Cmd => unreachable!("cmd is never returned by grammar_for"),
     };
     if parse(other, command).status == Status::Ok {
         return Some(format!(
