@@ -64,7 +64,7 @@ test("preview skips leading cd but expanded input keeps it", () => {
   const only = parseAgentLog('[tool.Bash] Bash(command="cd /x")')[0];
   assert.equal(agentLogPreview(only), "cd /x");
   const other = parseAgentLog("[tool.Read] Read(path=a)")[0];
-  assert.equal(agentLogPreview(other), "path=a");
+  assert.equal(agentLogPreview(other), "a");
 });
 
 test("structured records merge call and result by tool-use id", () => {
@@ -191,4 +191,34 @@ test("agentLogPrettyInput pretty-prints valid JSON and leaves everything else al
   assert.equal(agentLogPrettyInput("[oops"), "[oops");
   assert.equal(agentLogPrettyInput("plain"), "plain");
   assert.equal(agentLogPrettyInput(""), "");
+});
+
+const { redactAgentLogEntry } = new Function(`${src.slice(a, b)}\nreturn { redactAgentLogEntry };`)();
+
+test("record entries get sorted args, and previews pick a meaningful value", () => {
+  const e = parse(
+    rec({ id: "r", tool: "Read", input: '{"limit":5,"file_path":"/a/b.rs"}' }),
+    rec({ id: "b", tool: "Bash", input: '{"description":"d","command":"cd /x && ls"}' }),
+    rec({ id: "g", tool: "Grep", input: '{"glob":"*.rs","pattern":"foo"}' }),
+    rec({ id: "o", tool: "Other", input: '{"zeta":"z","alpha":"first"}' }),
+    rec({ id: "n", tool: "Read" }),
+  );
+  assert.deepEqual(e[0].args.map((x) => [x.key, x.value]), [["file_path", "/a/b.rs"], ["limit", "5"]]);
+  assert.equal(agentLogPreview(e[0]), "/a/b.rs");
+  assert.equal(agentLogPreview(e[1]), "ls");
+  assert.equal(agentLogPreview(e[2]), "foo");
+  assert.equal(agentLogPreview(e[3]), "first");
+  assert.equal(e[4].args.length, 0);
+});
+
+test("argument values are redacted on the record and text paths", () => {
+  const redact = (t) => t.replace(/(token\s*=\s*)\S+/g, "$1[REDACTED]").replace(/sk-[a-z0-9]{8,}/g, "[REDACTED]");
+  const r = parse(rec({ id: "a", tool: "Http", input: '{"token":"hunter2","url":"u","note":"sk-abcdefgh12"}' }))[0];
+  const t = parseAgentLog('[tool.Http] Http(token="hunter2", url=u)')[0];
+  for (const e of [r, t]) {
+    redactAgentLogEntry(e, redact);
+    assert.equal(e.args.find((x) => x.key === "token").value, "[REDACTED]");
+    assert.equal(e.args.find((x) => x.key === "url").value, "u");
+  }
+  assert.equal(r.args.find((x) => x.key === "note").value, "[REDACTED]");
 });

@@ -27,6 +27,8 @@
        */
       /** Tools whose `command` argument is a shell command line. */
       const AGENT_LOG_SHELL_TOOLS = ["Bash", "bash", "PowerShell", "powershell", "exec"];
+      /** Argument names a non-shell call's collapsed row prefers, in priority order. */
+      const AGENT_LOG_PREVIEW_KEYS = ["file_path", "path", "pattern", "command", "url", "query"];
       /** How many of the newest entries are drawn before "show earlier" is pressed. */
       const AGENT_LOG_PAGE = 150;
       /** Marker of a structured tool record; matches runner/src/tool_record.rs::TOOL_MARKER. */
@@ -88,9 +90,15 @@
        */
       function agentLogPreview(e) {
         let text = e.input;
+        const cmd = e.args.find((a) => a.key === "command" || a.key === "cmd");
+        if (!AGENT_LOG_SHELL_TOOLS.includes(e.tool) && e.args.length > 0) {
+          const key = AGENT_LOG_PREVIEW_KEYS.find((k) => e.args.some((a) => a.key === k));
+          const pick = key === undefined ? e.args[0] : e.args.find((a) => a.key === key);
+          if (pick !== undefined) text = pick.value;
+        }
         if (AGENT_LOG_SHELL_TOOLS.includes(e.tool)) {
-          const cmd = e.args.find((a) => a.key === "command" || a.key === "cmd");
           if (cmd !== undefined) text = cmd.value;
+          else if (e.args.length > 0) text = e.args[0].value;
           const cd = /^\s*cd\s+(?:"[^"]*"|'[^']*'|[^\s&;|]+)\s*(?:&&|;|\n)\s*/;
           let rest = text;
           while (cd.test(rest)) rest = rest.replace(cd, "");
@@ -152,7 +160,10 @@
             cur.sub = typeof rec.sub === "string" ? rec.sub : "";
             cur.tag = typeof rec.tag === "string" ? rec.tag : `tool.${rec.tool}`;
           }
-          if (typeof rec.input === "string") cur.input = agentLogPrettyInput(rec.input);
+          if (typeof rec.input === "string") {
+            cur.args = splitAgentLogArgs(rec.input);
+            cur.input = agentLogPrettyInput(rec.input);
+          }
           if (typeof rec.output === "string") {
             cur.output = rec.output;
             cur.status = rec.is_error ? "error" : "ok";
@@ -228,6 +239,20 @@
         if (f.q === "") return true;
         const q = f.q.toLowerCase();
         return `${e.tool}\n${e.sub}\n${e.input}\n${e.output}`.toLowerCase().includes(q);
+      }
+      /**
+       * Masks an entry's input, output and each argument value in place. An
+       * argument whose name looks like a credential is masked whole.
+       * @param {AgentLogEntry} e
+       * @param {(text: string) => string} redact
+       * @returns {void}
+       */
+      function redactAgentLogEntry(e, redact) {
+        e.input = redact(e.input);
+        e.output = redact(e.output);
+        for (const arg of e.args) {
+          arg.value = redact(`${arg.key}=x`) !== `${arg.key}=x` ? "[REDACTED]" : redact(arg.value);
+        }
       }
       // RALPHUS-AGENT-LOG:END
 
@@ -403,10 +428,7 @@
         const memo = agentLogParsed[key];
         if (memo && memo.src === src) return memo.entries;
         const entries = parseAgentLog(src);
-        for (const e of entries) {
-          e.input = redactAgentLog(e.input);
-          e.output = redactAgentLog(e.output);
-        }
+        for (const e of entries) redactAgentLogEntry(e, redactAgentLog);
         agentLogParsed[key] = { src, entries };
         return entries;
       }
