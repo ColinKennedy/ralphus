@@ -22,13 +22,22 @@ pub(crate) fn parse(shell: Shell, text: &str) -> Parsed {
     let language = match shell {
         Shell::Bash => tree_sitter_bash::LANGUAGE,
         Shell::PowerShell => tree_sitter_powershell::LANGUAGE,
+        Shell::Cmd => tree_sitter_batch::LANGUAGE,
     };
     if parser.set_language(&language.into()).is_err() {
         return Parsed::empty(Status::Unparsed);
     }
     let deadline = Instant::now() + Duration::from_millis(PARSE_TIMEOUT_MS);
     let mut over_budget = |_: &tree_sitter::ParseState| Instant::now() > deadline;
-    let bytes = text.as_bytes();
+    // The batch grammar ends every statement with a newline, so a one-line
+    // command needs one appended; the extra byte lies past every span.
+    let owned;
+    let bytes = if shell == Shell::Cmd && !text.ends_with(char::from(10)) {
+        owned = format!("{text}{}", char::from(10));
+        owned.as_bytes()
+    } else {
+        text.as_bytes()
+    };
     let tree = parser.parse_with_options(
         &mut |offset, _| &bytes[offset.min(bytes.len())..],
         None,
@@ -45,6 +54,7 @@ pub(crate) fn parse(shell: Shell, text: &str) -> Parsed {
     match shell {
         Shell::Bash => flatten_bash(root, &mut items),
         Shell::PowerShell => flatten_powershell(root, &mut items),
+        Shell::Cmd => flatten_cmd(root, &mut items),
     }
     let mut spans = Vec::new();
     collect_spans(shell, root, text, &mut spans);
@@ -147,6 +157,25 @@ fn flatten_powershell(node: Node, items: &mut Vec<Item>) {
     }
 }
 
+/// `&`, `&&` and `||` nest as `command_sep` / `cond_exec` nodes; a `|` pipeline
+/// (`pipe_stmt`) stays one row, like Bash and PowerShell.
+fn flatten_cmd(node: Node, items: &mut Vec<Item>) {
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if !child.is_named() {
+            if matches!(child.kind(), "&" | "&&" | "||") {
+                items.push(Item::Sep(child.kind().to_string()));
+            }
+            continue;
+        }
+        match child.kind() {
+            "comment" => {}
+            "command_sep" | "cond_exec" => flatten_cmd(child, items),
+            _ => row(child, items),
+        }
+    }
+}
+
 fn has_child(node: Node, kind: &str) -> bool {
     let mut cursor = node.walk();
     node.children(&mut cursor).any(|c| c.kind() == kind)
@@ -186,6 +215,17 @@ fn classify(shell: Shell, node: Node, text: &str) -> Option<SpanKind> {
             "command_name" => Some(SpanKind::CommandName),
             "command_parameter" => Some(SpanKind::Flag),
             "merging_redirection_operator" | "file_redirection_operator" => {
+                Some(SpanKind::Operator)
+            }
+            _ => None,
+        },
+        Shell::Cmd => match kind {
+            "comment" => Some(SpanKind::Comment),
+            "string" => Some(SpanKind::String),
+            "variable_reference" | "for_variable" => Some(SpanKind::Variable),
+            "command_name" => Some(SpanKind::CommandName),
+            "command_option" | "if_option" | "for_options" => Some(SpanKind::Flag),
+            "redirect_op" | "redirect_target" | "fd_redirect" | "fd_redirect_op" => {
                 Some(SpanKind::Operator)
             }
             _ => None,
@@ -337,5 +377,71 @@ mod tests {
         let p = parse(Shell::Bash, "");
         assert_eq!(p.status, Status::Ok);
         assert!(p.commands.is_empty());
+    }
+
+    #[test]
+    fn cmd_splits_on_ampersands_but_not_pipes() {
+        let t = "echo hi & dir && cd x || echo \"a b\" 2>nul";
+        let p = parse(Shell::Cmd, t);
+        assert_eq!(p.status, Status::Ok);
+        assert_eq!(
+            texts(&p),
+            vec![
+                ("", "echo hi"),
+                ("&", "dir"),
+                ("&&", "cd x"),
+                ("||", "echo \"a b\" 2>nul"),
+            ]
+        );
+        for c in &p.commands {
+            assert_eq!(&t[c.start..c.end], c.text);
+        }
+        assert!(has(&p, t, SpanKind::CommandName, "dir"));
+        assert!(has(&p, t, SpanKind::String, "\"a b\""));
+        assert!(has(&p, t, SpanKind::Operator, "&&"));
+        assert!(has(&p, t, SpanKind::Operator, "2>"));
+        assert!(has(&p, t, SpanKind::Operator, "nul"));
+    }
+
+    #[test]
+    fn cmd_newlines_pipes_and_caret_escapes() {
+        let t = "echo a ^& b ^^ c | findstr /i x >nul 2>&1\r\ndir";
+        let p = parse(Shell::Cmd, t);
+        assert_eq!(p.status, Status::Ok);
+        assert_eq!(
+            texts(&p),
+            vec![
+                ("", "echo a ^& b ^^ c | findstr /i x >nul 2>&1"),
+                ("", "dir"),
+            ]
+        );
+        assert!(has(&p, t, SpanKind::Operator, "|"));
+        assert!(has(&p, t, SpanKind::Flag, "/i"));
+        assert!(has(&p, t, SpanKind::Operator, "2>&1"));
+        // An escaped `&` is an argument, not a separator.
+        assert!(!has(&p, t, SpanKind::Operator, "&"));
+    }
+
+    #[test]
+    fn cmd_variables_and_if_for_one_liners() {
+        let t = "for %%i in (a b) do echo %%i %PATH%";
+        let p = parse(Shell::Cmd, t);
+        assert_eq!(p.status, Status::Ok);
+        assert_eq!(p.commands.len(), 1);
+        assert!(has(&p, t, SpanKind::Variable, "%%i"));
+        assert!(has(&p, t, SpanKind::Variable, "%PATH%"));
+
+        let t = "if exist a.txt (del a.txt) else echo no";
+        let p = parse(Shell::Cmd, t);
+        assert_eq!(p.status, Status::Ok);
+        assert_eq!(p.commands.len(), 1);
+        assert!(has(&p, t, SpanKind::CommandName, "del"));
+    }
+
+    #[test]
+    fn cmd_parse_failure_is_unparsed() {
+        let p = parse(Shell::Cmd, "if exist");
+        assert_eq!(p.status, Status::Unparsed);
+        assert!(p.commands.is_empty() && p.spans.is_empty());
     }
 }
