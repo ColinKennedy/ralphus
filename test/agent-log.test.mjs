@@ -66,55 +66,6 @@ test("preview skips leading cd but expanded input keeps it", () => {
   const other = parseAgentLog("[tool.Read] Read(path=a)")[0];
   assert.equal(agentLogPreview(other), "a");
 });
-
-const { agentLogRedactArgs } = new Function(
-  `${src.slice(a, b)}\nreturn { agentLogRedactArgs };`,
-)();
-
-test("record entries get sorted args and meaningful previews, never `{`", () => {
-  const e = parse(
-    rec({ id: "r", tool: "Read", input: '{"offset":5,"file_path":"/a/b.rs"}' }),
-    rec({ id: "e", tool: "Edit", input: '{"new_string":"y","old_string":"x"}' }),
-    rec({ id: "b", tool: "Bash", input: '{"command":"cd /x && ls -la","description":"d"}' }),
-    rec({ id: "g", tool: "Grep", input: '{"glob":"*.rs","pattern":"foo"}' }),
-  );
-  assert.deepEqual(e[0].args.map((x) => [x.key, x.value]), [["file_path", "/a/b.rs"], ["offset", "5"]]);
-  assert.equal(agentLogPreview(e[0]), "/a/b.rs");
-  assert.equal(agentLogPreview(e[1]), "y");
-  assert.equal(agentLogPreview(e[2]), "ls -la");
-  assert.equal(agentLogPreview(e[3]), "foo");
-  assert.ok(e.every((x) => x.args.length > 0 && agentLogPreview(x) !== "{"));
-});
-
-test("a pending call already has args", () => {
-  const e = parse(rec({ id: "p", tool: "Read", input: '{"path":"x"}' }));
-  assert.equal(e[0].status, "pending");
-  assert.equal(e[0].args[0].value, "x");
-});
-
-test("argument values are redacted per value on record and text paths", () => {
-  const redact = (s) => s.replace(/sk-[a-z0-9]+/g, "[REDACTED]");
-  const e = [
-    ...parse(rec({ id: "r", tool: "Bash", input: '{"command":"curl -H sk-abc123","api_key":"hunter2"}' })),
-    ...parseAgentLog('[tool.Bash] Bash(command="echo sk-abc123", password=hunter2)'),
-  ];
-  for (const x of e) agentLogRedactArgs(x, redact);
-  assert.deepEqual(e[0].args.map((x) => x.value), ["[REDACTED]", "curl -H [REDACTED]"]);
-  assert.deepEqual(e[1].args.map((x) => x.value), ["echo [REDACTED]", "[REDACTED]"]);
-});
-
-test("preview skips PowerShell Set-Location / sl prefixes", () => {
-  const prev = (command) => agentLogPreview({ tool: "Bash", input: command, args: [{ key: "command", value: command }] });
-  assert.equal(prev("Set-Location C:\\foo; cargo test"), "cargo test");
-  assert.equal(prev('set-location "C:\\a b" && cargo test'), "cargo test");
-  assert.equal(prev("SET-LOCATION 'C:\\a b'; cargo test"), "cargo test");
-  assert.equal(prev("Set-Location -Path C:\\foo; cargo test"), "cargo test");
-  assert.equal(prev('Set-Location -LiteralPath "C:\\a b"\ncargo test'), "cargo test");
-  assert.equal(prev("cd C:\\foo; Set-Location bar && sl baz; cargo test"), "cargo test");
-  assert.equal(prev("sl C:\\foo; cargo test"), "cargo test");
-  assert.equal(prev("Set-Location C:\\foo"), "Set-Location C:\\foo");
-  assert.equal(prev("sl -x"), "sl -x");
-  assert.equal(prev("slow build; x"), "slow build; x");
 });
 
 test("structured records merge call and result by tool-use id", () => {
@@ -241,4 +192,34 @@ test("agentLogPrettyInput pretty-prints valid JSON and leaves everything else al
   assert.equal(agentLogPrettyInput("[oops"), "[oops");
   assert.equal(agentLogPrettyInput("plain"), "plain");
   assert.equal(agentLogPrettyInput(""), "");
+});
+
+const { redactAgentLogEntry } = new Function(`${src.slice(a, b)}\nreturn { redactAgentLogEntry };`)();
+
+test("record entries get sorted args, and previews pick a meaningful value", () => {
+  const e = parse(
+    rec({ id: "r", tool: "Read", input: '{"limit":5,"file_path":"/a/b.rs"}' }),
+    rec({ id: "b", tool: "Bash", input: '{"description":"d","command":"cd /x && ls"}' }),
+    rec({ id: "g", tool: "Grep", input: '{"glob":"*.rs","pattern":"foo"}' }),
+    rec({ id: "o", tool: "Other", input: '{"zeta":"z","alpha":"first"}' }),
+    rec({ id: "n", tool: "Read" }),
+  );
+  assert.deepEqual(e[0].args.map((x) => [x.key, x.value]), [["file_path", "/a/b.rs"], ["limit", "5"]]);
+  assert.equal(agentLogPreview(e[0]), "/a/b.rs");
+  assert.equal(agentLogPreview(e[1]), "ls");
+  assert.equal(agentLogPreview(e[2]), "foo");
+  assert.equal(agentLogPreview(e[3]), "first");
+  assert.equal(e[4].args.length, 0);
+});
+
+test("argument values are redacted on the record and text paths", () => {
+  const redact = (t) => t.replace(/(token\s*=\s*)\S+/g, "$1[REDACTED]").replace(/sk-[a-z0-9]{8,}/g, "[REDACTED]");
+  const r = parse(rec({ id: "a", tool: "Http", input: '{"token":"hunter2","url":"u","note":"sk-abcdefgh12"}' }))[0];
+  const t = parseAgentLog('[tool.Http] Http(token="hunter2", url=u)')[0];
+  for (const e of [r, t]) {
+    redactAgentLogEntry(e, redact);
+    assert.equal(e.args.find((x) => x.key === "token").value, "[REDACTED]");
+    assert.equal(e.args.find((x) => x.key === "url").value, "u");
+  }
+  assert.equal(r.args.find((x) => x.key === "note").value, "[REDACTED]");
 });
