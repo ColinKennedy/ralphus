@@ -5649,7 +5649,8 @@ pub fn stop_actioning(
     }
 
     let final_status = if rebase_stop || !worker_left {
-        match store.lock().stop_guardian_merge(id) {
+        let stop_result = store.lock().stop_guardian_merge(id);
+        match stop_result {
             Ok(status) => status.as_str().to_string(),
             Err(_) => store
                 .lock()
