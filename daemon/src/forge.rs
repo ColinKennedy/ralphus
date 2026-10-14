@@ -1037,6 +1037,17 @@ impl ForgeClient {
         &self,
         number: i64,
     ) -> Result<(String, Option<String>), String> {
+        self.get_pull_request_live(number)
+            .map(|live| (live.state, live.head))
+    }
+
+    /// [`Self::get_pull_request_state_and_head`] plus the PR/MR's source
+    /// branch. PR/MR numbers are only unique within one repository, so a
+    /// caller that may be asking the wrong repository (a recorded `repo` that
+    /// no longer matches the resolved client) compares
+    /// [`LivePullRequest::source_branch`] to the branch it filed the PR from
+    /// before trusting the answer.
+    pub fn get_pull_request_live(&self, number: i64) -> Result<LivePullRequest, String> {
         // ralphus[ignore-rlog-pair]: this provider boundary has no Store; its caller records the structured workflow outcome
         crate::rlog!(
             DEBUG,
@@ -1047,11 +1058,12 @@ impl ForgeClient {
         let result = self.get_pull_request_state_inner(number);
         match &result {
             // ralphus[ignore-rlog-pair]: this provider boundary has no Store; its caller records the structured workflow outcome
-            Ok((state, _)) => crate::rlog!(
+            Ok(live) => crate::rlog!(
                 DEBUG,
-                "ralphus [forge] get pr state done kind={} repo={} number={number} state={state}",
+                "ralphus [forge] get pr state done kind={} repo={} number={number} state={}",
                 self.kind.as_str(),
-                self.repo_path
+                self.repo_path,
+                live.state
             ),
             // ralphus[ignore-rlog-pair]: this provider boundary has no Store; its caller records the structured workflow outcome
             Err(e) => crate::rlog!(
@@ -1064,10 +1076,7 @@ impl ForgeClient {
         result
     }
 
-    fn get_pull_request_state_inner(
-        &self,
-        number: i64,
-    ) -> Result<(String, Option<String>), String> {
+    fn get_pull_request_state_inner(&self, number: i64) -> Result<LivePullRequest, String> {
         let token = self.require_token()?;
         match self.kind {
             ForgeKind::GitHub => {
@@ -1079,10 +1088,17 @@ impl ForgeClient {
                         .set("Accept", "application/vnd.github+json"),
                 )?;
                 let head = resp["head"]["sha"].as_str().map(str::to_string);
-                if resp["merged"].as_bool().unwrap_or(false) {
-                    return Ok(("merged".to_string(), head));
-                }
-                Ok((resp["state"].as_str().unwrap_or("open").to_string(), head))
+                let source_branch = resp["head"]["ref"].as_str().map(str::to_string);
+                let state = if resp["merged"].as_bool().unwrap_or(false) {
+                    "merged".to_string()
+                } else {
+                    resp["state"].as_str().unwrap_or("open").to_string()
+                };
+                Ok(LivePullRequest {
+                    state,
+                    head,
+                    source_branch,
+                })
             }
             ForgeKind::GitLab => {
                 let url = format!(
@@ -1094,11 +1110,16 @@ impl ForgeClient {
                     .as_str()
                     .or_else(|| resp["diff_refs"]["head_sha"].as_str())
                     .map(str::to_string);
+                let source_branch = resp["source_branch"].as_str().map(str::to_string);
                 let state = match resp["state"].as_str().unwrap_or("opened") {
                     "opened" => "open".to_string(),
                     other => other.to_string(),
                 };
-                Ok((state, head))
+                Ok(LivePullRequest {
+                    state,
+                    head,
+                    source_branch,
+                })
             }
         }
     }
@@ -4445,6 +4466,18 @@ pub struct PrRoute {
     /// `target_project_id` makes the parent allocate the MR's `iid`
     /// (RAL-496) even though the create call itself POSTs to the fork.
     pub repo: String,
+}
+
+/// One PR/MR's live forge answer ([`ForgeClient::get_pull_request_live`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LivePullRequest {
+    /// Normalized `"open"`/`"merged"`/`"closed"`.
+    pub state: String,
+    /// The source-head commit SHA, when the response carries one.
+    pub head: Option<String>,
+    /// The branch the PR/MR was filed from (GitHub's `head.ref`, GitLab's
+    /// `source_branch`), when the response carries one.
+    pub source_branch: Option<String>,
 }
 
 impl PrRoute {

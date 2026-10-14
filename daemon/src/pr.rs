@@ -4368,18 +4368,13 @@ pub fn check_pr_merges(store: &crate::store_lock::StoreHandle, id: &str) -> bool
         set_merge_state_unknown(id, false);
         return false;
     }
-    if prs
-        .iter()
-        .all(|pull_request| pull_request.state == "merged")
-    {
-        set_merge_state_unknown(id, false);
-        return settle_pr_merge_states(store, id, &[]);
-    }
-
-    // Resolve each open PR's forge client up front (cheap, local config/DB
-    // reads); the actual forge call is the only genuinely slow part here,
-    // and is fired off concurrently below since one PR's merge state has no
-    // bearing on any other's.
+    // Resolve each open or recorded-merged PR's forge client up front (cheap,
+    // local config/DB reads); the actual forge call is the only genuinely
+    // slow part here, and is fired off concurrently below since one PR's
+    // merge state has no bearing on any other's. A recorded `merged` is
+    // re-checked like an `open` row rather than trusted: it may have been
+    // written from another project's PR that shared the number, and a
+    // review settles as merged on it.
     struct MergeCheckJob<'a> {
         pr: &'a PullRequestView,
         client: crate::forge::ForgeClient,
@@ -4388,7 +4383,7 @@ pub fn check_pr_merges(store: &crate::store_lock::StoreHandle, id: &str) -> bool
     let mut unknown = false;
     for pr in prs
         .iter()
-        .filter(|pull_request| pull_request.state == "open")
+        .filter(|pull_request| matches!(pull_request.state.as_str(), "open" | "merged"))
     {
         let project_root = pr
             .branch_id
@@ -4421,7 +4416,12 @@ pub fn check_pr_merges(store: &crate::store_lock::StoreHandle, id: &str) -> bool
             // extends the limit. The outage notice was raised when the limit
             // was first seen ([`crate::forge_health::report_failure`]).
             Some(client) if is_backed_off(client) => unknown = true,
-            Some(client) if client.kind().as_str() == pr.forge => {
+            // The number is only meaningful in the repository that allocated
+            // it, so a client for any other repository (a stale recorded
+            // `repo`, a removed fork) would answer for an unrelated PR/MR.
+            Some(client)
+                if client.kind().as_str() == pr.forge && client.repo_label() == pr.repo =>
+            {
                 jobs.push(MergeCheckJob {
                     pr,
                     client: client.clone(),
@@ -4473,6 +4473,7 @@ pub fn check_pr_merges(store: &crate::store_lock::StoreHandle, id: &str) -> bool
     });
 
     let mut freshly_merged = Vec::new();
+    let mut reverted = false;
     for (job, result) in jobs.iter().zip(fetched) {
         if let Some(Err(error)) = &result {
             unknown = true;
@@ -4483,7 +4484,7 @@ pub fn check_pr_merges(store: &crate::store_lock::StoreHandle, id: &str) -> bool
                 start_backoff(&job.client, None);
             }
         }
-        apply_pr_merge_state(store, id, job.pr, result, &mut freshly_merged);
+        reverted |= apply_pr_merge_state(store, id, job.pr, result, &mut freshly_merged);
     }
     set_merge_state_unknown(id, unknown);
     // RAL-338: react to a freshly-observed cross-repository root merge
@@ -4491,7 +4492,7 @@ pub fn check_pr_merges(store: &crate::store_lock::StoreHandle, id: &str) -> bool
     // already exists when `settle_pr_merge_states` re-reads this guardian's
     // current PRs just below.
     maybe_promote_fork_root(store, id, &guardian, &freshly_merged);
-    settle_pr_merge_states(store, id, &freshly_merged)
+    settle_pr_merge_states(store, id, &freshly_merged) || reverted
 }
 
 /// Reconcile-first promotion (RAL-338 Phase 5): once the stack's cross-
@@ -4979,12 +4980,16 @@ fn apply_pr_merge_check(
     client: &crate::forge::ForgeClient,
 ) -> bool {
     let mut freshly_merged: Vec<PullRequestView> = Vec::new();
-    for pr in prs.iter().filter(|p| p.state == "open") {
+    let mut reverted = false;
+    for pr in prs
+        .iter()
+        .filter(|p| matches!(p.state.as_str(), "open" | "merged"))
+    {
         let fetched = fetch_pr_merge_state(pr, client);
-        apply_pr_merge_state(store, id, pr, fetched, &mut freshly_merged);
+        reverted |= apply_pr_merge_state(store, id, pr, fetched, &mut freshly_merged);
     }
 
-    settle_pr_merge_states(store, id, &freshly_merged)
+    settle_pr_merge_states(store, id, &freshly_merged) || reverted
 }
 
 /// The network half of a single PR's merge-state check: just the forge call,
@@ -4996,16 +5001,28 @@ fn fetch_pr_merge_state(
     client: &crate::forge::ForgeClient,
 ) -> Option<std::result::Result<String, String>> {
     let number = pr.pr_number?;
-    Some(
-        client
-            .get_pull_request_state_and_head(number)
-            .map(|(state, head)| {
-                if let Some(head) = head {
-                    note_forge_head(&pr.id, &head);
-                }
-                state
-            }),
-    )
+    Some(client.get_pull_request_live(number).and_then(|live| {
+        // PR/MR numbers are unique only within one repository. If the number
+        // resolves to a PR filed from some other branch, this client is
+        // pointed at a different project than the one that allocated it, and
+        // its answer says nothing about this PR.
+        if let Some(source) = live.source_branch.as_deref() {
+            if source != pr.branch_alias {
+                return Err(format!(
+                    "{} #{number} in {} was filed from branch {source}, not {}; the recorded \
+                     repo {} is not the one that allocated this number",
+                    client.kind().as_str(),
+                    client.repo_label(),
+                    pr.branch_alias,
+                    pr.repo
+                ));
+            }
+        }
+        if let Some(head) = live.head {
+            note_forge_head(&pr.id, &head);
+        }
+        Ok(live.state)
+    }))
 }
 
 /// How long a forge-reported PR head ([`note_forge_head`]) may stand in for a
@@ -5069,20 +5086,59 @@ fn can_skip_pr_fetch(
 /// already-fetched forge state ([`fetch_pr_merge_state`]) to the PR row and
 /// `freshly_merged`. Kept serial (unlike the fetch) since it mutates shared
 /// state.
+///
+/// A row recorded `merged` that the forge now reports otherwise was recorded
+/// wrongly (another project's PR shared its number, or the forge reopened it):
+/// the row takes the forge's state and its branch leaves `merged` again
+/// ([`revert_branch_marked_merged`]). Returns whether it did so.
 fn apply_pr_merge_state(
     store: &crate::store_lock::StoreHandle,
     id: &str,
     pr: &PullRequestView,
     fetched: Option<std::result::Result<String, String>>,
     freshly_merged: &mut Vec<PullRequestView>,
-) {
+) -> bool {
     let Some(result) = fetched else {
-        return;
+        return false;
     };
     if result.is_ok() {
         crate::forge_health::note_success(&pr.forge, &pr.repo);
     }
     match result {
+        Ok(state) if state == pr.state => {}
+        Ok(state) if pr.state == "merged" => {
+            let result = store.lock().update_pull_request_ex(
+                &pr.id,
+                None,
+                None,
+                None,
+                Some(&state),
+                None,
+                None,
+                None,
+            );
+            warn_on_store_write(store, "update_pull_request_ex", &pr.id, false, result);
+            crate::rlog!(
+                WARNING,
+                "ralphus [pr] review {id} pr {} was recorded merged but the forge reports it \
+                 {state}; corrected",
+                pr.id
+            );
+            crate::cartographer::Note::new("pr")
+                .level(crate::logging::LogLevel::WARNING)
+                .scope("guardian")
+                .guardian(id)
+                .emit(
+                    &store.lock(),
+                    "linked pr recorded merged but the forge reports otherwise; corrected",
+                    serde_json::json!({"pr_id": pr.id, "state": state}),
+                );
+            revert_branch_marked_merged(store, id, pr);
+            if state == "closed" {
+                mark_branch_pr_closed_externally(store, id, pr);
+            }
+            return true;
+        }
         Ok(state) if state != "open" => {
             let result = store.lock().update_pull_request_ex(
                 &pr.id,
@@ -5129,6 +5185,50 @@ fn apply_pr_merge_state(
         Ok(_) => {}
         Err(error) => log_pr_merge_check_failure(store, id, pr, &error),
     }
+    false
+}
+
+/// The `detail` [`settle_pr_merge_states`] stamps on a branch it marks
+/// `merged` because its PR merged; [`revert_branch_marked_merged`] undoes only
+/// that, never a `merged` the rebase path set from git ancestry (RAL-480).
+const BRANCH_PR_MERGED_DETAIL: &str = "pr merged";
+
+/// Takes `pr`'s branch out of `merged` when `merged` came from its PR merging
+/// and that PR is not merged: back to `done`, where it is submittable again.
+/// A no-op for a `merged` set any other way, a non-"parent" row, or a branch
+/// in any other status. Returns whether it changed the branch.
+fn revert_branch_marked_merged(
+    store: &crate::store_lock::StoreHandle,
+    id: &str,
+    pr: &PullRequestView,
+) -> bool {
+    if pr.pr_kind != "parent" {
+        return false;
+    }
+    let Some(branch_id) = pr.branch_id.as_deref() else {
+        return false;
+    };
+    let Ok(guardian) =
+        store.with_read_snapshot(|conn| crate::store::Store::get_guardian_conn(conn, id))
+    else {
+        return false;
+    };
+    let marked_by_pr = guardian.branches.iter().any(|b| {
+        b.id == branch_id
+            && b.merge_status == MergeStatus::Merged.as_str()
+            && b.detail.as_deref() == Some(BRANCH_PR_MERGED_DETAIL)
+    });
+    if !marked_by_pr {
+        return false;
+    }
+    let result = store.lock().set_branch_status(
+        id,
+        branch_id,
+        MergeStatus::Done,
+        Some("pr no longer merged on the forge"),
+    );
+    warn_on_store_write(store, "set_branch_status", id, true, result);
+    true
 }
 
 /// Marks the branch whose "parent"-kind PR was just observed closed on the
@@ -5299,7 +5399,11 @@ fn settle_pr_merge_states(
         // which deliberately leaves branch/guardian state alone instead.
         let mut any_branch_freshly_marked_merged = false;
         for pull_request in &live_prs {
+            // A branch marked merged from a PR row that has since gone back
+            // to open (or closed) is not merged: restore it.
             if pull_request.state != "merged" {
+                any_branch_freshly_marked_merged |=
+                    revert_branch_marked_merged(store, id, pull_request);
                 continue;
             }
             let Some(branch_id) = pull_request.branch_id.as_deref() else {
@@ -5315,7 +5419,7 @@ fn settle_pr_merge_states(
                     id,
                     branch_id,
                     MergeStatus::Merged,
-                    Some("pr merged"),
+                    Some(BRANCH_PR_MERGED_DETAIL),
                 );
                 warn_on_store_write(store, "set_branch_status", id, true, result);
                 any_branch_freshly_marked_merged = true;
@@ -8688,9 +8792,9 @@ fn refresh_open_prs<'a>(
     open_by_branch
         .into_iter()
         .filter(|(_, pr)| {
-            let Some(number) = pr.pr_number else {
+            if pr.pr_number.is_none() {
                 return true;
-            };
+            }
             // A GitLab MR IID is scoped to its project. In fork mode, the
             // parent-project root MR and fork-internal stack MRs can have
             // the same IID, so every row must be queried through the client
@@ -8700,7 +8804,7 @@ fn refresh_open_prs<'a>(
                     &pr.repo,
                     &[&routing.parent_client, &routing.fork_client],
                 ),
-                None => Some(client),
+                None => Some(client).filter(|c| c.repo_label() == pr.repo),
             };
             let Some(state_client) = state_client else {
                 let git_root = store
@@ -8726,7 +8830,9 @@ fn refresh_open_prs<'a>(
                     );
                 return true;
             };
-            match state_client.get_pull_request_state(number) {
+            // The number is only meaningful in the repository that allocated
+            // it; the guarded fetch rejects an answer for another branch's PR.
+            match fetch_pr_merge_state(pr, state_client).unwrap_or_else(|| Ok("open".to_string())) {
                 Ok(state) if state != "open" => {
                     // ralphus[ignore-rlog-pair]: this low-level helper has no Store; its Store-owning caller records the structured workflow outcome
                     crate::rlog!(
@@ -16952,6 +17058,52 @@ mod tests {
     }
 
     #[test]
+    fn refresh_open_prs_ignores_a_closed_mr_of_the_same_number_in_another_project() {
+        // The recorded `repo` is `acme/widget`, but the client is pointed at a
+        // different project whose MR #3 is closed and filed from another
+        // branch: that must neither close this row nor count as an answer.
+        let mock = MockForge::start(move |server| {
+            let req = server.recv();
+            req.respond(
+                tiny_http::Response::from_string(
+                    r#"{"state": "closed", "source_branch": "someone-elses-branch"}"#,
+                )
+                .with_status_code(200),
+            )
+            .unwrap();
+        });
+        let store = Arc::new(crate::store_lock::StoreMutex::new(store()));
+        let gid = store
+            .lock()
+            .create_guardian("demo", "main", "/repo")
+            .unwrap();
+        let pr_id = store
+            .lock()
+            .create_pull_request(
+                &gid,
+                Some("branch-000000000001"),
+                "gitlab",
+                "acme/widget",
+                "feature/foo",
+                "main",
+                "Add foo",
+                "Adds the foo thing.",
+                Some(3),
+                None,
+            )
+            .unwrap();
+        let client = mock.client(crate::forge::ForgeKind::GitLab, "acme/widget");
+        let prs = store.lock().list_pull_requests_for_guardian(&gid).unwrap();
+        let by_branch = open_prs_by_branch(&prs);
+
+        let refreshed = refresh_open_prs(&store, &gid, &client, None, by_branch);
+
+        assert_eq!(refreshed.len(), 1, "an unrelated MR must not close the row");
+        assert_eq!(store.lock().get_pull_request(&pr_id).unwrap().state, "open");
+        mock.finish();
+    }
+
+    #[test]
     fn refresh_open_prs_uses_the_parent_client_for_a_fork_mode_root_gitlab_mr() {
         let mock = MockForge::start(move |server| {
             let req = server.recv();
@@ -17715,6 +17867,260 @@ token_env = "RALPHUS_TEST_FORGE_TOKEN"
         assert_eq!(pr_a_row.state, "merged");
 
         mock.finish();
+    }
+
+    /// A `in_review` GitLab review with one `done` branch `feature/foo` whose
+    /// MR is #7 in `acme/widget`; returns `(store, guardian id, branch id, pr id)`.
+    fn gitlab_review_with_one_mr() -> (Arc<crate::store_lock::StoreMutex>, String, String, String) {
+        let store = Arc::new(crate::store_lock::StoreMutex::new(store()));
+        let gid = store
+            .lock()
+            .create_guardian("demo", "main", "/repo")
+            .unwrap();
+        store
+            .lock()
+            .set_guardian_status(&gid, GuardianStatus::InReview, None)
+            .unwrap();
+        store
+            .lock()
+            .add_guardian_branch(&gid, "feature/foo")
+            .unwrap();
+        let branch = store.lock().get_guardian(&gid).unwrap().branches[0]
+            .id
+            .clone();
+        store
+            .lock()
+            .set_branch_status(&gid, &branch, MergeStatus::Done, None)
+            .unwrap();
+        let pr = store
+            .lock()
+            .create_pull_request(
+                &gid,
+                Some(&branch),
+                "gitlab",
+                "acme/widget",
+                "feature/foo",
+                "main",
+                "Add foo",
+                "Adds foo.",
+                Some(7),
+                None,
+            )
+            .unwrap();
+        (store, gid, branch, pr)
+    }
+
+    #[test]
+    fn check_pr_merges_ignores_a_gitlab_mr_number_that_belongs_to_another_project() {
+        // MR numbers are per-project. When the client is pointed at a project
+        // that did not allocate #7, #7 there is some unrelated MR; its
+        // merged state must not be recorded against this branch.
+        let mock = MockForge::start(move |server| {
+            let req = server.recv();
+            req.respond(
+                tiny_http::Response::from_string(
+                    r#"{"state": "merged", "source_branch": "someone-elses-branch", "sha": "abc"}"#,
+                )
+                .with_status_code(200),
+            )
+            .unwrap();
+        });
+        let (store, gid, branch, pr) = gitlab_review_with_one_mr();
+        let client = mock.client(crate::forge::ForgeKind::GitLab, "acme/widget");
+        let prs = store.lock().list_pull_requests_for_guardian(&gid).unwrap();
+
+        let changed = apply_pr_merge_check(&store, &gid, &prs, &client);
+
+        assert!(!changed, "an unrelated MR's state is not a change here");
+        assert_eq!(store.lock().get_pull_request(&pr).unwrap().state, "open");
+        let guardian = store.lock().get_guardian(&gid).unwrap();
+        assert_eq!(guardian.status.as_str(), "in_review");
+        let view = guardian.branches.iter().find(|b| b.id == branch).unwrap();
+        assert_eq!(view.merge_status, MergeStatus::Done.as_str());
+        mock.finish();
+    }
+
+    #[test]
+    fn check_pr_merges_reverifies_a_recorded_merged_gitlab_mr_and_reopens_it() {
+        // A row wrongly recorded `merged` (and its branch marked merged) is
+        // checked against the forge again; the forge says it is open, so the
+        // row and branch both go back.
+        let mock = MockForge::start(move |server| {
+            let req = server.recv();
+            req.respond(
+                tiny_http::Response::from_string(
+                    r#"{"state": "opened", "source_branch": "feature/foo", "sha": "abc"}"#,
+                )
+                .with_status_code(200),
+            )
+            .unwrap();
+        });
+        let (store, gid, branch, pr) = gitlab_review_with_one_mr();
+        store
+            .lock()
+            .update_pull_request(&pr, None, None, None, Some("merged"))
+            .unwrap();
+        store
+            .lock()
+            .set_branch_status(&gid, &branch, MergeStatus::Merged, Some("pr merged"))
+            .unwrap();
+        let client = mock.client(crate::forge::ForgeKind::GitLab, "acme/widget");
+        let prs = store.lock().list_pull_requests_for_guardian(&gid).unwrap();
+
+        let changed = apply_pr_merge_check(&store, &gid, &prs, &client);
+
+        assert!(changed, "correcting a recorded merge is a change");
+        assert_eq!(store.lock().get_pull_request(&pr).unwrap().state, "open");
+        let guardian = store.lock().get_guardian(&gid).unwrap();
+        assert_eq!(guardian.status.as_str(), "in_review");
+        let view = guardian.branches.iter().find(|b| b.id == branch).unwrap();
+        assert_eq!(view.merge_status, MergeStatus::Done.as_str());
+        mock.finish();
+    }
+
+    #[test]
+    fn settle_pr_merge_states_returns_a_pr_merged_branch_to_done_when_its_mr_is_open() {
+        let (store, gid, branch, _pr) = gitlab_review_with_one_mr();
+        store
+            .lock()
+            .set_branch_status(&gid, &branch, MergeStatus::Merged, Some("pr merged"))
+            .unwrap();
+
+        assert!(settle_pr_merge_states(&store, &gid, &[]));
+
+        let guardian = store.lock().get_guardian(&gid).unwrap();
+        let view = guardian.branches.iter().find(|b| b.id == branch).unwrap();
+        assert_eq!(view.merge_status, MergeStatus::Done.as_str());
+    }
+
+    #[test]
+    fn settle_pr_merge_states_keeps_an_ancestry_merged_branch_merged() {
+        // `merged` from git ancestry (not from the PR merging) is not undone
+        // just because a PR for the branch is open.
+        let (store, gid, branch, _pr) = gitlab_review_with_one_mr();
+        store
+            .lock()
+            .set_branch_status(&gid, &branch, MergeStatus::Merged, Some("already upstream"))
+            .unwrap();
+
+        assert!(!settle_pr_merge_states(&store, &gid, &[]));
+
+        let guardian = store.lock().get_guardian(&gid).unwrap();
+        let view = guardian.branches.iter().find(|b| b.id == branch).unwrap();
+        assert_eq!(view.merge_status, MergeStatus::Merged.as_str());
+    }
+
+    /// Live gitlab.com check of the merge-detection fixes. Needs two private
+    /// projects that both have an `!1`: `$RALPHUS_LIVE_GITLAB_A` (encoded
+    /// path; `!1` open, from `feature/foo`) and `$RALPHUS_LIVE_GITLAB_B`
+    /// (`!1` merged, from another branch), plus `$RALPHUS_LIVE_GITLAB_TOKEN`.
+    #[test]
+    #[ignore = "live gitlab.com: needs RALPHUS_LIVE_GITLAB_{TOKEN,A,B}"]
+    fn live_gitlab_same_numbered_mr_in_another_project_is_not_a_merge() {
+        let (Ok(token), Ok(a), Ok(b)) = (
+            std::env::var("RALPHUS_LIVE_GITLAB_TOKEN"),
+            std::env::var("RALPHUS_LIVE_GITLAB_A"),
+            std::env::var("RALPHUS_LIVE_GITLAB_B"),
+        ) else {
+            return;
+        };
+        let new_client = |repo: &str| {
+            crate::forge::ForgeClient::new(
+                crate::forge::ForgeKind::GitLab,
+                "https://gitlab.com/api/v4".to_string(),
+                repo.to_string(),
+                Some(token.clone()),
+            )
+        };
+        let store = Arc::new(crate::store_lock::StoreMutex::new(store()));
+        let gid = store
+            .lock()
+            .create_guardian("demo", "main", "/repo")
+            .unwrap();
+        store
+            .lock()
+            .set_guardian_status(&gid, GuardianStatus::InReview, None)
+            .unwrap();
+        store
+            .lock()
+            .add_guardian_branch(&gid, "feature/foo")
+            .unwrap();
+        let branch = store.lock().get_guardian(&gid).unwrap().branches[0]
+            .id
+            .clone();
+        store
+            .lock()
+            .set_branch_status(&gid, &branch, MergeStatus::Done, None)
+            .unwrap();
+        let pr = store
+            .lock()
+            .create_pull_request(
+                &gid,
+                Some(&branch),
+                "gitlab",
+                &a,
+                "feature/foo",
+                "main",
+                "Add foo",
+                "Adds foo.",
+                Some(1),
+                None,
+            )
+            .unwrap();
+        let state_of = || store.lock().get_pull_request(&pr).unwrap().state;
+        let branch_status = || {
+            let guardian = store.lock().get_guardian(&gid).unwrap();
+            guardian
+                .branches
+                .iter()
+                .find(|x| x.id == branch)
+                .unwrap()
+                .merge_status
+                .clone()
+        };
+        let run = |client: &crate::forge::ForgeClient| {
+            let prs = store.lock().list_pull_requests_for_guardian(&gid).unwrap();
+            apply_pr_merge_check(&store, &gid, &prs, client)
+        };
+
+        // Project B's `!1` is merged; asking B about A's number must not
+        // merge A's branch.
+        run(&new_client(&b));
+        assert_eq!(state_of(), "open", "B's merged !1 leaked into A's row");
+        assert_eq!(branch_status(), MergeStatus::Done.as_str());
+        assert_eq!(
+            store.lock().get_guardian(&gid).unwrap().status.as_str(),
+            "in_review"
+        );
+
+        // The submission-time state check must not take B's answer either.
+        let prs = store.lock().list_pull_requests_for_guardian(&gid).unwrap();
+        let refreshed = refresh_open_prs(
+            &store,
+            &gid,
+            &new_client(&b),
+            None,
+            open_prs_by_branch(&prs),
+        );
+        assert_eq!(refreshed.len(), 1, "refresh_open_prs took B's answer");
+        assert_eq!(state_of(), "open");
+
+        // Asking the right project keeps it open.
+        run(&new_client(&a));
+        assert_eq!(state_of(), "open");
+
+        // A wrongly recorded merge is corrected from the right project.
+        store
+            .lock()
+            .update_pull_request(&pr, None, None, None, Some("merged"))
+            .unwrap();
+        store
+            .lock()
+            .set_branch_status(&gid, &branch, MergeStatus::Merged, Some("pr merged"))
+            .unwrap();
+        run(&new_client(&a));
+        assert_eq!(state_of(), "open", "recorded merge was not re-verified");
+        assert_eq!(branch_status(), MergeStatus::Done.as_str());
     }
 
     #[test]
