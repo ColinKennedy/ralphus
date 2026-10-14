@@ -1145,7 +1145,6 @@ dependencies = [
 name = "ralphus-shell-syntax"
 version = "0.1.0"
 dependencies = [
- "ralphus-core",
  "serde",
  "tree-sitter",
  "tree-sitter-bash",

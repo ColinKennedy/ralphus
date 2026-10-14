@@ -45,9 +45,15 @@ pub fn shell_for_tool(tool: &str, host_is_windows: bool) -> Option<Shell> {
         }),
         // `cmd`, `cmd.exe` or a path to it, keyed the same way the runner's
         // `shell_prefix` picks `cmd.exe /C`.
-        other => (ralphus_core::shellcmd::shell_kind_from_exe(other) == Some("cmd"))
-            .then_some(Shell::Cmd),
+        other => is_cmd_exe(other).then_some(Shell::Cmd),
     }
+}
+
+fn is_cmd_exe(name: &str) -> bool {
+    let trimmed = name.trim();
+    let base = trimmed.rsplit(['/', '\\']).next().unwrap_or(trimmed);
+    let cleaned = base.trim_start_matches('-').to_lowercase();
+    cleaned == "cmd" || cleaned == "cmd.exe"
 }
 
 /// Outcome of a parse request.
