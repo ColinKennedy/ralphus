@@ -48,7 +48,17 @@ pub(crate) fn parse(shell: Shell, text: &str) -> Parsed {
     };
     let root = tree.root_node();
     if root.has_error() {
-        return Parsed::empty(Status::Unparsed);
+        let mut parsed = Parsed::empty(Status::Unparsed);
+        parsed.error_line = first_error(root).map(|n| {
+            // An ERROR node spans everything the parser skipped; it gave up at its end.
+            let at = if n.is_missing() {
+                n.start_position()
+            } else {
+                n.end_position()
+            };
+            at.row as u32 + 1
+        });
+        return parsed;
     }
     let mut items = Vec::new();
     match shell {
@@ -62,7 +72,20 @@ pub(crate) fn parse(shell: Shell, text: &str) -> Parsed {
         status: Status::Ok,
         commands: rows(text, &items),
         spans,
+        error_line: None,
     }
+}
+
+/// The first (document-order) error or missing node under `node`.
+fn first_error(node: Node) -> Option<Node> {
+    if node.is_error() || node.is_missing() {
+        return Some(node);
+    }
+    if !node.has_error() {
+        return None;
+    }
+    let mut cursor = node.walk();
+    node.children(&mut cursor).find_map(first_error)
 }
 
 /// Turns the flattened items into trimmed, non-empty commands carrying the

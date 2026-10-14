@@ -109,6 +109,10 @@ pub struct Parsed {
     pub status: Status,
     pub commands: Vec<Command>,
     pub spans: Vec<Span>,
+    /// 1-based line of the first syntax error, set only with
+    /// [`Status::Unparsed`] when the grammar could place it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_line: Option<u32>,
 }
 
 impl Parsed {
@@ -118,6 +122,7 @@ impl Parsed {
             status,
             commands: Vec::new(),
             spans: Vec::new(),
+            error_line: None,
         }
     }
 }

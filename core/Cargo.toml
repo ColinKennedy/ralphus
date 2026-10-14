@@ -9,7 +9,13 @@ description = "Shared types and logic for ralphus: task schema, validation, and 
 [lints]
 workspace = true
 
+[features]
+# Embeds the Bash/PowerShell tree-sitter grammars so `validate` can warn when a
+# command's syntax does not match its `shell`. Off: the check is skipped.
+shell-syntax = ["ralphus-shell-syntax/parser"]
+
 [dependencies]
+ralphus-shell-syntax = { path = "../shell-syntax" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 toml = { workspace = true }

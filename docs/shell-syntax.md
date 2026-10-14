@@ -50,3 +50,20 @@ collapsed row shows `+N more` when the command has further rows (leading
 `cd <dir>` rows are skipped, as in the preview). Colors are the `--sh-*`
 variables in [`colors.md`](colors.md). After the daemon says `unavailable`, the
 board stops asking for the rest of the session.
+
+## Submit-time shell check (RAL-651)
+
+`ralphus validate`, `submit`, the daemon's submit path and the MCP `validate`
+tool also use the parser (feature `shell-syntax` on `ralphus-core`, forwarded by
+the daemon, CLI and MCP crates) to warn -- never fail -- when a cell or proof
+`command` does not fit its shell (`core/src/shell_check.rs`, warning kind
+`shell_mismatch`):
+
+- Explicit `shell` of the Bash family or PowerShell family, command fails that
+  grammar but parses as the other: names both shells and suggests the fix.
+- Explicit shell, fails and parses as neither: syntax error with the line within
+  the command.
+- `shell` unset: only a command that parses as PowerShell and contains a
+  `Verb-Noun` cmdlet or `$env:` gets a "set `shell = "powershell"`" suggestion.
+- `cmd` and other shells are not checked (no grammar yet). Without the feature
+  the check is skipped silently.

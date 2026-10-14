@@ -16,6 +16,7 @@ pub mod project_hints;
 pub mod rate_limit;
 pub mod redact;
 pub mod schema;
+pub mod shell_check;
 pub mod shellcmd;
 pub mod thrash;
 pub mod uri;
