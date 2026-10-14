@@ -631,6 +631,9 @@
         const stopItem = g.status === "merging"
           ? `<div data-click="stopMerge" data-guardian-id="${esc(id)}" data-tip="Stop this rebase mid-flight — halts at the next checkpoint and pauses the review.\nThe review and its branches are kept, so you can resume the rebase afterward.\nThis is not a cancel: nothing is discarded.">⏸ Stop rebase</div>`
           : "";
+        const stopActioningItem = reviewIsActioning(g)
+          ? `<div data-click="stopActioning" data-guardian-id="${esc(id)}" data-tip="Stop whatever is working in this review's worktrees right now -- feedback, merge/rebase or an automatic CI fix.\nA rebase in progress is aborted and the worktree is reset to how it was before the action started.\nAuto-fix then stays paused until you press 'Action feedback' or 'Merge / rebase'.">⏹ Stop actioning</div>`
+          : `<div class="ctx-disabled" data-tip="Nothing to stop -- no branch of this review is being actioned (feedback, merge/rebase or auto-fix) right now.">⏹ Stop actioning</div>`;
         const canSync = ["in_review", "merging"].includes(g.status);
         const syncItem = canSync
           ? `<div data-click="syncPrReview" data-guardian-id="${esc(id)}" data-tip="Check GitHub/GitLab for a stack reorder made outside ralphus (e.g. dragging PRs into a new order) and apply it here, retriggering a rebase.\nRuns in the background; watch this review's branch order/status for the result.\nAlso happens automatically every 5 minutes for reviews with an active stack.">⇅ Sync PR order</div>`
@@ -638,7 +641,7 @@
         const logsItem = `<div data-click="toggleReviewDock" data-guardian-id="${esc(id)}" data-tip="Open the log drawer docked at the bottom of this review.\nIt follows whatever you select — the whole review, one branch, or one command — and stays open while you work instead of covering the page.">☰ Logs</div>`;
         const setupItem = `<div data-click="openEditReviewDetails" data-guardian-id="${esc(id)}" data-tip="Edit this review's settings — name, upstream branch, resolver, proof scope, build/squash options, PR settings.\nEnvironment overrides live on each section's ⋯, next to the commands they govern.\nNothing takes effect until you click Save; Save applies every change in a single request and triggers at most one rebase.">✎ Setup</div>`;
         menu.innerHTML = `<div class="ctx-group">review</div>`
-          + logsItem + setupItem + followupMenuItem(g) + approveItem + submitItem + syncItem + stopItem
+          + logsItem + setupItem + followupMenuItem(g) + approveItem + submitItem + syncItem + stopItem + stopActioningItem
           + `<div class="ctx-sep"></div><div class="ctx-group">stack</div>`
           + stacksItem + cancelItem;
         document.body.appendChild(menu);
@@ -1151,6 +1154,29 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
             ${autoFixOutcome}
           </div>`;
       }
+      // RALPHUS-STOP-ACTIONING:BEGIN
+      /**
+       * True while any enabled branch of the review has a feedback pass,
+       * merge/rebase or auto-fix round working in its worktree (RAL-655) --
+       * the only time "Stop actioning" has anything to stop.
+       * @param {{branches?: GuardianBranch[]}|null|undefined} g
+       * @returns {boolean}
+       */
+      function reviewIsActioning(g) {
+        return !!(g && g.branches && g.branches.some((b) => b.enabled !== false
+          && (b.merge_status === "in_progress" || b.merge_status === "proof_pending" || b.merge_status === "actioning")));
+      }
+      /**
+       * Renders the per-branch "auto-fix paused" badge (RAL-655), shown while
+       * the branch carries the latch set by "Stop actioning".
+       * @param {GuardianBranch} b
+       * @returns {string}
+       */
+      function autoFixPausedBadge(b) {
+        if (!b.auto_fix_paused_at_ms) return "";
+        return `<span class="badge" style="color:var(--muted);border-color:var(--border);font-size:11px" data-tip="${esc("Unattended CI auto-fix is paused for this branch because you stopped its actioning.\nIt will not resume by itself.\nPress 'Action feedback' or 'Merge / rebase' to clear the pause and let auto-fix run again.")}">⏸ auto-fix paused</span>`;
+      }
+      // RALPHUS-STOP-ACTIONING:END
       // RALPHUS-AUTO-FIX-EXHAUSTED-BADGE:BEGIN
       /**
        * Renders a badge for a worktree chip when unattended CI auto-fix has
@@ -2120,7 +2146,7 @@ Press Accept on the note to create it.">Squad pending</span>`;
               ${toggle}
               <span>${gdot(b.merge_status || "")}</span>
               <span class="mono" style="flex:1${isEnabled ? "" : ";color:var(--muted)"}" data-tip="${esc(b.branch)}\nSelect it to read its position, source and status in the inspector.">${esc(b.branch)}</span>
-              ${isEnabled ? `${branchBadge(b)} ${autoFixExhaustedBadge(pullRequests[g.id] || [], b)} ${branchStatusPill(b)}${blockingBadge(b.blocking)} ${branchPrLink(g, b)}` : '<span class="badge" style="color:var(--muted);border-color:var(--border);font-size:11px">disabled</span>'}
+              ${isEnabled ? `${branchBadge(b)} ${autoFixExhaustedBadge(pullRequests[g.id] || [], b)}${autoFixPausedBadge(b)} ${branchStatusPill(b)}${blockingBadge(b.blocking)} ${branchPrLink(g, b)}` : '<span class="badge" style="color:var(--muted);border-color:var(--border);font-size:11px">disabled</span>'}
               ${enableToggle}${reEnableIcon}${branchMenuBtn}
             </div>
             ${branchConflictBar(b)}
@@ -3160,6 +3186,18 @@ Press Accept on the note to create it.">Squad pending</span>`;
         if (!confirm("Stop this rebase mid-flight? It will halt at the next checkpoint and pause the review (resumable). Nothing is discarded — this is not a cancel.")) return;
         const resp = await guardianAction(`/api/guardians/${id}/stop`);
         if (resp && resp.ok) notify("success", "Rebase stopped — resumable from where it left off.");
+        tick();
+      }
+      /**
+       * Stops whatever is actioning a review's worktrees and pauses auto-fix
+       * (RAL-655).
+       * @param {string} id
+       * @returns {Promise<void>}
+       */
+      async function stopActioning(id) {
+        if (!confirm("Stop actioning this review? Work in progress is aborted and the worktree reset to its pre-action state. Auto-fix stays paused until you press Action feedback or Merge / rebase.")) return;
+        const resp = await guardianAction(`/api/guardians/${id}/stop-actioning`);
+        if (resp && resp.ok) notify("success", "Actioning stopped — auto-fix is paused.");
         tick();
       }
       /**

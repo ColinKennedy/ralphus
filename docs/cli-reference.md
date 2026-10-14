@@ -382,6 +382,7 @@ the daemon's hourly Free-tier background sweep
 | `review restart-merge <selector>` | Cancel an in-progress rebase, start fresh |
 | `review rebuild <selector>` | Tear down and rebuild a settled review's prepared build now, ignoring its `rebuild_on` setting |
 | `review stop-merge <selector>` | Stop an in-progress rebase, leaving the review resumable (not cancelled) |
+| `review stop-actioning <selector>` | Stop whatever is actioning the review worktree (feedback, merge/rebase, auto-fix), reset the worktree, and pause auto-fix |
 | `review force-start <selector>` | Disable not-yet-done branches, merge immediately |
 | `review approve <selector>` | Approve an in_review review |
 | `review feedback <selector#branch> <text> [--author name]` | Post feedback on a branch, optionally attributed to a different registered user than the one submitting it (RAL-379); defaults to the submitter when omitted |
@@ -907,6 +908,7 @@ use; see `READ_ONLY_NOTE`.
         - (read-only-safe) show selector [uri]  {Show a single review's detail.}
         - squash selector [uri] project [str] --off --on  {Enable/disable squashing one git project's task branches to a single commit each in the review worktree.}
         - (read-only-safe) status selector [uri]  {Per-branch readiness + a summary verdict ('is this review ready?').}
+        - stop-actioning selector [uri]  {Stop whatever is actioning a review's worktree (feedback, merge/rebase or auto-fix), abort a mid-rebase and reset the worktree, and pause auto-fix until the next explicit Action feedback or Merge / rebase.}
         - stop-merge selector [uri]  {Stop an in-progress rebase at the next checkpoint, leaving the review resumable instead of cancelled.}
         - sync-pr selector [uri]  {Check the forge for a stack reorder made outside ralphus and apply it if found.}
         - upstream  {Inspect/change a review's upstream branch.}

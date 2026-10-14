@@ -294,6 +294,7 @@
       CLICK_HANDLERS.mergeReview = (e, ds) => mergeReview(ds.guardianId || "", ds.status || "");
       CLICK_HANDLERS.mergeReviewFromMenu = (e, ds) => mergeReviewFromMenu(ds.guardianId || "");
       CLICK_HANDLERS.stopMerge = (e, ds) => stopMerge(ds.guardianId || "");
+      CLICK_HANDLERS.stopActioning = (e, ds) => stopActioning(ds.guardianId || "");
       CLICK_HANDLERS.approveReview = (e, ds) => approveReview(ds.guardianId || "");
       CLICK_HANDLERS.syncPrReview = (e, ds) => syncPrReview(ds.guardianId || "");
       CLICK_HANDLERS.runAllManualChecks = (e, ds) => runAllManualChecks(ds.guardianId || "");

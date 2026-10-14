@@ -4051,6 +4051,7 @@ impl Store {
             "ALTER TABLE proofs ADD COLUMN halted_waypoint_id TEXT",
             "ALTER TABLE guardian_branches ADD COLUMN delayed_until_ms INTEGER",
             "ALTER TABLE guardian_branches ADD COLUMN delayed_reason TEXT",
+            "ALTER TABLE guardian_branches ADD COLUMN auto_fix_paused_at_ms INTEGER",
             // RAL-308: hard cumulative maximum-runtime cap in seconds, at
             // each of the three task-file scopes -- see
             // `ralphus_core::schema::TaskDef::maximum_timeout_seconds` /

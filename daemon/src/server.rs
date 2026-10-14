@@ -2329,6 +2329,7 @@ fn route_for_user(
         // ralphus[ignore-endpoint-cli]: board multi-select Delete context-menu action (RAL-549); the CLI already has per-review `review delete`
         ("POST", ["api", "guardians", "delete-batch"]) => guardian_delete_batch(daemon, body),
         ("POST", ["api", "guardians", id, "stop"]) => guardian_stop(daemon, id),
+        ("POST", ["api", "guardians", id, "stop-actioning"]) => guardian_stop_actioning(daemon, id),
         ("POST", ["api", "guardians", id, "cancel_and_merge"]) => {
             guardian_cancel_and_merge(daemon, id)
         }
@@ -20625,7 +20626,17 @@ fn guardian_delete_batch(daemon: &Daemon, body: &str) -> Reply {
 /// feedback") gives the CI watcher another chance to fix an unchanged failure.
 /// Background polling retains its one-attempt cap until a person makes this
 /// request.
+///
+/// RAL-655: it also lifts every branch's "auto-fix paused" latch, which a
+/// `review stop-actioning` set -- Merge / rebase is one of the two explicit
+/// actions that re-arms auto-fix.
 fn reset_auto_fix_attempts_for_explicit_request(daemon: &Daemon, id: &str, trigger: &'static str) {
+    if let Err(e) = daemon.lock().clear_guardian_auto_fix_paused(id) {
+        crate::rlog!(
+            WARNING,
+            "ralphus [server] review {id} could not clear the auto-fix pause before {trigger}: {e}"
+        );
+    }
     let reset = daemon.lock().reset_open_pr_auto_fix_attempts(id);
     match reset {
         Ok(0) => {}
@@ -20688,6 +20699,13 @@ fn guardian_stop(daemon: &Daemon, id: &str) -> Reply {
         daemon.cancellations_handle(),
         id,
     )
+}
+
+/// RAL-655: stop whatever is acting on the review's worktrees (feedback,
+/// Merge / rebase or PR auto-fix) and restore them, pausing auto-fix on the
+/// branches it was acting on.
+fn guardian_stop_actioning(daemon: &Daemon, id: &str) -> Reply {
+    crate::guardian_merge::stop_actioning(daemon.store_handle(), daemon.cancellations_handle(), id)
 }
 
 /// Cancel an in-progress rebase (status `merging` or `in_review`) and
@@ -20770,6 +20788,14 @@ fn guardian_feedback(
             Ok(v) => v,
             Err(reply) => return reply,
         };
+    // RAL-655: an explicit Action feedback re-arms PR auto-fix for the branch
+    // a `review stop-actioning` paused.
+    if let Err(e) = daemon.lock().clear_branch_auto_fix_paused(id, branch_id) {
+        crate::rlog!(
+            WARNING,
+            "ralphus [server] review {id} could not clear the auto-fix pause for {branch_id}: {e}"
+        );
+    }
     let runner = guardian_agent_runner(daemon);
     crate::guardian_merge::start_feedback(
         daemon.store_handle(),
@@ -21828,6 +21854,7 @@ fn manual_action_label(method: &str, segs: &[&str]) -> Option<&'static str> {
             "approve" => "approve review",
             "cancel" => "cancel review",
             "stop" => "stop review merge",
+            "stop-actioning" => "stop review actioning",
             "reopen" => "reopen review",
             "merge" => "merge review",
             "rebuild" => "rebuild review",

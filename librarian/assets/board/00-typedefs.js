@@ -297,6 +297,7 @@
        * @property {string} [name]
        * @property {string} [project]
        * @property {string} [merge_status] - "pending" | "in_progress" | "done" | "proof_pending" | "conflict_resolved" | "failed" | "merged" | "closed" | ...
+       * @property {number} [auto_fix_paused_at_ms] - RAL-655: epoch-ms when "Stop actioning" paused unattended CI auto-fix for this branch; absent when auto-fix is not paused. Cleared by an explicit Action feedback or Merge / rebase.
        * @property {number|null} [delayed_until_ms] - Epoch-ms when this review worktree's agent call will retry after a provider rate limit.
        * @property {string|null} [delayed_reason] - Safe provider-delay summary shown while `delayed_until_ms` is set.
        * @property {string} [moved_from_guardian_id]
