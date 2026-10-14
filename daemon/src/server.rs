@@ -4573,6 +4573,7 @@ fn shell_syntax_parse(body: &str) -> Reply {
         Some(shell) => ralphus_shell_syntax::parse(shell, &req.command),
         None => ralphus_shell_syntax::Parsed::empty(ralphus_shell_syntax::Status::Unsupported),
     };
+    // ralphus[ignore-rlog-pair]: shell-syntax parse is display-only infrastructure, not a notable business event
     crate::rlog!(
         DEBUG,
         "ralphus [shell-syntax] parse tool={} len={} status={:?}",
