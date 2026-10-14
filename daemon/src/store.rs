@@ -69,6 +69,7 @@ impl std::error::Error for StoreError {}
 
 impl From<rusqlite::Error> for StoreError {
     fn from(e: rusqlite::Error) -> Self {
+        crate::daemon_health::report_sqlite_error(&e);
         Self::Sqlite(e)
     }
 }

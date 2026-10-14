@@ -407,14 +407,16 @@ pub fn spawn(store: StoreHandle, state: Arc<WatchdogState>) {
                     emit(event);
                 }
                 if round % HEARTBEAT_EVERY_ROUNDS == 0 {
-                    emit(
-                        HealthEvent::ok("daemon.heartbeat")
-                            .attr(
-                                "uptime_secs",
-                                i64::try_from(started.elapsed().as_secs()).unwrap_or(i64::MAX),
-                            )
-                            .attr("store_reachable", reachable),
-                    );
+                    let mut beat = HealthEvent::ok("daemon.heartbeat")
+                        .attr(
+                            "uptime_secs",
+                            i64::try_from(started.elapsed().as_secs()).unwrap_or(i64::MAX),
+                        )
+                        .attr("store_reachable", reachable);
+                    if let Some(threads) = crate::daemon_health::check_thread_count() {
+                        beat = beat.attr("threads", i64::try_from(threads).unwrap_or(i64::MAX));
+                    }
+                    emit(beat);
                 }
                 std::thread::sleep(CHECK_INTERVAL);
                 reachable = check_once(&store, &state, STALL_TIMEOUT);

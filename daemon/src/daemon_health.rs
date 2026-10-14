@@ -31,6 +31,8 @@
 //! | `daemon.loop.stale` / `.recovered` / `.dead` | scheduler / health sweep |
 //! | `daemon.tmux.unavailable` / `.recovered` / `.startup_reap` | tmux layer |
 //! | `daemon.resource.low_disk` | free space under 10 % / 5 % |
+//! | `daemon.resource.threads_high` / `.threads_normal` | process thread count crosses 500 (Linux) |
+//! | `daemon.sqlite.busy` / `.write_failed` | busy timeout / disk full, I/O, read-only (max one a minute each) |
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
@@ -312,6 +314,129 @@ pub fn check_disk_space(labelled_paths: &[(&'static str, std::path::PathBuf)]) -
     reported.len()
 }
 
+// ── SQLite busy / write failures ────────────────────────────────────────
+
+/// Minimum gap between two spans of the same SQLite kind, so a failing disk
+/// that errors on every statement produces one span a minute, not thousands.
+const SQLITE_EMIT_GAP_MS: i64 = 60_000;
+
+/// What kind of daemon-level SQLite trouble an error is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SqliteTrouble {
+    /// `SQLITE_BUSY` / `SQLITE_LOCKED`: the busy timeout ran out.
+    Busy,
+    /// Disk full, read-only database, I/O failure or an unopenable file.
+    WriteFailure,
+}
+
+impl SqliteTrouble {
+    const fn event_name(self) -> &'static str {
+        match self {
+            Self::Busy => "daemon.sqlite.busy",
+            Self::WriteFailure => "daemon.sqlite.write_failed",
+        }
+    }
+
+    const fn slot(self) -> usize {
+        match self {
+            Self::Busy => 0,
+            Self::WriteFailure => 1,
+        }
+    }
+}
+
+/// Classify a rusqlite error; `None` for ordinary query errors (constraint
+/// violations, missing rows, ...), which are per-operation and not daemon health.
+#[must_use]
+pub fn classify_sqlite_error(e: &rusqlite::Error) -> Option<SqliteTrouble> {
+    use rusqlite::ErrorCode as C;
+    match e.sqlite_error_code()? {
+        C::DatabaseBusy | C::DatabaseLocked => Some(SqliteTrouble::Busy),
+        C::DiskFull | C::ReadOnly | C::SystemIoFailure | C::CannotOpen | C::DatabaseCorrupt => {
+            Some(SqliteTrouble::WriteFailure)
+        }
+        _ => None,
+    }
+}
+
+static SQLITE_COUNTS: [std::sync::atomic::AtomicU64; 2] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
+static SQLITE_LAST_EMIT_MS: [std::sync::atomic::AtomicI64; 2] = [
+    std::sync::atomic::AtomicI64::new(0),
+    std::sync::atomic::AtomicI64::new(0),
+];
+
+/// Count `e` and, at most once a minute per kind, emit its health span.
+/// Lock-free and non-blocking: called from the `rusqlite::Error` conversion,
+/// which runs on any thread including ones holding the store lock.
+pub fn report_sqlite_error(e: &rusqlite::Error) {
+    let Some(kind) = classify_sqlite_error(e) else {
+        return;
+    };
+    let total = SQLITE_COUNTS[kind.slot()].fetch_add(1, Ordering::Relaxed) + 1;
+    if sqlite_emit_due(&SQLITE_LAST_EMIT_MS[kind.slot()], crate::store::now_ms()) {
+        emit(
+            HealthEvent::error(kind.event_name(), e.to_string())
+                .attr("total", i64::try_from(total).unwrap_or(i64::MAX)),
+        );
+    }
+}
+
+/// Whether a span is due given the last emission stamp; claims the slot.
+fn sqlite_emit_due(last: &std::sync::atomic::AtomicI64, now_ms: i64) -> bool {
+    let prev = last.load(Ordering::Relaxed);
+    now_ms.saturating_sub(prev) >= SQLITE_EMIT_GAP_MS
+        && last
+            .compare_exchange(prev, now_ms, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+}
+
+// ── Thread count ────────────────────────────────────────────────────────
+
+/// OS threads in the daemon process above which the count is reported.
+pub const THREAD_COUNT_WARN: usize = 500;
+
+static THREADS_HIGH: AtomicBool = AtomicBool::new(false);
+
+/// OS threads in this process. Only Linux exposes this without `unsafe`
+/// (`/proc/self/task`); other platforms return `None` and are not monitored.
+#[must_use]
+pub fn process_thread_count() -> Option<usize> {
+    std::fs::read_dir("/proc/self/task")
+        .ok()
+        .map(|d| d.filter_map(Result::ok).count())
+}
+
+/// Event for a thread-count observation when the high/normal state changed.
+fn thread_count_transition(high: &AtomicBool, count: usize) -> Option<HealthEvent> {
+    let now_high = count >= THREAD_COUNT_WARN;
+    (high.swap(now_high, Ordering::AcqRel) != now_high).then(|| {
+        let count = i64::try_from(count).unwrap_or(i64::MAX);
+        if now_high {
+            HealthEvent::error(
+                "daemon.resource.threads_high",
+                format!("{count} threads in the daemon process"),
+            )
+            .attr("threads", count)
+        } else {
+            HealthEvent::ok("daemon.resource.threads_normal").attr("threads", count)
+        }
+    })
+}
+
+/// Sample the thread count and emit on a state change; returns the count.
+pub fn check_thread_count() -> Option<usize> {
+    let count = process_thread_count()?;
+    if let Some(event) = thread_count_transition(&THREADS_HIGH, count) {
+        // ralphus[ignore-rlog-pair]: process-wide probe with no entity to attach a Cartographer row to; the OTel span is its structured record
+        crate::rlog!(WARNING, "ralphus [resource] daemon thread count: {count}");
+        emit(event);
+    }
+    Some(count)
+}
+
 // ── Tmux reachability ───────────────────────────────────────────────────
 
 static TMUX_BROKEN: AtomicBool = AtomicBool::new(false);
@@ -475,6 +600,52 @@ mod tests {
         assert_eq!(found.0, parent);
         let _ = std::fs::remove_dir(&nested);
         assert!(volume_for_path(&[], Path::new("/nowhere")).is_none());
+    }
+
+    #[test]
+    fn sqlite_errors_are_classified_by_code() {
+        let err = |code| {
+            rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error {
+                    code,
+                    extended_code: 0,
+                },
+                None,
+            )
+        };
+        use rusqlite::ErrorCode as C;
+        assert_eq!(
+            classify_sqlite_error(&err(C::DatabaseBusy)),
+            Some(SqliteTrouble::Busy)
+        );
+        assert_eq!(
+            classify_sqlite_error(&err(C::DiskFull)),
+            Some(SqliteTrouble::WriteFailure)
+        );
+        assert_eq!(classify_sqlite_error(&err(C::ConstraintViolation)), None);
+        assert_eq!(
+            classify_sqlite_error(&rusqlite::Error::QueryReturnedNoRows),
+            None
+        );
+    }
+
+    #[test]
+    fn sqlite_spans_are_rate_limited() {
+        let last = std::sync::atomic::AtomicI64::new(0);
+        assert!(sqlite_emit_due(&last, 100_000));
+        assert!(!sqlite_emit_due(&last, 100_001));
+        assert!(sqlite_emit_due(&last, 100_000 + SQLITE_EMIT_GAP_MS));
+    }
+
+    #[test]
+    fn thread_count_fires_only_on_a_state_change() {
+        let high = AtomicBool::new(false);
+        assert!(thread_count_transition(&high, 10).is_none());
+        let up = thread_count_transition(&high, THREAD_COUNT_WARN).expect("goes high");
+        assert_eq!(up.name, "daemon.resource.threads_high");
+        assert!(thread_count_transition(&high, THREAD_COUNT_WARN + 1).is_none());
+        let down = thread_count_transition(&high, 10).expect("recovers");
+        assert_eq!(down.name, "daemon.resource.threads_normal");
     }
 
     #[test]
