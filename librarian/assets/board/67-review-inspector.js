@@ -492,17 +492,31 @@
        */
       const prPollStatus = {};
       /**
-       * Fetches `GET /api/pull-requests/{id}/poll-status` once per PR.
+       * When each PR's poll status was last requested, in epoch ms. A render
+       * older than {@link PR_POLL_STATUS_TTL_MS} refetches it, so the
+       * "last checked" ages do not count up against a snapshot the daemon has
+       * long since replaced.
+       * @type {{[prId: string]: number}}
+       */
+      const prPollStatusFetchedAt = {};
+      /** How long a fetched poll status is shown before it is requested again. */
+      const PR_POLL_STATUS_TTL_MS = 30000;
+      /**
+       * Fetches `GET /api/pull-requests/{id}/poll-status`. The first load shows
+       * "loading"; a refresh keeps the previous status on screen until the new
+       * one lands, and keeps it if the request fails.
        * @param {string} prId - The PR id.
        * @returns {Promise<void>}
        */
       async function loadPrPollStatus(prId) {
-        prPollStatus[prId] = null;
+        const refreshing = !!prPollStatus[prId];
+        if (!refreshing) prPollStatus[prId] = null;
+        prPollStatusFetchedAt[prId] = Date.now();
         try {
           const r = await fetch(`/api/pull-requests/${encodeURIComponent(prId)}/poll-status`);
           if (r.ok) prPollStatus[prId] = await r.json();
         } catch {
-          prPollStatus[prId] = null;
+          if (!refreshing) prPollStatus[prId] = null;
         }
         renderReviewInspector();
       }
@@ -540,6 +554,7 @@
         const st = prPollStatus[prId];
         if (!st) return `<div class="insp-pr-sub">polls: unavailable</div>`;
         const now = Date.now();
+        if (now - (prPollStatusFetchedAt[prId] || 0) > PR_POLL_STATUS_TTL_MS) loadPrPollStatus(prId);
         /** @type {{[kind: string]: string}} */
         const labels = { ci: "CI check", drift: "branch drift", comments: "PR comments" };
         const rows = st.polls.map((p) => {
