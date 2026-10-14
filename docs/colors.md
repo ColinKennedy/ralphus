@@ -49,7 +49,6 @@ role in the table below, then use it.
 | `--drift` | `#f0883e` | *(shared)* | semantic (a submitted PR's remote branch and its review worktree have diverged, RAL-190) |
 | `--incomplete` | `#db6d28` | *(shared)* | semantic (uber-log-viewer data that may be pruned/truncated, RAL-155) |
 | `--out-of-date` | `#d4a72c` | *(shared)* | semantic (a task/cell/proof step's env overrides changed since it last ran, RAL-271) |
-| `--detached` | `#d2a8ff` | *(shared)* | semantic (a cell cleanly stopped mid-task for a real interactive agent session to take over, not Done/Failed/Cancelled, RAL-288) |
 | `--delayed` | `#79c0ff` | *(shared)* | semantic (a cell waiting out a recognized, retryable provider rate limit before automatically resuming, RAL-435) |
 | `--arbiter` | `#7c3aed` | *(shared)* | semantic (a review automatically created by the Arbiter/Triage subsystem rather than an authored `[[review]]`, RAL-318) |
 | `--sh-cmd` | `#79c0ff` | `#0550ae` | semantic (shell-syntax highlight: command name, RAL-644) |
@@ -58,7 +57,7 @@ role in the table below, then use it.
 | `--sh-var` | `#ffa657` | `#953800` | semantic (shell-syntax highlight: variables/expansions) |
 | `--sh-op` | `#ff7b72` | `#cf222e` | semantic (shell-syntax highlight: operators: `&&`, pipe, redirects) |
 | `--sh-comment` | `#8b949e` | `#57606a` | semantic (shell-syntax highlight: comments, heredoc stub) |
-| `--terminal-bg` | `#000000` | `#f6f8fa` | surface (terminal background: Live tab transcript and remote xterm.js panel; full palette in "Terminal surface") |
+| `--terminal-bg` | `#000000` | `#f6f8fa` | surface (terminal background: Live tab transcript; full palette in "Terminal surface") |
 | `--roster-block` | `#e8590c` | *(shared)* | semantic (a unit of work a cross-squad waypoint affects in `block` mode — can halt in-flight cells, RAL-400) |
 | `--faint` | `#6e7681` | `#818b98` | chrome (tertiary text — metadata that annotates a value without competing with it) |
 | `--border-soft` | `#262c34` | `#e4e8ec` | chrome (divider *inside* one component, where `--border` would read as a seam between two separate things) |
@@ -303,39 +302,21 @@ a different concept even though both are "stored state diverged from
 current"); `--out-of-date` exists only because no existing role fit this
 new concept (see "Adding a new UI element" below).
 
-### Detached cell — `--detached` only (RAL-288)
-A task cell's status pill grows a `⏸ detached` badge while it reads `running`
-but has actually been cleanly stopped for a human's real interactive agent
-session to take over (the "Open Agent" action). The cell is not stuck or
-stalled — its Live View pane legitimately goes quiet and shows the historical
-record of the now-ended headless process, since the live conversation moved
-to a separate tmux session outside the daemon's own polling — but the cell
-itself has not failed, finished, or been cancelled either, so it deliberately
-does not reuse `--stale` (reserved for a *still headlessly running* cell that
-has gone quiet, a different and more alarming situation), `--ignored`
-(reserved for the real `ignored` status), or `--muted` (would read as "just a
-normal read-only field", losing the signal entirely); `--detached` exists
-only because no existing role fit this new concept (see "Adding a new UI
-element" below). Clears automatically the next time the cell is dispatched
-(a restart, or the explicit resume-automation trigger).
 
 ### Rate-limited retry wait — `--delayed` only (RAL-435)
 A task cell, agent-backed proof, or review worktree's status pill grows a
 `⏳ delayed` badge while it is waiting out a recognized, retryable provider
 rate limit before the daemon automatically resumes the same agent session —
-no human action needed, unlike a `⏸ detached` cell. Its underlying active
-status remains unchanged and resumes once the delay ends. It deliberately
-does not reuse `--detached`
-(that badge specifically means a human is or was in the driver's seat via
-"Open Agent"; this one means the daemon itself is waiting out a timer),
-`--stale` (reserved for a still-headlessly-running cell gone quiet, a sign
-something may be wrong, whereas a delayed cell is behaving exactly as
-expected), or `--waiting` (reserved for a `pending` *squad* held back by a
-scheduler down-time window — a different entity and a different cause);
-`--delayed` exists only because no existing role fit this new concept (see
-"Adding a new UI element" below). Clears automatically once the delay
-elapses and execution resumes, or once repeated rate limits exhaust the
-retry budget and the owning call fails outright instead of retrying again.
+no human action needed. Its underlying active status remains unchanged and
+resumes once the delay ends. It deliberately does not reuse `--stale`
+(reserved for a still-running cell gone quiet, a sign something may be wrong,
+whereas a delayed cell is behaving exactly as expected), or `--waiting`
+(reserved for a `pending` *squad* held back by a scheduler down-time window —
+a different entity and a different cause); `--delayed` exists only because no
+existing role fit this new concept (see "Adding a new UI element" below).
+Clears automatically once the delay elapses and execution resumes, or once
+repeated rate limits exhaust the retry budget and the owning call fails
+outright instead of retrying again.
 
 The board's forge rate-limit section (review inspector, Overview tab) reuses
 `--delayed` for the same role: the daemon itself is waiting out a timer, here

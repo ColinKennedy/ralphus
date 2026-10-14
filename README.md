@@ -42,8 +42,8 @@ for the full breakdown. `cli/` is a separate Python project kept only for doc
 screenshot generation and bench-graph rendering; it is never shipped. See
 `PLAN.local.md` for the build plan, `FINDINGS.local.md` for research on the
 predecessor, and `FOLLOW.local.md` for decisions to revisit. Everything this
-repo depends on to build or run — Rust toolchain, git, tmux/psmux, optional
-agent CLIs, and more — is inventoried in [`docs/dependencies.md`](docs/dependencies.md).
+repo depends on to build or run — Rust toolchain, git, optional agent CLIs,
+and more — is inventoried in [`docs/dependencies.md`](docs/dependencies.md).
 
 ## Repository layout
 

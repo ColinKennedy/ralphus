@@ -73,7 +73,7 @@ where one exists.
 | POST | `/api/squads/{id}/activate` | [Queued → Pending](#post-apisquadsidactivate) |
 | POST | `/api/squads/{id}/cancel/preview` | [Dry-run preview](#post-apisquadsidcancelpreview) of a cascading cancel's impact |
 | POST | `/api/squads/{id}/cancel` | [Cancel the squad](#post-apisquadsidcancel), cascading to downstream dependents |
-| POST | `/api/squads/{id}/set-status` | Manually override a squad/task/cell/proof's state — for a task/cell/proof, any target state but `pending` first captures its running agent's tmux pane into that cell's ghost and kills it (RAL-163) |
+| POST | `/api/squads/{id}/set-status` | Manually override a squad/task/cell/proof's state — for a task/cell/proof, any target state but `pending` first terminates its running subprocess and captures its output (RAL-163) |
 | POST | `/api/squads/{id}/edit` | Edit a squad/task/cell/proof's fields; a squad/task edit resets the whole squad to Pending, a cell edit resets only that cell + its downstream, a proof edit only that step + later steps in its scope. A cell edit also accepts `initialization_commands` (newline-separated; blank clears) and `initialization_timeout_sec` (RAL-615): it sets the cell's worktree-init source to `edited`, applies to every cell sharing the worktree, and marks the worktree for re-initialization on Retry when the command hash changed. Each cell in the squad view carries `worktree_init` (`commands`, `source`, `timeout_sec`, `status`, `duration_ms`, `exit_status`, `output`) |
 | POST | `/api/squads/{id}/retry` | Re-run with existing parameters (reset to Pending) |
 | POST | `/api/squads/{id}/restart/preview` | [Dry-run preview](#post-apisquadsidrestartpreview) of a whole-squad restart's downstream impact |
@@ -438,14 +438,11 @@ what `ralphus-daemon stop [--port N] [--auto-cancel]` calls.
 
 Unconditionally, regardless of the request body: trips every in-flight squad's
 cooperative cancellation token (stops its subprocess within the runner's
-normal poll interval) and force-kills every `ralphus_`-prefixed tmux.exe
-process (covers both squad cells and guardian/review sessions, which share
-that naming prefix). Anything left alive after that — e.g. a `command`-kind
-proof subprocess, which has no cooperative cancellation today — is still
-guaranteed to die: the daemon confines its whole process tree to a Windows
-Job Object at startup (`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`, see
-`daemon/src/jobobject.rs`), so terminating the daemon process itself takes
-every remaining descendant down with it.
+normal poll interval) and terminates every running cell/proof/review subprocess.
+The daemon confines its whole process tree to a Windows Job Object at startup
+(`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`, see `daemon/src/jobobject.rs`), so
+terminating the daemon process itself takes every remaining descendant down
+with it.
 
 Request (all fields optional; an empty/absent body is equivalent to
 `{"auto_cancel": false}`):
