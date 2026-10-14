@@ -110,7 +110,8 @@ fn missing_inputs(g: &GuardianView, check: &GuardianCheck) -> Vec<String> {
 
 /// Which checks of `g` should start on their own right now. A check qualifies
 /// when its own `auto_run` -- falling back to the review's resolved default --
-/// is on, it is ready, runnable as a command, local, and the review is not in a
+/// is on, it is ready, runnable (a command, or a user action's agent prompt),
+/// local, and the review is not in a
 /// terminal state. Remote reviews are out of scope: a check bound for a review
 /// machine never auto-runs.
 pub(crate) fn plan(g: &GuardianView) -> Plan {
@@ -122,7 +123,7 @@ pub(crate) fn plan(g: &GuardianView) -> Plan {
         for (index, check) in checks_of(g, kind).iter().enumerate() {
             let eligible = check.auto_run.unwrap_or(g.effective_auto_run)
                 && check.preparation_state.as_deref() == Some("ready")
-                && check.command.is_some()
+                && (check.command.is_some() || (kind == "action" && check.prompt.is_some()))
                 && check.run_on.as_deref() != Some("review_machine")
                 && !(check.run_on.is_none() && g.machine.is_some());
             if !eligible {
@@ -289,6 +290,28 @@ pub(crate) fn run_ready_checks(store: &StoreHandle, id: &str) {
 /// Run one claimed check to completion and report a failure.
 fn run_one(store: &StoreHandle, id: &str, g: &GuardianView, check: &GuardianCheck, at: CheckRef) {
     let label = display_label(check, at);
+    // A `prompt` action is agent-run: it goes onto the review's live-run
+    // queue (followed in Live View) instead of opening a terminal.
+    if at.kind == "action" && check.command.is_none() && check.prompt.is_some() {
+        let queued = crate::live_runs::queue_action_prompt_run(
+            store,
+            &crate::live_runs::default_runner_factory(),
+            id,
+            at.index,
+            "auto",
+        );
+        note(
+            &store.lock(),
+            id,
+            crate::logging::LogLevel::INFO,
+            format!(
+                "auto-run queued review={id} check={}-{} label={label:?} as a live run: {queued:?}",
+                at.kind, at.index
+            ),
+            serde_json::json!({ "check": format!("{}-{}", at.kind, at.index), "live_run": queued.ok() }),
+        );
+        return;
+    }
     running().push(RunningCheck {
         review_id: id.to_string(),
         check: at,

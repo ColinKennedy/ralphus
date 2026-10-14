@@ -142,6 +142,8 @@ pub enum ReviewCommand {
         /// skipped. Defaults to `false` (generation runs) when unset.
         skip_manual_checks: Option<bool>,
         auto_run: Option<bool>,
+        /// This review's own live-actions opt-in. Defaults to off when unset.
+        live_actions: Option<bool>,
         /// This review's own list of events that tear down and rebuild its
         /// prepared build. Outer `None` leaves it alone, `Some(None)` clears
         /// it back to inherit, `Some(Some(list))` sets it (an empty list never
@@ -237,6 +239,7 @@ pub enum ReviewCommand {
     Branch(ReviewBranchCommand),
     Checks(ReviewChecksCommand),
     Action(ReviewActionCommand),
+    Live(ReviewLiveCommand),
     Followup(ReviewFollowupCommand),
     UsageError(String),
 }
@@ -379,6 +382,24 @@ pub enum ReviewFollowupCommand {
     UsageError(String),
 }
 
+/// `ralphus review live ...`: a review's live actions.
+#[derive(Debug, Clone)]
+pub enum ReviewLiveCommand {
+    Help,
+    List {
+        selector: String,
+    },
+    Run {
+        selector: String,
+        index: Option<i64>,
+    },
+    Cancel {
+        selector: String,
+        run_id: String,
+    },
+    UsageError(String),
+}
+
 #[derive(Debug, Clone)]
 pub enum ReviewActionCommand {
     Help,
@@ -484,6 +505,7 @@ pub fn parse(args: &[String]) -> ReviewCommand {
             let cache_manual_checks = take_tri_bool(&mut scanner, "--cache-manual-checks");
             let skip_manual_checks = take_tri_bool(&mut scanner, "--skip-manual-checks");
             let auto_run = take_tri_bool(&mut scanner, "--auto-run");
+            let live_actions = take_tri_bool(&mut scanner, "--live-actions");
             let rebuild_on = match take_rebuild_on(&mut scanner) {
                 Ok(value) => value,
                 Err(UsageError(message)) => return ReviewCommand::UsageError(message),
@@ -520,6 +542,7 @@ pub fn parse(args: &[String]) -> ReviewCommand {
                 cache_manual_checks,
                 skip_manual_checks,
                 auto_run,
+                live_actions,
                 rebuild_on,
                 followup_enabled,
                 followup_auto_start,
@@ -656,6 +679,7 @@ pub fn parse(args: &[String]) -> ReviewCommand {
         Some("branch") => ReviewCommand::Branch(parse_branch(&scanner.remaining())),
         Some("checks") => ReviewCommand::Checks(parse_checks(&scanner.remaining())),
         Some("action") => ReviewCommand::Action(parse_action(&scanner.remaining())),
+        Some("live") => ReviewCommand::Live(parse_live(&scanner.remaining())),
         Some("followup") => ReviewCommand::Followup(parse_followup(&scanner.remaining())),
         Some(other) => ReviewCommand::UsageError(format!("unknown review subcommand: {other}")),
     }
@@ -1120,6 +1144,39 @@ fn with_selector_checks(
     }
 }
 
+fn parse_live(args: &[String]) -> ReviewLiveCommand {
+    let mut scanner = Scanner::new(&args[1.min(args.len())..]);
+    match args.first().map(String::as_str) {
+        None | Some("help" | "--help" | "-h") => ReviewLiveCommand::Help,
+        Some("list") => match scanner.remaining().into_iter().next() {
+            Some(selector) => ReviewLiveCommand::List { selector },
+            None => ReviewLiveCommand::UsageError("list requires a review selector".to_string()),
+        },
+        Some("run") => {
+            let index = match scanner.take_parsed::<i64>("--index") {
+                Ok(v) => v,
+                Err(e) => return ReviewLiveCommand::UsageError(e.0),
+            };
+            match scanner.remaining().into_iter().next() {
+                Some(selector) => ReviewLiveCommand::Run { selector, index },
+                None => ReviewLiveCommand::UsageError("run requires a review selector".to_string()),
+            }
+        }
+        Some("cancel") => {
+            let mut rest = scanner.remaining().into_iter();
+            match (rest.next(), rest.next()) {
+                (Some(selector), Some(run_id)) => ReviewLiveCommand::Cancel { selector, run_id },
+                _ => ReviewLiveCommand::UsageError(
+                    "cancel requires a review selector and a live run id".to_string(),
+                ),
+            }
+        }
+        Some(other) => {
+            ReviewLiveCommand::UsageError(format!("unknown review live subcommand: {other}"))
+        }
+    }
+}
+
 fn parse_action(args: &[String]) -> ReviewActionCommand {
     let mut scanner = Scanner::new(&args[1.min(args.len())..]);
     match args.first().map(String::as_str) {
@@ -1554,6 +1611,7 @@ pub fn dispatch(cmd: ReviewCommand, opts: &GlobalOpts) -> i32 {
             cache_manual_checks,
             skip_manual_checks,
             auto_run,
+            live_actions,
             rebuild_on,
             followup_enabled,
             followup_auto_start,
@@ -1581,6 +1639,7 @@ pub fn dispatch(cmd: ReviewCommand, opts: &GlobalOpts) -> i32 {
                 cache_manual_checks,
                 skip_manual_checks,
                 auto_run,
+                live_actions,
                 rebuild_on,
                 followup_enabled,
                 followup_auto_start,
@@ -1834,6 +1893,7 @@ pub fn dispatch(cmd: ReviewCommand, opts: &GlobalOpts) -> i32 {
         ReviewCommand::Branch(c) => dispatch_branch(c, opts, &client),
         ReviewCommand::Checks(c) => dispatch_checks(c, opts, &client),
         ReviewCommand::Action(c) => dispatch_action(c, opts, &client),
+        ReviewCommand::Live(c) => dispatch_live(c, opts, &client),
         ReviewCommand::Followup(c) => dispatch_followup(c, opts, &client),
     }
 }
@@ -2615,6 +2675,89 @@ fn dispatch_checks_terminal(
         print_command_with_cwd(&cwd, &command_line, None)
     });
     0
+}
+
+fn dispatch_live(cmd: ReviewLiveCommand, opts: &GlobalOpts, client: &DaemonClient) -> i32 {
+    match cmd {
+        ReviewLiveCommand::Help => {
+            println!(
+                "{}",
+                crate::help_map::command_help(&["review", "live"])
+                    .expect("review live help exists")
+            );
+            0
+        }
+        ReviewLiveCommand::UsageError(m) => {
+            println!("usage error: {m}");
+            2
+        }
+        ReviewLiveCommand::List { selector } => run_and_report(opts, None, || {
+            let resolved = resolve_guardian_selector(client, &selector, DEFAULT_REVIEW_LIST_HINT)?;
+            let view = client.guardian_live_actions(&resolved.guardian_id)?;
+            emit(opts, &view, render_live_actions);
+            Ok(())
+        }),
+        ReviewLiveCommand::Run { selector, index } => run_and_report(opts, None, || {
+            let resolved = resolve_guardian_selector(client, &selector, DEFAULT_REVIEW_LIST_HINT)?;
+            let result = client.guardian_run_live_actions(&resolved.guardian_id, index)?;
+            emit(opts, &result, |r| {
+                let queued = r["queued"].as_array().cloned().unwrap_or_default();
+                println!("queued {} live run(s)", queued.len());
+                for id in queued {
+                    println!("  {}", id.as_str().unwrap_or_default());
+                }
+            });
+            Ok(())
+        }),
+        ReviewLiveCommand::Cancel { selector, run_id } => run_and_report(opts, None, || {
+            let resolved = resolve_guardian_selector(client, &selector, DEFAULT_REVIEW_LIST_HINT)?;
+            let result = client.guardian_cancel_live_run(&resolved.guardian_id, &run_id)?;
+            emit(opts, &result, |_| println!("cancelled live run {run_id}"));
+            Ok(())
+        }),
+    }
+}
+
+/// Text view of `GET /api/guardians/{id}/live-actions`.
+fn render_live_actions(view: &Value) {
+    println!(
+        "live actions: {}{}",
+        if view["enabled"].as_bool() == Some(true) {
+            "on"
+        } else {
+            "off"
+        },
+        if view["auto_ran_at_ms"].is_null() {
+            ""
+        } else {
+            " (automatic run done)"
+        }
+    );
+    let actions = view["actions"].as_array().cloned().unwrap_or_default();
+    if actions.is_empty() {
+        println!("no live actions yet");
+    }
+    for a in &actions {
+        println!("[{}] {}", a["idx"], a["label"].as_str().unwrap_or_default());
+        for line in a["prompt"].as_str().unwrap_or_default().lines() {
+            println!("      {line}");
+        }
+    }
+    let runs = view["runs"].as_array().cloned().unwrap_or_default();
+    if !runs.is_empty() {
+        println!("runs (newest first):");
+    }
+    for r in &runs {
+        println!(
+            "  {}  [{}] {}  {}  commits={}  integration={}",
+            r["run_id"].as_str().unwrap_or_default(),
+            r["action_idx"],
+            r["kind"].as_str().unwrap_or_default(),
+            r["state"].as_str().unwrap_or_default(),
+            r["commits"].as_array().map_or(0, Vec::len),
+            r["integration"].as_str().unwrap_or_default(),
+        );
+    }
 }
 
 fn dispatch_action(cmd: ReviewActionCommand, opts: &GlobalOpts, client: &DaemonClient) -> i32 {
@@ -3584,6 +3727,47 @@ mod tests {
                 skip_manual_checks, ..
             } => assert_eq!(skip_manual_checks, None),
             other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_review_live_subcommands() {
+        let v = |items: &[&str]| items.iter().map(|s| (*s).to_string()).collect::<Vec<_>>();
+        assert!(matches!(
+            parse(&v(&["live", "list", "r1"])),
+            ReviewCommand::Live(ReviewLiveCommand::List { selector }) if selector == "r1"
+        ));
+        assert!(matches!(
+            parse(&v(&["live", "run", "r1"])),
+            ReviewCommand::Live(ReviewLiveCommand::Run { selector, index: None }) if selector == "r1"
+        ));
+        assert!(matches!(
+            parse(&v(&["live", "run", "r1", "--index", "2"])),
+            ReviewCommand::Live(ReviewLiveCommand::Run { index: Some(2), .. })
+        ));
+        assert!(matches!(
+            parse(&v(&["live", "cancel", "r1", "lr1-0"])),
+            ReviewCommand::Live(ReviewLiveCommand::Cancel { run_id, .. }) if run_id == "lr1-0"
+        ));
+        assert!(matches!(
+            parse(&v(&["live", "cancel", "r1"])),
+            ReviewCommand::Live(ReviewLiveCommand::UsageError(_))
+        ));
+    }
+
+    #[test]
+    fn parses_settings_live_actions_tri_state() {
+        for (flag, want) in [
+            (Some("--live-actions"), Some(true)),
+            (Some("--no-live-actions"), Some(false)),
+            (None, None),
+        ] {
+            let mut args = vec!["settings".to_string(), "r1".to_string()];
+            args.extend(flag.map(str::to_string));
+            match parse(&args) {
+                ReviewCommand::Settings { live_actions, .. } => assert_eq!(live_actions, want),
+                other => panic!("unexpected: {other:?}"),
+            }
         }
     }
 

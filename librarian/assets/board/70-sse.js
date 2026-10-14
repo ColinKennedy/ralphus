@@ -1039,14 +1039,19 @@
       function fetchGuardianDetail(gid) {
         const inFlight = guardianDetailFetches[gid];
         if (inFlight) return inFlight;
-        const p = fetch(`/api/guardians/${gid}`)
+        const detailFetch = fetch(`/api/guardians/${gid}`)
           .then((r) => (r.ok ? r.json() : null))
           .then((detail) => {
             if (!detail) return;
             const entry = guardians.find((x) => x.id === gid);
             if (entry) Object.assign(entry, detail);
           })
-          .catch(() => {})
+          .catch(() => {});
+        // The review's live actions are a per-review sub-resource of the
+        // detail the user is looking at, so they refresh on the same cadence
+        // and land in the same render.
+        const p = Promise.all([detailFetch, pollLiveActions(gid)])
+          .then(() => {})
           .finally(() => { delete guardianDetailFetches[gid]; });
         guardianDetailFetches[gid] = p;
         return p;

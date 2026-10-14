@@ -90,8 +90,6 @@ pub struct SuggestedAction {
     #[serde(default)]
     pub description: Option<String>,
     #[serde(default)]
-    pub success: Option<String>,
-    #[serde(default)]
     pub cleanup_command: Option<String>,
     /// Whether the check suits auto-run. `false` means it should not be
     /// offered for auto-run (it is interactive, destructive, or heavy).
@@ -286,9 +284,6 @@ pub fn render_hints(hints: &[CollectedHint]) -> String {
         }
         if let Some(description) = &action.description {
             out.push_str(&format!("\n  description: {description}"));
-        }
-        if let Some(success) = &action.success {
-            out.push_str(&format!("\n  success: {success}"));
         }
         for rule in &action.hint {
             out.push_str(&format!("\n  include when: {}", describe_rule(rule)));

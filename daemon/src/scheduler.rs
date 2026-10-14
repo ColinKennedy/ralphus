@@ -555,6 +555,7 @@ pub fn run_loop(
     // down is retired promptly instead of waiting a full interval.
     if first_run {
         crate::guardian_merge::retire_stale_worktrees(&store);
+        crate::live_runs::retire_live_refs(&store);
         crate::pr::sweep_terminal_dual_root_upstream_branches(&store);
     }
     let mut last_worktree_retirement = std::time::Instant::now();
@@ -583,6 +584,17 @@ pub fn run_loop(
     if first_run {
         crate::pr::recover_pending_auto_submits_on_startup(&store);
         recover_interrupted_reviews(&store, &sem, &cancellations);
+        // Live actions: nothing can still be running a live run in this
+        // process, so a row left `running` by the previous daemon was
+        // interrupted. It counts as the review's one automatic run; the user
+        // reruns it by hand.
+        match store.lock().interrupt_running_live_runs() {
+            Ok(0) | Err(_) => {}
+            Ok(n) => crate::rlog!(
+                WARNING,
+                "ralphus [recovery] {n} live run(s) were interrupted by the daemon restart"
+            ),
+        }
     }
     // Recovery: start collecting guardians whose contributing cells are all
     // Done. This handles the case where the daemon was restarted after the squad
@@ -643,6 +655,13 @@ pub fn run_loop(
         tick(&store, &runner, &sem, &cancellations, &summary_queue);
         if last_maintenance.elapsed() >= REVIEW_MAINT_INTERVAL {
             crate::guardian_merge::review_maintenance(&store, &sem, &cancellations);
+            // Live actions whose one automatic run became due without a new
+            // preparation (the last cell finished later, the opt-in or the
+            // budget changed).
+            crate::live_runs::sweep_automatic_runs(
+                &store,
+                &crate::live_runs::default_runner_factory(),
+            );
             last_maintenance = std::time::Instant::now();
         }
         if last_base_branch_freshness_poll.elapsed() >= BASE_BRANCH_FRESHNESS_POLL_INTERVAL {
@@ -662,6 +681,7 @@ pub fn run_loop(
         }
         if last_worktree_retirement.elapsed() >= WORKTREE_RETIREMENT_INTERVAL {
             crate::guardian_merge::retire_stale_worktrees(&store);
+            crate::live_runs::retire_live_refs(&store);
             crate::pr::sweep_terminal_dual_root_upstream_branches(&store);
             last_worktree_retirement = std::time::Instant::now();
         }
@@ -3981,6 +4001,16 @@ fn run_cell_worker(
             None => guidance,
         });
     }
+    // A git-backed task fails with "no commits since baseline" when its cells
+    // leave their work uncommitted (`check_task_no_commits_guard`), and the
+    // review only ever sees committed work -- so a prompt cell is told to
+    // commit exactly when that guard applies to it.
+    if spec.prompt.is_some() && task_requires_commits(store, squad_id, row.task_idx) {
+        spec.system_prompt = Some(match spec.system_prompt {
+            Some(existing) => format!("{existing}\n\n{CELL_COMMIT_SYSTEM_PROMPT}"),
+            None => CELL_COMMIT_SYSTEM_PROMPT.to_string(),
+        });
+    }
     spec.agent = selection.backend.clone();
     spec.executable = selection.executable.clone();
     spec.prompt = spec
@@ -4718,6 +4748,34 @@ fn run_cell_worker(
         }
     }
 
+    // Live actions: how this cell's agent said it would test its work live.
+    // Recorded from every finished prompt cell's final reply; the review the
+    // cell lands in turns them into live actions.
+    if row.prompt.is_some() && result.is_done() {
+        let handoffs = crate::live_actions::parse_live_handoffs(&result.summary);
+        let guard = store.lock();
+        if guard
+            .replace_cell_live_handoffs(squad_id, row.task_idx, row.idx, &handoffs)
+            .is_ok()
+        {
+            let (count, nothing_to_test) = match &handoffs {
+                crate::live_actions::LiveHandoffs::NoMarker => (0, false),
+                crate::live_actions::LiveHandoffs::NothingToTest => (0, true),
+                crate::live_actions::LiveHandoffs::Tests(tests) => (tests.len(), false),
+            };
+            crate::cartographer::Note::new("scheduler")
+                .squad(squad_id)
+                .cell(&row.cell_id)
+                .task(&row.task_name)
+                .scope("cell")
+                .emit(
+                    &guard,
+                    "live handoffs recorded",
+                    serde_json::json!({"count": count, "nothing_to_test": nothing_to_test}),
+                );
+        }
+    }
+
     if let Some(ghost_text) = result.ghost.as_deref().map(str::trim) {
         if !ghost_text.is_empty() {
             let uri = crate::ghost::cell_uri(squad_id, row.task_idx, row.idx);
@@ -5039,6 +5097,35 @@ fn run_proof_only_worker(
 /// human needing to open the Logs modal. `git` subprocess/provider calls run
 /// outside the store lock, matching this module's "subprocess waits happen
 /// outside the store lock" rule.
+/// Told to every prompt cell of a task [`check_task_no_commits_guard`] applies
+/// to: its work only counts once it is committed.
+pub(crate) const CELL_COMMIT_SYSTEM_PROMPT: &str = "## Committing\n\
+When your change is complete, commit it in this worktree: stage the files you \
+changed (never build output or scratch files) and `git commit` with a short, \
+descriptive message. Ralphus reviews and merges only committed work -- edits \
+left uncommitted are not seen, and the task fails for having no commits. Do \
+not push; ralphus does that.";
+
+/// Whether [`check_task_no_commits_guard`] will require this task's cells to
+/// have committed: a git project, and the task does not opt out with
+/// `no_commit_required`.
+fn task_requires_commits(
+    store: &crate::store_lock::StoreHandle,
+    squad_id: &str,
+    task_idx: i64,
+) -> bool {
+    let guard = store.lock();
+    let Ok(Some(info)) = guard.task_commit_guard_info(squad_id, task_idx) else {
+        return false;
+    };
+    !info.no_commit_required
+        && info
+            .project
+            .as_deref()
+            .and_then(|name| guard.get_project(name).ok().flatten())
+            .is_some_and(|p| p.vcs == "git")
+}
+
 fn check_task_no_commits_guard(
     store: &crate::store_lock::StoreHandle,
     squad_id: &str,
@@ -5046,19 +5133,7 @@ fn check_task_no_commits_guard(
     task_name: &str,
     cells: &[crate::store::CellRow],
 ) -> bool {
-    let (info, is_git) = {
-        let guard = store.lock();
-        let Ok(Some(info)) = guard.task_commit_guard_info(squad_id, task_idx) else {
-            return true;
-        };
-        let is_git = info
-            .project
-            .as_deref()
-            .and_then(|name| guard.get_project(name).ok().flatten())
-            .is_some_and(|p| p.vcs == "git");
-        (info, is_git)
-    };
-    if info.no_commit_required || !is_git {
+    if !task_requires_commits(store, squad_id, task_idx) {
         return true;
     }
     let workspaces: Vec<crate::workspace::Workspace> = cells
@@ -7100,6 +7175,50 @@ mod tests {
     use super::*;
     use crate::runner::{RunnerResult, RunnerSpec};
     use std::collections::BTreeMap;
+
+    #[test]
+    fn prompt_cells_are_told_to_commit_exactly_when_the_no_commits_guard_applies() {
+        let mut raw = crate::store::Store::open_in_memory().unwrap();
+        raw.register_project("gitproj", "", "/repo", "git").unwrap();
+        let file: ralphus_core::schema::TaskFile = toml::from_str(
+            r#"
+[[task]]
+name = "needs-commit"
+project = "gitproj"
+[[task.cell]]
+cwd = "/repo"
+prompt = "add a label"
+
+[[task]]
+name = "opted-out"
+project = "gitproj"
+no_commit_required = true
+[[task.cell]]
+cwd = "/repo"
+prompt = "look around"
+
+[[task]]
+name = "no-project"
+[[task.cell]]
+cwd = "/repo"
+prompt = "anything"
+"#,
+        )
+        .unwrap();
+        let squad = raw.insert_squad(&file, None, false).unwrap();
+        let store: crate::store_lock::StoreHandle =
+            Arc::new(crate::store_lock::StoreMutex::new(raw));
+        assert!(task_requires_commits(&store, &squad, 0));
+        assert!(
+            !task_requires_commits(&store, &squad, 1),
+            "no_commit_required opts out"
+        );
+        assert!(
+            !task_requires_commits(&store, &squad, 2),
+            "no git project, no guard"
+        );
+        assert!(CELL_COMMIT_SYSTEM_PROMPT.contains("git commit"));
+    }
 
     #[test]
     fn earlier_proofs_text_no_prior_proofs() {

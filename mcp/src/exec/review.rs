@@ -13,7 +13,8 @@ use ralphus_cli::commands::CommandError;
 use ralphus_cli::commands::env;
 use ralphus_cli::commands::review::{
     self, GuardianEnvArgs, ReviewActionCommand, ReviewBranchCommand, ReviewChecksCommand,
-    ReviewCommand, ReviewFollowupCommand, ReviewPrCommand, ReviewUpstreamCommand,
+    ReviewCommand, ReviewFollowupCommand, ReviewLiveCommand, ReviewPrCommand,
+    ReviewUpstreamCommand,
 };
 use ralphus_cli::commands::task::with_uri;
 use ralphus_cli::selector::{
@@ -162,6 +163,7 @@ pub fn execute(cmd: ReviewCommand, client: &DaemonClient) -> ExecResult {
             cache_manual_checks,
             skip_manual_checks,
             auto_run,
+            live_actions,
             rebuild_on,
             followup_enabled,
             followup_auto_start,
@@ -189,6 +191,7 @@ pub fn execute(cmd: ReviewCommand, client: &DaemonClient) -> ExecResult {
                 cache_manual_checks,
                 skip_manual_checks,
                 auto_run,
+                live_actions,
                 rebuild_on,
                 followup_enabled,
                 followup_auto_start,
@@ -341,6 +344,7 @@ pub fn execute(cmd: ReviewCommand, client: &DaemonClient) -> ExecResult {
         ReviewCommand::Branch(c) => exec_branch(c, client),
         ReviewCommand::Checks(c) => exec_checks(c, client),
         ReviewCommand::Action(c) => exec_action(c, client),
+        ReviewCommand::Live(c) => exec_live(c, client),
         ReviewCommand::Followup(c) => exec_followup(c, client),
     }
 }
@@ -754,6 +758,24 @@ fn exec_checks_terminal(client: &DaemonClient, selector: &str, mode: &str) -> Ex
         mode,
     );
     Ok(json!({"cwd": cwd, "command": cmd.join(" "), "guardian_id": resolved.guardian_id}))
+}
+
+fn exec_live(cmd: ReviewLiveCommand, client: &DaemonClient) -> ExecResult {
+    match cmd {
+        ReviewLiveCommand::Help | ReviewLiveCommand::UsageError(_) => Err(usage("no such tool")),
+        ReviewLiveCommand::List { selector } => {
+            let resolved = resolve_guardian_selector(client, &selector, DEFAULT_REVIEW_LIST_HINT)?;
+            Ok(client.guardian_live_actions(&resolved.guardian_id)?)
+        }
+        ReviewLiveCommand::Run { selector, index } => {
+            let resolved = resolve_guardian_selector(client, &selector, DEFAULT_REVIEW_LIST_HINT)?;
+            Ok(client.guardian_run_live_actions(&resolved.guardian_id, index)?)
+        }
+        ReviewLiveCommand::Cancel { selector, run_id } => {
+            let resolved = resolve_guardian_selector(client, &selector, DEFAULT_REVIEW_LIST_HINT)?;
+            Ok(client.guardian_cancel_live_run(&resolved.guardian_id, &run_id)?)
+        }
+    }
 }
 
 fn exec_action(cmd: ReviewActionCommand, client: &DaemonClient) -> ExecResult {

@@ -88,6 +88,28 @@ Reach for one of these instead:
 
 Treat typing `git stash` as a stop-and-ask trigger.
 
+## Never use tmux for anything new
+
+tmux (psmux on Windows) is being removed from ralphus. New work must not add
+to what has to be unwound:
+
+- **Running a process** (an agent, a command, a check): go through the
+  runner's tmux-free path, `daemon/src/runner/direct.rs`. It is already the
+  default for every spec (`RALPHUS_RUNNER_MODE` unset). It runs a plain child
+  process, tees its output into the durable `.raw` transcript, and kills the
+  whole process tree on cancel. Don't create tmux sessions or panes, and don't
+  depend on `RALPHUS_RUNNER_MODE=tmux`.
+- **Showing it live**: build Live View on that transcript (the `pane` /
+  `pane-transcript` endpoints already serve it for a direct run), never on
+  capturing a tmux pane.
+- **Naming**: the `squad / task / cell` triple that `crate::tmux::session_name`
+  formats is only a key, so reusing it to name a session or transcript is fine.
+  A new `Tmux::resolve()`, `has_session`, `kill_session` or pane capture call is
+  not.
+
+When existing tmux-specific code is in the way, leave it untouched rather than
+extending it, and say so in your report.
+
 ## Extend agent backends through their existing abstractions
 
 When changing an agent, agent backend, model integration, launcher, or its

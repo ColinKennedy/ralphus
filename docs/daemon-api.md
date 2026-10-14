@@ -169,7 +169,13 @@ where one exists.
 | POST | `/api/guardians/{id}/followup/accept` | Accept the offer: draft the follow-up squad |
 | POST | `/api/guardians/{id}/followup/decline` | Decline the offer |
 | POST | `/api/guardians/{id}/run-manual-commands` | Launch a ready manual-check command at its prepared execution location; `409` until ready |
-| POST | `/api/guardians/{id}/run-action-hint` | Launch a ready authored action at its prepared execution location; prompt actions are expanded during preparation |
+| POST | `/api/guardians/{id}/run-action-hint` | Launch a ready authored action at its prepared execution location. A `prompt` action is agent-run: it is queued as a [live run](#live-actions) and the reply is `{ok, live_run}` |
+| GET | `/api/guardians/{id}/live-actions` | The review's [live actions](#live-actions), its live runs (newest first), and whether the opt-in is on |
+| POST | `/api/guardians/{id}/live-actions/run` | Queue manual live runs: body `{"index": N}` for one, `{}` for all; `409` when no member cell posted a live handoff |
+| POST | `/api/guardians/{id}/live-runs/{run_id}/cancel` | Drop a queued live run, or stop a running one |
+| GET | `/api/guardians/{id}/live-runs/{run_id}/pane` | Live pane of one live run's agent session (board Live View) |
+| GET | `/api/guardians/{id}/live-runs/{run_id}/pane-transcript` | Raw transcript range of one live run's agent session |
+| GET | `/api/guardians/{id}/live-runs/{run_id}/terminal-log` | Persisted terminal-log attempts of one live run |
 | GET | `/api/guardians/{id}/check-runs/{kind}/{index}/output` | [Captured output of the last run of one board-launched check](#get-apiguardiansidcheck-runskindindexoutput) |
 | POST | `/api/guardians/{id}/resolve-input` | [Delegate a named check input to the resolver agent](#post-apiguardiansidresolve-input) ("set it for me", RAL-164) |
 
@@ -2115,6 +2121,10 @@ Manual Check. Your check environment may be out of date. Consider closing and
 re-running.", the board shows it as a warning on the row, and watchers get a
 `review_auto_run_superseded` notice. The run is left alone; the note clears when
 the check is prepared again.
+
+*Prompt actions.* A `[[review.action]]` whose `prompt` is set (and no
+`command`) is agent-run: auto-run queues it as a [live run](#live-actions)
+rather than opening a terminal.
 
 *Failures.* A failing auto-run (non-zero exit, or timed out) sends an
 informational `review_auto_run_check_failed` notice. It carries no remediation
@@ -5371,3 +5381,67 @@ point, auto-resuming once the waypoint closes — see
   shared token) is the expected addition (see `FOLLOW.local.md` #3).
 - Live updates are poll-based for now (librarian polls `GET /api/tasks`); an SSE
   or WebSocket channel is a later optimization.
+
+## Live actions
+
+A **live action** is an agent-run live test of a review's tip. Every prompt
+cell is asked how it would test its work live and answers with
+`RALPHUS_LIVE_ACTION:` handoffs (see `docs/special-syntax.md`), served per cell
+at `GET /api/squads/{id}/cells/{ti}/{si}/live-handoffs` as
+`{tests: string[], nothing_to_test: bool, recorded_at_ms}`. A review's live
+actions are its member cells' handoffs -- the latest-finished cell of each task
+only -- deduplicated once by the review's resolver agent and then fixed.
+
+`live_actions` (boolean, default `false`) opts a review in: per review (`POST
+/api/guardians/{id}/settings` or `/details`, `[[review]] live_actions`), with a
+project default (`POST /api/projects/{name}/review-settings`, `.ralphus.toml
+[review] live_actions`). `GuardianView` carries `live_actions` (the review's own
+value or `null`), `effective_live_actions`, and `live_actions_auto_ran_at_ms`.
+
+*One automatic run.* An opted-in review runs its live actions once, by itself,
+the first time it has a prepared checkout while every member cell has finished
+(done, failed, cancelled or ignored), it is not stopped or finished, and its
+`maximum_budget_usd` is not spent. It never waits for PR CI. The claim is
+write-once (`live_actions_auto_ran_at_ms`), so a restart, rebase, feedback pass
+or auto-fix never repeats it; later runs are manual. A failed preparation does
+not hold it back: the failure detail is handed to the agent. Turning the opt-in
+on for an already prepared review starts it at once.
+
+*Runs.* Each execution is a live run, queued and run one at a time per review
+in the review's prepared checkout, which is held for the run's duration (a newer
+preparation goes to a sibling directory). The agent runs as a plain child
+process (the runner's tmux-free path), keyed `guardian-{id}` / task
+`live-action` / cell `live-{index}-{run_id}`; the board's Live View follows its
+durable transcript. `GET /api/guardians/{id}/live-actions` returns:
+
+```json
+{
+  "enabled": true, "own_setting": true, "auto_ran_at_ms": 1760000000000,
+  "checkout": ".../review-postmerge", "preparation_failure": null,
+  "actions": [{"idx": 0, "label": "Board review inspector", "prompt": "...",
+               "source_cells": ["ralphus:/squad-.../0/1"], "created_at_ms": 0}],
+  "runs": [{"run_id": "lr...", "kind": "live", "action_idx": 0, "label": "...",
+            "trigger": "auto", "state": "finished", "base_tip": "...",
+            "live_ref": null, "commits": ["..."], "report": "...", "error": null,
+            "cost_usd": 0.42, "cell_id": "live-0-lr...",
+            "integration": "integrated", "integration_detail": "...",
+            "queued_at_ms": 0, "started_at_ms": 0, "finished_at_ms": 0}]
+}
+```
+
+`state` is `queued`, `running`, `finished`, `failed`, `cancelled`,
+`over_budget`, or `interrupted` (the daemon restarted mid-run). A finished run
+posts its report into the review's conversation (author `Live action`, on the
+top branch).
+
+*Commits.* A run may commit (never push); leftover tracked edits are committed
+for it, untracked build output never is. Its commits are pinned on
+`refs/ralphus/live/<review>/<run>` and carried onto the review's topmost
+enabled branch through the same pass feedback uses -- worktree lease, proof
+gate, push to the branch's PR, downstream restack, rebuild. A clean cherry-pick
+needs no agent; a conflict hands the resolver the run's report and patch.
+`integration` is `none`, `pending`, `integrating`, `integrated`, `failed` (kept
+on its live ref, watchers notified with remediation), `skipped` (the review
+finished first) or `kept` (the review finished with the commits never carried).
+The live ref is deleted once patch-ids confirm the commits landed, and the daily
+worktree sweep retires the rest when the review finishes.

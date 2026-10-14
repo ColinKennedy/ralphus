@@ -303,6 +303,7 @@ pub const REVIEW_KEYS: &[&str] = &[
     "cache_manual_checks",
     "skip_manual_checks",
     "auto_run",
+    "live_actions",
     "rebuild_on",
 ];
 /// The full set of top-level `[[waypoint]]` keys (RAL-400).
@@ -336,7 +337,6 @@ const REVIEW_ACTION_KEYS: &[&str] = &[
     "prompt",
     "command",
     "description",
-    "success",
     "prepare",
     "cleanup_command",
     "input",
@@ -2370,6 +2370,7 @@ fn validate_review_blocks(value: Option<&toml::Value>, ctx: &mut Ctx) {
         check_type(ctx, table, "cache_manual_checks", Ty::Bool, &rpath, header);
         check_type(ctx, table, "skip_manual_checks", Ty::Bool, &rpath, header);
         check_type(ctx, table, "auto_run", Ty::Bool, &rpath, header);
+        check_type(ctx, table, "live_actions", Ty::Bool, &rpath, header);
         validate_rebuild_on(table, &rpath, ctx, header);
         check_type(
             ctx,
@@ -3083,7 +3084,6 @@ fn validate_review_action_array(value: Option<&toml::Value>, path: &str, ctx: &m
         check_type(ctx, table, "cleanup_command", Ty::Str, &apath, None);
         check_type(ctx, table, "auto_run", Ty::Bool, &apath, None);
         check_type(ctx, table, "description", Ty::Str, &apath, None);
-        check_type(ctx, table, "success", Ty::Str, &apath, None);
         for key in ["command", "cleanup_command"] {
             if let Some(value) = table.get(key).and_then(toml::Value::as_str) {
                 check_worktree_text_placeholders(ctx, &format!("{apath}.{key}"), value);
@@ -4788,6 +4788,29 @@ auto_run=false
                 r.errors
             );
         }
+    }
+
+    // ── [[review]] live_actions ──
+
+    #[test]
+    fn review_live_actions_must_be_a_bool() {
+        let base = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nreview=\"<<review:r>>\"\n[[review]]\nid=\"r\"\n";
+        for value in ["true", "false"] {
+            let r = validate_toml(&format!("{base}live_actions={value}\n"));
+            assert!(r.is_ok(), "{:?}", r.errors);
+        }
+        for bad in ["\"yes\"", "1"] {
+            let r = validate_toml(&format!("{base}live_actions={bad}\n"));
+            assert!(
+                r.errors
+                    .iter()
+                    .any(|e| e.kind == ErrorKind::WrongType && e.message.contains("live_actions")),
+                "{bad}: {:?}",
+                r.errors
+            );
+        }
+        let typo = validate_toml(&format!("{base}live_action=true\n"));
+        assert!(!typo.is_ok(), "a misspelled key is rejected as unknown");
     }
 
     // ── [[review]] cache_manual_checks (RAL-521) ──
@@ -6529,7 +6552,6 @@ command = "cargo build"
 label = "Run build"
 command = "staged/app"
 description = "Exercise the prepared binary"
-success = "It prints PASS"
 [[review.action.artifact]]
 source = "target/debug/app"
 destination = "staged/app"

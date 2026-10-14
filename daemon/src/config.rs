@@ -298,6 +298,11 @@ pub struct ReviewConfig {
     /// `auto_run` both win over this.
     #[serde(default)]
     pub auto_run: Option<bool>,
+    /// Live actions: project default for whether a review runs its live
+    /// actions. `None` resolves to `false` (see [`Self::live_actions`]); a
+    /// review's own `live_actions` wins over this.
+    #[serde(default)]
+    pub live_actions: Option<bool>,
     /// Which events tear down and rebuild a review's prepared build (any of
     /// `ralphus_core::schema::REBUILD_ON_VALUES`). `None` means unset, which
     /// resolves to all three values (see [`Self::rebuild_on`]); the project
@@ -494,6 +499,7 @@ pub const REVIEW_CONFIG_KEYS: &[&str] = &[
     "cache_manual_checks",
     "skip_manual_checks",
     "auto_run",
+    "live_actions",
     "rebuild_on",
 ];
 
@@ -656,6 +662,12 @@ impl ReviewConfig {
     #[must_use]
     pub fn auto_run(&self) -> bool {
         self.auto_run.unwrap_or(false)
+    }
+
+    /// Whether reviews run their live actions when no layer sets it (`false`).
+    #[must_use]
+    pub fn live_actions(&self) -> bool {
+        self.live_actions.unwrap_or(false)
     }
 
     /// The events that rebuild a review's prepared build when neither the
@@ -821,6 +833,7 @@ impl ReviewConfig {
             cache_manual_checks: over.cache_manual_checks.or(self.cache_manual_checks),
             skip_manual_checks: over.skip_manual_checks.or(self.skip_manual_checks),
             auto_run: over.auto_run.or(self.auto_run),
+            live_actions: over.live_actions.or(self.live_actions),
             rebuild_on: over.rebuild_on.or(self.rebuild_on),
             auto_fix_prompt_template: over
                 .auto_fix_prompt_template
@@ -995,6 +1008,10 @@ pub const REVIEW_FIELD_PARITY: &[(&str, ReviewFieldDefault)] = &[
     (
         "auto_run",
         ReviewFieldDefault::ProjectDefault(|c| c.auto_run.is_some()),
+    ),
+    (
+        "live_actions",
+        ReviewFieldDefault::ProjectDefault(|c| c.live_actions.is_some()),
     ),
     (
         "rebuild_on",

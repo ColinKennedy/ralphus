@@ -1735,14 +1735,14 @@ Check the task's cell output and re-run it — or, if this branch is meant to be
        * their commands. `kind` picks the run-all action; the ▾ half opens the
        * section's own menu so one command can be run instead of all of them.
        * @param {GuardianView} g - The review.
-       * @param {string} kind - "manual" or "actions".
+       * @param {string} kind - "manual", "actions" or "live".
        * @param {boolean} enabled - Whether running is possible right now.
        * @param {string} label - Button text, which carries the gating reason when disabled.
        * @param {string} tip - Tooltip explaining what pressing it does, or why it cannot be pressed.
        * @returns {string}
        */
       function reviewRunControl(g, kind, enabled, label, tip) {
-        const action = kind === "manual" ? "runAllManualChecks" : "runAllActionHints";
+        const action = kind === "manual" ? "runAllManualChecks" : kind === "live" ? "runAllLiveActions" : "runAllActionHints";
         const btn = `<button class="btn primary rg-runbtn" ${enabled ? "" : "disabled"} `
           + `data-click="${action}" data-guardian-id="${esc(g.id)}"${enabled ? ` data-tip="${esc(tip)}"` : ""}>${esc(label)}</button>`;
         // A disabled <button> swallows mouseover, so its tooltip has to live on
@@ -2214,7 +2214,27 @@ Press Accept on the note to create it.">Squad pending</span>`;
               const key = `${g.id}:action:${i}`;
               const needsInput = !!(h.inputs && h.inputs.length);
               const label = esc(h.label || "Run");
-              const ready = h.preparation_state === "ready" && !!h.command;
+              // A prompt action is run by an agent rather than a terminal, so it
+              // is ready with no command of its own.
+              const isPrompt = !h.command && !!h.prompt;
+              const ready = h.preparation_state === "ready" && (!!h.command || isPrompt);
+              if (ready && isPrompt) {
+                const promptText = h.prompt || "";
+                const run = latestLiveRun(liveActionsViews[g.id], "action", i);
+                const rowClick = run
+                  ? `data-click="openLiveRunPane" data-guardian-id="${esc(g.id)}" data-run-id="${esc(run.run_id)}"`
+                  : `data-click="toggleReviewCommandFull" data-key="${esc(key)}"`;
+                return `<div class="cmd-row selectable${run && inspectorLiveRun && inspectorLiveRun.runId === run.run_id ? " sel" : ""}" ${rowClick} data-tip="${esc(run
+                    ? "An agent runs this action. Click to show its newest run in Live View in the details pane.\nUse + for its prompt and report."
+                    : "An agent runs this action. It has not run yet; click to see its prompt.")}">
+                    <button class="cmd-run" data-click="runCheck" data-kind="action" data-guardian-id="${esc(g.id)}" data-i="${i}" data-runkey="${esc(key)}"
+                      data-tip="${esc(`Queue an agent run of this action in the built review.\nIt costs money; follow it in Live View.\nPrompt: ${promptText}`)}">▶</button>
+                    <span class="cmd-label">${label}</span>
+                    <span class="cmd-text" data-tip="${esc(promptText)}">${esc(promptText)}</span>
+                    ${autoRunNoteBadge(h)}${promptActionRunStatus(g, i)}
+                    <button class="cmd-expand" data-click="toggleReviewCommandFull" data-key="${esc(key)}" data-tip="Show or hide this action's prompt and its newest run's report beneath its row.">${commandFullOpen[key] ? "−" : "+"}</button>
+                  </div>${promptActionFullBlock(g, key, i, promptText)}`;
+              }
               if (!ready) {
                 const status = h.preparation_state || "waiting";
                 const detail = h.preparation_detail || (h.prompt
@@ -2240,7 +2260,7 @@ Press Accept on the note to create it.">Squad pending</span>`;
             return `<h3 class="section" data-tip="User actions: checks you write yourself in the task file, as [[review.action]] blocks.\nThey stay the same on every rebase and run in the built review.\nAdvisory — they never block Approve or Merge / rebase.">user actions${sectionMenuBtn(g.id, "actions")}</h3>
               ${reviewRunGroup(
                 reviewRunControl(g, "actions", hints.some((h) => h.preparation_state === "ready" && h.command && !(h.inputs && h.inputs.length)), "▶ Run all",
-                  "Run every ready action, each from its already-prepared location.\nActions needing input are skipped — run those from their own row.") + rebuildNowControl(g),
+                  "Run every ready action, each from its already-prepared location.\nActions needing input are skipped — run those from their own row.\nPrompt actions are skipped too: each is an agent run that costs money, so start those from their own row.") + rebuildNowControl(g),
                 "",
                 rows)}`;
           })()}
@@ -2302,7 +2322,8 @@ Press Accept on the note to create it.">Squad pending</span>`;
                     }).join(""), false, headAttrs)
                 : reviewRunGroup(runControl, waitingNote, "", false, headAttrs)}
               `;
-          })()}`;
+          })()}
+          ${liveActionsSectionHtml(g)}`;
         attachPeekResizeHandlers();
         restorePeekScrollPositions(); // RAL-471: the innerHTML rewrite above just destroyed/recreated any peek `<pre>` nodes, dropping their scroll position
         restorePromptBoxScroll();
@@ -3665,6 +3686,14 @@ Press Accept on the note to create it.">Squad pending</span>`;
         }
         for (const i of runnable) await runCheck("action", id, i);
       }
+      /**
+       * Queues an agent run of every one of a review's live actions.
+       * @param {string} id - The review id.
+       * @returns {Promise<void>}
+       */
+      async function runAllLiveActions(id) {
+        await runLiveActions(id, null);
+      }
 
       // ---------- structured check inputs (RAL-164) ----------
       /**
@@ -3687,12 +3716,24 @@ Press Accept on the note to create it.">Squad pending</span>`;
         const inputs = (g && check) ? checkInputValues(g, check, key) : {};
         const cleanupEl = /** @type {HTMLInputElement|null} */ (document.getElementById(`check-cleanup:${key}`));
         const run_cleanup = !!(cleanupEl && cleanupEl.checked);
-        markCommandLaunched(key);
+        // A prompt action is queued as an agent run, not handed to a terminal,
+        // so it never reports a check-run finish; its row follows the live run.
+        const isPrompt = kind === "action" && !!check && !check.command && !!check.prompt;
+        if (!isPrompt) markCommandLaunched(key);
         const url = `/api/guardians/${id}/${kind === "manual" ? "run-manual-commands" : "run-action-hint"}`;
         const resp = await guardianAction(url, { index, inputs, run_cleanup });
         // A refused launch never reports finishing, so it would otherwise sit
         // at "running" for good; the error toast already says why.
         if (!resp || !resp.ok) forgetCommandLaunch(key);
+        else {
+          /** @type {{live_run?: string}} */
+          const data = await resp.json().catch(() => ({}));
+          if (data.live_run) {
+            forgetCommandLaunch(key);
+            notify("info", "Agent run queued — click the action's row to follow it in Live View.");
+            await pollLiveActions(id);
+          }
+        }
         tick();
       }
       /**

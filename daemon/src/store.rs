@@ -1049,6 +1049,10 @@ pub struct ProjectReviewSettings {
     /// ready. Defaults to `false` when unset.
     #[serde(default)]
     pub auto_run: Option<bool>,
+    /// Live actions: project-level default for whether reviews run their live
+    /// actions. Defaults to `false` when unset.
+    #[serde(default)]
+    pub live_actions: Option<bool>,
     /// Project-level default for which events (`rebase`, `feedback`,
     /// `auto_fix`) tear down and rebuild a review's prepared build. Unset
     /// resolves to all three; an empty list never rebuilds automatically.
@@ -1111,6 +1115,7 @@ impl ProjectReviewSettings {
             cache_manual_checks: self.cache_manual_checks,
             skip_manual_checks: self.skip_manual_checks,
             auto_run: self.auto_run,
+            live_actions: self.live_actions,
             rebuild_on: self.rebuild_on,
             auto_fix_max_attempts: None,
             auto_fix_retry_base_seconds: None,
@@ -2642,6 +2647,60 @@ impl Store {
             );
             CREATE INDEX IF NOT EXISTS idx_ghosts_squad ON ghosts(squad_id);
             CREATE INDEX IF NOT EXISTS idx_ghosts_guardian ON ghosts(guardian_id);
+            -- Live handoffs (`crate::live_actions`): how a prompt cell's agent
+            -- said it would test its work live, one row per
+            -- `RALPHUS_LIVE_ACTION:` marker of its latest reply. A single row
+            -- with `nothing_to_test = 1` records the explicit 'nothing to test
+            -- live' answer.
+            CREATE TABLE IF NOT EXISTS cell_live_handoffs (
+                squad_id        TEXT NOT NULL REFERENCES squads(id) ON DELETE CASCADE,
+                task_idx        INTEGER NOT NULL,
+                cell_idx        INTEGER NOT NULL,
+                ordinal         INTEGER NOT NULL,
+                text            TEXT NOT NULL,
+                nothing_to_test INTEGER NOT NULL DEFAULT 0,
+                created_at_ms   INTEGER NOT NULL,
+                PRIMARY KEY (squad_id, task_idx, cell_idx, ordinal)
+            );
+            -- A review's live actions: its member cells' handoffs, deduplicated
+            -- once and then fixed. `source_cells` is a JSON array of the cell
+            -- URIs each action came from.
+            CREATE TABLE IF NOT EXISTS guardian_live_actions (
+                guardian_id   TEXT NOT NULL REFERENCES guardians(id) ON DELETE CASCADE,
+                idx           INTEGER NOT NULL,
+                label         TEXT NOT NULL,
+                prompt        TEXT NOT NULL,
+                source_cells  TEXT NOT NULL,
+                created_at_ms INTEGER NOT NULL,
+                PRIMARY KEY (guardian_id, idx)
+            );
+            -- Every execution of a live action (or of an agent-run user
+            -- action), queued and run one at a time per review
+            -- (`crate::live_runs`). `commits` is a JSON array, oldest first.
+            CREATE TABLE IF NOT EXISTS guardian_live_runs (
+                run_id             TEXT PRIMARY KEY,
+                guardian_id        TEXT NOT NULL REFERENCES guardians(id) ON DELETE CASCADE,
+                kind               TEXT NOT NULL,
+                action_idx         INTEGER NOT NULL,
+                label              TEXT NOT NULL,
+                trigger            TEXT NOT NULL,
+                state              TEXT NOT NULL,
+                cwd                TEXT,
+                base_tip           TEXT,
+                live_ref           TEXT,
+                commits            TEXT,
+                report             TEXT,
+                error              TEXT,
+                cost_usd           REAL,
+                cell_id            TEXT,
+                integration        TEXT NOT NULL DEFAULT 'none',
+                integration_detail TEXT,
+                queued_at_ms       INTEGER NOT NULL,
+                started_at_ms      INTEGER,
+                finished_at_ms     INTEGER
+            );
+            CREATE INDEX IF NOT EXISTS idx_guardian_live_runs_guardian
+                ON guardian_live_runs(guardian_id, state);
             -- Prophecy subsystem (docs/prophecy-design.md): a durable,
             -- append-only record of what an agent learned while it worked.
             -- Unlike ghosts, this is NOT one row per owner -- every write is
@@ -4159,6 +4218,19 @@ impl Store {
             // RAL-565: per-review default for auto-running manual checks. NULL
             // inherits the project/global default, which resolves to `false`.
             "ALTER TABLE guardians ADD COLUMN auto_run INTEGER",
+            // Live actions: per-review opt-in (NULL inherits the project/global
+            // default, which resolves to off) and the write-once marker of the
+            // review's one automatic live-action run.
+            "ALTER TABLE guardians ADD COLUMN live_actions INTEGER",
+            "ALTER TABLE guardians ADD COLUMN live_actions_auto_ran_at_ms INTEGER",
+            // Live actions: the checkout the review's latest preparation
+            // produced (where live runs execute) and that preparation's
+            // failure detail, if it failed.
+            "ALTER TABLE guardians ADD COLUMN live_actions_checkout TEXT",
+            "ALTER TABLE guardians ADD COLUMN live_actions_checkout_note TEXT",
+            // Live actions: the session cell of the agent that generated the
+            // review's live actions (its deduplication pass).
+            "ALTER TABLE guardians ADD COLUMN live_actions_generation_cell TEXT",
             // Per-review overrides of the global `[followup]` config: whether
             // this review offers follow-up work when it merges, and whether an
             // accepted follow-up squad starts at once. NULL inherits the
@@ -20054,6 +20126,7 @@ command = "e"
             cache_manual_checks: Some(false),
             skip_manual_checks: Some(true),
             auto_run: Some(true),
+            live_actions: Some(true),
             rebuild_on: Some(vec!["feedback".to_string(), "auto_fix".to_string()]),
             base_shift_maximum_rebuilds: Some(5),
             default_pr_user: Some("alice".to_string()),

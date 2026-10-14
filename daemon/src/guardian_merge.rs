@@ -248,6 +248,36 @@ pub(crate) fn feedback_cell_id(branch_id: &str) -> String {
     format!("reviewer-{branch_id}")
 }
 
+/// The cell id of the most recent feedback pass started for each
+/// `(guardian, branch)` in this process. Each pass runs under its own
+/// timestamped `feedback-{branch}-{ms}` cell, so the board's default Live
+/// View for an actioning branch cannot derive the name; it reads it from here.
+/// Process-local: a restart drops it, and the agent it named died with the
+/// process.
+static LATEST_FEEDBACK_CELLS: parking_lot::Mutex<
+    Option<std::collections::HashMap<(String, String), String>>,
+> = parking_lot::Mutex::new(None);
+
+pub(crate) fn record_latest_feedback_cell(guardian_id: &str, branch_id: &str, cell_id: &str) {
+    LATEST_FEEDBACK_CELLS
+        .lock()
+        .get_or_insert_with(Default::default)
+        .insert(
+            (guardian_id.to_string(), branch_id.to_string()),
+            cell_id.to_string(),
+        );
+}
+
+/// The cell id of the most recent feedback pass started for this branch in
+/// this process, if any.
+pub(crate) fn latest_feedback_cell(guardian_id: &str, branch_id: &str) -> Option<String> {
+    LATEST_FEEDBACK_CELLS.lock().as_ref().and_then(|cells| {
+        cells
+            .get(&(guardian_id.to_string(), branch_id.to_string()))
+            .cloned()
+    })
+}
+
 /// Fallback delay for [`run_agent_with_rate_limit_retry`] when a recognized
 /// rate limit carries no provider-suggested delay -- mirrors
 /// `scheduler::DEFAULT_RATE_LIMIT_RETRY`.
@@ -443,7 +473,7 @@ fn run_agent_with_rate_limit_retry(
 /// resets `ThinkingStallDetector`'s own per-attempt low-diversity streak,
 /// and the terminal mailbox escalation once the interview's
 /// `THINKING_STALL_MAX_STRIKES` limit is reached.
-fn run_agent_with_stall_recovery(
+pub(crate) fn run_agent_with_stall_recovery(
     store: &crate::store_lock::StoreHandle,
     spec: &mut RunnerSpec,
     runner: &dyn Runner,
@@ -2125,7 +2155,7 @@ pub(crate) struct ResolvedResolverAgent {
 /// conflict-resolution path RAL-408's database-backed project defaults are
 /// meant to govern, so it resolves through `Store::resolve_review_config`
 /// (file layers + database) directly rather than delegating to them.
-fn resolve_resolver_agent(
+pub(crate) fn resolve_resolver_agent(
     stored_agent: Option<&str>,
     stored_model: Option<&str>,
     store: &crate::store_lock::StoreHandle,
@@ -2329,7 +2359,7 @@ fn final_branch_id(branches: &[crate::guardian::OrderedBranch]) -> Option<&str> 
 /// it. Mirrors the RAL-161 cell/task budget kill-switch: once exceeded,
 /// callers should stop making further resolver/prover calls and fail the
 /// guardian/branch, using the returned error message.
-fn record_guardian_call_cost(
+pub(crate) fn record_guardian_call_cost(
     store: &crate::store_lock::StoreHandle,
     id: &str,
     branch_id: Option<&str>,
@@ -8006,10 +8036,93 @@ pub fn run_feedback(
         feedback,
         message_seq,
         require_proof,
+        None,
         cancel,
     );
     record_feedback_outcome(store, id, branch_id, &outcome);
     outcome
+}
+
+/// Live actions: carry a live run's commits onto `branch_id` (the review's
+/// top branch) through the same pass feedback uses -- the branch's worktree
+/// lease, its proof gate, the push to its PR, the downstream restack and the
+/// rebuild. The commits are cherry-picked; when they do not apply cleanly to
+/// the branch's current head (feedback or an auto-fix moved it since the live
+/// run started), the pick is abandoned and the review's resolver agent is
+/// given `feedback` -- which carries the patch and the live run's report --
+/// to apply the change itself.
+pub fn run_live_action_integration(
+    store: &crate::store_lock::StoreHandle,
+    runner: &dyn Runner,
+    id: &str,
+    branch_id: &str,
+    feedback: &str,
+    commits: &[String],
+    cancel: &CancelToken,
+) -> FeedbackOutcome {
+    if should_rebuild_for(store, id, RebuildTrigger::Feedback) {
+        store.lock_free_memory().cancel_guardian_preparation(id);
+        invalidate_guardian_preparation(
+            store,
+            id,
+            "a live action's fix is landing on the stack; preparation will refresh afterward",
+        );
+        crate::auto_run::note_superseded(store, id, "live action");
+    }
+    let outcome = run_feedback_pass(
+        store,
+        runner,
+        id,
+        branch_id,
+        feedback,
+        None,
+        false,
+        Some(commits),
+        cancel,
+    );
+    record_feedback_outcome(store, id, branch_id, &outcome);
+    outcome
+}
+
+/// Cherry-pick `commits` (oldest first) onto `wt`'s HEAD, one at a time. A
+/// commit whose change is already on the branch (feedback or an auto-fix made
+/// the same fix) is skipped rather than failing the pick. On a real conflict
+/// the pick is aborted and the worktree reset to `start`, so whatever handles
+/// the change next sees the branch exactly as it was. Returns how many commits
+/// were applied, or `None` on a conflict.
+fn cherry_pick_live_commits(wt: &Workspace, commits: &[String], start: &str) -> Option<usize> {
+    let mut applied = 0;
+    for commit in commits {
+        if wt
+            .git(&[
+                "-c",
+                "core.editor=true",
+                "cherry-pick",
+                "--allow-empty-message",
+                commit,
+            ])
+            .is_ok()
+        {
+            applied += 1;
+            continue;
+        }
+        let conflicted = wt
+            .git(&["diff", "--name-only", "--diff-filter=U"])
+            .map(|out| !out.trim().is_empty())
+            .unwrap_or(true);
+        let nothing_left = wt.git(&["diff", "--cached", "--quiet"]).is_ok()
+            && wt.git(&["diff", "--quiet"]).is_ok();
+        if !conflicted && nothing_left {
+            // The change is already there: an empty pick.
+            if wt.git(&["cherry-pick", "--skip"]).is_ok() {
+                continue;
+            }
+        }
+        let _ = wt.git(&["cherry-pick", "--abort"]);
+        let _ = wt.git(&["reset", "--hard", start]);
+        return None;
+    }
+    Some(applied)
 }
 
 /// Persist [`run_feedback`]'s outcome on the branch's open PR rows. A branch
@@ -8054,6 +8167,7 @@ fn run_feedback_pass(
     feedback: &str,
     message_seq: Option<i64>,
     require_proof: bool,
+    live_commits: Option<&[String]>,
     cancel: &CancelToken,
 ) -> FeedbackOutcome {
     // RAL-380: mark the reviewer message this call was invoked for as
@@ -8277,6 +8391,7 @@ fn run_feedback_pass(
          Ralphus pushes it to the pull request for you."
     );
     let feedback_run_cell_id = format!("feedback-{branch_id}-{}", crate::store::now_ms());
+    record_latest_feedback_cell(id, branch_id, &feedback_run_cell_id);
     {
         let guard = store.lock();
         let _ = guard.cartographer_log(crate::cartographer::CartographerEntry {
@@ -8402,14 +8517,44 @@ fn run_feedback_pass(
         .git(&["rev-parse", "HEAD"])
         .ok()
         .map(|s| s.trim().to_string());
-    let result = run_agent_with_stall_recovery(
-        store,
-        &mut spec,
-        runner,
-        cancel,
-        Some((store, id, branch_id)),
-    );
-    let _ = record_guardian_call_cost(store, id, Some(branch_id), "feedback", &result);
+    // Live actions: a live run's commits are cherry-picked first; only a
+    // conflict hands the change (carried in `feedback`) to the resolver.
+    let cleanly_picked = match (live_commits, before_resolver_sha.as_deref()) {
+        (Some(commits), Some(start)) => cherry_pick_live_commits(&wt, commits, start),
+        _ => None,
+    };
+    if live_commits.is_some() {
+        crate::cartographer::Note::new("guardian")
+            .guardian(id)
+            .scope("live_action")
+            .emit(
+                &store.lock(),
+                "live action commits carried",
+                serde_json::json!({
+                    "branch_id": branch_id,
+                    "commits": live_commits.map(<[String]>::len),
+                    "cherry_picked": cleanly_picked,
+                    "resolver_fallback": cleanly_picked.is_none(),
+                }),
+            );
+    }
+    let result = if let Some(applied) = cleanly_picked {
+        let mut picked = crate::runner::RunnerResult::failure("");
+        picked.status = "done".to_string();
+        picked.error = None;
+        picked.summary = format!("cherry-picked {applied} live-action commit(s)");
+        picked
+    } else {
+        let result = run_agent_with_stall_recovery(
+            store,
+            &mut spec,
+            runner,
+            cancel,
+            Some((store, id, branch_id)),
+        );
+        let _ = record_guardian_call_cost(store, id, Some(branch_id), "feedback", &result);
+        result
+    };
     if cancel.is_cancelled() {
         stop_feedback!();
     }
@@ -11686,6 +11831,7 @@ pub fn run_guardian_post_merge_for(
         }
     });
 
+    let mut prepared_checkout = None;
     let outcome = post_merge_jobs_inner(
         store,
         runner,
@@ -11695,6 +11841,7 @@ pub fn run_guardian_post_merge_for(
         jobs,
         trigger,
         &cancel,
+        &mut prepared_checkout,
     );
 
     // Stop the supersede watcher: the run is over, one way or the other. The
@@ -11771,6 +11918,19 @@ pub fn run_guardian_post_merge_for(
     );
     let _ = watcher.join();
     memory.finish_guardian_preparation(id, generation);
+    // Live actions run against the checkout this generation prepared. A
+    // failed preparation still counts: the build failing is exactly the kind
+    // of thing a live test should look at, so the failure is handed to the
+    // live run instead of withholding it.
+    if let (Some(checkout), false) = (prepared_checkout.as_deref(), was_superseded) {
+        crate::live_runs::on_preparation_finished(
+            store,
+            &crate::live_runs::default_runner_factory(),
+            id,
+            checkout,
+            (!ok).then_some(detail.unwrap_or("preparation failed")),
+        );
+    }
 }
 
 /// Send the terminal, watcher-visible outcome of one manual-preparation pass.
@@ -11836,6 +11996,7 @@ fn post_merge_jobs_inner(
     jobs: PostMergeJobs,
     trigger: RebuildTrigger,
     cancel: &CancelToken,
+    prepared_checkout: &mut Option<String>,
 ) -> std::result::Result<Option<String>, String> {
     let combined_path = PathBuf::from(combined_str);
     // Project root of the combined worktree: `<proj>/.git/.ralphus/g/<short>/review`.
@@ -11977,6 +12138,7 @@ fn post_merge_jobs_inner(
     let pm_dir = claim_post_merge_checkout(&ws_root, &combined_ws, &pm_parent, &tip)?;
     let pm_ws = ws_root.at(&pm_dir);
     let pm_str = pm_dir.to_string_lossy().to_string();
+    *prepared_checkout = Some(pm_str.clone());
 
     // First prepare the author-declared action surface. It must not wait on
     // optional AI discovery of additional manual checks: an unavailable model
@@ -12460,13 +12622,33 @@ const FEEDBACK_LOG_TEXT_CHARS: usize = 2000;
 /// cleared where possible, and when it still cannot be reused the next sibling
 /// (`review-postmerge-1`, ...) is claimed instead. Actions record the directory
 /// they were prepared in, so they follow whichever one this returns.
+///
+/// RAL-642: a directory an action or live run still holds
+/// ([`crate::checkout_hold`]) is never removed, reset or cleaned -- the next
+/// sibling is claimed instead, and the running work finishes against the
+/// checkout it started in.
 fn claim_post_merge_checkout(
     ws_root: &Workspace,
     combined_ws: &Workspace,
     parent: &Path,
     tip: &str,
 ) -> std::result::Result<PathBuf, String> {
+    claim_post_merge_checkout_with(ws_root, combined_ws, parent, tip, &|dir| {
+        crate::checkout_hold::is_held(&dir.to_string_lossy())
+    })
+}
+
+/// [`claim_post_merge_checkout`] with the "is this directory held" check
+/// supplied by the caller.
+fn claim_post_merge_checkout_with(
+    ws_root: &Workspace,
+    combined_ws: &Workspace,
+    parent: &Path,
+    tip: &str,
+    is_held: &dyn Fn(&Path) -> bool,
+) -> std::result::Result<PathBuf, String> {
     let mut last_error = String::new();
+    let mut held = Vec::new();
     for attempt in 0..POST_MERGE_CHECKOUT_ATTEMPTS {
         let dir = if attempt == 0 {
             parent.join(POST_MERGE_WORKTREE_DIR)
@@ -12475,6 +12657,10 @@ fn claim_post_merge_checkout(
         };
         let ws = ws_root.at(&dir);
         let dir_str = dir.to_string_lossy().to_string();
+        if is_held(&dir) {
+            held.push(dir_str);
+            continue;
+        }
         if ws.root().exists() {
             let _ = combined_ws.git(&["worktree", "remove", "--force", &dir_str]);
         }
@@ -12509,14 +12695,21 @@ fn claim_post_merge_checkout(
             "post-merge scratch directory {dir_str} is not a worktree and could not be cleared"
         );
     }
+    if held.len() == POST_MERGE_CHECKOUT_ATTEMPTS {
+        return Err(format!(
+            "every prepared checkout directory is in use by a running action or live run ({}); \
+             wait for those runs to finish (or close their terminals) and rebuild",
+            held.join(", ")
+        ));
+    }
     Err(last_error)
 }
 
 /// Whether an action needs no preparation at all: it declares a verbatim
-/// command and nothing to build, transfer or publish, so it is runnable as soon
-/// as the checkout exists.
+/// command (or an agent prompt) and nothing to build, transfer or publish, so
+/// it is runnable as soon as the checkout exists.
 fn action_needs_no_preparation(hint: &crate::guardian::GuardianCheck) -> bool {
-    hint.command.is_some()
+    (hint.command.is_some() || hint.prompt.is_some())
         && hint.prepare.is_empty()
         && hint.artifacts.is_empty()
         && hint.shared_store.is_none()
@@ -12703,24 +12896,6 @@ fn prepare_action_hints(
                         shared_root.display()
                     )
                 })?;
-            }
-            if hints[index].command.is_none() {
-                if let Some(prompt) = hints[index].prompt.as_deref() {
-                    hints[index].command = Some(expand_action_prompt(
-                        store,
-                        runner,
-                        id,
-                        root,
-                        combined_str,
-                        prompt,
-                        &action_env,
-                        cancel,
-                    )?);
-                    store
-                        .lock()
-                        .set_guardian_action_hints(id, &hints)
-                        .map_err(|e| e.to_string())?;
-                }
             }
             if has_new_preparation {
                 for step in &hints[index].prepare {
@@ -12975,86 +13150,6 @@ fn prepare_generated_manual_checks(
             failures.join("; ")
         ))
     }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn expand_action_prompt(
-    store: &crate::store_lock::StoreHandle,
-    runner: &dyn Runner,
-    id: &str,
-    root: &Workspace,
-    combined_str: &str,
-    prompt: &str,
-    env: &std::collections::BTreeMap<String, String>,
-    cancel: &CancelToken,
-) -> std::result::Result<String, String> {
-    let (stored_agent, stored_model) = {
-        let guardian = store.lock().get_guardian(id).map_err(|e| e.to_string())?;
-        (guardian.resolver_agent, guardian.resolver_model)
-    };
-    let resolved = resolve_resolver_agent(
-        stored_agent.as_deref(),
-        stored_model.as_deref(),
-        store,
-        Path::new(combined_str),
-    )
-    .map_err(|e| format!("could not resolve prompt-action agent: {e}"))?;
-    let mut spec = RunnerSpec {
-        squad_id: format!("guardian-{id}"),
-        task: "expand-review-action".to_string(),
-        cell_id: "expand-review-action".to_string(),
-        cwd: combined_str.to_string(),
-        prompt: Some(format!(
-            "Turn this authored manual-test instruction into one runnable shell command. Do not run it. Return only JSON shaped {{\"manual_commands\":[\"command\"]}}. Instruction:\n\n{prompt}"
-        )),
-        command: None,
-        shell: None,
-        agent: resolved.backend.clone(),
-        executable: resolved.executable.clone(),
-        model: resolved.model.clone(),
-        system_prompt: None,
-        system_prompt_position: None,
-        timeout_sec: None,
-        budget_tokens: None,
-        maximum_budget_usd: None,
-        maximum_context: None,
-        auto_compact_threshold: None,
-        maximum_tool_output_tokens: None,
-        effort: None,
-        temperature: None,
-        proof: false,
-        trace_context: None,
-        resume_agent_session_id: None,
-        assigned_agent_session_id: None,
-        env_overrides: {
-            let mut resolved_env = resolved.env;
-            resolved_env.extend(env.clone());
-            resolved_env
-        },
-        machine: root.machine().map(str::to_string),
-        tool_arg_truncate_chars: None,
-        thrash_max_compactions: None,
-        thrash_min_turn_gap: None,
-        allow_personal_settings: false,
-        allow_personal_memory: false,
-        waypoint_context: false,
-        retry_attempt: 0,
-        retry_after_unknown_default_seconds: crate::config::resolve(Path::new(combined_str))
-            .retry_after_unknown_default_seconds(),
-        maximum_timeout: None,
-        pass_score: None,
-    };
-    let result = run_agent_with_stall_recovery(store, &mut spec, runner, cancel, None);
-    if !result.is_done() {
-        return Err(format!(
-            "prompt action expansion failed: {}",
-            result.error.as_deref().unwrap_or("agent did not finish")
-        ));
-    }
-    parse_manual_commands_response(&result.summary)
-        .into_iter()
-        .find_map(|check| check.command)
-        .ok_or_else(|| "prompt action expansion returned no runnable command".to_string())
 }
 
 /// Resolve a V1 shared-store namespace on this machine. Remote providers will
@@ -16275,8 +16370,6 @@ enum ManualCheckItem {
         #[serde(default)]
         description: Option<String>,
         #[serde(default)]
-        success: Option<String>,
-        #[serde(default)]
         run_on: Option<String>,
         #[serde(default)]
         prepare: Vec<crate::guardian::GuardianAutoBuild>,
@@ -16305,7 +16398,6 @@ impl From<ManualCheckItem> for GuardianCheck {
             ManualCheckItem::Structured {
                 command,
                 description,
-                success,
                 run_on,
                 prepare,
                 artifacts,
@@ -16317,7 +16409,6 @@ impl From<ManualCheckItem> for GuardianCheck {
                 command: Some(command),
                 prompt: None,
                 description,
-                success,
                 run_on: Some(run_on.unwrap_or_else(|| "daemon".to_string())),
                 prepare,
                 artifacts,
@@ -16465,7 +16556,7 @@ pub fn manual_commands_prompt(tail: &str, steering: Option<&str>) -> String {
          runnable command line -- never an instruction written for a person. To get a person \
          to look at something, launch it with a command (e.g. `Start-Process \
          http://localhost:{port}`) and write what to look at and what correct looks like in \
-         \"description\" and \"success\". A \"command\" such as `Open http://... in your browser. \
+         \"description\". A \"command\" such as `Open http://... in your browser. \
          Verify: ...` is wrong and will fail. \
          If a command depends on a value that could vary or collide between runs -- a \
          port number, a file path, a branch name, anything where running the same \
@@ -16480,7 +16571,7 @@ pub fn manual_commands_prompt(tail: &str, steering: Option<&str>) -> String {
          a blanket kill by image name such as `taskkill /IM python.exe` or `pkill python`, \
          which would take down unrelated work on the machine. A command with nothing variable and nothing \
          left running can stay a plain string. Structured objects may also include \
-         \"description\" and \"success\" guidance. Set \"auto_run\": true on an object only \
+         \"description\" guidance. Set \"auto_run\": true on an object only \
          when you are very confident the command is safe to start unattended -- idempotent, \
          non-destructive, non-interactive, and every input has a safe \"default\"; omit it \
          otherwise. You are writing every check of this review in this one answer, so look at \
@@ -18904,6 +18995,8 @@ mod tests {
 
     #[test]
     fn generated_manual_command_can_carry_preparation_and_observation_guidance() {
+        // A model that still answers with the retired "success" key is
+        // tolerated; the key is simply dropped.
         let text = r#"{
             "manual_commands": [{
                 "command": "target/debug/demo",
@@ -18917,10 +19010,6 @@ mod tests {
 
         assert_eq!(checks[0].run_on.as_deref(), Some("daemon"));
         assert_eq!(checks[0].description.as_deref(), Some("Open the window"));
-        assert_eq!(
-            checks[0].success.as_deref(),
-            Some("The greeting is visible")
-        );
         assert_eq!(
             checks[0].prepare[0].command.as_deref(),
             Some("cargo build --bin demo")
@@ -23197,11 +23286,109 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
+    /// A new commit on `repo`, returning its hash.
+    fn commit_empty(repo: &Path, message: &str) -> String {
+        Workspace::local(repo)
+            .git(&[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@example.com",
+                "commit",
+                "--allow-empty",
+                "-m",
+                message,
+            ])
+            .unwrap();
+        head_of(repo)
+    }
+
+    /// RAL-642: a checkout an action is still running in keeps its files and
+    /// its commit while a newer generation is prepared in a sibling.
+    #[test]
+    fn claiming_the_post_merge_checkout_never_resets_a_held_one() {
+        let (base, repo, _fwt) = make_repo("claim-held");
+        let root = Workspace::local(&repo);
+        let parent = base.join("pm-parent");
+        std::fs::create_dir_all(&parent).unwrap();
+        let first_tip = head_of(&repo);
+        let first =
+            claim_post_merge_checkout_with(&root, &root, &parent, &first_tip, &|_| false).unwrap();
+        std::fs::write(first.join("build-output.txt"), "in use").unwrap();
+
+        let next_tip = commit_empty(&repo, "newer review tip");
+        let held = first.clone();
+        let second =
+            claim_post_merge_checkout_with(&root, &root, &parent, &next_tip, &|dir| dir == held)
+                .unwrap();
+
+        assert_eq!(second, parent.join(format!("{POST_MERGE_WORKTREE_DIR}-1")));
+        assert_eq!(head_of(&second), next_tip);
+        assert_eq!(
+            head_of(&first),
+            first_tip,
+            "the held checkout must not be moved to the newer tip"
+        );
+        assert_eq!(
+            std::fs::read_to_string(first.join("build-output.txt")).unwrap(),
+            "in use",
+            "the held checkout must not be cleaned"
+        );
+
+        // Released, the usual directory is reused again rather than leaving
+        // siblings to pile up.
+        let third =
+            claim_post_merge_checkout_with(&root, &root, &parent, &next_tip, &|_| false).unwrap();
+        assert_eq!(third, first);
+        assert_eq!(head_of(&third), next_tip);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn claiming_the_post_merge_checkout_fails_clearly_when_every_candidate_is_held() {
+        let (base, repo, _fwt) = make_repo("claim-all-held");
+        let root = Workspace::local(&repo);
+        let parent = base.join("pm-parent");
+        std::fs::create_dir_all(&parent).unwrap();
+        let tip = head_of(&repo);
+        let error = claim_post_merge_checkout_with(&root, &root, &parent, &tip, &|_| true)
+            .expect_err("nothing may be reset when every directory is in use");
+        assert!(error.contains("in use by a running action"), "{error}");
+        assert!(
+            !parent.join(POST_MERGE_WORKTREE_DIR).exists(),
+            "no checkout is created or touched"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The production claim consults the real hold records.
+    #[test]
+    fn claiming_the_post_merge_checkout_respects_a_recorded_hold() {
+        let (base, repo, _fwt) = make_repo("claim-recorded-hold");
+        let root = Workspace::local(&repo);
+        let parent = base.join("pm-parent");
+        std::fs::create_dir_all(&parent).unwrap();
+        let first_tip = head_of(&repo);
+        let first = claim_post_merge_checkout(&root, &root, &parent, &first_tip).unwrap();
+        let hold = crate::checkout_hold::hold(
+            &first.to_string_lossy(),
+            "test",
+            std::time::Duration::from_secs(60),
+        )
+        .unwrap();
+        let next_tip = commit_empty(&repo, "newer review tip");
+        let second = claim_post_merge_checkout(&root, &root, &parent, &next_tip).unwrap();
+        assert_ne!(second, first);
+        assert_eq!(head_of(&first), first_tip);
+        drop(hold);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     #[test]
     fn preparation_order_puts_actions_needing_no_preparation_first() {
         let mut prompt_only = plain_action("prompt");
         prompt_only.command = None;
-        prompt_only.prompt = Some("expand me".to_string());
+        prompt_only.prompt = Some("test it live".to_string());
         let hints = vec![
             built_action("build-a", "make a"),
             plain_action("quick-1"),
@@ -23209,9 +23396,10 @@ mod tests {
             prompt_only,
             plain_action("quick-2"),
         ];
-        // Quick actions keep their relative order and lead; everything that
-        // needs work (a build, or a prompt to expand) follows in declaration order.
-        assert_eq!(preparation_order(&hints), vec![1, 4, 0, 2, 3]);
+        // Quick actions -- a plain command, or an agent prompt with nothing to
+        // build -- keep their relative order and lead; actions with a build
+        // follow in declaration order.
+        assert_eq!(preparation_order(&hints), vec![1, 3, 4, 0, 2]);
         assert_eq!(preparation_order(&[]), Vec::<usize>::new());
         assert_eq!(preparation_order(&hints[1..2]), vec![0]);
     }

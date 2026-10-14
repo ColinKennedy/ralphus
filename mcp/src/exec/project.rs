@@ -76,6 +76,7 @@ fn exec_review_settings(cmd: ProjectReviewSettingsCommand, client: &DaemonClient
             cache_manual_checks,
             skip_manual_checks,
             auto_run,
+            live_actions,
             rebuild_on,
         } => {
             let patch = ProjectReviewSettingsPatch {
@@ -104,6 +105,7 @@ fn exec_review_settings(cmd: ProjectReviewSettingsCommand, client: &DaemonClient
                 cache_manual_checks,
                 skip_manual_checks,
                 auto_run,
+                live_actions,
                 rebuild_on,
             };
             Ok(client.set_project_review_settings(&name, &patch)?)

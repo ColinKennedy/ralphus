@@ -380,6 +380,19 @@ impl DaemonClient {
         self.get(&format!("/api/squads/{squad_id}"))
     }
 
+    /// How one cell's agent said it would test its work live
+    /// (`RALPHUS_LIVE_ACTION:` handoffs).
+    pub fn cell_live_handoffs(
+        &self,
+        squad_id: &str,
+        task_idx: i64,
+        cell_idx: i64,
+    ) -> Result<Value, DaemonError> {
+        self.get(&format!(
+            "/api/squads/{squad_id}/cells/{task_idx}/{cell_idx}/live-handoffs"
+        ))
+    }
+
     /// One surface's resolved environment (RAL-324). `api_path` is the very
     /// path that surface's overrides are *set* on -- the daemon serves each
     /// read-only view as a `GET` twin of the matching `POST .../env` route --
@@ -556,6 +569,7 @@ impl DaemonClient {
         set_if_some(&mut body, "cache_manual_checks", patch.cache_manual_checks);
         set_if_some(&mut body, "skip_manual_checks", patch.skip_manual_checks);
         set_if_some(&mut body, "auto_run", patch.auto_run);
+        set_if_some(&mut body, "live_actions", patch.live_actions);
         set_rebuild_on(&mut body, patch.rebuild_on.clone());
         self.post(&format!("/api/projects/{name}/review-settings"), Some(body))
     }
@@ -1769,6 +1783,39 @@ impl DaemonClient {
         self.get("/api/guardians")
     }
 
+    /// A review's live actions and live runs.
+    pub fn guardian_live_actions(&self, guardian_id: &str) -> Result<Value, DaemonError> {
+        self.get(&format!("/api/guardians/{guardian_id}/live-actions"))
+    }
+
+    /// Queue live runs: one live action (`Some(index)`) or all of them.
+    pub fn guardian_run_live_actions(
+        &self,
+        guardian_id: &str,
+        index: Option<i64>,
+    ) -> Result<Value, DaemonError> {
+        let body = match index {
+            Some(i) => serde_json::json!({ "index": i }),
+            None => serde_json::json!({}),
+        };
+        self.post(
+            &format!("/api/guardians/{guardian_id}/live-actions/run"),
+            Some(body),
+        )
+    }
+
+    /// Cancel a queued or running live run.
+    pub fn guardian_cancel_live_run(
+        &self,
+        guardian_id: &str,
+        run_id: &str,
+    ) -> Result<Value, DaemonError> {
+        self.post(
+            &format!("/api/guardians/{guardian_id}/live-runs/{run_id}/cancel"),
+            None,
+        )
+    }
+
     pub fn guardian_get(&self, guardian_id: &str) -> Result<Value, DaemonError> {
         self.get(&format!("/api/guardians/{guardian_id}"))
     }
@@ -1953,6 +2000,7 @@ impl DaemonClient {
         );
         set_if_some(&mut body, "skip_manual_checks", settings.skip_manual_checks);
         set_if_some(&mut body, "auto_run", settings.auto_run);
+        set_if_some(&mut body, "live_actions", settings.live_actions);
         set_rebuild_on(&mut body, settings.rebuild_on.clone());
         set_tri_state(&mut body, "followup_enabled", settings.followup_enabled);
         set_tri_state(
@@ -2566,6 +2614,9 @@ pub struct GuardianSettings<'a> {
     /// Whether ready manual checks run automatically after their build
     /// succeeds. Defaults to `false` when unset.
     pub auto_run: Option<bool>,
+    /// Whether this review runs its live actions (agent-run live tests from
+    /// its cells' handoffs). Defaults to `false` when unset.
+    pub live_actions: Option<bool>,
     /// Which events tear down and rebuild this review's prepared build.
     /// Outer `None` leaves it alone, `Some(None)` clears the override back to
     /// inherit (sent as JSON `null`), `Some(Some(list))` sets it (an empty list
@@ -2640,6 +2691,9 @@ pub struct ProjectReviewSettingsPatch<'a> {
     /// The project's default for whether ready manual checks run
     /// automatically after their build succeeds. Defaults to `false`.
     pub auto_run: Option<bool>,
+    /// The project's default for whether reviews run their live actions.
+    /// Defaults to `false`.
+    pub live_actions: Option<bool>,
     /// The project's default list of events that tear down and rebuild a
     /// review's prepared build. Outer `None` leaves it alone, `Some(None)`
     /// clears it back to inherit (sent as JSON `null`), `Some(Some(list))`

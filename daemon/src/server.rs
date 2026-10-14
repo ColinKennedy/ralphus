@@ -1802,6 +1802,9 @@ fn route_for_user(
             cell_proof_env_view(daemon, id, ti, si)
         }
         ("GET", ["api", "squads", id, "cells", ti, si, "env"]) => cell_env_view(daemon, id, ti, si),
+        ("GET", ["api", "squads", id, "cells", ti, si, "live-handoffs"]) => {
+            cell_live_handoffs_view(daemon, id, ti, si)
+        }
         // RAL-191: the per-step routes must precede the scope-wide ones, since
         // `["proof", "env"]` and `["proof", vi, "env"]` are otherwise
         // ambiguous to a reader (they are not to the matcher, which is
@@ -2213,6 +2216,61 @@ fn route_for_user(
         // ralphus[ignore-endpoint-cli]: daemon-host GUI terminal spawn for manual checks; CLI is deliberately headless
         ("POST", ["api", "guardians", id, "manual-checks", "open-terminal"]) => {
             open_guardian_manual_checks_terminal(daemon, id, query)
+        }
+        ("GET", ["api", "guardians", id, "live-actions"]) => guardian_live_actions_view(daemon, id),
+        ("POST", ["api", "guardians", id, "live-actions", "run"]) => {
+            guardian_run_live_actions(daemon, id, body)
+        }
+        // ralphus[ignore-endpoint-cli]: board Live View of the agent generating a review's live actions
+        ("GET", ["api", "guardians", id, "live-actions", "generation", "pane"]) => {
+            guardian_live_generation_pane(daemon, id, query)
+        }
+        // ralphus[ignore-endpoint-cli]: board Live View scrollback of the live-actions generation agent
+        (
+            "GET",
+            [
+                "api",
+                "guardians",
+                id,
+                "live-actions",
+                "generation",
+                "pane-transcript",
+            ],
+        ) => guardian_live_generation_pane_transcript(daemon, id, query),
+        // ralphus[ignore-endpoint-cli]: board transcript of the live-actions generation agent
+        (
+            "GET",
+            [
+                "api",
+                "guardians",
+                id,
+                "live-actions",
+                "generation",
+                "terminal-log",
+            ],
+        ) => guardian_live_generation_terminal_log(daemon, id),
+        ("POST", ["api", "guardians", id, "live-runs", run_id, "cancel"]) => {
+            guardian_cancel_live_run(daemon, id, run_id)
+        }
+        // ralphus[ignore-endpoint-cli]: board Live View of one live run's agent session
+        ("GET", ["api", "guardians", id, "live-runs", run_id, "pane"]) => {
+            guardian_live_run_pane(daemon, id, run_id, query)
+        }
+        // ralphus[ignore-endpoint-cli]: board Live View scrollback of one live run's agent session
+        (
+            "GET",
+            [
+                "api",
+                "guardians",
+                id,
+                "live-runs",
+                run_id,
+                "pane-transcript",
+            ],
+        ) => guardian_live_run_pane_transcript(daemon, id, run_id, query),
+        // ralphus[ignore-endpoint-cli]: board transcript of one live run's agent session
+        ("GET", ["api", "guardians", id, "live-runs", run_id, "terminal-log"]) => {
+            guardian_live_run_terminal_log(daemon, id, run_id)
         }
         // ralphus[ignore-endpoint-cli]: board manual-checks pane view
         ("GET", ["api", "guardians", id, "manual-checks", "pane"]) => {
@@ -3128,6 +3186,9 @@ struct EffectiveReviewDefaults {
     /// RAL-565: the resolved manual-check auto-run default (per-review >
     /// database default > `.ralphus.toml`/global > `false`).
     auto_run: bool,
+    /// The resolved live-actions default (per-review > database default >
+    /// `.ralphus.toml`/global > `false`).
+    live_actions: bool,
     /// The resolved list of events that rebuild a review's prepared build
     /// (per-review override > database default > `.ralphus.toml`/global >
     /// every event).
@@ -3161,6 +3222,7 @@ impl EffectiveReviewDefaults {
             cache_manual_checks: cfg.cache_manual_checks(),
             skip_manual_checks: cfg.skip_manual_checks(),
             auto_run: cfg.auto_run(),
+            live_actions: cfg.live_actions(),
             rebuild_on: cfg.rebuild_on(),
         }
     }
@@ -3288,6 +3350,10 @@ struct ProjectReviewSettingsBody {
     /// ready -- see [`crate::store::ProjectReviewSettings`].
     #[serde(default)]
     auto_run: Option<bool>,
+    /// Project-level default for whether reviews run their live actions --
+    /// see [`crate::store::ProjectReviewSettings`].
+    #[serde(default)]
+    live_actions: Option<bool>,
     /// Project-level default for which events (`rebase`, `feedback`,
     /// `auto_fix`) tear down and rebuild a review's prepared build -- see
     /// [`crate::store::ProjectReviewSettings`]. Absent leaves the setting
@@ -3515,6 +3581,9 @@ fn set_project_review_settings(daemon: &Daemon, name: &str, body: &str) -> Reply
     }
     if let Some(v) = req.auto_run {
         settings.auto_run = Some(v);
+    }
+    if let Some(v) = req.live_actions {
+        settings.live_actions = Some(v);
     }
     if let Some(v) = req.rebuild_on {
         settings.rebuild_on = v;
@@ -10101,6 +10170,23 @@ fn cell_env_view(daemon: &Daemon, id: &str, ti: &str, si: &str) -> Reply {
     })
 }
 
+/// `GET /api/squads/{id}/cells/{ti}/{si}/live-handoffs`: how this cell's
+/// agent said it would test its work live (`RALPHUS_LIVE_ACTION:`), the seed
+/// of its review's live actions.
+fn cell_live_handoffs_view(daemon: &Daemon, id: &str, ti: &str, si: &str) -> Reply {
+    let (task_idx, cell_idx) = match (parse_index(ti, "task index"), parse_index(si, "cell index"))
+    {
+        (Ok(t), Ok(c)) => (t, c),
+        (Err(reply), _) | (_, Err(reply)) => return reply,
+    };
+    match daemon.with_read_snapshot(|conn| {
+        crate::live_actions::cell_live_handoffs_conn(conn, id, task_idx, cell_idx)
+    }) {
+        Ok(handoffs) => json(200, &handoffs),
+        Err(e) => store_error(&e),
+    }
+}
+
 /// `GET /api/squads/{id}/cells/{ti}/{si}/proof/env` (RAL-324).
 fn cell_proof_env_view(daemon: &Daemon, id: &str, ti: &str, si: &str) -> Reply {
     let (task_idx, cell_idx) = match (parse_index(ti, "task index"), parse_index(si, "cell index"))
@@ -12428,13 +12514,19 @@ fn resolver_task_and_cell_id(
 
 /// The session to show while a branch is `actioning`. Feedback actioning runs
 /// two agents back to back under the same status: the feedback resolver
-/// (`reviewer-{branch}`) and then the commit step (`reviewer-{branch}-commit`,
-/// see `guardian_merge::run_commit_step`). Pointing at the first one only
-/// leaves Live View on its finished transcript while the commit agent works.
+/// (`feedback-{branch}-{ms}`, its latest pass recorded by
+/// `guardian_merge::latest_feedback_cell`) and then the commit step
+/// (`reviewer-{branch}-commit`, see `guardian_merge::run_commit_step`).
+/// Pointing at the first one only leaves Live View on its finished transcript
+/// while the commit agent works.
 fn actioning_session(id: &str, branch_id: &str) -> (&'static str, String) {
     let squad = format!("guardian-{id}");
-    let feedback_cell = crate::guardian_merge::feedback_cell_id(branch_id);
-    let commit_cell = format!("{feedback_cell}-commit");
+    let commit_cell = format!(
+        "{}-commit",
+        crate::guardian_merge::feedback_cell_id(branch_id)
+    );
+    let feedback_cell = crate::guardian_merge::latest_feedback_cell(id, branch_id)
+        .unwrap_or_else(|| crate::guardian_merge::feedback_cell_id(branch_id));
     let task = crate::guardian_merge::FEEDBACK_TASK;
     let commit_live = crate::tmux::Tmux::resolve()
         .map(|t| t.has_session(&crate::tmux::session_name(&squad, task, &commit_cell)))
@@ -12474,7 +12566,8 @@ fn freshest_resolver_or_feedback(id: &str, branch_id: &str) -> (&'static str, St
     );
     let feedback = (
         crate::guardian_merge::FEEDBACK_TASK,
-        crate::guardian_merge::feedback_cell_id(branch_id),
+        crate::guardian_merge::latest_feedback_cell(id, branch_id)
+            .unwrap_or_else(|| crate::guardian_merge::feedback_cell_id(branch_id)),
     );
     let squad = format!("guardian-{id}");
     let resolver_mtime =
@@ -13134,6 +13227,213 @@ fn open_guardian_manual_checks_terminal(daemon: &Daemon, id: &str, query: &str) 
         crate::guardian_merge::MANUAL_COMMANDS_TASK,
         crate::guardian_merge::MANUAL_COMMANDS_SESSION,
     )
+}
+
+/// `GET /api/guardians/{id}/live-actions`: the review's live actions, its
+/// live runs (newest first), and whether the opt-in is on.
+fn guardian_live_actions_view(daemon: &Daemon, id: &str) -> Reply {
+    #[derive(Serialize)]
+    struct LiveActionsView {
+        enabled: bool,
+        own_setting: Option<bool>,
+        auto_ran_at_ms: Option<i64>,
+        checkout: Option<String>,
+        preparation_failure: Option<String>,
+        /// The session cell of the agent that generated the live actions, when
+        /// one ran; its session is served under `.../live-actions/generation/`.
+        generation_cell: Option<String>,
+        actions: Vec<crate::live_actions::LiveAction>,
+        runs: Vec<crate::live_runs::LiveRunRow>,
+    }
+    let guardian = match daemon.lock().get_guardian(id) {
+        Ok(g) => g,
+        Err(e) => return store_error(&e),
+    };
+    let loaded = daemon.with_read_snapshot(|conn| {
+        Ok((
+            crate::live_actions::guardian_live_actions_conn(conn, id)?,
+            crate::live_runs::guardian_live_runs_conn(conn, id)?,
+            crate::live_runs::live_checkout_conn(conn, id)?,
+            crate::live_runs::live_actions_generation_cell_conn(conn, id)?,
+        ))
+    });
+    match loaded {
+        Ok((actions, runs, checkout, generation_cell)) => json(
+            200,
+            &LiveActionsView {
+                enabled: guardian.effective_live_actions,
+                own_setting: guardian.live_actions,
+                auto_ran_at_ms: guardian.live_actions_auto_ran_at_ms,
+                checkout: checkout.path,
+                preparation_failure: checkout.preparation_failure,
+                generation_cell,
+                actions,
+                runs,
+            },
+        ),
+        Err(e) => store_error(&e),
+    }
+}
+
+/// `POST /api/guardians/{id}/live-actions/run`, body `{"index": N}` for one
+/// live action or `{}` for all: queue manual live runs. The review's live
+/// actions are generated from its cells' handoffs first if it has none yet,
+/// so this may take as long as one agent call; the runs themselves execute in
+/// the background, one at a time.
+fn guardian_run_live_actions(daemon: &Daemon, id: &str, body: &str) -> Reply {
+    #[derive(Deserialize, Default)]
+    struct Body {
+        index: Option<i64>,
+    }
+    let req: Body = if body.trim().is_empty() {
+        Body::default()
+    } else {
+        match serde_json::from_str(body) {
+            Ok(req) => req,
+            Err(_) => return error(400, "bad_request", "body must be {index?}", vec![]),
+        }
+    };
+    if let Err(e) = daemon.lock().get_guardian(id) {
+        return store_error(&e);
+    }
+    match crate::live_runs::queue_manual_runs(
+        &daemon.store_handle(),
+        &crate::live_runs::default_runner_factory(),
+        id,
+        req.index,
+    ) {
+        Ok(run_ids) => json(200, &serde_json::json!({"queued": run_ids})),
+        Err(message) => error(409, "no_live_actions", &message, vec![]),
+    }
+}
+
+/// `POST /api/guardians/{id}/live-runs/{run_id}/cancel`: drop a queued run, or
+/// stop a running one.
+fn guardian_cancel_live_run(daemon: &Daemon, id: &str, run_id: &str) -> Reply {
+    let belongs = daemon
+        .with_read_snapshot(|conn| crate::live_runs::live_run_conn(conn, run_id))
+        .is_ok_and(|run| run.guardian_id == id);
+    if !belongs {
+        return error(404, "not_found", "no such live run", vec![]);
+    }
+    match crate::live_runs::cancel_run(&daemon.store_handle(), run_id) {
+        Ok(()) => json(200, &serde_json::json!({"ok": true})),
+        Err(message) => error(409, "not_running", &message, vec![]),
+    }
+}
+
+/// The session cell a live run's agent ran under, when the run belongs to the
+/// review and has started.
+fn live_run_cell(daemon: &Daemon, id: &str, run_id: &str) -> std::result::Result<String, Reply> {
+    match daemon.with_read_snapshot(|conn| crate::live_runs::live_run_conn(conn, run_id)) {
+        Ok(run) if run.guardian_id == id => run
+            .cell_id
+            .ok_or_else(|| error(409, "not_started", "this live run has not started", vec![])),
+        Ok(_) | Err(crate::store::StoreError::NotFound) => {
+            Err(error(404, "not_found", "no such live run", vec![]))
+        }
+        Err(e) => Err(store_error(&e)),
+    }
+}
+
+/// The live-actions generation agent's session cell, when one ran.
+fn live_generation_cell(daemon: &Daemon, id: &str) -> std::result::Result<String, Reply> {
+    match daemon
+        .with_read_snapshot(|conn| crate::live_runs::live_actions_generation_cell_conn(conn, id))
+    {
+        Ok(Some(cell)) => Ok(cell),
+        Ok(None) => Err(error(
+            404,
+            "not_found",
+            "no agent has generated this review's live actions",
+            vec![],
+        )),
+        Err(e) => Err(store_error(&e)),
+    }
+}
+
+/// Live pane of the agent generating a review's live actions.
+fn guardian_live_generation_pane(daemon: &Daemon, id: &str, query: &str) -> Reply {
+    match live_generation_cell(daemon, id) {
+        Ok(cell) => capture_pane_reply(
+            daemon,
+            &crate::live_actions::live_run_squad_id(id),
+            crate::live_actions::LIVE_ACTION_TASK,
+            &cell,
+            query,
+        ),
+        Err(reply) => reply,
+    }
+}
+
+/// Raw transcript range of the live-actions generation agent's session.
+fn guardian_live_generation_pane_transcript(daemon: &Daemon, id: &str, query: &str) -> Reply {
+    match live_generation_cell(daemon, id) {
+        Ok(cell) => pane_transcript_range_reply(
+            &crate::live_actions::live_run_squad_id(id),
+            crate::live_actions::LIVE_ACTION_TASK,
+            &cell,
+            query,
+        ),
+        Err(reply) => reply,
+    }
+}
+
+/// Persisted terminal-log attempts of the live-actions generation agent.
+fn guardian_live_generation_terminal_log(daemon: &Daemon, id: &str) -> Reply {
+    match live_generation_cell(daemon, id) {
+        Ok(cell) => terminal_log_attempts_reply(
+            &crate::live_actions::live_run_squad_id(id),
+            crate::live_actions::LIVE_ACTION_TASK,
+            &cell,
+        ),
+        Err(reply) => reply,
+    }
+}
+
+/// Live pane content of one live run's agent session (board Live View).
+fn guardian_live_run_pane(daemon: &Daemon, id: &str, run_id: &str, query: &str) -> Reply {
+    match live_run_cell(daemon, id, run_id) {
+        Ok(cell) => capture_pane_reply(
+            daemon,
+            &crate::live_actions::live_run_squad_id(id),
+            crate::live_actions::LIVE_ACTION_TASK,
+            &cell,
+            query,
+        ),
+        Err(reply) => reply,
+    }
+}
+
+/// Raw transcript range of one live run's agent session (Live View
+/// scrollback), see [`pane_transcript_range_reply`].
+fn guardian_live_run_pane_transcript(
+    daemon: &Daemon,
+    id: &str,
+    run_id: &str,
+    query: &str,
+) -> Reply {
+    match live_run_cell(daemon, id, run_id) {
+        Ok(cell) => pane_transcript_range_reply(
+            &crate::live_actions::live_run_squad_id(id),
+            crate::live_actions::LIVE_ACTION_TASK,
+            &cell,
+            query,
+        ),
+        Err(reply) => reply,
+    }
+}
+
+/// The persisted terminal-log attempts of one finished live run.
+fn guardian_live_run_terminal_log(daemon: &Daemon, id: &str, run_id: &str) -> Reply {
+    match live_run_cell(daemon, id, run_id) {
+        Ok(cell) => terminal_log_attempts_reply(
+            &crate::live_actions::live_run_squad_id(id),
+            crate::live_actions::LIVE_ACTION_TASK,
+            &cell,
+        ),
+        Err(reply) => reply,
+    }
 }
 
 /// The live pane content of a review's manual-checks generation tmux session,
@@ -15180,6 +15480,10 @@ struct GuardianSettingsBody {
     /// auto-run once ready. `None` inherits the project/global default.
     #[serde(default)]
     auto_run: Option<bool>,
+    /// This review's own live-actions opt-in. `None` inherits the
+    /// project/global default.
+    #[serde(default)]
+    live_actions: Option<bool>,
     /// Which events (`rebase`, `feedback`, `auto_fix`) tear down and rebuild
     /// this review's prepared build. Absent leaves it untouched, a list sets
     /// it (an empty list never rebuilds automatically), and an explicit
@@ -15308,6 +15612,9 @@ struct GuardianDetailsBody {
     /// See [`GuardianSettingsBody::auto_run`].
     #[serde(default)]
     auto_run: Option<bool>,
+    /// See [`GuardianSettingsBody::live_actions`].
+    #[serde(default)]
+    live_actions: Option<bool>,
     /// See [`GuardianSettingsBody::rebuild_on`].
     #[serde(default, deserialize_with = "deserialize_present")]
     rebuild_on: Option<Option<Vec<String>>>,
@@ -15897,6 +16204,11 @@ fn guardian_settings(daemon: &Daemon, id: &str, body: &str) -> Reply {
             return store_error(&e);
         }
     }
+    if let Some(enabled) = req.live_actions {
+        if let Err(e) = store.set_guardian_live_actions(id, Some(enabled)) {
+            return store_error(&e);
+        }
+    }
     if let Some(events) = &req.rebuild_on {
         if let Err(e) = store.set_guardian_rebuild_on(id, events.as_deref()) {
             return store_error(&e);
@@ -15968,9 +16280,22 @@ fn guardian_settings(daemon: &Daemon, id: &str, body: &str) -> Reply {
     if req.skip_manual_checks.is_some() {
         crate::guardian_merge::maybe_generate_manual_checks_for_settled(&daemon.store_handle(), id);
     }
+    start_live_actions_if_turned_on(daemon, id, req.live_actions);
     match daemon.lock().get_guardian(id) {
         Ok(g) => json(200, &g),
         Err(e) => store_error(&e),
+    }
+}
+
+/// Turning live actions on for a review that is already prepared starts its
+/// one automatic run now, rather than at the next maintenance pass.
+fn start_live_actions_if_turned_on(daemon: &Daemon, id: &str, live_actions: Option<bool>) {
+    if live_actions == Some(true) {
+        let _ = crate::live_runs::maybe_start_automatic_run(
+            &daemon.store_handle(),
+            &crate::live_runs::default_runner_factory(),
+            id,
+        );
     }
 }
 
@@ -16264,6 +16589,11 @@ fn guardian_details(daemon: &Daemon, id: &str, body: &str) -> Reply {
             return store_error(&e);
         }
     }
+    if let Some(enabled) = req.live_actions {
+        if let Err(e) = store.set_guardian_live_actions(id, Some(enabled)) {
+            return store_error(&e);
+        }
+    }
     if let Some(events) = &req.rebuild_on {
         if let Err(e) = store.set_guardian_rebuild_on(id, events.as_deref()) {
             return store_error(&e);
@@ -16435,6 +16765,7 @@ fn guardian_details(daemon: &Daemon, id: &str, body: &str) -> Reply {
     if req.skip_manual_checks.is_some() {
         crate::guardian_merge::maybe_generate_manual_checks_for_settled(&daemon.store_handle(), id);
     }
+    start_live_actions_if_turned_on(daemon, id, req.live_actions);
     match daemon.lock().get_guardian(id) {
         Ok(g) => json(
             200,
@@ -19058,6 +19389,12 @@ fn check_run_note(
 ///
 /// `kind` is `"manual"` for a generated manual check and `"action"` for a
 /// `[[review.action]]` hint; `index` is the check's position in that list.
+///
+/// `hold` (RAL-642) is the run's hold on its working directory, taken by the
+/// caller before the terminal was spawned. The watcher keeps it until the run
+/// reports or times out, so a newer preparation generation never resets the
+/// checkout under a running check.
+#[allow(clippy::too_many_arguments)]
 fn watch_check_run(
     store: crate::store_lock::StoreHandle,
     guardian_id: &str,
@@ -19065,6 +19402,7 @@ fn watch_check_run(
     index: usize,
     prepared: &PreparedCheck,
     auto: bool,
+    hold: Option<crate::checkout_hold::CheckoutHold>,
 ) -> std::thread::JoinHandle<Option<i32>> {
     let result_path = check_run_result_path(guardian_id, kind, index);
     // The previous run's recorded result would otherwise be served as this
@@ -19088,6 +19426,7 @@ fn watch_check_run(
     let marker_path = prepared.marker_path.clone();
     let log_path = prepared.log_path.clone();
     std::thread::spawn(move || {
+        let _hold = hold;
         let started = std::time::Instant::now();
         let exit_code = loop {
             if let Some(code) = read_check_run_marker(&marker_path) {
@@ -19136,6 +19475,32 @@ fn watch_check_run(
     })
 }
 
+/// RAL-642: hold a check run's working directory before its terminal is
+/// spawned. A failure to write the hold only loses the protection, so it is
+/// logged and the run still goes ahead.
+fn hold_check_run_cwd(
+    guardian_id: &str,
+    kind: &str,
+    index: usize,
+    cwd: &str,
+) -> Option<crate::checkout_hold::CheckoutHold> {
+    match crate::checkout_hold::hold(
+        cwd,
+        &format!("check-run:{guardian_id}:{kind}:{index}"),
+        CHECK_RUN_MARKER_TIMEOUT,
+    ) {
+        Ok(hold) => Some(hold),
+        Err(e) => {
+            // ralphus[ignore-rlog-pair]: store-less best-effort diagnostic; the check run it guards records its own Cartographer start/finish rows
+            crate::rlog!(
+                WARNING,
+                "ralphus [guardian] review {guardian_id} could not record that {kind} check {index} is using {cwd}: {e}"
+            );
+            None
+        }
+    }
+}
+
 /// RAL-565: run one ready check unattended, in the same visible terminal a
 /// click would open, and wait for it. Returns the check's exit code, `Some(None)`
 /// when the watcher gave up waiting for one, or `None` when no terminal could be
@@ -19169,6 +19534,7 @@ pub(crate) fn run_check_unattended(
         &marker,
         &log,
     )?;
+    let hold = hold_check_run_cwd(id, kind, index, &cwd);
     if let Err(e) = spawn_in_terminal(None, "cmd", &prepared.args, &g.manual_checks_env) {
         crate::rlog!(
             WARNING,
@@ -19177,7 +19543,7 @@ pub(crate) fn run_check_unattended(
         return None;
     }
     Some(
-        watch_check_run(store.clone(), id, kind, index, &prepared, true)
+        watch_check_run(store.clone(), id, kind, index, &prepared, true, hold)
             .join()
             .unwrap_or(None),
     )
@@ -19238,9 +19604,10 @@ fn guardian_run_manual_commands(daemon: &Daemon, id: &str, body: &str) -> Reply 
         return reply;
     }
 
-    // Run against the built review worktree (e.g. `<id>-review`), not the
-    // original repo — that's the checkout the commands are meant to verify
-    // Fall back to git_root only if the review hasn't been built yet.
+    // Run in the checkout this check was prepared in (the review's prepared
+    // checkout, `review-postmerge`, or a directory its own preparation
+    // returned), then the combined worktree, and the original repo root only
+    // if the review hasn't been built yet.
     let mut errors: Vec<String> = Vec::new();
     for (index, check) in &to_run {
         if check.preparation_state.as_deref() != Some("ready") {
@@ -19286,6 +19653,7 @@ fn guardian_run_manual_commands(daemon: &Daemon, id: &str, body: &str) -> Reply 
             };
             prepared
         };
+        let hold = hold_check_run_cwd(id, "manual", *index, &cwd);
         match spawn_in_terminal(None, "cmd", &prepared.args, &g.manual_checks_env) {
             Ok(()) => {
                 watch_check_run(
@@ -19295,6 +19663,7 @@ fn guardian_run_manual_commands(daemon: &Daemon, id: &str, body: &str) -> Reply 
                     *index,
                     &prepared,
                     false,
+                    hold,
                 );
             }
             Err(e) => errors.push(e),
@@ -19410,10 +19779,25 @@ fn guardian_run_action_hint(daemon: &Daemon, id: &str, body: &str) -> Reply {
         return reply;
     }
 
+    // A `prompt` action is run by an agent, as a live run: queued, one at a
+    // time per review, followed in the board's Live View.
+    if hint.command.is_none() && hint.prompt.is_some() {
+        return match crate::live_runs::queue_action_prompt_run(
+            &daemon.store_handle(),
+            &crate::live_runs::default_runner_factory(),
+            id,
+            req.index,
+            "manual",
+        ) {
+            Ok(run_id) => json(200, &serde_json::json!({"ok": true, "live_run": run_id})),
+            Err(message) => error(409, "action_not_runnable", &message, vec![]),
+        };
+    }
+
     // Same reasoning as guardian_run_manual_commands, including the RAL-203
-    // manual-checks environment -- action hints run in the same combined
-    // worktree via the same terminal-spawning mechanism, so they inherit it
-    // too: prefer the built review worktree over the original repo root.
+    // manual-checks environment -- action hints run in the same prepared
+    // checkout via the same terminal-spawning mechanism, so they inherit it
+    // too.
     let cwd = hint
         .prepared_cwd
         .clone()
@@ -19448,6 +19832,7 @@ fn guardian_run_action_hint(daemon: &Daemon, id: &str, body: &str) -> Reply {
         )
     };
     if let Some(prepared) = prepared {
+        let hold = hold_check_run_cwd(id, "action", req.index, &cwd);
         let result = spawn_in_terminal(None, "cmd", &prepared.args, &g.manual_checks_env);
         if !req.inputs.is_empty() {
             let _ = daemon.lock().merge_guardian_input_values(id, &req.inputs);
@@ -19461,6 +19846,7 @@ fn guardian_run_action_hint(daemon: &Daemon, id: &str, body: &str) -> Reply {
                     req.index,
                     &prepared,
                     false,
+                    hold,
                 );
                 json(200, &OpenTerminalResponse { ok: true })
             }
@@ -28026,6 +28412,30 @@ remediation_attempts=1
         let (task, cell_id) = resolver_task_and_cell_id(&d, &id, &branch_id).unwrap();
         assert_eq!(task, crate::guardian_merge::FEEDBACK_TASK);
         assert_eq!(cell_id, crate::guardian_merge::feedback_cell_id(&branch_id));
+    }
+
+    #[test]
+    fn resolver_task_and_cell_id_follows_the_running_feedback_pass() {
+        // Each feedback pass runs under its own timestamped cell; Live View
+        // must find that one, not a name no feedback agent runs under.
+        let d = daemon();
+        let id = d.lock().create_guardian("g", "main", "/r").unwrap();
+        d.lock().add_guardian_branch(&id, "a").unwrap();
+        let branch_id = d.lock().guardian_branches(&id).unwrap()[0].id.clone();
+        d.lock()
+            .set_branch_status(
+                &id,
+                &branch_id,
+                crate::guardian::MergeStatus::Actioning,
+                Some("applying reviewer feedback"),
+            )
+            .unwrap();
+        let running = format!("feedback-{branch_id}-1234");
+        crate::guardian_merge::record_latest_feedback_cell(&id, &branch_id, &running);
+
+        let (task, cell_id) = resolver_task_and_cell_id(&d, &id, &branch_id).unwrap();
+        assert_eq!(task, crate::guardian_merge::FEEDBACK_TASK);
+        assert_eq!(cell_id, running);
     }
 
     #[test]
