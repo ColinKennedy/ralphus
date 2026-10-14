@@ -521,6 +521,15 @@
         renderReviewInspector();
       }
       /**
+       * Drops every cached poll status so the next render refetches them; used
+       * after an action that resets the auto-fix budget review-wide.
+       * @returns {void}
+       */
+      function clearPrPollStatusCache() {
+        for (const id of Object.keys(prPollStatus)) delete prPollStatus[id];
+        renderReviewInspector();
+      }
+      /**
        * The auto-fix budget line for one open PR, from its poll status. Empty
        * until the status loads, or when the daemon could not resolve the max.
        * @param {string} prId - The PR id.
@@ -538,7 +547,7 @@
         const tip = [
           "Why: shows how much of this PR's automatic CI-fix budget is in use, so you can see how close auto-fix is to giving up.",
           "This is not the number of fixes tried: when a later CI run fails fewer checks than the one before, one attempt is refunded, so more fixes may have run than this shows.",
-          "Who/when: it resets when CI passes or when you press 'Merge / rebase'. At the maximum, auto-fix stops until then.",
+          "Who/when: it resets when CI passes, when you press 'Merge / rebase', or when you press 'Action feedback' on one of the review's PRs. At the maximum, auto-fix stops until then.",
           `Caveats: the maximum is the project's auto_fix_max_attempts.${disabled ? " Auto-fix is currently disabled for this review, so no further attempts will run." : ""}`,
         ].join("\n");
         return `<div class="insp-pr-sub" style="color:${colour}" data-tip="${esc(tip)}">${esc(label)}</div>`;
