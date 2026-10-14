@@ -1028,6 +1028,7 @@
           return;
         }
         notify("info", "Actioning PR feedback…");
+        clearPrPollStatusCache();
         tick();
       }
       // RALPHUS-PR-BADGE-MENU:END

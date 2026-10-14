@@ -16919,6 +16919,14 @@ fn pr_comments(daemon: &Daemon, pr_id: &str) -> Reply {
 /// `pr::MANUAL_PR_FEEDBACK_AUTHOR` instead of a named person.
 fn pr_action_feedback(daemon: &Daemon, user_header: Option<&str>, pr_id: &str) -> Reply {
     let submitted_by = current_user(daemon, user_header).ok().flatten();
+    let guardian_id = daemon
+        .lock()
+        .get_pull_request(pr_id)
+        .ok()
+        .map(|pr| pr.guardian_id);
+    if let Some(gid) = guardian_id {
+        reset_auto_fix_attempts_for_explicit_request(daemon, &gid, "action feedback");
+    }
     let runner: Arc<dyn Runner> = Arc::new(crate::remote_runner::MachineRouter::from_env(
         daemon.store_handle(),
     ));
@@ -19709,7 +19717,7 @@ fn guardian_force_start(daemon: &Daemon, id: &str) -> Reply {
         return store_error(&e);
     }
     drop(store);
-    reset_auto_fix_attempts_for_manual_rebase(daemon, id);
+    reset_auto_fix_attempts_for_explicit_request(daemon, id, "manual rebase");
     // RAL-279: force_start only fires while status == "collecting", which
     // precedes PR submission, so this is a no-op today -- kept for
     // correctness/future-proofing if that invariant ever changes (see the
@@ -19919,7 +19927,7 @@ fn rebuild_after_branch_move(
 }
 
 fn guardian_merge(daemon: &Daemon, id: &str) -> Reply {
-    reset_auto_fix_attempts_for_manual_rebase(daemon, id);
+    reset_auto_fix_attempts_for_explicit_request(daemon, id, "manual rebase");
     reset_base_shift_campaign_for_manual_rebase(daemon, id);
     let runner = guardian_agent_runner(daemon);
     crate::guardian_merge::start_merge(
@@ -20096,7 +20104,7 @@ fn guardian_merge_batch(daemon: &Daemon, body: &str) -> Reply {
         .ids
         .iter()
         .map(|id| {
-            reset_auto_fix_attempts_for_manual_rebase(daemon, id);
+            reset_auto_fix_attempts_for_explicit_request(daemon, id, "manual rebase");
             reset_base_shift_campaign_for_manual_rebase(daemon, id);
             let outcome = crate::guardian_merge::kickoff_merge(
                 daemon.store_handle(),
@@ -20179,24 +20187,29 @@ fn guardian_delete_batch(daemon: &Daemon, body: &str) -> Reply {
     json(200, &GuardianDeleteBatchResponse { results })
 }
 
-/// An explicit rebase request gives the CI watcher another chance to fix an
-/// unchanged failure after the rebuild. Background polling retains its
-/// one-attempt cap until a person makes this request.
-fn reset_auto_fix_attempts_for_manual_rebase(daemon: &Daemon, id: &str) {
+/// An explicit person-directed request (`trigger`: "manual rebase" or "action
+/// feedback") gives the CI watcher another chance to fix an unchanged failure.
+/// Background polling retains its one-attempt cap until a person makes this
+/// request.
+fn reset_auto_fix_attempts_for_explicit_request(daemon: &Daemon, id: &str, trigger: &'static str) {
     let reset = daemon.lock().reset_open_pr_auto_fix_attempts(id);
     match reset {
         Ok(0) => {}
         Ok(count) => {
             crate::rlog!(
                 INFO,
-                "ralphus [server] review {id} manual rebase reset auto-fix attempts for {count} open PR(s)"
+                "ralphus [server] review {id} {trigger} reset auto-fix attempts for {count} open PR(s)"
             );
             let _ = daemon
                 .lock()
                 .cartographer_log(crate::cartographer::CartographerEntry {
                     level: crate::logging::LogLevel::INFO,
                     source: "server",
-                    message: "manual rebase reset PR auto-fix attempts",
+                    message: if trigger == "manual rebase" {
+                        "manual rebase reset PR auto-fix attempts"
+                    } else {
+                        "action feedback reset PR auto-fix attempts"
+                    },
                     scope: Some("guardian"),
                     squad_id: None,
                     guardian_id: Some(id),
@@ -20210,7 +20223,7 @@ fn reset_auto_fix_attempts_for_manual_rebase(daemon: &Daemon, id: &str) {
         Err(e) => {
             crate::rlog!(
                 WARNING,
-                "ralphus [server] review {id} could not reset PR auto-fix attempts before manual rebase: {e}"
+                "ralphus [server] review {id} could not reset PR auto-fix attempts before {trigger}: {e}"
             );
         }
     }
@@ -20254,7 +20267,7 @@ fn guardian_stop(daemon: &Daemon, id: &str) -> Reply {
 /// threads shared (RAL-213's second bug: `cancel_and_merge` was already
 /// unsafe before this fix).
 fn guardian_cancel_and_merge(daemon: &Daemon, id: &str) -> Reply {
-    reset_auto_fix_attempts_for_manual_rebase(daemon, id);
+    reset_auto_fix_attempts_for_explicit_request(daemon, id, "manual rebase");
     let runner = guardian_agent_runner(daemon);
     crate::guardian_merge::restart_guardian_merge(
         daemon.store_handle(),
@@ -33514,6 +33527,46 @@ remediation_attempts=1
             after.auto_fix_last_outcome, None,
             "the board's 'auto-fix exhausted' badge reads auto_fix_last_outcome, so the reset must clear it too"
         );
+    }
+
+    #[test]
+    fn action_feedback_resets_every_open_pr_auto_fix_budget_in_the_review() {
+        let d = daemon();
+        let gid = make_guardian(&d);
+        let mk = |branch: &str| {
+            d.lock()
+                .create_pull_request(
+                    &gid,
+                    Some("branch-000000000001"),
+                    "github",
+                    "acme/widget",
+                    branch,
+                    "main",
+                    "Add foo",
+                    "",
+                    Some(1),
+                    None,
+                )
+                .unwrap()
+        };
+        let a = mk("feature/a");
+        let b = mk("feature/b");
+        for id in [&a, &b] {
+            d.lock().mark_pr_auto_fix_attempted(id).unwrap();
+            d.lock().set_pr_auto_fix_outcome(id, "exhausted").unwrap();
+        }
+
+        let _ = route(
+            &d,
+            "POST",
+            &format!("/api/pull-requests/{a}/action-feedback"),
+            "",
+        );
+        for id in [&a, &b] {
+            let after = d.lock().get_pull_request(id).unwrap();
+            assert_eq!(after.auto_fix_attempted_at_ms, None);
+            assert_eq!(after.auto_fix_last_outcome, None);
+        }
     }
 
     #[test]
