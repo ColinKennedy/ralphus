@@ -20740,16 +20740,21 @@ command = "e"
         // Try a write every few ms for `window`, counting SQLITE_BUSY refusals,
         // while `mode` checkpoints run on another thread.
         let busy_writes_during = |mode: WalCheckpointMode, window: Duration| -> usize {
+            use std::sync::{Arc, Barrier};
             let path = db_path.clone();
+            let barrier = Arc::new(Barrier::new(2));
+            let barrier_copy = Arc::clone(&barrier);
             let checkpointer = std::thread::spawn(move || {
                 let conn = Connection::open(&path).expect("open checkpointer");
                 conn.busy_timeout(Duration::from_millis(1_500)).unwrap();
+                barrier_copy.wait(); // Signal that checkpointer thread has started
                 let until = Instant::now() + Duration::from_millis(600);
                 while Instant::now() < until {
                     let _ = wal_checkpoint_pass(&conn, mode);
                 }
             });
             let mut busy = 0;
+            barrier.wait(); // Wait for checkpointer thread to start
             let until = Instant::now() + window;
             while Instant::now() < until {
                 match writer.execute("INSERT INTO ckpt_probe VALUES (2)", []) {
