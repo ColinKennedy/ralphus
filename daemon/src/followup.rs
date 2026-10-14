@@ -221,6 +221,18 @@ impl Store {
         Ok(depth.unwrap_or(0))
     }
 
+    /// The follow-up generation of the cells in `squad_id`: `0` for a squad a
+    /// user submitted, and one more than the offer's own generation when the
+    /// squad was created by accepting a follow-up offer.
+    pub fn followup_depth_of_squad(&self, squad_id: &str) -> Result<i64> {
+        let depth: Option<i64> = self.conn.query_row(
+            "SELECT MAX(depth) + 1 FROM followup_offers WHERE squad_id=?1",
+            params![squad_id],
+            |r| r.get(0),
+        )?;
+        Ok(depth.unwrap_or(0))
+    }
+
     /// The prompt, agent, model, review branch and task name of the cell
     /// named by a prophecy's `entity_uri`, when that cell still exists.
     fn cell_context_for_uri(&self, entity_uri: &str) -> Option<CellContext> {
@@ -1723,6 +1735,8 @@ mod tests {
             .unwrap();
         assert_eq!(s.followup_depth_of_review("g1").unwrap(), 0);
         assert_eq!(s.followup_depth_of_review("g2").unwrap(), 1);
+        assert_eq!(s.followup_depth_of_squad("squad-f").unwrap(), 1);
+        assert_eq!(s.followup_depth_of_squad("squad-other").unwrap(), 0);
 
         defer(
             &s,

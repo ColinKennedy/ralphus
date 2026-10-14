@@ -2190,6 +2190,20 @@ fn apply_arbiter_pool_order(
     ordered
 }
 
+/// Group `ordered` by ascending follow-up depth (RAL-652): user-submitted
+/// work (depth 0) first, then follow-ups, then follow-ups of follow-ups, and
+/// so on. The sort is stable, so each depth group keeps the relative order it
+/// had in `ordered`, and since it only permutes rows nothing is dropped or
+/// duplicated. A squad absent from `depths` counts as depth 0.
+#[must_use]
+fn stratify_by_followup_depth(
+    mut ordered: Vec<crate::triage::TriagePoolCellRow>,
+    depths: &std::collections::HashMap<String, i64>,
+) -> Vec<crate::triage::TriagePoolCellRow> {
+    ordered.sort_by_key(|c| depths.get(&c.squad_id).copied().unwrap_or(0));
+    ordered
+}
+
 /// RAL-346: the Arbiter's cron straggler sweep. Unlike
 /// [`create_review_from_triage_pool`] (which fires exactly one pool key --
 /// the coherent, threshold-driven unit of work), this drains *every* pool
@@ -2260,7 +2274,7 @@ fn build_review_from_drained_pool(
     // Defense in depth: `drain_triage_pool` already selects only completed
     // cells. Keep that invariant here in case a future caller supplies rows
     // without going through the drain filter.
-    let (drained, candidates) = {
+    let (drained, candidates, depths) = {
         let store = store.lock();
         let mut viable = Vec::with_capacity(drained.len());
         for cell in drained {
@@ -2303,7 +2317,26 @@ fn build_review_from_drained_pool(
                 }
             })
             .collect();
-        (drained, candidates)
+        // RAL-652: each squad's follow-up depth, applied after the Arbiter
+        // replies. A failed lookup counts as depth 0 (a logged warning).
+        let mut depths: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
+        for cell in &drained {
+            if depths.contains_key(&cell.squad_id) {
+                continue;
+            }
+            let depth = store
+                .followup_depth_of_squad(&cell.squad_id)
+                .unwrap_or_else(|e| {
+                    crate::rlog!(
+                        WARNING,
+                        "ralphus [reviews] follow-up depth lookup failed for {}: {e}; treating as depth 0",
+                        cell.squad_id
+                    );
+                    0
+                });
+            depths.insert(cell.squad_id.clone(), depth);
+        }
+        (drained, candidates, depths)
     };
     // The orderer runs its Arbiter round-trip with NO store guard held
     // (`order_pooled_candidates` re-locks briefly around it as needed) --
@@ -2313,6 +2346,7 @@ fn build_review_from_drained_pool(
         Some(proposed) => apply_arbiter_pool_order(drained, &proposed),
         None => drained,
     };
+    let drained = stratify_by_followup_depth(drained, &depths);
     let upstream = drained
         .first()
         .map(|c| c.upstream.clone())
@@ -4197,6 +4231,141 @@ prompt=\"a\"
             drained.len(),
             "every drained candidate still appears exactly once"
         );
+    }
+
+    fn depth_row(squad: &str, branch: &str) -> crate::triage::TriagePoolCellRow {
+        crate::triage::TriagePoolCellRow {
+            squad_id: squad.to_string(),
+            task_idx: 0,
+            idx: 0,
+            branch: branch.to_string(),
+            upstream: "main".to_string(),
+        }
+    }
+
+    fn branches(rows: &[crate::triage::TriagePoolCellRow]) -> Vec<&str> {
+        rows.iter().map(|c| c.branch.as_str()).collect()
+    }
+
+    /// RAL-652: depth groups ascend; Arbiter order holds inside each group.
+    #[test]
+    fn stratify_groups_by_depth_keeping_arbiter_order_within_groups() {
+        let depths: std::collections::HashMap<String, i64> = [
+            ("s-a".to_string(), 2),
+            ("s-b".to_string(), 0),
+            ("s-c".to_string(), 1),
+            ("s-d".to_string(), 0),
+            ("s-e".to_string(), 7),
+        ]
+        .into();
+        let pool = vec![
+            depth_row("s-a", "a"),
+            depth_row("s-b", "b"),
+            depth_row("s-c", "c"),
+            depth_row("s-d", "d"),
+            depth_row("s-e", "e"),
+        ];
+        // Canned Arbiter order: e, d, c, b, a.
+        let proposed: Vec<String> = ["s-e", "s-d", "s-c", "s-b", "s-a"]
+            .iter()
+            .map(|s| format!("{s}/t0:c0"))
+            .collect();
+        let ordered = super::stratify_by_followup_depth(
+            apply_arbiter_pool_order(pool.clone(), &proposed),
+            &depths,
+        );
+        assert_eq!(branches(&ordered), ["d", "b", "c", "a", "e"]);
+        // No Arbiter order: deterministic pool order within each group.
+        let ordered = super::stratify_by_followup_depth(pool, &depths);
+        assert_eq!(branches(&ordered), ["b", "d", "c", "a", "e"]);
+    }
+
+    /// RAL-652: a single-depth pool keeps its order unchanged.
+    #[test]
+    fn stratify_leaves_a_single_depth_pool_unchanged() {
+        let pool = vec![
+            depth_row("s-1", "x"),
+            depth_row("s-2", "y"),
+            depth_row("s-3", "z"),
+        ];
+        let none = std::collections::HashMap::new();
+        assert_eq!(
+            branches(&super::stratify_by_followup_depth(pool.clone(), &none)),
+            ["x", "y", "z"]
+        );
+        let all_two: std::collections::HashMap<String, i64> =
+            pool.iter().map(|c| (c.squad_id.clone(), 2)).collect();
+        assert_eq!(
+            branches(&super::stratify_by_followup_depth(pool, &all_two)),
+            ["x", "y", "z"]
+        );
+    }
+
+    /// RAL-652: both drain paths (threshold pool and cron sweep) put the
+    /// follow-up squad's branch after the user-submitted one, whatever the
+    /// Arbiter proposes.
+    #[test]
+    fn drained_pools_put_follow_up_cells_after_submitted_cells() {
+        for sweep in [false, true] {
+            let store = std::sync::Arc::new(crate::store_lock::StoreMutex::new(
+                Store::open_in_memory().unwrap(),
+            ));
+            let followup_squad = completed_pool_cell(&mut store.lock());
+            let submitted_squad = completed_pool_cell(&mut store.lock());
+            {
+                let guard = store.lock();
+                guard
+                    .conn
+                    .execute(
+                        "INSERT INTO followup_offers(guardian_id, status, items, depth, squad_id, created_at_ms)
+                         VALUES ('g0','accepted','[]',0,?1,0)",
+                        rusqlite::params![followup_squad],
+                    )
+                    .unwrap();
+                // Follow-up pooled first, so pool order alone would put it first.
+                guard
+                    .record_triage_pool_cell(
+                        "proj",
+                        "bug",
+                        &followup_squad,
+                        0,
+                        0,
+                        "b-followup",
+                        "main",
+                    )
+                    .unwrap();
+                guard
+                    .record_triage_pool_cell(
+                        "proj",
+                        "bug",
+                        &submitted_squad,
+                        0,
+                        0,
+                        "b-submitted",
+                        "main",
+                    )
+                    .unwrap();
+            }
+            let followup_first = {
+                let id = format!("{followup_squad}/t0:c0");
+                move |_: &[crate::arbiter::OrderingCandidate]| Some(vec![id.clone()])
+            };
+            let gid = if sweep {
+                super::create_review_from_triage_project_sweep(
+                    &store,
+                    "proj",
+                    "bug",
+                    followup_first,
+                )
+            } else {
+                create_review_from_triage_pool(&store, "proj", "bug", followup_first)
+            }
+            .unwrap()
+            .expect("pool was non-empty, must create a review");
+            let g = store.lock().get_guardian(&gid).unwrap();
+            let order: Vec<&str> = g.branches.iter().map(|b| b.branch.as_str()).collect();
+            assert_eq!(order, ["b-submitted", "b-followup"], "sweep={sweep}");
+        }
     }
 
     #[test]
