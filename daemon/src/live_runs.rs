@@ -372,6 +372,24 @@ impl crate::store::Store {
         )?)
     }
 
+    /// Record the tmux cell of the agent generating a review's live actions
+    /// (the deduplication pass), so its session can be followed and read back.
+    ///
+    /// # Errors
+    ///
+    /// On a database failure.
+    pub fn set_live_actions_generation_cell(
+        &self,
+        guardian_id: &str,
+        cell_id: &str,
+    ) -> crate::store::Result<()> {
+        self.conn.execute(
+            "UPDATE guardians SET live_actions_generation_cell=? WHERE id=?",
+            rusqlite::params![cell_id, guardian_id],
+        )?;
+        Ok(())
+    }
+
     /// Record the checkout a review's latest preparation produced.
     ///
     /// # Errors
@@ -414,6 +432,27 @@ impl crate::store::Store {
         let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
+}
+
+/// The tmux cell of the agent that generated a review's live actions, if one
+/// ran (a single handoff needs no generation agent).
+///
+/// # Errors
+///
+/// On a database failure.
+pub fn live_actions_generation_cell_conn(
+    conn: &rusqlite::Connection,
+    guardian_id: &str,
+) -> crate::store::Result<Option<String>> {
+    use rusqlite::OptionalExtension as _;
+    Ok(conn
+        .query_row(
+            "SELECT live_actions_generation_cell FROM guardians WHERE id=?",
+            rusqlite::params![guardian_id],
+            |r| r.get::<_, Option<String>>(0),
+        )
+        .optional()?
+        .flatten())
 }
 
 /// [`crate::store::Store::live_checkout`] over a bare connection.

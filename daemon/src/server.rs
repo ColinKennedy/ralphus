@@ -2221,6 +2221,34 @@ fn route_for_user(
         ("POST", ["api", "guardians", id, "live-actions", "run"]) => {
             guardian_run_live_actions(daemon, id, body)
         }
+        // ralphus[ignore-endpoint-cli]: board Live View of the agent generating a review's live actions
+        ("GET", ["api", "guardians", id, "live-actions", "generation", "pane"]) => {
+            guardian_live_generation_pane(daemon, id, query)
+        }
+        // ralphus[ignore-endpoint-cli]: board Live View scrollback of the live-actions generation agent
+        (
+            "GET",
+            [
+                "api",
+                "guardians",
+                id,
+                "live-actions",
+                "generation",
+                "pane-transcript",
+            ],
+        ) => guardian_live_generation_pane_transcript(daemon, id, query),
+        // ralphus[ignore-endpoint-cli]: board transcript of the live-actions generation agent
+        (
+            "GET",
+            [
+                "api",
+                "guardians",
+                id,
+                "live-actions",
+                "generation",
+                "terminal-log",
+            ],
+        ) => guardian_live_generation_terminal_log(daemon, id),
         ("POST", ["api", "guardians", id, "live-runs", run_id, "cancel"]) => {
             guardian_cancel_live_run(daemon, id, run_id)
         }
@@ -13211,6 +13239,9 @@ fn guardian_live_actions_view(daemon: &Daemon, id: &str) -> Reply {
         auto_ran_at_ms: Option<i64>,
         checkout: Option<String>,
         preparation_failure: Option<String>,
+        /// The tmux cell of the agent that generated the live actions, when
+        /// one ran; its session is served under `.../live-actions/generation/`.
+        generation_cell: Option<String>,
         actions: Vec<crate::live_actions::LiveAction>,
         runs: Vec<crate::live_runs::LiveRunRow>,
     }
@@ -13223,10 +13254,11 @@ fn guardian_live_actions_view(daemon: &Daemon, id: &str) -> Reply {
             crate::live_actions::guardian_live_actions_conn(conn, id)?,
             crate::live_runs::guardian_live_runs_conn(conn, id)?,
             crate::live_runs::live_checkout_conn(conn, id)?,
+            crate::live_runs::live_actions_generation_cell_conn(conn, id)?,
         ))
     });
     match loaded {
-        Ok((actions, runs, checkout)) => json(
+        Ok((actions, runs, checkout, generation_cell)) => json(
             200,
             &LiveActionsView {
                 enabled: guardian.effective_live_actions,
@@ -13234,6 +13266,7 @@ fn guardian_live_actions_view(daemon: &Daemon, id: &str) -> Reply {
                 auto_ran_at_ms: guardian.live_actions_auto_ran_at_ms,
                 checkout: checkout.path,
                 preparation_failure: checkout.preparation_failure,
+                generation_cell,
                 actions,
                 runs,
             },
@@ -13300,6 +13333,61 @@ fn live_run_cell(daemon: &Daemon, id: &str, run_id: &str) -> std::result::Result
             Err(error(404, "not_found", "no such live run", vec![]))
         }
         Err(e) => Err(store_error(&e)),
+    }
+}
+
+/// The live-actions generation agent's tmux cell, when one ran.
+fn live_generation_cell(daemon: &Daemon, id: &str) -> std::result::Result<String, Reply> {
+    match daemon
+        .with_read_snapshot(|conn| crate::live_runs::live_actions_generation_cell_conn(conn, id))
+    {
+        Ok(Some(cell)) => Ok(cell),
+        Ok(None) => Err(error(
+            404,
+            "not_found",
+            "no agent has generated this review's live actions",
+            vec![],
+        )),
+        Err(e) => Err(store_error(&e)),
+    }
+}
+
+/// Live pane of the agent generating a review's live actions.
+fn guardian_live_generation_pane(daemon: &Daemon, id: &str, query: &str) -> Reply {
+    match live_generation_cell(daemon, id) {
+        Ok(cell) => capture_pane_reply(
+            daemon,
+            &crate::live_actions::live_run_squad_id(id),
+            crate::live_actions::LIVE_ACTION_TASK,
+            &cell,
+            query,
+        ),
+        Err(reply) => reply,
+    }
+}
+
+/// Raw transcript range of the live-actions generation agent's session.
+fn guardian_live_generation_pane_transcript(daemon: &Daemon, id: &str, query: &str) -> Reply {
+    match live_generation_cell(daemon, id) {
+        Ok(cell) => pane_transcript_range_reply(
+            &crate::live_actions::live_run_squad_id(id),
+            crate::live_actions::LIVE_ACTION_TASK,
+            &cell,
+            query,
+        ),
+        Err(reply) => reply,
+    }
+}
+
+/// Persisted terminal-log attempts of the live-actions generation agent.
+fn guardian_live_generation_terminal_log(daemon: &Daemon, id: &str) -> Reply {
+    match live_generation_cell(daemon, id) {
+        Ok(cell) => terminal_log_attempts_reply(
+            &crate::live_actions::live_run_squad_id(id),
+            crate::live_actions::LIVE_ACTION_TASK,
+            &cell,
+        ),
+        Err(reply) => reply,
     }
 }
 

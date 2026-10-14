@@ -283,6 +283,7 @@
         }
         if (kind === "guardian-manual") { const [gid] = rest; return `/api/guardians/${gid}/manual-checks/pane?lines=500`; }
         if (kind === "guardian-live-run") { const [gid, runId] = rest; return `/api/guardians/${gid}/live-runs/${encodeURIComponent(runId)}/pane?lines=500`; }
+        if (kind === "guardian-live-gen") { const [gid] = rest; return `/api/guardians/${gid}/live-actions/generation/pane?lines=500`; }
         return null;
       }
       /**
@@ -307,6 +308,7 @@
         }
         if (kind === "guardian-manual") { const [gid] = rest; return `/api/guardians/${gid}/manual-checks/pane-transcript`; }
         if (kind === "guardian-live-run") { const [gid, runId] = rest; return `/api/guardians/${gid}/live-runs/${encodeURIComponent(runId)}/pane-transcript`; }
+        if (kind === "guardian-live-gen") { const [gid] = rest; return `/api/guardians/${gid}/live-actions/generation/pane-transcript`; }
         return null;
       }
       /**

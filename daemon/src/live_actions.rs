@@ -675,6 +675,11 @@ pub fn deduplicate_handoffs(
         maximum_timeout: None,
         pass_score: None,
     };
+    // Recorded before the agent starts, so the board can follow the
+    // generation live -- the same way it follows auto-action generation.
+    let _ = store
+        .lock()
+        .set_live_actions_generation_cell(gid, &spec.cell_id);
     let result = crate::guardian_merge::run_agent_with_stall_recovery(
         store, &mut spec, runner, cancel, None,
     );

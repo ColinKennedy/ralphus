@@ -104,6 +104,7 @@
       function openAutoActionsPane(gid) {
         const key = autoActionsPeekKey(gid);
         closeLiveRunPane();
+        closeLiveGenerationPane();
         inspectorAutoActionsGid = gid;
         inspectorBranchId = null;
         selectedBranch[gid] = null;
@@ -424,9 +425,97 @@
         const empty = actions.length ? "" : (runs.length
           ? "No live actions are posted now; earlier runs are below."
           : "None yet. A prompt cell posts one by ending its reply with a <span class=\"mono\">RALPHUS_LIVE_ACTION</span> handoff.");
-        return `<h3 class="section" data-tip="${esc(headTip)}">live actions</h3>
+        const genShowing = inspectorLiveGenGid === g.id;
+        const headClickTip = view && view.generation_cell
+          ? (genShowing
+            ? "The details pane on the right is showing the agent that generated these live actions from the cells' handoffs. Click a branch to go back to its details."
+            : "Show the agent that generated these live actions -- it merged the cells' handoffs into them -- in the details pane: what it did and how it ended.\nEach run's own agent, including any fix it made while testing, is one click away on its row.")
+          : (runs.length
+            ? "A single handoff needs no generation agent, so this shows the newest live run in the details pane instead: the agent testing the review's tip, including any fix it made while doing so."
+            : "Nothing to show yet: no agent has generated or run this review's live actions.");
+        return `<h3 class="section" data-click="openLiveActionsHeader" data-guardian-id="${esc(g.id)}" style="cursor:pointer" data-tip="${esc(`${headTip}\n\n${headClickTip}`)}">live actions</h3>
           ${failure}
           ${reviewRunGroup(control, `${status}${empty ? ` · ${empty}` : ""}`, rows)}`;
+      }
+      /** @type {string|null} Review whose live-actions generation agent the inspector shows in place of a branch, or null. */
+      let inspectorLiveGenGid = null;
+      /**
+       * The live-actions generation agent's live-view peek key.
+       * @param {string} gid - The review id.
+       * @returns {string}
+       */
+      function liveGenerationPeekKey(gid) {
+        return `guardian-live-gen|${gid}`;
+      }
+      /**
+       * The live-actions section header was clicked: show the agent that
+       * generated the live actions, or -- when a single handoff needed no
+       * generation agent -- the newest live run's agent, the same way the
+       * auto-actions header shows its generation agent.
+       * @param {string} gid - The review id.
+       * @returns {void}
+       */
+      function openLiveActionsHeader(gid) {
+        const view = liveActionsViews[gid];
+        if (view && view.generation_cell) {
+          openLiveGenerationPane(gid);
+          return;
+        }
+        const newest = view ? view.runs.find((r) => r.kind === "live" && r.cell_id) : undefined;
+        if (newest) openLiveRunPane(gid, newest.run_id);
+      }
+      /**
+       * Shows the live-actions generation agent in the inspector, replacing
+       * the branch details until a branch is selected.
+       * @param {string} gid - The review id.
+       * @returns {void}
+       */
+      function openLiveGenerationPane(gid) {
+        const key = liveGenerationPeekKey(gid);
+        closeAutoActionsPane();
+        closeLiveRunPane();
+        inspectorLiveGenGid = gid;
+        inspectorBranchId = null;
+        selectedBranch[gid] = null;
+        if (!peekOpen[key]) {
+          peekOpen[key] = true;
+          fetchPeek(key, !peekScrollState[key]);
+        }
+        syncHash();
+        renderReviewDetail();
+      }
+      /**
+       * Hides the live-actions generation pane and releases its live view.
+       * No-op when it is not showing.
+       * @returns {void}
+       */
+      function closeLiveGenerationPane() {
+        const gid = inspectorLiveGenGid;
+        if (!gid) return;
+        inspectorLiveGenGid = null;
+        if (peekOpen[liveGenerationPeekKey(gid)]) togglePeek(liveGenerationPeekKey(gid));
+      }
+      /**
+       * The inspector's body while it shows the live-actions generation agent.
+       * @param {GuardianView} g - The review.
+       * @returns {string}
+       */
+      function liveGenerationInspectorHtml(g) {
+        const key = liveGenerationPeekKey(g.id);
+        const view = liveActionsViews[g.id];
+        const done = !!(view && view.actions.length);
+        return `<div class="insp-head"><div class="insp-title"><span class="t" data-tip="The agent that merged this review's cells' live handoffs into its live actions. Click a branch in the stack to go back to its details.">Live actions generation</span></div></div>
+          <div class="insp-body">${squadLiveSlot(squadLiveCtx({
+            baseKey: key,
+            title: "live actions generation",
+            canThink: true,
+            promptText: "",
+            promptHint: "",
+            noPromptText: "The handoffs it merged are listed under each live action (expand a row with +). The Agent Log tab shows what the agent did with them.",
+            withAttempts: false,
+            currentMeta: done ? "finished" : "running",
+            closeKey: "",
+          }))}</div>`;
       }
       /**
        * Queues agent runs of a review's live actions: every one, or just
@@ -479,6 +568,7 @@
         const prior = inspectorLiveRun;
         if (prior && (prior.gid !== gid || prior.runId !== runId)) closeLiveRunPane();
         closeAutoActionsPane();
+        closeLiveGenerationPane();
         const key = liveRunPeekKey(gid, runId);
         inspectorLiveRun = { gid, runId };
         inspectorBranchId = null;
@@ -546,6 +636,7 @@
       function selectInspectorBranch(branchId) {
         closeAutoActionsPane();
         closeLiveRunPane();
+        closeLiveGenerationPane();
         inspectorBranchId = branchId || null;
         if (!reviewDockSticky) reviewDockScope = branchId;
         // Switching branches while watching is still watching: the newly
@@ -693,6 +784,11 @@
         }
         if (inspectorAutoActionsGid === g.id) {
           host.innerHTML = autoActionsInspectorHtml(g);
+          restorePeekScrollPositions();
+          return;
+        }
+        if (inspectorLiveGenGid === g.id) {
+          host.innerHTML = liveGenerationInspectorHtml(g);
           restorePeekScrollPositions();
           return;
         }
