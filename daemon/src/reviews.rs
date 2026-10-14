@@ -2327,6 +2327,7 @@ fn build_review_from_drained_pool(
             let depth = store
                 .followup_depth_of_squad(&cell.squad_id)
                 .unwrap_or_else(|e| {
+                    // ralphus[ignore-rlog-pair]: error fallback in lookup; pool stratification owns the main flow outcome
                     crate::rlog!(
                         WARNING,
                         "ralphus [reviews] follow-up depth lookup failed for {}: {e}; treating as depth 0",
