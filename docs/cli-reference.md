@@ -908,8 +908,8 @@ use; see `READ_ONLY_NOTE`.
         - (read-only-safe) show selector [uri]  {Show a single review's detail.}
         - squash selector [uri] project [str] --off --on  {Enable/disable squashing one git project's task branches to a single commit each in the review worktree.}
         - (read-only-safe) status selector [uri]  {Per-branch readiness + a summary verdict ('is this review ready?').}
-        - stop-merge selector [uri]  {Stop an in-progress rebase at the next checkpoint, leaving the review resumable instead of cancelled.}
         - stop-actioning selector [uri]  {Stop whatever is actioning a review's worktree (feedback, merge/rebase or auto-fix), abort a mid-rebase and reset the worktree, and pause auto-fix until the next explicit Action feedback or Merge / rebase.}
+        - stop-merge selector [uri]  {Stop an in-progress rebase at the next checkpoint, leaving the review resumable instead of cancelled.}
         - sync-pr selector [uri]  {Check the forge for a stack reorder made outside ralphus and apply it if found.}
         - upstream  {Inspect/change a review's upstream branch.}
             - (read-only-safe) list selector [uri]  {List candidate upstream branches.}
