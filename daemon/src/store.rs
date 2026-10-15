@@ -6612,7 +6612,7 @@ impl Store {
                     .get(&(task_idx, idx))
                     .cloned()
                     .unwrap_or_default();
-                let triage_pending =
+                let is_triage_pending =
                     triage_types.is_empty() && triage_pending.contains(&(task_idx, idx));
                 let (subprojects, subprojects_inferred) = subprojects_by_cell
                     .get(&(task_idx, idx))
@@ -6673,7 +6673,7 @@ impl Store {
                         proof: Vec::new(),
                         reviews,
                         triage_types,
-                        triage_pending,
+                        triage_pending: is_triage_pending,
                         subprojects,
                         subprojects_inferred,
                         agent_session_id: r.get::<_, Option<String>>(17)?,
