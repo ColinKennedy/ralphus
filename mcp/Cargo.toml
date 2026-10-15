@@ -17,6 +17,10 @@ path = "src/lib.rs"
 [lints]
 workspace = true
 
+[features]
+# Warn at validate/submit when a command does not match its shell (RAL-651).
+shell-syntax = ["ralphus-core/shell-syntax"]
+
 [dependencies]
 ralphus-cli = { path = "../cli" }
 ralphus-core = { workspace = true }

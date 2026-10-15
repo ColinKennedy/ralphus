@@ -45,9 +45,15 @@ pub fn shell_for_tool(tool: &str, host_is_windows: bool) -> Option<Shell> {
         }),
         // `cmd`, `cmd.exe` or a path to it, keyed the same way the runner's
         // `shell_prefix` picks `cmd.exe /C`.
-        other => (ralphus_core::shellcmd::shell_kind_from_exe(other) == Some("cmd"))
-            .then_some(Shell::Cmd),
+        other => is_cmd_exe(other).then_some(Shell::Cmd),
     }
+}
+
+fn is_cmd_exe(name: &str) -> bool {
+    let trimmed = name.trim();
+    let base = trimmed.rsplit(['/', '\\']).next().unwrap_or(trimmed);
+    let cleaned = base.trim_start_matches('-').to_lowercase();
+    cleaned == "cmd" || cleaned == "cmd.exe"
 }
 
 /// Outcome of a parse request.
@@ -109,6 +115,19 @@ pub struct Parsed {
     pub status: Status,
     pub commands: Vec<Command>,
     pub spans: Vec<Span>,
+    /// 1-based line of the first syntax error, set only with
+    /// [`Status::Unparsed`] when the grammar could place it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_line: Option<u32>,
+    /// Number of error or missing nodes the grammar found, set only with
+    /// [`Status::Unparsed`]. Comparing it across grammars says which shell a
+    /// text fits best.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub error_count: u32,
+}
+
+fn is_zero(n: &u32) -> bool {
+    *n == 0
 }
 
 impl Parsed {
@@ -118,6 +137,8 @@ impl Parsed {
             status,
             commands: Vec::new(),
             spans: Vec::new(),
+            error_line: None,
+            error_count: 0,
         }
     }
 }

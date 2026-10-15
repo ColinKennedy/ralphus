@@ -40,6 +40,9 @@ pub enum ErrorKind {
     /// field that does not exist at the level its `.`/`..` navigation
     /// reaches (including walking `..` past the top of the submission).
     UnknownLinkedField,
+    /// A `command` looks like it was written for a different shell than the
+    /// one it runs under, or is not valid syntax for it (always a warning).
+    ShellMismatch,
 }
 
 /// A single validation finding.
@@ -78,6 +81,15 @@ impl ValidationReport {
         self.errors.is_empty()
     }
 
+    fn warning(&mut self, path: &str, kind: ErrorKind, msg: impl Into<String>, line: Option<u32>) {
+        self.warnings.push(ValidationError {
+            path: path.to_string(),
+            kind,
+            message: msg.into(),
+            line,
+        });
+    }
+
     fn error(&mut self, path: &str, kind: ErrorKind, msg: impl Into<String>, line: Option<u32>) {
         self.errors.push(ValidationError {
             path: path.to_string(),
@@ -100,6 +112,10 @@ struct Ctx<'a> {
 impl Ctx<'_> {
     fn error(&mut self, path: &str, kind: ErrorKind, msg: impl Into<String>, line: Option<u32>) {
         self.report.error(path, kind, msg, line);
+    }
+
+    fn warning(&mut self, path: &str, kind: ErrorKind, msg: impl Into<String>, line: Option<u32>) {
+        self.report.warning(path, kind, msg, line);
     }
 
     fn key_line(&self, header: Option<u32>, key: &str) -> Option<u32> {
@@ -549,6 +565,22 @@ fn check_command_mode(
             "'shell' is only valid alongside 'command'",
             ctx.key_line(header, "shell"),
         );
+    }
+
+    if let Some(command) = table.get("command").and_then(toml::Value::as_str) {
+        let shell = table
+            .get("shell")
+            .and_then(toml::Value::as_str)
+            .filter(|s| !s.trim().is_empty());
+        if let Some(message) = crate::shell_check::check_command(command, shell) {
+            let line = ctx.key_line(header, "command");
+            ctx.warning(
+                &format!("{path}.command"),
+                ErrorKind::ShellMismatch,
+                message,
+                line,
+            );
+        }
     }
 
     let mode = table.get("mode").and_then(toml::Value::as_str);
@@ -7593,5 +7625,25 @@ placement = "copy"
         );
         let r = validate_toml(&ok);
         assert!(r.is_ok(), "{:?}", r.errors);
+    }
+}
+
+#[cfg(all(test, feature = "shell-syntax"))]
+mod shell_check_tests {
+    use super::*;
+
+    #[test]
+    fn mismatched_cell_command_warns_but_stays_valid() {
+        let raw = "[[task]]\nname = \"t\"\n\n[[task.cell]]\nid = \"c\"\ncwd = \"/w\"\nremediation_attempts = 1\nshell = \"bash\"\ncommand = \"foreach ($i in 1..3) { Write-Host $i }\"\n";
+        let report = validate_toml(raw);
+        assert!(report.is_ok(), "{:?}", report.errors);
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|w| w.kind == ErrorKind::ShellMismatch && w.line.is_some()),
+            "{:?}",
+            report.warnings
+        );
     }
 }

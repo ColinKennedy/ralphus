@@ -30,7 +30,7 @@ embedded-tmux = []
 # RAL-644: tree-sitter Bash/PowerShell parse that lets the board's agent log
 # show a shell command as highlighted rows. Display-only and optional (needs a
 # C compiler); see docs/shell-syntax.md.
-shell-syntax = ["ralphus-shell-syntax/parser"]
+shell-syntax = ["ralphus-shell-syntax/parser", "ralphus-core/shell-syntax"]
 # Builds and runs `tests/review_input_races.rs`, ~150 real-git scenarios that
 # take ~30 minutes on a hosted runner. The test target requires this feature
 # (below), so `cargo test`, `cargo nextest run`, `--all-targets` and
