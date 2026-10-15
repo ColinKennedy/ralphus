@@ -416,7 +416,15 @@ pub struct PrCiProbe {
 /// listed run reports a failure the newer run already superseded. A check is
 /// identified by its app and name; the highest check-run id is the newest. A
 /// run with no id cannot be ordered, so it is always kept.
+///
+/// Matching by name alone misses a matrix job: the older run lists
+/// `build (ubuntu-latest)` while a newer run that skipped the job lists it as
+/// `build (${{ matrix.os }})`, so the cancelled leftover has no same-named
+/// successor. A `cancelled` check is therefore also dropped when a newer
+/// Actions workflow run on the commit overlaps its own run by check name,
+/// which is what marks that newer run as its replacement.
 fn latest_check_runs(runs: Vec<serde_json::Value>) -> Vec<serde_json::Value> {
+    let runs = drop_cancelled_of_superseded_workflow_runs(runs);
     let key = |run: &serde_json::Value| {
         (
             run["app"]["id"].as_i64(),
@@ -442,6 +450,52 @@ fn latest_check_runs(runs: Vec<serde_json::Value>) -> Vec<serde_json::Value> {
         })
         .map(|(_, run)| run.clone())
         .collect()
+}
+
+/// The GitHub Actions workflow-run id in a check run's job URL
+/// (`.../actions/runs/<run>/job/<job>`), if it is an Actions check.
+fn actions_run_id(run: &serde_json::Value) -> Option<i64> {
+    let url = run["details_url"]
+        .as_str()
+        .or_else(|| run["html_url"].as_str())?;
+    let (_, rest) = url.split_once("/actions/runs/")?;
+    rest.split('/').next()?.parse().ok()
+}
+
+/// Remove `cancelled` checks whose workflow run was replaced by a newer run of
+/// the same workflow (see [`latest_check_runs`]).
+fn drop_cancelled_of_superseded_workflow_runs(
+    runs: Vec<serde_json::Value>,
+) -> Vec<serde_json::Value> {
+    let name = |run: &serde_json::Value| run["name"].as_str().unwrap_or("check").to_string();
+    let mut names_by_run: std::collections::HashMap<
+        (Option<i64>, i64),
+        std::collections::HashSet<String>,
+    > = std::collections::HashMap::new();
+    for run in &runs {
+        if let Some(run_id) = actions_run_id(run) {
+            names_by_run
+                .entry((run["app"]["id"].as_i64(), run_id))
+                .or_default()
+                .insert(name(run));
+        }
+    }
+    let superseded = |run: &serde_json::Value| -> bool {
+        if run["conclusion"].as_str() != Some("cancelled") {
+            return false;
+        }
+        let Some(run_id) = actions_run_id(run) else {
+            return false;
+        };
+        let app = run["app"]["id"].as_i64();
+        let Some(own_names) = names_by_run.get(&(app, run_id)) else {
+            return false;
+        };
+        names_by_run.iter().any(|((other_app, other_id), names)| {
+            *other_app == app && *other_id > run_id && !names.is_disjoint(own_names)
+        })
+    };
+    runs.into_iter().filter(|run| !superseded(run)).collect()
 }
 
 fn pr_object_draft(obj: &serde_json::Value) -> bool {
@@ -8029,6 +8083,75 @@ mod tests {
         });
         let client = mock.client(ForgeKind::GitHub, "acme/widget");
         assert_eq!(client.check_pr_ci_status(4).unwrap(), PrCiState::Passing);
+        mock.finish();
+    }
+
+    #[test]
+    fn check_pr_ci_status_ignores_cancelled_matrix_jobs_a_newer_run_skipped() {
+        let mock = MockForge::start(move |server| {
+            let req = server.recv();
+            req.respond(
+                tiny_http::Response::from_string(
+                    r#"{"mergeable_state": "clean", "head": {"sha": "deadbeef"}}"#,
+                )
+                .with_status_code(200),
+            )
+            .unwrap();
+            let req = server.recv();
+            // Run 100 was cancelled; run 200 replaced it. Its matrix jobs were
+            // skipped, so they carry the unexpanded template name and never
+            // match the cancelled `build (linux)` by name.
+            req.respond(
+                tiny_http::Response::from_string(
+                    r#"{"check_runs": [
+                        {"id": 1, "name": "scope", "app": {"id": 15368}, "details_url": "https://github.com/a/b/actions/runs/100/job/1", "status": "completed", "conclusion": "cancelled"},
+                        {"id": 2, "name": "build (linux)", "app": {"id": 15368}, "details_url": "https://github.com/a/b/actions/runs/100/job/2", "status": "completed", "conclusion": "cancelled"},
+                        {"id": 3, "name": "scope", "app": {"id": 15368}, "details_url": "https://github.com/a/b/actions/runs/200/job/3", "status": "completed", "conclusion": "success"},
+                        {"id": 4, "name": "build (${{ matrix.os }})", "app": {"id": 15368}, "details_url": "https://github.com/a/b/actions/runs/200/job/4", "status": "completed", "conclusion": "skipped"}
+                    ]}"#,
+                )
+                .with_status_code(200),
+            )
+            .unwrap();
+            let req = server.recv();
+            req.respond(
+                tiny_http::Response::from_string(r#"{"state": "success"}"#).with_status_code(200),
+            )
+            .unwrap();
+        });
+        let client = mock.client(ForgeKind::GitHub, "acme/widget");
+        assert_eq!(client.check_pr_ci_status(4).unwrap(), PrCiState::Passing);
+        mock.finish();
+    }
+
+    #[test]
+    fn check_pr_ci_status_still_fails_on_a_cancelled_job_of_the_newest_workflow_run() {
+        let mock = MockForge::start(move |server| {
+            let req = server.recv();
+            req.respond(
+                tiny_http::Response::from_string(
+                    r#"{"mergeable_state": "clean", "head": {"sha": "deadbeef"}}"#,
+                )
+                .with_status_code(200),
+            )
+            .unwrap();
+            let req = server.recv();
+            req.respond(
+                tiny_http::Response::from_string(
+                    r#"{"check_runs": [
+                        {"id": 1, "name": "scope", "app": {"id": 15368}, "details_url": "https://github.com/a/b/actions/runs/100/job/1", "status": "completed", "conclusion": "success"},
+                        {"id": 2, "name": "build (linux)", "app": {"id": 15368}, "details_url": "https://github.com/a/b/actions/runs/100/job/2", "status": "completed", "conclusion": "cancelled"}
+                    ]}"#,
+                )
+                .with_status_code(200),
+            )
+            .unwrap();
+        });
+        let client = mock.client(ForgeKind::GitHub, "acme/widget");
+        assert!(matches!(
+            client.check_pr_ci_status(4).unwrap(),
+            PrCiState::Failing(_)
+        ));
         mock.finish();
     }
 
