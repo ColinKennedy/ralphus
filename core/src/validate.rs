@@ -1178,6 +1178,9 @@ fn validate_cells(
     let mut has_placeholder = false;
     let mut has_auto_review = false;
     let mut worktree_groups: WorktreeGroupMap = HashMap::new();
+    // Cell index -> (triage opt-in, worktree identity), for the
+    // cross-worktree dependency check.
+    let mut cell_worktrees: HashMap<usize, (bool, String)> = HashMap::new();
 
     for (s, item) in arr.iter().enumerate() {
         let path = format!("{task_path}.cell[{s}]");
@@ -1416,6 +1419,16 @@ fn validate_cells(
         check_type(ctx, table, "triage", Ty::Bool, &path, header);
         check_type(ctx, table, "triage_type", Ty::StrOrStrArray, &path, header);
         check_triage(ctx, table, &path, header, &mut has_auto_review);
+        if let Some(cwd) = table.get("cwd").and_then(toml::Value::as_str) {
+            let worktree = crate::schema::first_worktree_placeholder_in_text(cwd)
+                .unwrap_or(cwd)
+                .to_string();
+            let triaged = table
+                .get("triage")
+                .and_then(toml::Value::as_bool)
+                .unwrap_or(false);
+            cell_worktrees.insert(s, (triaged, worktree));
+        }
 
         check_type(ctx, table, "extends", Ty::StrArray, &path, header);
         check_extends(ctx, table, &path, header);
@@ -1475,6 +1488,51 @@ fn validate_cells(
     }
 
     check_cell_deps(&ids, &dep_edges, arr.len(), task_path, task_idx, ctx);
+    check_triage_dep_worktrees(&ids, &dep_edges, &cell_worktrees, task_path, task_idx, ctx);
+}
+
+/// RAL-666: a triaged cell must not depend on a cell in a different worktree.
+/// A dependent cell's branch is based on its upstream's, so the Arbiter could
+/// drain upstream commits into a review they don't belong to, breaking the
+/// review's linear rebase stack. Dependencies within one worktree are fine
+/// (they pool as a single unit). This also rejects a triaged cell depending
+/// on a non-triaged cell in another worktree, whose branch no triage review
+/// owns. Cross-task references (`task/cell`) are not resolvable here.
+fn check_triage_dep_worktrees(
+    ids: &HashMap<String, usize>,
+    edges: &[(usize, String)],
+    cell_worktrees: &HashMap<usize, (bool, String)>,
+    task_path: &str,
+    task_idx: usize,
+    ctx: &mut Ctx,
+) {
+    for (from, dep) in edges {
+        let (Some(&to), Some((true, from_wt))) = (ids.get(dep), cell_worktrees.get(from)) else {
+            continue;
+        };
+        let Some((dep_triaged, dep_wt)) = cell_worktrees.get(&to) else {
+            continue;
+        };
+        if dep_wt == from_wt {
+            continue;
+        }
+        let kind = if *dep_triaged {
+            "triaged"
+        } else {
+            "non-triaged"
+        };
+        let line = ctx.idx.cell_line(task_idx, *from);
+        ctx.error(
+            &format!("{task_path}.cell[{from}].depends_on"),
+            ErrorKind::InvalidValue,
+            format!(
+                "triaged cell depends on {kind} cell \"{dep}\" in a different worktree; \
+                 commits would cross review branches. Run them in the same worktree, or \
+                 express the sequence as an authored [[review]] stack"
+            ),
+            line,
+        );
+    }
 }
 
 /// Validate the `subprojects` array (RAL-23): each element must be a
@@ -7463,6 +7521,79 @@ placement = "copy"
             "{:?}",
             r.errors
         );
+    }
+
+    const TRIAGE_DEP_HEAD: &str = "[[task]]\nname=\"t\"\nproject=\"p\"\n";
+
+    fn triage_dep_cell(id: &str, cwd: &str, triage: bool, dep: Option<&str>) -> String {
+        let mut s = format!("[[task.cell]]\nid=\"{id}\"\ncwd=\"{cwd}\"\nprompt=\"p\"\n");
+        if triage {
+            s.push_str("triage=true\n");
+        }
+        if let Some(d) = dep {
+            s.push_str(&format!("depends_on=[\"{d}\"]\n"));
+        }
+        s
+    }
+
+    #[test]
+    fn triaged_dep_across_worktrees_is_rejected() {
+        let wt_a = "<<ralphus:new-worktree/a?upstream=main>>";
+        let wt_b = "<<ralphus:new-worktree/b?upstream=main>>";
+        let src = format!(
+            "{TRIAGE_DEP_HEAD}{}{}",
+            triage_dep_cell("one", wt_a, true, None),
+            triage_dep_cell("two", wt_b, true, Some("one")),
+        );
+        let r = validate_toml(&src);
+        let e = r
+            .errors
+            .iter()
+            .find(|e| e.message.contains("different worktree"))
+            .unwrap_or_else(|| panic!("{:?}", r.errors));
+        assert!(e.message.contains("[[review]]"));
+        assert_eq!(e.line, Some(9));
+    }
+
+    #[test]
+    fn triaged_dep_on_non_triaged_other_worktree_is_rejected() {
+        let wt_a = "<<ralphus:new-worktree/a?upstream=main>>";
+        let src = format!(
+            "{TRIAGE_DEP_HEAD}{}{}",
+            triage_dep_cell("one", "/repo", false, None),
+            triage_dep_cell("two", wt_a, true, Some("one")),
+        );
+        let r = validate_toml(&src);
+        assert!(
+            r.errors
+                .iter()
+                .any(|e| e.message.contains("non-triaged") && e.message.contains("[[review]]")),
+            "{:?}",
+            r.errors
+        );
+    }
+
+    #[test]
+    fn triaged_dep_within_one_worktree_is_valid() {
+        let wt_a = "<<ralphus:new-worktree/a?upstream=main>>";
+        let src = format!(
+            "{TRIAGE_DEP_HEAD}{}{}",
+            triage_dep_cell("one", wt_a, true, None),
+            triage_dep_cell("two", wt_a, true, Some("one")),
+        );
+        let r = validate_toml(&src);
+        assert!(r.is_ok(), "{:?}", r.errors);
+    }
+
+    #[test]
+    fn non_triaged_dep_across_worktrees_is_valid() {
+        let src = format!(
+            "{TRIAGE_DEP_HEAD}{}{}",
+            triage_dep_cell("one", "/a", false, None),
+            triage_dep_cell("two", "/b", false, Some("one")),
+        );
+        let r = validate_toml(&src);
+        assert!(r.is_ok(), "{:?}", r.errors);
     }
 
     #[test]
