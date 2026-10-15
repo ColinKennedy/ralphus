@@ -1,4 +1,4 @@
-//! Optional tree-sitter parse of a Bash / PowerShell command line, for the
+//! Optional tree-sitter parse of a Bash / PowerShell / cmd command line, for the
 //! board's experimental agent log (RAL-644).
 //!
 //! The parse only changes how a command is *drawn*: it splits the text into
@@ -28,6 +28,7 @@ pub const PARSE_TIMEOUT_MS: u64 = 250;
 pub enum Shell {
     Bash,
     PowerShell,
+    Cmd,
 }
 
 /// The grammar for a recorded agent tool name, or `None` for a tool that is
@@ -42,7 +43,10 @@ pub fn shell_for_tool(tool: &str, host_is_windows: bool) -> Option<Shell> {
         } else {
             Shell::Bash
         }),
-        _ => None,
+        // `cmd`, `cmd.exe` or a path to it, keyed the same way the runner's
+        // `shell_prefix` picks `cmd.exe /C`.
+        other => (ralphus_core::shellcmd::shell_kind_from_exe(other) == Some("cmd"))
+            .then_some(Shell::Cmd),
     }
 }
 
@@ -165,6 +169,8 @@ mod tests {
         assert_eq!(shell_for_tool("powershell", false), Some(Shell::PowerShell));
         assert_eq!(shell_for_tool("exec", true), Some(Shell::PowerShell));
         assert_eq!(shell_for_tool("exec", false), Some(Shell::Bash));
+        assert_eq!(shell_for_tool("cmd", false), Some(Shell::Cmd));
+        assert_eq!(shell_for_tool("cmd.exe", false), Some(Shell::Cmd));
         assert_eq!(shell_for_tool("Read", true), None);
     }
 }
