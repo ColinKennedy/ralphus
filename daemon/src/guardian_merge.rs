@@ -2647,8 +2647,8 @@ fn load_guardian_for_worker(
     id: &str,
     worker: &str,
 ) -> Option<crate::guardian::GuardianView> {
-    let guard = store.lock();
-    match guard.get_guardian(id) {
+    let result = store.lock().get_guardian(id);
+    match result {
         Ok(g) => Some(g),
         Err(e) => {
             crate::cartographer::Note::new("guardian")
@@ -2656,7 +2656,7 @@ fn load_guardian_for_worker(
                 .scope("guardian")
                 .guardian(id)
                 .emit(
-                    &guard,
+                    &store.lock(),
                     format!("review {id} {worker} skipped: could not load review: {e}"),
                     serde_json::json!({"worker": worker, "error": e.to_string()}),
                 );
