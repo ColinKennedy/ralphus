@@ -15640,15 +15640,18 @@ fn guardian_unlink_prs(daemon: &Daemon, id: &str) -> Reply {
     if let Some(stack_number) = stack_number {
         let root = Path::new(&guardian.git_root);
         let forge_cfg = crate::config::resolve_forge(root);
-        let identity = crate::forge::effective_forge_identity(None, guardian.owner.as_deref());
-        match crate::forge::resolve_remote_for_base_with_store(
+        // A native stack lives on the fork when the project registers one
+        // (RAL-338), so the client comes from the PR routing, not the base
+        // branch's remote -- otherwise the fork's stack number would be
+        // sent to the parent repo.
+        match crate::pr::forge_client_for_stack(
             &daemon.store_handle(),
             root,
             &guardian.base_branch,
             &forge_cfg,
-            identity.as_deref(),
+            guardian.owner.as_deref(),
         ) {
-            Ok(client) => {
+            Some(client) => {
                 if let Err(e) = client.unstack(stack_number) {
                     crate::rlog!(
                         WARNING,
@@ -15656,10 +15659,10 @@ fn guardian_unlink_prs(daemon: &Daemon, id: &str) -> Reply {
                     );
                 }
             }
-            Err(e) => {
+            None => {
                 crate::rlog!(
                     WARNING,
-                    "ralphus [pr] review {id} could not resolve a forge client to dissolve github pr stack {stack_number} during unlink: {e}"
+                    "ralphus [pr] review {id} could not resolve a forge client to dissolve github pr stack {stack_number} during unlink"
                 );
             }
         }
@@ -16112,7 +16115,9 @@ fn pr_pull_from_pr(daemon: &Daemon, pr_id: &str) -> Reply {
 /// tick. Persists the result the same way the standing poll does
 /// (`Store::set_pr_ci_status`), so it's also picked up by the next
 /// `GET /api/pull-requests/index` poll. Identical for GitHub/GitLab -- both
-/// go through the same `ForgeClient::check_pr_ci_status`.
+/// go through the same `ForgeClient::check_pr_ci_status`. The client is
+/// resolved by the PR's own `repo` (fork-aware, as the standing poll does), and
+/// 502 `forge_error` is returned when none matches.
 fn pr_refresh_ci(daemon: &Daemon, pr_id: &str) -> Reply {
     // Scoped so the store guard is released before anything below reaches for
     // the forge -- same reasoning as `pr_comments` above: the guard must not
@@ -16137,16 +16142,21 @@ fn pr_refresh_ci(daemon: &Daemon, pr_id: &str) -> Reply {
     };
     let root = Path::new(&guardian.git_root);
     let forge_cfg = crate::config::resolve_forge(root);
-    let identity = crate::forge::effective_forge_identity(None, guardian.owner.as_deref());
-    let client = match crate::forge::resolve_remote_for_base_with_store(
+    // Resolved through the same PR-aware routing the standing poll uses
+    // (RAL-338): a PR number is only meaningful within the repo named by the
+    // PR's own `repo`, which under fork routing need not be the base branch's
+    // remote. Asking the parent about a fork PR's number reads an unrelated PR.
+    let Some(client) = crate::pr::forge_client_for_pr(
         &daemon.store_handle(),
         root,
         &guardian.base_branch,
         &forge_cfg,
-        identity.as_deref(),
-    ) {
-        Ok(c) => c,
-        Err(e) => return error(502, "forge_error", &e, vec![]),
+        &pr.repo,
+        guardian.owner.as_deref(),
+    ) else {
+        let msg = "no forge client could be resolved for this PR's repo";
+        let _ = daemon.lock().record_pr_ci_check(pr_id, Some(msg));
+        return error(502, "forge_error", msg, vec![]);
     };
     let state = match client.check_pr_ci_status(pr_number) {
         Ok(s) => s,
@@ -32415,6 +32425,242 @@ remediation_attempts=1
         let d = daemon();
         let r = route(&d, "POST", "/api/pull-requests/pr-999/refresh-ci", "");
         assert_eq!(r.status, 404);
+    }
+
+    /// A review over a git repo whose `origin` is the parent `acme/widget` and,
+    /// when `with_fork`, a registered fork `alice/widget`, both reached through
+    /// one mock forge. The mock answers `GET` PR/MR reads by repo: the parent
+    /// reports a merge conflict (failing CI), the fork reports no verdict yet
+    /// (pending). It returns every request URL it saw.
+    fn forked_review_with_mock(
+        tag: &str,
+        kind: &str,
+        with_fork: bool,
+        unstack_ok: bool,
+    ) -> (
+        Daemon,
+        String,
+        crate::mock_forge::MockForge<Vec<String>>,
+        std::path::PathBuf,
+    ) {
+        let repo = tmp_git_repo(tag);
+        let host = if kind == "gitlab" {
+            "gitlab.com"
+        } else {
+            "github.com"
+        };
+        let git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&repo)
+                .status()
+                .expect("git");
+            assert!(status.success(), "git {args:?} failed");
+        };
+        git(&[
+            "remote",
+            "add",
+            "origin",
+            &format!("https://{host}/acme/widget.git"),
+        ]);
+        git(&[
+            "remote",
+            "add",
+            "fork-alice",
+            &format!("https://{host}/alice/widget.git"),
+        ]);
+        let is_gitlab = kind == "gitlab";
+        let mock = crate::mock_forge::MockForge::start(move |server| {
+            let mut seen = Vec::new();
+            for req in server.requests() {
+                let url = req.url().to_string();
+                seen.push(url.clone());
+                let fork = url.contains("alice");
+                let body = match (is_gitlab, fork) {
+                    (true, true) => r#"{"merge_status": "can_be_merged"}"#,
+                    (true, false) => r#"{"merge_status": "cannot_be_merged"}"#,
+                    (_, true) => r#"{"mergeable_state": "unknown"}"#,
+                    (_, false) => r#"{"mergeable_state": "dirty"}"#,
+                };
+                let resp = if url.contains("/unstack") {
+                    if unstack_ok {
+                        tiny_http::Response::from_string("").with_status_code(204)
+                    } else {
+                        tiny_http::Response::from_string("no").with_status_code(404)
+                    }
+                } else {
+                    tiny_http::Response::from_string(body).with_status_code(200)
+                };
+                req.respond(resp).unwrap();
+            }
+            seen
+        });
+        let addr = mock.addr();
+        std::fs::write(
+            repo.join(".ralphus.toml"),
+            format!(
+                "[forge]\nkind = \"{kind}\"\napi_base = \"http://{addr}\"\ntoken_env = \"RALPHUS_TEST_FORGE_TOKEN\"\n"
+            ),
+        )
+        .unwrap();
+        let d = daemon();
+        d.lock()
+            .register_project("demo", "orchestrator", repo.to_str().unwrap(), "git")
+            .unwrap();
+        if with_fork {
+            d.lock()
+                .upsert_project_fork(
+                    "demo",
+                    "",
+                    &format!("https://{host}/alice/widget.git"),
+                    "fork-alice",
+                    "alice",
+                )
+                .unwrap();
+        }
+        let gid = d
+            .lock()
+            .create_guardian("demo", "origin/main", repo.to_str().unwrap())
+            .unwrap();
+        (d, gid, mock, repo)
+    }
+
+    fn add_pr(d: &Daemon, gid: &str, kind: &str, repo: &str, number: i64) -> String {
+        d.lock()
+            .create_pull_request(
+                gid,
+                None,
+                kind,
+                repo,
+                "feature/foo",
+                "main",
+                "Add foo",
+                "",
+                Some(number),
+                None,
+            )
+            .unwrap()
+    }
+
+    /// Regression (RAL-668): a fork PR's number means nothing in the parent
+    /// repo, so refreshing it must read the fork -- and persist the fork's
+    /// verdict, the same one the standing poll writes -- never the parent's
+    /// same-numbered PR.
+    fn refresh_ci_reads_the_fork_repo_for_a_fork_pr(kind: &str) {
+        let (d, gid, mock, _repo) = forked_review_with_mock("refresh-fork", kind, true, true);
+        // A GitLab client's repo label is the URL-encoded project path, which
+        // is what a stored GitLab PR row carries.
+        let repo = if kind == "gitlab" {
+            "alice%2Fwidget"
+        } else {
+            "alice/widget"
+        };
+        let pr_id = add_pr(&d, &gid, kind, repo, 123);
+        let r = route(
+            &d,
+            "POST",
+            &format!("/api/pull-requests/{pr_id}/refresh-ci"),
+            "",
+        );
+        assert_eq!(r.status, 200, "{}", r.body);
+        let seen = mock.finish();
+        assert!(!seen.is_empty(), "the forge was never asked");
+        assert!(
+            seen.iter()
+                .all(|u| u.contains("alice") && !u.contains("acme")),
+            "only the fork repo may be queried, saw {seen:?}"
+        );
+        let pr = d.lock().get_pull_request(&pr_id).unwrap();
+        assert_eq!(pr.ci_status.as_deref(), Some("pending"));
+    }
+
+    #[test]
+    fn refresh_ci_reads_the_fork_repo_for_a_fork_github_pr() {
+        refresh_ci_reads_the_fork_repo_for_a_fork_pr("github");
+    }
+
+    #[test]
+    fn refresh_ci_reads_the_fork_repo_for_a_fork_gitlab_mr() {
+        refresh_ci_reads_the_fork_repo_for_a_fork_pr("gitlab");
+    }
+
+    #[test]
+    fn refresh_ci_reads_the_parent_repo_for_a_parent_pr_under_fork_routing() {
+        let (d, gid, mock, _repo) = forked_review_with_mock("refresh-parent", "github", true, true);
+        let pr_id = add_pr(&d, &gid, "github", "acme/widget", 123);
+        let r = route(
+            &d,
+            "POST",
+            &format!("/api/pull-requests/{pr_id}/refresh-ci"),
+            "",
+        );
+        assert_eq!(r.status, 200, "{}", r.body);
+        let seen = mock.finish();
+        assert!(seen.iter().all(|u| u.contains("acme")), "saw {seen:?}");
+        let pr = d.lock().get_pull_request(&pr_id).unwrap();
+        assert_eq!(pr.ci_status.as_deref(), Some("failing"));
+    }
+
+    #[test]
+    fn refresh_ci_without_a_fork_uses_the_parent_client() {
+        let (d, gid, mock, _repo) =
+            forked_review_with_mock("refresh-nofork", "github", false, true);
+        let pr_id = add_pr(&d, &gid, "github", "acme/widget", 7);
+        let r = route(
+            &d,
+            "POST",
+            &format!("/api/pull-requests/{pr_id}/refresh-ci"),
+            "",
+        );
+        assert_eq!(r.status, 200, "{}", r.body);
+        let seen = mock.finish();
+        assert_eq!(seen, vec!["/repos/acme/widget/pulls/7".to_string()]);
+        let pr = d.lock().get_pull_request(&pr_id).unwrap();
+        assert_eq!(pr.ci_status.as_deref(), Some("failing"));
+    }
+
+    #[test]
+    fn refresh_ci_is_502_when_no_client_matches_the_prs_repo() {
+        let (d, gid, mock, _repo) =
+            forked_review_with_mock("refresh-noclient", "github", true, true);
+        let pr_id = add_pr(&d, &gid, "github", "ghost/elsewhere", 5);
+        let r = route(
+            &d,
+            "POST",
+            &format!("/api/pull-requests/{pr_id}/refresh-ci"),
+            "",
+        );
+        assert_eq!(r.status, 502, "{}", r.body);
+        assert!(r.body.contains("forge_error"), "{}", r.body);
+        assert!(r.body.contains("no forge client"), "{}", r.body);
+        assert!(mock.finish().is_empty(), "no forge call may be made");
+    }
+
+    /// Regression (RAL-668): a native GitHub stack lives on the fork under
+    /// fork routing, so unlinking must dissolve it there, not send the fork's
+    /// stack number to the parent repo.
+    #[test]
+    fn unlink_prs_dissolves_a_fork_stack_on_the_fork_repo() {
+        let (d, gid, mock, _repo) = forked_review_with_mock("unlink-fork", "github", true, true);
+        let pr_id = add_pr(&d, &gid, "github", "alice/widget", 1);
+        d.lock().set_guardian_forge_stack_number(&gid, 42).unwrap();
+        let r = route(
+            &d,
+            "POST",
+            &format!("/api/guardians/{gid}/pull-requests/unlink"),
+            "",
+        );
+        assert_eq!(r.status, 200, "{}", r.body);
+        let seen = mock.finish();
+        assert_eq!(
+            seen,
+            vec!["/repos/alice/widget/stacks/42/unstack".to_string()]
+        );
+        assert_eq!(d.lock().get_pull_request(&pr_id).unwrap().state, "dropped");
+        assert_eq!(
+            d.lock().get_guardian_forge_stack_number(&gid).unwrap(),
+            None
+        );
     }
 
     #[test]

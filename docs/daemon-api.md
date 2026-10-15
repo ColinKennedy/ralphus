@@ -3658,9 +3658,12 @@ uses, persists the result, and returns the updated PR row. A complement to
 that poll (`ci_watch::poll_open_pr_ci_status`, throttled to once every two
 minutes per guardian), not a replacement for it — lets the board refresh a
 single PR's badge immediately (e.g. the Tasks tab's "Check PR" action)
-instead of waiting for the next standing-poll tick. `409` if the PR has no
-recorded number yet; `502` on a forge API error. Identical behavior for
-GitHub and GitLab.
+instead of waiting for the next standing-poll tick. The forge client is
+resolved by the PR's own `repo` (fork-aware, like the standing poll), so a
+fork PR is read from the fork, never the parent's same-numbered PR. `409` if
+the PR has no recorded number yet; `502` on a forge API error or when no
+forge client matches the PR's `repo`. Identical behavior for GitHub and
+GitLab.
 
 ### `POST /api/pull-requests/{pr_id}/pull-from-pr`
 Fetch the PR branch's commits and rebase them into the owning review

@@ -3212,6 +3212,23 @@ pub fn forge_client_for_pr(
         .cloned()
 }
 
+/// The forge client that owns a review's native PR stack: the fork's when the
+/// project has a registered fork, else the parent's.
+///
+/// Stack objects are repo-scoped and, under fork routing (RAL-338), live only
+/// on the fork -- the same choice `repoint_stack` makes when it repoints
+/// stack members -- so a stack number must never be sent to the parent.
+pub fn forge_client_for_stack(
+    store: &crate::store_lock::StoreHandle,
+    root: &Path,
+    base_branch: &str,
+    forge_cfg: &crate::config::ForgeConfig,
+    owner: Option<&str>,
+) -> Option<crate::forge::ForgeClient> {
+    let routing = resolve_pr_repo_routing(store, root, base_branch, forge_cfg, owner);
+    routing.fork_client.or(routing.parent_client)
+}
+
 /// The registered project's `clone_url` for `project_name`, if any
 /// (RAL-<new>) -- looked up fresh per call rather than cached anywhere, since
 /// a project's `clone_url` can be edited after a guardian/PR routing
