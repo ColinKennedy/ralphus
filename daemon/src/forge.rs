@@ -923,6 +923,7 @@ impl ForgeClient {
                 let url = resp["html_url"].as_str().unwrap_or_default().to_string();
                 for label in labels {
                     if let Err(e) = self.set_pull_request_label(number, label, true) {
+                        // ralphus[ignore-rlog-pair]: this provider boundary has no Store; its caller records the structured workflow outcome
                         crate::rlog!(
                             WARNING,
                             "ralphus [forge] could not label new pr #{number} with {label}: {e}"
