@@ -13280,6 +13280,32 @@ fn prepare_action_hints(
     }
 }
 
+/// Whether `prepared_cwd` lies inside a post-merge checkout
+/// (`review-postmerge`, `review-postmerge-1`, ...) other than `checkout`, the
+/// one [`claim_post_merge_checkout`] returned for this pass. A `prepared_cwd`
+/// outside every post-merge checkout (a shared store, a materialized artifact
+/// directory) is never considered stale.
+fn prepared_in_other_checkout(prepared_cwd: Option<&str>, checkout: &str) -> bool {
+    let Some(cwd) = prepared_cwd else {
+        return false;
+    };
+    let is_post_merge_dir = |name: &str| {
+        name == POST_MERGE_WORKTREE_DIR
+            || name
+                .strip_prefix(POST_MERGE_WORKTREE_DIR)
+                .and_then(|rest| rest.strip_prefix('-'))
+                .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+    };
+    Path::new(cwd)
+        .ancestors()
+        .find(|dir| {
+            dir.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(is_post_merge_dir)
+        })
+        .is_some_and(|root| root != Path::new(checkout))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn prepare_generated_manual_checks(
     store: &crate::store_lock::StoreHandle,
@@ -13303,8 +13329,13 @@ fn prepare_generated_manual_checks(
         // blow away its `prepared_at_ms` stamp on every later merge/rebase.
         // Generation always hands back fresh commands with `prepared_at_ms`
         // unset (see `parse_manual_commands_response`), so this only skips
-        // checks generation did not just (re)produce.
-        if checks[index].prepared_at_ms.is_some() {
+        // checks generation did not just (re)produce. A check prepared in a
+        // different post-merge checkout than `combined_str` is not skipped:
+        // its recorded `prepared_cwd` would point at a directory that no
+        // longer holds the current tip or its build output.
+        if checks[index].prepared_at_ms.is_some()
+            && !prepared_in_other_checkout(checks[index].prepared_cwd.as_deref(), combined_str)
+        {
             continue;
         }
         checks[index].preparation_state = Some("preparing".to_string());
@@ -19019,6 +19050,33 @@ mod tests {
             ..GuardianCheck::default()
         }];
         assert!(!settled_review_needs_manual_checks(&has_checks));
+    }
+
+    #[test]
+    fn prepared_in_other_checkout_detects_a_moved_post_merge_checkout() {
+        let parent = Path::new("g").join("g241");
+        let current = parent.join("review-postmerge-1");
+        let current = current.to_string_lossy().to_string();
+        let old = parent
+            .join("review-postmerge")
+            .to_string_lossy()
+            .to_string();
+        let nested = parent
+            .join("review-postmerge")
+            .join("target")
+            .to_string_lossy()
+            .to_string();
+        assert!(prepared_in_other_checkout(Some(&old), &current));
+        assert!(prepared_in_other_checkout(Some(&nested), &current));
+        assert!(!prepared_in_other_checkout(Some(&current), &current));
+        let inside = Path::new(&current)
+            .join("core")
+            .to_string_lossy()
+            .to_string();
+        assert!(!prepared_in_other_checkout(Some(&inside), &current));
+        assert!(!prepared_in_other_checkout(None, &current));
+        let shared = parent.join("shared-store").to_string_lossy().to_string();
+        assert!(!prepared_in_other_checkout(Some(&shared), &current));
     }
 
     #[test]
