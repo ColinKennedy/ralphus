@@ -1723,7 +1723,11 @@ step). Response `200` is the resulting full override map:
 Every change is also recorded to Cartographer with the changed key names in
 the clear but **values redacted unless the key is in the project's
 `[env_overrides].allowlist`** (`.ralphus.toml`) — see `EnvOverridesConfig` in
-`daemon/src/config.rs`. The squad detail view (`GET /api/squads/{id}`,
+`daemon/src/config.rs`. The allowlist is layered: the global `config.toml`,
+then each file of `$RALPHUS_CONFIGURATION_PATH` (a platform path-separator
+list, merged in listed order; a missing file is warned about and skipped, a
+malformed one is logged as an error and skipped), then the project
+`.ralphus.toml`; entries are unioned. The squad detail view (`GET /api/squads/{id}`,
 `SquadView.env_overrides`) shows the raw, unredacted current values, since that
 view is scoped to whoever already has squad-detail access rather than a shared
 audit log.

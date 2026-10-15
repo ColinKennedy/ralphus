@@ -3136,6 +3136,27 @@ pub fn find_project_config(start: &Path) -> Option<PathBuf> {
     None
 }
 
+/// Find all `.ralphus.toml` files from the filesystem root down to `start`,
+/// returning them in order (root-first). This enables parent-plus-subfolder
+/// layering: a root `.ralphus.toml` sets base configuration, intermediate
+/// `.ralphus.toml` files narrow or extend it, and a leaf subdirectory
+/// `.ralphus.toml` makes final overrides. All existing files on the path
+/// from root to `start` are collected, then reversed to root-first order.
+#[must_use]
+pub fn find_all_project_configs(start: &Path) -> Vec<PathBuf> {
+    let mut configs = Vec::new();
+    let mut dir = Some(start);
+    while let Some(d) = dir {
+        let candidate = d.join(".ralphus.toml");
+        if candidate.is_file() {
+            configs.push(candidate);
+        }
+        dir = d.parent();
+    }
+    configs.reverse();
+    configs
+}
+
 /// Parse a `DaemonConfig` from the given TOML text.
 #[must_use]
 pub fn daemon_from_toml_str(s: &str) -> DaemonConfig {
@@ -3423,20 +3444,88 @@ pub fn env_overrides_from_toml_str(s: &str) -> EnvOverridesConfig {
 /// (current-dir-based) rather than [`resolve`]/[`resolve_forge`]
 /// (explicit-cwd, used where a specific review/worktree root is already in
 /// hand).
+///
+/// Layers, lowest to highest: the global `config.toml`, each
+/// `$RALPHUS_CONFIGURATION_PATH` entry in listed order (later entries'
+/// allowlist entries are appended after earlier ones'), then the project
+/// `.ralphus.toml`. A malformed `$RALPHUS_CONFIGURATION_PATH` file is logged
+/// as an ERROR and skipped here because every caller is infallible; use
+/// [`try_load_env_overrides_config_with`] to get the error.
 #[must_use]
 pub fn load_env_overrides_config() -> EnvOverridesConfig {
-    let global = global_config_path()
+    let cwd = std::env::current_dir().ok();
+    let raw = std::env::var("RALPHUS_CONFIGURATION_PATH").ok();
+    let (config, errors) = load_env_overrides_layers(cwd.as_deref(), raw.as_deref());
+    for e in errors {
+        if config_log_changed(&format!("env-overrides-error:{e}"), 0) {
+            // ralphus[ignore-rlog-pair]: config accessors run without a Store and before one exists at startup
+            crate::rlog!(ERROR, "ralphus [config] {e}");
+        }
+    }
+    config
+}
+
+/// [`load_env_overrides_config`], but a malformed
+/// `$RALPHUS_CONFIGURATION_PATH` file is an `Err` naming the file and the
+/// parser's detail instead of being skipped.
+///
+/// # Errors
+/// Returns the first malformed `$RALPHUS_CONFIGURATION_PATH` file's error.
+pub fn try_load_env_overrides_config_with(
+    cwd: Option<&Path>,
+    configuration_path_env: Option<&str>,
+) -> Result<EnvOverridesConfig, String> {
+    let (config, errors) = load_env_overrides_layers(cwd, configuration_path_env);
+    match errors.into_iter().next() {
+        Some(e) => Err(e),
+        None => Ok(config),
+    }
+}
+
+/// Merges the env-override layers, returning the config built from every
+/// well-formed layer plus one message per malformed `$RALPHUS_CONFIGURATION_PATH`
+/// file. A missing listed file is warned about and skipped. Per-project layers
+/// are merged in root-to-leaf order (parent-plus-subfolder), allowing
+/// hierarchical configuration in monorepos.
+fn load_env_overrides_layers(
+    cwd: Option<&Path>,
+    configuration_path_env: Option<&str>,
+) -> (EnvOverridesConfig, Vec<String>) {
+    let mut merged = global_config_path()
         .and_then(|p| read_config_text(&p))
         .map(|s| env_overrides_from_toml_str(&s))
         .unwrap_or_default();
-    let local = std::env::current_dir()
-        .ok()
-        .as_deref()
-        .and_then(find_project_config)
-        .and_then(|p| read_config_text(&p))
-        .map(|s| env_overrides_from_toml_str(&s))
-        .unwrap_or_default();
-    global.merge(local)
+    let mut errors = Vec::new();
+    for path in configuration_path_entries(configuration_path_env) {
+        let display = path.display().to_string();
+        match std::fs::read_to_string(&path) {
+            Ok(text) => match toml::from_str::<ConfigFile>(&text) {
+                Ok(cfg) => merged = merged.merge(cfg.env_overrides.unwrap_or_default()),
+                Err(e) => errors.push(format!(
+                    "config file failed to parse path={display} error={}",
+                    e.to_string().replace('\n', " ")
+                )),
+            },
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                if config_log_changed(&format!("missing:{display}"), 0) {
+                    // ralphus[ignore-rlog-pair]: config accessors run without a Store and before one exists at startup
+                    crate::rlog!(
+                        WARNING,
+                        "ralphus [config] RALPHUS_CONFIGURATION_PATH file not found; skipping path={display}"
+                    );
+                }
+            }
+            Err(e) => errors.push(format!("config file unreadable path={display} error={e}")),
+        }
+    }
+    if let Some(cwd_val) = cwd {
+        for path in find_all_project_configs(cwd_val) {
+            if let Some(s) = read_config_text(&path) {
+                merged = merged.merge(env_overrides_from_toml_str(&s));
+            }
+        }
+    }
+    (merged, errors)
 }
 
 /// Parse a `[[templates]]` list from the given TOML text (RAL-297). Absent
@@ -5409,6 +5498,81 @@ fail_after_minutes = 5
         assert!(c.allowlist.is_empty());
     }
 
+    fn env_layer_dir(tag: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("ralphus-envlayers-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn join_paths(paths: &[PathBuf]) -> String {
+        std::env::join_paths(paths)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    #[test]
+    fn env_overrides_configuration_path_merges_in_order_and_dedupes() {
+        let dir = env_layer_dir("order");
+        let a = dir.join("a.toml");
+        let b = dir.join("b.toml");
+        let empty = dir.join("empty.toml");
+        std::fs::write(&a, "[env_overrides]\nallowlist = [\"A\", \"DUP\"]\n").unwrap();
+        std::fs::write(&b, "[env_overrides]\nallowlist = [\"DUP\", \"B\"]\n").unwrap();
+        std::fs::write(&empty, "").unwrap();
+        let raw = join_paths(&[a, empty, b]);
+        let c = try_load_env_overrides_config_with(None, Some(&raw)).unwrap();
+        let globals = global_config_path()
+            .and_then(|p| std::fs::read_to_string(p).ok())
+            .map(|s| env_overrides_from_toml_str(&s).allowlist)
+            .unwrap_or_default();
+        let ours: Vec<_> = c
+            .allowlist
+            .iter()
+            .filter(|k| !globals.contains(k))
+            .cloned()
+            .collect();
+        assert_eq!(ours, ["A", "DUP", "B"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn env_overrides_configuration_path_missing_file_is_skipped() {
+        let dir = env_layer_dir("missing");
+        let present = dir.join("present.toml");
+        std::fs::write(&present, "[env_overrides]\nallowlist = [\"ONLY_ME\"]\n").unwrap();
+        let raw = join_paths(&[dir.join("absent.toml"), present]);
+        let c = try_load_env_overrides_config_with(None, Some(&raw)).unwrap();
+        assert!(c.is_allowed("ONLY_ME"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn env_overrides_configuration_path_malformed_file_is_an_error() {
+        let dir = env_layer_dir("malformed");
+        let good = dir.join("good.toml");
+        let bad = dir.join("bad.toml");
+        std::fs::write(&good, "[env_overrides]\nallowlist = [\"G\"]\n").unwrap();
+        std::fs::write(&bad, "not = = valid").unwrap();
+        let raw = join_paths(&[good, bad.clone()]);
+        let err = try_load_env_overrides_config_with(None, Some(&raw)).unwrap_err();
+        assert!(err.contains("bad.toml"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn env_overrides_configuration_path_single_entry_matches_unset_shape() {
+        let dir = env_layer_dir("single");
+        let one = dir.join("one.toml");
+        std::fs::write(&one, "[env_overrides]\nallowlist = [\"X\"]\n").unwrap();
+        let raw = join_paths(&[one]);
+        let c = try_load_env_overrides_config_with(None, Some(&raw)).unwrap();
+        assert!(c.is_allowed("X"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn env_overrides_merge_unions_and_dedupes() {
         let global = EnvOverridesConfig {
@@ -5422,6 +5586,93 @@ fail_after_minutes = 5
             merged.allowlist,
             vec!["A".to_string(), "B".to_string(), "C".to_string()]
         );
+    }
+
+    #[test]
+    fn find_all_project_configs_returns_empty_when_none_exist() {
+        let dir =
+            std::env::temp_dir().join(format!("ralphus-configs-empty-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let configs = find_all_project_configs(&dir);
+        assert!(configs.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn find_all_project_configs_collects_parent_and_child() {
+        let base = std::env::temp_dir().join(format!("ralphus-hierarchy-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let root_config = base.join(".ralphus.toml");
+        let subdir = base.join("a").join("b");
+        std::fs::create_dir_all(&subdir).unwrap();
+        std::fs::write(&root_config, "[env_overrides]\nallowlist = [\"ROOT\"]\n").unwrap();
+        let child_config = subdir.join(".ralphus.toml");
+        std::fs::write(&child_config, "[env_overrides]\nallowlist = [\"CHILD\"]\n").unwrap();
+
+        let configs = find_all_project_configs(&subdir);
+        assert_eq!(configs.len(), 2, "should find root and child configs");
+        assert_eq!(configs[0], root_config, "root config should come first");
+        assert_eq!(configs[1], child_config, "child config should come second");
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn find_all_project_configs_root_first_order() {
+        let base = std::env::temp_dir().join(format!("ralphus-order-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let root = base.join(".ralphus.toml");
+        let level1 = base.join("x").join(".ralphus.toml");
+        let level2 = base.join("x").join("y").join(".ralphus.toml");
+        std::fs::create_dir_all(level2.parent().unwrap()).unwrap();
+        std::fs::write(&root, "[env_overrides]\nallowlist = [\"R\"]\n").unwrap();
+        std::fs::write(&level1, "[env_overrides]\nallowlist = [\"L1\"]\n").unwrap();
+        std::fs::write(&level2, "[env_overrides]\nallowlist = [\"L2\"]\n").unwrap();
+
+        let configs = find_all_project_configs(level2.parent().unwrap());
+        assert_eq!(configs.len(), 3);
+        assert_eq!(configs[0], root);
+        assert_eq!(configs[1], level1);
+        assert_eq!(configs[2], level2);
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn env_overrides_parent_plus_subfolder_layering() {
+        let base = std::env::temp_dir().join(format!("ralphus-parent-sub-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let root = base.join(".ralphus.toml");
+        let subdir = base.join("subdir");
+        std::fs::create_dir_all(&subdir).unwrap();
+        let sub_config = subdir.join(".ralphus.toml");
+
+        std::fs::write(
+            &root,
+            "[env_overrides]\nallowlist = [\"ROOT_VAR\", \"SHARED\"]\n",
+        )
+        .unwrap();
+        std::fs::write(
+            &sub_config,
+            "[env_overrides]\nallowlist = [\"SUB_VAR\", \"SHARED\"]\n",
+        )
+        .unwrap();
+
+        let c = try_load_env_overrides_config_with(Some(&subdir), None).unwrap();
+        let globals = global_config_path()
+            .and_then(|p| std::fs::read_to_string(p).ok())
+            .map(|s| env_overrides_from_toml_str(&s).allowlist)
+            .unwrap_or_default();
+        let ours: Vec<_> = c
+            .allowlist
+            .iter()
+            .filter(|k| !globals.contains(k))
+            .cloned()
+            .collect();
+        assert_eq!(ours, ["ROOT_VAR", "SHARED", "SUB_VAR"]);
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     // ── AgentIsolationConfig (RAL-336) ────────────────────────────────────
