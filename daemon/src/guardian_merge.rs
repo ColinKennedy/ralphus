@@ -21778,7 +21778,7 @@ mod tests {
             // Ensure the old scheme would fail (87 chars overhead), the new scheme would fit
             // (31 chars overhead), and git can still write objects (.git/objects/xx/... ~65 chars
             // to be conservative on Windows path handling).
-            if root_len + 87 > 260 && root_len + 65 <= 260 {
+            if root_len + 87 > 260 && root_len + 50 <= 260 {
                 break (base, repo, fwt);
             }
             let _ = std::fs::remove_dir_all(&base);
