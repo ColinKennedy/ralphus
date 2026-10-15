@@ -1005,6 +1005,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "ralphus-grammars"
+version = "0.1.0"
+dependencies = [
+ "cc",
+ "tree-sitter-bash",
+ "tree-sitter-batch",
+ "tree-sitter-language",
+ "tree-sitter-powershell",
+]
+
+[[package]]
 name = "ralphus-keygen"
 version = "0.1.0"
 dependencies = [
@@ -1065,11 +1076,10 @@ dependencies = [
 name = "ralphus-shell-syntax"
 version = "0.1.0"
 dependencies = [
+ "ralphus-grammars",
  "serde",
+ "serde_json",
  "tree-sitter",
- "tree-sitter-bash",
- "tree-sitter-batch",
- "tree-sitter-powershell",
 ]
 
 [[package]]

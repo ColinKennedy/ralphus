@@ -20,9 +20,9 @@ enum Item {
 pub(crate) fn parse(shell: Shell, text: &str) -> Parsed {
     let mut parser = Parser::new();
     let language = match shell {
-        Shell::Bash => tree_sitter_bash::LANGUAGE,
-        Shell::PowerShell => tree_sitter_powershell::LANGUAGE,
-        Shell::Cmd => tree_sitter_batch::LANGUAGE,
+        Shell::Bash => ralphus_grammars::bash(),
+        Shell::PowerShell => ralphus_grammars::powershell(),
+        Shell::Cmd => ralphus_grammars::batch(),
     };
     if parser.set_language(&language.into()).is_err() {
         return Parsed::empty(Status::Unparsed);
@@ -386,11 +386,59 @@ mod tests {
 
     #[test]
     fn grammar_errors_yield_unparsed_not_a_failure() {
-        // The PowerShell grammar rejects a bare `--` argument.
-        let p = parse(Shell::PowerShell, "cargo clippy -- -D warnings");
+        // `@{u}` is a hashtable literal to PowerShell, so the unquoted git ref is a real error.
+        let p = parse(Shell::PowerShell, "git log @{u}..HEAD");
         assert_eq!(p.status, Status::Unparsed);
         assert!(p.commands.is_empty() && p.spans.is_empty());
         assert_eq!(parse(Shell::Bash, "if then ((").status, Status::Unparsed);
+    }
+
+    /// Commands the patched vendored grammars accept; the crates.io releases do
+    /// not, so these run only when the vendored submodules were built in.
+    fn vendored() -> bool {
+        ralphus_grammars::fallbacks().is_empty()
+    }
+
+    #[test]
+    fn powershell_accepts_native_command_arguments() {
+        if !vendored() {
+            return;
+        }
+        for command in [
+            "cargo fmt --all -- --check",
+            "git log -1 -- README.md",
+            "tar -xf -",
+            "git log --format=%H",
+            "git log --pretty=format:\"%h %s\"",
+            "grep -n -A5 needle file.txt",
+            "Select-Object Id, State, Command",
+            "Add-Type -AssemblyName System.Windows.Forms,System.Drawing",
+            "npm run dev &",
+        ] {
+            let p = parse(Shell::PowerShell, command);
+            assert_eq!(p.status, Status::Ok, "{command}");
+        }
+        let rows = parse(Shell::PowerShell, "cargo test -- --nocapture");
+        assert_eq!(rows.commands.len(), 1);
+    }
+
+    #[test]
+    fn bash_heredoc_ends_only_on_the_exact_delimiter() {
+        if !vendored() {
+            return;
+        }
+        let command = "python - <<'E'\nx = 1\n    Err(StoreError::NotFound)\nE\nls";
+        let p = parse(Shell::Bash, command);
+        assert_eq!(p.status, Status::Ok);
+        assert_eq!(p.commands.len(), 2);
+    }
+
+    #[test]
+    fn cmd_accepts_a_trailing_ampersand() {
+        if !vendored() {
+            return;
+        }
+        assert_eq!(parse(Shell::Cmd, "npm run dev &").status, Status::Ok);
     }
 
     #[test]

@@ -148,6 +148,24 @@ pub const fn available() -> bool {
     cfg!(feature = "parser")
 }
 
+/// A warning for a binary whose grammars are not all the patched vendored
+/// copies, or `None` when they are (or the parser is not built in). The
+/// vendored submodules are missing when a checkout skipped
+/// `git submodule update --init`; the crates.io releases stand in.
+pub fn grammar_warning() -> Option<String> {
+    #[cfg(feature = "parser")]
+    {
+        let fallbacks = ralphus_grammars::fallbacks();
+        if !fallbacks.is_empty() {
+            return Some(format!(
+                "not using the vendored tree-sitter grammar for {}; results may not be exactly as expected",
+                fallbacks.join(", ")
+            ));
+        }
+    }
+    None
+}
+
 /// Parses `text` with `shell`'s grammar. Never fails: every problem is a
 /// [`Status`] with empty `commands` and `spans`.
 pub fn parse(shell: Shell, text: &str) -> Parsed {

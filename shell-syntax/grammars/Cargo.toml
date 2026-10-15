@@ -1,0 +1,27 @@
+[package]
+name = "ralphus-grammars"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "ralphus tree-sitter grammars: the patched vendored Bash/PowerShell/batch grammars when checked out, else the crates.io releases."
+build = "build.rs"
+
+# This crate holds the FFI glue to the vendored grammars' C `parser.c`, which
+# needs `unsafe`, so it does not opt in to the workspace's `unsafe_code = "forbid"`.
+# Everything else about the workspace lint set still applies.
+[lints.rust]
+warnings = "deny"
+
+[lints.clippy]
+all = "deny"
+
+[dependencies]
+tree-sitter-language = "0.1"
+# The fallback: used per grammar when its vendored checkout is missing.
+tree-sitter-bash = "=0.25.1"
+tree-sitter-powershell = "=0.26.4"
+tree-sitter-batch = "=0.11.1"
+
+[build-dependencies]
+cc = "1"

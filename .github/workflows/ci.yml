@@ -76,6 +76,8 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: true
       - name: Install Rust toolchain
         run: rustup toolchain install ${{ matrix.toolchain }} --profile minimal --component rustfmt,clippy
       - uses: Swatinem/rust-cache@v2
@@ -161,6 +163,8 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: true
       - name: Install Rust toolchain
         run: rustup toolchain install stable --profile minimal
       - uses: Swatinem/rust-cache@v2
@@ -194,6 +198,8 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: true
       - name: Install Rust toolchain
         run: rustup toolchain install stable --profile minimal
       - uses: Swatinem/rust-cache@v2
@@ -218,6 +224,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: true
       - uses: actions/setup-node@v4
         with:
           # 22+: `node --test "<glob>"` expands the pattern itself, so the test
@@ -242,6 +250,8 @@ jobs:
         working-directory: cli-py
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: true
       # Lint/type-check once, on the newest version cli-py/pyproject.toml's
       # `requires-python = ">=3.11"` covers -- these tools don't need a
       # version matrix, only pytest (below) does.
@@ -285,6 +295,8 @@ jobs:
       RALPHUS_CLI_BIN: ../target/debug/ralphus
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: true
       - name: Install Python 3.13
         uses: actions/setup-python@v5
         with:
@@ -312,6 +324,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: true
       - name: Install Rust toolchain
         run: rustup toolchain install stable --profile minimal
       - uses: Swatinem/rust-cache@v2
@@ -412,6 +426,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: true
       - uses: actions/setup-python@v5
         with:
           python-version: "3.x"
@@ -423,6 +439,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: true
       - uses: actions/setup-python@v5
         with:
           python-version: "3.x"
@@ -436,6 +454,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: true
       - uses: actions/setup-python@v5
         with:
           python-version: "3.x"
@@ -467,6 +487,8 @@ jobs:
       RALPHUS_CLI_BIN: ../target/debug/ralphus
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: true
       - name: Install uv
         uses: astral-sh/setup-uv@v6
         with:
