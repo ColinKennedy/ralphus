@@ -75,10 +75,10 @@ if "%db_path%"=="" if not "%daemon_port%"=="7890" (
     set "db_path=%USERPROFILE%\.ralphus\tasks-%daemon_port%.db"
 )
 
-rem 1. Build all four Rust bins in debug (fast incremental rebuild picks up
-rem    any CLI/runner/librarian source edit alike).
+rem 1. Build all four Rust bins in debug with tree-sitter shell syntax for
+rem    Bash, PowerShell, and cmd (requires a working C compiler).
 echo == cargo build (debug) daemon + librarian + runner + cli ==
-cargo build --package ralphus-daemon --package ralphus-librarian --package ralphus-runner --package ralphus-cli --manifest-path "%root%\Cargo.toml"
+cargo build --package ralphus-daemon --package ralphus-librarian --package ralphus-runner --package ralphus-cli --features ralphus-daemon/shell-syntax --manifest-path "%root%\Cargo.toml"
 if errorlevel 1 exit /b 1
 
 rem 2. Point RALPHUS_RUNNER_CMD at the just-built debug runner exe.

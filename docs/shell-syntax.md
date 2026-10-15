@@ -16,8 +16,8 @@ executes, validates or rewrites a command.
 
 - Crate: `shell-syntax/` (`ralphus-shell-syntax`), feature `parser`.
 - Daemon: `cargo build -p ralphus-daemon --features shell-syntax`.
-- `scripts/build-debug.sh` turns it on; `scripts/build-release.sh` / `dist/` do
-  not, until the PowerShell grammar has proven itself.
+- `scripts/build-debug.sh` and `scripts/build-debug.cmd` turn it on;
+  `scripts/build-release.sh` and `scripts/build-release.cmd` leave it off.
 - CI tests both configurations: the default workspace run covers feature-off,
   and a separate step runs `-p ralphus-shell-syntax --features parser`.
 
