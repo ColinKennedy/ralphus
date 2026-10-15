@@ -805,6 +805,19 @@ impl StoreMemory {
         self.cell_diffs.lock().cells.get(key).cloned()
     }
 
+    /// Of `keys` (the cells sharing one worktree), the one whose summary was
+    /// pushed or pulled most recently. Every cell in a worktree measures
+    /// against the same base, so the freshest push is the worktree's summary.
+    #[must_use]
+    pub fn freshest_cell_diff_key<'a>(&self, keys: &'a [String]) -> Option<&'a String> {
+        let guard = self.cell_diffs.lock();
+        keys.iter()
+            .filter_map(|k| guard.cells.get(k).map(|s| (k, s)))
+            .filter(|(_, s)| s.version > 0)
+            .max_by_key(|(_, s)| s.touched)
+            .map(|(k, _)| k)
+    }
+
     /// The cached full diff when it is still current (not dirty).
     #[must_use]
     pub fn fresh_cell_diff(&self, key: &str) -> Option<(u64, String)> {
