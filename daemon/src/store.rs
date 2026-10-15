@@ -2880,6 +2880,7 @@ impl Store {
                 created_at_ms INTEGER NOT NULL,
                 PRIMARY KEY (squad_id, task_idx, idx)
             );
+            CREATE INDEX IF NOT EXISTS idx_triage_pending_cells_created_at_ms ON triage_pending_cells(squad_id, created_at_ms);
             -- RAL-346: a cell's resolved monorepo subproject(s) -- either
             -- seeded from the cell's own manually-declared `CellDef.subprojects`
             -- TOML field (`inferred = 0`), or written by the Arbiter's async
