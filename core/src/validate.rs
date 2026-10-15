@@ -303,6 +303,7 @@ pub const REVIEW_KEYS: &[&str] = &[
     "skip_worktrees",
     "auto_pr_feedback",
     "skip_base_updates",
+    "base_update_mode",
     "base_shift_maximum_rebuilds",
     "proof_skip_auto_clean",
     "skip_auto_clean",
@@ -2334,6 +2335,25 @@ fn validate_review_blocks(value: Option<&toml::Value>, ctx: &mut Ctx) {
         check_type(ctx, table, "skip_worktrees", Ty::Bool, &rpath, header);
         check_type(ctx, table, "auto_pr_feedback", Ty::Bool, &rpath, header);
         check_type(ctx, table, "skip_base_updates", Ty::Bool, &rpath, header);
+        check_type(ctx, table, "base_update_mode", Ty::Str, &rpath, header);
+        if let Some(mode) = table.get("base_update_mode").and_then(toml::Value::as_str) {
+            if !crate::schema::BASE_UPDATE_MODE_VALUES.contains(&mode) {
+                let line = ctx.key_line(header, "base_update_mode");
+                ctx.error(
+                    &format!("{rpath}.base_update_mode"),
+                    ErrorKind::InvalidValue,
+                    format!(
+                        "'base_update_mode' must be one of {} -- got \"{mode}\"",
+                        crate::schema::BASE_UPDATE_MODE_VALUES
+                            .iter()
+                            .map(|v| format!("\"{v}\""))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
+                    line,
+                );
+            }
+        }
         check_type(
             ctx,
             table,
@@ -4643,6 +4663,37 @@ shell=\"bash\"
         let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nreview=\"<<review:r>>\"\n[[review]]\nid=\"r\"\nproof_scope=\"each_branch\"\nskip_worktrees=true\nauto_pr_feedback=true\nskip_base_updates=true\nskip_auto_clean=true\nmatch_pr_branch_name=true\nseparate_pr_branch=true\ndual_root_pr=true\n";
         let r = validate_toml(src);
         assert!(r.is_ok(), "{:?}", r.errors);
+    }
+
+    // ── [[review]] base_update_mode ──
+
+    #[test]
+    fn review_base_update_mode_accepts_each_value_and_rejects_others() {
+        for mode in crate::schema::BASE_UPDATE_MODE_VALUES {
+            let src = format!(
+                "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nreview=\"<<review:r>>\"\n[[review]]\nid=\"r\"\nbase_update_mode=\"{mode}\"\n"
+            );
+            let r = validate_toml(&src);
+            assert!(r.is_ok(), "{mode}: {:?}", r.errors);
+        }
+        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nreview=\"<<review:r>>\"\n[[review]]\nid=\"r\"\nbase_update_mode=\"sometimes\"\n";
+        let r = validate_toml(src);
+        assert!(
+            r.errors.iter().any(
+                |e| e.kind == ErrorKind::InvalidValue && e.message.contains("base_update_mode")
+            ),
+            "{:?}",
+            r.errors
+        );
+        let src = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nreview=\"<<review:r>>\"\n[[review]]\nid=\"r\"\nbase_update_mode=true\n";
+        let r = validate_toml(src);
+        assert!(
+            r.errors
+                .iter()
+                .any(|e| e.kind == ErrorKind::WrongType && e.message.contains("base_update_mode")),
+            "{:?}",
+            r.errors
+        );
     }
 
     // ── [[review]] base_shift_maximum_rebuilds (RAL-507) ──

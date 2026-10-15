@@ -16,6 +16,7 @@ const PAIRS: &[(&str, &str)] = &[
     ("match_pr_branch_name", "match_pr_branch_name"),
     ("skip_worktrees", "skip_worktrees"),
     ("skip_base_updates", "skip_base_updates"),
+    ("base_update_mode", "base_update_mode"),
     ("proof_skip_auto_clean", "proof_skip_auto_clean"),
     ("summary_format", "summary_format"),
     ("post_appraisals", "post_appraisals"),

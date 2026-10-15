@@ -11095,7 +11095,9 @@ pub fn rebuild_on_base_shift_with_debounce(
     // maintenance sweep must not rebuild it on a base shift. This gates ONLY
     // this automatic pass -- a manual `review upstream set` / merge goes
     // through its own explicit path and is unaffected.
-    if guardian.effective_skip_base_updates {
+    let mode = ralphus_core::schema::BaseUpdateMode::parse(&guardian.effective_base_update_mode)
+        .unwrap_or_default();
+    if mode == ralphus_core::schema::BaseUpdateMode::Never {
         return false;
     }
 
@@ -11107,6 +11109,13 @@ pub fn rebuild_on_base_shift_with_debounce(
         return false;
     }
     if !first_pass.any_shifted {
+        return false;
+    }
+    // A stack already judged clean against exactly this base and these branch
+    // tips needs neither the debounce wait nor another assessment.
+    if mode == ralphus_core::schema::BaseUpdateMode::Required
+        && crate::base_update::known_clean(store, &guardian, &first_pass.shift_targets)
+    {
         return false;
     }
 
@@ -11146,6 +11155,34 @@ pub fn rebuild_on_base_shift_with_debounce(
         && approve_base_already_landed(store, id)
     {
         return true;
+    }
+    // `required` mode: rebuild only when the preflight or the forge says the
+    // stack needs it. A skipped shift leaves the recorded built base untouched,
+    // so the next pass sees the same shift until the stack is rebuilt or the
+    // clean verdict is remembered.
+    if mode == ralphus_core::schema::BaseUpdateMode::Required {
+        let assessment = crate::base_update::assess(store, &guardian, &shift_targets);
+        match crate::base_update::record(id, &assessment) {
+            crate::base_update::Gate::Rebuild => {
+                crate::rlog!(
+                    INFO,
+                    "ralphus [guardian] review {id} base shift needs a rebuild: {}",
+                    assessment.reasons.join("; ")
+                );
+            }
+            gate => {
+                let verdict = assessment.verdict;
+                crate::rlog!(
+                    INFO,
+                    "ralphus [guardian] review {id} base shift left alone ({verdict:?}): {}",
+                    assessment.reasons.join("; ")
+                );
+                if gate == crate::base_update::Gate::SkipAndNotify {
+                    crate::base_update::notify_inconclusive(store, &guardian, &assessment);
+                }
+                return false;
+            }
+        }
     }
     // RAL-542: bound each shifted worktree's own slice of the unattended
     // retry campaign independently -- a persistent conflict, failed proof,

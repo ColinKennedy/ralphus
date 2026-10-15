@@ -98,6 +98,10 @@ pub enum ReviewCommand {
         ci_deferral: Option<String>,
         skip_auto_clean: Option<bool>,
         skip_base_updates: Option<bool>,
+        /// When the review's stack is rebased onto upstream changes
+        /// (`always`, `required`, `never`); an empty string clears it back
+        /// to inheriting. Wins over `skip_base_updates`.
+        base_update_mode: Option<String>,
         /// RAL-307: this review's own override for whether a newly
         /// submitted PR's branch defaults to the worktree/feature branch
         /// name.
@@ -491,6 +495,7 @@ pub fn parse(args: &[String]) -> ReviewCommand {
             let ci_deferral = scanner.take_value("--ci-deferral").ok().flatten();
             let skip_auto_clean = take_tri_bool(&mut scanner, "--skip-auto-clean");
             let skip_base_updates = take_tri_bool(&mut scanner, "--skip-base-updates");
+            let base_update_mode = scanner.take_value("--base-update-mode").ok().flatten();
             let match_pr_branch_name = take_tri_bool(&mut scanner, "--match-pr-branch-name");
             let auto_submit_pr_stack = take_tri_bool(&mut scanner, "--auto-submit-pr-stack");
             let separate_pr_branch = take_tri_bool(&mut scanner, "--separate-pr-branch");
@@ -533,6 +538,7 @@ pub fn parse(args: &[String]) -> ReviewCommand {
                 ci_deferral,
                 skip_auto_clean,
                 skip_base_updates,
+                base_update_mode,
                 match_pr_branch_name,
                 auto_submit_pr_stack,
                 separate_pr_branch,
@@ -1605,6 +1611,7 @@ pub fn dispatch(cmd: ReviewCommand, opts: &GlobalOpts) -> i32 {
             ci_deferral,
             skip_auto_clean,
             skip_base_updates,
+            base_update_mode,
             match_pr_branch_name,
             auto_submit_pr_stack,
             separate_pr_branch,
@@ -1633,6 +1640,7 @@ pub fn dispatch(cmd: ReviewCommand, opts: &GlobalOpts) -> i32 {
                 ci_deferral: ci_deferral.as_deref(),
                 proof_skip_auto_clean: skip_auto_clean,
                 skip_base_updates,
+                base_update_mode: base_update_mode.as_deref(),
                 match_pr_branch_name,
                 auto_submit_pr_stack,
                 separate_pr_branch,
@@ -3038,6 +3046,20 @@ fn render_review_detail(g: &Value) {
             .to_string(),
     ));
     rows.push((
+        "base_update_mode",
+        match g["base_update_mode"].as_str() {
+            Some(v) if !v.is_empty() => format!("{v} (explicit)"),
+            _ => "(unset)".to_string(),
+        },
+    ));
+    rows.push((
+        "effective_base_update_mode",
+        g["effective_base_update_mode"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string(),
+    ));
+    rows.push((
         "proof_skip_auto_clean",
         match proof_skip_auto_clean {
             Some(v) => format!("{v} (explicit)"),
@@ -3553,6 +3575,24 @@ mod tests {
                 assert_eq!(skip_worktrees, None);
                 assert_eq!(skip_base_updates, None);
             }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_settings_base_update_mode_values() {
+        for mode in ["always", "required", "never", ""] {
+            match parse(&v(&["settings", "g1", "--base-update-mode", mode])) {
+                ReviewCommand::Settings {
+                    base_update_mode, ..
+                } => assert_eq!(base_update_mode.as_deref(), Some(mode)),
+                other => panic!("unexpected: {other:?}"),
+            }
+        }
+        match parse(&v(&["settings", "g1"])) {
+            ReviewCommand::Settings {
+                base_update_mode, ..
+            } => assert_eq!(base_update_mode, None),
             other => panic!("unexpected: {other:?}"),
         }
     }

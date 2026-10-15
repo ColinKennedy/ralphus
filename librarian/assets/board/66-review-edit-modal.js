@@ -53,7 +53,9 @@
        * @property {boolean} originalProofSkipAutoClean
        * @property {boolean} skipWorktrees
        * @property {boolean} originalSkipWorktrees
+       * @property {string} baseUpdateMode - "" (inherit the project default) | "always" | "required" | "never"
        * @property {boolean} skipBaseUpdates - RAL-514: this review's own override for whether the automatic base-branch auto-update rebuild is skipped.
+       * @property {string} originalBaseUpdateMode
        * @property {boolean} originalSkipBaseUpdates
        * @property {boolean} separatePrBranch
        * @property {boolean} originalSeparatePrBranch
@@ -343,6 +345,7 @@
         const ciDeferral = g.ci_deferral || "";
         const skipWorktrees = !!g.skip_worktrees;
         const skipBaseUpdates = !!g.effective_skip_base_updates;
+        const baseUpdateMode = g.base_update_mode || "";
         const separatePrBranch = !!g.effective_separate_pr_branch;
         const matchPrBranchName = !!g.effective_match_pr_branch_name;
         const autoSubmitPrStack = !!g.effective_auto_submit_pr_stack;
@@ -372,6 +375,7 @@
           proofSkipAutoClean, originalProofSkipAutoClean: proofSkipAutoClean,
           skipWorktrees, originalSkipWorktrees: skipWorktrees,
           skipBaseUpdates, originalSkipBaseUpdates: skipBaseUpdates,
+          baseUpdateMode, originalBaseUpdateMode: baseUpdateMode,
           separatePrBranch, originalSeparatePrBranch: separatePrBranch,
           matchPrBranchName, originalMatchPrBranchName: matchPrBranchName,
           autoSubmitPrStack, originalAutoSubmitPrStack: autoSubmitPrStack,
@@ -509,6 +513,12 @@
        * @returns {void}
        */
       function onEditSkipWorktrees(checked) { if (reviewEditDraft) reviewEditDraft.skipWorktrees = checked; }
+      /**
+       * Stages the base-update mode (empty inherits, else always/required/never).
+       * @param {string} value
+       * @returns {void}
+       */
+      function onEditBaseUpdateMode(value) { if (reviewEditDraft) reviewEditDraft.baseUpdateMode = value; }
       /**
        * Stages the skip-automatic-base-rebasing flag (RAL-514).
        * @param {boolean} checked
@@ -910,6 +920,27 @@
             </select></div>`;
       }
       /**
+       * Base-update mode selector: when the review's stack is rebased onto
+       * upstream changes. Shared by the review-edit modal and the project
+       * review-settings modal, which differ only in the handler they wire up
+       * and the "(inherit)" label.
+       * @param {string} mode - "" (inherit) | "always" | "required" | "never"
+       * @param {string} onChange
+       * @param {string} inheritLabel
+       * @returns {string}
+       */
+      function renderBaseUpdateModeFieldsHtml(mode, onChange, inheritLabel) {
+        const option = (/** @type {string} */ value, /** @type {string} */ label) =>
+          `<option value="${value}" ${mode === value ? "selected" : ""}>${label}</option>`;
+        return `<div class="kv-row"><span class="k">rebase onto upstream</span>
+            <select style="${REVIEW_EDIT_INPUT_STYLE}" onchange="${onChange}(this.value)" data-tip="When this review's stack is rebased onto new commits on its upstream branch.\n'always' rebases on every upstream change. 'required' rebases only when the forge's merge path needs it (the PR/MR can no longer merge as it stands). 'never' leaves the stack alone; a manual merge/rebase still works.\nWhen set, this wins over the older 'skip base-branch rebasing' checkbox. Applies on Save.">
+              <option value="" ${mode === "" ? "selected" : ""}>${inheritLabel}</option>
+              ${option("always", "always (every upstream change)")}
+              ${option("required", "only when required to merge")}
+              ${option("never", "never")}
+            </select></div>`;
+      }
+      /**
        * RAL-408: pull-request settings fields (separate PR branch / match
        * worktree branch name / auto-submit PR stack / dual root PR), shared
        * as above.
@@ -989,6 +1020,7 @@
             <div ${grp("proof")}><h3 class="section">proof</h3>${proofScopeSection}</div>
             <div ${grp("ci")}><h3 class="section">CI</h3>${renderCiDeferralFieldsHtml(draft.ciDeferral, "onEditCiDeferral", "(inherit project default)")}</div>
             <div><h3 class="section">rebase</h3>
+              ${renderBaseUpdateModeFieldsHtml(draft.baseUpdateMode, "onEditBaseUpdateMode", "(inherit project default)")}
               <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--muted);margin-top:4px" data-tip="Overrides the project default for this review only: when its upstream branch moves, don't automatically rebuild/rebase this review's stack onto the new tip. Use for a review whose auto-rebase keeps getting in the way (e.g. one under heavy manual conflict resolution). You can still start a merge/rebase manually at any time, individually or via the review list's bulk Merge/Rebase action, regardless of this setting. Applies on Save.">
                 <input type="checkbox" ${draft.skipBaseUpdates ? "checked" : ""} onchange="onEditSkipBaseUpdates(this.checked)">skip automatic base-branch rebasing</label>
               <div class="hint">Action preparation is declared in task TOML and runs automatically before its controls unlock.</div></div>
@@ -1083,6 +1115,7 @@
         if (draft.ciDeferral !== draft.originalCiDeferral) body.ci_deferral = draft.ciDeferral;
         if (draft.skipWorktrees !== draft.originalSkipWorktrees) body.skip_worktrees = draft.skipWorktrees;
         if (draft.skipBaseUpdates !== draft.originalSkipBaseUpdates) body.skip_base_updates = draft.skipBaseUpdates;
+        if (draft.baseUpdateMode !== draft.originalBaseUpdateMode) body.base_update_mode = draft.baseUpdateMode;
         if (draft.separatePrBranch !== draft.originalSeparatePrBranch) body.separate_pr_branch = draft.separatePrBranch;
         if (draft.matchPrBranchName !== draft.originalMatchPrBranchName) body.match_pr_branch_name = draft.matchPrBranchName;
         if (draft.autoSubmitPrStack !== draft.originalAutoSubmitPrStack) body.auto_submit_pr_stack = draft.autoSubmitPrStack;
@@ -1130,4 +1163,4 @@
         }
       }
 
-      void [onEditResolverAgent, onEditResolverModel, onEditProofScope, onEditCiDeferral, onEditProofSkipAutoClean, onEditSeparatePrBranch, onEditMatchPrBranchName, onEditAutoSubmitPrStack, onEditDualRootPr, onEditAutoFixPrErrors, onEditAutoFixPromptTemplate, onEditDiscourageTests, onEditRebuildOnInherit, onEditRebuildOnTrigger];
+      void [onEditBaseUpdateMode, onEditResolverAgent, onEditResolverModel, onEditProofScope, onEditCiDeferral, onEditProofSkipAutoClean, onEditSeparatePrBranch, onEditMatchPrBranchName, onEditAutoSubmitPrStack, onEditDualRootPr, onEditAutoFixPrErrors, onEditAutoFixPromptTemplate, onEditDiscourageTests, onEditRebuildOnInherit, onEditRebuildOnTrigger];

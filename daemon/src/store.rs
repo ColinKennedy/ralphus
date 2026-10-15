@@ -993,6 +993,10 @@ pub struct ProjectReviewSettings {
     pub skip_worktrees: Option<bool>,
     #[serde(default)]
     pub skip_base_updates: Option<bool>,
+    /// Project default base-update mode (`always`/`required`/`never`); wins
+    /// over [`Self::skip_base_updates`] within this layer.
+    #[serde(default)]
+    pub base_update_mode: Option<String>,
     #[serde(default)]
     pub match_pr_branch_name: Option<bool>,
     #[serde(default)]
@@ -1070,6 +1074,16 @@ pub struct ProjectReviewSettings {
 }
 
 impl ProjectReviewSettings {
+    /// The base-update mode these settings set, if any; the explicit mode
+    /// wins over the legacy skip flag.
+    #[must_use]
+    pub fn base_update_mode_override(&self) -> Option<ralphus_core::schema::BaseUpdateMode> {
+        ralphus_core::schema::BaseUpdateMode::for_layer(
+            self.base_update_mode.as_deref(),
+            self.skip_base_updates,
+        )
+    }
+
     /// Projects these settings onto a [`crate::config::ReviewConfig`]
     /// (`checks`/`summary_format` left at their defaults -- see this
     /// struct's own doc comment for why those two are out of scope here),
@@ -1090,6 +1104,7 @@ impl ProjectReviewSettings {
             default_machine: self.default_machine,
             default_maximum_budget_usd: self.default_maximum_budget_usd,
             skip_base_updates: self.skip_base_updates,
+            base_update_mode: self.base_update_mode,
             match_pr_branch_name: self.match_pr_branch_name,
             auto_submit_pr_stack: self.auto_submit_pr_stack,
             separate_pr_branch: self.separate_pr_branch,
@@ -4170,6 +4185,9 @@ impl Store {
             // `None` inherits the project/global default, which resolves to
             // `true` (on by default).
             "ALTER TABLE guardians ADD COLUMN post_appraisals INTEGER",
+            // Per-review base-update mode (`always`/`required`/`never`).
+            // NULL inherits the project/global default.
+            "ALTER TABLE guardians ADD COLUMN base_update_mode TEXT",
             // Per-review `ci_deferral` mode (`every`/`top`/`bottom+top`).
             // NULL behaves as `every`: no PR/MR in the stack carries the
             // defer-full-CI label.
@@ -19928,6 +19946,7 @@ command = "e"
             default_ci_deferral: Some("bottom+top".to_string()),
             verify_skip_auto_clean: Some(true),
             skip_worktrees: Some(true),
+            base_update_mode: Some("required".to_string()),
             skip_base_updates: Some(false),
             match_pr_branch_name: Some(true),
             separate_pr_branch: Some(false),

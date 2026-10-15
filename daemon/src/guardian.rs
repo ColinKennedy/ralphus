@@ -1130,6 +1130,16 @@ pub struct GuardianView {
     /// this project's creation-time stamp, and the live global config -- the
     /// value `rebuild_on_base_shift` actually gates on.
     pub effective_skip_base_updates: bool,
+    /// This review's own base-update mode literal (`always`/`required`/
+    /// `never`). `None` means "inherit"; it wins over
+    /// [`Self::skip_base_updates`] when both are set.
+    pub base_update_mode: Option<String>,
+    /// The base-update mode the base-shift pass actually follows: the first
+    /// layer (review, project settings, `.ralphus.toml`, registration stamp,
+    /// global config) that states a mode or the legacy skip flag, else
+    /// `always`. Always one of [`ralphus_core::schema::BaseUpdateMode`]'s
+    /// literals.
+    pub effective_base_update_mode: String,
     /// RAL-507: this review's own cap on unattended base-shift rebuild
     /// attempts. `None` means "inherit the project/global default"
     /// (resolved into [`Self::effective_base_shift_maximum_rebuilds`] at
@@ -1611,12 +1621,15 @@ impl Store {
         // RAL-250: freeze the effective base-update setting onto the new
         // review, with the project's registration-time stamp taking
         // precedence over the live global value.
-        let skip_base_updates = db_settings
-            .skip_base_updates
-            .or(explicit_project.skip_base_updates)
-            .or(self.project_skip_base_updates_stamp(git_root))
-            .or(live_global.skip_base_updates)
-            .unwrap_or(false);
+        let base_update_mode = db_settings
+            .base_update_mode_override()
+            .or(explicit_project.base_update_mode_override())
+            .or(self
+                .project_skip_base_updates_stamp(git_root)
+                .map(ralphus_core::schema::BaseUpdateMode::from_legacy_skip))
+            .or(live_global.base_update_mode_override())
+            .unwrap_or_default();
+        let skip_base_updates = base_update_mode == ralphus_core::schema::BaseUpdateMode::Never;
         // RAL-378: same stamping shape again. `readable_review_branch` is set
         // unconditionally here -- every review created from now on names its
         // combined branch readably; only reviews that predate the column keep
@@ -1665,7 +1678,7 @@ impl Store {
             "UPDATE guardians SET \
              resolver_agent=?, resolver_model=?, machine=?, maximum_budget_usd=?, \
              proof_skip_auto_clean=?, skip_worktrees=?, skip_base_updates=?, \
-             auto_submit_pr_stack=?, match_pr_branch_name=?, checks=?, \
+             base_update_mode=?, auto_submit_pr_stack=?, match_pr_branch_name=?, checks=?, \
              summary_format=? WHERE id=?",
             params![
                 defaults.default_resolver_agent(),
@@ -1675,6 +1688,7 @@ impl Store {
                 i64::from(defaults.proof_skip_auto_clean()),
                 i64::from(defaults.skip_worktrees()),
                 i64::from(skip_base_updates),
+                base_update_mode.as_str(),
                 i64::from(auto_submit_pr_stack),
                 i64::from(match_pr_branch_name),
                 crate::store::to_json(&defaults.checks),
@@ -2844,6 +2858,7 @@ impl Store {
     /// it does not exist. Branches are removed explicitly so the delete also holds
     /// on connections without `ON DELETE CASCADE` enforcement (in-memory tests).
     pub fn delete_guardian(&self, id: &str) -> Result<()> {
+        crate::base_update::forget(id);
         self.conn.execute(
             "DELETE FROM guardian_branches WHERE guardian_id=?",
             params![id],
@@ -4133,11 +4148,30 @@ impl Store {
 
     /// Set this review's own override for whether the automatic base-branch
     /// auto-update rebuild is skipped (RAL-250). `None` resets it to "inherit
-    /// the project/global default".
+    /// the project/global default". Also clears the review's own
+    /// `base_update_mode`, so the legacy flag is the only review-level value.
     pub fn set_guardian_skip_base_updates(&self, id: &str, skip: Option<bool>) -> Result<()> {
         let n = self.conn.execute(
-            "UPDATE guardians SET skip_base_updates=?, updated_at_ms=? WHERE id=?",
+            "UPDATE guardians SET skip_base_updates=?, base_update_mode=NULL, updated_at_ms=? WHERE id=?",
             params![skip.map(i64::from), crate::store::now_ms(), id],
+        )?;
+        if n == 0 {
+            Err(StoreError::NotFound)
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Set this review's own base-update mode (`always`/`required`/`never`).
+    /// `None` clears it back to "inherit". Validation of the literal belongs
+    /// to the caller.
+    ///
+    /// # Errors
+    /// [`StoreError::NotFound`] when no such guardian exists.
+    pub fn set_guardian_base_update_mode(&self, id: &str, mode: Option<&str>) -> Result<()> {
+        let n = self.conn.execute(
+            "UPDATE guardians SET base_update_mode=?, updated_at_ms=? WHERE id=?",
+            params![mode, crate::store::now_ms(), id],
         )?;
         if n == 0 {
             Err(StoreError::NotFound)
@@ -6118,7 +6152,7 @@ impl Store {
     pub(crate) fn get_guardian_conn(conn: &Connection, id: &str) -> Result<GuardianView> {
         let row = conn
             .query_row(
-                "SELECT id, name, base_branch, git_root, review_branch, status, detail, checks, squad_id, combined_worktree, conflicts_found, conflicts_fixed, conflicts_committed, skip_worktree_checks, review_type, skip_worktrees, created_at_ms, resolver_agent, resolver_model, base_commit, change_summary, base_commits, manual_commands, action_hints, summary_agent, summary_model, manual_commands_agent, manual_commands_model, manual_commands_agent_session_id, squash_projects, auto_pr_feedback, input_values, proof_scope, proof_skip_auto_clean, machine, build_env_overrides, manual_checks_env_overrides, maximum_budget_usd, merge_attempt, skip_base_updates, manual_checks_started_at_ms, notice_kind, notice_message, notice_at_ms, match_pr_branch_name, auto_submit_pr_stack, origin, auto_build_json, separate_pr_branch, readable_review_branch, review_branch_name, project, auto_fix_pr_errors, auto_fix_prompt_template, manual_checks_finished_at_ms, post_merge_status, post_merge_detail, post_merge_started_at_ms, post_merge_finished_at_ms, owner, dual_root_pr, discourage_tests_during_auto_pull_request_fixes, base_shift_maximum_rebuilds, base_shift_rebuild_attempts, base_shift_rebuild_targets, base_shift_exhausted_notified_at_ms, auto_cancel_outdated_pr_pipelines, cache_manual_checks, manual_checks_cached, manual_checks_basis, manual_checks_focus, summary_format, base_shift_rebuild_attempts_by_project, rebuild_on, skip_manual_checks, auto_run, followup_enabled, followup_auto_start, post_appraisals, ci_deferral, live_actions, live_actions_auto_ran_at_ms
+                "SELECT id, name, base_branch, git_root, review_branch, status, detail, checks, squad_id, combined_worktree, conflicts_found, conflicts_fixed, conflicts_committed, skip_worktree_checks, review_type, skip_worktrees, created_at_ms, resolver_agent, resolver_model, base_commit, change_summary, base_commits, manual_commands, action_hints, summary_agent, summary_model, manual_commands_agent, manual_commands_model, manual_commands_agent_session_id, squash_projects, auto_pr_feedback, input_values, proof_scope, proof_skip_auto_clean, machine, build_env_overrides, manual_checks_env_overrides, maximum_budget_usd, merge_attempt, skip_base_updates, manual_checks_started_at_ms, notice_kind, notice_message, notice_at_ms, match_pr_branch_name, auto_submit_pr_stack, origin, auto_build_json, separate_pr_branch, readable_review_branch, review_branch_name, project, auto_fix_pr_errors, auto_fix_prompt_template, manual_checks_finished_at_ms, post_merge_status, post_merge_detail, post_merge_started_at_ms, post_merge_finished_at_ms, owner, dual_root_pr, discourage_tests_during_auto_pull_request_fixes, base_shift_maximum_rebuilds, base_shift_rebuild_attempts, base_shift_rebuild_targets, base_shift_exhausted_notified_at_ms, auto_cancel_outdated_pr_pipelines, cache_manual_checks, manual_checks_cached, manual_checks_basis, manual_checks_focus, summary_format, base_shift_rebuild_attempts_by_project, rebuild_on, skip_manual_checks, auto_run, followup_enabled, followup_auto_start, post_appraisals, ci_deferral, live_actions, live_actions_auto_ran_at_ms, base_update_mode
                   FROM guardians WHERE id=?", // `skip_worktree_checks` (col 13) is read-only legacy data (RAL-285) -- see `GuardianRow::legacy_skip_worktree_checks`.
                 /*
                 "SELECT id, name, base_branch, git_root, review_branch, status, detail, checks, squad_id, combined_worktree, conflicts_found, conflicts_fixed, conflicts_committed, skip_worktree_checks, review_type, skip_worktrees, created_at_ms, resolver_agent, resolver_model, base_commit, change_summary, base_commits, manual_commands, action_hints, summary_agent, summary_model, manual_commands_agent, manual_commands_model, manual_commands_agent_session_id, squash_projects, auto_pr_feedback, input_values, proof_scope, proof_skip_auto_clean, machine, build_env_overrides, manual_checks_env_overrides, maximum_budget_usd, merge_attempt, skip_base_updates, manual_checks_started_at_ms, notice_kind, notice_message, notice_at_ms, match_pr_branch_name, auto_submit_pr_stack, origin, auto_build_json, separate_pr_branch, readable_review_branch, review_branch_name, project, auto_fix_pr_errors, auto_fix_prompt_template, manual_checks_finished_at_ms, post_merge_status, post_merge_detail, post_merge_started_at_ms, post_merge_finished_at_ms, owner, dual_root_pr, discourage_tests_during_auto_pull_request_fixes, base_shift_maximum_rebuilds, base_shift_rebuild_attempts, base_shift_rebuild_targets, base_shift_exhausted_notified_at_ms, auto_cancel_outdated_pr_pipelines, cache_manual_checks, manual_checks_cached, manual_checks_basis, manual_checks_focus
@@ -6279,7 +6313,7 @@ impl Store {
     /// (`crate::store_pool`) can serve it without the writer lock.
     pub(crate) fn list_guardians_conn(conn: &Connection) -> Result<Vec<GuardianView>> {
         let mut stmt = conn.prepare(
-            "SELECT id, name, base_branch, git_root, review_branch, status, detail, checks, squad_id, combined_worktree, conflicts_found, conflicts_fixed, conflicts_committed, skip_worktree_checks, review_type, skip_worktrees, created_at_ms, resolver_agent, resolver_model, base_commit, change_summary, base_commits, manual_commands, action_hints, summary_agent, summary_model, manual_commands_agent, manual_commands_model, manual_commands_agent_session_id, squash_projects, auto_pr_feedback, input_values, proof_scope, proof_skip_auto_clean, machine, build_env_overrides, manual_checks_env_overrides, maximum_budget_usd, merge_attempt, skip_base_updates, manual_checks_started_at_ms, notice_kind, notice_message, notice_at_ms, match_pr_branch_name, auto_submit_pr_stack, origin, auto_build_json, separate_pr_branch, readable_review_branch, review_branch_name, project, auto_fix_pr_errors, auto_fix_prompt_template, manual_checks_finished_at_ms, post_merge_status, post_merge_detail, post_merge_started_at_ms, post_merge_finished_at_ms, owner, dual_root_pr, discourage_tests_during_auto_pull_request_fixes, base_shift_maximum_rebuilds, base_shift_rebuild_attempts, base_shift_rebuild_targets, base_shift_exhausted_notified_at_ms, auto_cancel_outdated_pr_pipelines, cache_manual_checks, manual_checks_cached, manual_checks_basis, manual_checks_focus, summary_format, base_shift_rebuild_attempts_by_project, rebuild_on, skip_manual_checks, auto_run, followup_enabled, followup_auto_start, post_appraisals, ci_deferral, live_actions, live_actions_auto_ran_at_ms
+            "SELECT id, name, base_branch, git_root, review_branch, status, detail, checks, squad_id, combined_worktree, conflicts_found, conflicts_fixed, conflicts_committed, skip_worktree_checks, review_type, skip_worktrees, created_at_ms, resolver_agent, resolver_model, base_commit, change_summary, base_commits, manual_commands, action_hints, summary_agent, summary_model, manual_commands_agent, manual_commands_model, manual_commands_agent_session_id, squash_projects, auto_pr_feedback, input_values, proof_scope, proof_skip_auto_clean, machine, build_env_overrides, manual_checks_env_overrides, maximum_budget_usd, merge_attempt, skip_base_updates, manual_checks_started_at_ms, notice_kind, notice_message, notice_at_ms, match_pr_branch_name, auto_submit_pr_stack, origin, auto_build_json, separate_pr_branch, readable_review_branch, review_branch_name, project, auto_fix_pr_errors, auto_fix_prompt_template, manual_checks_finished_at_ms, post_merge_status, post_merge_detail, post_merge_started_at_ms, post_merge_finished_at_ms, owner, dual_root_pr, discourage_tests_during_auto_pull_request_fixes, base_shift_maximum_rebuilds, base_shift_rebuild_attempts, base_shift_rebuild_targets, base_shift_exhausted_notified_at_ms, auto_cancel_outdated_pr_pipelines, cache_manual_checks, manual_checks_cached, manual_checks_basis, manual_checks_focus, summary_format, base_shift_rebuild_attempts_by_project, rebuild_on, skip_manual_checks, auto_run, followup_enabled, followup_auto_start, post_appraisals, ci_deferral, live_actions, live_actions_auto_ran_at_ms, base_update_mode
               FROM guardians ORDER BY created_at_ms DESC", // `skip_worktree_checks` (col 13) is read-only legacy data (RAL-285) -- see `GuardianRow::legacy_skip_worktree_checks`.
         )?;
         let rows = stmt
@@ -6430,6 +6464,7 @@ impl Store {
             ci_deferral: r.get(79)?,
             live_actions: r.get::<_, Option<i64>>(80)?.map(|v| v != 0),
             live_actions_auto_ran_at_ms: r.get(81)?,
+            base_update_mode: r.get(82)?,
         })
     }
 
@@ -6778,13 +6813,21 @@ impl Store {
         // one, but must never break a project that has never touched it
         // (`db_settings.<field>` is simply `None` there, so `.or()` falls
         // through to the existing chain unchanged).
-        let effective_skip_base_updates = row
-            .skip_base_updates
-            .or(db_settings.skip_base_updates)
-            .or(explicit_project.skip_base_updates)
-            .or(stamps.and_then(|s| s.skip_base_updates))
-            .or(live_global.skip_base_updates)
-            .unwrap_or(false);
+        // RAL-660: the base-update mode follows the same chain, but each
+        // layer states one setting through `BaseUpdateMode::for_layer`, so a
+        // layer's explicit mode wins over its own legacy `skip_base_updates`.
+        // The registration stamp predates modes and only carries the flag.
+        let effective_base_update_mode = ralphus_core::schema::BaseUpdateMode::for_layer(
+            row.base_update_mode.as_deref(),
+            row.skip_base_updates,
+        )
+        .or(db_settings.base_update_mode_override())
+        .or(explicit_project.base_update_mode_override())
+        .or(stamps
+            .and_then(|s| s.skip_base_updates)
+            .map(ralphus_core::schema::BaseUpdateMode::from_legacy_skip))
+        .or(live_global.base_update_mode_override())
+        .unwrap_or_default();
 
         // RAL-507: effective base-shift rebuild retry cap, layered per-review
         // override > database-backed project default > explicit
@@ -7043,7 +7086,10 @@ impl Store {
             effective_proof_scope,
             effective_proof_skip_auto_clean,
             skip_base_updates: row.skip_base_updates,
-            effective_skip_base_updates,
+            effective_skip_base_updates: effective_base_update_mode
+                == ralphus_core::schema::BaseUpdateMode::Never,
+            base_update_mode: row.base_update_mode,
+            effective_base_update_mode: effective_base_update_mode.as_str().to_string(),
             base_shift_maximum_rebuilds: row
                 .base_shift_maximum_rebuilds
                 .and_then(|v| u32::try_from(v).ok()),
@@ -7643,6 +7689,9 @@ struct GuardianRow {
     post_appraisals: Option<bool>,
     /// This review's own `ci_deferral` literal as stored; `None` when unset.
     ci_deferral: Option<String>,
+    /// This review's own `base_update_mode` literal as stored; `None` when
+    /// unset.
+    base_update_mode: Option<String>,
 }
 
 #[cfg(test)]

@@ -536,6 +536,7 @@ impl DaemonClient {
         );
         set_if_some(&mut body, "skip_worktrees", patch.skip_worktrees);
         set_if_some(&mut body, "skip_base_updates", patch.skip_base_updates);
+        set_if_some(&mut body, "base_update_mode", patch.base_update_mode);
         set_if_some(
             &mut body,
             "match_pr_branch_name",
@@ -1912,6 +1913,11 @@ impl DaemonClient {
         set_if_some(&mut body, "skip_base_updates", settings.skip_base_updates);
         set_if_some(
             &mut body,
+            "base_update_mode",
+            settings.base_update_mode.map(str::to_string),
+        );
+        set_if_some(
+            &mut body,
             "match_pr_branch_name",
             settings.match_pr_branch_name,
         );
@@ -2525,6 +2531,10 @@ pub struct GuardianSettings<'a> {
     pub proof_skip_auto_clean: Option<bool>,
     /// RAL-250: whether this review skips automatic base-branch auto-updates.
     pub skip_base_updates: Option<bool>,
+    /// When this review rebases its stack onto upstream changes: `always`,
+    /// `required` or `never`. An empty string clears it back to inheriting.
+    /// Wins over `skip_base_updates` when both are set.
+    pub base_update_mode: Option<&'a str>,
     /// RAL-307: whether this review defaults a newly submitted PR's branch
     /// to the exact worktree/feature branch name.
     pub match_pr_branch_name: Option<bool>,
@@ -2617,6 +2627,9 @@ pub struct ProjectReviewSettingsPatch<'a> {
     pub verify_skip_auto_clean: Option<bool>,
     pub skip_worktrees: Option<bool>,
     pub skip_base_updates: Option<bool>,
+    /// Project default base-update mode (`always`/`required`/`never`); an
+    /// empty string clears it back to inheriting.
+    pub base_update_mode: Option<&'a str>,
     pub match_pr_branch_name: Option<bool>,
     pub separate_pr_branch: Option<bool>,
     pub dual_root_pr: Option<bool>,

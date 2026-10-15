@@ -737,6 +737,7 @@ instead of falling through to a global, non-project-aware default:
 | `default_maximum_budget_usd` | `maximum_budget_usd` | unbounded |
 | `default_proof_scope` | `proof_scope` | `"each_branch"` |
 | `default_ci_deferral` | `ci_deferral` | `"every"` |
+| `base_update_mode` | `base_update_mode` | `"always"` |
 
 An explicitly declared `[[review]]` value always wins over its project
 default. `ci_deferral` (`every` | `top` | `bottom+top`) decides which PRs/MRs
@@ -758,7 +759,7 @@ periodic review check re-labels a review whose stack of open PRs/MRs no longer
 matches the one it was last labelled for -- a PR/MR merged, closed or dropped
 included -- without any forge call when nothing changed. An unrecognised stored
 value behaves as `every`. How a repository's CI reads the label is in
-[`ci-deferral.md`](ci-deferral.md). `default_proof_scope` accepts the legacy `verify_scope` key name too
+[`ci-deferral.md`](ci-deferral.md). `base_update_mode` (`always` | `required` | `never`) decides when a review's stack is rebased onto upstream changes: `always` rebases on every upstream change, `required` only when the forge merge path needs it, `never` not at all (a manual merge/rebase still works). It is a string enum like `ci_deferral`: on `POST .../settings`, `.../details` and the project review-settings body an empty string (or null) clears the override back to inheriting, and an unrecognised value is rejected. When both are set at the same layer it wins over the legacy `skip_base_updates` (legacy `true` means `never`, `false` means `always`). Review views carry `base_update_mode` (the raw override, or null) and `effective_base_update_mode` (always one of the three values); the project review settings carry `base_update_mode`. It is also declarable as `base_update_mode` in `[[review]]`, `.ralphus.toml` `[review]` and the global config `[review]`. `default_proof_scope` accepts the legacy `verify_scope` key name too
 (pre-dates the Verify→Proof rename, see the glossary). `id`/`name`/`upstream`/
 `action` have no project-default equivalent -- see
 `daemon/src/config.rs`'s `REVIEW_FIELD_PARITY` for why each is excluded.
@@ -1954,7 +1955,7 @@ body are changed, everything else is left as-is. Returns the updated
 `GuardianSettingsBody` in `daemon/src/server.rs` for the exhaustive list).
 
 The settings `skip_worktrees`, `auto_pr_feedback`, `skip_base_updates`,
-`proof_skip_auto_clean`, `match_pr_branch_name`, and `separate_pr_branch` are
+`base_update_mode`, `proof_skip_auto_clean`, `match_pr_branch_name`, and `separate_pr_branch` are
 also declarable at submit time in `[[review]]` as the same names, except
 `proof_skip_auto_clean`, which is `skip_auto_clean`. `skip_auto_clean` requires
 `proof_scope = "each_branch"`. `base_branch` is represented at submit time by
@@ -2211,7 +2212,7 @@ Field-by-field, this replaces:
 |---|---|
 | `name` | `POST .../rename` |
 | `base_branch` | `POST .../base` |
-| `resolver_agent`, `resolver_model`, `proof_scope`, `ci_deferral`, `proof_skip_auto_clean`, `skip_worktrees`, `skip_base_updates`, `separate_pr_branch`, `match_pr_branch_name`, `auto_submit_pr_stack` | `POST .../settings` |
+| `resolver_agent`, `resolver_model`, `proof_scope`, `ci_deferral`, `proof_skip_auto_clean`, `skip_worktrees`, `skip_base_updates`, `base_update_mode`, `separate_pr_branch`, `match_pr_branch_name`, `auto_submit_pr_stack` | `POST .../settings` |
 | `squash_projects` (full desired membership — every project in the list gets squash turned on, every other project on the review gets it turned off) | `POST .../squash` (one call per project) |
 | `build_env`, `manual_checks_env`, `branch_env` (keyed by branch id) | `POST .../build-env`, `POST .../manual-checks-env`, `POST .../branches/{id}/env` respectively — each an `{set, unset, clear}` object with the same three-way inherited-override shape those endpoints already use |
 

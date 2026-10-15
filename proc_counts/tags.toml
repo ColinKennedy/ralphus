@@ -96,3 +96,16 @@ tag = "review-live-action"
 [[test]]
 id = "ralphus-daemon::live_actions a_clean_live_fix_is_cherry_picked_onto_the_top_branch_and_pushed"
 tag = "review-live-integration"
+
+# Base-update mode `required` (RAL-660; local merge-tree preflight of a base shift).
+[[test]]
+id = "ralphus-daemon::guardian_merge required_mode_leaves_a_clean_stack_untouched_on_base_shift"
+tag = "review-base-update-required"
+
+[[test]]
+id = "ralphus-daemon::guardian_merge required_mode_rebuilds_when_the_shift_conflicts"
+tag = "review-base-update-required-conflict"
+
+[[test]]
+id = "ralphus-daemon::guardian_merge explicit_never_and_always_modes_keep_their_behavior"
+tag = "review-base-update-modes"

@@ -45,6 +45,8 @@
        * @property {boolean} originalSkipWorktrees
        * @property {boolean} skipBaseUpdates
        * @property {boolean} originalSkipBaseUpdates
+       * @property {string} baseUpdateMode - "" (inherit the file-config/global default) | "always" | "required" | "never"
+       * @property {string} originalBaseUpdateMode
        * @property {number|null} baseShiftMaximumRebuilds
        * @property {number|null} originalBaseShiftMaximumRebuilds
        * @property {boolean} matchPrBranchName
@@ -118,6 +120,7 @@
         const proofSkipAutoClean = boolOr(s.verify_skip_auto_clean, effective.skip_auto_clean);
         const skipWorktrees = boolOr(s.skip_worktrees, effective.skip_worktrees);
         const skipBaseUpdates = boolOr(s.skip_base_updates, effective.skip_base_updates);
+        const baseUpdateMode = str(s.base_update_mode);
         const baseShiftMaximumRebuilds = s.base_shift_maximum_rebuilds === null || s.base_shift_maximum_rebuilds === undefined
           ? null
           : s.base_shift_maximum_rebuilds;
@@ -148,6 +151,7 @@
           proofSkipAutoClean, originalProofSkipAutoClean: proofSkipAutoClean,
           skipWorktrees, originalSkipWorktrees: skipWorktrees,
           skipBaseUpdates, originalSkipBaseUpdates: skipBaseUpdates,
+          baseUpdateMode, originalBaseUpdateMode: baseUpdateMode,
           baseShiftMaximumRebuilds, originalBaseShiftMaximumRebuilds: baseShiftMaximumRebuilds,
           matchPrBranchName, originalMatchPrBranchName: matchPrBranchName,
           separatePrBranch, originalSeparatePrBranch: separatePrBranch,
@@ -265,6 +269,12 @@
        * @returns {void}
        */
       function onProjectEditSkipWorktrees(checked) { if (projectReviewSettingsDraft) projectReviewSettingsDraft.skipWorktrees = checked; }
+      /**
+       * Stages the base-update mode default (empty inherits, else always/required/never).
+       * @param {string} value
+       * @returns {void}
+       */
+      function onProjectEditBaseUpdateMode(value) { if (projectReviewSettingsDraft) projectReviewSettingsDraft.baseUpdateMode = value; }
       /**
        * Stages the skip-base-branch-auto-updates default.
        * @param {boolean} checked
@@ -429,6 +439,7 @@
               <input type="checkbox" ${draft.skipWorktrees ? "checked" : ""} onchange="onProjectEditSkipWorktrees(this.checked)">skip per-branch worktrees</label>
             <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--muted);margin-top:4px" data-tip="Skip the automatic base-branch auto-update rebuild, for a future review that declares no explicit skip_base_updates of its own.">
               <input type="checkbox" ${draft.skipBaseUpdates ? "checked" : ""} onchange="onProjectEditSkipBaseUpdates(this.checked)">skip base-branch auto-updates</label>
+            ${renderBaseUpdateModeFieldsHtml(draft.baseUpdateMode, "onProjectEditBaseUpdateMode", `(inherit: ${esc(draft.effective.base_update_mode || "always")})`)}
             <div class="kv-row"><span class="k">base-shift rebuild cap</span><input type="number" min="1" step="1" class="mono" style="${REVIEW_EDIT_INPUT_STYLE};width:80px" value="${draft.baseShiftMaximumRebuilds === null ? "" : esc(String(draft.baseShiftMaximumRebuilds))}" placeholder="${draft.effective.base_shift_maximum_rebuilds === undefined ? "3" : esc(String(draft.effective.base_shift_maximum_rebuilds))}" oninput="onProjectEditBaseShiftMaximumRebuilds(this.value)" data-tip="${PROJECT_REVIEW_SETTINGS_BASE_SHIFT_CAP_TIP}"></div>
             <div style="margin-top:8px">
               <label for="project-auto-build-input" style="font-size:12px;color:var(--muted);display:block;margin-bottom:4px" data-tip="${PROJECT_REVIEW_SETTINGS_AUTO_BUILD_TIP}">default preparation command</label>
@@ -485,6 +496,7 @@
         if (draft.proofSkipAutoClean !== draft.originalProofSkipAutoClean) body.verify_skip_auto_clean = draft.proofSkipAutoClean;
         if (draft.skipWorktrees !== draft.originalSkipWorktrees) body.skip_worktrees = draft.skipWorktrees;
         if (draft.skipBaseUpdates !== draft.originalSkipBaseUpdates) body.skip_base_updates = draft.skipBaseUpdates;
+        if (draft.baseUpdateMode !== draft.originalBaseUpdateMode) body.base_update_mode = draft.baseUpdateMode;
         if (draft.baseShiftMaximumRebuilds !== draft.originalBaseShiftMaximumRebuilds) {
           if (draft.baseShiftMaximumRebuilds === null) {
             body.clear_base_shift_maximum_rebuilds = true;
@@ -527,4 +539,4 @@
         closeProjectReviewSettingsModal();
       }
 
-      void [onProjectEditResolverAgent, onProjectEditResolverModel, onProjectEditMachine, onProjectEditMaximumBudgetUsd, onProjectEditProofScope, onProjectEditCiDeferral, onProjectEditProofSkipAutoClean, onProjectEditSkipWorktrees, onProjectEditSkipBaseUpdates, onProjectEditBaseShiftMaximumRebuilds, onProjectEditSeparatePrBranch, onProjectEditDualRootPr, onProjectEditMatchPrBranchName, onProjectEditAutoBuild, onProjectEditAutoSubmitPrStack, onProjectEditAutoFixPrErrors, onProjectEditAutoFixPromptTemplate, onProjectEditDiscourageTests, onProjectEditAutoCancelOutdatedPrPipelines, onProjectEditRebuildOnInherit, onProjectEditRebuildOnTrigger];
+      void [onProjectEditBaseUpdateMode, onProjectEditResolverAgent, onProjectEditResolverModel, onProjectEditMachine, onProjectEditMaximumBudgetUsd, onProjectEditProofScope, onProjectEditCiDeferral, onProjectEditProofSkipAutoClean, onProjectEditSkipWorktrees, onProjectEditSkipBaseUpdates, onProjectEditBaseShiftMaximumRebuilds, onProjectEditSeparatePrBranch, onProjectEditDualRootPr, onProjectEditMatchPrBranchName, onProjectEditAutoBuild, onProjectEditAutoSubmitPrStack, onProjectEditAutoFixPrErrors, onProjectEditAutoFixPromptTemplate, onProjectEditDiscourageTests, onProjectEditAutoCancelOutdatedPrPipelines, onProjectEditRebuildOnInherit, onProjectEditRebuildOnTrigger];

@@ -84,6 +84,7 @@ pub enum ProjectReviewSettingsCommand {
         skip_auto_clean: Option<bool>,
         skip_worktrees: Option<bool>,
         skip_base_updates: Option<bool>,
+        base_update_mode: Option<String>,
         match_pr_branch_name: Option<bool>,
         separate_pr_branch: Option<bool>,
         dual_root_pr: Option<bool>,
@@ -357,6 +358,7 @@ fn parse_review_settings_set(
     let skip_auto_clean = crate::commands::review::take_tri_bool(scanner, "--skip-auto-clean");
     let skip_worktrees = crate::commands::review::take_tri_bool(scanner, "--skip-worktrees");
     let skip_base_updates = crate::commands::review::take_tri_bool(scanner, "--skip-base-updates");
+    let base_update_mode = scanner.take_value("--base-update-mode")?;
     let match_pr_branch_name =
         crate::commands::review::take_tri_bool(scanner, "--match-pr-branch-name");
     let separate_pr_branch =
@@ -430,6 +432,7 @@ fn parse_review_settings_set(
         skip_auto_clean,
         skip_worktrees,
         skip_base_updates,
+        base_update_mode,
         match_pr_branch_name,
         separate_pr_branch,
         dual_root_pr,
@@ -587,6 +590,7 @@ fn dispatch_review_settings(cmd: ProjectReviewSettingsCommand, opts: &GlobalOpts
             skip_auto_clean,
             skip_worktrees,
             skip_base_updates,
+            base_update_mode,
             match_pr_branch_name,
             separate_pr_branch,
             dual_root_pr,
@@ -616,6 +620,7 @@ fn dispatch_review_settings(cmd: ProjectReviewSettingsCommand, opts: &GlobalOpts
                 verify_skip_auto_clean: skip_auto_clean,
                 skip_worktrees,
                 skip_base_updates,
+                base_update_mode: base_update_mode.as_deref(),
                 match_pr_branch_name,
                 separate_pr_branch,
                 dual_root_pr,
@@ -698,6 +703,7 @@ fn render_review_settings(payload: &Value) {
     row_bool("skip auto-clean:", "verify_skip_auto_clean");
     row_bool("skip worktrees:", "skip_worktrees");
     row_bool("skip base updates:", "skip_base_updates");
+    row_str("base update mode:", "base_update_mode");
     println!(
         "  {:<26} {:<24} (effective: {})",
         "base-shift rebuild cap:",
