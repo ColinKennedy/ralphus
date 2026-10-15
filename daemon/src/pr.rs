@@ -21885,6 +21885,127 @@ token_env = "RALPHUS_TEST_FORGE_TOKEN"
         let _ = std::fs::remove_dir_all(&remote_dir);
     }
 
+    #[test]
+    fn submit_stacked_branch_pr_labels_a_deferred_member_right_after_creating_it() {
+        // RAL-649: under `top` deferral the bottom of a two-branch stack is
+        // deferred, so the GitHub create POST must be followed at once by a
+        // label call carrying the deferral label, and the PR row is still
+        // recorded as the stack member.
+        let mock = MockForge::start(move |server| {
+            expect_cancel_check(server, "acme/w");
+
+            let req = server.recv();
+            assert_eq!(req.method(), &tiny_http::Method::Get);
+            req.respond(tiny_http::Response::from_string("[]").with_status_code(200))
+                .unwrap();
+            let req = server.recv();
+            assert_eq!(req.method(), &tiny_http::Method::Post);
+            assert_eq!(req.url(), "/repos/acme/w/pulls");
+            req.respond(
+                tiny_http::Response::from_string(
+                    r#"{"number": 51, "html_url": "http://x/51", "draft": false}"#,
+                )
+                .with_status_code(201),
+            )
+            .unwrap();
+            let mut req = server.recv();
+            assert_eq!(req.method(), &tiny_http::Method::Post);
+            assert_eq!(req.url(), "/repos/acme/w/issues/51/labels");
+            let mut body = String::new();
+            req.as_reader().read_to_string(&mut body).unwrap();
+            let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(
+                json["labels"],
+                serde_json::json!([ralphus_core::schema::DEFER_FULL_CI_LABEL])
+            );
+            req.respond(tiny_http::Response::from_string("[]").with_status_code(200))
+                .unwrap();
+        });
+
+        let root = tmp_dir("create-label-root");
+        let mut init_opts = git2::RepositoryInitOptions::new();
+        init_opts.initial_head("main");
+        let repo = git2::Repository::init_opts(&root, &init_opts).unwrap();
+        let sig = git2::Signature::now("t", "t@t").unwrap();
+        gwrite(&root, "base.txt", "base\n");
+        let base_oid = git2_commit_all(&repo, &sig, "base", &[]);
+        let base_commit = repo.find_commit(base_oid).unwrap();
+        repo.branch("review-branch", &base_commit, false).unwrap();
+        git2_checkout(&repo, "review-branch");
+        gwrite(&root, "feat.txt", "feat\n");
+        git2_commit_all(&repo, &sig, "feat", &[&base_commit]);
+
+        let remote_dir = tmp_dir("create-label-remote");
+        git2::Repository::init_bare(&remote_dir).unwrap();
+        repo.remote("origin", remote_dir.to_str().unwrap()).unwrap();
+        g(&root, &["push", "origin", "review-branch:refs/heads/pr-y"]);
+
+        let store = Arc::new(crate::store_lock::StoreMutex::new(store()));
+        let gid = store
+            .lock()
+            .create_guardian("demo", "main", root.to_str().unwrap())
+            .unwrap();
+        store
+            .lock()
+            .add_guardian_branch(&gid, "review-branch")
+            .unwrap();
+        store
+            .lock()
+            .add_guardian_branch(&gid, "upper-branch")
+            .unwrap();
+        let branch_id = store.lock().get_guardian(&gid).unwrap().branches[0]
+            .id
+            .clone();
+        store
+            .lock()
+            .set_branch_review(&gid, &branch_id, "review-branch", root.to_str().unwrap())
+            .unwrap();
+
+        let client = mock.client(crate::forge::ForgeKind::GitHub, "acme/w");
+        let runner = NoopRunner;
+        let mut guardian = store.lock().get_guardian(&gid).unwrap();
+        guardian.effective_ci_deferral = ralphus_core::schema::CI_DEFERRAL_TOP.to_string();
+        let ordered_enabled: Vec<&BranchView> = guardian.branches.iter().collect();
+        assert_eq!(ordered_enabled.len(), 2);
+        let branch = ordered_enabled[0];
+        let mut alias_by_branch = HashMap::new();
+        let req = PrRequest {
+            branch_id: Some(branch_id.clone()),
+            branch_alias: Some("pr-y".to_string()),
+            title: Some("t".to_string()),
+            description: Some("d".to_string()),
+            use_worktree_branch_name: None,
+            draft: None,
+        };
+
+        let pr = submit_stacked_branch_pr(
+            &store,
+            &runner,
+            &client,
+            &gid,
+            &root,
+            "origin",
+            &guardian,
+            &ordered_enabled,
+            &mut alias_by_branch,
+            "main",
+            branch,
+            &req,
+            "{name}-alias",
+            None,
+            "stack-1",
+            None,
+            false,
+        )
+        .expect("submission must create and label the PR");
+
+        assert_eq!(pr.pr_number, Some(51));
+
+        mock.finish();
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&remote_dir);
+    }
+
     /// RAL-575: a two-branch review submitted in stack order, with one stored
     /// appraisal belonging to the review. Returns the creation POST bodies
     /// (`title`/`body` fields normalized across forges), the PR rows, the
