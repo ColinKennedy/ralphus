@@ -10,7 +10,9 @@ name: CI
 # so a missing label or a typo costs minutes, never coverage.
 #
 # `labeled`/`unlabeled` re-run the workflow when ralphus flips the label, so a
-# change of setting takes effect without a new push. Any label change re-runs
+# change of setting takes effect without a new push. The `defer-gate` job reads
+# the PR's current labels through the API, because the `opened` payload is
+# taken before ralphus can label a new PR. Any label change re-runs
 # CI; the concurrency group below cancels the run it supersedes.
 on:
   pull_request:
@@ -29,14 +31,38 @@ concurrency:
 # below) so the packaging scripts get validated on every PR.
 
 jobs:
+  # Decides whether this PR is deferred, from the labels the forge has *now*.
+  # The `opened` event's payload is taken before ralphus can label a new PR, so
+  # `github.event.pull_request.labels` is stale there; the live labels are read
+  # through the API, falling back to the payload if that call fails.
+  defer-gate:
+    name: Defer gate
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: read
+    outputs:
+      deferred: ${{ steps.labels.outputs.deferred }}
+    steps:
+      - name: Read the PR's current labels
+        id: labels
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PAYLOAD_DEFERRED: ${{ contains(github.event.pull_request.labels.*.name, 'ralphus:defer-full-ci') }}
+        run: |
+          deferred="$PAYLOAD_DEFERRED"
+          if names=$(gh api "repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/labels" --jq '.[].name'); then
+            if printf '%s\n' "$names" | grep -qx 'ralphus:defer-full-ci'; then deferred=true; else deferred=false; fi
+          fi
+          echo "deferred=$deferred" >> "$GITHUB_OUTPUT"
   # Says, in the run's summary, which scope this run has. Always runs.
   ci-scope:
+    needs: defer-gate
     name: CI scope
     runs-on: ubuntu-latest
     steps:
       - name: Report the CI scope
         env:
-          DEFERRED: ${{ contains(github.event.pull_request.labels.*.name, 'ralphus:defer-full-ci') }}
+          DEFERRED: ${{ needs.defer-gate.outputs.deferred }}
         run: |
           if [ "$DEFERRED" = "true" ]; then
             echo "### Slow jobs deferred" >> "$GITHUB_STEP_SUMMARY"
@@ -47,6 +73,7 @@ jobs:
           fi
 
   rust:
+    needs: defer-gate
     name: Rust (fmt, clippy, test)
     strategy:
       fail-fast: false
@@ -85,7 +112,7 @@ jobs:
       # install, the test run and doctests, and the build-only MSRV/macOS legs.
       # fmt and clippy below always run.
       - name: Install cargo-nextest
-        if: matrix.suite == 'full' && !contains(github.event.pull_request.labels.*.name, 'ralphus:defer-full-ci')
+        if: matrix.suite == 'full' && needs.defer-gate.outputs.deferred != 'true'
         uses: taiki-e/install-action@nextest
       - name: Format check
         if: matrix.suite == 'full'
@@ -117,7 +144,7 @@ jobs:
       # as the perf job's store-contention step; genuine blocking I/O under
       # the lock (a subprocess, a sleep, a network call) still blows past it.
       - name: Test
-        if: matrix.suite == 'full' && !contains(github.event.pull_request.labels.*.name, 'ralphus:defer-full-ci')
+        if: matrix.suite == 'full' && needs.defer-gate.outputs.deferred != 'true'
         env:
           RALPHUS_GUARD_HOLD_PANIC_MS: "8000"
         # The review-input race suite (daemon/tests/review_input_races.rs) is
@@ -129,28 +156,29 @@ jobs:
       # docs/shell-syntax.md). The default run above covers the feature-off
       # build; this leg builds the C grammars and runs the parser tests.
       - name: Test (shell-syntax feature)
-        if: matrix.suite == 'full' && !contains(github.event.pull_request.labels.*.name, 'ralphus:defer-full-ci')
+        if: matrix.suite == 'full' && needs.defer-gate.outputs.deferred != 'true'
         run: cargo "+${{ matrix.toolchain }}" nextest run -p ralphus-shell-syntax --features parser
       - name: Doctests
-        if: ${{ !cancelled() && matrix.suite == 'full' && !contains(github.event.pull_request.labels.*.name, 'ralphus:defer-full-ci') }}
+        if: ${{ !cancelled() && matrix.suite == 'full' && needs.defer-gate.outputs.deferred != 'true' }}
         run: cargo "+${{ matrix.toolchain }}" test --doc --workspace
       # MSRV leg: just prove the workspace compiles at the oldest supported
       # toolchain. (Cargo's default resolver is not MSRV-aware, so this is the
       # only guard against a dependency silently bumping the floor.)
       - name: Build (MSRV verification)
-        if: matrix.suite == 'msrv' && !contains(github.event.pull_request.labels.*.name, 'ralphus:defer-full-ci')
+        if: matrix.suite == 'msrv' && needs.defer-gate.outputs.deferred != 'true'
         run: cargo "+${{ matrix.toolchain }}" build --workspace --all-targets
       # macOS leg (RAL-398): experimental support, so this only proves the
       # workspace builds -- no fmt/clippy/test/doctest suite. A deeper
       # macOS CI leg can follow once there's a real need to justify it.
       - name: Build (macOS smoke test)
-        if: matrix.suite == 'macos-min' && !contains(github.event.pull_request.labels.*.name, 'ralphus:defer-full-ci')
+        if: matrix.suite == 'macos-min' && needs.defer-gate.outputs.deferred != 'true'
         run: cargo "+${{ matrix.toolchain }}" build --workspace --all-targets
 
   # Deferrable: skipped on a `ralphus:defer-full-ci` PR.
   release-builds:
+    needs: defer-gate
     name: Release build (${{ matrix.os }})
-    if: ${{ !contains(github.event.pull_request.labels.*.name, 'ralphus:defer-full-ci') }}
+    if: ${{ needs.defer-gate.outputs.deferred != 'true' }}
     strategy:
       fail-fast: false
       matrix:
@@ -185,8 +213,9 @@ jobs:
   # remote variant only.
   # Deferrable: skipped on a `ralphus:defer-full-ci` PR.
   initialize-exercises:
+    needs: defer-gate
     name: Initialize exercises (${{ matrix.os }})
-    if: ${{ !contains(github.event.pull_request.labels.*.name, 'ralphus:defer-full-ci') }}
+    if: ${{ needs.defer-gate.outputs.deferred != 'true' }}
     strategy:
       fail-fast: false
       matrix:
@@ -280,8 +309,9 @@ jobs:
 
   # Deferrable: skipped on a `ralphus:defer-full-ci` PR.
   python-test:
+    needs: defer-gate
     name: Python 3.13 (pytest)
-    if: ${{ !contains(github.event.pull_request.labels.*.name, 'ralphus:defer-full-ci') }}
+    if: ${{ needs.defer-gate.outputs.deferred != 'true' }}
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -319,8 +349,9 @@ jobs:
 
   # Deferrable: skipped on a `ralphus:defer-full-ci` PR.
   perf-tests:
+    needs: defer-gate
     name: Board cold-load performance budget (RAL-414)
-    if: ${{ !contains(github.event.pull_request.labels.*.name, 'ralphus:defer-full-ci') }}
+    if: ${{ needs.defer-gate.outputs.deferred != 'true' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

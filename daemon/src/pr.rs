@@ -8283,7 +8283,24 @@ fn submit_stacked_branch_pr(
                      the review commit history: {e}"
                 ),
             }
-            match route.create_pull_request(&title, &description, draft) {
+            // The label is decided against the stack as currently intended;
+            // `reconcile_ci_deferral` corrects it if the final shape differs.
+            let defer_label = ordered_enabled_branches
+                .iter()
+                .position(|b| b.id == branch.id)
+                .is_some_and(|index| {
+                    defers_full_ci(
+                        &guardian.effective_ci_deferral,
+                        index,
+                        ordered_enabled_branches.len(),
+                    )
+                });
+            let initial_labels: &[&str] = if defer_label {
+                &[ralphus_core::schema::DEFER_FULL_CI_LABEL]
+            } else {
+                &[]
+            };
+            match route.create_pull_request_labeled(&title, &description, draft, initial_labels) {
                 Ok(created) => (created, base, title, description, false),
                 // RAL-568: a concurrent create can win the race between the
                 // lookup above and this create. Re-ask the forge by head and

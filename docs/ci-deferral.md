@@ -119,6 +119,49 @@ For a single slow step inside a job, put the same expression in that step's
 `if:`. Keep job names unchanged so required-check settings keep matching.
 Ralphus's own `.github/workflows/ci.yml` is a worked example.
 
+#### Gate on the live labels
+
+GitHub's create-PR API has no labels field, so ralphus labels a new PR in a
+call right after creating it, and the `opened` event's payload
+(`github.event.pull_request.labels`) is taken before that call and never
+carries the label. A condition written against the payload alone would start
+the slow jobs on `opened` and only cancel them when `labeled` arrives. Add a
+small gate job that reads the labels from the API and make the slow jobs
+depend on it:
+
+```yaml
+jobs:
+  defer-gate:
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: read
+    outputs:
+      deferred: ${{ steps.labels.outputs.deferred }}
+    steps:
+      - id: labels
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PAYLOAD_DEFERRED: ${{ contains(github.event.pull_request.labels.*.name, 'ralphus:defer-full-ci') }}
+        run: |
+          deferred="$PAYLOAD_DEFERRED"
+          if names=$(gh api "repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/labels" --jq '.[].name'); then
+            if printf '%s\n' "$names" | grep -qx 'ralphus:defer-full-ci'; then deferred=true; else deferred=false; fi
+          fi
+          echo "deferred=$deferred" >> "$GITHUB_OUTPUT"
+
+  full-tests:
+    needs: defer-gate
+    if: ${{ needs.defer-gate.outputs.deferred != 'true' }}
+    runs-on: ubuntu-latest
+    steps: [...]
+```
+
+Ralphus sets the label as soon as it creates each PR/MR (GitLab takes it in
+the create call itself), but it decides "top" or "middle" from the stack as
+submitted so far, so a final reconcile still corrects it. The gate narrows the
+window the label cannot close; it does not remove it, and the API read adds a
+few seconds before the slow jobs start.
+
 Things to know:
 
 - Without `labeled` and `unlabeled`, a label change re-runs nothing.

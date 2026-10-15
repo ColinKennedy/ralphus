@@ -822,7 +822,7 @@ impl ForgeClient {
         base: &str,
         draft: bool,
     ) -> Result<CreatedPr, String> {
-        self.create_pull_request_routed(title, body, head, base, None, draft)
+        self.create_pull_request_routed(title, body, head, base, None, draft, &[])
     }
 
     /// Like [`Self::create_pull_request`], but additionally accepts a GitLab
@@ -834,6 +834,13 @@ impl ForgeClient {
     /// entirely through an `owner:branch`-prefixed `head` called against the
     /// *parent's* own client instead (see `PrRoute`), never through a field
     /// on the request body.
+    ///
+    /// `labels` are put on the PR/MR as early as the forge allows: GitLab
+    /// takes them in the create call itself; GitHub's create endpoint has no
+    /// labels field, so each is added in a call straight after creation (a
+    /// failure there is logged, not returned -- the PR exists and a later
+    /// label reconcile corrects it).
+    #[allow(clippy::too_many_arguments)]
     pub fn create_pull_request_routed(
         &self,
         title: &str,
@@ -842,6 +849,7 @@ impl ForgeClient {
         base: &str,
         target_project_id: Option<i64>,
         draft: bool,
+        labels: &[&str],
     ) -> Result<CreatedPr, String> {
         // ralphus[ignore-rlog-pair]: this provider boundary has no Store; its caller records the structured workflow outcome
         crate::rlog!(
@@ -850,8 +858,15 @@ impl ForgeClient {
             self.kind.as_str(),
             self.repo_path
         );
-        let result =
-            self.create_pull_request_inner(title, body, head, base, target_project_id, draft);
+        let result = self.create_pull_request_inner(
+            title,
+            body,
+            head,
+            base,
+            target_project_id,
+            draft,
+            labels,
+        );
         match &result {
             // ralphus[ignore-rlog-pair]: this provider boundary has no Store; its caller records the structured workflow outcome
             Ok(pr) => crate::rlog!(
@@ -873,6 +888,7 @@ impl ForgeClient {
         result
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn create_pull_request_inner(
         &self,
         title: &str,
@@ -881,6 +897,7 @@ impl ForgeClient {
         base: &str,
         target_project_id: Option<i64>,
         draft: bool,
+        labels: &[&str],
     ) -> Result<CreatedPr, String> {
         let token = self.require_token()?;
         match self.kind {
@@ -904,6 +921,14 @@ impl ForgeClient {
                     .as_i64()
                     .ok_or_else(|| format!("unexpected GitHub PR response shape: {resp}"))?;
                 let url = resp["html_url"].as_str().unwrap_or_default().to_string();
+                for label in labels {
+                    if let Err(e) = self.set_pull_request_label(number, label, true) {
+                        crate::rlog!(
+                            WARNING,
+                            "ralphus [forge] could not label new pr #{number} with {label}: {e}"
+                        );
+                    }
+                }
                 Ok(CreatedPr {
                     number,
                     url,
@@ -934,6 +959,9 @@ impl ForgeClient {
                 });
                 if let Some(id) = target_project_id {
                     payload["target_project_id"] = serde_json::json!(id);
+                }
+                if !labels.is_empty() {
+                    payload["labels"] = serde_json::json!(labels.join(","));
                 }
                 let resp = self.send(
                     http_agent().post(&url).set("PRIVATE-TOKEN", token),
@@ -4721,6 +4749,21 @@ impl PrRoute {
         body: &str,
         draft: bool,
     ) -> Result<CreatedPr, String> {
+        self.create_pull_request_labeled(title, body, draft, &[])
+    }
+
+    /// [`Self::create_pull_request`] that also puts `labels` on the new
+    /// PR/MR right away -- see [`ForgeClient::create_pull_request_routed`].
+    ///
+    /// # Errors
+    /// Propagates the underlying forge API failure.
+    pub fn create_pull_request_labeled(
+        &self,
+        title: &str,
+        body: &str,
+        draft: bool,
+        labels: &[&str],
+    ) -> Result<CreatedPr, String> {
         self.create_client
             .as_ref()
             .unwrap_or(&self.client)
@@ -4731,6 +4774,7 @@ impl PrRoute {
                 &self.base,
                 self.target_project_id,
                 draft,
+                labels,
             )
     }
 
@@ -5806,8 +5850,74 @@ mod tests {
         });
         let client = mock.client(ForgeKind::GitLab, "alice%2Fwidget");
         client
-            .create_pull_request_routed("t", "b", "alias", "main", Some(42), false)
+            .create_pull_request_routed("t", "b", "alias", "main", Some(42), false, &[])
             .unwrap();
+        mock.finish();
+    }
+
+    #[test]
+    fn create_pull_request_gitlab_sends_labels_in_the_create_call() {
+        let mock = MockForge::start(move |server| {
+            let mut req = server.recv();
+            let mut body = String::new();
+            req.as_reader().read_to_string(&mut body).unwrap();
+            let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(json["labels"], serde_json::json!("ralphus:defer-full-ci"));
+            req.respond(
+                tiny_http::Response::from_string(r#"{"iid": 1, "web_url": "http://x"}"#)
+                    .with_status_code(201),
+            )
+            .unwrap();
+        });
+        let client = mock.client(ForgeKind::GitLab, "alice%2Fwidget");
+        client
+            .create_pull_request_routed(
+                "t",
+                "b",
+                "alias",
+                "main",
+                None,
+                false,
+                &["ralphus:defer-full-ci"],
+            )
+            .unwrap();
+        mock.finish();
+    }
+
+    #[test]
+    fn create_pull_request_github_labels_the_new_pr_right_after_creating_it() {
+        let mock = MockForge::start(move |server| {
+            let req = server.recv();
+            assert!(req.url().ends_with("/pulls"));
+            req.respond(
+                tiny_http::Response::from_string(
+                    r#"{"number": 7, "html_url": "http://x/7", "draft": false}"#,
+                )
+                .with_status_code(201),
+            )
+            .unwrap();
+            let mut req = server.recv();
+            assert!(req.url().ends_with("/issues/7/labels"));
+            let mut body = String::new();
+            req.as_reader().read_to_string(&mut body).unwrap();
+            let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(json["labels"], serde_json::json!(["ralphus:defer-full-ci"]));
+            req.respond(tiny_http::Response::from_string("[]").with_status_code(200))
+                .unwrap();
+        });
+        let client = mock.client(ForgeKind::GitHub, "acme/widget");
+        let created = client
+            .create_pull_request_routed(
+                "t",
+                "b",
+                "acme:alias",
+                "main",
+                None,
+                false,
+                &["ralphus:defer-full-ci"],
+            )
+            .unwrap();
+        assert_eq!(created.number, 7);
         mock.finish();
     }
 
