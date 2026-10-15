@@ -134,6 +134,9 @@ pub struct TriageScheduleRow {
 
 // ── Type registry ───────────────────────────────────────────────────────────
 
+/// How long a pending-classification marker is honored (RAL-662).
+const TRIAGE_PENDING_TTL_MS: i64 = 10 * 60 * 1000;
+
 impl Store {
     /// Register (or update) a Triage type. Upserts on `name`, matching
     /// [`Store::register_machine_provider`]'s behavior.
@@ -262,6 +265,10 @@ impl Store {
         triage_types: &[String],
     ) -> StoreResult<()> {
         self.conn.execute(
+            "DELETE FROM triage_pending_cells WHERE squad_id=? AND task_idx=? AND idx=?",
+            params![squad_id, task_idx, idx],
+        )?;
+        self.conn.execute(
             "DELETE FROM triage_cell_types WHERE squad_id=? AND task_idx=? AND idx=?",
             params![squad_id, task_idx, idx],
         )?;
@@ -273,6 +280,47 @@ impl Store {
             )?;
         }
         Ok(())
+    }
+
+    /// Records that a Triage-opted-in cell is awaiting Arbiter classification
+    /// (RAL-662); [`Self::set_cell_triage_types`] clears it.
+    ///
+    /// # Errors
+    /// Propagates any SQLite failure.
+    pub fn mark_cell_triage_pending(
+        &self,
+        squad_id: &str,
+        task_idx: i64,
+        idx: i64,
+    ) -> StoreResult<()> {
+        self.conn.execute(
+            "INSERT OR IGNORE INTO triage_pending_cells(squad_id, task_idx, idx, created_at_ms)
+             VALUES(?,?,?,?)",
+            params![squad_id, task_idx, idx, now_ms()],
+        )?;
+        Ok(())
+    }
+
+    /// `(task_idx, idx)` of every cell in `squad_id` still awaiting Arbiter
+    /// classification. Markers older than [`TRIAGE_PENDING_TTL_MS`] are
+    /// ignored so a classification lost to a daemon restart never leaves the
+    /// placeholder stuck.
+    ///
+    /// # Errors
+    /// Propagates any SQLite failure.
+    pub fn triage_pending_cells(
+        conn: &Connection,
+        squad_id: &str,
+    ) -> StoreResult<std::collections::HashSet<(i64, i64)>> {
+        let mut stmt = conn.prepare(
+            "SELECT task_idx, idx FROM triage_pending_cells WHERE squad_id=? AND created_at_ms>?",
+        )?;
+        let rows = stmt
+            .query_map(params![squad_id, now_ms() - TRIAGE_PENDING_TTL_MS], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })?
+            .collect::<std::result::Result<_, _>>()?;
+        Ok(rows)
     }
 
     /// The resolved Triage type(s) for one cell, alphabetical by name. Empty
@@ -2242,6 +2290,21 @@ prompt=\"y\"
                 subprojects: vec!["core".to_string()],
                 inferred: false,
             }
+        );
+    }
+
+    #[test]
+    fn triage_pending_marker_clears_when_types_are_written() {
+        let s = store();
+        s.mark_cell_triage_pending("squad-1", 0, 0).unwrap();
+        let pending = Store::triage_pending_cells(&s.conn, "squad-1").unwrap();
+        assert!(pending.contains(&(0, 0)));
+        s.set_cell_triage_types("squad-1", 0, 0, &["unclassified".to_string()])
+            .unwrap();
+        assert!(
+            Store::triage_pending_cells(&s.conn, "squad-1")
+                .unwrap()
+                .is_empty()
         );
     }
 

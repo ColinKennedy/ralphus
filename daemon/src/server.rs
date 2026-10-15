@@ -7091,6 +7091,7 @@ pub(crate) fn submit(daemon: &Daemon, body: &str, query: &str, user_header: Opti
                     .clone()
                     .or_else(|| cell.command.clone())
                     .unwrap_or_default();
+                let _ = store.mark_cell_triage_pending(&squad_id, task_idx, idx);
                 pending_classifications.push(crate::arbiter::PendingClassification {
                     task_idx,
                     idx,
