@@ -687,11 +687,6 @@ files or cell replies:
   machine provider, print these on stderr; the daemon's stderr-reading
   thread forwards them. Note the provider must not block its own stderr pipe
   on the forwarding thread.
-- **`RALPHUS_TMUX_DONE: <status>`** — a stdout sentinel the runner prints
-  into its tmux pane once it has written its result file (RAL-102). The
-  daemon polls pane content for a **standalone line of that exact form** —
-  deliberately not a substring scan, which false-positives whenever the
-  cell's own work echoes the literal marker.
 - **`RALPHUS_THINKING: <one line of reasoning>`** — a stdout marker the
   runner prints before each line of model thinking/reasoning content, for
   backends that report thinking as its own distinct event stream (RAL-434;

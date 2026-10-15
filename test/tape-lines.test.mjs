@@ -85,11 +85,6 @@ test("agent output lines are kept verbatim (with the trailing CR of a CRLF trimm
   assert.equal(classifyTapeLine("hello world\r", false, true), "hello world");
 });
 
-test("the done sentinel is always dropped, in both debug states", () => {
-  assert.equal(classifyTapeLine("RALPHUS_TMUX_DONE: ok", false, true), null);
-  assert.equal(classifyTapeLine("RALPHUS_TMUX_DONE: ok", true, true), null);
-});
-
 test("RALPHUS_EVENT lines are dropped when Debug is off", () => {
   assert.equal(classifyTapeLine('RALPHUS_EVENT: {"source":"claude-code","message":"live usage"}', false, true), null);
 });
@@ -131,28 +126,26 @@ test("malformed event JSON falls back to the raw payload rather than throwing", 
 
 // ---- renderTapeLines (the whole pipeline) ----
 
-test("renderTapeLines strips ANSI, drops sentinels/events, and joins agent output (Debug off)", () => {
+test("renderTapeLines strips ANSI, drops events, and joins agent output (Debug off)", () => {
   const raw = [
     "\x1b[32mbuilding...\x1b[0m",
     'RALPHUS_EVENT: {"source":"claude-code","message":"live usage"}',
     "done",
-    "RALPHUS_TMUX_DONE: ok",
   ];
   assert.equal(renderTapeLines(raw, false, true), "building...\ndone");
 });
 
-test("renderTapeLines inlines events in place when Debug is on, still dropping the sentinel", () => {
+test("renderTapeLines inlines events in place when Debug is on", () => {
   const raw = [
     "building...",
     'RALPHUS_EVENT: {"source":"claude-code","message":"live usage"}',
     "done",
-    "RALPHUS_TMUX_DONE: ok",
   ];
   const out = renderTapeLines(raw, true, true).split("\n");
   assert.equal(out[0], "building...");
   assert.ok(out[1].includes("live usage"), "the event is rendered inline right where it occurred");
   assert.equal(out[2], "done");
-  assert.equal(out.length, 3, "the done sentinel is still dropped");
+  assert.equal(out.length, 3);
 });
 
 // ---- RAL-434: the "Show Thinking" fold ----
