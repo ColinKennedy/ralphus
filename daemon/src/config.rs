@@ -2588,6 +2588,15 @@ pub fn resolve_command_shell(cwd: &Path) -> Option<String> {
     project.flatten().or(global.flatten())
 }
 
+/// The shell a command cell or proof step rooted at `cwd` runs under when it
+/// declares none: [`resolve_command_shell`], then `cmd` on Windows and `sh`
+/// elsewhere.
+#[must_use]
+pub fn effective_command_shell(cwd: &Path) -> String {
+    resolve_command_shell(cwd)
+        .unwrap_or_else(|| if cfg!(windows) { "cmd" } else { "sh" }.to_string())
+}
+
 /// Whether `key` is a syntactically valid environment-variable name
 /// (`[A-Za-z_][A-Za-z0-9_]*`) — required for a RAL-150 env override key.
 /// Enforced at the API boundary ([`crate::server`]'s env-override handler)

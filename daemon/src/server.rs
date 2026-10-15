@@ -8799,6 +8799,10 @@ struct EditBody {
     prompt: Option<String>,
     #[serde(default)]
     command: Option<String>,
+    /// Shell a `command` cell or proof step runs under; blank clears it back
+    /// to the project/platform default.
+    #[serde(default)]
+    shell: Option<String>,
     #[serde(default)]
     auto_compact_threshold: Option<String>,
     #[serde(default)]
@@ -9043,8 +9047,13 @@ fn reject_unsupported_temperature(agent: &str) -> Option<Reply> {
 /// just its own. Observed live: a squad's cell being edited on a ~5s cadence
 /// made an unrelated, otherwise-trivial 2-task squad's materialization take
 /// nearly a minute because it could never get the lock.
-fn cell_edit_is_noop(current: &crate::store::CellRow, edit: &crate::store::CellEdit<'_>) -> bool {
-    edit.cwd.is_none_or(|v| v == current.cwd.as_deref())
+fn cell_edit_is_noop(
+    current: &crate::store::CellRow,
+    current_shell: Option<&str>,
+    edit: &crate::store::CellEdit<'_>,
+) -> bool {
+    edit.shell.is_none_or(|v| v == current_shell)
+        && edit.cwd.is_none_or(|v| v == current.cwd.as_deref())
         && edit.agent.is_none_or(|v| v == current.agent)
         && edit.model.is_none_or(|v| v == current.model.as_deref())
         && edit.prompt.is_none_or(|v| v == current.prompt.as_deref())
@@ -9221,12 +9230,37 @@ fn edit_squad(daemon: &Daemon, id: &str, body: &str) -> Reply {
                 Ok(v) => v,
                 Err(msg) => return error(400, "bad_request", &msg, vec![]),
             };
+            let shell = nullable_field_edit(req.shell.as_ref());
+            // A shell only means something to a `command` cell: setting one
+            // on a cell that is (or is being edited into) a prompt cell is
+            // rejected, while clearing it is always fine.
+            if let Some(Some(_)) = shell {
+                let stays_command = match command {
+                    Some(c) => c.is_some(),
+                    None => match daemon.lock().cells_of(id) {
+                        Ok(cells) => cells
+                            .iter()
+                            .find(|c| c.task_idx == req.task_idx && c.idx == req.cell_idx)
+                            .is_some_and(|c| c.command.is_some()),
+                        Err(e) => return store_error(&e),
+                    },
+                };
+                if !stays_command {
+                    return error(
+                        400,
+                        "bad_request",
+                        "'shell' is only valid on a command cell, not a prompt cell",
+                        vec![],
+                    );
+                }
+            }
             let edit = crate::store::CellEdit {
                 cwd: nullable_field_edit(req.cwd.as_ref()),
                 agent: new_agent,
                 model: nullable_field_edit(req.model.as_ref()),
                 prompt,
                 command,
+                shell,
                 auto_compact_threshold,
                 maximum_context,
                 maximum_tool_output_tokens,
@@ -9237,16 +9271,24 @@ fn edit_squad(daemon: &Daemon, id: &str, body: &str) -> Reply {
             // Computed before the write below so it reflects the PRE-edit
             // state -- see `cell_edit_is_noop`'s doc comment for why this
             // guards the restart cascade rather than the write itself.
-            let is_noop = daemon
-                .lock()
-                .cells_of(id)
-                .ok()
-                .and_then(|cells| {
-                    cells
-                        .into_iter()
-                        .find(|c| c.task_idx == req.task_idx && c.idx == req.cell_idx)
-                })
-                .is_some_and(|current| cell_edit_is_noop(&current, &edit));
+            let is_noop = {
+                let store = daemon.lock();
+                let current_shell = store
+                    .cell_shell(id, req.task_idx, req.cell_idx)
+                    .ok()
+                    .flatten();
+                store
+                    .cells_of(id)
+                    .ok()
+                    .and_then(|cells| {
+                        cells
+                            .into_iter()
+                            .find(|c| c.task_idx == req.task_idx && c.idx == req.cell_idx)
+                    })
+                    .is_some_and(|current| {
+                        cell_edit_is_noop(&current, current_shell.as_deref(), &edit)
+                    })
+            };
             if let Err(e) = daemon
                 .lock()
                 .edit_cell_fields(id, req.task_idx, req.cell_idx, &edit)
@@ -9331,10 +9373,69 @@ fn edit_squad(daemon: &Daemon, id: &str, body: &str) -> Reply {
                 .as_deref()
                 .map(crate::store::ProofBody::Command)
                 .or_else(|| req.prompt.as_deref().map(crate::store::ProofBody::Prompt));
+            let shell = nullable_field_edit(req.shell.as_ref());
+            // Same rule as the `"cell"` arm: a shell only means something to
+            // a `command` step, so setting one on a step that is (or is being
+            // edited into) a prompt step is rejected; clearing is always fine.
+            if let Some(Some(_)) = shell {
+                let stays_command = match body {
+                    Some(crate::store::ProofBody::Command(_)) => true,
+                    Some(crate::store::ProofBody::Prompt(_)) => false,
+                    None => match daemon.lock().proofs_for(
+                        id,
+                        req.task_idx,
+                        &req.proof_scope,
+                        req.cell_idx,
+                    ) {
+                        Ok(steps) => usize::try_from(req.proof_idx)
+                            .ok()
+                            .and_then(|i| steps.get(i))
+                            .is_some_and(|s| s.kind == "command"),
+                        Err(e) => return store_error(&e),
+                    },
+                };
+                if !stays_command {
+                    return error(
+                        400,
+                        "bad_request",
+                        "'shell' is only valid on a command proof step, not a prompt step",
+                        vec![],
+                    );
+                }
+            }
+            // A request that only resubmits the shell the step already has
+            // changes nothing, so it must not restart the proof list.
+            let shell_only_noop = match shell {
+                Some(wanted)
+                    if new_agent.is_none()
+                        && req.model.is_none()
+                        && body.is_none()
+                        && maximum_tool_output_tokens.is_none() =>
+                {
+                    daemon
+                        .lock()
+                        .proof_shell(
+                            id,
+                            req.task_idx,
+                            &req.proof_scope,
+                            req.cell_idx,
+                            req.proof_idx,
+                        )
+                        .is_ok_and(|current| current.as_deref() == wanted)
+                }
+                _ => false,
+            };
+            if shell_only_noop {
+                return match daemon.lock().get_squad(id) {
+                    Ok(squad) => json(200, &squad),
+                    Err(e) => store_error(&e),
+                };
+            }
             let edit = crate::store::ProofEdit {
                 agent: new_agent,
                 model: nullable_field_edit(req.model.as_ref()),
                 body,
+                shell,
                 maximum_tool_output_tokens,
             };
             if let Err(e) = daemon.lock().edit_proof_fields(
@@ -25472,6 +25573,7 @@ temperature=0.5
             model: None,
             prompt: None,
             command: None,
+            shell: None,
             auto_compact_threshold: None,
             maximum_context: None,
             maximum_tool_output_tokens: None,
@@ -25479,12 +25581,12 @@ temperature=0.5
             temperature: Some(Some(0.5)),
             system_prompt: None,
         };
-        assert!(cell_edit_is_noop(&current, &edit));
+        assert!(cell_edit_is_noop(&current, None, &edit));
         edit.effort = Some(Some("high"));
-        assert!(!cell_edit_is_noop(&current, &edit));
+        assert!(!cell_edit_is_noop(&current, None, &edit));
         edit.effort = None;
         edit.temperature = Some(None);
-        assert!(!cell_edit_is_noop(&current, &edit));
+        assert!(!cell_edit_is_noop(&current, None, &edit));
     }
 
     #[test]
@@ -25892,6 +25994,218 @@ prompt=\"check\"
         let r = route(&d, "POST", "/api/squads/squad-000000000001/edit", &clear);
         assert_eq!(r.status, 200, "{}", r.body);
         assert!(!r.body.contains("maximum_tool_output_tokens"), "{}", r.body);
+    }
+
+    const SHELL_SQUAD: &str = "[[task]]
+name=\"t\"
+[[task.cell]]
+cwd=\".\"
+command=\"echo hi\"
+remediation_attempts=1
+[[task.cell.proof]]
+command=\"echo ok\"
+remediation_attempts=1
+[[task.cell]]
+cwd=\".\"
+prompt=\"p\"
+agent=\"claude-code\"
+[[task.cell.proof]]
+prompt=\"check\"
+";
+
+    fn edit_json(d: &Daemon, body: serde_json::Value) -> Reply {
+        route(
+            d,
+            "POST",
+            "/api/squads/squad-000000000001/edit",
+            &body.to_string(),
+        )
+    }
+
+    fn squad_state_of(r: &Reply) -> String {
+        let v: serde_json::Value = serde_json::from_str(&r.body).unwrap();
+        v["state"].as_str().unwrap().to_string()
+    }
+
+    #[test]
+    fn edit_cell_shell_set_clear_and_noop() {
+        let d = daemon();
+        let sub = route(&d, "POST", "/api/squads", &submit_body(SHELL_SQUAD));
+        assert_eq!(sub.status, 201, "{}", sub.body);
+        let set = serde_json::json!({
+            "kind": "cell", "task_idx": 0, "cell_idx": 0, "shell": "bash"
+        });
+        let r = edit_json(&d, set.clone());
+        assert_eq!(r.status, 200, "{}", r.body);
+        assert!(r.body.contains("\"shell\":\"bash\""), "{}", r.body);
+        assert!(
+            r.body.contains("\"effective_shell\":\"bash\""),
+            "{}",
+            r.body
+        );
+        assert_eq!(
+            d.lock().cell_shell("squad-000000000001", 0, 0).unwrap(),
+            Some("bash".to_string())
+        );
+
+        // Resubmitting the same shell restarts nothing.
+        d.lock()
+            .set_squad_state("squad-000000000001", SquadState::Done)
+            .unwrap();
+        let r = edit_json(&d, set);
+        assert_eq!(r.status, 200, "{}", r.body);
+        assert_eq!(squad_state_of(&r), "done", "{}", r.body);
+
+        // A different shell restarts the cell (and so the squad).
+        let r = edit_json(
+            &d,
+            serde_json::json!({"kind": "cell", "task_idx": 0, "cell_idx": 0, "shell": "pwsh"}),
+        );
+        assert_eq!(r.status, 200, "{}", r.body);
+        assert_ne!(squad_state_of(&r), "done", "{}", r.body);
+
+        // Blank clears back to the default.
+        let r = edit_json(
+            &d,
+            serde_json::json!({"kind": "cell", "task_idx": 0, "cell_idx": 0, "shell": ""}),
+        );
+        assert_eq!(r.status, 200, "{}", r.body);
+        assert_eq!(
+            d.lock().cell_shell("squad-000000000001", 0, 0).unwrap(),
+            None
+        );
+        assert!(!r.body.contains("\"shell\":\"pwsh\""), "{}", r.body);
+    }
+
+    #[test]
+    fn edit_cell_shell_rejected_on_prompt_cell_but_clear_is_fine() {
+        let d = daemon();
+        let sub = route(&d, "POST", "/api/squads", &submit_body(SHELL_SQUAD));
+        assert_eq!(sub.status, 201, "{}", sub.body);
+        let r = edit_json(
+            &d,
+            serde_json::json!({"kind": "cell", "task_idx": 0, "cell_idx": 1, "shell": "bash"}),
+        );
+        assert_eq!(r.status, 400, "{}", r.body);
+        assert!(r.body.contains("shell"), "{}", r.body);
+        let r = edit_json(
+            &d,
+            serde_json::json!({"kind": "cell", "task_idx": 0, "cell_idx": 1, "shell": ""}),
+        );
+        assert_eq!(r.status, 200, "{}", r.body);
+        // Switching a command cell to a prompt while setting a shell is
+        // rejected too.
+        let r = edit_json(
+            &d,
+            serde_json::json!({
+                "kind": "cell", "task_idx": 0, "cell_idx": 0,
+                "prompt": "now a prompt", "shell": "bash"
+            }),
+        );
+        assert_eq!(r.status, 400, "{}", r.body);
+    }
+
+    #[test]
+    fn edit_cell_command_to_prompt_nulls_the_stored_shell() {
+        let d = daemon();
+        let sub = route(&d, "POST", "/api/squads", &submit_body(SHELL_SQUAD));
+        assert_eq!(sub.status, 201, "{}", sub.body);
+        let r = edit_json(
+            &d,
+            serde_json::json!({"kind": "cell", "task_idx": 0, "cell_idx": 0, "shell": "bash"}),
+        );
+        assert_eq!(r.status, 200, "{}", r.body);
+        let r = edit_json(
+            &d,
+            serde_json::json!({
+                "kind": "cell", "task_idx": 0, "cell_idx": 0, "prompt": "now a prompt"
+            }),
+        );
+        assert_eq!(r.status, 200, "{}", r.body);
+        assert_eq!(
+            d.lock().cell_shell("squad-000000000001", 0, 0).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn edit_proof_shell_set_clear_noop_and_prompt_rejection() {
+        let d = daemon();
+        let sub = route(&d, "POST", "/api/squads", &submit_body(SHELL_SQUAD));
+        assert_eq!(sub.status, 201, "{}", sub.body);
+        let proof = |cell_idx: i64, shell: &str| {
+            serde_json::json!({
+                "kind": "proof", "task_idx": 0, "proof_scope": "cell",
+                "cell_idx": cell_idx, "proof_idx": 0, "shell": shell,
+            })
+        };
+        let r = edit_json(&d, proof(0, "bash"));
+        assert_eq!(r.status, 200, "{}", r.body);
+        assert!(r.body.contains("\"shell\":\"bash\""), "{}", r.body);
+        assert_eq!(
+            d.lock()
+                .proof_shell("squad-000000000001", 0, "cell", 0, 0)
+                .unwrap(),
+            Some("bash".to_string())
+        );
+
+        // Same value again: no restart.
+        d.lock()
+            .set_squad_state("squad-000000000001", SquadState::Done)
+            .unwrap();
+        let r = edit_json(&d, proof(0, "bash"));
+        assert_eq!(r.status, 200, "{}", r.body);
+        assert_eq!(squad_state_of(&r), "done", "{}", r.body);
+
+        // A changed value restarts.
+        let r = edit_json(&d, proof(0, "pwsh"));
+        assert_eq!(r.status, 200, "{}", r.body);
+        assert_ne!(squad_state_of(&r), "done", "{}", r.body);
+
+        // Clear.
+        let r = edit_json(&d, proof(0, ""));
+        assert_eq!(r.status, 200, "{}", r.body);
+        assert_eq!(
+            d.lock()
+                .proof_shell("squad-000000000001", 0, "cell", 0, 0)
+                .unwrap(),
+            None
+        );
+
+        // A prompt proof step rejects a shell, but accepts a clear.
+        let r = edit_json(&d, proof(1, "bash"));
+        assert_eq!(r.status, 400, "{}", r.body);
+        let r = edit_json(&d, proof(1, ""));
+        assert_eq!(r.status, 200, "{}", r.body);
+    }
+
+    #[test]
+    fn edit_proof_command_to_prompt_nulls_the_stored_shell() {
+        let d = daemon();
+        let sub = route(&d, "POST", "/api/squads", &submit_body(SHELL_SQUAD));
+        assert_eq!(sub.status, 201, "{}", sub.body);
+        let r = edit_json(
+            &d,
+            serde_json::json!({
+                "kind": "proof", "task_idx": 0, "proof_scope": "cell",
+                "cell_idx": 0, "proof_idx": 0, "shell": "bash",
+            }),
+        );
+        assert_eq!(r.status, 200, "{}", r.body);
+        let r = edit_json(
+            &d,
+            serde_json::json!({
+                "kind": "proof", "task_idx": 0, "proof_scope": "cell",
+                "cell_idx": 0, "proof_idx": 0, "prompt": "check it",
+            }),
+        );
+        assert_eq!(r.status, 200, "{}", r.body);
+        assert_eq!(
+            d.lock()
+                .proof_shell("squad-000000000001", 0, "cell", 0, 0)
+                .unwrap(),
+            None
+        );
     }
 
     #[test]

@@ -59,6 +59,8 @@
        * @property {AppraisalView} [appraisal] - RAL-575: latest appraisal of a scored prompt proof step; absent for unscored steps and until one is recorded.
        * @property {string|null} id
        * @property {string} kind - "command" | "prompt"
+       * @property {string} [shell] - RAL-664: the shell declared for a command step; absent when none is declared.
+       * @property {string} [effective_shell] - RAL-664: the shell a command step actually runs under (declared, else the configured default, else the platform default).
        * @property {string} state - "pending" | "running" | "done" | "failed" | "cancelled"
        * @property {number} duration_ms - Completed active duration plus any active interval at response time.
        * @property {number} active_duration_intervals - Active intervals contributing to live duration updates.
@@ -114,6 +116,8 @@
        * @property {ProofView[]} [proof]
        * @property {string[]} [depends_on]
        * @property {string} [command]
+       * @property {string} [shell] - RAL-664: the shell declared for a command cell; absent when none is declared.
+       * @property {string} [effective_shell] - RAL-664: the shell a command cell actually runs under (declared, else the configured default, else the platform default).
        * @property {string} [prompt]
        * @property {string} [description]
        * @property {string} [success]

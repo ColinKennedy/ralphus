@@ -333,7 +333,7 @@ the daemon's hourly Free-tier background sweep
 | `cell restart <selector>` | Restart a cell and its downstream |
 | `cell copy <selector> [--from-branch]` | Copy a cell into a new one-task squad from a clean base (or from the cell's own branch), linked both ways (RAL-641) |
 | `cell restart-proof <selector> --from <i>` | Restart every cell-level proof step, re-running from the start |
-| `cell edit <selector> [--cwd] [--agent] [--model] [--prompt] [--command] [--system-prompt] [--initialization-commands] [--initialization-timeout-sec]` | Edit a cell's fields |
+| `cell edit <selector> [--cwd] [--agent] [--model] [--prompt] [--command] [--shell] [--system-prompt] [--initialization-commands] [--initialization-timeout-sec]` | Edit a cell's fields |
 | `cell terminal <selector> [--mode open\|readonly]` | Print the `claude --resume` command + cwd (does **not** ask the daemon to spawn a terminal — see below) |
 
 ## proof
@@ -343,7 +343,7 @@ the daemon's hourly Free-tier background sweep
 | `proof show <selector>` | Proof step detail (kind, state, spec, output) |
 | `proof set-status <selector> <state>` | Override a proof step's status |
 | `proof restart <selector>` | Restart a proof step (dispatches to the task- or cell-scoped restart endpoint) |
-| `proof edit <selector> [--agent] [--model] [--command] [--prompt] [--maximum-tool-output-tokens]` | Edit a proof step's agent/model/command/prompt/tool-output-cap overrides |
+| `proof edit <selector> [--agent] [--model] [--command] [--prompt] [--shell] [--maximum-tool-output-tokens]` | Edit a proof step's agent/model/command/prompt/shell/tool-output-cap overrides |
 
 ## review
 

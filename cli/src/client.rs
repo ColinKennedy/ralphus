@@ -1638,6 +1638,7 @@ impl DaemonClient {
         model: Option<&str>,
         command: Option<&str>,
         prompt: Option<&str>,
+        shell: Option<&str>,
         maximum_tool_output_tokens: Option<&str>,
     ) -> Result<Value, DaemonError> {
         let mut body = json!({
@@ -1651,6 +1652,7 @@ impl DaemonClient {
         set_if_some(&mut body, "model", model.map(str::to_string));
         set_if_some(&mut body, "command", command.map(str::to_string));
         set_if_some(&mut body, "prompt", prompt.map(str::to_string));
+        set_if_some(&mut body, "shell", shell.map(str::to_string));
         set_if_some(
             &mut body,
             "maximum_tool_output_tokens",
@@ -1670,6 +1672,7 @@ impl DaemonClient {
         model: Option<&str>,
         prompt: Option<&str>,
         command: Option<&str>,
+        shell: Option<&str>,
         auto_compact_threshold: Option<&str>,
         maximum_context: Option<&str>,
         maximum_tool_output_tokens: Option<&str>,
@@ -1685,6 +1688,7 @@ impl DaemonClient {
         set_if_some(&mut body, "model", model.map(str::to_string));
         set_if_some(&mut body, "prompt", prompt.map(str::to_string));
         set_if_some(&mut body, "command", command.map(str::to_string));
+        set_if_some(&mut body, "shell", shell.map(str::to_string));
         set_if_some(
             &mut body,
             "auto_compact_threshold",
