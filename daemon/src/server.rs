@@ -8043,6 +8043,8 @@ fn squad_worktrees(daemon: &Daemon, id: &str) -> Reply {
 /// never pulled) and cached against the push version, so repeat calls with
 /// nothing new are free. A cell whose worktree is not on this host (SSH
 /// machine) still reports its pushed summary but has no pullable full diff.
+/// The summary is the worktree's: cells sharing a `cwd` all report the freshest
+/// push among them, measured against the worktree's fork-point baseline.
 fn cell_diff(daemon: &Daemon, id: &str, query: &str) -> Reply {
     let idx = |key: &str| query_param(query, key).and_then(|v| v.parse::<i64>().ok());
     let (Some(task_idx), Some(cell_idx)) = (idx("task"), idx("cell")) else {
@@ -8065,7 +8067,21 @@ fn cell_diff(daemon: &Daemon, id: &str, query: &str) -> Reply {
         return error(404, "not_found", "no such cell", vec![]);
     };
     let memory = daemon.lock().memory();
-    let key = crate::store_memory::StoreMemory::cell_diff_key(id, &row.task_name, &row.cell_id);
+    // Cells sharing a worktree share one summary: the freshest push from any
+    // of them, all measured against the worktree's one base.
+    let own_key = crate::store_memory::StoreMemory::cell_diff_key(id, &row.task_name, &row.cell_id);
+    let sibling_keys: Vec<String> = match row.cwd.as_deref().filter(|c| !c.is_empty()) {
+        Some(cwd) => rows
+            .iter()
+            .filter(|r| r.cwd.as_deref() == Some(cwd))
+            .map(|r| crate::store_memory::StoreMemory::cell_diff_key(id, &r.task_name, &r.cell_id))
+            .collect(),
+        None => vec![own_key.clone()],
+    };
+    let key = memory
+        .freshest_cell_diff_key(&sibling_keys)
+        .cloned()
+        .unwrap_or(own_key);
     let state = memory.cell_diff_state(&key);
     let version = state.as_ref().map_or(0, |s| s.version);
     let summary = state

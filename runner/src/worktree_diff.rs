@@ -10,9 +10,13 @@
 //!
 //! The summary is computed without touching the index (no `git add -N`), so it
 //! cannot contend with the agent's own git operations or alter what it later
-//! commits: tracked changes come from `git diff` against the commit `HEAD`
-//! pointed at when the watcher started (so commits the agent makes still
-//! count), and untracked files are counted by reading them.
+//! commits: tracked changes come from `git diff` against the worktree's base
+//! (so commits the agent makes still count), and untracked files are counted
+//! by reading them.
+//!
+//! The base is a property of the worktree, not of the cell: every cell sharing
+//! a worktree measures against the same commit ([`worktree_base`]), so they all
+//! report the same net change however many cells committed before them.
 
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
@@ -42,7 +46,7 @@ const MAX_INTERVAL: Duration = Duration::from_secs(8);
 /// Untracked files larger than this are counted as zero lines rather than read.
 const MAX_UNTRACKED_READ_BYTES: u64 = 1024 * 1024;
 
-/// Numstat-style counts of what a worktree has changed since the watcher began.
+/// Numstat-style counts of what a worktree has changed since its base.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct DiffSummary {
     pub files_changed: u64,
@@ -140,6 +144,31 @@ fn head_commit_detailed(root: &Path) -> Result<String, String> {
         return Ok(head);
     }
     git_detailed(root, &["rev-parse", "--verify", "HEAD"]).map(|s| s.trim().to_string())
+}
+
+/// The commit a worktree's change counts are measured against: the frozen
+/// `ralphus.<branch>.baseline` marker the daemon writes when it claims the
+/// worktree (its fork point, moved only when the branch is rebased onto an
+/// upstream task), so every cell in the worktree agrees on it. Falls back to the
+/// commit `HEAD` points at now for a checkout that was never claimed that way.
+fn worktree_base(root: &Path) -> Result<String, String> {
+    if let Ok(branch) = git_detailed(root, &["rev-parse", "--abbrev-ref", "HEAD"]) {
+        let branch = branch.trim();
+        if !branch.is_empty() && branch != "HEAD" {
+            let key = format!("ralphus.{branch}.baseline");
+            if let Ok(marker) = git_detailed(root, &["config", "--get", &key]) {
+                let marker = format!("{}^{{commit}}", marker.trim());
+                if let Ok(sha) = git_detailed(root, &["rev-parse", "--verify", "--quiet", &marker])
+                {
+                    let sha = sha.trim();
+                    if !sha.is_empty() {
+                        return Ok(sha.to_string());
+                    }
+                }
+            }
+        }
+    }
+    head_commit_detailed(root)
 }
 
 fn count_lines(path: &Path) -> u64 {
@@ -295,7 +324,7 @@ impl WorktreeWatcher {
         max: Duration,
         emit: impl Fn(&str, &DiffSummary) + Send + 'static,
     ) -> Option<Self> {
-        let baseline = match head_commit_detailed(root) {
+        let baseline = match worktree_base(root) {
             Ok(head) => head,
             Err(error) => {
                 cartographer::emit(
@@ -311,7 +340,10 @@ impl WorktreeWatcher {
         let root: PathBuf = root.to_path_buf();
         let (stop, rx) = mpsc::channel::<()>();
         let handle = std::thread::spawn(move || {
-            let mut last = DiffSummary::default();
+            // `None` until the first measurement, which is always pushed: a
+            // cell that changed nothing then reports a real zero instead of
+            // silence.
+            let mut last: Option<DiffSummary> = None;
             let mut backoff = Backoff::new(min, max);
             // Polls repeat every few seconds, so a persistent failure is
             // reported once when it starts and once when it clears, not per
@@ -320,7 +352,7 @@ impl WorktreeWatcher {
             // One libgit2 handle for the watcher's whole life; `None` when
             // libgit2 cannot read this repository (polls then spawn git).
             let mut repo = crate::git_inproc::Repo::open(&root).ok();
-            let mut poll = |last: &mut DiffSummary| -> bool {
+            let mut poll = |last: &mut Option<DiffSummary>| -> bool {
                 match summarize_polled(&mut repo, &root, &baseline) {
                     Ok(now) => {
                         if failing {
@@ -333,10 +365,10 @@ impl WorktreeWatcher {
                                 json!({"root": root.display().to_string()}),
                             );
                         }
-                        if now == *last {
+                        if *last == Some(now) {
                             return false;
                         }
-                        *last = now;
+                        *last = Some(now);
                         emit(&baseline, &now);
                         true
                     }
@@ -355,6 +387,7 @@ impl WorktreeWatcher {
                     }
                 }
             };
+            poll(&mut last);
             loop {
                 match rx.recv_timeout(backoff.current()) {
                     Err(RecvTimeoutError::Timeout) => {
@@ -552,6 +585,106 @@ mod tests {
             summarize_polled(&mut repo, &dir, &base).unwrap(),
             DiffSummary::default()
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Runs a watcher over `dir` to its final poll and returns every summary it
+    /// pushed.
+    fn watch_once(dir: &Path) -> Vec<DiffSummary> {
+        let seen: Arc<Mutex<Vec<DiffSummary>>> = Arc::default();
+        let sink = Arc::clone(&seen);
+        let watcher = WorktreeWatcher::start_with(
+            dir,
+            Duration::from_millis(20),
+            Duration::from_millis(80),
+            move |_, s| sink.lock().unwrap().push(*s),
+        )
+        .expect("git worktree");
+        drop(watcher);
+        let out = seen.lock().unwrap().clone();
+        out
+    }
+
+    fn claim_base(dir: &Path) -> String {
+        let base = head_commit(dir).unwrap();
+        let branch = git_detailed(dir, &["rev-parse", "--abbrev-ref", "HEAD"]).unwrap();
+        run(
+            dir,
+            &[
+                "config",
+                &format!("ralphus.{}.baseline", branch.trim()),
+                &base,
+            ],
+        );
+        base
+    }
+
+    #[test]
+    fn a_cell_that_changes_nothing_pushes_an_explicit_zero() {
+        let dir = temp_repo("zero");
+        assert_eq!(watch_once(&dir), vec![DiffSummary::default()]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cells_sharing_a_worktree_report_the_same_net_change() {
+        let dir = temp_repo("shared");
+        claim_base(&dir);
+
+        // Cell one commits a file, edits another, and leaves an untracked file.
+        std::fs::write(
+            dir.join("b.txt"),
+            "b
+",
+        )
+        .unwrap();
+        run(&dir, &["add", "b.txt"]);
+        run(&dir, &["commit", "-q", "-m", "work"]);
+        std::fs::write(
+            dir.join("a.txt"),
+            "one
+two
+three
+",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("new.txt"),
+            "x
+y
+",
+        )
+        .unwrap();
+        let first = *watch_once(&dir).last().unwrap();
+        assert_eq!(first.files_changed, 3);
+        assert_eq!(first.lines_added, 4);
+
+        // Cell two starts after cell one committed and does nothing: it still
+        // reports the worktree's net change, not zero and not a smaller number.
+        run(&dir, &["commit", "-q", "-am", "more"]);
+        let second = watch_once(&dir);
+        assert_eq!(second, vec![first]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_change_reverted_by_a_later_cell_nets_out() {
+        let dir = temp_repo("revert");
+        claim_base(&dir);
+        std::fs::write(
+            dir.join("b.txt"),
+            "b
+",
+        )
+        .unwrap();
+        run(&dir, &["add", "b.txt"]);
+        run(&dir, &["commit", "-q", "-m", "work"]);
+        assert_eq!(watch_once(&dir).last().unwrap().files_changed, 1);
+
+        // A later cell removes the file again: the net change is zero.
+        run(&dir, &["rm", "-q", "b.txt"]);
+        run(&dir, &["commit", "-q", "-m", "revert"]);
+        assert_eq!(watch_once(&dir), vec![DiffSummary::default()]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
