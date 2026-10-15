@@ -119,6 +119,15 @@ pub struct Parsed {
     /// [`Status::Unparsed`] when the grammar could place it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error_line: Option<u32>,
+    /// Number of error or missing nodes the grammar found, set only with
+    /// [`Status::Unparsed`]. Comparing it across grammars says which shell a
+    /// text fits best.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub error_count: u32,
+}
+
+fn is_zero(n: &u32) -> bool {
+    *n == 0
 }
 
 impl Parsed {
@@ -129,6 +138,7 @@ impl Parsed {
             commands: Vec::new(),
             spans: Vec::new(),
             error_line: None,
+            error_count: 0,
         }
     }
 }

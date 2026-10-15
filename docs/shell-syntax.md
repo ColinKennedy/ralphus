@@ -57,13 +57,20 @@ board stops asking for the rest of the session.
 tool also use the parser (feature `shell-syntax` on `ralphus-core`, forwarded by
 the daemon, CLI and MCP crates) to warn -- never fail -- when a cell or proof
 `command` does not fit its shell (`core/src/shell_check.rs`, warning kind
-`shell_mismatch`):
+`shell_mismatch`).
 
-- Explicit `shell` of the Bash family or PowerShell family, command fails that
-  grammar but parses as the other: names both shells and suggests the fix.
-- Explicit shell, fails and parses as neither: syntax error with the line within
-  the command.
-- `shell` unset: only a command that parses as PowerShell and contains a
-  `Verb-Noun` cmdlet or `$env:` gets a "set `shell = "powershell"`" suggestion.
-- `cmd` and other shells are not checked (no grammar yet). Without the feature
-  the check is skipped silently.
+Ralphus does not guess the shell itself. The command is parsed with the Bash,
+PowerShell and cmd grammars and each reports how many syntax errors it found;
+the grammar with the fewest wins.
+
+- Explicit `shell` that has a grammar (Bash family, PowerShell family, `cmd`)
+  and parses cleanly: no warning.
+- Explicit shell with errors, another grammar reports strictly fewer: names both
+  shells and suggests the fix. A tie is not a suggestion.
+- Explicit shell with errors and no grammar does better: syntax error with the
+  line within the command.
+- `shell` unset: the host's default shell (PowerShell on Windows, Bash
+  elsewhere) stands in; the same comparison applies, but without a better
+  grammar nothing is said.
+- Shells with no grammar are not checked. Without the feature the check is
+  skipped silently.

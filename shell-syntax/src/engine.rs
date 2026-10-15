@@ -58,6 +58,7 @@ pub(crate) fn parse(shell: Shell, text: &str) -> Parsed {
             };
             at.row as u32 + 1
         });
+        parsed.error_count = count_errors(root);
         return parsed;
     }
     let mut items = Vec::new();
@@ -73,7 +74,21 @@ pub(crate) fn parse(shell: Shell, text: &str) -> Parsed {
         commands: rows(text, &items),
         spans,
         error_line: None,
+        error_count: 0,
     }
+}
+
+/// How many error or missing nodes are under `node`; fewer means the grammar
+/// fits the text better.
+fn count_errors(node: Node) -> u32 {
+    if node.is_error() || node.is_missing() {
+        return 1;
+    }
+    if !node.has_error() {
+        return 0;
+    }
+    let mut cursor = node.walk();
+    node.children(&mut cursor).map(count_errors).sum()
 }
 
 /// The first (document-order) error or missing node under `node`.

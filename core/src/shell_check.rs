@@ -1,19 +1,24 @@
 //! Offline check that a `command` is written for the shell it runs under
 //! (RAL-651).
 //!
-//! Uses the optional tree-sitter parse in `ralphus-shell-syntax`; without its
-//! `parser` feature every check answers `None`. Only Bash-family and
-//! PowerShell-family shells have a grammar, so a `cmd` (or unknown) shell is
-//! never checked. Findings are advisory: the caller reports them as warnings.
+//! Which shell a text belongs to is decided entirely by the tree-sitter
+//! grammars in `ralphus-shell-syntax`: the command is parsed with every
+//! grammar and the one reporting the fewest syntax errors fits best. Nothing
+//! here inspects the text itself. Without the crate's `parser` feature every
+//! check answers `None`, and a shell with no grammar is never checked.
+//! Findings are advisory: the caller reports them as warnings.
 
-use ralphus_shell_syntax::{Parsed, Shell, SpanKind, Status, parse};
+use ralphus_shell_syntax::{Parsed, Shell, Status, parse, shell_for_tool};
 
 use crate::shellcmd::shell_kind_from_exe;
+
+const GRAMMARS: [Shell; 3] = [Shell::Bash, Shell::PowerShell, Shell::Cmd];
 
 fn grammar_for(shell: &str) -> Option<Shell> {
     match shell_kind_from_exe(shell)? {
         "bash" | "sh" | "zsh" => Some(Shell::Bash),
         "powershell" | "pwsh" => Some(Shell::PowerShell),
+        "cmd" => Some(Shell::Cmd),
         _ => None,
     }
 }
@@ -26,67 +31,64 @@ fn name(shell: Shell) -> &'static str {
     }
 }
 
-/// `Verb-Noun` with both halves capitalized, the PowerShell cmdlet shape.
-fn is_cmdlet_name(word: &str) -> bool {
-    let Some((verb, noun)) = word.split_once('-') else {
-        return false;
-    };
-    let capitalized = |s: &str| {
-        s.chars().next().is_some_and(|c| c.is_ascii_uppercase())
-            && s.chars().all(|c| c.is_ascii_alphanumeric())
-    };
-    capitalized(verb) && capitalized(noun)
+/// Syntax errors in a parse, or `None` when the grammar gave no verdict
+/// (timeout, too long, parser not built in).
+fn errors(parsed: &Parsed) -> Option<u32> {
+    match parsed.status {
+        Status::Ok => Some(0),
+        Status::Unparsed => Some(parsed.error_count),
+        _ => None,
+    }
 }
 
-/// Positive evidence that `text` (already parsed cleanly as PowerShell) was
-/// written for PowerShell: a cmdlet invocation or an `$env:` variable.
-fn looks_like_powershell(text: &str, parsed: &Parsed) -> bool {
-    text.contains("$env:")
-        || parsed
-            .spans
-            .iter()
-            .filter(|s| s.kind == SpanKind::CommandName)
-            .filter_map(|s| text.get(s.start..s.end))
-            .any(is_cmdlet_name)
-}
-
-/// A warning message when `command` does not fit `shell` (the explicit
-/// `shell` of the cell or proof step, `None` when unset), or `None` when it
-/// fits, is ambiguous, or cannot be checked.
+/// A warning message when `command` fits another shell's grammar better than
+/// `shell` (the explicit `shell` of the cell or proof step, `None` when
+/// unset), or `None` when it fits, ties, or cannot be checked. With no
+/// explicit shell the host's default shell stands in for it.
 #[must_use]
 pub fn check_command(command: &str, shell: Option<&str>) -> Option<String> {
-    let Some(shell) = shell else {
-        let parsed = parse(Shell::PowerShell, command);
-        if parsed.status == Status::Ok && looks_like_powershell(command, &parsed) {
-            return Some(
-                "this command looks like PowerShell; want to set `shell = \"powershell\"` explicitly?"
-                    .to_string(),
-            );
-        }
-        return None;
+    let (declared, explicit) = match shell {
+        Some(shell) => (grammar_for(shell)?, true),
+        None => (shell_for_tool("exec", cfg!(windows))?, false),
     };
-    let target = grammar_for(shell)?;
-    let parsed = parse(target, command);
-    if parsed.status != Status::Unparsed {
+    let declared_parse = parse(declared, command);
+    let declared_errors = errors(&declared_parse)?;
+    if declared_errors == 0 {
         return None;
     }
-    let other = match target {
-        Shell::Bash => Shell::PowerShell,
-        Shell::PowerShell => Shell::Bash,
-        Shell::Cmd => unreachable!("cmd is never returned by grammar_for"),
-    };
-    if parse(other, command).status == Status::Ok {
-        return Some(format!(
-            "this command looks like {other_name} but its shell is {shell}; fix the command or set `shell = \"{other_name}\"`",
-            other_name = name(other),
-        ));
+    let best = GRAMMARS
+        .into_iter()
+        .filter(|g| *g != declared)
+        .filter_map(|g| Some((errors(&parse(g, command))?, g)))
+        .min_by_key(|(count, _)| *count);
+    if let Some((count, other)) = best.filter(|(count, _)| *count < declared_errors) {
+        let other_name = name(other);
+        let verdict = if count == 0 {
+            "is valid"
+        } else {
+            "fits better as"
+        };
+        return Some(if explicit {
+            format!(
+                "this command {verdict} {other_name} but its shell is {}; fix the command or set `shell = \"{other_name}\"`",
+                name(declared),
+            )
+        } else {
+            format!(
+                "this command {verdict} {other_name}, not the default {}; want to set `shell = \"{other_name}\"` explicitly?",
+                name(declared),
+            )
+        });
     }
-    let at = parsed
+    if !explicit {
+        return None;
+    }
+    let at = declared_parse
         .error_line
         .map_or(String::new(), |n| format!(" at line {n} of the command"));
     Some(format!(
         "syntax error{at}: not valid {} syntax",
-        name(target)
+        name(declared)
     ))
 }
 
@@ -102,10 +104,19 @@ mod tests {
     }
 
     #[test]
-    fn unset_shell_suggests_powershell_on_positive_evidence() {
-        let msg = check_command("Get-ChildItem -Recurse", None).unwrap();
-        assert!(msg.contains("shell = \"powershell\""), "{msg}");
-        assert!(check_command("echo $env:HOME", None).is_some());
+    fn unset_shell_compares_against_the_host_default() {
+        let msg = check_command("if [ -f a ]; then echo hi; fi", None);
+        if cfg!(windows) {
+            assert!(msg.unwrap().contains("shell = \"bash\""));
+        } else {
+            assert_eq!(msg, None);
+        }
+        let msg = check_command("foreach ($i in 1..3) { Write-Host $i }", None);
+        if cfg!(windows) {
+            assert_eq!(msg, None);
+        } else {
+            assert!(msg.unwrap().contains("shell = \"powershell\""));
+        }
     }
 
     #[test]
@@ -127,8 +138,8 @@ mod tests {
     }
 
     #[test]
-    fn cmd_shell_is_not_checked() {
-        assert_eq!(check_command("Get-ChildItem", Some("cmd")), None);
+    fn unknown_shell_is_not_checked() {
+        assert_eq!(check_command("if then ((", Some("fish")), None);
     }
 }
 
