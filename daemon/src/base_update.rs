@@ -263,21 +263,21 @@ pub fn check_pr(
                 continue;
             }
         };
-        if let (Some(want), Some(got)) = (expected_head, seen.head.as_deref())
-            && want != got
-        {
-            return PrCheck::Inconclusive(format!(
-                "PR #{number}: forge head {} differs from the local tip {}",
-                &got[..got.len().min(8)],
-                &want[..want.len().min(8)]
-            ));
+        if let (Some(want), Some(got)) = (expected_head, seen.head.as_deref()) {
+            if want != got {
+                return PrCheck::Inconclusive(format!(
+                    "PR #{number}: forge head {} differs from the local tip {}",
+                    &got[..got.len().min(8)],
+                    &want[..want.len().min(8)]
+                ));
+            }
         }
-        if let Some(base) = seen.base_ref.as_deref()
-            && base != expected_base
-        {
-            return PrCheck::Inconclusive(format!(
-                "PR #{number}: forge base {base} differs from the recorded base {expected_base}"
-            ));
+        if let Some(base) = seen.base_ref.as_deref() {
+            if base != expected_base {
+                return PrCheck::Inconclusive(format!(
+                    "PR #{number}: forge base {base} differs from the recorded base {expected_base}"
+                ));
+            }
         }
         match seen.need {
             PrRebaseNeed::Clean => return PrCheck::Clean,
