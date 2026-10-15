@@ -795,16 +795,3 @@
         worktreeMenuOpen[key] = !worktreeMenuOpen[key];
         renderReviewDetail();
       }
-      // Render resolver terminal buttons for a review branch (RAL-102).
-      // Every resolver agent (not just claude-code) now runs inside tmux, so
-      // the dropdown is available whenever a review worktree exists — "not
-      // currently live" degrades gracefully at click/peek time instead of
-      // pre-disabling. "Open Worktree Shell" (a plain shell, unrelated to
-      // tmux) remains available too, since it's useful even between
-      // resolver passes.
-      // Sibling to resolverTerminalBtns — rendered outside the flex btn-row
-      // (see the call site) so the box lays out on its own line, not squeezed
-      // in as a flex item next to the buttons.
-
-      // Render manual-checks-generation terminal buttons for a review (RAL-88
- 

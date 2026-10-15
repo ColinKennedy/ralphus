@@ -1,171 +1,6 @@
-﻿      // ---- Remote Open Agent terminal relay (RAL-355 Phase 10) ----
-      // The browser counterpart of `ralphus cell remote-terminal`
-      // (cli/src/terminal_relay.rs): a cell whose `machine` is set has no
-      // window to open on the daemon's own desktop the way `openAgentTerminal`
-      // does, so this mints a one-shot ticket (POST .../terminal-ticket),
-      // connects a raw WebSocket directly to the daemon's terminal-relay
-      // listener (one port above the daemon API -- see
-      // docs/machine-providers.md's "The `terminal` verb" section), and
-      // renders it into an xterm.js instance in a modal. Direct
-      // browser-to-daemon, NOT proxied through this librarian process the way
-      // `/api/events` SSE is: unlike SSE (a very long plain HTTP response,
-      // which `tiny_http` handles fine), a WebSocket needs a protocol
-      // *upgrade* `tiny_http` cannot do -- the same limitation that made the
-      // daemon bind its own dedicated port in the first place (see
-      // `Cargo.toml`'s `tungstenite` dependency comment). This assumes the
-      // daemon is reachable at the same hostname the browser used to reach
-      // this board, just on a different port -- true whenever daemon and
-      // librarian are co-located (every build script in this repo runs them
-      // that way); a deployment that puts them on genuinely different hosts
-      // needs its own reachability plan for the relay port, same as it would
-      // for `ralphus cell remote-terminal` run from a third machine.
-
-      /** @typedef {{term: any, ws: WebSocket, squadId: string, ti: number, si: number, themeObserver: MutationObserver}} RemoteTerminalSession */
-      /** @type {RemoteTerminalSession|null} the one remote-terminal modal open at a time -- only one can be, since it's a modal */
-      let remoteTerminalSession = null;
-
-      /**
-       * Renders the "Remote Terminal" terminal-menu item -- only offered for
-       * a cell whose `machine` is set (a local cell keeps using "Open
-       * Agent"/`openAgentMenuItem` instead, which the call site is
-       * responsible for choosing between). Mirrors `openAgentMenuItem`'s
-       * disabled-reason style, plus the daemon's own eligibility checks
-       * (`server::mint_terminal_ticket_route`) so a doomed request never
-       * reaches the network: still-running (no remote detach mechanism yet),
-       * no session to resume, or a non-Claude-Code agent (this release only
-       * supports Claude Code remotely, mirroring
-       * `ralphus_core::agent_resume::is_claude_agent`).
-       * @param {string} key
-       * @param {string} clickAction
-       * @param {{[k: string]: string|number}} clickData
-       * @param {boolean} isRunning
-       * @param {string} [agentSessionId]
-       * @param {string} [agent]
-       * @returns {string}
-       */
-      function remoteTerminalMenuItem(key, clickAction, clickData, isRunning, agentSessionId, agent) {
-        if (isRunning) {
-          return terminalMenuItem(key, "Remote Terminal", "", {},
-            "Not available — this cell is still running remotely, and the remote terminal relay has no detach mechanism yet (unlike local Open Agent). Wait for it to finish, then try again.",
-            true);
-        }
-        if (!agentSessionId) {
-          return terminalMenuItem(key, "Remote Terminal", "", {},
-            "Not available yet — no resumable agent session has been recorded for this cell.",
-            true);
-        }
-        if (!["claude", "anthropic", "claude-code", "claude-cli"].includes(agent || "")) {
-          return terminalMenuItem(key, "Remote Terminal", "", {},
-            `Not available — the remote terminal relay only supports Claude Code cells this release; this cell's agent is ${JSON.stringify(agent)}.`,
-            true);
-        }
-        return terminalMenuItem(key, "Remote Terminal", clickAction, clickData,
-          "Attach an interactive terminal to this cell's resumed Claude Code session, running on its remote machine, over the daemon's WebSocket relay.\nWho/when: you want to keep working with the agent interactively on a remote cell — the same thing \"Open Agent\" gives a local cell.\nOnly one terminal can be attached to this cell at a time; closing this window ends the session (no reattach in this release).");
-      }
-
-      /**
-       * Builds an xterm.js `theme` object from the active theme's terminal
-       * CSS variables (docs/colors.md "Terminal surface"). xterm takes literal
-       * color strings, so the resolved values are read at call time.
-       * @returns {{[k: string]: string}}
-       */
-      function xtermThemeFromCss() {
-        const cs = getComputedStyle(document.documentElement);
-        const v = (/** @type {string} */ name) => cs.getPropertyValue(name).trim();
-        const names = ["black", "red", "green", "yellow", "blue", "magenta", "cyan", "white"];
-        /** @type {{[k: string]: string}} */
-        const theme = {
-          background: v("--terminal-bg"), foreground: v("--terminal-fg"),
-          cursor: v("--terminal-cursor"), cursorAccent: v("--terminal-bg"),
-          selectionBackground: v("--terminal-selection"),
-        };
-        for (const n of names) {
-          theme[n] = v(`--ansi-${n}`);
-          theme[`bright${n[0].toUpperCase()}${n.slice(1)}`] = v(`--ansi-bright-${n}`);
-        }
-        return theme;
-      }
-
-      /**
-       * Mints a terminal-relay ticket and opens the remote-terminal modal,
-       * connecting an xterm.js instance to it over WebSocket. See the
-       * "Remote Open Agent terminal relay" block comment above for the full
-       * design.
-       * @param {string} squadId
-       * @param {number} ti
-       * @param {number} si
-       * @returns {Promise<void>}
-       */
-      async function openRemoteTerminal(squadId, ti, si) {
-        let resp;
-        try {
-          resp = await post(`/api/squads/${squadId}/cells/${ti}/${si}/terminal-ticket`);
-        } catch (_) {
-          notify("error", "Failed to open remote terminal: network error");
-          return;
-        }
-        if (!resp.ok) {
-          const e = await resp.json().catch(() => ({}));
-          notify("error", `Failed to open remote terminal: ${((e.error || {}).message) || "unknown error"}`);
-          return;
-        }
-        const data = await resp.json();
-        byId("modal-root").innerHTML = `<div class="modal-bg" onclick="if(event.target===this)closeRemoteTerminal()"><div class="modal" style="width:900px;max-width:96vw">
-          <h2>Remote Terminal <button class="btn" style="float:right" onclick="closeRemoteTerminal()" data-tip="Close this terminal — ends the remote session immediately.\nThis cannot be undone; reopen from the cell to start a fresh session.">✕</button></h2>
-          <div id="remote-terminal-container" style="height:520px;background:var(--terminal-bg)" data-tip="Live remote terminal — bytes typed here go straight to the resumed Claude Code process on the remote machine."></div>
-        </div></div>`;
-        const container = /** @type {HTMLElement} */ (byId("remote-terminal-container"));
-        const XTerm = /** @type {any} */ (window).Terminal;
-        const XTermFitAddon = /** @type {any} */ (window).FitAddon;
-        const term = new XTerm({ convertEol: true, cursorBlink: true, theme: xtermThemeFromCss() });
-        const themeObserver = new MutationObserver(() => { term.options.theme = xtermThemeFromCss(); });
-        themeObserver.observe(document.documentElement, { attributes: true, attributeFilter: ["data-theme"] });
-        const fit = new XTermFitAddon.FitAddon();
-        term.loadAddon(fit);
-        term.open(container);
-        fit.fit();
-        const proto = location.protocol === "https:" ? "wss:" : "ws:";
-        const params = new URLSearchParams({
-          ticket: data.ticket, squad_id: squadId, task_idx: String(ti), cell_idx: String(si),
-          cols: String(term.cols), lines: String(term.rows),
-        });
-        const ws = new WebSocket(`${proto}//${location.hostname}:${data.port}${data.path}?${params}`);
-        ws.binaryType = "arraybuffer";
-        remoteTerminalSession = { term, ws, squadId, ti, si, themeObserver };
-        ws.onmessage = (ev) => {
-          if (typeof ev.data === "string") {
-            term.write(ev.data);
-          } else {
-            term.write(new Uint8Array(/** @type {ArrayBuffer} */ (ev.data)));
-          }
-        };
-        ws.onclose = () => term.write("\r\n\x1b[33m[ralphus] terminal session ended.\x1b[0m\r\n");
-        ws.onerror = () => term.write("\r\n\x1b[31m[ralphus] connection error.\x1b[0m\r\n");
-        term.onData((/** @type {string} */ chunk) => {
-          if (ws.readyState === WebSocket.OPEN) ws.send(chunk);
-        });
-      }
-
-      /**
-       * Tears down the active remote-terminal session (if any) and closes
-       * its modal -- called from the modal's own close button/backdrop
-       * click, in place of the generic `closeModal()`, since this modal
-       * alone needs to end a live WebSocket session first.
-       * @returns {void}
-       */
-      function closeRemoteTerminal() {
-        if (remoteTerminalSession) {
-          remoteTerminalSession.themeObserver.disconnect();
-          try { remoteTerminalSession.ws.close(); } catch (_) { /* already closed */ }
-          try { remoteTerminalSession.term.dispose(); } catch (_) { /* already disposed */ }
-          remoteTerminalSession = null;
-        }
-        closeModal();
-      }
-
-      // ---- Live tmux pane peek (RAL-102) ----
+﻿      // ---- Live pane peek (RAL-102) ----
       // The "Read-only terminal" button toggles an inline, auto-refreshing box
-      // showing a cell/proof/resolver's tmux pane content — never sends
+      // showing a cell/proof/resolver's live output — never sends
       // input. Keyed by a stable string so `pollOpenPeeks` (on its own 2s
       // interval — see the bottom of this script) can refresh every
       // currently-expanded box without disturbing anything else on the page
@@ -185,7 +20,7 @@
        *   only for its liveness `active` flag (RAL-397 Phase 2G-A moved Live
        *   View content onto the transcript tape); its `content` is no longer
        *   rendered.
-       * @property {boolean} [active] - Whether the daemon found a live tmux cell for this key (`has-session`).
+       * @property {boolean} [active] - Whether the daemon found a live direct run for this key.
        * @property {string} [content] - Live pane snapshot (no longer rendered by the Live View).
        * @property {number|null} [last_activity_ms] - Unix-epoch-ms of the last observed fresh output (RAL-170); unused now that liveness ms comes from tape growth.
        */
@@ -195,7 +30,7 @@
        *   box's liveness (RAL-397 Phase 2G-A). The Live View's *content* now
        *   comes from the transcript tape, not `/pane`; `/pane` is still polled
        *   purely as an authoritative liveness probe (its `active` flag, based on
-       *   the daemon's `has-session` check — its pane content is ignored).
+       *   the daemon's liveness check — its pane content is ignored).
        * @property {boolean|null} live - Liveness from the `/pane` probe's `active` flag, or null only when that probe itself failed/errored this poll — in which case the tape-growth fallback (`grew`) decides.
        * @property {boolean} grew - Whether the transcript's `total` grew since the previous poll — the tape-growth liveness fallback when `live` is null, and what feeds `lastActivityMs`.
        * @property {number} nowMs - Current wall-clock ms, passed in (never read here) so this stays pure and testable.
@@ -211,8 +46,8 @@
        * @property {PeekPaneState} state - The state to store for this key.
        * @property {boolean} headerChanged - Whether `ended` flipped, in either direction.
        */
-      // A lone `active:false` poll is often just a transient psmux hiccup
-      // (see PSMUX_CRASH_NOTES.local.md) rather than a real session death —
+      // A lone `active:false` poll is often just a transient probe miss
+      // rather than a real session death —
       // confirmed live: a session flashed "terminal session has ended" in
       // this exact peek box while the daemon's own Cartographer trail showed
       // a completely clean run with no missed-cell detection at all.
@@ -261,7 +96,7 @@
         return variant ? `variant=${variant}` : "";
       }
       /**
-       * Resolves a peek key to the daemon API URL for its live tmux pane content.
+       * Resolves a peek key to the daemon API URL for its live output.
        * An attempt-pinned key has no live pane to probe -- it is a finished
        * record -- so it resolves to null and liveness falls back to the tape.
        * @param {string} key
@@ -505,11 +340,10 @@ ${state.restartNote}` : state.text;
        * that shortens `content` can't desync the byte offset.
        *
        * NOTE — byte-cap freeze (RAL-397): once an attempt exceeds
-       * `max_transcript_bytes_per_attempt` (default 256 MiB) the pipe-sink
-       * stops appending and `total` freezes while the pane keeps producing, so
-       * the tail stops advancing here. Only bites pathologically huge attempts;
-       * called out so it isn't a silent surprise (see PSMUX_MEMORY_FIX.local.md
-       * 2G "Liveness caveats").
+       * `max_transcript_bytes_per_attempt` (default 256 MiB) the transcript
+       * writer stops appending and `total` freezes while the run keeps
+       * producing, so the tail stops advancing here. Only bites pathologically
+       * huge attempts; called out so it isn't a silent surprise.
        * @param {TapeWindow} w
        * @param {TapeChunk} chunk
        * @returns {TapeWindow}
@@ -583,15 +417,15 @@ ${state.restartNote}` : state.text;
       // tape is served raw — `/pane-transcript` does NOT strip ralphus's own
       // marker lines the way `/pane` does — so this is where they're handled.
       // Sliced out and driven standalone by test/board-tape-lines.mjs.
-      /** Internal tmux-completion sentinel; always dropped, never shown in any debug state. Matches daemon/src/runner.rs::TMUX_DONE_MARKER. */
+      /** Internal completion sentinel; always dropped, never shown in any debug state. */
       const RALPHUS_TAPE_DONE_PREFIX = "RALPHUS_TMUX_DONE:";
       /** Cartographer event marker, trailing space included. Matches runner/src/cartographer.rs::EVENT_MARKER. */
       const RALPHUS_TAPE_EVENT_PREFIX = "RALPHUS_EVENT: ";
       /** Structured tool-record marker, trailing space included. Matches runner/src/tool_record.rs::TOOL_MARKER. Only the Agent Log tab reads these; the terminal tape drops them. */
       const RALPHUS_TAPE_TOOL_PREFIX = "RALPHUS_TOOL: ";
-      /** Model thinking/reasoning marker, tagging one line of reasoning (RAL-434); matches runner/src/pi_backend.rs::THINKING_MARKER and daemon/src/runner.rs::THINKING_MARKER minus their trailing space. The space is deliberately not matched on: tmux trims each captured row's trailing whitespace, so a line of *empty* reasoning arrives as a bare "RALPHUS_THINKING:" that a space-carrying prefix misses -- which rendered the raw marker into the pane. unprefixThinkingLine drops the space when the row kept one. */
+      /** Model thinking/reasoning marker, tagging one line of reasoning (RAL-434); matches runner/src/pi_backend.rs::THINKING_MARKER and daemon/src/runner.rs::THINKING_MARKER minus their trailing space. The space is deliberately not matched on: a captured row's trailing whitespace may be trimmed, so a line of *empty* reasoning arrives as a bare "RALPHUS_THINKING:" that a space-carrying prefix misses -- which rendered the raw marker into the pane. unprefixThinkingLine drops the space when the row kept one. */
       const RALPHUS_TAPE_THINKING_TAG = "RALPHUS_THINKING:";
-      /** Trailing byte tmux writes on a row it had to wrap at the pane width (`-x 500`, daemon/src/tmux.rs). The overflow continues on the next captured row, which carries no marker of its own -- see tapeLineWrapped. */
+      /** Trailing byte marking a row that was wrapped at the pane width. The overflow continues on the next captured row, which carries no marker of its own -- see tapeLineWrapped. */
       const TAPE_WRAP_MARKER = "\b";
       /** Private sentinel classifyTapeLine returns for a thinking line that is folded away, so renderTapeLines can collapse a whole run of them into one placeholder. Carries a NUL byte so it can never collide with a real rendered line. */
       const THINKING_FOLDED = "\u0000thinking-folded";
@@ -781,11 +615,11 @@ ${state.restartNote}` : state.text;
         return rest.startsWith(" ") ? rest.slice(1) : rest;
       }
       /**
-       * Whether `raw` is a row tmux had to wrap, so the next captured row is
+       * Whether `raw` is a wrapped row, so the next captured row is
        * its tail rather than a new logical line.
        *
        * The pane is created 500 columns wide to cap its resident memory
-       * (daemon/src/tmux.rs), and tmux marks a wrapped row by ending it with a
+       * and a wrapped row is marked by ending it with a
        * backspace. This has to read the *raw* row: renderPaneLine consumes the
        * backspace as a cursor move, so by the time a line reaches
        * classifyTapeLine the evidence is gone.
@@ -820,7 +654,7 @@ ${state.restartNote}` : state.text;
         let inWrap = false;
         /** @type {boolean} */
         let wrapIsThinking = false;
-        // A tmux wrap tail has no type marker of its own. Keep the excluded
+        // A wrap tail has no type marker of its own. Keep the excluded
         // line's decision across its rows, without treating ordinary untagged
         // continuation output as part of that line.
         /** @type {boolean} */
@@ -907,7 +741,7 @@ ${state.restartNote}` : state.text;
       // "view latest attempt" path (see `viewHistoryAttempt`) also now reads
       // from for its "popup/expanded" presentation of the same stream. This
       // is still a deliberate approximation, not true line-by-line
-      // interleaving -- tmux pane captures carry no reliable per-line
+      // interleaving -- pane captures carry no reliable per-line
       // timestamps to splice against (`daemon/src/timeline.rs`'s module doc
       // comment documents the same limitation for the whole-squad timeline
       // this reuses).

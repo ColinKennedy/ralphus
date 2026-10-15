@@ -47,35 +47,10 @@ creator, restart-safe because the marker carries branch and upstream). See
 `worktrees.rs`'s test module (`concurrent_*`, `*_interrupted_by_restart`,
 `*_never_deleted`).
 
-## Tmux cell process-tree confinement (RAL-321)
-
-On Windows, `tmux.rs`'s `confine` module assigns each cell's `new-session`
-client `Child` to a Windows Job Object (`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`)
-immediately after spawn, keyed by session name in a process-global registry.
-Job membership is inherited automatically by any child the client process
-spawns (the psmux server, then the shell, then the runner/agent CLI), so
-`Tmux::kill_session` dropping that job kills the whole real process tree, not
-just the top `tmux.exe`/client box — `force_kill_tmux_processes` remains only
-as a last-resort fallback for the server process itself. This relies on the
-assignment completing before the client has a chance to spawn the psmux
-server (the same accepted race `daemon/src/proof.rs`'s `ProcessTree` already
-documents for check-gate commands); it's confirmed to hold in practice by
-`runner.rs`'s `live_tmux_cancel_kills_the_real_process_tree` test, which
-starts a real tmux-wrapped cell, cancels it, and polls for the real OS PID to
-die.
-
-**No equivalent confinement exists for the tmux path on Unix** — real tmux
-uses `setsid()` for its server, which defeats process-group inheritance from
-the client, so a Unix fix would need a different mechanism (e.g. resolving
-and signalling the session's pane PIDs directly) and is not implemented.
-`runner/src/tools.rs::run_bash`'s non-tmux timeout-kill path does have a
-working Unix implementation (`process_group(0)` + `killpg`), since that path
-doesn't go through tmux/psmux at all.
-
 ## Store state that is not in SQLite (WS-E.1)
 
 `Store` is the only place SQL lives, but it is not the place non-database state
-lives. Worktree leases, restack bookkeeping, tmux liveness, stall-escalation
+lives. Worktree leases, restack bookkeeping, run liveness, stall-escalation
 debounce and the secret-env-name cache are all in
 [`store_memory.rs`](src/store_memory.rs), behind their own small locks, reached
 via `Store::memory()` or -- without taking the store lock at all --
@@ -145,34 +120,3 @@ Ollama-backed test that runs unconditionally. Keep the same runtime guard too
 (skip/return early with a clear message if Ollama isn't reachable on
 `127.0.0.1:11434` or the required model isn't pulled), so even an explicit
 opt-in run degrades gracefully without live infra.
-
-## Testing — real tmux/psmux
-
-Every Windows test that starts, queries, or kills a real psmux session is named
-`live_tmux_*` and `#[ignore]`d on Windows. A developer's psmux server is shared
-with the live Ralphus stack, while nextest launches each test in a separate
-process, so the crate's in-process `LIVE_TMUX_TEST_LOCK` cannot isolate a normal
-local run from either source of contention.
-
-The per-PR `psmux-integration` job in `.github/workflows/ci.yml` builds the
-vendored `vendor/psmux` git submodule (RAL-347; ralphus's psmux fork, `v3.3.8`
-plus the changes listed in [`vendor/AGENTS.md`](../vendor/AGENTS.md)) from
-source, gives it a job-private `PSMUX_DATA_DIR`, and runs the ignored
-`live_tmux_*` tests serially against that build. `.github/workflows/psmux-stress.yml`
-runs the same tests concurrently, against the same vendored build, on a
-schedule or manual dispatch. This keeps the default local suite hermetic
-while preserving both reliable compatibility coverage and an explicit
-shared-server stress signal. `psmux-integration` additionally has one
-narrowly-scoped extra step that downloads a separate, non-vendorized `v3.3.8`
-release and re-runs a single fast `live_tmux_*` test with `RALPHUS_TMUX_CMD`
-pointed at it, proving that override path still works — see
-`docs/dependencies.md` for why relying on that path day-to-day is
-discouraged.
-
-When adding a test that touches the real binary on Windows:
-
-- give it a `live_tmux_*` name;
-- add `#[cfg_attr(windows, ignore = "CI-only on Windows: exercises a real psmux server")]`;
-- use `unique_test_tag` and a cleanup guard for every session it creates; and
-- keep concurrency inside the test explicit when concurrency is the behavior
-  under test. Ambient load from unrelated tests is not an assertion.

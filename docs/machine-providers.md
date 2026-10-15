@@ -160,17 +160,15 @@ or `#[derive(Deserialize)]` matching the direction it's used in).
 | `materialize` | `--uri` | [`MaterializeRequest`](../daemon/src/remote_runner.rs) (`source`: absolute path on the provider, `destination`: absolute path on the daemon, optional `executable`) | Stream one explicitly selected file or directory from the provider to an exact daemon-host destination. Transfers are binary-safe and staged before publication; there is deliberately no size limit or implicit whole-worktree copy. |
 | `remove-path` | `--uri` | [`FileRequest`](../daemon/src/remote_runner.rs) (`path: String`, `content: null`, `recursive: bool`) | Delete a file, or a directory tree when `recursive` is `true`. A path that does not exist is success, not an error. |
 | `ping` | `--uri` | none | Confirm the machine is reachable and ready, doing no work. Reply `{"ok": true, "detail": "..."}`. Called on demand from the board's Machines tab, never polled. |
-| `capabilities` | `--uri` | none | **Optional.** Report what this provider/machine pairing supports. Reply `{"capabilities": {...}}` — see [`Capabilities`](../daemon/src/remote_runner.rs) (`os?`, `arch?`, `supported_ops: [String]`, `async_exec: bool`, `terminal: bool`, `runner_version?`). Every field is best-effort (`None`/omitted means "unknown", never "no"). A provider that does not implement this verb is not a failure — the daemon reads that the same way as "no capability information available", not an error. Must never have side effects (no runner upload, no workspace mutation) even when answering `runner_version` or `async_exec` would otherwise tempt one. |
+| `capabilities` | `--uri` | none | **Optional.** Report what this provider/machine pairing supports. Reply `{"capabilities": {...}}` — see [`Capabilities`](../daemon/src/remote_runner.rs) (`os?`, `arch?`, `supported_ops: [String]`, `async_exec: bool`, `runner_version?`). Every field is best-effort (`None`/omitted means "unknown", never "no"). A provider that does not implement this verb is not a failure — the daemon reads that the same way as "no capability information available", not an error. Must never have side effects (no runner upload, no workspace mutation) even when answering `runner_version` or `async_exec` would otherwise tempt one. |
 | `channel` | `--uri` | newline-delimited `RunRequest`s | **Optional.** Serve many requests from one process: read newline-delimited JSON `run` requests on stdin, write one newline-delimited JSON response each, until stdin closes. |
 | `cleanup` | `--uri` | [`CleanupRequest`](../daemon/src/remote_runner.rs) (`project: String`, `clone_url: String`, `branch?: String`, `remote_root?: String`) | Tear one workspace down — one worktree when `branch` is given, the whole project directory (repository plus every worktree) when it is omitted. Reply `{"removed": "<abs path on this machine>"}`. See "The `cleanup` verb and its retention policy" below. |
 | `retire` | `--uri` | [`RetireRequest`](../daemon/src/remote_runner.rs) (`path: String` — the worktree's absolute path on this machine) | **Optional**, and unlike `cleanup`, called automatically once a day per stale review worktree. Decide (and possibly carry out) one worktree-retirement attempt. Reply `{"outcome": "removed"}`, `{"outcome": "deferred", "reason?": "...", "retry_at_ms?": N}`, or `{"outcome": "opted_out", "reason?": "..."}`. See "The `retire` verb and worktree-retirement policy" below. |
-| `terminal` | `--uri --command --cols --lines` | none (raw byte stream, not JSON) | **The one verb that is not JSON request/response.** Runs `--command` on the target under an allocated pty (e.g. `ssh -tt`), with `--cols`/`--lines` setting the pty's *initial* size only (no live resize forwarding — see below). From the moment the pty connects, this process's own stdin/stdout **are** the terminal byte stream: read stdin, write it to the pty; read the pty, write it to stdout; until either side closes. Success/failure is this process's own exit code, not a trailing JSON line — see "The `terminal` verb" below. |
 
 The cell spec arrives on stdin for `exec`; the provision request arrives on
 stdin for `provision`; the file/run/cleanup requests above arrive on stdin
 for their own verb. Handle-scoped verbs (`status`/`stream`/`cancel`/
-`job-cleanup`) and `ping` take no stdin payload. `terminal` takes no stdin
-payload either — its whole request is the four flags above.
+`job-cleanup`) and `ping` take no stdin payload.
 
 **Synchronous vs async `exec`.** A provider that can only block returns
 `result` and is done — no `status`/`stream`/`cancel` needed. A provider that
@@ -278,48 +276,6 @@ Every outcome — `retired`, `failed`, `deferred`, `opted_out` — is queryable
 through `GET /api/worktree-retirements`, alongside the existing
 `scheduled`/`eligible`/`claimed` states derived live from worktree age and
 claims.
-
-### The `terminal` verb
-
-`terminal` (RAL-355 Phase 10) exists for exactly one purpose: a remote Open
-Agent terminal relay, so a browser or CLI client can attach an interactive
-terminal to a **remote** cell's resumed Claude Code session. It is the one
-verb in the whole contract that is not JSON request/response — see the note
-in the verb table above. A trailing JSON envelope would land in the middle of
-a human's terminal session as garbled text, so there is nothing to parse:
-success or failure is reported through this process's own exit code after
-the byte-relay ends, not through anything on stdout.
-
-The daemon never calls `terminal` directly through `ProviderRunner::invoke` —
-it spawns the provider program with `terminal --uri <uri> --command <cmd>
---cols <n> --lines <n>` and piped stdio (`ProviderRunner::spawn_terminal`),
-then relays bytes between that child's stdin/stdout and a WebSocket
-connection itself. `--command` is the already-built resume command (e.g.
-`'claude' --resume '<session-id>' --dangerously-skip-permissions`, POSIX-quoted
-— see `ralphus_core::agent_resume::resume_agent_command_posix`), not
-something the provider constructs.
-
-**Claude Code only, this release.** The daemon's ticket-mint route
-(`POST /api/squads/{id}/cells/{task}/{cell}/terminal-ticket`) refuses any
-cell whose `agent` isn't Claude Code-family, and any cell that has no
-recorded `agent_session_id` yet (nothing to resume). Codex/Pi remote
-terminals are deferred until their resume paths are actually exercised
-remotely, matching this codebase's existing precedent of not guessing at an
-unexercised harness's shape.
-
-**No live resize forwarding.** `--cols`/`--lines` set the pty's *initial*
-size only, via `COLUMNS`/`LINES` on the remote command. A later browser
-resize does not propagate — the ssh-provider implementation's own `ssh`
-child has no local pty of its own to detect the change and forward it via
-`SIGWINCH`, and taking on a local pty-allocation dependency for that is out
-of scope for this first version. This is a disclosed limitation, not a bug.
-
-**Session lifecycle: dies on disconnect.** There is no reattach. A closed
-WebSocket connection (tab closed, network drop, CLI client exited) kills the
-spawned `terminal` child and the `ssh -tt` underneath it — ending the remote
-session outright. To resume, a human runs the existing headless Resume
-Automation, or opens a fresh terminal relay connection (same as local Open
-Agent's own resume path already works).
 
 ### Failure classification
 
@@ -489,19 +445,9 @@ verb boundary rather than requiring the whole set.
    per command instead and works identically, just with more per-call
    overhead — the daemon falls back automatically if a channel cannot be
    opened or stops answering.
-5. **Terminal capability, for remote Open Agent**: the `terminal` verb (RAL-355
-   Phase 10) — the one verb in the whole contract that isn't JSON
-   request/response (see "The `terminal` verb" above). The daemon still
-   brokers the actual client-facing relay itself, over its own WebSocket
-   listener; a provider's job is only to turn `terminal --uri --command
-   --cols --lines` into a byte-for-byte pty tunnel on its own stdin/stdout. A
-   provider reports whether it implements this tier via `terminal: bool` in
-   `capabilities` (`ssh-provider` reports `true`; a provider with no
-   interactive-terminal story reports `false`, or omits the field entirely,
-   both read the same as "not supported").
 
 `capabilities`'s own `supported_ops`/`async_exec` fields are how a provider
-reports which of tiers 1–4 it actually implements, so an operator (or a
+reports which of these tiers it actually implements, so an operator (or a
 future daemon-side check) can see a gap at registration/health time instead
 of discovering it mid-Cell.
 
@@ -616,7 +562,7 @@ throwaway-example) provider in the repo.
 > **Status: every verb except `retire` is implemented** —
 > `exec`, `status`, `stream`, `cancel`, `job-cleanup`, `provision`, `run`,
 > `read-file`, `write-file`, `remove-path`, `materialize`, `cleanup`,
-> `terminal`, `ping`, `capabilities`, and `channel`. Configured targets use durable
+> `ping`, `capabilities`, and `channel`. Configured targets use durable
 > asynchronous execution; legacy invocations without a matching target policy
 > preserve the synchronous `exec` result path. `provision` (RAL-355 Phase 4)
 > durably clones/fetches a project and creates a `git worktree` per task

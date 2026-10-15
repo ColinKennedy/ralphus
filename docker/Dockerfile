@@ -50,30 +50,17 @@ RUN uv sync --extra runner --no-dev --frozen
 # ---- Runtime ----------------------------------------------------------------
 FROM python:3.12-slim-bookworm AS runtime
 
-# tmux: real Linux tmux backs the same tmux-wrapped session/live-view/
-# terminal-log machinery `daemon/src/tmux.rs` already drives on a bare host
-# -- no psmux, no Windows-only quirks (see AGENTS.md's "A tmux-wrapped
-# session's pane can vanish..." gotcha, which is Windows/psmux-specific).
 # git: agent sessions run `git` inside their workspace as part of normal
 # task work.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends tmux git ca-certificates \
+    && apt-get install -y --no-install-recommends git ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
 # Non-root throughout -- part of the hardening posture alongside the
 # read-only rootfs / dropped capabilities set in docker-compose.yml.
 #
-# Shell must be a REAL shell, not /usr/sbin/nologin: tmux resolves the
-# pane's interpreter from this user's passwd entry (`default-shell`) even
-# when it's given an explicit command to run, and execs that as the
-# session's shell. `nologin` only blocks interactive login -- it still
-# "succeeds" as an execve() target, just by printing "This account is
-# currently not available." and exiting immediately, which silently killed
-# every tmux pane before this was caught by manually verifying the tmux
-# live-view path actually works in this container (RAL-225's own
-# acceptance criterion). `nologin` on this uid would have blocked an SSH/
-# console login, which was never how this uid is used anyway -- only
-# `docker exec`/process spawning, which a shell is required for.
+#
+# Shell must be a real shell for `docker exec` and process spawning.
 RUN useradd --create-home --uid 10001 --shell /bin/bash ralphus
 
 COPY --from=rust-builder /src/target/release/ralphus-daemon /usr/local/bin/ralphus-daemon

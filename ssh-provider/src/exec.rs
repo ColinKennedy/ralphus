@@ -380,7 +380,7 @@ fn run_remote_cell(
 
 /// The external CLI backends render human-readable conversation text on
 /// stdout before `main::finish` writes the runner contract's final JSON line.
-/// Local tmux execution avoids ambiguity by using `--result-file`; the
+/// Local direct execution avoids ambiguity by using `--result-file`; the
 /// synchronous SSH adapter has one combined remote stdout pipe, so its result
 /// is the final non-empty line. Earlier lines are terminal display, not part of
 /// the result document.

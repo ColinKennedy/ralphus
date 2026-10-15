@@ -15,12 +15,6 @@ rem cargo build --release produces one executable per binary, no _internal\ dire
 rem keep each exe beside. `cli-py\` still exists for `docsgen\` (Playwright
 rem screenshots, dev-only, never shipped) -- see AGENTS.md.
 rem
-rem By default this also builds the vendored psmux (RAL-347, vendor/psmux git
-rem submodule) and links it into ralphus-daemon.exe via the `embedded-tmux`
-rem feature, so a release build works out of the box without a separate tmux
-rem install. Pass --skip-tmux to skip this (e.g. no network access to build
-rem the submodule, or you intentionally always point RALPHUS_TMUX_CMD at your
-rem own binary) and build without embedded-tmux.
 
 set "root=%~dp0.."
 for %%I in ("%root%") do set "root=%%~fI"
@@ -38,18 +32,8 @@ for %%B in (ralphus ralphus-runner ralphus-daemon ralphus-librarian ralphus-ssh-
   if exist "%dist%\%%B.exe" del /f /q "%dist%\%%B.exe"
 )
 
-set "daemon_features="
-if /I "%~1"=="--skip-tmux" (
-  echo == --skip-tmux: skipping vendored psmux build ==
-) else (
-  echo == building vendored psmux ^(vendor/psmux submodule^) ==
-  powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0build-vendored-tmux.ps1"
-  if errorlevel 1 exit /b 1
-  set "daemon_features=--features ralphus-daemon/embedded-tmux"
-)
-
 echo == building Rust executables (release) ==
-cargo build --release --package ralphus-daemon --package ralphus-librarian --package ralphus-cli --package ralphus-runner --package ralphus-ssh-provider --manifest-path "%root%\Cargo.toml" !daemon_features!
+cargo build --release --package ralphus-daemon --package ralphus-librarian --package ralphus-cli --package ralphus-runner --package ralphus-ssh-provider --manifest-path "%root%\Cargo.toml"
 if errorlevel 1 exit /b 1
 
 for %%B in (ralphus-daemon ralphus-librarian ralphus ralphus-runner ralphus-ssh-provider) do (

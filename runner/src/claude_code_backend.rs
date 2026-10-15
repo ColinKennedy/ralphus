@@ -258,7 +258,7 @@ impl ModelBackend for ClaudeCodeBackend {
             }),
         );
 
-        // Human-readable header for the live tmux pane (RAL-102) -- everything
+        // Human-readable header for the live transcript (RAL-102) -- everything
         // below this is Claude's own text/tool-call activity, not runner logging.
         print_header(options.model, workspace);
 
@@ -565,12 +565,6 @@ fn write_initial_turn(stdin: &Arc<Mutex<ChildStdin>>, prompt: &str) -> std::io::
 /// against the real `claude` binary that never closing stdin at all hangs
 /// every cell forever, since `--input-format stream-json` does not
 /// auto-exit once idle after a turn.
-///
-/// A deliberate mid-task detach (RAL-288 Stage 6) does not go through this
-/// thread at all -- the daemon kills the cell's whole tmux session directly
-/// (`Store`/`Detachments`, see `daemon/src/server.rs::detach_and_open_agent`),
-/// which works regardless of what this thread is doing and is what makes a
-/// safe handoff to a real interactive `claude --resume` session possible.
 fn spawn_stdin_closer(
     stdin: Arc<Mutex<ChildStdin>>,
     keep_polling: Arc<AtomicBool>,
@@ -830,7 +824,7 @@ struct ParseState {
 }
 
 /// Handles one parsed stream-json line, updating `state` and printing to the
-/// live tmux pane (RAL-102) as a side effect. `assigned_session_id` is the id
+/// live transcript (RAL-102) as a side effect. `assigned_session_id` is the id
 /// pre-assigned at spawn time (RAL-288 Stage 1), if any, used only to warn on
 /// a mismatch against Claude's own report. `tool_arg_truncate_chars` (RAL-303)
 /// bounds how much of a `tool_use` argument value is rendered before
@@ -911,7 +905,7 @@ fn process_event(
             // conversation history once it nears its context limit -- this
             // can happen mid-turn on any `--resume`'d call, headless or not.
             // Surface it: silently dropping this into the `_ => {}` arm
-            // below made compaction invisible to both the live tmux pane
+            // below made compaction invisible to both the live transcript
             // and Cartographer, indistinguishable from "never happened".
             let trigger = event["compactMetadata"]["trigger"]
                 .as_str()
@@ -949,7 +943,7 @@ fn process_event(
         }
         Some("assistant") => {
             // Claude's own text/tool-call activity -- the whole point of the
-            // live tmux pane (RAL-102) is to let a human read this, so print
+            // live transcript (RAL-102) is to let a human read this, so print
             // it plainly rather than folding it into a summary line. `text`
             // blocks are skipped here when the deltas above already streamed
             // this turn's text -- printing both would duplicate the whole
@@ -1272,9 +1266,9 @@ fn head(text: &str, limit: usize) -> String {
     }
 }
 
-/// Human-readable header for the live tmux pane (RAL-102) -- printed once,
+/// Human-readable header for the live transcript (RAL-102) -- printed once,
 /// before Claude's own streamed text/tool-call activity below it.
-#[allow(clippy::print_stdout)] // intentional: this process runs tmux-wrapped (see `daemon/src/runner.rs::run_via_tmux`), so stdout is the live pane, not the daemon<->runner JSON channel (that contract is file-based here -- see `main.rs`'s `--result-file` handling)
+#[allow(clippy::print_stdout)] // intentional: this process runs as a direct child (see `daemon/src/runner/direct.rs`), so stdout is the live pane, not the daemon<->runner JSON channel (that contract is file-based here -- see `main.rs`'s `--result-file` handling)
 fn print_header(model: Option<&str>, workspace: &Workspace) {
     println!(
         "Claude Code · model={}\ncwd: {}\n",
@@ -1327,7 +1321,7 @@ fn split_thinking_lines(buffer: &mut String, delta: &str) -> Vec<String> {
     complete
 }
 
-/// Prints one line of Claude's own streamed text output to the live tmux
+/// Prints one line of Claude's own streamed text output to the live session
 /// pane -- the whole point of RAL-102 is to let a human read this.
 #[allow(clippy::print_stdout)] // intentional: see `print_header`
 fn print_line(text: &str) {

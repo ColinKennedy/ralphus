@@ -37,7 +37,7 @@ pub mod section {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Applicability {
-    /// The daemon's own host (or, for CLI-local checks like `git`/`tmux`,
+    /// The daemon's own host (or, for CLI-local checks like `git`,
     /// whatever host the CLI process itself runs on -- normally the same
     /// machine).
     DaemonLocal,
@@ -169,7 +169,6 @@ catalog_ids! {
     ID_GH => "gh",
     ID_GLAB => "glab",
     ID_RG => "ripgrep",
-    ID_TMUX => "tmux",
     ID_CLAUDE_COMMAND => "claude-command",
     ID_CODEX_COMMAND => "codex-command",
     ID_PI_COMMAND => "pi-command",
@@ -350,17 +349,6 @@ pub const CATALOG: &[CatalogEntry] = &[
         probe: Probe::Local,
         impact: "Agents are prompted to prefer ripgrep for repository search; without a working rg they fall back to grep, which is slower on large repositories.",
         remediation: "Optional: install ripgrep (https://github.com/BurntSushi/ripgrep#installation) so `rg --version` works from PATH, or reinstall/remove a broken rg.",
-    },
-    CatalogEntry {
-        id: ID_TMUX,
-        label: "tmux/psmux",
-        section: section::HARNESS,
-        applicability: Applicability::DaemonLocal,
-        cost_tier: CostTier::Free,
-        requirement: RequirementLevel::Required,
-        probe: Probe::Local,
-        impact: "Live sessions/panes for running cells depend on this binary; a missing one fails every cell that starts a session.",
-        remediation: "Install tmux/psmux and put it on PATH, or set RALPHUS_TMUX_CMD to its full path (see docs/dependencies.md).",
     },
     CatalogEntry {
         id: ID_CLAUDE_COMMAND,
@@ -734,8 +722,7 @@ pub fn free_daemon_local_entries() -> impl Iterator<Item = &'static CatalogEntry
 /// of these ids is cross-referenced by its exact catalog id, so the two
 /// documents can never silently disagree about which check backs which
 /// dependency section.
-pub const DOCUMENTED_IN_DEPENDENCIES_MD: &[&str] =
-    &[ID_GIT, ID_TMUX, ID_GH, ID_GLAB, ID_RG, ID_NVIDIA_SMI];
+pub const DOCUMENTED_IN_DEPENDENCIES_MD: &[&str] = &[ID_GIT, ID_GH, ID_GLAB, ID_RG, ID_NVIDIA_SMI];
 
 #[cfg(test)]
 mod tests {
@@ -817,7 +804,6 @@ mod tests {
         assert!(!free.contains(&ID_REMOTE_SSH_REACHABLE));
         assert!(free.contains(&ID_DAEMON));
         assert!(free.contains(&ID_GIT));
-        assert!(free.contains(&ID_TMUX));
     }
 
     #[test]

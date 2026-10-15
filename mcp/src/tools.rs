@@ -199,7 +199,11 @@ mod tests {
     #[test]
     fn excluded_leaves_produce_no_tool() {
         let tools = all_tools();
-        assert!(!tools.iter().any(|t| t.path == ["cell", "open-agent"]));
+        assert!(
+            !tools
+                .iter()
+                .any(|t| t.path.first() == Some(&"nonexistent-group"))
+        );
         assert!(!tools.iter().any(|t| t.path.first() == Some(&"quick-start")));
     }
 

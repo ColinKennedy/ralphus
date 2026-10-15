@@ -165,7 +165,7 @@ impl ModelBackend for CodexBackend {
             }),
         );
 
-        // Human-readable header for the live tmux pane (RAL-102) -- everything
+        // Human-readable header for the live transcript (RAL-102) -- everything
         // below this is Codex's own text/tool activity, not runner logging.
         print_header(options.model, workspace);
 
@@ -613,7 +613,7 @@ fn drive_thread_events(
                 match item["type"].as_str() {
                     Some("agent_message") => {
                         // The model's own reply -- the whole point of the
-                        // live tmux pane is to let a human read this.
+                        // live transcript is to let a human read this.
                         if let Some(text) = item["text"].as_str() {
                             record_agent_message(text, &mut latest_agent_message, &mut prophecies);
                         }
@@ -870,9 +870,9 @@ fn split_turn_usage(usage: &Value) -> (i64, i64, i64) {
     ((input - cached).max(0), cached, output)
 }
 
-/// Human-readable header for the live tmux pane (RAL-102) -- printed once,
+/// Human-readable header for the live transcript (RAL-102) -- printed once,
 /// before Codex's own streamed text/tool activity below it.
-#[allow(clippy::print_stdout)] // intentional: this process runs tmux-wrapped (see `daemon/src/runner.rs::run_via_tmux`), so stdout is the live pane, not the daemon<->runner JSON channel (that contract is file-based here -- see `main.rs`'s `--result-file` handling)
+#[allow(clippy::print_stdout)] // intentional: this process runs as a direct child (see `daemon/src/runner/direct.rs`), so stdout is the live pane, not the daemon<->runner JSON channel (that contract is file-based here -- see `main.rs`'s `--result-file` handling)
 fn print_header(model: Option<&str>, workspace: &Workspace) {
     println!(
         "Codex · model={}
@@ -883,7 +883,7 @@ cwd: {}
     );
 }
 
-/// Prints one of Codex's own agent-message replies to the live tmux pane --
+/// Prints one of Codex's own agent-message replies to the live transcript --
 /// the whole point of RAL-102 is to let a human read this.
 #[allow(clippy::print_stdout)] // intentional: see `print_header`
 fn print_line(text: &str) {

@@ -1604,16 +1604,6 @@ mod tests {
                 provenance: None,
             },
             crate::health::CheckResult {
-                name: "tmux".to_string(),
-                status: "fail",
-                detail: "no tmux-compatible binary found".to_string(),
-                section: crate::health::HARNESS,
-                id: "tmux".to_string(),
-                impact: "Cells cannot start a live, pollable session; task execution fails wherever it depends on tmux/psmux.".to_string(),
-                remediation: "Install tmux/psmux and put it on PATH, or set RALPHUS_TMUX_CMD to its full path.".to_string(),
-                provenance: None,
-            },
-            crate::health::CheckResult {
                 name: "nvidia-smi".to_string(),
                 status: "warn",
                 detail: "not found on PATH".to_string(),
@@ -1658,8 +1648,6 @@ Core:
 Harness:
   [SKIP] git: not found on PATH, but no registered project uses Git
         impact: None today -- every registered project's vcs kind is non-Git.; remediation: If you register a Git-based project later, install git and re-run this check.
-  [FAIL] tmux: no tmux-compatible binary found
-        impact: Cells cannot start a live, pollable session; task execution fails wherever it depends on tmux/psmux.; remediation: Install tmux/psmux and put it on PATH, or set RALPHUS_TMUX_CMD to its full path.
 Machine:
   [WARN] nvidia-smi: not found on PATH
         impact: The resource view's GPU column shows N/A instead of live usage; nothing else is affected.; remediation: Optional: install NVIDIA drivers/nvidia-smi if you want GPU usage reported.
@@ -1668,7 +1656,7 @@ Configuration file issues:
   /repo/.ralphus.toml  (local)
     - TOML syntax error: unexpected token
 
-3 check(s) failed.
+2 check(s) failed.
 ";
         assert_eq!(rendered, expected);
     }
@@ -1704,9 +1692,9 @@ Configuration file issues:
         let rendered = render_health_json(&results, &file_issues, failed);
         let parsed: serde_json::Value = serde_json::from_str(&rendered).unwrap();
 
-        assert_eq!(parsed["failed"], 3);
+        assert_eq!(parsed["failed"], 2);
         let checks = parsed["checks"].as_array().unwrap();
-        assert_eq!(checks.len(), 5);
+        assert_eq!(checks.len(), 4);
 
         let config_check = checks.iter().find(|c| c["name"] == "config").unwrap();
         assert_eq!(config_check["section"], "core");
@@ -1770,12 +1758,12 @@ Configuration file issues:
         let e = serde_json::json!({
             "at_ms": 1732300000000i64,
             "source": "runner",
-            "message": "tmux session started",
+            "message": "cell session started",
             "log_excerpt": null,
         });
         assert_eq!(
             format_debug_event_line(&e),
-            "[1732300000000] runner: tmux session started"
+            "[1732300000000] runner: cell session started"
         );
     }
 

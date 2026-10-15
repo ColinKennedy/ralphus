@@ -87,7 +87,7 @@ pub const CARTOGRAPHER_PRUNE_INTERVAL: Duration = Duration::from_secs(600);
 /// here too.
 pub const TERMINAL_LOG_PRUNE_INTERVAL: Duration = Duration::from_secs(600);
 
-/// RAL-288: the sole turn content sent when resuming via resume-automation
+/// RAL-288: the sole turn content sent when resuming a cell's own agent session
 /// -- deliberately generic (not the cell's own task text, which the
 /// resumed session already has from its first turn) since `claude -p`/
 /// `codex exec`/etc. all require *some* prompt to run at all.
@@ -843,9 +843,6 @@ pub(crate) fn watchdog_verdict(
     if probe.delayed_until_ms.is_some() {
         return WatchdogVerdict::Skip("waiting out a rate limit");
     }
-    if probe.detached_at_ms.is_some() {
-        return WatchdogVerdict::Skip("detached for manual takeover");
-    }
     if probe.waypoint_halted_at_ms.is_some() {
         return WatchdogVerdict::Skip("held by a waypoint");
     }
@@ -859,7 +856,7 @@ pub(crate) fn watchdog_verdict(
 }
 
 /// RAL-626: one sweep over every `running` cell. A cell with no in-process
-/// runner registration (tmux is deliberately ignored), no exclusion, and no
+/// runner registration (session is deliberately ignored), no exclusion, and no
 /// Cartographer activity for the configured thresholds is surfaced (urgent
 /// mailbox notice + board badge) and later failed. Never restarts anything.
 pub(crate) fn runner_watchdog_sweep(
@@ -1363,16 +1360,14 @@ enum CellState {
     /// and — unlike [`CellState::Failed`] — never folded into
     /// `Progress.failed`, so cancelling a task does not mislabel it as failed.
     Cancelled,
-    /// RAL-288 Stage 6: a deliberate human-triggered detach mid-task. Resolved
-    /// *for this dispatcher run* — like `Done`/`Failed`/`Cancelled`, it stops
-    /// counting toward `active` so the worker thread can exit instead of
+    /// A cell parked mid-task (for example halted by a blocking waypoint).
+    /// Resolved *for this dispatcher run* — like `Done`/`Failed`/`Cancelled`, it
+    /// stops counting toward `active` so the worker thread can exit instead of
     /// polling forever for a resolution that will only ever come from an
-    /// explicit resume-automation call, not on its own — but unlike `Done`,
+    /// explicit resume, not on its own — but unlike `Done`,
     /// it never satisfies a dependent's `cells_ready` check, since the cell's
-    /// actual work is nowhere near finished. The cell's *store* row stays
-    /// `Running` throughout (see `scheduler::run_cell_worker`'s detach
-    /// branch) — this variant only exists in the dispatcher's own in-memory
-    /// bookkeeping, which has no other way to represent "not active, but
+    /// actual work is nowhere near finished. This variant only exists in the
+    /// dispatcher's own in-memory bookkeeping, which has no other way to represent "not active, but
     /// also not really done" for a single dispatcher pass.
     Detached,
 }
@@ -1781,12 +1776,11 @@ fn execute_squad_inner(
             // instead of sitting Pending until the whole squad drains and a
             // fresh worker gets claimed for it.
             {
-                // RAL-1xx: a `Detached` cell (RAL-288's manual-takeover pause)
-                // never joins `finalized` -- `all_terminal` below only counts
+                // A `Detached` (parked) cell never joins `finalized` -- `all_terminal` below only counts
                 // Done/Failed/Cancelled, deliberately excluding Detached (see
                 // its own doc comment) -- so the `reclaimed_tasks` reclaim just
                 // below, keyed off `finalized`, can never see it. Left alone,
-                // a cell resumed via `resume-automation`/`restart_cell` while
+                // a cell resumed via `restart_cell` while
                 // this same squad's *other* tasks are still genuinely running
                 // sits Pending in the store but never gets redispatched by
                 // this live worker: it only resurfaces once every other
@@ -2101,7 +2095,7 @@ fn execute_squad_inner(
                                     // executing -- must not count as `active`,
                                     // or this loop spins forever waiting for a
                                     // `Done` that can only ever arrive via an
-                                    // explicit resume-automation call. That
+                                    // explicit resume. That
                                     // would permanently block this worker's
                                     // dispatch loop from ever exiting to reach
                                     // the `any_detached` early return below
@@ -2109,9 +2103,7 @@ fn execute_squad_inner(
                                     // worker's slot in the shared cancellation
                                     // registry and silently blocking every
                                     // future re-claim of this squad too — the
-                                    // exact failure mode a live "Open Agent"
-                                    // then "Resume Automation" test on a
-                                    // multi-cell squad surfaced.
+                                    // failure mode seen on multi-cell squads.
                                     let cell_dep_detached =
                                         deps.iter().any(|&d| prog.status[d] == CellState::Detached);
                                     let task_dep_detached = task_deps.iter().any(|&t| {
@@ -2324,7 +2316,7 @@ fn execute_squad_inner(
     let failed_tasks = progress.failed;
     // RAL-288 Stage 6: a detached cell resolved the *dispatcher's* wait loop
     // (see `CellState::Detached`) without resolving the cell's actual work —
-    // the squad did not complete, it's paused for manual takeover, and must
+    // the squad did not complete, it's parked, and must
     // not be reported Done just because nothing is left to poll.
     let any_detached =
         progress.status.contains(&CellState::Detached) || !progress.halted_tasks.is_empty();
@@ -2357,9 +2349,7 @@ fn execute_squad_inner(
             .squad(squad_id)
             .emit(
                 &guard,
-                format!(
-                    "squad {squad_id} left un-finalized: a cell is detached for manual takeover"
-                ),
+                format!("squad {squad_id} left un-finalized: a cell is parked"),
                 serde_json::json!({ "failed_tasks": failed_tasks.len() }),
             );
         return;
@@ -3197,8 +3187,8 @@ fn run_cell_with_rate_limit_retries<'a>(
             total_turns = Some(total_turns.unwrap_or(0) + t);
         }
 
-        // RAL-536: a thinking-repetition stall is not a rate limit -- its tmux
-        // session is already dead (`run_via_tmux_attempt` killed it the moment
+        // RAL-536: a thinking-repetition stall is not a rate limit -- its session
+        // session is already dead (`run_direct_attempt` killed it the moment
         // `ThinkingStallDetector` tripped) -- so it's intercepted here, before
         // the rate-limit check below, and handed to the shared three-failure
         // rule in `handle_thinking_stall_attempt`. See that function's doc
@@ -3206,7 +3196,7 @@ fn run_cell_with_rate_limit_retries<'a>(
         if attempt.is_thinking_stalled() {
             match handle_thinking_stall_attempt(store, spec, &attempt) {
                 // No sleep/permit release here, unlike the rate-limit retry
-                // path below -- the stalled attempt already ended (its tmux
+                // path below -- the stalled attempt already ended (its session
                 // session is dead), so there is nothing to wait out; retrying
                 // immediately with the still-held permit is correct.
                 ThinkingStallOutcome::Retry => continue,
@@ -3475,8 +3465,8 @@ pub(crate) enum ThinkingStallOutcome {
 /// [`run_proof_with_rate_limit_retries`], and
 /// `guardian_merge::run_agent_with_stall_recovery` -- so cells, proof steps,
 /// and review/guardian-merge agents (the interview's full scope) all get the
-/// identical rule. By the time this runs, `attempt`'s tmux session has
-/// already been killed by `SubprocessRunner::run_via_tmux_attempt`
+/// identical rule. By the time this runs, `attempt`'s cell session has
+/// already been killed by `SubprocessRunner::run_direct_attempt`
 /// (`crate::thinking_stall`'s trip site) -- this function only ever decides
 /// whether to resume or give up, never kills anything itself.
 ///
@@ -3492,7 +3482,7 @@ pub(crate) enum ThinkingStallOutcome {
 ///
 /// # Three-failure rule and what resets what
 ///
-/// `work_key` -- `crate::tmux::session_name(&spec.squad_id, &spec.task,
+/// `work_key` -- `crate::cell_session::session_name(&spec.squad_id, &spec.task,
 /// &spec.cell_id)`, the same triple every `RunnerSpec` this can see already
 /// carries, whether it names a real cell, a proof step's synthetic
 /// `proof-<scope>-<idx>` id, or a guardian-merge agent's
@@ -3519,7 +3509,7 @@ pub(crate) enum ThinkingStallOutcome {
 ///   mirrors `SubprocessRunner::check_stall_escalation`'s RAL-241 pane-quiet
 ///   escalation), and the returned message is what the caller should surface
 ///   as its own terminal failure. No cell/proof/review-agent is auto-killed
-///   here -- it already isn't running (its tmux session died with the
+///   here -- it already isn't running (its cell session died with the
 ///   `thinking_stalled` result) -- this only stops the automatic retries.
 pub(crate) fn handle_thinking_stall_attempt(
     store: &crate::store_lock::StoreHandle,
@@ -3527,7 +3517,7 @@ pub(crate) fn handle_thinking_stall_attempt(
     attempt: &RunnerResult,
 ) -> ThinkingStallOutcome {
     debug_assert!(attempt.is_thinking_stalled());
-    let work_key = crate::tmux::session_name(&spec.squad_id, &spec.task, &spec.cell_id);
+    let work_key = crate::cell_session::session_name(&spec.squad_id, &spec.task, &spec.cell_id);
     let strikes = store
         .lock_free_memory()
         .record_thinking_stall_strike(&work_key);
@@ -3750,9 +3740,9 @@ fn run_cell_worker(
     // RAL-377: verify the runner executable itself can actually be spawned
     // *before* this cell is marked Running, not after -- previously a
     // missing/misconfigured `RALPHUS_RUNNER_CMD` only surfaced once
-    // `runner.run_cancellable` tried and failed to launch its tmux-wrapped
+    // `runner.run_cancellable` tried and failed to launch its direct
     // subprocess, by which point the cell already looked in-progress with no
-    // further signal (the shell inside the tmux pane prints its own
+    // further signal (the shell inside the cell transcript prints its own
     // "not recognized"/"command not found" and exits, but nothing here was
     // watching for that -- the cell just sat Running until its timeout, if
     // it had one at all).
@@ -3815,16 +3805,6 @@ fn run_cell_worker(
             squad_id,
             "set_task_state",
             guard.set_task_state(squad_id, row.task_idx, NodeState::Running),
-        );
-        // RAL-288: a fresh dispatch clears any stale `detached_at_ms` from a
-        // previous attempt -- covers both a plain restart and a
-        // resume-automation-triggered one, without either needing to know
-        // about the other's bookkeeping.
-        store_ok(
-            &guard,
-            squad_id,
-            "clear_cell_detached",
-            guard.clear_cell_detached(squad_id, row.task_idx, row.idx),
         );
         // RAL-400 Phase 3: same reasoning, for a stale `waypoint_halted_at_ms`
         // left behind by a previous attempt that was halted by a since-closed
@@ -4152,12 +4132,41 @@ fn run_cell_worker(
     spec.env_overrides = merged_profile_env;
     register_secret_named_env_values(store, &spec.env_overrides);
 
-    // RAL-288 Stage 6: an explicit resume-automation trigger takes priority
-    // over dependency-based sharing below -- it means a human just finished
-    // working in this exact cell's own real interactive session and wants
-    // automation to continue *that* conversation, not borrow one from a
+    // RAL-248: continue from a completed dependency's agent session when safe
+    // (cross-cell session sharing), so this cell resumes with the context the
+    // prior cell already built instead of re-reading files from scratch.
+    // Start fresh otherwise, logging why (model mismatch / no session to resume).
+    match resolve_shared_session_id(store, squad_id, row, cells, plan, i, &selection.backend) {
+        SessionShare::Resume {
+            session_id,
+            from_cell,
+            from_task,
+        } => {
+            crate::rlog!(
+                INFO,
+                "ralphus [scheduler] cell {squad_id}/{} resuming agent session {} from {}/{}",
+                row.cell_id,
+                session_id,
+                from_task,
+                from_cell,
+            );
+            spec.resume_agent_session_id = Some(session_id);
+        }
+        SessionShare::Skip { reason } => {
+            crate::rlog!(
+                INFO,
+                "ralphus [scheduler] cell {squad_id}/{} NOT sharing agent session (fresh cell): {reason}",
+                row.cell_id,
+            );
+        }
+        SessionShare::None => {}
+    }
+
+    // RAL-288 Stage 6: a forced own-session resume (set when a waypoint-halted cell resumes) takes priority
+    // over dependency-based sharing below -- it means the cell was halted mid-conversation and
+    // should continue *that* conversation, not borrow one from a
     // sibling. `take_...` clears the flag as it reads it, so it can only
-    // ever fire once per resume-automation call.
+    // ever fire once per resume.
     let own_resume = {
         let guard = store.lock();
         if guard.take_force_resume_own_session(squad_id, row.task_idx, row.idx) {
@@ -4172,7 +4181,7 @@ fn run_cell_worker(
     if let Some(session_id) = own_resume {
         crate::rlog!(
             INFO,
-            "ralphus [scheduler] cell {squad_id}/{} resuming its own agent session {} (resume-automation)",
+            "ralphus [scheduler] cell {squad_id}/{} resuming its own agent session {}",
             row.cell_id,
             session_id,
         );
@@ -4181,7 +4190,7 @@ fn run_cell_worker(
             let _ = guard.cartographer_log(crate::cartographer::CartographerEntry {
                 level: crate::logging::LogLevel::INFO,
                 source: "scheduler",
-                message: "cell resuming its own agent session (resume-automation)",
+                message: "cell resuming its own agent session",
                 scope: Some("cell"),
                 squad_id: Some(squad_id),
                 guardian_id: None,
@@ -4242,8 +4251,8 @@ fn run_cell_worker(
     // *prompt* cell (not resuming one, and not a `command`-kind cell -- those
     // never reach `ClaudeCodeBackend::run` at all, see `execute.rs`'s dispatch
     // comment, so there is no Claude session to attach to) and persist it
-    // *before* the runner starts, so the board's "Open Agent" action can
-    // attach from t=0 instead of waiting on Claude's own `system/init` event
+    // *before* the runner starts, so a resume can
+    // use it from t=0 instead of waiting on Claude's own `system/init` event
     // to report an id. Reuses the same write path as the Stage 0 live-capture
     // code (`set_cell_agent_session_id_live`) — a spawn failure just leaves a
     // harmless, never-confirmed id on the row rather than blocking dispatch.
@@ -4449,24 +4458,14 @@ fn run_cell_worker(
             ));
         }
     }
-    // RAL-288 Stage 6: a deliberate human-triggered detach mid-task is
-    // neither success nor failure -- record whatever usage/session-id was
-    // captured live (so the board's numbers don't regress), but never run
-    // this cell's proof steps and never touch `prog.status`/`prog.failed`,
-    // the same "abandon this cell, leave it as the store already reflects"
-    // treatment cancellation gets just above. A real interactive session is
-    // about to take over; automation picks back up only via the explicit
-    // resume-automation trigger, not by falling through to the normal
-    // done/failed path below.
     // RAL-400 Phase 3: a squad-kind affected entry just became `mode=block` on
     // an open waypoint while this cell was actively running (the trigger is
     // `waypoints::survey_candidate` calling `.cancel(squad_id)` on the
-    // `WaypointHalts` registry this runner attempt was polling). Like a
-    // detach, this is neither success nor failure -- record whatever
-    // usage/session-id was captured live, but never run proof steps. Unlike a
-    // detach, no human interactive session takes over: the periodic
-    // resume-sweep in `waypoints.rs` automatically hands the cell back to
-    // `pending` once the blocking waypoint closes or de-escalates.
+    // `WaypointHalts` registry this runner attempt was polling). This is
+    // neither success nor failure -- record whatever usage/session-id was
+    // captured live, but never run proof steps. The periodic resume-sweep in
+    // `waypoints.rs` automatically hands the cell back to `pending` once the
+    // blocking waypoint closes or de-escalates.
     if result.is_arbiter_stopped() {
         let outcome = CellOutcome {
             state: NodeState::Cancelled,
@@ -4589,64 +4588,6 @@ fn run_cell_worker(
                 waypoint_id,
             );
         }
-        return;
-    }
-    if result.is_detached() {
-        crate::rlog!(
-            INFO,
-            "ralphus [scheduler] cell {squad_id}/{} detached tokens_in={} tokens_out={}",
-            row.cell_id,
-            result.tokens_in,
-            result.tokens_out,
-        );
-        // Resolves this cell for *this dispatcher pass* (see
-        // `CellState::Detached`'s doc comment) so the squad's worker thread
-        // can exit instead of polling forever -- the cell's actual work
-        // stays unresolved until an explicit resume-automation call, this
-        // just stops the in-memory dispatch loop from waiting on it.
-        progress.lock().expect("progress mutex poisoned").status[i] = CellState::Detached;
-        let outcome = CellOutcome {
-            state: result.node_state(),
-            usage: (&result).into(),
-            error: None,
-            agent_session_id: result.agent_session_id.clone(),
-        };
-        let guard = store.lock();
-        store_ok(
-            &guard,
-            squad_id,
-            "record_cell_result",
-            guard.record_cell_result(squad_id, row.task_idx, row.idx, &outcome),
-        );
-        store_ok(
-            &guard,
-            squad_id,
-            "mark_cell_detached",
-            guard.mark_cell_detached(squad_id, row.task_idx, row.idx),
-        );
-        let _ = guard.cartographer_log(crate::cartographer::CartographerEntry {
-            level: crate::logging::LogLevel::INFO,
-            source: "scheduler",
-            message: "cell detached for manual takeover",
-            scope: Some("cell"),
-            squad_id: Some(squad_id),
-            guardian_id: None,
-            cell_id: Some(&row.cell_id),
-            task: Some(&row.task_name),
-            log_path: None,
-            payload: serde_json::json!({
-                "tokens_in": result.tokens_in,
-                "tokens_out": result.tokens_out,
-                "cache_creation_tokens": result.cache_creation_tokens,
-                "cache_read_tokens": result.cache_read_tokens,
-                "compaction_input_tokens": result.compaction_input_tokens,
-                "compaction_count": result.compaction_count,
-                "cost_usd": result.cost_usd,
-                "cost_is_estimated": result.cost_is_estimated,
-                "agent_session_id": result.agent_session_id,
-            }),
-            admin_only: false,
-        });
         return;
     }
     crate::rlog!(
@@ -6312,7 +6253,7 @@ fn run_proof_with_rate_limit_retries(
 
         // RAL-536: same interception as `run_cell_with_rate_limit_retries` --
         // a proof step's thinking-repetition stall is not a rate limit and
-        // its tmux session is already dead, so it's handled by the shared
+        // its cell session is already dead, so it's handled by the shared
         // three-failure rule before the rate-limit check below. `spec.cell_id`
         // is already this proof step's synthetic `proof-<scope>-<idx>` id
         // (set when this `RunnerSpec` was built), so it keys the strike
@@ -6689,12 +6630,12 @@ fn run_proofs(
                     });
                 }
                 set_proof_running(store, squad_id, task_idx, scope, cell_idx, idx);
-                // RAL-151: run through the same `Runner` (tmux-wrapped) path
+                // RAL-151: run through the same `Runner` (direct) path
                 // a `prompt`-kind proof step already does, rather than
                 // `proof::run_command_proof_capture` directly, so it can
                 // be watched live and reuses the exact same peek/pane-
                 // capture endpoints (keyed by `proof-{scope}-{idx}`, which
-                // `server.rs::proof_tmux_keys` already assumes for any
+                // `server.rs::the proof input path` already assumes for any
                 // proof kind).
                 let proof_span =
                     otel::start_span("scheduler.proof_command", &cx, SpanKind::Internal);
@@ -7531,213 +7472,7 @@ prompt = "anything"
         assert_eq!(recorded[0].kind, "refused");
     }
 
-    /// RAL-288 Stage 6: records whatever `resume_agent_session_id` (and, for
-    /// the resume-automation preamble regression below, `prompt`) it was
-    /// dispatched with, so a test can assert the scheduler actually resolved
-    /// it to a specific value rather than just checking the cell finished.
-    struct SpyResumeRunner {
-        seen_resume_agent_session_id: Arc<Mutex<Option<String>>>,
-        #[allow(clippy::type_complexity)]
-        seen_prompt: Option<Arc<Mutex<Option<String>>>>,
-    }
-
-    impl Runner for SpyResumeRunner {
-        fn run(&self, spec: &RunnerSpec) -> RunnerResult {
-            *self.seen_resume_agent_session_id.lock().unwrap() =
-                spec.resume_agent_session_id.clone();
-            if let Some(seen_prompt) = &self.seen_prompt {
-                *seen_prompt.lock().unwrap() = spec.prompt.clone();
-            }
-            RunnerResult {
-                bearing: None,
-                thinking_stall_last_line: None,
-                retry_after_secs: None,
-                status: "done".to_string(),
-                tokens_in: 1,
-                tokens_out: 1,
-                cache_creation_tokens: 0,
-                cache_read_tokens: 0,
-                compaction_input_tokens: 0,
-                compaction_count: 0,
-                cost_usd: 0.1,
-                cost_is_estimated: false,
-                summary: "ok".to_string(),
-                error: None,
-                proofed: spec.proof.then_some(true),
-                agent_session_id: spec.resume_agent_session_id.clone(),
-                ghost: None,
-                turns: None,
-                prophecies: Vec::new(),
-                appraisal: None,
-            }
-        }
-    }
-
-    #[test]
-    fn resume_automation_makes_the_scheduler_resume_the_cells_own_prior_session() {
-        let (store, id) = store_with(ONE_CELL);
-        // Seed the cell with a prior agent session, the way a real detach
-        // outcome would have (`CellOutcome.agent_session_id`) -- reusing the
-        // detach path itself is the most realistic way to get there.
-        execute_squad(&store, &DetachRunner, &id);
-        {
-            let guard = store.lock();
-            let squad = guard.get_squad(&id).unwrap();
-            assert_eq!(
-                squad.tasks[0].cells[0].agent_session_id.as_deref(),
-                Some("sess-detach-1")
-            );
-            guard.set_force_resume_own_session(&id, 0, 0).unwrap();
-        }
-
-        let seen = Arc::new(Mutex::new(None));
-        let runner = SpyResumeRunner {
-            seen_resume_agent_session_id: Arc::clone(&seen),
-            seen_prompt: None,
-        };
-        execute_squad(&store, &runner, &id);
-
-        assert_eq!(seen.lock().unwrap().as_deref(), Some("sess-detach-1"));
-        let guard = store.lock();
-        assert_eq!(guard.squad_state(&id).unwrap(), SquadState::Done);
-    }
-
-    #[test]
-    fn resume_automation_flag_is_consumed_and_never_reused_by_a_later_restart() {
-        let (store, id) = store_with(ONE_CELL);
-        execute_squad(&store, &DetachRunner, &id);
-        {
-            let guard = store.lock();
-            guard.set_force_resume_own_session(&id, 0, 0).unwrap();
-        }
-        let seen = Arc::new(Mutex::new(None));
-        execute_squad(
-            &store,
-            &SpyResumeRunner {
-                seen_resume_agent_session_id: Arc::clone(&seen),
-                seen_prompt: None,
-            },
-            &id,
-        );
-        assert_eq!(seen.lock().unwrap().as_deref(), Some("sess-detach-1"));
-
-        // A later, unrelated restart must NOT still be treated as a resume
-        // -- the flag was a one-shot hint, not a durable "always resume this
-        // cell" toggle.
-        store.lock().restart_cell(&id, 0, 0).unwrap();
-        let seen2 = Arc::new(Mutex::new(Some("unset".to_string())));
-        execute_squad(
-            &store,
-            &SpyResumeRunner {
-                seen_resume_agent_session_id: Arc::clone(&seen2),
-                seen_prompt: None,
-            },
-            &id,
-        );
-        assert_eq!(*seen2.lock().unwrap(), None);
-    }
-
-    const ONE_PROMPT_CELL: &str =
-        "[[task]]\nname=\"build\"\n[[task.cell]]\ncwd=\".\"\nprompt=\"do-thing\"\n";
-
-    /// RAL-288: caught live (RAL-239 verification pass) -- a human reported
-    /// that resuming after "Open Agent"/"Resume Automation" looked like the
-    /// agent "started from scratch" despite the session id genuinely being
-    /// resumed (confirmed correct separately: same id, `--resume` not
-    /// `--session-id`). Root cause: the backend resends the cell's raw
-    /// original task prompt as a fresh user turn on *every* resume (by
-    /// design, see `ClaudeCodeBackend::run`'s doc comment) -- correct for
-    /// RAL-248 cross-cell resume, where the next cell's task genuinely
-    /// differs, but redundant here since it's the same cell's same task,
-    /// already fully present in the resumed session's own history. Asserts
-    /// the resume-automation path replaces the prompt outright with the
-    /// fixed, task-blind [`RESUME_AUTOMATION_PROMPT`] rather than resending
-    /// the original task text, and that a plain (non-resume-automation)
-    /// dispatch's prompt is untouched.
-    #[test]
-    fn resume_automation_replaces_the_prompt_with_a_fixed_continuation_nudge() {
-        let (store, id) = store_with(ONE_PROMPT_CELL);
-        execute_squad(&store, &DetachRunner, &id);
-        {
-            let guard = store.lock();
-            guard.set_force_resume_own_session(&id, 0, 0).unwrap();
-        }
-        let seen_prompt = Arc::new(Mutex::new(None));
-        execute_squad(
-            &store,
-            &SpyResumeRunner {
-                seen_resume_agent_session_id: Arc::new(Mutex::new(None)),
-                seen_prompt: Some(Arc::clone(&seen_prompt)),
-            },
-            &id,
-        );
-        assert_eq!(
-            seen_prompt.lock().unwrap().as_deref(),
-            Some(RESUME_AUTOMATION_PROMPT)
-        );
-
-        // A plain restart (no resume-automation flag set) must not pick up
-        // the nudge -- it's specific to "a human just handed this back",
-        // not every resumed/restarted dispatch.
-        store.lock().restart_cell(&id, 0, 0).unwrap();
-        let seen_plain_prompt = Arc::new(Mutex::new(None));
-        execute_squad(
-            &store,
-            &SpyResumeRunner {
-                seen_resume_agent_session_id: Arc::new(Mutex::new(None)),
-                seen_prompt: Some(Arc::clone(&seen_plain_prompt)),
-            },
-            &id,
-        );
-        assert_eq!(
-            seen_plain_prompt.lock().unwrap().as_deref(),
-            Some("do-thing")
-        );
-    }
-
-    /// RAL-288 Stage 6: always reports a deliberate detach, carrying fixed
-    /// usage figures so the test can assert they were actually persisted.
-    struct DetachRunner;
-
-    impl Runner for DetachRunner {
-        fn run(&self, _spec: &RunnerSpec) -> RunnerResult {
-            RunnerResult::detached(
-                crate::runner::LiveUsage {
-                    tokens_in: 3,
-                    tokens_out: 7,
-                    cache_creation_tokens: 0,
-                    cache_read_tokens: 0,
-                    cost_usd: 0.25,
-                    turns: 0,
-                },
-                Some("sess-detach-1".to_string()),
-            )
-        }
-    }
-
-    #[test]
-    fn a_detached_cell_stays_running_and_never_reaches_proof_or_the_task_finalizer() {
-        let (store, id) = store_with(ONE_CELL);
-        execute_squad(&store, &DetachRunner, &id);
-
-        let guard = store.lock();
-        let squad = guard.get_squad(&id).unwrap();
-        assert_eq!(squad.tasks[0].cells[0].state, "running");
-        assert_eq!(squad.tasks[0].cells[0].tokens_in, 3);
-        assert_eq!(squad.tasks[0].cells[0].tokens_out, 7);
-        assert_eq!(
-            squad.tasks[0].cells[0].agent_session_id.as_deref(),
-            Some("sess-detach-1")
-        );
-        // Neither the task nor the squad ever reached a terminal state --
-        // a detach must not be mistaken for completion at any level above
-        // the cell either.
-        assert_eq!(squad.tasks[0].state, "running");
-        assert_ne!(guard.squad_state(&id).unwrap(), SquadState::Done);
-        assert_ne!(guard.squad_state(&id).unwrap(), SquadState::Failed);
-    }
-
-    /// RAL-400 Phase 3: reports a waypoint halt, mirroring [`DetachRunner`].
+    /// RAL-400 Phase 3: reports a waypoint halt.
     struct WaypointHaltRunner;
 
     impl Runner for WaypointHaltRunner {
@@ -8011,248 +7746,6 @@ prompt = "anything"
             "ghost note must preserve the completed-change commit reference: {}",
             ghost.content
         );
-    }
-
-    const WORK_THEN_FINALIZE: &str = "[[task]]\nname=\"t\"\n[[task.cell]]\nid=\"work\"\ncwd=\".\"\ncommand=\"do-work\"\n[[task.cell]]\nid=\"finalize\"\ncwd=\".\"\ncommand=\"do-finalize\"\ndepends_on=[\"work\"]\n";
-
-    /// RAL-288 regression: caught live (RAL-239 verification pass) when a
-    /// real squad shaped exactly like `WORK_THEN_FINALIZE` -- "work" then a
-    /// dependent "finalize" -- got detached via "Open Agent". "finalize"
-    /// stayed `Pending`, blocked on "work" (now `Detached`, not `Done`), and
-    /// the pre-fix dispatch loop's `else { active = true; }` fallback
-    /// treated that block-on-Detached exactly like "might still become
-    /// ready this pass", spinning forever instead of ever reaching the
-    /// `any_detached` early return. `execute_squad_inner` never returned,
-    /// so its caller's `cancellations.remove(squad_id)` never ran either --
-    /// permanently orphaning the squad's slot in the shared cancellation
-    /// registry and silently blocking every future re-claim (including the
-    /// one `resume-automation` needs to hand the cell back to headless
-    /// execution). This test fails by hanging (via the bounded join below)
-    /// rather than a plain assertion if the bug ever comes back.
-    #[test]
-    fn a_detached_cell_with_a_pending_dependent_still_lets_the_worker_exit() {
-        let (store, id) = store_with(WORK_THEN_FINALIZE);
-        let store_for_thread = Arc::clone(&store);
-        let id_for_thread = id.clone();
-        let handle = std::thread::spawn(move || {
-            execute_squad(&store_for_thread, &DetachRunner, &id_for_thread);
-        });
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while !handle.is_finished() {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "execute_squad never returned -- the dispatch loop is spinning \
-                 forever on a Pending cell blocked by a Detached dependency"
-            );
-            std::thread::sleep(std::time::Duration::from_millis(20));
-        }
-        handle.join().unwrap();
-
-        let guard = store.lock();
-        let squad = guard.get_squad(&id).unwrap();
-        assert_eq!(squad.tasks[0].cells[0].state, "running");
-        assert!(squad.tasks[0].cells[0].detached_at_ms.is_some());
-        // "finalize" was correctly never dispatched -- it stayed blocked on
-        // its still-Detached dependency, not silently run out of order.
-        assert_eq!(squad.tasks[0].cells[1].state, "pending");
-        assert_ne!(guard.squad_state(&id).unwrap(), SquadState::Done);
-        assert_ne!(guard.squad_state(&id).unwrap(), SquadState::Failed);
-    }
-
-    /// RAL-288's `Detached` on task "a", genuinely still-running on task "b"
-    /// (independent, no dependency between them). "a" detaches exactly once,
-    /// then reports done if dispatched again; "b" blocks until the test
-    /// releases it, so the squad's worker is provably still alive and
-    /// driving a sibling for the whole window the test cares about.
-    struct DetachThenReviveRunner {
-        detached_once: std::sync::atomic::AtomicBool,
-        release_b: (Mutex<bool>, Condvar),
-        b_started: (Mutex<bool>, Condvar),
-    }
-
-    impl Runner for DetachThenReviveRunner {
-        fn run(&self, spec: &RunnerSpec) -> RunnerResult {
-            match spec.command.as_deref() {
-                Some("x") => {
-                    use std::sync::atomic::Ordering;
-                    if !self.detached_once.swap(true, Ordering::SeqCst) {
-                        return RunnerResult::detached(
-                            crate::runner::LiveUsage {
-                                tokens_in: 1,
-                                tokens_out: 1,
-                                cache_creation_tokens: 0,
-                                cache_read_tokens: 0,
-                                cost_usd: 0.01,
-                                turns: 0,
-                            },
-                            Some("sess-a".to_string()),
-                        );
-                    }
-                    RunnerResult {
-                        bearing: None,
-                        thinking_stall_last_line: None,
-                        retry_after_secs: None,
-                        status: "done".to_string(),
-                        tokens_in: 0,
-                        tokens_out: 0,
-                        cache_creation_tokens: 0,
-                        cache_read_tokens: 0,
-                        compaction_input_tokens: 0,
-                        compaction_count: 0,
-                        cost_usd: 0.0,
-                        cost_is_estimated: false,
-                        summary: "ok".to_string(),
-                        error: None,
-                        proofed: None,
-                        agent_session_id: None,
-                        ghost: None,
-                        turns: None,
-                        prophecies: Vec::new(),
-                        appraisal: None,
-                    }
-                }
-                Some("y") => {
-                    {
-                        let (lock, cv) = &self.b_started;
-                        let mut started = lock.lock().expect("mutex poisoned");
-                        *started = true;
-                        cv.notify_all();
-                    }
-                    let (lock, cv) = &self.release_b;
-                    let mut released = lock.lock().expect("mutex poisoned");
-                    while !*released {
-                        released = cv.wait(released).expect("mutex poisoned");
-                    }
-                    RunnerResult {
-                        bearing: None,
-                        thinking_stall_last_line: None,
-                        retry_after_secs: None,
-                        status: "done".to_string(),
-                        tokens_in: 0,
-                        tokens_out: 0,
-                        cache_creation_tokens: 0,
-                        cache_read_tokens: 0,
-                        compaction_input_tokens: 0,
-                        compaction_count: 0,
-                        cost_usd: 0.0,
-                        cost_is_estimated: false,
-                        summary: "ok".to_string(),
-                        error: None,
-                        proofed: None,
-                        agent_session_id: None,
-                        ghost: None,
-                        turns: None,
-                        prophecies: Vec::new(),
-                        appraisal: None,
-                    }
-                }
-                other => panic!("unexpected command {other:?}"),
-            }
-        }
-    }
-
-    /// Regression for the "forever pending" report: `resume-automation` (or
-    /// a plain `restart_cell`) on a `Detached` cell must be picked up by the
-    /// *same* live worker right away, even while an unrelated sibling task in
-    /// the same squad is still genuinely running -- not wait for that
-    /// sibling's whole chain to finish and a fresh tick to reclaim the squad.
-    /// Before this fix, task a's cell only ever transitioned out of
-    /// `Detached` in-memory once task b's blocked runner call returned, which
-    /// this test would catch as a timeout.
-    #[test]
-    fn detached_cell_is_revived_by_the_same_live_worker_while_a_sibling_task_is_still_running() {
-        let (store, id) = store_with(TWO_INDEPENDENT_TASKS);
-        let runner = Arc::new(DetachThenReviveRunner {
-            detached_once: std::sync::atomic::AtomicBool::new(false),
-            release_b: (Mutex::new(false), Condvar::new()),
-            b_started: (Mutex::new(false), Condvar::new()),
-        });
-        let store_for_thread = Arc::clone(&store);
-        let id_for_thread = id.clone();
-        let runner_for_thread = Arc::clone(&runner);
-        let handle = std::thread::spawn(move || {
-            execute_squad(
-                &store_for_thread,
-                runner_for_thread.as_ref(),
-                &id_for_thread,
-            );
-        });
-
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
-
-        // Wait for b's cell to actually start, proving the worker is still
-        // alive and genuinely driving a sibling.
-        {
-            let (lock, cv) = &runner.b_started;
-            let mut started = lock.lock().expect("mutex poisoned");
-            while !*started {
-                assert!(std::time::Instant::now() < deadline, "b never started");
-                let (guard, _timeout) = cv
-                    .wait_timeout(started, Duration::from_millis(100))
-                    .expect("mutex poisoned");
-                started = guard;
-            }
-        }
-
-        // Poll until task a's cell has actually detached.
-        loop {
-            let detached = store.lock().get_squad(&id).unwrap().tasks[0].cells[0]
-                .detached_at_ms
-                .is_some();
-            if detached {
-                break;
-            }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "cell a never detached"
-            );
-            std::thread::sleep(Duration::from_millis(10));
-        }
-
-        // Simulate exactly what `server::resume_automation` does: mark the
-        // cell to resume its own session, then hand it back via
-        // `resume_detached_cell` -- NOT `restart_cell` -- while b's cell is
-        // still genuinely running (blocked in `release_b`). This must never
-        // touch the squad's own row: only the target cell resets.
-        {
-            let guard = store.lock();
-            guard.set_force_resume_own_session(&id, 0, 0).unwrap();
-            guard.resume_detached_cell(&id, 0, 0).unwrap();
-        }
-        assert_eq!(
-            store.lock().squad_state(&id).unwrap(),
-            SquadState::Running,
-            "resuming one detached cell must never touch the squad's own row"
-        );
-
-        // The live worker must redispatch and finish cell a on its own,
-        // without needing b to finish first.
-        loop {
-            let cell_a_done =
-                store.lock().get_squad(&id).unwrap().tasks[0].cells[0].state == "done";
-            if cell_a_done {
-                break;
-            }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "detached cell a was never revived while sibling b was still running"
-            );
-            std::thread::sleep(Duration::from_millis(10));
-        }
-
-        // Let b finish and let this pass complete.
-        {
-            let (lock, cv) = &runner.release_b;
-            let mut released = lock.lock().expect("mutex poisoned");
-            *released = true;
-            cv.notify_all();
-        }
-        handle.join().unwrap();
-
-        // The squad row was never touched by the resume, so this same live
-        // worker's own end-of-pass guard sees `Running` throughout and
-        // finalizes normally in this single pass -- no extra reclaim needed.
-        assert_eq!(store.lock().squad_state(&id).unwrap(), SquadState::Done);
     }
 
     /// RAL-435: reports a recognized, retryable Pi rate limit on its first
@@ -10246,7 +9739,6 @@ prompt = "anything"
             active_started_at_ms: Some(0),
             started_at_ms: Some(0),
             delayed_until_ms: None,
-            detached_at_ms: None,
             waypoint_halted_at_ms: None,
             runner_stalled_at_ms: None,
         }
@@ -10301,11 +9793,9 @@ prompt = "anything"
         ));
         let mut delayed = watchdog_probe();
         delayed.delayed_until_ms = Some(1);
-        let mut detached = watchdog_probe();
-        detached.detached_at_ms = Some(1);
         let mut halted = watchdog_probe();
         halted.waypoint_halted_at_ms = Some(1);
-        for p in [delayed, detached, halted] {
+        for p in [delayed, halted] {
             assert!(matches!(
                 watchdog_verdict(&p, false, idle, &cfg),
                 WatchdogVerdict::Skip(_)

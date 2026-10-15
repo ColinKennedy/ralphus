@@ -137,12 +137,6 @@ def read_daemon_token() -> str | None:
         return None
 
 
-def read_version(path: Path) -> str:
-    completed = run_checked([str(path), "-V"], cwd=path.parent)
-    text = (completed.stdout + completed.stderr).strip()
-    return text
-
-
 def bundle_readme(
     *,
     bundle_name: str,
@@ -152,7 +146,6 @@ def bundle_readme(
     dirty: bool,
     dirty_list: list[str],
     docs: list[str],
-    tmux_version_substring: str,
 ) -> str:
     dirty_block = "clean"
     if dirty:
@@ -183,10 +176,6 @@ def bundle_readme(
         -------------
         - bin/
           ralphus-daemon.exe, ralphus-librarian.exe, ralphus.exe, and ralphus-runner.exe.
-        - tmux/
-          {tmux_version_substring}, built from the vendored vendor/psmux git submodule
-          (RAL-347) -- not a separately installed/downloaded binary -- plus its LICENSE
-          and upstream README.
         - docs/
           User-facing references copied from this repo:
         {docs_block}
@@ -201,7 +190,7 @@ def bundle_readme(
 
         Launcher behavior
         -----------------
-        - The launcher exports RALPHUS_RUNNER_CMD, RALPHUS_TMUX_CMD, and RALPHUS_DAEMON_URL before starting the stack.
+        - The launcher exports RALPHUS_RUNNER_CMD and RALPHUS_DAEMON_URL before starting the stack.
         - Defaults: daemon on 127.0.0.1:7890, librarian on 127.0.0.1:7474.
         - Pass --daemon-port, --librarian-port, and optionally --db-path to run a second isolated stack.
         - Non-default daemon ports auto-derive a DB at %USERPROFILE%\\.ralphus\\tasks-<port>.db unless --db-path is supplied explicitly.
@@ -209,13 +198,8 @@ def bundle_readme(
 
         Troubleshooting
         ---------------
-        - If the launcher reports a missing file, keep the extracted folder layout intact; the executables and tmux binary are resolved relative to this folder.
+        - If the launcher reports a missing file, keep the extracted folder layout intact; the executables are resolved relative to this folder.
         - If the daemon does not come up, check logs\\daemon.log first, then try bin\\ralphus-daemon.exe serve --port 7890 manually from this folder.
-        - If tmux behavior looks wrong, run tmux\\tmux.exe -V and confirm it reports {tmux_version_substring}.
-        - The bundled tmux/tmux.exe is the vendored, in-repo psmux build. Pointing
-          RALPHUS_TMUX_CMD at a different, externally installed tmux/psmux is possible but
-          discouraged: an untrusted or tampered external binary can see everything a task
-          session does, including model API keys (see docs/dependencies.md).
         """
     )
 
@@ -290,37 +274,10 @@ def assemble_bundle(
         src = root / rel_path
         copy_file(src, bundle_root / src.name)
 
-    tmux_manifest = manifest["tmux"]["windows"]
-    tmux_exe = root / str(tmux_manifest["exe"])
-    tmux_license = root / str(tmux_manifest["license"])
-    tmux_readme = root / str(tmux_manifest["readme"])
-    for required in (tmux_exe, tmux_license, tmux_readme):
-        if not required.is_file():
-            raise FileNotFoundError(
-                f"required tmux asset missing: {required} -- run "
-                "scripts/build-vendored-tmux.ps1 (scripts/build-release.cmd does this by "
-                "default) "
-                "before assembling a bundle"
-            )
-    actual_hash = sha256_file(tmux_exe)
-    version_text = read_version(tmux_exe)
-    expected_version = str(tmux_manifest["version_substring"])
-    if expected_version not in version_text:
-        raise RuntimeError(
-            f"tmux version mismatch: expected substring {expected_version!r}, got {version_text!r}"
-        )
-    copy_file(tmux_exe, bundle_root / "tmux" / "tmux.exe")
-    copy_file(tmux_license, bundle_root / "tmux" / "LICENSE")
-    copy_file(tmux_readme, bundle_root / "tmux" / "psmux-README.md")
-
     commit = git_output(root, "rev-parse", "HEAD")
     branch = git_output(root, "rev-parse", "--abbrev-ref", "HEAD")
     dirty_list = dirty_paths(root)
     built_at = time.strftime("%Y-%m-%d %H:%M:%S %z")
-    try:
-        vendor_psmux_commit = git_output(root, "-C", "vendor/psmux", "rev-parse", "HEAD")
-    except subprocess.CalledProcessError:
-        vendor_psmux_commit = None
     provenance = {
         "bundle_name": bundle_name,
         "built_at": built_at,
@@ -329,12 +286,6 @@ def assemble_bundle(
         "source_dirty": bool(dirty_list),
         "source_dirty_paths": dirty_list,
         "allow_dirty": allow_dirty,
-        "tmux": {
-            "path": str(tmux_exe),
-            "sha256": actual_hash,
-            "version": version_text,
-            "vendor_psmux_submodule_commit": vendor_psmux_commit,
-        },
         "manifest": manifest,
     }
     readme = bundle_readme(
@@ -345,7 +296,6 @@ def assemble_bundle(
         dirty=bool(dirty_list),
         dirty_list=dirty_list,
         docs=list(manifest["bundle"]["docs"]),
-        tmux_version_substring=expected_version,
     )
     (bundle_root / "README.txt").write_text(readme, encoding="utf-8")
     (bundle_root / "PROVENANCE.json").write_text(
@@ -365,7 +315,7 @@ def zip_bundle(stage_root: Path, bundle_root_name: str, zip_path: Path) -> None:
             zf.write(path, path.relative_to(stage_root))
 
 
-def smoke_test(zip_path: Path, *, tmux_version_substring: str) -> None:
+def smoke_test(zip_path: Path) -> None:
     print_step("smoke test")
     with tempfile.TemporaryDirectory(prefix="ralphus-bundle-smoke-") as tmp:
         temp_root = Path(tmp)
@@ -401,10 +351,6 @@ def smoke_test(zip_path: Path, *, tmux_version_substring: str) -> None:
                 require_daemon_auth=True,
             )
             wait_http(f"http://127.0.0.1:{librarian_port}/", timeout_sec=30.0)
-
-            tmux_version = read_version(bundle_root / "tmux" / "tmux.exe")
-            if tmux_version_substring not in tmux_version:
-                raise RuntimeError(f"unexpected bundled tmux version: {tmux_version}")
 
             cli = bundle_root / "bin" / "ralphus.exe"
             daemon_url = f"http://127.0.0.1:{daemon_port}"
@@ -486,10 +432,7 @@ def main() -> int:
     checksum_path.write_text(f"{checksum}  {zip_path.name}\n", encoding="ascii")
 
     if not args.skip_smoke_test:
-        smoke_test(
-            zip_path,
-            tmux_version_substring=str(manifest["tmux"]["windows"]["version_substring"]),
-        )
+        smoke_test(zip_path)
 
     if not args.keep_stage:
         shutil.rmtree(stage_root)

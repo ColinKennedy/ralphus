@@ -6,7 +6,7 @@
 //! This module's direct, un-wrapped subprocess execution is used by Guardian
 //! review check gates (`daemon/src/guardian_merge.rs`), which have no live
 //! view of their own to preserve. A task/cell `command`-kind proof step
-//! instead runs through [`crate::runner::Runner`] (RAL-151), tmux-wrapped
+//! instead runs through [`crate::runner::Runner`] (RAL-151), direct
 //! exactly like a `prompt`-kind proof step, so it can be watched live from
 //! the board — see `daemon/src/scheduler.rs::run_proofs`'s `"command"`
 //! branch.

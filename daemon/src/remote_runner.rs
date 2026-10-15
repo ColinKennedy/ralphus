@@ -339,10 +339,6 @@ pub struct Capabilities {
     /// `cancel`-capable) rather than only blocking synchronously.
     #[serde(default)]
     pub async_exec: bool,
-    /// Whether this machine supports an interactive terminal relay (Open
-    /// Agent, RAL-355 Phase 10).
-    #[serde(default)]
-    pub terminal: bool,
     /// The remote `ralphus-runner` executable's own version string
     /// (`ralphus-runner --version`'s output), when the provider could
     /// determine it without side effects (e.g. without triggering an
@@ -457,29 +453,6 @@ pub struct ProviderRunner {
 }
 
 impl ProviderRunner {
-    /// Program and argv for opening this provider's interactive terminal verb
-    /// in a daemon-host terminal window.
-    #[must_use]
-    pub fn terminal_invocation(
-        &self,
-        command: &str,
-        cols: u16,
-        lines: u16,
-    ) -> (String, Vec<String>) {
-        let mut args = self.args.clone();
-        args.extend([
-            "terminal".to_string(),
-            "--uri".to_string(),
-            self.uri.clone(),
-            "--command".to_string(),
-            command.to_string(),
-            "--cols".to_string(),
-            cols.to_string(),
-            "--lines".to_string(),
-            lines.to_string(),
-        ]);
-        (self.program.clone(), args)
-    }
     /// Build a runner for one registered provider + machine uri.
     #[must_use]
     pub fn new(
@@ -822,7 +795,8 @@ impl ProviderRunner {
         spec: &RunnerSpec,
         cancel: Option<&CancelToken>,
     ) -> RunnerResult {
-        let session_name = crate::tmux::session_name(&spec.squad_id, &spec.task, &spec.cell_id);
+        let session_name =
+            crate::cell_session::session_name(&spec.squad_id, &spec.task, &spec.cell_id);
         let started = Instant::now();
         let budget = spec.timeout_sec.map(Duration::from_secs);
         let mut transcript = String::new();
@@ -839,7 +813,7 @@ impl ProviderRunner {
                         self.scheme
                     );
                 }
-                crate::tmux::write_pane_snapshot(&session_name, &transcript);
+                crate::cell_session::write_pane_snapshot(&session_name, &transcript);
                 self.note(
                     spec,
                     crate::logging::LogLevel::INFO,
@@ -862,7 +836,7 @@ impl ProviderRunner {
                             }),
                         );
                     }
-                    crate::tmux::write_pane_snapshot(&session_name, &transcript);
+                    crate::cell_session::write_pane_snapshot(&session_name, &transcript);
                     self.note(
                         spec,
                         crate::logging::LogLevel::WARNING,
@@ -900,7 +874,7 @@ impl ProviderRunner {
                             self.scheme
                         );
                     }
-                    crate::tmux::write_pane_snapshot(&session_name, &transcript);
+                    crate::cell_session::write_pane_snapshot(&session_name, &transcript);
                     crate::rlog!(
                         WARNING,
                         "ralphus [remote] cost ${:.4} exceeded maximum_budget_usd cap ${cap:.4} on machine provider {:?}, cancelling handle {handle}",
@@ -927,7 +901,7 @@ impl ProviderRunner {
                 Ok(resp) => {
                     if let Some(chunk) = resp.output.filter(|c| !c.is_empty()) {
                         transcript.push_str(&chunk);
-                        crate::tmux::write_pane_snapshot(&session_name, &transcript);
+                        crate::cell_session::write_pane_snapshot(&session_name, &transcript);
                     }
                     if resp.next.is_some() {
                         cursor = resp.next;
@@ -946,14 +920,14 @@ impl ProviderRunner {
             let status = match self.invoke_handle(VERB_STATUS, handle, None, spec) {
                 Ok(s) => s,
                 Err(e) => {
-                    crate::tmux::write_pane_snapshot(&session_name, &transcript);
+                    crate::cell_session::write_pane_snapshot(&session_name, &transcript);
                     return RunnerResult::failure(e);
                 }
             };
             match status.state.as_deref() {
                 Some("starting" | "running") | None => {}
                 Some(_) => {
-                    crate::tmux::write_pane_snapshot(&session_name, &transcript);
+                    crate::cell_session::write_pane_snapshot(&session_name, &transcript);
                     return status.result.unwrap_or_else(|| {
                         RunnerResult::failure(format!(
                             "machine provider {:?} reported handle {handle} finished but returned no \"result\" object",
@@ -1113,45 +1087,6 @@ fn provider_exec_payload(spec: &RunnerSpec) -> Result<String, serde_json::Error>
 }
 
 impl ProviderRunner {
-    /// Spawn this provider's `terminal` verb (RAL-355 Phase 10) as a
-    /// long-lived child process with piped stdin/stdout, and return the
-    /// [`std::process::Child`] handle directly instead of invoking it
-    /// through [`Self::invoke`] -- `terminal` is the one verb in the
-    /// contract that is not JSON request/response (see
-    /// `docs/machine-providers.md`), so there is no envelope to parse here;
-    /// the caller relays raw bytes to/from this child's stdio itself for as
-    /// long as the terminal session lives.
-    ///
-    /// # Errors
-    /// The provider program failing to spawn at all.
-    pub fn spawn_terminal(
-        &self,
-        command: &str,
-        cols: u16,
-        lines: u16,
-    ) -> Result<std::process::Child, String> {
-        let mut cmd = Command::new(&self.program);
-        cmd.args(&self.args)
-            .arg("terminal")
-            .arg("--uri")
-            .arg(&self.uri)
-            .arg("--command")
-            .arg(command)
-            .arg("--cols")
-            .arg(cols.to_string())
-            .arg("--lines")
-            .arg(lines.to_string())
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::inherit());
-        cmd.spawn().map_err(|e| {
-            format!(
-                "could not run machine provider {:?} ({}) for a terminal session: {e}",
-                self.scheme, self.program
-            )
-        })
-    }
-
     /// Ask the machine to confirm it is reachable and ready (RAL-185 Phase 3,
     /// Q3). Returns the provider's own detail line, if it offered one.
     ///
@@ -2595,13 +2530,13 @@ else:
         sp.cell_id = "s0-farm-stream".to_string();
         let r = router.run(&sp);
         assert_eq!(r.status, "done", "{r:?}");
-        let name = crate::tmux::session_name(&sp.squad_id, &sp.task, &sp.cell_id);
-        let snapshot = crate::tmux::read_pane_snapshot(&name).unwrap_or_default();
+        let name = crate::cell_session::session_name(&sp.squad_id, &sp.task, &sp.cell_id);
+        let snapshot = crate::cell_session::read_pane_snapshot(&name).unwrap_or_default();
         assert!(
             snapshot.contains("hello from the farm"),
             "streamed output must land in the pane snapshot the board reads; got {snapshot:?}"
         );
-        let _ = std::fs::remove_file(crate::tmux::pane_snapshot_path(&name));
+        let _ = std::fs::remove_file(crate::cell_session::pane_snapshot_path(&name));
     }
 
     #[test]
@@ -2981,77 +2916,11 @@ else:
         assert!(!err.contains("could not run machine provider"), "{err}");
     }
 
-    /// Write a throwaway provider script that echoes its own argv, one
-    /// argument per line, to stdout and exits 0 -- used to confirm
-    /// [`ProviderRunner::spawn_terminal`] actually builds the command line
-    /// it claims to (`terminal --uri ... --command ... --cols ... --lines
-    /// ...`), since `terminal` has no JSON reply to assert against the way
-    /// every other verb's tests do.
-    fn argv_echoing_provider(tag: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("ral355-argv-{tag}-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("mkdir");
-        let (path, body) = if cfg!(windows) {
-            (
-                dir.join("provider.cmd"),
-                "@echo off\r\nfor %%a in (%*) do echo %%~a\r\n".to_string(),
-            )
-        } else {
-            (
-                dir.join("provider.sh"),
-                "#!/bin/sh\nfor a in \"$@\"; do echo \"$a\"; done\n".to_string(),
-            )
-        };
-        std::fs::write(&path, body).expect("write provider script");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
-        }
-        path
-    }
-
-    #[test]
-    fn spawn_terminal_builds_the_expected_argv_and_pipes_stdio() {
-        let script = argv_echoing_provider("spawn-terminal");
-        let provider =
-            ProviderRunner::new(script.to_string_lossy().into_owned(), vec![], "ct", "A");
-        let child = provider
-            .spawn_terminal(
-                "claude --resume sess-1 --dangerously-skip-permissions",
-                100,
-                40,
-            )
-            .expect("must spawn");
-        let output = child.wait_with_output().expect("must run to completion");
-        let argv = String::from_utf8_lossy(&output.stdout);
-        assert!(argv.contains("terminal"), "{argv}");
-        assert!(argv.contains("--uri"), "{argv}");
-        assert!(argv.contains('A'), "{argv}");
-        assert!(argv.contains("--command"), "{argv}");
-        assert!(
-            argv.contains("claude --resume sess-1 --dangerously-skip-permissions"),
-            "{argv}"
-        );
-        assert!(argv.contains("--cols"), "{argv}");
-        assert!(argv.contains("100"), "{argv}");
-        assert!(argv.contains("--lines"), "{argv}");
-        assert!(argv.contains("40"), "{argv}");
-    }
-
-    #[test]
-    fn spawn_terminal_reports_a_clear_error_when_the_provider_program_does_not_exist() {
-        let provider = ProviderRunner::new("/definitely/not/a/real/provider", vec![], "ct", "A");
-        let err = provider
-            .spawn_terminal("claude --resume sess-1", 80, 24)
-            .expect_err("a nonexistent provider program must fail to spawn");
-        assert!(err.contains("terminal session"), "{err}");
-    }
-
     #[test]
     fn capabilities_reports_what_the_provider_returns() {
         let ok = fake_provider(
             "capabilities-ok",
-            r#"{"ok":true,"protocol_version":1,"capabilities":{"os":"linux","arch":"x86_64","supported_ops":["run","exec"],"async_exec":true,"terminal":false,"runner_version":"ralphus-runner 0.1.0"}}"#,
+            r#"{"ok":true,"protocol_version":1,"capabilities":{"os":"linux","arch":"x86_64","supported_ops":["run","exec"],"async_exec":true,"runner_version":"ralphus-runner 0.1.0"}}"#,
             &[],
         );
         let provider = ProviderRunner::new(ok.to_string_lossy().into_owned(), vec![], "ct", "A");
@@ -3062,7 +2931,6 @@ else:
         assert_eq!(caps.os.as_deref(), Some("linux"));
         assert_eq!(caps.arch.as_deref(), Some("x86_64"));
         assert!(caps.async_exec);
-        assert!(!caps.terminal);
         assert_eq!(caps.runner_version.as_deref(), Some("ralphus-runner 0.1.0"));
         assert_eq!(
             caps.supported_ops,

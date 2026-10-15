@@ -35,7 +35,6 @@ const SUPPORTED_OPS: &[&str] = &[
     "materialize",
     "cleanup",
     "capabilities",
-    "terminal",
     "channel",
 ];
 
@@ -90,11 +89,6 @@ pub fn run(uri: &str, config: &EffectiveConfig) -> Value {
         "arch": arch,
         "supported_ops": SUPPORTED_OPS,
         "async_exec": async_exec,
-        // True: this provider implements the `terminal` verb (RAL-355 Phase
-        // 10). The daemon still brokers the actual WebSocket listener a
-        // browser/CLI client connects to -- this field is this provider's
-        // half of the capability (can it open a remote pty at all).
-        "terminal": true,
         "runner_version": runner_version,
     })
 }
@@ -121,11 +115,9 @@ mod tests {
         assert_eq!(result["arch"], Value::Null);
         assert_eq!(result["runner_version"], Value::Null);
         assert_eq!(result["async_exec"], json!(false));
-        assert_eq!(result["terminal"], json!(true));
         let ops = result["supported_ops"].as_array().expect("array");
         assert!(ops.iter().any(|v| v == "provision"));
         assert!(ops.iter().any(|v| v == "run"));
-        assert!(ops.iter().any(|v| v == "terminal"));
         assert!(ops.iter().any(|v| v == "materialize"));
         assert!(ops.iter().any(|v| v == "channel"));
     }

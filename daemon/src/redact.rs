@@ -3,7 +3,7 @@
 //! A resolved secret (an agent-profile `from_env` value, see
 //! `crate::agent_profiles`) must never land in anything durable or
 //! user-facing — not the daemon's SQLite store, the CLI's JSON output, or the
-//! board UI. One leak path was a proof step's tmux pane text being folded
+//! board UI. One leak path was a proof step's cell transcript text being folded
 //! verbatim into a failure `detail` (and pane snapshot / terminal-log files)
 //! while the pane still showed the agent's own `$env:... = 'sk-or-v1-...'`
 //! assignment; the resolved token value was not scrubbed anywhere in that
@@ -12,8 +12,8 @@
 //! This module owns the scrubbing. It is deliberately **precise-value**
 //! redaction: the daemon registers the exact resolved values of every
 //! `from_env`-sourced agent-profile env var, and each durable-pane sink
-//! (`crate::tmux::write_pane_snapshot`, `crate::terminal_log::write_attempt`,
-//! `crate::runner::read_tmux_result`) replaces those exact strings with
+//! (`crate::cell_session::write_pane_snapshot`, `crate::terminal_log::write_attempt`,
+//! `crate::runner::read_result`) replaces those exact strings with
 //! [`REDACTED`] before the text is persisted or surfaced. There is no
 //! regex/pattern fallback — matching on the resolved value is what makes this
 //! deterministic and safe from false positives.

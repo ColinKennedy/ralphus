@@ -1,8 +1,6 @@
 # RAL-241 manual-verification repro: a task engineered to stall/hang.
 #
-# Every cell -- command or prompt/agent alike -- runs tmux-wrapped
-# (daemon/src/runner.rs::SubprocessRunner::run_cancellable, RAL-151), so a
-# plain `command` cell is enough to exercise the stall-detection path: the
+# A plain `command` cell is enough to exercise the stall-detection path: the
 # cell below sleeps for 10 minutes without printing anything, so
 # `Store::live_activity_ms` never advances past this attempt's start time.
 # Once that silence exceeds the configured stall threshold, the daemon

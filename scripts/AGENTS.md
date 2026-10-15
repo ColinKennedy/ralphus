@@ -9,7 +9,7 @@ Two build scripts, two purposes:
 
 **Fast dev loop — `bash scripts/build-debug.sh`.** Debug-builds all four binaries (daemon, librarian, runner, CLI) with `cargo` (incremental, ~seconds each) and points `RALPHUS_RUNNER_CMD` at the just-built debug `ralphus-runner` exe. It boots the daemon (`127.0.0.1:7890`) in the background and the librarian board (`127.0.0.1:7474`) in the foreground; **Ctrl-C stops both**. Invoke the CLI yourself from another shell, e.g. `target/debug/ralphus status`.
 
-**Release build — `bash scripts/build-release.sh`.** Builds copyable standalone binaries into `dist/`: `ralphus-daemon`, `ralphus-librarian`, `ralphus` (CLI), `ralphus-runner` — all four are a single `cargo build --release` now, no PyInstaller step. On Windows, it also builds and embeds the vendored psmux binary by default; pass `--skip-tmux` to either `build-release.sh` or `build-release.cmd` to omit that step and build without the `embedded-tmux` feature. Stop any running daemon/librarian/CLI/runner first: they lock their own `dist/` exes and the copy step will fail with "Device or resource busy".
+**Release build — `bash scripts/build-release.sh`.** Builds copyable standalone binaries into `dist/`: `ralphus-daemon`, `ralphus-librarian`, `ralphus` (CLI), `ralphus-runner` — all four are a single `cargo build --release` now, no PyInstaller step. Stop any running daemon/librarian/CLI/runner first: they lock their own `dist/` exes and the copy step will fail with "Device or resource busy".
 
 **Testing ralphus using ralphus (multi-instance dev stacks, RAL-164).** `ralphus-daemon serve` accepts `--db <path>` alongside `--port`, and `build-debug.sh`/`.cmd` accept a matching `--db-path`. To keep your regular ralphus instance open while exercising a change in another git worktree, give that worktree's stack its own port *and* its own DB explicitly:
 
@@ -21,7 +21,7 @@ bash scripts/build-debug.sh
 bash scripts/build-debug.sh --daemon-port 7891 --librarian-port 7475 --db-path ~/.ralphus/tasks-worktree-b.db
 ```
 
-This is deliberately explicit, not auto-picked: if a script silently chose a port or DB path on `start`, a later `ralphus-daemon stop --port N` (a new shell, a different agent) would have no reliable way to know what to target. Passing a non-default `--daemon-port` without `--db-path` still gets automatic DB isolation (derived as `~/.ralphus/tasks-<port>.db`) — only the *default* port keeps using the plain `~/.ralphus/tasks.db` it always has, so existing setups are unaffected. The same non-default port also gets its own psmux instance: `build-debug` exports `PSMUX_DATA_DIR=~/.ralphus/psmux-<port>` (an explicit `PSMUX_DATA_DIR` wins). That variable is the instance key the daemon's tmux reap is scoped by (see `.agent/gotchas.md`), so the second stack neither kills nor is killed by the regular one's sessions. Point the CLI or a browser at the second instance with `ralphus --daemon-url http://127.0.0.1:7891 ...` / `http://127.0.0.1:7475`, and stop it with `ralphus-daemon stop --port 7891` when done.
+This is deliberately explicit, not auto-picked: if a script silently chose a port or DB path on `start`, a later `ralphus-daemon stop --port N` (a new shell, a different agent) would have no reliable way to know what to target. Passing a non-default `--daemon-port` without `--db-path` still gets automatic DB isolation (derived as `~/.ralphus/tasks-<port>.db`) — only the *default* port keeps using the plain `~/.ralphus/tasks.db` it always has, so existing setups are unaffected. Point the CLI or a browser at the second instance with `ralphus --daemon-url http://127.0.0.1:7891 ...` / `http://127.0.0.1:7475`, and stop it with `ralphus-daemon stop --port 7891` when done.
 
 Run the pieces directly:
 
@@ -49,9 +49,8 @@ machine provider in strict mode), plus the exempt `initialize followup`
 locally only, each against its own throwaway daemon that
 `--stop` shuts down. Build `ralphus`, `ralphus-daemon` and `ralphus-runner`
 first; needs git and Python 3. `--only review,waypoint`, `--local-only` /
-`--remote-only` narrow it. CI's `initialize-exercises` job runs it (Windows:
-`--remote-only`, since local cells need psmux). It never touches a running
-dev stack: each exercise gets its own port, database, home, and psmux data dir.
+`--remote-only` narrow it. CI's `initialize-exercises` job runs it. It never touches a running
+dev stack: each exercise gets its own port, database, and home.
 The rules every exercise must meet (no LLM, local and remote, CI-wired) live in
 [`cli/src/commands/initialize/AGENTS.md`](../cli/src/commands/initialize/AGENTS.md).
 

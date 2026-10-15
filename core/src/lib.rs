@@ -50,7 +50,7 @@ fn home_dir() -> Option<PathBuf> {
 /// needed. Falls back to `./.ralphus` when no home directory is set.
 ///
 /// Lives here — rather than only in `ralphus-daemon`, which owns most of what
-/// it stores (the SQLite DB, tmux pane snapshots, terminal logs) — because the
+/// it stores (the SQLite DB, cell transcripts, terminal logs) — because the
 /// daemon's bearer-token file (RAL-219, [`daemon_token_path`] below) must also
 /// be resolvable by the librarian, without pulling in the whole daemon crate
 /// (SQLite, scheduler, ...) just for a path join. `ralphus_daemon::state_dir()`

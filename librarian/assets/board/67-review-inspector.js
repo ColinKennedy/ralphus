@@ -1710,7 +1710,7 @@
         const isLatest = ri === runs.length - 1;
         const sub = liveSub[b.id] || "terminal";
         const ended = !!peekEnded[key];
-        // Only the newest pass that used a tmux pane has content the live view
+        // Only the newest pass that used a live pane has content the live view
         // still holds: the pane is reused, so an earlier pass's text is no
         // longer in it. "Am I looking at live content" therefore keys on the
         // Whether the pane still holds this run's text at all, separate from
@@ -1796,13 +1796,11 @@
        * @param {string} key - The peek key.
        * @param {BranchRun|null} run - The run being shown.
        * @param {boolean} isLatest - Whether that run is the newest one that used
-       *   a tmux pane, and so the only one whose text the live view still holds.
+       *   a live pane, and so the only one whose text the live view still holds.
        * @returns {string}
        */
       function inspectorLiveTerminalView(g, b, key, run, isLatest) {
         const foot = `<div class="run-foot">
-            ${isLatest ? `<button class="btn" style="padding:3px 8px;font-size:11.5px" data-click="openGuardianBranchTerminalMenuItem" data-key="${esc(key)}" data-gid="${esc(g.id)}" data-bid="${esc(b.id)}" data-mode="open"
-              data-tip="Attach a real, interactive terminal to this session.\nShows the runner's own log/event stream, not the agent's conversation.">Open terminal</button>` : ""}
             <button class="btn" style="padding:3px 8px;font-size:11.5px" data-click="scopeReviewDockToBranch" data-guardian-id="${esc(g.id)}" data-branch-id="${esc(b.id)}"
               data-tip="Open this branch's log drawer alongside the transcript.">Logs</button>
             <span class="rg-sub">${run ? esc(run.agent || resolverOf(g)) : ""}</span>

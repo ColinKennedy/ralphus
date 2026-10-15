@@ -1,8 +1,4 @@
-//! Mirrors `ralphus_cli::commands::cell::dispatch`. `cell open-agent` and
-//! `cell remote-terminal` are excluded from the MCP tool surface (see
-//! `crate::exclusions`) so their `CellCommand` arms are unreachable from a
-//! real tool call, but are still handled (as a defensive error, not a
-//! `panic!`/`unreachable!`) in case argv construction is ever wired up wrong.
+//! Mirrors `ralphus_cli::commands::cell::dispatch`.
 
 use ralphus_cli::client::DaemonClient;
 use ralphus_cli::commands::CommandError;
@@ -160,20 +156,6 @@ pub fn execute(cmd: CellCommand, client: &DaemonClient) -> ExecResult {
                 "command": resume_cmd.join(" "),
                 "cell": cell_data,
             }))
-        }
-        CellCommand::OpenAgent { .. } => Err(usage(
-            "cell open-agent is excluded from the MCP tool surface",
-        )),
-        CellCommand::RemoteTerminal { .. } => Err(usage(
-            "cell remote-terminal is excluded from the MCP tool surface",
-        )),
-        CellCommand::ResumeAutomation { selector } => {
-            let resolved = cell::resolve_scoped(client, &selector, "cell")?;
-            Ok(client.resume_automation(
-                &resolved.squad_id,
-                resolved.task_idx,
-                resolved.cell_idx,
-            )?)
         }
     }
 }

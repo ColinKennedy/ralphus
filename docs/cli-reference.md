@@ -239,10 +239,7 @@ indented under its own heading:
   (timeouts, concurrency, forge/PR conventions, templates, agent
   profiles/resolver).
 - **Harness** -- `git` (only required when a registered project actually
-  uses it; otherwise reported `SKIP`, not `FAIL`), `tmux`/psmux (resolved the
-  same way the daemon does, reporting both the resolved binary and which
-  resolution source won: an explicit `RALPHUS_TMUX_CMD` override, the
-  embedded vendored build, or `PATH`), the runner binary, agent backend
+  uses it; otherwise reported `SKIP`, not `FAIL`), the runner binary, agent backend
   commands (`claude`/`codex`/`pi`/`ollama`), and the optional `gh`/`glab`
   forge-auth fallbacks (never fail if missing -- see
   [`docs/dependencies.md`](dependencies.md)).
@@ -413,8 +410,7 @@ the daemon's hourly Free-tier background sweep
 
 `cell terminal`, `review checks run`, and `review action run` deliberately
 print a resolved shell command + working directory instead of calling the
-daemon's `open-terminal` / `run-manual-commands` / `run-action-hint`
-endpoints. Those endpoints spawn a GUI terminal window **on whatever machine
+daemon's `run-manual-commands` / `run-action-hint` endpoints. Those endpoints spawn a GUI terminal window **on whatever machine
 runs `ralphus-daemon`** — meaningful for the browser board (same desktop
 session) but not for a headless/remote CLI invocation. Run the printed
 command yourself instead.
@@ -751,11 +747,8 @@ use; see `READ_ONLY_NOTE`.
         - (read-only-safe) diff selector [uri] --summary  {Show a running cell's live worktree diff (full diff computed only when changes were pushed).}
         - edit selector [uri] --agent [name] --auto-compact-threshold [tokens] --command [cmd] --cwd [path] --effort [level] --initialization-commands [text] --initialization-timeout-sec [seconds] --maximum-context [tokens] --maximum-tool-output-tokens [tokens] --model [name] --prompt [text] --system-prompt [text] --temperature [number]  {Edit a cell's fields. --initialization-commands (one command per line; blank clears) sets the worktree initialization that runs once in the cell's freshly created worktree.}
         - (read-only-safe) env selector [uri] --scope [cell|proof]  {List a cell's resolved environment variables, read-only (RAL-324); --scope proof shows what its own proof steps inherit.}
-        - open-agent selector [uri]  {Open the real interactive agent in a new terminal -- while running, cleanly detaches the cell first (RAL-288); while finished, resumes it the old way.}
-        - remote-terminal selector [uri]  {Attach an interactive terminal to a remote cell's resumed Claude Code session over the daemon's WebSocket relay (RAL-355).}
         - restart selector [uri]  {Restart a cell (and its downstream), dirtying dependent squads.}
         - restart-proof selector [uri] --from [index]  {Restart a cell's proof steps: resets the whole sequence to pending and re-runs from the start.}
-        - resume-automation selector [uri]  {Hand a detached cell back to unattended execution, continuing the exact same agent conversation (RAL-288).}
         - (read-only-safe) reviews selector [uri]  {The reviews this cell's branch participates in.}
         - set-status selector [uri] state [str]  {Manually override a cell's status.}
         - (read-only-safe) show selector [uri]  {Show a single cell's detail.}
@@ -763,7 +756,7 @@ use; see `READ_ONLY_NOTE`.
         - (read-only-safe) worktree selector [uri]  {Show the worktree/project a cell is using.}
     - check  {System and environment checks.}
         - (read-only-safe) catalog --json  {List every check ralphus_core::health_catalog knows about -- stable id, Core/Harness/Machine section, daemon/remote applicability, Free/OnDemand cost tier, Required/Optional/FallbackOnly requirement level, and impact -- without running any probes (RAL-416). Instant and side-effect-free, unlike `check health`.}
-        - (read-only-safe) health --all-remotes --enable-developer-checks --enable-live-agent-check --json (subagent)  {Check the local ralphus setup, grouped into Core/Harness/Machine sections (daemon, layered config, git, tmux, runner, agent backends, gh/glab, resource checks). --all-remotes also checks every configured [machine.targets.*] entry (RAL-355 Phase 9); --enable-live-agent-check additionally performs a live, cost-incurring Arbiter completion round-trip (RAL-415, off by default).}
+        - (read-only-safe) health --all-remotes --enable-developer-checks --enable-live-agent-check --json (subagent)  {Check the local ralphus setup, grouped into Core/Harness/Machine sections (daemon, layered config, git, runner, agent backends, gh/glab, resource checks). --all-remotes also checks every configured [machine.targets.*] entry (RAL-355 Phase 9); --enable-live-agent-check additionally performs a live, cost-incurring Arbiter completion round-trip (RAL-415, off by default).}
         - restart-thread name [str] --json  {Restart a daemon background thread that has panicked or exited (scheduler, health-sweep, pr-base-drift-poller, store-watchdog) without restarting the daemon. `check health` reports each thread's state and names this command for any that is down. Refused for a thread that is still alive.}
     - clear --all --keep-temporary --status [states] --yes (subagent)  {Delete tasks and reviews from the daemon.}
     - (read-only-safe) completion  {Print a shell tab-completion script. (Rust port: not yet implemented -- prints a placeholder message; Python's `shell` argument is not read.)}
@@ -775,7 +768,7 @@ use; see `READ_ONLY_NOTE`.
             - remove kind [github|gitlab] label [str] --host [host]  {Remove a labelled token from the poll pool.}
     - (read-only-safe) get selector [uri] field [str, optional]  {Query one field from any entity's JSON view (jq-lite).}
     - (read-only-safe) graph squad_id [id, optional] --all --dot  {Render the task-order dependency graph. (Rust port simplifies Python's --global/--format ascii|dot choice to plain --dot/--all boolean flags.)}
-    - (read-only-safe) history selector [uri] --type [str]  {Show a cell/proof step's tmux history (one-shot snapshot; Python's --live tailing and --wait-until-valid are not yet ported).}
+    - (read-only-safe) history selector [uri] --type [str]  {Show a cell/proof step's transcript history (one-shot snapshot; Python's --live tailing and --wait-until-valid are not yet ported).}
     - initialize  {One-time local setup helpers for a repository.}
         - followup --remote --state-dir [path] --stop  {Launch an isolated daemon and run the deferred-prophecy follow-up flow with a stub agent: a review merges, offers follow-up work, the offer is accepted, and the drafted squad runs to completion. Local only (--remote is refused); --stop shuts the daemon down afterwards.}
         - git --path [path]  {Enable git rerere in a repo so review rebases replay conflict resolutions.}

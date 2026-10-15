@@ -13,8 +13,7 @@
 # if any exercise fails, printing that exercise's output and daemon log tail.
 #
 # Run it from your own terminal, never from inside a ralphus cell or feedback
-# pass: each daemon's startup reap kills every ralphus_ tmux server on the
-# machine, including the one hosting the caller (.agent/agent-conduct.md).
+# pass (.agent/agent-conduct.md).
 set -u
 
 repo_root=$(cd "$(dirname "$0")/.." && pwd)

@@ -1085,7 +1085,7 @@ pub struct GuardianView {
     /// Model behind `manual_commands` (see [`Self::manual_commands_agent`]).
     pub manual_commands_model: Option<String>,
     /// RAL-88 follow-up: agent_session_id from the most recent manual-checks
-    /// generation pass, for its "Open Agent" terminal action. `None` when the
+    /// generation pass. `None` when the
     /// resolved agent isn't claude-code, or generation hasn't run yet.
     pub manual_commands_agent_session_id: Option<String>,
     /// Git project roots whose task branches are squashed to a single commit in
@@ -4833,8 +4833,7 @@ impl Store {
     }
 
     /// Fetch a branch's recorded conflict-resolver Claude Code session id,
-    /// for its "Open Agent" terminal action (resuming the real `claude` CLI
-    /// rather than re-attaching to the runner's tmux wrapper) — see
+    /// to resume the real `claude` CLI — see
     /// `Store::get_cell_agent_resume`'s doc comment for the same idea
     /// applied to a plain cell.
     pub fn get_branch_resolver_agent_session_id(
@@ -4918,8 +4917,7 @@ impl Store {
         Ok(())
     }
 
-    /// Fetch a guardian's recorded manual-commands agent_session_id, for its
-    /// "Open Agent" terminal action, plus the cwd generation ran/runs in
+    /// Fetch a guardian's recorded manual-commands agent_session_id, plus the cwd generation ran/runs in
     /// (the combined review worktree, falling back to `git_root` before one
     /// exists). `None` in either position means the corresponding action
     /// isn't available yet.

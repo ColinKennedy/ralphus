@@ -3,12 +3,9 @@
 //! Guarantees that the *values* of auth/credential environment variables
 //! (e.g. `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_BASE_URL`,
 //! and any provider credentials) are never echoed to a terminal, written to a
-//! transcript, or shown in any user-visible view. The daemon delivers squad
-//! env-overrides to a tmux-wrapped runner on Windows by inlining them into the
-//! typed shell line (see
-//! `ralphus_daemon::tmux::new_detached_session_with_command`) — PowerShell
-//! echoes that whole line into the pane as text, so on a pane-capture the
-//! secret shows up as a `$env:KEY = '<value>'` assignment. This module is the
+//! transcript, or shown in any user-visible view. A shell line that inlines a
+//! squad env-override is echoed as text, so a captured transcript can show the
+//! secret as a `$env:KEY = '<value>'` assignment. This module is the
 //! single redaction getter (`[`redact_secrets`]`) that every read/serve/log
 //! path calls to scrub such assignments, and the predicate
 //! (`[`is_secret_env_key`]`) that decides which env names are secrets.

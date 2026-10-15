@@ -10,7 +10,6 @@ librarian/assets/
   board.css             # the whole stylesheet (dark + light theme variables)
   board/*.js            # the board's JavaScript, one file per section, loaded in
                         # filename order via board.html's sequential <script> tags
-  vendor/               # vendored xterm.js + xterm-addon-fit (RAL-355), UMD globals
 ```
 
 The chunk files are plain global-scope scripts — no `import`/`export` — so
@@ -27,10 +26,10 @@ Serving has two modes (see `src/assets.rs`):
   copies.
 
 Route names are validated by the shared rules in `src/asset_rules.rs`:
-the shell and stylesheet, every `*.js` under `board/`, and exactly the three
-vendored xterm files. Nothing else is ever served or embedded — both the
-build-time walk and the dev-mode disk reader include the same rules file, and
-Rust tests in `src/assets.rs` pin them against the on-disk truth.
+the shell and stylesheet, every `*.js` under `board/`. Nothing else is ever
+served or embedded — both the build-time walk and the dev-mode disk reader
+include the same rules file, and Rust tests in `src/assets.rs` pin them
+against the on-disk truth.
 
 ```bash
 npm ci --no-audit --no-fund             # once in each git worktree

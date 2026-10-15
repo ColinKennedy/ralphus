@@ -42,10 +42,8 @@ All of the following hold for **every** exercise, with no exceptions:
    a fixed port, path, project name, or machine name between exercises, and
    never touch the user's real daemon or global config. Any exercise must be
    runnable in any order, or concurrently with another.
-   (Isolation covers state, not tmux: a daemon's startup reap kills every
-   `ralphus_` tmux server machine-wide, so an exercise must never be run from
-   inside a ralphus cell or feedback pass; see
-   [`.agent/agent-conduct.md`](../../../../.agent/agent-conduct.md).)
+   (An exercise must never be run from inside a ralphus cell or feedback
+   pass; see [`.agent/agent-conduct.md`](../../../../.agent/agent-conduct.md).)
 3. **No LLM, ever.** An exercise must pass with no model, API key, network
    access, or agent backend available. Use raw `command` cells/proofs only —
    never a `prompt` cell, an agent, or anything that calls
@@ -76,9 +74,7 @@ All of the following hold for **every** exercise, with no exceptions:
   bash scripts/check-initialize-exercises.sh --only <name>
   ```
 
-  Windows runs only the remote variant in CI (local cells need psmux, which
-  only the `psmux-integration` job builds); Ubuntu runs both. Say so plainly if
-  you could only run one mode.
+  Say so plainly if you could only run one mode.
 - Comments describe the current code only, and logging follows
   [`.agent/logging-policy.md`](../../../../.agent/logging-policy.md): stdout is
   the exercise's output, diagnostics go to stderr with the `ralphus [exercise]`

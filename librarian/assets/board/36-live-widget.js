@@ -248,7 +248,7 @@
        * @param {string} key - The peek key.
        * @param {BranchRun|null} run - The run being shown.
        * @param {boolean} isLatest - Whether that run is the newest one that used
-       *   a tmux pane, and so the only one whose text the live view still holds.
+       *   a live pane, and so the only one whose text the live view still holds.
        * @returns {string}
        */
       function liveTerminalView(ctx, key, run, isLatest) {

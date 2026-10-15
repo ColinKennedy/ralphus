@@ -131,28 +131,12 @@ This mode closes the *filesystem* half of the problem. It does **not**:
   A task routed to a `machine = "ssh:..."` target runs on that remote host
   exactly as before, regardless of which mode the daemon itself runs in.
 
-## tmux-wrapped live cells still work unchanged
+## Agent subprocess execution in container mode
 
-Agent-kind cell/proof runs execute inside a detached tmux session
-(`daemon/src/tmux.rs`), which is what makes the Live view and "Open
-Terminal Log" possible. Container mode installs real Linux tmux (not the
-Windows `psmux` alternative this project also supports) — `daemon/src/tmux.rs`
-resolves it the same way it always does (`RALPHUS_TMUX_CMD` override, else
-`tmux` on `PATH`), so no daemon-side code path changes.
-
-Verified manually, against the same running container as above:
-
-```bash
-$ docker compose -f docker/docker-compose.yml exec ralphus sh -c \
-    'tmux new-session -d -s live -x 80 -y 24 "echo hello-from-pane; sleep 60"; sleep 1; tmux list-sessions; tmux capture-pane -t live -p'
-live: 1 windows (created ...)
-hello-from-pane
-```
-
-A detached tmux session starts, keeps running, and `capture-pane` (the same
-primitive the board's Live View polls) reads its output — the same mechanism
-a real agent cell or `docker compose exec ralphus tmux attach -t
-<session-name>` (interactive terminal attach) relies on.
+Agent-kind cell/proof runs execute as plain child processes (RAL-658: the
+tmux/psmux multiplexer was removed). The runner spawns the agent subprocess,
+captures its output to a durable transcript file, and the board's Live View
+reads from that transcript in real time.
 
 ## Manual verification (filesystem confinement)
 
@@ -221,19 +205,6 @@ Linux kernel (bind mounts + `read_only` rootfs), not by anything in
 ralphus's own code, which is what makes it real confinement rather than a
 convention an injected prompt could talk an agent out of.
 
-**A real bug this verification caught:** the first build set the container's
-`ralphus` user's login shell to `/usr/sbin/nologin`, intending it as
-additional hardening. That silently broke every tmux pane — tmux resolves
-the pane's interpreter from the user's passwd shell even when given an
-explicit command, and `nologin` "succeeds" as an execve() target by printing
-`This account is currently not available.` and exiting immediately, so every
-pane died on creation. `nologin` was only ever relevant to blocking
-interactive login (SSH/console) on this uid, which was never how it's used —
-this container only ever spawns processes as this uid, never logs into it.
-Fixed to `/bin/bash` in `docker/Dockerfile`; see the manual tmux check below
-for the passing re-verification. This is exactly the kind of gap that stays
-invisible without actually running the container and exercising the tmux
-path, not just reading the compose file's flags.
 
 ## Future follow-up (explicitly out of scope here)
 

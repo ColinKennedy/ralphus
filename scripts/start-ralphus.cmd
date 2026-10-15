@@ -48,7 +48,6 @@ if "%db_path%"=="" if not "%daemon_port%"=="7890" (
 )
 
 set "RALPHUS_RUNNER_CMD=%root%\bin\ralphus-runner.exe"
-set "RALPHUS_TMUX_CMD=%root%\tmux\tmux.exe"
 set "RALPHUS_DAEMON_URL=http://127.0.0.1:%daemon_port%"
 set "daemon_exe=%root%\bin\ralphus-daemon.exe"
 set "librarian_exe=%root%\bin\ralphus-librarian.exe"
@@ -59,7 +58,7 @@ set "daemon_stderr_log=%log_dir%\daemon.stderr.log"
 set "librarian_log=%log_dir%\librarian.log"
 set "daemon_pid_file=%log_dir%\daemon.pid"
 
-for %%F in ("%daemon_exe%" "%librarian_exe%" "%RALPHUS_RUNNER_CMD%" "%RALPHUS_TMUX_CMD%") do (
+for %%F in ("%daemon_exe%" "%librarian_exe%" "%RALPHUS_RUNNER_CMD%") do (
     if not exist "%%~fF" (
         echo required file missing: %%~fF 1>&2
         exit /b 1
@@ -81,7 +80,6 @@ if exist "%daemon_pid_file%" del "%daemon_pid_file%"
 
 echo == starting ralphus bundle ==
 echo    runner    -^> %RALPHUS_RUNNER_CMD%
-echo    tmux      -^> %RALPHUS_TMUX_CMD%
 echo    daemon    -^> %RALPHUS_DAEMON_URL%
 if "%db_path%"=="" (
     echo    db        -^> ^<default: %%USERPROFILE%%\.ralphus\tasks.db^>

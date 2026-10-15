@@ -191,8 +191,6 @@ enum Slot<'a> {
 
 fn slot<'a>(setup: &'a mut InitializeSoloDeveloperOptions, key: &str) -> Option<Slot<'a>> {
     Some(match key {
-        "install_tmux" => Slot::Bool(&mut setup.install_tmux),
-        "tmux_program" => Slot::Text(&mut setup.tmux_program),
         "setup_mcp" => Slot::Bool(&mut setup.setup_mcp),
         "mcp_host" => Slot::List(&mut setup.mcp_hosts),
         "agent_logins" => Slot::Text(&mut setup.agent_logins),
@@ -404,10 +402,7 @@ pub(super) fn load_into(
 fn unasked_default(key: &str) -> toml::Value {
     use toml::Value::{Array, Boolean, String as Text};
     match key {
-        "install_tmux" => Boolean(false),
-        "tmux_program" | "project_fork_url" | "project_description" | "fork_url" => {
-            Text(String::new())
-        }
+        "project_fork_url" | "project_description" | "fork_url" => Text(String::new()),
         "setup_mcp" | "project_is_fork" | "require_forks" | "create_admin" | "force_skills" => {
             Boolean(false)
         }
@@ -463,7 +458,7 @@ fn supplied_value(setup: &mut InitializeSoloDeveloperOptions, key: &str) -> Opti
 pub(super) fn render(setup: &mut InitializeSoloDeveloperOptions) -> String {
     let mut out = format!(
         "# ralphus initialize solo-developer answers (replay with `--answers-file <this file>`)\n\
-         # Some values (tmux paths, MCP hosts, project names/URLs) are specific to the\n\
+         # Some values (MCP hosts, project names/URLs) are specific to the\n\
          # machine that produced this file; the forge token is never stored.\n\
          version = {VERSION}\n"
     );

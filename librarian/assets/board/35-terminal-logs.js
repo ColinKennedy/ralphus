@@ -172,7 +172,7 @@
           // failed probe leaves `live` null so the tape-growth fallback decides.
           // Fired now but awaited after the tape fetch below: `/pane` and
           // `/pane-transcript` are independent requests (the daemon-side
-          // `/pane` handler can shell out to tmux, which is the slower of the
+          // `/pane` handler can do extra work, which is the slower of the
           // two), so kicking both off together instead of one-after-another
           // roughly halves this box's per-tick latency.
           const liveUrl = peekUrlFor(key);
@@ -527,7 +527,7 @@
 
       // ---- Durable terminal-log attempt history (RAL-154) ----
       // Sibling feature to the live pane peek above: lists every durably
-      // persisted attempt (initial run + each tmux reattach) for a cell's
+      // persisted attempt (initial run + each later attempt) for a cell's
       // terminal log, and lets any one of them be opened and read in full —
       // unlike the peek box, this survives pane death and daemon restarts,
       // and stays keyed the same way (see peekUrlFor) so the same `key`
@@ -745,8 +745,8 @@
        * @returns {Promise<void>}
        */
       async function pollOpenPeeks() {
-        // A hidden tab shows nothing, and every box poll can cost the daemon a
-        // tmux process; the visibilitychange handler refreshes on return.
+        // A hidden tab shows nothing, and every box poll costs the daemon a
+        // request; the visibilitychange handler refreshes on return.
         if (document.hidden) return;
         // Replacing a pre's text destroys any in-progress text selection inside it
         // (e.g. the user copying a line from the terminal transcript) even though
@@ -756,7 +756,7 @@
         if (userIsSelecting()) return;
         // Ended boxes poll every tick too, so a restart revives them within a
         // tick or two. The daemon answers an ended cell from its stored
-        // snapshot without touching tmux, so this costs only an HTTP request
+        // snapshot without touching the live run, so this costs only an HTTP request
         // and a database read per box. If that ever adds up, throttle ended
         // boxes here (e.g. poll them every Nth tick) at the price of a slower
         // revive; deliberately not throttled for now.

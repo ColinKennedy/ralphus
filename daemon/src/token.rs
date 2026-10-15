@@ -317,7 +317,7 @@ mod tests {
     }
 
     /// A throwaway directory under the OS temp dir, unique per call — keeps
-    /// these tests off the real `state_dir()` (same idiom as `tmux.rs`'s test
+    /// these tests off the real `state_dir()` (same idiom as `cell_session.rs`'s test
     /// helpers).
     fn tempdir() -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!(

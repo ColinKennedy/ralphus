@@ -40,7 +40,7 @@ jobs:
         run: |
           if [ "$DEFERRED" = "true" ]; then
             echo "### Slow jobs deferred" >> "$GITHUB_STEP_SUMMARY"
-            echo "This PR carries \`ralphus:defer-full-ci\`, so the full test suite, the release builds, the exercises, the psmux tests, the Python tests and the perf tests were skipped. Fast checks still ran. The full suite runs on the top PR of the stack." >> "$GITHUB_STEP_SUMMARY"
+            echo "This PR carries \`ralphus:defer-full-ci\`, so the full test suite, the release builds, the exercises, the Python tests and the perf tests were skipped. Fast checks still ran. The full suite runs on the top PR of the stack." >> "$GITHUB_STEP_SUMMARY"
           else
             echo "### Full CI" >> "$GITHUB_STEP_SUMMARY"
             echo "No \`ralphus:defer-full-ci\` label: every job runs." >> "$GITHUB_STEP_SUMMARY"
@@ -139,8 +139,7 @@ jobs:
         if: matrix.suite == 'msrv' && !contains(github.event.pull_request.labels.*.name, 'ralphus:defer-full-ci')
         run: cargo "+${{ matrix.toolchain }}" build --workspace --all-targets
       # macOS leg (RAL-398): experimental support, so this only proves the
-      # workspace builds -- no fmt/clippy/test/doctest suite, and no vendored
-      # psmux (that feature is Windows-only and off by default). A deeper
+      # workspace builds -- no fmt/clippy/test/doctest suite. A deeper
       # macOS CI leg can follow once there's a real need to justify it.
       - name: Build (macOS smoke test)
         if: matrix.suite == 'macos-min' && !contains(github.event.pull_request.labels.*.name, 'ralphus:defer-full-ci')
@@ -157,17 +156,11 @@ jobs:
         # (scripts/build-release.sh on linux, scripts/build-release.cmd on
         # Windows) so ship-ready bundling -- not just compilation -- is
         # covered. Debug builds are already exercised by the `rust` job
-        # (including its macOS smoke leg), so they are not repeated here. The
-        # Windows leg also exercises the vendored psmux submodule build that
-        # scripts/build-release.cmd performs by default.
+        # (including its macOS smoke leg), so they are not repeated here.
         os: [ubuntu-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
-        with:
-          # Only the Windows leg needs vendor/psmux checked out --
-          # scripts/build-release.cmd builds it by default (RAL-347).
-          submodules: ${{ matrix.os == 'windows-latest' }}
       - name: Install Rust toolchain
         run: rustup toolchain install stable --profile minimal
       - uses: Swatinem/rust-cache@v2
@@ -185,8 +178,7 @@ jobs:
   # which refuses any path that is not on "the machine"). These are the
   # documented first-run checks, so a change that breaks one is caught here
   # rather than by a new user. Ubuntu runs both variants; Windows runs the
-  # remote variant only, because local cells need psmux, which only the
-  # psmux-integration job builds.
+  # remote variant only.
   # Deferrable: skipped on a `ralphus:defer-full-ci` PR.
   initialize-exercises:
     name: Initialize exercises (${{ matrix.os }})
@@ -208,9 +200,6 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.13"
-      - name: Install tmux
-        if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y tmux
       - name: Build the CLI, daemon, and runner
         run: cargo build -p ralphus-cli -p ralphus-daemon -p ralphus-runner
       - name: Run every exercise
@@ -223,87 +212,6 @@ jobs:
           name: initialize-exercises-${{ matrix.os }}
           path: ${{ runner.temp }}/exercises
           retention-days: 7
-
-  # Deferrable: skipped on a `ralphus:defer-full-ci` PR.
-  psmux-integration:
-    name: Windows psmux integration
-    if: ${{ !contains(github.event.pull_request.labels.*.name, 'ralphus:defer-full-ci') }}
-    runs-on: windows-latest
-    env:
-      # Only used by the "external tmux override" smoke test at the bottom of
-      # this job -- the main suite above it runs against the vendored
-      # vendor/psmux submodule build instead (RAL-347).
-      PSMUX_VERSION: v3.3.8
-      PSMUX_X64_SHA256: 1ad127ba937194a890b933a73d9b023e297bd73dc742abd841bf159984c2effe
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          submodules: true
-      - name: Install Rust toolchain
-        run: rustup toolchain install stable --profile minimal
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.13"
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: |
-            . -> target
-            vendor/psmux -> target
-      - name: Install cargo-nextest
-        uses: taiki-e/install-action@nextest
-      - name: Build vendored psmux (vendor/psmux submodule, RAL-347)
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          cargo build --release --manifest-path vendor/psmux/Cargo.toml --bin tmux
-          $tmux = (Resolve-Path 'vendor/psmux/target/release/tmux.exe').Path
-          $dataDir = Join-Path $env:RUNNER_TEMP "psmux-data-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
-          New-Item -ItemType Directory -Path $dataDir | Out-Null
-          "RALPHUS_TMUX_CMD=$tmux" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-          "PSMUX_DATA_DIR=$dataDir" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-          "PSMUX_CONFIG_FILE=NUL" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-      - name: Verify psmux installation
-        shell: pwsh
-        run: '& $env:RALPHUS_TMUX_CMD --version'
-      # All Windows tests that touch the real, machine-wide psmux server are
-      # `#[ignore]`d in the default suite and named `live_tmux_*`. Run them in
-      # this isolated namespace, one at a time, for a stable per-PR signal.
-      - name: Run real psmux tests serially
-        run: cargo nextest run --package ralphus-daemon --lib --run-ignored only --test-threads 1 --no-tests fail --filter-expr 'test(live_tmux)'
-      - name: Stop isolated psmux server
-        if: always()
-        continue-on-error: true
-        shell: pwsh
-        run: '& $env:RALPHUS_TMUX_CMD kill-server'
-      # RAL-347: the vendorized build above is the default/recommended path,
-      # but RALPHUS_TMUX_CMD must still let a user point at their own
-      # tmux/psmux binary. This is deliberately narrow -- one fast real test
-      # against a separately downloaded, non-vendorized psmux release -- not a
-      # full parallel matrix of the live_tmux_* suite.
-      - name: External tmux override smoke test (RALPHUS_TMUX_CMD)
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $archive = Join-Path $env:RUNNER_TEMP "psmux-$env:PSMUX_VERSION-windows-x64.zip"
-          $installDir = Join-Path $env:RUNNER_TEMP 'psmux-external-bin'
-          $url = "https://github.com/psmux/psmux/releases/download/$env:PSMUX_VERSION/psmux-$env:PSMUX_VERSION-windows-x64.zip"
-          Invoke-WebRequest -Uri $url -OutFile $archive -UseBasicParsing
-          $actual = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant()
-          if ($actual -ne $env:PSMUX_X64_SHA256) {
-            throw "psmux archive checksum mismatch: expected $env:PSMUX_X64_SHA256, got $actual"
-          }
-          Expand-Archive -LiteralPath $archive -DestinationPath $installDir
-          $externalTmux = Get-ChildItem -LiteralPath $installDir -Filter tmux.exe -Recurse |
-            Select-Object -First 1 -ExpandProperty FullName
-          if (-not $externalTmux) { throw 'psmux archive did not contain tmux.exe' }
-          $dataDir = Join-Path $env:RUNNER_TEMP "psmux-external-data-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
-          New-Item -ItemType Directory -Path $dataDir | Out-Null
-          $env:RALPHUS_TMUX_CMD = $externalTmux
-          $env:PSMUX_DATA_DIR = $dataDir
-          $env:PSMUX_CONFIG_FILE = 'NUL'
-          & $externalTmux --version
-          cargo nextest run --package ralphus-daemon --lib --run-ignored only --test-threads 1 --no-tests fail --filter-expr 'test(live_tmux_new_session_capture_and_kill_roundtrip)'
-          & $externalTmux kill-server
 
   web:
     name: Web (eslint + tsc --checkJs + knip + node --test on the board chunks)

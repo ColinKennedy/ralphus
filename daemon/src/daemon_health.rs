@@ -1,7 +1,7 @@
 //! RAL-596: daemon-wide health signals, exported as OpenTelemetry spans.
 //!
 //! Scope is the daemon itself -- a wedged store lock, a stalled or dead
-//! background loop, a startup/fatal failure, a broken tmux layer, a nearly
+//! background loop, a startup/fatal failure, a nearly
 //! full disk, and a positive "daemon is up" heartbeat. Failures inside one
 //! review, squad or cell stay in their own logs and Cartographer rows and are
 //! deliberately never sent here.
@@ -29,8 +29,7 @@
 //! | `daemon.store_lock.slow_wait` / `.long_hold` | wait >= 2 s / hold >= 1 s |
 //! | `daemon.store_lock.stalled` / `.recovered` | watchdog round result |
 //! | `daemon.loop.stale` / `.recovered` / `.dead` | scheduler / health sweep |
-//! | `daemon.tmux.unavailable` / `.recovered` / `.startup_reap` | tmux layer |
-//! | `daemon.resource.low_disk` | free space under 10 % / 5 % |
+//! //! | `daemon.resource.low_disk` | free space under 10 % / 5 % |
 //! | `daemon.resource.threads_high` / `.threads_normal` | process thread count crosses 500 (Linux) |
 //! | `daemon.sqlite.busy` / `.write_failed` | busy timeout / disk full, I/O, read-only (max one a minute each) |
 
@@ -51,7 +50,7 @@ const QUEUE_CAPACITY: usize = 256;
 /// How often the daemon-up heartbeat span is emitted.
 pub const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(60);
 
-/// Cadence of the slow probes (disk space, tmux reachability).
+/// Cadence of the slow probes (disk space).
 pub const PROBE_INTERVAL: Duration = Duration::from_secs(15 * 60);
 
 /// Grace after startup before the first slow probe, so it does not compete
@@ -437,74 +436,7 @@ pub fn check_thread_count() -> Option<usize> {
     Some(count)
 }
 
-// ── Tmux reachability ───────────────────────────────────────────────────
-
-static TMUX_BROKEN: AtomicBool = AtomicBool::new(false);
-
-/// Probe name; the `ralphus_` prefix keeps it inside the startup reap.
-const TMUX_PROBE_SESSION: &str = "ralphus_healthprobe";
-
-/// Whether the tmux/psmux layer can create (and remove) a session.
-fn probe_tmux() -> Result<(), String> {
-    let tmux = crate::tmux::Tmux::resolve().map_err(|e| e.to_string())?;
-    let (program, args): (&str, Vec<String>) = if cfg!(windows) {
-        ("cmd", vec!["/c".to_string(), "exit 0".to_string()])
-    } else {
-        ("sleep", vec!["1".to_string()])
-    };
-    let cwd = std::env::temp_dir().to_string_lossy().into_owned();
-    let created = tmux.new_detached_session_with_command(
-        TMUX_PROBE_SESSION,
-        &cwd,
-        &std::collections::BTreeMap::new(),
-        program,
-        &args,
-        None,
-    );
-    let _ = tmux.kill_session(TMUX_PROBE_SESSION);
-    created.map_err(|e| e.to_string())
-}
-
-/// Record a tmux probe outcome and return the event to emit, if the state
-/// changed (healthy -> broken, or broken -> healthy).
-fn tmux_transition(broken: &AtomicBool, result: &Result<(), String>) -> Option<HealthEvent> {
-    match result {
-        Err(e) => (!broken.swap(true, Ordering::AcqRel)).then(|| {
-            HealthEvent::error("daemon.tmux.unavailable", e.clone()).attr("error", e.clone())
-        }),
-        Ok(()) => broken
-            .swap(false, Ordering::AcqRel)
-            .then(|| HealthEvent::ok("daemon.tmux.recovered")),
-    }
-}
-
-/// Run the tmux probe once, logging and emitting on a state change.
-pub fn check_tmux() {
-    let result = probe_tmux();
-    if let Err(e) = &result {
-        // ralphus[ignore-rlog-pair]: machine-wide probe with no entity to attach a Cartographer row to; the OTel span is its structured record
-        crate::rlog!(WARNING, "ralphus [tmux] health probe failed: {e}");
-    }
-    if let Some(event) = tmux_transition(&TMUX_BROKEN, &result) {
-        emit(event);
-    }
-}
-
-/// Report the startup reap of leftover `ralphus_` tmux processes: a non-zero
-/// count means the previous daemon died uncleanly.
-pub fn report_startup_reap(reaped: usize) {
-    if reaped > 0 {
-        emit(
-            HealthEvent::error(
-                "daemon.tmux.startup_reap",
-                format!("force-killed {reaped} orphaned tmux process(es) at startup"),
-            )
-            .attr("count", i64::try_from(reaped).unwrap_or(i64::MAX)),
-        );
-    }
-}
-
-/// Spawn the slow-probe thread: disk space and tmux reachability every
+/// Spawn the slow-probe thread: disk space every
 /// [`PROBE_INTERVAL`].
 pub fn spawn_periodic_probes(store: StoreHandle) {
     let spawned = std::thread::Builder::new()
@@ -520,7 +452,6 @@ pub fn spawn_periodic_probes(store: StoreHandle) {
                         .map(|p| ("worktree", std::path::PathBuf::from(p.path))),
                 );
                 check_disk_space(&paths);
-                check_tmux();
                 std::thread::sleep(PROBE_INTERVAL);
             }
         });
@@ -646,18 +577,5 @@ mod tests {
         assert!(thread_count_transition(&high, THREAD_COUNT_WARN + 1).is_none());
         let down = thread_count_transition(&high, 10).expect("recovers");
         assert_eq!(down.name, "daemon.resource.threads_normal");
-    }
-
-    #[test]
-    fn tmux_transitions_fire_only_on_a_state_change() {
-        let broken = AtomicBool::new(false);
-        let bad = Err("no server".to_string());
-        let first = tmux_transition(&broken, &bad).expect("first failure reports");
-        assert_eq!(first.name, "daemon.tmux.unavailable");
-        assert!(first.error.is_some());
-        assert!(tmux_transition(&broken, &bad).is_none(), "still broken");
-        let back = tmux_transition(&broken, &Ok(())).expect("recovery reports");
-        assert_eq!(back.name, "daemon.tmux.recovered");
-        assert!(tmux_transition(&broken, &Ok(())).is_none(), "still healthy");
     }
 }

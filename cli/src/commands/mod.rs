@@ -473,8 +473,6 @@ fn parse_initialize_solo_developer(
         answers_file: scanner
             .take_value("--answers-file")?
             .map(std::path::PathBuf::from),
-        install_tmux: parse_initialize_bool(scanner, "--install-tmux")?,
-        tmux_program: scanner.take_value("--tmux-program")?,
         setup_mcp: parse_initialize_bool(scanner, "--setup-mcp")?,
         mcp_hosts: scanner.take_repeated("--mcp-host")?,
         agent_logins: scanner.take_value("--agent-logins")?,
@@ -682,10 +680,6 @@ mod tests {
         match parse_args(&v(&[
             "initialize",
             "solo-developer",
-            "--install-tmux",
-            "no",
-            "--tmux-program",
-            "",
             "--setup-mcp",
             "yes",
             "--mcp-host",
@@ -741,7 +735,6 @@ mod tests {
                 assert_eq!(setup.agent_logins.as_deref(), Some("claude,codex"));
                 assert_eq!(setup.install_skills.as_deref(), Some("claude-code,pi"));
                 assert_eq!(setup.force_skills, Some(true));
-                assert_eq!(setup.install_tmux, Some(false));
                 assert_eq!(setup.mcp_hosts, ["claude"]);
                 assert_eq!(setup.project_name.as_deref(), Some("ralphus"));
                 assert_eq!(setup.project_is_fork, Some(true));

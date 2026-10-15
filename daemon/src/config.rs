@@ -1792,10 +1792,9 @@ pub struct BudgetConfig {
     /// Milliseconds between cost-cap checks. `0` means "check immediately on
     /// every event" (no additional throttling beyond the loop's own
     /// cadence). Defaults to 200ms when unset -- tighter than the 500ms
-    /// `tmux capture-pane` scrape cadence it rides alongside, per RAL-161's
+    /// transcript-poll cadence it rides alongside, per RAL-161's
     /// "bias toward catching an overrun quickly" requirement. The check
-    /// itself is a cheap in-memory float comparison, decoupled from the
-    /// actual (expensive, subprocess-spawning) pane scrape.
+    /// itself is a cheap in-memory float comparison.
     #[serde(default)]
     pub poll_interval_ms: Option<u64>,
 }
@@ -1816,21 +1815,19 @@ impl BudgetConfig {
 }
 
 /// Terminal-log retention configuration (`[terminal_logs]` table, RAL-154).
-/// Governs the durable, per-attempt tmux pane transcripts persisted by
+/// Governs the durable, per-attempt transcripts persisted by
 /// `crate::terminal_log` (see that module's doc comment) — independent of
 /// [`CartographerConfig`], which only governs the separate structured
 /// `cartographer_events` table.
 ///
-/// Five independently configurable knobs, all `None` meaning unset (so a
+/// Four independently configurable knobs, all `None` meaning unset (so a
 /// lower layer can supply it): [`max_lines_per_attempt`](Self::max_lines_per_attempt)
 /// bounds a single attempt's log file size; `retention_days` and `max_files`
 /// bound the total on-disk footprint over time, mirroring
 /// [`CartographerConfig`]'s two-cap retention model (either condition
 /// triggers pruning); [`max_transcript_bytes_per_attempt`](Self::max_transcript_bytes_per_attempt)
-/// (RAL-397 Phase 2H) bounds the *raw* `.raw` pipe-pane transcript a single
-/// attempt writes, independent of the `.log` file's line-based cap; and
-/// [`pane_history_limit`](Self::pane_history_limit) (RAL-397 Phase 2H)
-/// overrides the tmux pane scrollback ceiling (`crate::tmux::TMUX_HISTORY_LIMIT`).
+/// (RAL-397 Phase 2H) bounds the *raw* `.raw` transcript a single attempt
+/// writes, independent of the `.log` file's line-based cap.
 #[derive(Debug, Default, Deserialize, Clone, Copy, PartialEq, Eq)]
 pub struct TerminalLogConfig {
     /// Max lines kept per attempt's log file (the tail is kept, oldest lines
@@ -1844,24 +1841,12 @@ pub struct TerminalLogConfig {
     #[serde(default)]
     pub max_files: Option<i64>,
     /// Max bytes a single attempt's `.raw` transcript may grow to (RAL-397
-    /// Phase 2C/2H) before `ralphus-runner pipe-sink` stops persisting
-    /// further output (still draining stdin so the pane never blocks — see
-    /// `runner/src/main.rs::pipe_sink`). Must be `>= 1` — same "unset on a
-    /// non-positive value" rule as `max_lines_per_attempt`.
+    /// Phase 2C/2H) before the direct runner stops persisting further output
+    /// (it keeps draining the child's pipes so the cell never blocks). Must
+    /// be `>= 1` — same "unset on a non-positive value" rule as
+    /// `max_lines_per_attempt`.
     #[serde(default)]
     pub max_transcript_bytes_per_attempt: Option<i64>,
-    /// The tmux pane `history-limit` (scrollback line ceiling) set on every
-    /// cell pane (RAL-397 Phase 2H). This is the per-pane resident-memory
-    /// ceiling (`history-limit × pane width`; see
-    /// `crate::tmux::TMUX_HISTORY_LIMIT`) — deep scrollback is served from the
-    /// durable `.raw` transcript, so the live pane only needs the live window.
-    /// Must be `>= 1` — same "unset on a non-positive value" rule as
-    /// `max_lines_per_attempt`. Unlike this struct's other knobs the *default*
-    /// when unset is not baked into a getter here but lives as
-    /// `crate::tmux::TMUX_HISTORY_LIMIT` (the const the set-option falls back
-    /// to), so there is a single source of truth for the live-window value.
-    #[serde(default)]
-    pub pane_history_limit: Option<i64>,
 }
 
 impl TerminalLogConfig {
@@ -1893,38 +1878,12 @@ impl TerminalLogConfig {
     }
 
     /// Max bytes a single attempt's `.raw` transcript may grow to. Defaults
-    /// to 256 MiB (matching `ralphus-runner pipe-sink`'s own built-in
-    /// default, `DEFAULT_PIPE_SINK_MAX_BYTES` — kept as a duplicated literal
-    /// rather than a shared constant since `daemon` and `runner` are separate
-    /// crates with no existing shared home for a single-value default this
-    /// small). A configured value `< 1` is treated as unset.
+    /// to 256 MiB. A configured value `< 1` is treated as unset.
     #[must_use]
     pub fn max_transcript_bytes_per_attempt(&self) -> u64 {
         match self.max_transcript_bytes_per_attempt {
             Some(n) if n >= 1 => n as u64,
             _ => 256 * 1024 * 1024,
-        }
-    }
-
-    /// The configured tmux pane `history-limit`, or `None` when unset (a
-    /// non-positive value is treated as unset per this struct's doc comment,
-    /// and a value too large to fit a `u32` line count likewise falls back).
-    /// Deliberately returns an `Option` rather than baking in a default: the
-    /// default lives as `crate::tmux::TMUX_HISTORY_LIMIT` (the const the
-    /// set-option falls back to), keeping a single source of truth for the
-    /// live-window value.
-    #[must_use]
-    pub fn pane_history_limit(&self) -> Option<u32> {
-        match self.pane_history_limit {
-            Some(n) if n >= 1 => u32::try_from(n).ok().or_else(|| {
-                warn_config_fallback(
-                    "terminal_logs.pane_history_limit",
-                    &n.to_string(),
-                    "the built-in tmux history limit",
-                );
-                None
-            }),
-            _ => None,
         }
     }
 }
@@ -1959,7 +1918,6 @@ pub fn load_terminal_log_config() -> TerminalLogConfig {
         max_transcript_bytes_per_attempt: local
             .max_transcript_bytes_per_attempt
             .or(global.max_transcript_bytes_per_attempt),
-        pane_history_limit: local.pane_history_limit.or(global.pane_history_limit),
     }
 }
 
@@ -2129,8 +2087,8 @@ pub fn load_agent_health_config() -> AgentHealthConfig {
 /// Live View debug-line-visibility configuration (`[live_view]` table,
 /// RAL-232). Controls the default state of the board's per-pane "Show Debug
 /// Messages" checkbox -- ralphus interleaves its own diagnostic/telemetry
-/// lines (`ralphus [TYPE] ...`, `RALPHUS_EVENT:`, `RALPHUS_TMUX_DONE`) into
-/// the same tmux pane the agent's own output streams through, and the board
+/// lines (`ralphus [TYPE] ...`, `RALPHUS_EVENT:`) into
+/// the same transcript the agent's own output streams through, and the board
 /// strips those lines from its live rendering by default
 /// (`librarian/assets/board.html`'s `stripDebugLines`). This config only
 /// governs that *rendering* default; the daemon's own pane capture, the
@@ -2145,9 +2103,8 @@ pub struct LiveViewConfig {
     #[serde(default)]
     pub show_debug_messages_default: Option<bool>,
     /// RAL-303: how many characters of a `tool_use` argument value the
-    /// claude-code backend renders into the Live View tmux pane before
-    /// truncating with a trailing `…`. The pane is a write-once pty
-    /// transcript (`daemon/src/tmux.rs`'s `capture-pane`), so this can only
+    /// claude-code backend renders into the Live View transcript before
+    /// truncating with a trailing `…`. The transcript is write-once, so this can only
     /// take effect at cell-launch time -- there is no retroactive/live
     /// toggle. `None` means unset; resolved callers use
     /// [`tool_arg_truncate_chars`](Self::tool_arg_truncate_chars), which
@@ -2183,7 +2140,7 @@ impl LiveViewConfig {
     }
 
     /// How many characters of a `tool_use` argument value to keep before
-    /// truncating in the Live View tmux pane. Defaults to 200 when unset.
+    /// truncating in the Live View transcript. Defaults to 200 when unset.
     #[must_use]
     pub fn tool_arg_truncate_chars(&self) -> u32 {
         self.tool_arg_truncate_chars
@@ -2592,10 +2549,7 @@ pub fn resolve_command_shell(cwd: &Path) -> Option<String> {
 /// (`[A-Za-z_][A-Za-z0-9_]*`) — required for a RAL-150 env override key.
 /// Enforced at the API boundary ([`crate::server`]'s env-override handler)
 /// so an override key is always a clean identifier everywhere it's used —
-/// the env-assignment prefix [`crate::tmux::build_command_line_with_env`]
-/// embeds for the POSIX `respawn-pane` path, and the `-e KEY=value` flag
-/// [`crate::tmux::new_detached_session_with_command`] passes to `new-session`
-/// on Windows.
+/// the child process's environment block.
 #[must_use]
 pub fn is_valid_env_key(key: &str) -> bool {
     let mut chars = key.chars();
@@ -4824,7 +4778,6 @@ fail_after_minutes = 5
         assert_eq!(c.retention_days(), 30);
         assert_eq!(c.max_files(), 2000);
         assert_eq!(c.max_transcript_bytes_per_attempt(), 256 * 1024 * 1024);
-        assert_eq!(c.pane_history_limit(), None);
     }
 
     #[test]
@@ -4836,7 +4789,6 @@ fail_after_minutes = 5
         assert_eq!(c.retention_days(), 7);
         assert_eq!(c.max_files(), 100);
         assert_eq!(c.max_transcript_bytes_per_attempt(), 1_048_576);
-        assert_eq!(c.pane_history_limit(), Some(5000));
     }
 
     #[test]
@@ -4846,7 +4798,6 @@ fail_after_minutes = 5
         assert_eq!(c.retention_days(), 7);
         assert_eq!(c.max_files(), 2000);
         assert_eq!(c.max_transcript_bytes_per_attempt(), 256 * 1024 * 1024);
-        assert_eq!(c.pane_history_limit(), None);
     }
 
     #[test]
@@ -4856,42 +4807,6 @@ fail_after_minutes = 5
         assert_eq!(c.retention_days(), 30);
         assert_eq!(c.max_files(), 2000);
         assert_eq!(c.max_transcript_bytes_per_attempt(), 256 * 1024 * 1024);
-        assert_eq!(c.pane_history_limit(), None);
-    }
-
-    #[test]
-    fn terminal_log_pane_history_limit_defaults_to_none_when_unset() {
-        // Unset resolves to `None` so the caller (`crate::tmux`) falls back to
-        // the `TMUX_HISTORY_LIMIT` const, the single source of truth.
-        assert_eq!(terminal_log_from_toml_str("").pane_history_limit(), None);
-        assert_eq!(
-            terminal_log_from_toml_str("[terminal_logs]\nretention_days = 7\n")
-                .pane_history_limit(),
-            None
-        );
-    }
-
-    #[test]
-    fn terminal_log_pane_history_limit_explicit_value_is_honored() {
-        let c = terminal_log_from_toml_str("[terminal_logs]\npane_history_limit = 2000\n");
-        assert_eq!(c.pane_history_limit(), Some(2000));
-    }
-
-    #[test]
-    fn terminal_log_pane_history_limit_below_one_falls_back_to_default() {
-        let zero = terminal_log_from_toml_str("[terminal_logs]\npane_history_limit = 0\n");
-        assert_eq!(zero.pane_history_limit(), None);
-        let negative = terminal_log_from_toml_str("[terminal_logs]\npane_history_limit = -5\n");
-        assert_eq!(negative.pane_history_limit(), None);
-    }
-
-    #[test]
-    fn terminal_log_pane_history_limit_malformed_toml_is_none() {
-        assert_eq!(
-            terminal_log_from_toml_str("[terminal_logs]\npane_history_limit = \"nope\"\n")
-                .pane_history_limit(),
-            None
-        );
     }
 
     #[test]

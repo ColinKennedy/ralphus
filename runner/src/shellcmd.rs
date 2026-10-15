@@ -8,7 +8,7 @@
 //!
 //! Ancestry walking uses the `sysinfo` crate uniformly across platforms
 //! (already a workspace dependency, used the same way by
-//! `daemon/src/tmux.rs::find_server_pid_windows`) rather than Python's
+//! `daemon/src/proof.rs`) rather than Python's
 //! separate Windows-`ctypes`/Linux-`/proc` implementations -- one
 //! cross-platform code path, same behavior.
 

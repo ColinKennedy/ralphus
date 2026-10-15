@@ -413,7 +413,7 @@
        */
       const STATE_TOOLTIPS = {
         pending: "Not yet started.\nWaiting on a dependency, a review-board slot, or just not yet picked up by the scheduler — normal for anything queued up behind other work.",
-        running: "Actively executing (or, for a squad/task, has at least one child still going).\nA cell that reads running can actually be paused for a human (⏸ detached) or automatically waiting out a provider rate limit (⏳ delayed) instead of making live progress — check for those badges rather than assuming steady progress from the state alone.",
+        running: "Actively executing (or, for a squad/task, has at least one child still going).\nA cell that reads running can actually be automatically waiting out a provider rate limit (⏳ delayed) instead of making live progress — check for those badges rather than assuming steady progress from the state alone.",
         done: "Finished successfully — completed its work (and any proof/verification steps) with no error.",
         failed: "Finished unsuccessfully.\nCheck its error/log for why, then use Restart to try again from scratch.",
         cancelled: "Stopped deliberately before finishing — a human or automated action cancelled it, not a crash or provider error.",
@@ -467,32 +467,10 @@
         return ` <span class="pill p-failed" data-tip="${esc(`This cell has failed ${blocking.failure_count} times and is holding up ${blocking.blocked_cells} cell(s) and ${blocking.blocked_branches} review branch(es).\nWho/when: it failed at least ${blocking.threshold} times (the task's max_retries, default 3) and other work waits on it.\nOpen the cell, then choose \"Show ways to fix this block…\" from the ⋯ menu at the top of its details.`)}">⛔ blocking ${total}</span>`;
       };
       /**
-       * Renders a "detached" badge (RAL-288) for a cell that reads `running`
-       * but has actually been cleanly stopped for a real interactive agent
-       * session to take over — not stuck, not stalled, and not Done/Failed/
-       * Cancelled either. `detachedAtMs` is the cell's own `detached_at_ms`
-       * field (present only while genuinely detached).
-       * @param {number|null|undefined} detachedAtMs
-       * @returns {string}
-       */
-      const detachedBadge = (detachedAtMs) => detachedAtMs
-        ? ` <span class="pill p-detached" data-tip="This cell cleanly stopped so a real interactive agent session could take over — it is not stuck, and its Live View below now shows the historical record of that stopped process, not a hang.\nWho/when: you (or someone else) clicked 'Open Agent' and the live conversation continues in a separate terminal (tmux session), outside this board.\nUse 'Open Agent' again to reattach a terminal to that live session, or 'Resume Automation' once you are done with it to continue unattended from where it left off.">⏸ detached — open agent to reattach</span>`
-        : "";
-      /**
-       * Compact "detached" badge (RAL-288) for the graph tree's cell node,
-       * where space is tight — same signal and tooltip as {@link detachedBadge},
-       * just the bare word instead of the full explanatory label.
-       * @param {number|null|undefined} detachedAtMs
-       * @returns {string}
-       */
-      const detachedGraphBadge = (detachedAtMs) => detachedAtMs
-        ? ` <span class="pill p-detached" data-tip="This cell cleanly stopped so a real interactive agent session could take over — it is not stuck.\nWho/when: 'Open Agent' was clicked and the live conversation continues in a separate terminal (tmux session), outside this board.\nUse 'Open Agent' again to reattach, or 'Resume Automation' to continue unattended from where it left off.">detached</span>`
-        : "";
-      /**
        * Renders a "delayed" badge (RAL-435) for a cell that reads `running`
        * but is actually waiting out a recognized, retryable provider rate
        * limit's suggested delay before the daemon automatically resumes it
-       * — not stuck, and not waiting on a human the way a detached cell is.
+       * — not stuck, and not waiting on a human.
        * `delayedUntilMs` is the cell's own `delayed_until_ms` field (present
        * only while genuinely delayed).
        * @param {number|null|undefined} delayedUntilMs

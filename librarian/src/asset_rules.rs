@@ -1,9 +1,8 @@
 //! The board's asset rules, shared between `build.rs` (which bakes the
 //! release exe's embedded copies) and `src/assets.rs` (which serves dev-mode
 //! reads from disk). One definition keeps both sides agreeing on what counts
-//! as a board asset: the shell page and stylesheet, every JS chunk under
-//! `board/`, and exactly the vendored xterm files — nothing else (editor temp
-//! files, notes, binaries never ship).
+//! as a board asset: the shell page and stylesheet, and every JS chunk under
+//! `board/`. Nothing else (editor temp files, notes, binaries) ever ships.
 //!
 //! The module is compiled into two contexts (build script + library runtime)
 //! and each context uses only part of the surface; the allow silences the
@@ -14,13 +13,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 /// Route names that must always exist on disk and in the embedded table.
-pub const REQUIRED_ASSETS: &[&str] = &[
-    "board.html",
-    "board.css",
-    "vendor/xterm.css",
-    "vendor/xterm.js",
-    "vendor/xterm-fit.js",
-];
+pub const REQUIRED_ASSETS: &[&str] = &["board.html", "board.css"];
 
 /// Collect `(route name, disk path)` pairs for every board asset under
 /// `assets_root`. Missing required assets panic — a broken assets tree must

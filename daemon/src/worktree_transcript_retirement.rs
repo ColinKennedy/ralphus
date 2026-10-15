@@ -4,7 +4,7 @@
 //! `daemon/src/terminal_log.rs`'s `prune()` already ages/caps `.log`/`.raw`
 //! transcript files on its own tick-loop timer (`TerminalLogConfig`,
 //! `scheduler.rs`), independent of worktree state -- that scheme is
-//! untouched by this module. Pane-snapshot files (`tmux::pane_snapshot_dir`)
+//! untouched by this module. Pane-snapshot files (`cell_session::pane_snapshot_dir`)
 //! had no pruning at all before this ticket; that gap is what this module
 //! closes.
 //!
@@ -77,18 +77,18 @@ pub(crate) fn retire_session_artifacts_for_worktree(store: &Store, worktree_path
         {
             continue;
         }
-        files_removed += delete_session_artifacts(&crate::tmux::session_name(
+        files_removed += delete_session_artifacts(&crate::cell_session::session_name(
             &owner.squad_id,
             &owner.task_name,
             &owner.session_id,
         ));
-        // A restarted/resumed cell runs a second tmux session under the same
+        // A restarted/resumed cell runs a second cell session under the same
         // sid with a fixed `-resume` suffix (see `server.rs`'s resume
         // endpoints) rather than allocating a new sid, so sweeping this one
         // extra, deterministic name covers every restart without needing
         // per-attempt bookkeeping. Best-effort deletion makes this a
         // harmless no-op for a session that was never restarted.
-        files_removed += delete_session_artifacts(&crate::tmux::session_name(
+        files_removed += delete_session_artifacts(&crate::cell_session::session_name(
             &owner.squad_id,
             &owner.task_name,
             &format!("{}-resume", owner.session_id),
@@ -117,7 +117,7 @@ pub(crate) fn retire_session_artifacts_for_worktree(store: &Store, worktree_path
 /// Delete one session's pane snapshot and terminal-log directory, returning
 /// how many of the two actually existed and were removed.
 fn delete_session_artifacts(session_name: &str) -> usize {
-    usize::from(crate::tmux::delete_pane_snapshot(session_name))
+    usize::from(crate::cell_session::delete_pane_snapshot(session_name))
         + usize::from(crate::terminal_log::delete_for_session(session_name))
 }
 
@@ -171,24 +171,28 @@ mod tests {
     fn sweeps_pane_snapshot_and_terminal_log_for_matching_cwd_only() {
         let pane_dir = temp_dir("pane");
         let log_dir = temp_dir("log");
-        crate::tmux::set_pane_snapshot_test_root(pane_dir.clone());
+        crate::cell_session::set_pane_snapshot_test_root(pane_dir.clone());
         crate::terminal_log::set_test_root(log_dir.clone());
 
         let store = Store::open_in_memory().expect("open store");
         insert_cell(&store, "sq1", 0, "sid-in-worktree", "/repo/w/wt-1");
         insert_cell(&store, "sq1", 1, "sid-elsewhere", "/repo/w/wt-2");
 
-        let in_worktree_session = crate::tmux::session_name("sq1", "task-a", "sid-in-worktree");
-        let elsewhere_session = crate::tmux::session_name("sq1", "task-a", "sid-elsewhere");
-        crate::tmux::write_pane_snapshot(&in_worktree_session, "in worktree output");
-        crate::tmux::write_pane_snapshot(&elsewhere_session, "elsewhere output");
+        let in_worktree_session =
+            crate::cell_session::session_name("sq1", "task-a", "sid-in-worktree");
+        let elsewhere_session = crate::cell_session::session_name("sq1", "task-a", "sid-elsewhere");
+        crate::cell_session::write_pane_snapshot(&in_worktree_session, "in worktree output");
+        crate::cell_session::write_pane_snapshot(&elsewhere_session, "elsewhere output");
         crate::terminal_log::write_attempt(&in_worktree_session, 0, "log line", 100);
         crate::terminal_log::write_attempt(&elsewhere_session, 0, "log line", 100);
 
         let swept = retire_session_artifacts_for_worktree(&store, "/repo/w/wt-1");
         assert_eq!(swept, 1);
-        assert_eq!(crate::tmux::read_pane_snapshot(&in_worktree_session), None);
-        assert!(crate::tmux::read_pane_snapshot(&elsewhere_session).is_some());
+        assert_eq!(
+            crate::cell_session::read_pane_snapshot(&in_worktree_session),
+            None
+        );
+        assert!(crate::cell_session::read_pane_snapshot(&elsewhere_session).is_some());
         assert!(crate::terminal_log::read_attempt(&in_worktree_session, 0).is_none());
         assert!(crate::terminal_log::read_attempt(&elsewhere_session, 0).is_some());
 
@@ -200,18 +204,21 @@ mod tests {
     fn sweeps_the_resume_session_too() {
         let pane_dir = temp_dir("resume-pane");
         let log_dir = temp_dir("resume-log");
-        crate::tmux::set_pane_snapshot_test_root(pane_dir.clone());
+        crate::cell_session::set_pane_snapshot_test_root(pane_dir.clone());
         crate::terminal_log::set_test_root(log_dir.clone());
 
         let store = Store::open_in_memory().expect("open store");
         insert_cell(&store, "sq1", 0, "sid-1", "/repo/w/wt-1");
 
-        let resume_session = crate::tmux::session_name("sq1", "task-a", "sid-1-resume");
-        crate::tmux::write_pane_snapshot(&resume_session, "resumed output");
+        let resume_session = crate::cell_session::session_name("sq1", "task-a", "sid-1-resume");
+        crate::cell_session::write_pane_snapshot(&resume_session, "resumed output");
 
         let swept = retire_session_artifacts_for_worktree(&store, "/repo/w/wt-1");
         assert_eq!(swept, 1);
-        assert_eq!(crate::tmux::read_pane_snapshot(&resume_session), None);
+        assert_eq!(
+            crate::cell_session::read_pane_snapshot(&resume_session),
+            None
+        );
 
         let _ = std::fs::remove_dir_all(&pane_dir);
         let _ = std::fs::remove_dir_all(&log_dir);

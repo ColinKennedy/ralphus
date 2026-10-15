@@ -8,7 +8,6 @@ docs = [
   "docs/machine-providers.md",
   "docs/otel-tracing.md",
   "docs/secure-dist.md",
-  "docs/tmux-embedding.md",
 ]
 examples = [
   "examples/hello.toml",
@@ -20,16 +19,3 @@ launchers = [
   "scripts/start-ralphus.cmd",
   "scripts/start-ralphus.sh",
 ]
-
-# RAL-347: sourced from the vendored psmux git submodule (vendor/psmux,
-# pinned to v3.3.8 -- see .gitmodules), built by
-# scripts/build-vendored-tmux.ps1 (which scripts/build-release.cmd runs by
-# default). Not downloaded, not WinGet-sourced -- the trust anchor is the
-# pinned submodule commit, not a checksum of a fetched artifact, so there is
-# no sha256 pin here; PROVENANCE.json records the hash of whatever was
-# actually built for auditability instead.
-[tmux.windows]
-exe = "daemon/assets/tmux/windows/tmux.exe"
-license = "vendor/psmux/LICENSE"
-readme = "vendor/psmux/README.md"
-version_substring = "psmux 3.3.8"

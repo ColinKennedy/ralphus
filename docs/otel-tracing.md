@@ -205,8 +205,6 @@ lock, the watchdog or the scheduler.
 | `daemon.store_lock.stalled` / `recovered` | the watchdog could not take the lock within its 5s timeout / got it back |
 | `daemon.loop.stale` / `recovered` | the scheduler or health-sweep loop missed its allowed beat gap / beat again |
 | `daemon.loop.dead` | the scheduler thread returned or panicked |
-| `daemon.tmux.unavailable` / `recovered` | the 15-minute tmux probe (creates and kills a throwaway session) failed / succeeded again |
-| `daemon.tmux.startup_reap` | orphaned tmux processes were force-killed at startup |
 | `daemon.resource.low_disk` | free space under 10% (warn) or 5% (critical) on the db or state volume, checked every 15 minutes |
 | `daemon.resource.threads_high` / `daemon.resource.threads_normal` | process thread count crosses 500 and recovers; sampled with each heartbeat; Linux only (`/proc/self/task`), other platforms are not monitored |
 | `daemon.sqlite.busy` / `daemon.sqlite.write_failed` | a `rusqlite::Error` that is a busy/locked timeout, or disk full / read-only / I/O failure; detected where `StoreError` is built, at most one span a minute per kind |

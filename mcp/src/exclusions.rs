@@ -45,19 +45,6 @@ pub const EXCLUDED: &[(&[&str], &str)] = &[
          edits do not have a single-request/response MCP shape.",
     ),
     (
-        &["cell", "open-agent"],
-        "Opens the real interactive agent in a new terminal for a human to drive directly \
-         (RAL-288) -- it hands control to a live, attached TTY session, not a value it could \
-         return from one MCP tool call.",
-    ),
-    (
-        &["cell", "remote-terminal"],
-        "Attaches this process's own stdin/stdout to a live WebSocket byte relay onto a remote \
-         cell's resumed Claude Code session (RAL-355 Phase 10) and blocks until the human ends \
-         the session -- the remote counterpart of `cell open-agent`'s exclusion above, same \
-         reason: a live, attached TTY session, not a value one MCP tool call could return.",
-    ),
-    (
         &["quick-start", "manager", "claude-code"],
         "Launches an interactive agent (Claude Code) preconfigured for the manager role and \
          drives it with an inherited TTY until the human ends the session -- the same reason \

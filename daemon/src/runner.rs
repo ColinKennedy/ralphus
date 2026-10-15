@@ -18,7 +18,6 @@ use crate::procreg::ProcRegistry;
 #[cfg(test)]
 use crate::store::Store;
 use crate::store::{CellRow, NodeState};
-use crate::tmux::Tmux;
 
 mod direct;
 pub(crate) use direct::{
@@ -92,7 +91,7 @@ struct RunnerEvent {
 /// mirroring the `agent_session_id` capture alongside it. Also the shape
 /// [`Store::set_cell_live_usage`] persists and the one every
 /// snapshot-derived [`RunnerResult`] constructor
-/// ([`RunnerResult::cost_exceeded`], [`RunnerResult::detached`]) takes, so
+/// ([`RunnerResult::cost_exceeded`], [`RunnerResult::waypoint_halted`]) takes, so
 /// growing the set of tracked usage fields is a one-place edit.
 ///
 /// `pub` (not private): [`crate::remote_runner::ProviderRunner`] needs this
@@ -115,7 +114,7 @@ pub struct LiveUsage {
 
 /// What [`forward_runner_event`] learned from one event, for the caller's own
 /// use beyond persisting it to Cartographer: a freshly-captured agent
-/// session id (for tmux auto-reattach) and/or a fresh live-usage snapshot
+/// session id (for auto-reattach) and/or a fresh live-usage snapshot
 /// (for the cost-cap kill check).
 #[derive(Debug, Clone, Default, PartialEq)]
 pub(crate) struct ForwardedEvent {
@@ -125,7 +124,7 @@ pub(crate) struct ForwardedEvent {
     /// (fires on a fixed cadence regardless of whether the agent did
     /// anything) and for a malformed/unparseable event. Every other event --
     /// a tool call, a session-id capture, any other Cartographer-logged
-    /// runner event -- is real forward progress, so the tmux poll loop resets
+    /// runner event -- is real forward progress, so the transcript poll loop resets
     /// [`crate::thinking_stall::ThinkingStallDetector`]'s streak on it. A
     /// heartbeat must not reset the streak, or a genuine "Hmm." loop would
     /// never accumulate enough consecutive low-diversity samples to trip.
@@ -227,8 +226,8 @@ pub struct RunnerSpec {
     /// backend's own still-working async retry loop, and (RAL-248) the
     /// scheduler when a cell continues from a completed dependency's session
     /// (cross-cell session sharing) — see `scheduler::resolve_shared_session_id`
-    /// and its model-mismatch guard. The daemon's [`SubprocessRunner::run_via_tmux`]
-    /// auto-reattach retry also sets it when a cell's tmux pane vanishes
+    /// and its model-mismatch guard. The daemon's [`SubprocessRunner::run_direct`]
+    /// auto-reattach retry also sets it when a cell's cell transcript vanishes
     /// mid-run but its live `agent_session_id` was already captured. `None`
     /// for a normal (first attempt) invocation. Both the claude-code and
     /// codex backends honor it; the hand-rolled backends accept and ignore it
@@ -239,7 +238,7 @@ pub struct RunnerSpec {
     /// *before* the runner subprocess was spawned (RAL-288 Stage 1), so the
     /// claude-code backend can pass `--session-id <id>` at launch instead of
     /// waiting on Claude's own `system/init` event to learn it. Closes the
-    /// window where "Open Agent" is disabled for the very start of a run.
+    /// window where the id is unknown at the very start of a run.
     /// Mutually exclusive with `resume_agent_session_id` in practice (the
     /// scheduler only generates one when that field is `None`); the
     /// claude-code backend prefers `--resume` when both happen to be set.
@@ -254,8 +253,8 @@ pub struct RunnerSpec {
     /// own environment — never sent over the stdin wire contract itself (the
     /// runner needs nothing about them beyond inheriting them from its own
     /// process environment, same as any other env var). See
-    /// [`SubprocessRunner::run_via_tmux_attempt`]
-    /// ([`crate::tmux::build_command_line_with_env`]) for where this actually
+    /// [`SubprocessRunner::run_direct_attempt`]
+    /// (the direct runner) for where this actually
     /// takes effect. Empty for every caller except the scheduler's own
     /// cell/proof dispatch, which fills it in from
     /// [`crate::store::Store::get_squad_env_overrides`].
@@ -277,7 +276,7 @@ pub struct RunnerSpec {
     /// (`crate::config::LiveViewConfig::tool_arg_truncate_chars`), forwarded
     /// over the stdin wire contract so the claude-code backend's
     /// `format_tool_input` knows how much of a `tool_use` argument to render
-    /// into the Live View tmux pane before truncating. Resolved once here
+    /// into the Live View cell transcript before truncating. Resolved once here
     /// (daemon-side, the sole owner of `.ralphus.toml`) rather than read by
     /// the runner subprocess itself -- the runner has no per-cell cwd config
     /// resolution of its own. `None` means the runner falls back to its own
@@ -1023,7 +1022,7 @@ impl RunnerSpec {
     }
 
     /// Build a spec for a `command`-kind proof step (RAL-151). Wrapped in
-    /// tmux exactly like every other cell/proof invocation, so it can be
+    /// session exactly like every other cell/proof invocation, so it can be
     /// watched live and reuses the same peek/pane-capture endpoints a
     /// `prompt`-kind proof step already does — see
     /// `daemon/src/scheduler.rs::run_verifies`'s `"command"` branch.
@@ -1349,51 +1348,12 @@ impl RunnerResult {
         }
     }
 
-    /// RAL-288 Stage 6: a deliberate human-triggered detach mid-task, so a
-    /// real interactive session can safely take over. Carries whatever
-    /// usage/session-id was captured live up to the detach point, mirroring
-    /// [`Self::cost_exceeded`]'s reasoning -- the board's numbers must not
-    /// regress to zero just because the cell paused rather than finished.
-    #[must_use]
-    pub fn detached(usage: LiveUsage, agent_session_id: Option<String>) -> Self {
-        Self {
-            status: "detached".to_string(),
-            tokens_in: usage.tokens_in,
-            tokens_out: usage.tokens_out,
-            cache_creation_tokens: usage.cache_creation_tokens,
-            cache_read_tokens: usage.cache_read_tokens,
-            // RAL-373: same reasoning as `cost_exceeded` -- no compaction
-            // breakdown in a live snapshot.
-            compaction_input_tokens: 0,
-            compaction_count: 0,
-            cost_usd: usage.cost_usd,
-            // Same reasoning as `cost_exceeded`: a detach point is a live
-            // snapshot, not a final accounting (RAL-326).
-            cost_is_estimated: true,
-            summary: String::new(),
-            error: None,
-            proofed: None,
-            agent_session_id,
-            turns: Some(usage.turns),
-            ghost: None,
-            retry_after_secs: None,
-            prophecies: Vec::new(),
-            appraisal: None,
-            thinking_stall_last_line: None,
-            bearing: None,
-        }
-    }
-
     /// RAL-400 Phase 3: a cell halted because its squad just became gated
     /// behind an open block-mode waypoint affected entry -- neither success nor
-    /// failure, mirroring [`Self::detached`]'s "don't regress the board's
-    /// numbers" reasoning. Deliberately a distinct status string from
-    /// `"detached"` even though both resolve to [`NodeState::Running`] and
-    /// the same in-memory `CellState::Detached` bookkeeping in the
-    /// scheduler: a waypoint halt leaves no interactive session behind to
-    /// resume into, so it must never surface the board's human-takeover
-    /// affordances, and it must auto-resume when the waypoint closes rather
-    /// than waiting on an explicit resume-automation call.
+    /// failure, mirroring [`Self::cost_exceeded`]'s "don't regress the board's
+    /// numbers" reasoning. It resolves to [`NodeState::Running`] and the
+    /// in-memory `CellState::Detached` bookkeeping in the scheduler, and
+    /// auto-resumes when the waypoint closes.
     #[must_use]
     pub fn waypoint_halted(usage: LiveUsage, agent_session_id: Option<String>) -> Self {
         Self {
@@ -1447,7 +1407,7 @@ impl RunnerResult {
     }
 
     /// RAL-435: a recognized, retryable Pi rate limit with a suggested
-    /// delay -- neither success nor failure, mirroring [`Self::detached`]'s
+    /// delay -- neither success nor failure, mirroring [`Self::cost_exceeded`]'s
     /// "don't regress the board's numbers" reasoning. `run_cell_worker`
     /// special-cases this before it would otherwise reach
     /// [`Self::node_state`] (it never lets a `"rate_limited"` result escape
@@ -1515,7 +1475,7 @@ impl RunnerResult {
     /// `Store::enqueue_error_mailbox_message`.
     ///
     /// Carries the last live usage snapshot for the same "don't regress the
-    /// board's numbers" reason as [`Self::detached`]/[`Self::cost_exceeded`],
+    /// board's numbers" reason as [`Self::cost_exceeded`],
     /// and `last_line` (the final thinking line observed before the trip) so
     /// the retry loop can quote it back into the resumed attempt's recovery
     /// context.
@@ -1555,22 +1515,10 @@ impl RunnerResult {
         self.status == "done"
     }
 
-    /// RAL-288 Stage 6: a deliberate human-triggered detach mid-task --
-    /// neither success nor failure. The scheduler special-cases this before
-    /// it would otherwise reach [`Self::node_state`] (mirroring how a
-    /// cancellation landing mid-run is handled), so this mapping only
-    /// matters as a safety net against a future caller that doesn't.
-    #[must_use]
-    pub fn is_detached(&self) -> bool {
-        self.status == "detached"
-    }
-
     /// RAL-400 Phase 3: a cell halted because its squad became gated behind
     /// an open block-mode waypoint affected entry -- see
-    /// [`Self::waypoint_halted`]. Distinct from [`Self::is_detached`] so the
-    /// scheduler can record the halt under its own DB column and Cartographer
-    /// scope, and resume it automatically rather than waiting for a human
-    /// resume-automation call.
+    /// [`Self::waypoint_halted`]. The scheduler records the halt under its own
+    /// DB column and Cartographer scope, and resumes it automatically.
     #[must_use]
     pub fn is_waypoint_halted(&self) -> bool {
         self.status == "waypoint_halted"
@@ -1584,7 +1532,7 @@ impl RunnerResult {
     /// RAL-435: a recognized, retryable Pi rate limit -- see
     /// [`Self::rate_limited`]. `run_cell_worker`'s retry loop checks this on
     /// every attempt and never lets it reach the rest of the normal
-    /// done/failed/detached handling.
+    /// done/failed handling.
     #[must_use]
     pub fn is_rate_limited(&self) -> bool {
         self.status == "rate_limited"
@@ -1593,7 +1541,7 @@ impl RunnerResult {
     /// RAL-536: a [`Self::thinking_stalled`] trip -- see that constructor's
     /// doc comment. The retry loop that owns the three-strike rule checks
     /// this on every attempt and never lets it reach the rest of the normal
-    /// done/failed/detached handling, mirroring [`Self::is_rate_limited`].
+    /// done/failed handling, mirroring [`Self::is_rate_limited`].
     #[must_use]
     pub fn is_thinking_stalled(&self) -> bool {
         self.status == "thinking_stalled"
@@ -1604,10 +1552,7 @@ impl RunnerResult {
     pub fn node_state(&self) -> NodeState {
         if self.is_done() {
             NodeState::Done
-        } else if self.is_detached()
-            || self.is_waypoint_halted()
-            || self.is_rate_limited()
-            || self.is_thinking_stalled()
+        } else if self.is_waypoint_halted() || self.is_rate_limited() || self.is_thinking_stalled()
         {
             NodeState::Running
         } else if self.is_arbiter_stopped() {
@@ -1693,22 +1638,13 @@ pub struct SubprocessRunner {
     /// When set, `RALPHUS_EVENT:` marker lines on the child's stderr are
     /// parsed and forwarded into Cartographer (RAL-98).
     cartographer: Option<crate::store_lock::StoreHandle>,
-    /// When set, a per-cell detach token is registered for the lifetime of
-    /// each tmux-wrapped attempt so an HTTP handler can request a clean
-    /// mid-task detach (RAL-288 Stage 6) via the same registry, without
-    /// touching the rest of that cell's squad.
-    detachments: Option<crate::cancel::Detachments>,
     /// When set, a per-squad waypoint-halt token is registered for the
-    /// lifetime of each tmux-wrapped attempt (RAL-400 Phase 3) so a squad
+    /// lifetime of each direct attempt (RAL-400 Phase 3) so a squad
     /// that becomes gated behind an open block-mode waypoint can have every
     /// one of its currently-running cells halted at once, without marking
     /// them terminally cancelled.
     waypoint_halts: Option<crate::cancel::WaypointHalts>,
     arbiter_stops: Option<crate::cancel::ArbiterStops>,
-    /// Pins every run to the tmux path whatever `RALPHUS_RUNNER_MODE` says,
-    /// so the tests of that path keep exercising it. Always `false` in
-    /// production.
-    force_tmux: bool,
 }
 
 impl SubprocessRunner {
@@ -1722,18 +1658,9 @@ impl SubprocessRunner {
             args: parts.collect(),
             registry: None,
             cartographer: None,
-            detachments: None,
             waypoint_halts: None,
             arbiter_stops: None,
-            force_tmux: false,
         }
-    }
-
-    /// Pins this runner to the tmux path; see the `force_tmux` field.
-    #[cfg(test)]
-    fn forced_tmux(mut self) -> Self {
-        self.force_tmux = true;
-        self
     }
 
     /// Resolve the runner command from `RALPHUS_RUNNER_CMD`, defaulting to
@@ -1761,17 +1688,8 @@ impl SubprocessRunner {
         self
     }
 
-    /// Attach the shared per-cell detach registry (RAL-288 Stage 6) so a
-    /// tmux-wrapped cell can be cleanly detached mid-task via an HTTP
-    /// handler holding the same registry.
-    #[must_use]
-    pub fn with_detachments(mut self, detachments: crate::cancel::Detachments) -> Self {
-        self.detachments = Some(detachments);
-        self
-    }
-
     /// Attach the shared per-squad waypoint-halt registry (RAL-400 Phase 3)
-    /// so a tmux-wrapped cell can be halted the moment its squad becomes
+    /// so a direct cell can be halted the moment its squad becomes
     /// gated behind an open block-mode waypoint, via an external caller
     /// holding the same registry.
     #[must_use]
@@ -1802,26 +1720,9 @@ impl Drop for PidGuard<'_> {
     }
 }
 
-/// Removes a cell's detach-token registration on every return path out of
-/// [`SubprocessRunner::run_via_tmux`] (RAL-288 Stage 6), the same way
-/// [`PidGuard`] removes a PID registration -- a token left registered after
-/// its run finished would let a stale HTTP detach request silently no-op
-/// against a run that already ended, never against something still live,
-/// but there's no reason to let the registry grow unbounded either.
-struct DetachGuard<'a> {
-    detachments: &'a crate::cancel::Detachments,
-    session_name: &'a str,
-}
-
-impl Drop for DetachGuard<'_> {
-    fn drop(&mut self) {
-        self.detachments.remove(self.session_name);
-    }
-}
-
 /// Removes a cell's waypoint-halt-token registration on every return path out
-/// of [`SubprocessRunner::run_via_tmux`] (RAL-400 Phase 3), the same way
-/// [`DetachGuard`] removes a detach-token registration -- keyed by
+/// of [`SubprocessRunner::run_direct`] (RAL-400 Phase 3), the same way
+/// [`PidGuard`] removes a PID registration -- keyed by
 /// `squad_id`, not `session_name`, since the registry is shared across every
 /// cell concurrently running in the same squad; `Cancellations::remove`'s
 /// refcounting already handles the case where more than one of that squad's
@@ -1847,57 +1748,11 @@ impl Drop for WaypointHaltGuard<'_> {
     }
 }
 
-/// How often a tmux-wrapped runner invocation's pane is polled for the
-/// completion sentinel (RAL-102). Deliberately coarser than a plain child-
-/// exit poll would be, since each tick costs a real `tmux capture-pane`
-/// subprocess spawn, not just a syscall.
-const TMUX_POLL_INTERVAL: Duration = Duration::from_millis(500);
+/// How often a cell's transcript is drained for markers and its stall and
+/// budget checks run.
+const DRAIN_POLL_INTERVAL: Duration = Duration::from_millis(500);
 
-/// Whether each tmux attempt starts the `powershell` exit-code watcher
-/// ([`crate::tmux::watch_for_exit`]) so an unexplained session death reports
-/// the server's exit code. Off unless `RALPHUS_TMUX_EXIT_DIAGNOSTICS` is set
-/// to a non-empty value other than `0`.
-fn tmux_exit_diagnostics_enabled() -> bool {
-    std::env::var("RALPHUS_TMUX_EXIT_DIAGNOSTICS").is_ok_and(|v| !v.is_empty() && v != "0")
-}
-
-/// How often the poll loop captures the pane for its "current screen"
-/// snapshot and completion safety net once the cell's transcript is
-/// delivering events (see the poll loop for when it captures every poll).
-const PANE_SNAPSHOT_INTERVAL: Duration = Duration::from_secs(5);
-
-/// How many lines the per-poll `capture_pane` pulls for the board's live and
-/// frozen "current screen" snapshot, since RAL-397 Phase 2D moved event and
-/// completion-sentinel detection off pane scrollback onto the `.raw`
-/// transcript tail ([`TranscriptTailer`]). The snapshot only needs the current
-/// screen now — deep scrollback is served from the transcript (Phase 2E/2F) —
-/// so this is a small visible-window read rather than the former 10_000-line
-/// scan, kept comfortably above both a terminal's visible height and
-/// [`SubprocessRunner::read_tmux_result`]'s 60-line failure-diagnostic tail.
-pub(crate) const LIVE_SNAPSHOT_CAPTURE_LINES: u32 = 500;
-
-/// How many lines the per-poll `capture_pane` pulls once the poll loop has
-/// fallen back to scanning the pane for `RALPHUS_EVENT:` markers (a `.raw`
-/// transcript that never materialized — see `pane_event_fallback` in
-/// `run_via_tmux_attempt`). The visible-window read
-/// [`LIVE_SNAPSHOT_CAPTURE_LINES`] is sized for a *snapshot*; an event scan
-/// needs enough depth that a marker printed between two polls is still on
-/// screen, so this restores the pre-Phase-2D scan depth. It costs nothing in
-/// pane memory — that ceiling is `history-limit` (Phase 2H), which this does
-/// not change; `capture-pane` simply returns fewer lines than asked for when
-/// scrollback is shallower, which is the normal case now.
-const FALLBACK_EVENT_CAPTURE_LINES: u32 = 10_000;
-
-/// How long `run_via_tmux_attempt` waits for the `.raw` transcript to produce
-/// its first byte before concluding the sink is not working and falling back
-/// to pane scanning for events. A working `pipe-pane` tee captures the pane's
-/// own shell prompt, so its first bytes land almost immediately; this is three
-/// poll intervals of slack on top of that, short enough that a cell whose
-/// session dies early still gets its `agent_session_id` captured in time to
-/// reattach.
-const TRANSCRIPT_FALLBACK_GRACE: Duration = Duration::from_millis(1500);
-
-/// RAL-241: how long a tmux-wrapped session may show no pane growth before a
+/// RAL-241: how long a cell's transcript may show no growth before a
 /// `high`-priority mailbox stall escalation fires (see
 /// `SubprocessRunner::check_stall_escalation`). Overridable via
 /// `RALPHUS_MAILBOX_STALL_SECS` — the ticket's own manual-verification repro
@@ -1911,57 +1766,10 @@ fn mailbox_stall_threshold() -> Duration {
         .unwrap_or(Duration::from_secs(5 * 60))
 }
 
-/// Sentinel prefix the runner prints to its own stdout (which lands in the
-/// tmux pane, not a pipe the daemon reads) once it has written its
-/// `CellResult` to the `--result-file` it was given. Mirrors the
-/// `RALPHUS_PROOF:`/`RALPHUS_EVENT:` marker idiom, just polled from pane
-/// content instead of a stderr pipe (RAL-102 Q2/Q3/Q5).
-const TMUX_DONE_MARKER: &str = "RALPHUS_TMUX_DONE";
-
-/// Whether `pane`'s captured content shows the *real* completion sentinel —
-/// a standalone line of the exact form `RALPHUS_TMUX_DONE: <status>`
-/// (`cli/src/ralphus/runner/__main__.py`'s `_finish`), not merely the
-/// marker text appearing anywhere in the buffer.
-///
-/// A plain `pane.contains(TMUX_DONE_MARKER)` substring scan false-positives
-/// whenever the cell's own work happens to echo the literal marker —
-/// e.g. an agent whose task is about this exact tmux-completion mechanism
-/// `Read`ing or `Grep`ing `runner.rs`/`__main__.py`, both of which contain
-/// the string `RALPHUS_TMUX_DONE` in their own source. That premature
-/// "done" makes the daemon try to read a result file the real subprocess
-/// hasn't written yet, fail with "no result file", and then kill the
-/// cell's tmux pane out from under work that was still genuinely in
-/// progress — observed in production repeatedly and *only* for a
-/// live-view/tmux-themed ticket, never for unrelated ones in the same
-/// batch. Requiring the marker to be the start of its own line (as
-/// `print(f"{TMUX_DONE_MARKER}: {status}")` always produces, flush left,
-/// nothing else on the line) is not proof against a maximally adversarial
-/// pane transcript, but it is proof against every real false-positive
-/// observed so far: a grep match is prefixed with `file:line:`, a `Read`
-/// tool's numbered listing is prefixed with a line number, and quoting the
-/// marker in prose reads as ordinary text, not a line starting with it.
-fn pane_shows_done_sentinel(pane: &str) -> bool {
-    pane.lines().any(line_is_done_sentinel)
-}
-
-/// Whether a single line is the standalone `RALPHUS_TMUX_DONE: <status>`
-/// completion sentinel — the per-line predicate behind
-/// [`pane_shows_done_sentinel`], shared with the Phase 2D [`TranscriptTailer`]
-/// so a sentinel read from the durable transcript and one read from a pane
-/// scrollback scan are accepted on byte-for-byte identical terms (line-start
-/// match only, defeating the mid-line false positives documented above).
-pub(crate) fn line_is_done_sentinel(line: &str) -> bool {
-    line.trim_start()
-        .strip_prefix(TMUX_DONE_MARKER)
-        .is_some_and(|rest| rest.starts_with(": "))
-}
-
 /// Max bytes [`TranscriptTailer::drain`] consumes from the `.raw` transcript in
 /// a single poll. Bounds the transient allocation when a cell floods output
 /// between polls; anything beyond it is drained on subsequent polls (the byte
-/// offset persists). Completion is never missed while catching up: the done
-/// sentinel is always the pane's final printed line, so the small
-/// `capture_pane` safety net in the poll loop still sees it even mid-catch-up.
+/// offset persists).
 const MAX_TRANSCRIPT_DRAIN_BYTES_PER_POLL: u64 = 4 * 1024 * 1024;
 
 /// Cap on the partial-line carry buffer. Real pane output is newline-
@@ -1990,7 +1798,7 @@ pub(crate) struct DrainedLines {
 /// losslessly, unlike the `capture_pane` scrollback scan it replaces — which
 /// could drop a marker that scrolled past a shrinking `history-limit` between
 /// the 500 ms polls. Constructed fresh per attempt; a reattach is a new
-/// `run_via_tmux_attempt` call with the next `attempt` number, pointing a new
+/// `run_direct_attempt` call with the next `attempt` number, pointing a new
 /// tailer at that attempt's own `.raw` file.
 pub(crate) struct TranscriptTailer {
     path: std::path::PathBuf,
@@ -2010,7 +1818,7 @@ impl TranscriptTailer {
     /// hold the handle open on Windows and defeat that removal, in which case
     /// starting past the survivors is what keeps a stale completion sentinel
     /// from ending this attempt on its first poll. See the reset in
-    /// `run_via_tmux_attempt`.
+    /// `run_direct_attempt`.
     fn new(session_name: &str, attempt: u32, start_offset: u64) -> Self {
         let mut tailer = Self::at_path(crate::terminal_log::raw_transcript_path(
             session_name,
@@ -2052,9 +1860,9 @@ impl TranscriptTailer {
             return DrainedLines::default();
         };
         // File shrank beneath us — the path was reused (a re-run clearing the
-        // previous run's transcript, see `run_via_tmux_attempt`) or it was
+        // previous run's transcript, see `run_direct_attempt`) or it was
         // pruned and recreated. Restart from the top rather than seek past the
-        // new end. Note this is *not* the byte-cap path: `pipe-sink` stops
+        // new end. Note this is *not* the byte-cap path: the transcript writer stops
         // appending at its cap, it never truncates, so a capped file only ever
         // stops growing.
         if total < self.offset {
@@ -2091,10 +1899,8 @@ impl TranscriptTailer {
 }
 
 /// Forward marker lines from one transcript chunk and fold the live fields
-/// needed by the tmux attempt into its in-memory state. Returns whether the
-/// chunk contained the completion sentinel.
+/// needed by the attempt into its in-memory state.
 struct TranscriptEventTarget<'a> {
-    pane_event_fallback: bool,
     cartographer: Option<&'a crate::store_lock::StoreHandle>,
     squad_id: &'a str,
     cell_id: &'a str,
@@ -2121,16 +1927,9 @@ fn consume_transcript_lines(
     resumable_agent_session_id: &mut Option<String>,
     current_usage: &mut LiveUsage,
     mut stall_detector: Option<&mut crate::thinking_stall::ThinkingStallDetector>,
-) -> (bool, Option<crate::thinking_stall::StallSample>) {
-    let mut done = false;
+) -> Option<crate::thinking_stall::StallSample> {
     let mut stall_sample = None;
     for line in lines {
-        if line_is_done_sentinel(line) {
-            done = true;
-        }
-        if target.pane_event_fallback {
-            continue;
-        }
         // RAL-536: `RALPHUS_THINKING:` lines are a separate stream from
         // `RALPHUS_EVENT:` tool-call/telemetry lines -- routed to
         // `observe_thinking_line`, never `reset()`, so a legitimate repeated
@@ -2201,7 +2000,7 @@ fn consume_transcript_lines(
             }
         }
     }
-    (done, stall_sample)
+    stall_sample
 }
 
 /// Drain every byte currently available after the completion sentinel has
@@ -2238,20 +2037,9 @@ impl Runner for SubprocessRunner {
         self.run_cancellable(spec, &CancelToken::never())
     }
 
-    /// Every spec — `prompt`-kind (agent invocations: normal task cells,
-    /// `agent`-kind proof steps, and Guardian merge/resolver/synthesizer
-    /// cells) and `command`-kind (deterministic shell cells/proof
-    /// steps) alike — runs tmux-wrapped so the board can show a live view.
-    /// `command`-kind specs joined this blanket, no-opt-in path in RAL-151;
-    /// before that (RAL-102) only `prompt`-kind specs ran under tmux and a
-    /// `command`-kind spec ran as a raw child process instead, with no live
-    /// view available for it.
+    /// Runs the cell as a plain child process; see [`direct`].
     fn run_cancellable(&self, spec: &RunnerSpec, cancel: &CancelToken) -> RunnerResult {
-        if !self.force_tmux && direct::use_direct(spec) {
-            self.run_direct(spec, cancel)
-        } else {
-            self.run_via_tmux(spec, cancel)
-        }
+        self.run_direct(spec, cancel)
     }
 
     fn preflight_agent(
@@ -2297,21 +2085,6 @@ impl Runner for SubprocessRunner {
 }
 
 impl SubprocessRunner {
-    /// Bounded retries for a cell whose tmux pane vanishes unexpectedly
-    /// mid-run — the still-unresolved "mystery session death" investigated at
-    /// length in `PSMUX_CRASH_NOTES.local.md`. One confirmed finding there is
-    /// that the underlying backing process can survive even after the daemon
-    /// loses tmux-level visibility into it, so a hard failure on the first
-    /// missed poll can discard genuinely-still-running work. Only exercised
-    /// for agents with a real resume mechanism (`claude-code`/`claude-cli`,
-    /// `codex`/`codex-cli`), and only once a `agent_session_id` has actually
-    /// been captured live from the pane — both required for the backend's
-    /// resume command to have anything to resume. Kept small: this
-    /// mitigates an unreliable pane-tracking layer, it is not a substitute for
-    /// genuine failure — a cell that keeps dying even after being resumed
-    /// still fails, it does not retry forever.
-    const MAX_REATTACH_ATTEMPTS: u32 = 2;
-
     /// RAL-536: whether `spec.agent` emits `RALPHUS_THINKING:` output at all
     /// (RAL-516's `thinking_capable`/`agent_supports_thinking` flag) --
     /// gates whether [`crate::thinking_stall::ThinkingStallDetector`] is
@@ -2331,1032 +2104,12 @@ impl SubprocessRunner {
         crate::agent_profiles::thinking_capable_for_agent(&spec.agent, &db_profiles)
     }
 
-    /// Run `spec` inside a tmux session, transparently retrying via the
-    /// backend's own resume mechanism (`claude -p --resume <id>` for
-    /// `claude-code`/`claude-cli`, `codex exec resume <id>` for
-    /// `codex`/`codex-cli`) in a fresh tmux session (same deterministic
-    /// name, so the board's existing "Show Live View"/"Open Terminal Log"
-    /// buttons — keyed by `(squad_id, task, cell_id)` — transparently start
-    /// working again once a reattach succeeds, no UI changes needed) if the
-    /// pane vanishes unexpectedly mid-run. See [`Self::MAX_REATTACH_ATTEMPTS`]
-    /// for why this is bounded, and `PSMUX_CRASH_NOTES.local.md` for the
-    /// underlying investigation this mitigates rather than fixes.
-    ///
-    /// The wall-clock timeout budget (`spec.timeout_sec`) is shared across
-    /// every attempt, not reset per attempt — a reattach must never let a
-    /// cell run longer in total than it was configured to. Cancellation
-    /// and a genuine timeout are never reattach-eligible; only a pane that
-    /// vanished on its own (confirmed via `MISSING_SESSION_STRIKE_LIMIT`
-    /// consecutive misses) is.
-    ///
-    /// Every stage is logged (both `rlog!` and a Cartographer breadcrumb via
-    /// [`Self::emit_reattach_note`]) with as much state as is available —
-    /// attempt number, elapsed time, the captured `agent_session_id`, why a
-    /// reattach was or wasn't attempted, and the eventual outcome — so a real
-    /// occurrence is fully diagnosable after the fact from Cartographer alone.
-    fn run_via_tmux(&self, spec: &RunnerSpec, cancel: &CancelToken) -> RunnerResult {
-        let tmux = match Tmux::resolve() {
-            Ok(t) => t,
-            Err(e) => return RunnerResult::failure(format!("could not resolve tmux: {e}")),
-        };
-
-        let io_dir = std::env::temp_dir().join("ralphus-runner-io");
-        if let Err(e) = std::fs::create_dir_all(&io_dir) {
-            return RunnerResult::failure(format!("could not create runner IO dir: {e}"));
-        }
-        // `key` (from `tmux::session_name`) is already the fully-formed,
-        // "ralphus_"-prefixed session name — do not re-prefix it. A prior
-        // double-prefix bug meant the tmux session actually created never
-        // matched the name `capture_pane_reply`/`attach_tmux_terminal`
-        // recomputed via a bare `tmux::session_name` call, so the live
-        // "peek"/"open terminal" endpoints always reported the session as
-        // inactive even while it was running. Reused unchanged across every
-        // reattach attempt below — see this fn's doc comment.
-        let session_name = crate::tmux::session_name(&spec.squad_id, &spec.task, &spec.cell_id);
-        let spec_path = io_dir.join(format!("{session_name}.spec.json"));
-        let result_path = io_dir.join(format!("{session_name}.result.json"));
-        // Loaded once per cell run (not per attempt/poll) — RAL-154.
-        let terminal_log_max_lines =
-            crate::config::load_terminal_log_config().max_lines_per_attempt();
-        // RAL-536: same "once per cell run" reasoning -- `spec.agent` and the
-        // layered `[agent.health]` config are both constant across every
-        // reattach attempt of this same cell.
-        let agent_health_config = crate::config::load_agent_health_config();
-        let thinking_capable = self.thinking_capable_for_spec(spec);
-
-        // Shared across every attempt: the overall wall-clock budget must not
-        // reset on a reattach, and the agent_session_id captured live on one
-        // attempt is exactly what the next attempt resumes from.
-        let started = Instant::now();
-        let deadline = spec.timeout_sec.map(Duration::from_secs);
-        let mut resumable_agent_session_id: Option<String> = None;
-        let mut attempt: u32 = 0;
-
-        // RAL-288 Stage 6: registered for the lifetime of this whole cell run
-        // (every reattach attempt below shares it, not a fresh one per
-        // attempt) so an HTTP handler can request a clean mid-task detach via
-        // the same registry at any point, keyed by the same deterministic
-        // `session_name` the board's live-view/attach endpoints already use.
-        // `_detach_guard` removes it on every return path via `Drop`, the
-        // same pattern `PidGuard` already uses below for the same reason.
-        let detach_token = self.detachments.as_ref().map(|d| d.register(&session_name));
-        let _detach_guard = self.detachments.as_ref().map(|d| DetachGuard {
-            detachments: d,
-            session_name: &session_name,
-        });
-
-        // RAL-400 Phase 3: also registered for the lifetime of this whole
-        // cell run, but keyed by `squad_id` rather than `session_name` --
-        // every cell concurrently running in the same squad shares this one
-        // token, so a single external `.cancel(squad_id)` halts all of them
-        // at once when that squad becomes gated behind an open block-mode
-        // waypoint. `_waypoint_halt_guard` removes this cell's registration
-        // on every return path, mirroring `_detach_guard`.
-        // A waypoint survey's agent run carries its candidate's squad id but is
-        // not that squad's work: it is never registered, so neither a halt
-        // already in force for the candidate nor a later one can kill it.
-        let halt_registry = self
-            .waypoint_halts
-            .as_ref()
-            .filter(|_| spec.task != WAYPOINT_SURVEY_TASK);
-        let waypoint_halt_token = halt_registry.map(|w| w.register(&spec.squad_id));
-        let _waypoint_halt_guard = halt_registry.map(|w| WaypointHaltGuard {
-            waypoint_halts: w,
-            squad_id: &spec.squad_id,
-        });
-        let arbiter_key = crate::store_memory::StoreMemory::cell_diff_key(
-            &spec.squad_id,
-            &spec.task,
-            &spec.cell_id,
-        );
-        let arbiter_stop_token = self
-            .arbiter_stops
-            .as_ref()
-            .map(|s| s.register(&arbiter_key));
-        let _arbiter_stop_guard = self.arbiter_stops.as_ref().map(|s| ArbiterStopGuard {
-            stops: s,
-            key: &arbiter_key,
-        });
-
-        loop {
-            let attempt_spec: std::borrow::Cow<'_, RunnerSpec> = if attempt == 0 {
-                std::borrow::Cow::Borrowed(spec)
-            } else {
-                let mut s = spec.clone();
-                s.resume_agent_session_id = resumable_agent_session_id.clone();
-                std::borrow::Cow::Owned(s)
-            };
-
-            if attempt > 0 {
-                crate::rlog!(
-                    WARNING,
-                    "ralphus [runner] reattach attempt {attempt}/{} squad={} cell={} task={} resuming agent_session_id={:?}",
-                    Self::MAX_REATTACH_ATTEMPTS,
-                    spec.squad_id,
-                    spec.cell_id,
-                    spec.task,
-                    resumable_agent_session_id,
-                );
-                self.emit_reattach_note(
-                    spec,
-                    "reattach attempt starting",
-                    crate::logging::LogLevel::WARNING,
-                    attempt,
-                    resumable_agent_session_id.as_deref(),
-                    None,
-                    started.elapsed().as_secs(),
-                    None,
-                );
-            }
-
-            let (result, session_died_unexpectedly) = self.run_via_tmux_attempt(
-                &attempt_spec,
-                cancel,
-                detach_token.as_ref(),
-                waypoint_halt_token.as_ref(),
-                arbiter_stop_token.as_ref(),
-                &tmux,
-                &session_name,
-                &spec_path,
-                &result_path,
-                &started,
-                deadline,
-                &mut resumable_agent_session_id,
-                attempt,
-                terminal_log_max_lines,
-                thinking_capable,
-                &agent_health_config,
-            );
-
-            if !session_died_unexpectedly {
-                crate::rlog!(
-                    INFO,
-                    "ralphus [runner] tmux done squad={} cell={} status={} tokens_in={} tokens_out={} cost_usd={:.4} attempts={}",
-                    spec.squad_id,
-                    spec.cell_id,
-                    result.status,
-                    result.tokens_in,
-                    result.tokens_out,
-                    result.cost_usd,
-                    attempt + 1,
-                );
-                self.clear_live_activity(&session_name);
-                return result;
-            }
-
-            // Session vanished on its own this attempt — decide whether a
-            // reattach is possible, logging full state either way (this is
-            // the "what was lost, what was retried, and why" breadcrumb
-            // trail this mechanism exists to leave behind).
-            let already_timed_out = timed_out(started.elapsed(), deadline);
-            let reason = if !matches!(
-                attempt_spec.agent.as_str(),
-                "claude-code" | "claude-cli" | "codex" | "codex-cli" | "pi"
-            ) {
-                "agent does not support resume"
-            } else if resumable_agent_session_id.is_none() {
-                "no agent_session_id was ever captured for this cell"
-            } else if already_timed_out {
-                "timeout budget exhausted"
-            } else if attempt >= Self::MAX_REATTACH_ATTEMPTS {
-                "reattach attempts exhausted"
-            } else {
-                "reattach possible"
-            };
-            let can_reattach = reason == "reattach possible";
-            crate::rlog!(
-                WARNING,
-                "ralphus [runner] session lost squad={} cell={} task={} attempt={}/{} agent={} elapsed_secs={} resumable_agent_session_id={:?} will_reattach={can_reattach} reason={reason:?} error={:?}",
-                spec.squad_id,
-                spec.cell_id,
-                spec.task,
-                attempt,
-                Self::MAX_REATTACH_ATTEMPTS,
-                attempt_spec.agent,
-                started.elapsed().as_secs(),
-                resumable_agent_session_id,
-                result.error,
-            );
-            self.emit_reattach_note(
-                spec,
-                "session lost",
-                crate::logging::LogLevel::WARNING,
-                attempt,
-                resumable_agent_session_id.as_deref(),
-                Some(reason),
-                started.elapsed().as_secs(),
-                result.error.as_deref(),
-            );
-
-            if !can_reattach {
-                crate::rlog!(
-                    ERROR,
-                    "ralphus [runner] giving up on session squad={} cell={} after {} attempt(s): {reason}",
-                    spec.squad_id,
-                    spec.cell_id,
-                    attempt + 1,
-                );
-                self.emit_reattach_note(
-                    spec,
-                    "giving up, no further reattach",
-                    crate::logging::LogLevel::ERROR,
-                    attempt,
-                    resumable_agent_session_id.as_deref(),
-                    Some(reason),
-                    started.elapsed().as_secs(),
-                    result.error.as_deref(),
-                );
-                let mut result = result;
-                if attempt > 0 {
-                    let note =
-                        format!("session lost after {attempt} reattach attempt(s) ({reason})");
-                    result.error = Some(match result.error.take() {
-                        Some(existing) => format!("{existing}\n{note}"),
-                        None => note,
-                    });
-                }
-                self.clear_live_activity(&session_name);
-                return result;
-            }
-
-            attempt += 1;
-        }
-    }
-
-    /// Run one attempt of a tmux-wrapped invocation of `attempt_spec`: write
-    /// it to `spec_path`, kill any stale session named `session_name`, spawn
-    /// a fresh one, and poll until it completes, is cancelled, times out
-    /// (against the *shared* `started`/`deadline` from [`Self::run_via_tmux`]
-    /// — never reset per attempt, so a reattach cannot extend a cell's
-    /// configured timeout budget), or is confirmed dead
-    /// (`MISSING_SESSION_STRIKE_LIMIT` consecutive `has-session` misses).
-    ///
-    /// Every "session-id known" event seen in the pane updates
-    /// `resumable_agent_session_id` in place, so a subsequent attempt can
-    /// resume the latest known conversation even if this one never finished.
-    ///
-    /// Returns `(result, session_died_unexpectedly)` — the latter is `true`
-    /// only on the "vanished on its own" path, never for an intentional
-    /// cancel/timeout, so [`Self::run_via_tmux`] can tell a genuine
-    /// mystery-death apart from a deliberate stop. A test caught this:
-    /// `live_tmux_run_via_tmux_is_cancellable` asserts the error is exactly
-    /// `"cancelled"` with no exit-code diagnostic appended.
-    #[allow(clippy::too_many_arguments)]
-    fn run_via_tmux_attempt(
-        &self,
-        attempt_spec: &RunnerSpec,
-        cancel: &CancelToken,
-        detach: Option<&crate::cancel::DetachToken>,
-        waypoint_halt: Option<&crate::cancel::WaypointHaltToken>,
-        arbiter_stop: Option<&crate::cancel::ArbiterStopToken>,
-        tmux: &Tmux,
-        session_name: &str,
-        spec_path: &std::path::Path,
-        result_path: &std::path::Path,
-        started: &Instant,
-        deadline: Option<Duration>,
-        resumable_agent_session_id: &mut Option<String>,
-        attempt: u32,
-        terminal_log_max_lines: usize,
-        thinking_capable: bool,
-        agent_health_config: &crate::config::AgentHealthConfig,
-    ) -> (RunnerResult, bool) {
-        // A stale file from a prior crashed/killed attempt of the same
-        // (squad_id, task, cell_id) must never be mistaken for this
-        // attempt's result.
-        let _ = std::fs::remove_file(result_path);
-
-        let payload = match serde_json::to_string(attempt_spec) {
-            Ok(p) => p,
-            Err(e) => {
-                return (
-                    RunnerResult::failure(format!("could not serialize spec: {e}")),
-                    false,
-                );
-            }
-        };
-        if let Err(e) = std::fs::write(spec_path, payload) {
-            return (
-                RunnerResult::failure(format!("could not write spec file: {e}")),
-                false,
-            );
-        }
-
-        let mut all_args = self.args.clone();
-        all_args.push("send".to_string());
-        all_args.push(spec_path.to_string_lossy().into_owned());
-        all_args.push("--result-file".to_string());
-        all_args.push(result_path.to_string_lossy().into_owned());
-
-        // A tmux session with this exact deterministic name can already exist
-        // and still be alive: tmux sessions are owned by the tmux server, not
-        // the daemon, so they survive a daemon crash/restart — or, on a
-        // reattach, may be the very session this attempt is replacing (killed
-        // just below, before this loop reaches this point again). Resuming
-        // this (squad_id, task, cell_id) slot without killing it first would
-        // otherwise collide with that existing session (`new-session` errors
-        // on a duplicate name), failing this attempt immediately.
-        if tmux.has_session(session_name) {
-            crate::rlog!(
-                WARNING,
-                "ralphus [runner] killing stale tmux session {session_name} before starting a fresh one squad={} cell={}",
-                attempt_spec.squad_id,
-                attempt_spec.cell_id,
-            );
-            // RAL-154: on a reattach, this stale session is the prior
-            // attempt's own pane, possibly still producing output after that
-            // attempt's own final capture (e.g. the pane flickered
-            // unreachable long enough to trip `MISSING_SESSION_STRIKE_LIMIT`
-            // and get treated as dead, but never actually died — see
-            // PSMUX_CRASH_NOTES.local.md). Grab one last capture and fold it
-            // into that outgoing attempt's durable log *before* killing it,
-            // so this content is never silently discarded — previously the
-            // prior attempt's log only ever reflected whatever `last_pane`
-            // held as of its own last successful poll. Not meaningful for the
-            // very first attempt (`attempt == 0`): a stale session found
-            // there belongs to no attempt this call has ever tracked (most
-            // likely a leftover from a crashed daemon's earlier lifetime),
-            // and the incoming fresh attempt 0 would immediately overwrite
-            // any salvage written to that same slot anyway.
-            if attempt > 0 {
-                if let Ok(content) = tmux.capture_pane(session_name, 10_000) {
-                    write_terminal_log_preferring_raw_transcript(
-                        session_name,
-                        attempt - 1,
-                        &content,
-                        terminal_log_max_lines,
-                    );
-                    self.emit_terminal_log_note(attempt_spec, session_name, attempt - 1);
-                }
-            }
-            self.kill_tmux_session(tmux, attempt_spec, session_name);
-        }
-        // RAL-397 Phase 2C: a durable, unbounded-depth transcript of this
-        // attempt's raw pane output, written continuously via `pipe_pane` --
-        // see `Tmux::new_detached_session_with_command`'s doc comment. Phase 2D
-        // reads event markers and the completion sentinel back from it (the
-        // `TranscriptTailer` in the poll loop below), and Phase 2E derives this
-        // attempt's durable terminal log from it.
-        let transcript_path = crate::terminal_log::raw_transcript_path(session_name, attempt);
-        // The `.raw` path is keyed on `(session_name, attempt)`, both of which
-        // are deterministic — `attempt` restarts at 0 every time a cell is
-        // re-run — while `pipe-sink` opens its target in append mode. Left
-        // alone, a re-run tails the *previous* run's transcript from byte 0
-        // and finds its completion sentinel on the very first poll, ending the
-        // new attempt before its own agent has produced a single byte (and
-        // replaying that run's stale `agent_session_id` and cost figures on
-        // the way out). Clear the file up front, then start the tailer past
-        // whatever survived — on Windows a previous run's sink can still hold
-        // the handle and defeat the removal.
-        let _ = std::fs::remove_file(&transcript_path);
-        let transcript_baseline = std::fs::metadata(&transcript_path).map_or(0, |m| m.len());
-        if let Err(e) = tmux.new_detached_session_with_command(
-            session_name,
-            &attempt_spec.cwd,
-            &attempt_spec.env_overrides,
-            &self.program,
-            &all_args,
-            Some(&transcript_path),
-        ) {
-            let _ = std::fs::remove_file(spec_path);
-            return (
-                RunnerResult::failure(format!("could not start tmux session: {e}")),
-                false,
-            );
-        }
-        crate::rlog!(
-            INFO,
-            "ralphus [runner] tmux session started {session_name} squad={} cell={} agent={} model={} resume={:?}",
-            attempt_spec.squad_id,
-            attempt_spec.cell_id,
-            attempt_spec.agent,
-            attempt_spec.model.as_deref().unwrap_or("default"),
-            attempt_spec.resume_agent_session_id,
-        );
-        self.emit_tmux_note(attempt_spec, "tmux session started", session_name);
-        // Best-effort: if the session dies with no explanation (the ongoing
-        // mystery -- see PSMUX_CRASH_NOTES.local.md), this is the one way to
-        // learn whether its process actually crashed (a real Windows
-        // exception code) or exited cleanly, without needing admin rights.
-        // It costs a `powershell` process kept alive for the whole attempt,
-        // so it only runs when `RALPHUS_TMUX_EXIT_DIAGNOSTICS` is set.
-        // `None` (disabled, PID lookup failed, or non-Windows) just means no
-        // exit-code detail is available later -- never fatal to the session.
-        let server_pid = crate::tmux::find_server_pid(session_name);
-        let exit_watch = server_pid
-            .filter(|_| tmux_exit_diagnostics_enabled())
-            .map(crate::tmux::watch_for_exit);
-        // Register the same PID for the resource-usage view (RAL-11) so a
-        // tmux-wrapped session (every cell/proof step, since RAL-151)
-        // still shows up there — the raw-child-process path this used to
-        // come from (`PidGuard` around a directly spawned `Command`) no
-        // longer exists now that nothing runs outside tmux. Best-effort and
-        // Windows-only, same caveats as `find_server_pid` itself; on any
-        // other platform (or if the lookup races the just-spawned server)
-        // this session simply doesn't appear in the resource view, exactly
-        // as every `prompt`-kind cell already didn't between RAL-102 and
-        // this fix.
-        let _pid_guard = match (self.registry.as_ref(), server_pid) {
-            (Some(registry), Some(pid)) => {
-                registry.register(&attempt_spec.squad_id, &attempt_spec.cell_id, pid);
-                Some(PidGuard {
-                    registry,
-                    squad_id: &attempt_spec.squad_id,
-                    cell_id: &attempt_spec.cell_id,
-                })
-            }
-            _ => None,
-        };
-
-        // RAL-241: baseline for the stall-escalation check below, used only
-        // until the first real activity is observed (`Store::live_activity_ms`
-        // is `None` until then).
-        let attempt_started_ms = crate::store::now_ms();
-        let stall_threshold = mailbox_stall_threshold();
-        // RAL-397 Phase 2D: the lossless event/sentinel source for this
-        // attempt, tailing the durable `.raw` transcript this attempt's
-        // `pipe_pane` wiring (Phase 2C) streams to. Fresh per attempt — see
-        // `TranscriptTailer`'s doc comment on how a reattach re-targets it.
-        let mut tailer = TranscriptTailer::new(session_name, attempt, transcript_baseline);
-        let mut last_pane: Option<String> = None;
-        // RAL-536: fresh per attempt, not shared across a reattach -- a
-        // reattach is a different, unrelated failure mode (the pane vanished)
-        // and the resumed agent's own thinking output starts a new stream, so
-        // carrying a partially-built window/streak across it would conflate
-        // two attempts' content. `None` when `spec.agent` doesn't emit
-        // `RALPHUS_THINKING:` output at all (RAL-516), so this whole check is
-        // a no-op for Claude Code/Codex.
-        let mut stall_detector = thinking_capable
-            .then(|| crate::thinking_stall::ThinkingStallDetector::new(agent_health_config));
-        // RAL-397: `pipe_pane` is best-effort by design (a `pipe-pane` call
-        // that returns `Ok` only means tmux accepted the target string — the
-        // sink can still fail to exec, die, or never get write access), but
-        // Phase 2D made the transcript the *only* source of `RALPHUS_EVENT:`
-        // markers. Without a fallback that combination silently costs this
-        // cell its `agent_session_id`, which is the one thing a reattach after
-        // an unexpected session death needs — the cell still completes (the
-        // done sentinel has its own `capture_pane` safety net below), it just
-        // can never be resumed. So: if the pane is visibly producing output
-        // while the transcript has yielded nothing at all, fall back to
-        // scanning the pane for events, exactly as the pre-2D code did.
-        //
-        // The two sources are mutually exclusive once the fallback engages,
-        // so an event can never be forwarded twice (duplicate Cartographer
-        // rows, double-counted usage), and the fallback never disengages —
-        // flipping back mid-attempt would either duplicate or skip whatever
-        // straddled the switch. The pane cursor is inherently lossier than the
-        // transcript (output that scrolls past `history-limit` between two
-        // polls is gone), which is precisely why it is the fallback and not
-        // the primary; it is still strictly better than capturing nothing.
-        let mut pane_event_fallback = false;
-        let mut pane_lines_seen: usize = 0;
-        let mut transcript_ever_produced_bytes = false;
-        let attempt_started_at = Instant::now();
-        let mut missing_session_strikes: u32 = 0;
-        // A session that appears gone must be confirmed gone across a couple
-        // of consecutive polls (not acted on the first miss) — root cause not
-        // yet pinned down, but this build's tmux alternative (psmux) has
-        // shown transient `capture-pane`/`has-session` failures under real
-        // load that clear on the very next poll. Requiring 3 consecutive
-        // misses (~1.5s at the current poll interval) filters those out
-        // without meaningfully delaying a genuine session death.
-        const MISSING_SESSION_STRIKE_LIMIT: u32 = 3;
-        // Set only when the loop breaks because the session vanished on its
-        // own (the mystery this file's exit-code watcher exists for) — never
-        // for an intentional `cancel()`/timeout kill, which also produce a
-        // non-done `RunnerResult` but have a perfectly well-known cause and
-        // should never get "tmux server process exit code: ..." appended to
-        // their message.
-        let mut session_died_unexpectedly = false;
-        // RAL-161: the last live usage snapshot seen from a runner event, so
-        // an over-budget kill can carry the real tokens/cost through to
-        // `record_cell_result` instead of zeroing them out.
-        let mut current_usage = LiveUsage::default();
-        // RAL-161: when a cost cap is configured, this loop's own cadence
-        // (the check itself is a cheap in-memory float comparison) is driven
-        // by the configurable, tighter `[budget].poll_interval_ms` instead of
-        // the coarser `TMUX_POLL_INTERVAL` below -- which stays fixed since
-        // it gates a real `tmux capture-pane` subprocess spawn, not just a
-        // comparison. Without a cap there's nothing to check faster, so the
-        // loop keeps its original cadence exactly.
-        let budget_poll_interval = attempt_spec
-            .maximum_budget_usd
-            .map(|_| crate::config::load_budget_config().poll_interval());
-        let mut last_tmux_poll = Instant::now();
-        let mut last_pane_capture: Option<Instant> = None;
-        let mut first_tick = true;
-        let result = loop {
-            if cancel.is_cancelled() {
-                self.kill_tmux_session(tmux, attempt_spec, session_name);
-                crate::rlog!(
-                    INFO,
-                    "ralphus [runner] cancelled squad={} cell={}",
-                    attempt_spec.squad_id,
-                    attempt_spec.cell_id
-                );
-                self.emit_tmux_note(attempt_spec, "tmux session killed: cancelled", session_name);
-                break RunnerResult::failure("cancelled");
-            }
-            if detach.is_some_and(crate::cancel::DetachToken::is_cancelled) {
-                self.kill_tmux_session(tmux, attempt_spec, session_name);
-                crate::rlog!(
-                    INFO,
-                    "ralphus [runner] detached squad={} cell={}",
-                    attempt_spec.squad_id,
-                    attempt_spec.cell_id
-                );
-                self.emit_tmux_note(
-                    attempt_spec,
-                    "tmux session killed: detached for manual takeover",
-                    session_name,
-                );
-                break RunnerResult::detached(current_usage, resumable_agent_session_id.clone());
-            }
-            if waypoint_halt.is_some_and(crate::cancel::WaypointHaltToken::is_cancelled) {
-                self.kill_tmux_session(tmux, attempt_spec, session_name);
-                crate::rlog!(
-                    INFO,
-                    "ralphus [runner] waypoint halted squad={} cell={}",
-                    attempt_spec.squad_id,
-                    attempt_spec.cell_id
-                );
-                self.emit_tmux_note(
-                    attempt_spec,
-                    "tmux session killed: waypoint halt",
-                    session_name,
-                );
-                break RunnerResult::waypoint_halted(
-                    current_usage,
-                    resumable_agent_session_id.clone(),
-                );
-            }
-            if arbiter_stop.is_some_and(crate::cancel::ArbiterStopToken::is_cancelled) {
-                self.kill_tmux_session(tmux, attempt_spec, session_name);
-                let arbiter_key = crate::store_memory::StoreMemory::cell_diff_key(
-                    &attempt_spec.squad_id,
-                    &attempt_spec.task,
-                    &attempt_spec.cell_id,
-                );
-                let numstat = self
-                    .cartographer
-                    .as_ref()
-                    .and_then(|store| {
-                        store
-                            .lock()
-                            .memory()
-                            .cell_diff_state(&arbiter_key)
-                            .map(|state| state.summary)
-                    })
-                    .unwrap_or_default();
-                self.emit_tmux_note(
-                    attempt_spec,
-                    "tmux session killed: stopped by Arbiter",
-                    session_name,
-                );
-                break RunnerResult::arbiter_stopped(
-                    current_usage,
-                    format!(
-                        "terminated by Arbiter after suspicious large diff; numstat: {numstat}"
-                    ),
-                );
-            }
-            if timed_out(started.elapsed(), deadline) {
-                self.kill_tmux_session(tmux, attempt_spec, session_name);
-                let secs = deadline.map(|d| d.as_secs()).unwrap_or(0);
-                crate::rlog!(
-                    WARNING,
-                    "ralphus [runner] timed out after {secs}s squad={} cell={}",
-                    attempt_spec.squad_id,
-                    attempt_spec.cell_id
-                );
-                self.emit_tmux_note(attempt_spec, "tmux session killed: timed out", session_name);
-                break RunnerResult::failure(format!("timed out after {secs}s"));
-            }
-            if let Some(cap) = attempt_spec.maximum_budget_usd {
-                if current_usage.cost_usd > cap {
-                    self.kill_tmux_session(tmux, attempt_spec, session_name);
-                    crate::rlog!(
-                        WARNING,
-                        "ralphus [runner] cost ${:.4} exceeded maximum_budget_usd cap ${cap:.4}, killing squad={} cell={}",
-                        current_usage.cost_usd,
-                        attempt_spec.squad_id,
-                        attempt_spec.cell_id
-                    );
-                    self.emit_tmux_note(
-                        attempt_spec,
-                        "tmux session killed: cost limit exceeded",
-                        session_name,
-                    );
-                    break RunnerResult::cost_exceeded(current_usage, cap);
-                }
-            }
-            // RAL-308: the hard, cumulative `maximum_timeout_seconds` caps --
-            // independent of (and checked alongside) `timeout_sec`/`deadline`
-            // above, which stays exactly as it was for `timeout_minutes`.
-            if let Some(reason) = self.maximum_timeout_exceeded(attempt_spec, started.elapsed()) {
-                self.kill_tmux_session(tmux, attempt_spec, session_name);
-                crate::rlog!(
-                    WARNING,
-                    "ralphus [runner] {reason}, killing squad={} cell={}",
-                    attempt_spec.squad_id,
-                    attempt_spec.cell_id
-                );
-                self.emit_tmux_note(
-                    attempt_spec,
-                    "tmux session killed: maximum_timeout_seconds exceeded",
-                    session_name,
-                );
-                break RunnerResult::maximum_timeout_exceeded(current_usage, reason);
-            }
-            if first_tick || last_tmux_poll.elapsed() >= TMUX_POLL_INTERVAL {
-                first_tick = false;
-                last_tmux_poll = Instant::now();
-                self.check_stall_escalation(
-                    attempt_spec,
-                    session_name,
-                    attempt_started_ms,
-                    stall_threshold,
-                );
-                // RAL-397 Phase 2D: read newly-appended `RALPHUS_EVENT:`
-                // markers and the completion sentinel from this attempt's
-                // durable `.raw` transcript, not from pane scrollback. The
-                // transcript is an append-only byte tee (`pipe_pane`, Phase 2C)
-                // the sink flushes continuously, so a marker can never scroll
-                // past a shrinking `history-limit` between polls the way the
-                // old `capture_pane(10_000)` scan risked — this is the change
-                // that lets `history-limit` drop to the live window (Phase 2H)
-                // without losing events. Runs independently of the
-                // `capture_pane` call below and of any transient capture error.
-                let drained = tailer.drain();
-                if drained.saw_new_bytes {
-                    transcript_ever_produced_bytes = true;
-                    self.note_live_activity(session_name);
-                }
-                // Once the pane fallback owns event parsing the two sources
-                // are mutually exclusive, so the same marker can never be
-                // forwarded twice. Sentinel detection stays active either
-                // way because it is an idempotent boolean.
-                let transcript_target = TranscriptEventTarget {
-                    pane_event_fallback,
-                    cartographer: self.cartographer.as_ref(),
-                    squad_id: &attempt_spec.squad_id,
-                    cell_id: &attempt_spec.cell_id,
-                    task: &attempt_spec.task,
-                    cwd: &attempt_spec.cwd,
-                    context: attempt_spec
-                        .prompt
-                        .as_deref()
-                        .unwrap_or(attempt_spec.command.as_deref().unwrap_or("")),
-                    arbiter_stops: self.arbiter_stops.as_ref(),
-                };
-                let (mut done, stall_sample) = consume_transcript_lines(
-                    &drained.lines,
-                    &transcript_target,
-                    resumable_agent_session_id,
-                    &mut current_usage,
-                    stall_detector.as_mut(),
-                );
-                if let Some(sample) = stall_sample {
-                    self.kill_tmux_session(tmux, attempt_spec, session_name);
-                    crate::rlog!(
-                        WARNING,
-                        "ralphus [runner] thinking-repetition stall detected ({} consecutive low-diversity samples over {}ms), killing squad={} cell={} last_line={:?}",
-                        sample.consecutive_samples,
-                        sample.span_ms,
-                        attempt_spec.squad_id,
-                        attempt_spec.cell_id,
-                        sample.last_line,
-                    );
-                    self.emit_tmux_note(
-                        attempt_spec,
-                        "tmux session killed: thinking-repetition stall detected",
-                        session_name,
-                    );
-                    break RunnerResult::thinking_stalled(
-                        current_usage,
-                        resumable_agent_session_id.clone(),
-                        sample.last_line,
-                    );
-                }
-
-                // A small `capture_pane` (visible window only, not the former
-                // deep 10_000-line scan events used to come from) still runs
-                // each poll for three jobs unrelated to event parsing: the
-                // single-slot "current screen" snapshot the board freezes once
-                // the session ends (deep scrollback is now served from the
-                // transcript — Phase 2E/2F), the `has-session` strike-based
-                // death detection, and a completion safety net. Because the
-                // sentinel is always the pane's final printed line, even this
-                // shallow window reliably shows it if the transcript tailer is
-                // still catching up or the `.raw` file never materialized (a
-                // best-effort `pipe_pane` that silently failed) — so completion
-                // detection never becomes dependent on the transcript alone.
-                //
-                // Each capture is a `tmux` client process, so while the
-                // transcript is flowing it runs every
-                // `PANE_SNAPSHOT_INTERVAL` rather than every poll: events,
-                // the sentinel and liveness already come from the transcript.
-                // It still runs every poll whenever the pane is the event
-                // source or the transcript has produced nothing yet, while a
-                // missing-session strike is pending (so death is confirmed
-                // as fast as before), and once more when the transcript
-                // reports completion, so the frozen final screen is current.
-                let capture_due = pane_event_fallback
-                    || !transcript_ever_produced_bytes
-                    || done
-                    || missing_session_strikes > 0
-                    || last_pane_capture.is_none_or(|at| at.elapsed() >= PANE_SNAPSHOT_INTERVAL);
-                if !capture_due {
-                    std::thread::sleep(budget_poll_interval.unwrap_or(TMUX_POLL_INTERVAL));
-                    continue;
-                }
-                last_pane_capture = Some(Instant::now());
-                let capture_lines = if pane_event_fallback {
-                    FALLBACK_EVENT_CAPTURE_LINES
-                } else {
-                    LIVE_SNAPSHOT_CAPTURE_LINES
-                };
-                match tmux.capture_pane(session_name, capture_lines) {
-                    Ok(pane) => {
-                        missing_session_strikes = 0;
-                        done = done || pane_shows_done_sentinel(&pane);
-                        // RAL-241 liveness must not hang off the transcript
-                        // alone: with a failed sink `saw_new_bytes` is never
-                        // true, so `live_activity_ms` would stay `None` for
-                        // the whole run — which both fires a `high`-priority
-                        // stall escalation on every cell that outlives the
-                        // threshold and makes a genuine stall undetectable. A
-                        // changed pane is the same "something happened"
-                        // signal the pre-2D `all_lines.len() > lines_seen`
-                        // check provided.
-                        if last_pane.as_deref() != Some(pane.as_str()) {
-                            self.note_live_activity(session_name);
-                        }
-                        // Engage the fallback only on the unambiguous signal:
-                        // the pane has printed something, the transcript has
-                        // yielded literally nothing since the attempt began,
-                        // and enough time has passed that a working sink would
-                        // certainly have flushed (it tees the shell's own
-                        // prompt, so its first bytes land almost immediately).
-                        if !pane_event_fallback
-                            && !transcript_ever_produced_bytes
-                            && !pane.trim().is_empty()
-                            && attempt_started_at.elapsed() >= TRANSCRIPT_FALLBACK_GRACE
-                        {
-                            pane_event_fallback = true;
-                            crate::rlog!(
-                                WARNING,
-                                "ralphus [runner] transcript produced no bytes in {}ms while the pane has output -- falling back to pane scanning for events squad={} cell={} session={session_name}",
-                                TRANSCRIPT_FALLBACK_GRACE.as_millis(),
-                                attempt_spec.squad_id,
-                                attempt_spec.cell_id,
-                            );
-                            self.emit_tmux_note(
-                                attempt_spec,
-                                "transcript unavailable: falling back to pane scanning for events",
-                                session_name,
-                            );
-                        }
-                        if pane_event_fallback {
-                            let all_lines: Vec<&str> = pane.lines().collect();
-                            if all_lines.len() > pane_lines_seen {
-                                for line in &all_lines[pane_lines_seen..] {
-                                    if let Some(json) = line.trim_end().strip_prefix(EVENT_MARKER) {
-                                        let fwd = forward_runner_event(
-                                            self.cartographer.as_ref(),
-                                            &attempt_spec.squad_id,
-                                            &attempt_spec.cell_id,
-                                            &attempt_spec.task,
-                                            json,
-                                        );
-                                        if let Some(stops) = self.arbiter_stops.as_ref() {
-                                            let verdict = crate::arbiter::inspect_large_diff(
-                                                self.cartographer
-                                                    .as_ref()
-                                                    .expect("Arbiter stops require a store"),
-                                                &attempt_spec.squad_id,
-                                                &attempt_spec.cell_id,
-                                                &attempt_spec.task,
-                                                &attempt_spec.cwd,
-                                                attempt_spec.prompt.as_deref().unwrap_or(
-                                                    attempt_spec.command.as_deref().unwrap_or(""),
-                                                ),
-                                            );
-                                            let key =
-                                                crate::store_memory::StoreMemory::cell_diff_key(
-                                                    &attempt_spec.squad_id,
-                                                    &attempt_spec.task,
-                                                    &attempt_spec.cell_id,
-                                                );
-                                            stop_suspicious_large_diff(
-                                                stops,
-                                                &key,
-                                                crate::config::load_arbiter_config()
-                                                    .allow_cell_stopping,
-                                                verdict,
-                                            );
-                                        }
-                                        if let Some(sid) = fwd.agent_session_id {
-                                            *resumable_agent_session_id = Some(sid);
-                                        }
-                                        if let Some(usage) = fwd.live_usage {
-                                            current_usage = usage;
-                                        }
-                                    }
-                                }
-                                pane_lines_seen = all_lines.len();
-                            }
-                        }
-                        last_pane = Some(pane);
-                    }
-                    Err(_) => {
-                        // The session may have died before printing the sentinel
-                        // (e.g. the runner process crashed hard enough to tear
-                        // down the pane) — or `has-session` itself may just be
-                        // having a transient hiccup, so this isn't trusted on the
-                        // first miss (see `MISSING_SESSION_STRIKE_LIMIT`).
-                        if !tmux.has_session(session_name) {
-                            missing_session_strikes += 1;
-                            if missing_session_strikes >= MISSING_SESSION_STRIKE_LIMIT {
-                                session_died_unexpectedly = true;
-                                break Self::read_tmux_result(result_path, last_pane.as_deref());
-                            }
-                        } else {
-                            missing_session_strikes = 0;
-                        }
-                    }
-                }
-                if done {
-                    break Self::read_tmux_result(result_path, last_pane.as_deref());
-                }
-            }
-            std::thread::sleep(budget_poll_interval.unwrap_or(TMUX_POLL_INTERVAL));
-        };
-
-        // The completion safety net can observe the pane's final sentinel
-        // while the capped transcript tailer is still working through a
-        // large burst. Catch it up before stopping the pipe so every marker
-        // already written by the runner reaches Cartographer.
-        let transcript_target = TranscriptEventTarget {
-            pane_event_fallback,
-            cartographer: self.cartographer.as_ref(),
-            squad_id: &attempt_spec.squad_id,
-            cell_id: &attempt_spec.cell_id,
-            task: &attempt_spec.task,
-            cwd: &attempt_spec.cwd,
-            context: attempt_spec
-                .prompt
-                .as_deref()
-                .unwrap_or(attempt_spec.command.as_deref().unwrap_or("")),
-            arbiter_stops: self.arbiter_stops.as_ref(),
-        };
-        drain_transcript_to_current_end(
-            &mut tailer,
-            &transcript_target,
-            resumable_agent_session_id,
-            &mut current_usage,
-        );
-
-        // RAL-397 Phase 2C: best-effort clean stop before the forceful
-        // process-tree kill below -- not load-bearing (the job-object
-        // confinement `kill_session` relies on, RAL-321, already tears down
-        // any pipe-sink child spawned into this session's tree), but gives
-        // the sink a chance to notice EOF and exit tidily rather than being
-        // killed outright. A no-op when this attempt never started a pipe
-        // (transcript_path was `None`).
-        tmux.stop_pipe_pane(session_name);
-        // Closing the tee lets its final buffered write settle. Consume those
-        // bytes before removing the session and transcript producer.
-        drain_transcript_to_current_end(
-            &mut tailer,
-            &transcript_target,
-            resumable_agent_session_id,
-            &mut current_usage,
-        );
-        self.kill_tmux_session(tmux, attempt_spec, session_name);
-        let _ = std::fs::remove_file(spec_path);
-        let _ = std::fs::remove_file(result_path);
-        self.emit_tmux_note(attempt_spec, "tmux session ended", session_name);
-        // Persist the last thing this attempt's pane actually showed, so
-        // "Show Live View"/"Open Terminal Log" can still display it as a
-        // read-only historical record once the live session is gone —
-        // otherwise it's simply lost the moment `has_session` goes false.
-        // Unconditional: written for every outcome (done, failed, cancelled,
-        // timed out), overwriting whatever an earlier attempt left behind.
-        crate::tmux::write_pane_snapshot(session_name, last_pane.as_deref().unwrap_or(""));
-        // RAL-154: also persist it as *this attempt's own* durable, never-
-        // overwritten record (unlike the single-slot snapshot above, which
-        // the next attempt/reattach will replace) — so a restarted cell's
-        // full multi-attempt history stays individually accessible.
-        write_terminal_log_preferring_raw_transcript(
-            session_name,
-            attempt,
-            last_pane.as_deref().unwrap_or(""),
-            terminal_log_max_lines,
-        );
-        self.emit_terminal_log_note(attempt_spec, session_name, attempt);
-
-        // Only worth the (bounded) wait on a failure -- a clean completion
-        // doesn't need the "was this a crash?" diagnostic. If the tracked
-        // process is really gone (which it should be, since the loop above
-        // just concluded the session ended), the watcher's own blocking wait
-        // should already be finishing, so this rarely actually waits long.
-        let mut result = result;
-        // RAL-187: rescue the tokens this attempt really spent before it
-        // failed — see `backfill_live_usage`.
-        backfill_live_usage(&mut result, current_usage);
-        if session_died_unexpectedly && !result.is_done() {
-            if let Some(observation) =
-                exit_watch.and_then(|rx| rx.recv_timeout(Duration::from_secs(2)).ok())
-            {
-                let detail = match observation {
-                    crate::tmux::ProcessExit::Exited(code) => {
-                        format!("tmux server process exit code: {code}")
-                    }
-                    crate::tmux::ProcessExit::Unknown(reason) => {
-                        let reason = reason.trim();
-                        let reason = if reason.is_empty() {
-                            "process exited but did not report an exit code"
-                        } else {
-                            reason
-                        };
-                        format!("tmux server process exit code: unknown ({reason})")
-                    }
-                };
-                crate::rlog!(
-                    WARNING,
-                    "ralphus [runner] {detail} squad={} cell={}",
-                    attempt_spec.squad_id,
-                    attempt_spec.cell_id
-                );
-                result.error = Some(match result.error.take() {
-                    Some(existing) => format!("{existing}\n{detail}"),
-                    None => detail,
-                });
-            }
-        }
-
-        (result, session_died_unexpectedly)
-    }
-
-    /// Kill this attempt's tmux session, logging a WARNING when the kill
-    /// fails -- a session that survives keeps its agent process (and its
-    /// tmux server) alive with nothing supervising it.
-    fn kill_tmux_session(&self, tmux: &Tmux, spec: &RunnerSpec, session_name: &str) {
-        let Err(e) = tmux.kill_session(session_name) else {
-            return;
-        };
-        if let Some(store) = &self.cartographer {
-            let guard = store.lock();
-            crate::cartographer::Note::new("runner")
-                .level(crate::logging::LogLevel::WARNING)
-                .squad(&spec.squad_id)
-                .cell(&spec.cell_id)
-                .task(&spec.task)
-                .scope("tmux")
-                .emit(
-                    &guard,
-                    format!("could not kill tmux session {session_name}: {e}"),
-                    serde_json::json!({"session_name": session_name, "error": e.to_string()}),
-                );
-        } else {
-            // ralphus[ignore-rlog-pair]: runner built without a cartographer store has nowhere to write a row
-            crate::rlog!(
-                WARNING,
-                "ralphus [runner] could not kill tmux session {session_name} squad={} cell={}: {e}",
-                spec.squad_id,
-                spec.cell_id
-            );
-        }
-    }
-
-    /// Emit a tmux session-lifecycle Cartographer note. Per RAL-102, only
-    /// these start/end transitions are logged — the `capture-pane` polling
-    /// itself never is, so a long-running session doesn't flood
-    /// `cartographer_events`.
-    fn emit_tmux_note(&self, spec: &RunnerSpec, message: &str, session_name: &str) {
-        let Some(store) = &self.cartographer else {
-            return;
-        };
-        let guard = store.lock();
-        crate::cartographer::Note::new("runner")
-            .squad(&spec.squad_id)
-            .cell(&spec.cell_id)
-            .task(&spec.task)
-            .scope("tmux")
-            .emit(
-                &guard,
-                format!("{message} ({session_name})"),
-                serde_json::json!({"session_name": session_name}),
-            );
-    }
-
     /// Record fresh pane output for `session_name` (RAL-170 liveness signal
     /// — see `Store::note_live_activity`'s doc comment for why this is an
     /// in-memory `Store` field rather than a Cartographer note or DB column).
     /// A no-op when no cartographer store is attached (e.g. in unit tests
     /// that construct a bare `SubprocessRunner`) or the mutex is poisoned —
-    /// mirrors [`Self::emit_tmux_note`]'s best-effort shape.
+    /// mirrors [`Self::emit_direct_note`]'s best-effort shape.
     fn note_live_activity(&self, session_name: &str) {
         let Some(store) = &self.cartographer else {
             return;
@@ -3370,7 +2123,7 @@ impl SubprocessRunner {
     }
 
     /// Drop the RAL-170 liveness entry for `session_name` once
-    /// [`Self::run_via_tmux`] has a terminal result for good — never after
+    /// [`Self::run_direct`] has a terminal result for good — never after
     /// just one attempt, since a reattach reuses the same deterministic
     /// `session_name` and the entry should keep reflecting real activity
     /// across that gap, not read as "ended" for the moments in between.
@@ -3458,8 +2211,8 @@ impl SubprocessRunner {
     /// RAL-241: check whether `session_name` has shown no activity (pane
     /// growth, per `Store::live_activity_ms`) for at least `threshold`, and
     /// if so, broadcast a `high`-priority mailbox message once for this
-    /// stall onset. Called from the same tmux-poll cadence gate
-    /// `Self::run_via_tmux_attempt`'s loop already uses for real
+    /// stall onset. Called from the same transcript-poll cadence gate
+    /// `Self::run_direct_attempt`'s loop already uses for real
     /// `capture_pane` work, so this adds one cheap mutex lock + comparison
     /// per poll, not per loop iteration. A no-op when no cartographer store
     /// is attached, mirroring every other best-effort helper in this file.
@@ -3595,51 +2348,7 @@ impl SubprocessRunner {
             );
     }
 
-    /// Emit a Cartographer breadcrumb for the tmux auto-reattach retry (see
-    /// [`Self::run_via_tmux`]) — deliberately richer than [`Self::emit_tmux_note`]
-    /// since this is recovering from an otherwise-silent, still-unexplained
-    /// failure mode (`PSMUX_CRASH_NOTES.local.md`). Captures everything
-    /// needed to reconstruct "what was lost, what was retried, and why"
-    /// after the fact from Cartographer alone, without re-deriving it from
-    /// raw pane output.
-    #[allow(clippy::too_many_arguments)]
-    fn emit_reattach_note(
-        &self,
-        spec: &RunnerSpec,
-        message: &str,
-        level: crate::logging::LogLevel,
-        attempt: u32,
-        resumable_agent_session_id: Option<&str>,
-        reason: Option<&str>,
-        elapsed_secs: u64,
-        error: Option<&str>,
-    ) {
-        let Some(store) = &self.cartographer else {
-            return;
-        };
-        let guard = store.lock();
-        crate::cartographer::Note::new("runner")
-            .level(level)
-            .squad(&spec.squad_id)
-            .cell(&spec.cell_id)
-            .task(&spec.task)
-            .scope("tmux-reattach")
-            .emit(
-                &guard,
-                message,
-                serde_json::json!({
-                    "attempt": attempt,
-                    "max_attempts": Self::MAX_REATTACH_ATTEMPTS,
-                    "agent": spec.agent,
-                    "resumable_agent_session_id": resumable_agent_session_id,
-                    "reason": reason,
-                    "elapsed_secs": elapsed_secs,
-                    "error": error,
-                }),
-            );
-    }
-
-    /// Read and parse the `CellResult` a tmux-wrapped runner wrote to
+    /// Read and parse the `CellResult` a direct runner wrote to
     /// `path`. A missing or malformed file (the runner crashed before
     /// writing it, or the session was killed before it finished) is
     /// reported as a failure, never a panic.
@@ -3647,12 +2356,12 @@ impl SubprocessRunner {
     /// `last_pane` — the tail of the most recent successful `capture-pane`
     /// read before this call, if any — is folded into a "no result file"
     /// failure so the surfaced error shows what the agent was doing/printing
-    /// right before its tmux session disappeared. Without this, a session
-    /// that vanishes mid-run (observed on the Windows psmux build this
+    /// right before its cell session disappeared. Without this, a session
+    /// that vanishes mid-run (observed on the Windows build this
     /// project targets, root cause not yet pinned down) produces only the
     /// bare OS error and no clue what the agent was actually doing at the
     /// time — nothing to diagnose from if it happens again.
-    fn read_tmux_result(path: &std::path::Path, last_pane: Option<&str>) -> RunnerResult {
+    fn read_result(path: &std::path::Path, last_pane: Option<&str>) -> RunnerResult {
         match std::fs::read_to_string(path) {
             Ok(text) => serde_json::from_str(&text).unwrap_or_else(|e| {
                 RunnerResult::failure(format!("runner result file was not valid JSON: {e}"))
@@ -3687,7 +2396,7 @@ impl SubprocessRunner {
 /// subprocess. Missing `squad_id`/`cell_id`/`task` fall back to the owning
 /// cell's spec. Returns the `agent_session_id` it just persisted, if the
 /// event's payload carried one — so a caller tracking a resumable session id
-/// locally (see `SubprocessRunner::run_via_tmux`'s auto-reattach retry) can
+/// locally (see `SubprocessRunner::run_direct`'s auto-reattach retry) can
 /// pick it up without a second JSON parse.
 pub(crate) fn forward_runner_event(
     cartographer: Option<&crate::store_lock::StoreHandle>,
@@ -3730,8 +2439,8 @@ pub(crate) fn forward_runner_event(
     // RAL-102 follow-up: as soon as the runner reports the agent's session id
     // — the claude-code backend's `stream-json` init event, codex's
     // `thread.started`, pi's equivalent — persist it immediately rather than
-    // waiting for the whole cell to finish, so the board's "Open Agent" action
-    // activates right away. A no-op for any event whose
+    // waiting for the whole cell to finish, so a resume
+    // can use it right away. A no-op for any event whose
     // (squad_id, task, cell_id) isn't a cell row — proof steps and Guardian
     // resolver invocations share this same forwarding path but aren't rows in
     // the `cells` table.
@@ -3744,7 +2453,7 @@ pub(crate) fn forward_runner_event(
     // a source cannot silently sever the capture.
     let mut captured_agent_session_id = None;
     // RAL-161: likewise, persist live token/cost usage as soon as an event's
-    // payload carries `cost_usd`, and hand it back so the tmux poll loop can
+    // payload carries `cost_usd`, and hand it back so the transcript poll loop can
     // compare it against the cell's `maximum_budget_usd` cap without a second
     // JSON parse or DB round-trip.
     let mut live_usage = None;
@@ -3955,7 +2664,7 @@ fn redact_event(event: &mut RunnerEvent) {
 /// [`Store::set_cell_live_usage`] already persisted while the cell was
 /// running. That is not hypothetical: a Codex cell observed in
 /// `run-000000000151` ran for minutes, completed several turns, then lost its
-/// tmux pane before writing a result file — and was recorded as `0` tokens
+/// cell transcript before writing a result file — and was recorded as `0` tokens
 /// forever, even though those tokens were genuinely spent. Every mid-run
 /// failure path (cancel, timeout, lost pane, unparseable result file) funnels
 /// through `failure()`, so backfilling once here covers all of them.
@@ -4033,9 +2742,9 @@ fn write_terminal_log_preferring_raw_transcript(
 }
 
 /// The last `n` non-empty lines of `text`, joined back with newlines — used
-/// to fold a bit of tmux pane context into a "no result file" failure
+/// to fold a bit of cell transcript context into a "no result file" failure
 /// message. Empty when `text` has no non-empty lines. `pub(crate)` since
-/// `tmux.rs::write_pane_snapshot` also truncates a persisted pane snapshot
+/// `cell_session.rs` also truncates a persisted pane snapshot
 /// with it.
 pub(crate) fn tail_lines(text: &str, n: usize) -> String {
     let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
@@ -4157,43 +2866,6 @@ mod tests {
         let result =
             RunnerResult::rate_limited(5, String::new(), 0, 0, 0, 0, 0, 0, None, 0.0, None);
         assert_eq!(result.retry_after_secs, Some(5));
-    }
-
-    #[test]
-    fn pane_shows_done_sentinel_true_for_the_real_wrapper_line() {
-        assert!(pane_shows_done_sentinel(
-            "some earlier output\nRALPHUS_TMUX_DONE: done\n"
-        ));
-        assert!(pane_shows_done_sentinel("RALPHUS_TMUX_DONE: failed"));
-        // Leading whitespace on the sentinel's own line is still fine.
-        assert!(pane_shows_done_sentinel("  RALPHUS_TMUX_DONE: done"));
-    }
-
-    /// RAL-1xx: `pane.contains(TMUX_DONE_MARKER)` used to false-positive
-    /// whenever the marker text appeared *anywhere* in the pane — including
-    /// in a session's own legitimate tool output, not just the real wrapper
-    /// line. Observed in production for a live-view/tmux-completion ticket
-    /// whose own work involves reading/grepping `runner.rs`/`__main__.py`,
-    /// both of which contain the literal string `RALPHUS_TMUX_DONE` in
-    /// their own source — the daemon believed the still-actively-working
-    /// session had finished, tried to read a result file that didn't exist
-    /// yet, and killed the pane out from under real, in-progress work.
-    #[test]
-    fn pane_shows_done_sentinel_false_for_marker_text_embedded_in_other_output() {
-        // A grep match: the marker isn't at the start of the line.
-        assert!(!pane_shows_done_sentinel(
-            "daemon/src/runner.rs:402:const TMUX_DONE_MARKER: &str = \"RALPHUS_TMUX_DONE\";"
-        ));
-        // A `Read` tool's numbered listing, same reason.
-        assert!(!pane_shows_done_sentinel(
-            "402\tconst TMUX_DONE_MARKER: &str = \"RALPHUS_TMUX_DONE\";"
-        ));
-        // The marker mentioned mid-sentence in the agent's own prose.
-        assert!(!pane_shows_done_sentinel(
-            "I'll check for the RALPHUS_TMUX_DONE sentinel in the pane."
-        ));
-        // No sentinel at all.
-        assert!(!pane_shows_done_sentinel("still working on it...\n"));
     }
 
     /// Asserts the structure of the fully assembled unattended system prompt
@@ -4641,7 +3313,7 @@ mod tests {
     }
 
     /// RAL-241: a minimal spec for exercising `check_stall_escalation`
-    /// directly — no tmux/subprocess involved, since that method only reads
+    /// directly — no session/subprocess involved, since that method only reads
     /// `spec`'s entity fields and talks to the attached `Store`.
     pub(super) fn stall_test_spec() -> RunnerSpec {
         RunnerSpec {
@@ -5288,7 +3960,7 @@ mod tests {
 
     #[test]
     fn a_worktree_diff_event_marks_the_cell_dirty_and_lands_in_cartographer() {
-        // Local cells reach `forward_runner_event` from the tmux poll loop and
+        // Local cells reach `forward_runner_event` from the transcript poll loop and
         // SSH-remote cells from `remote_runner`'s live stderr relay (same
         // function), so one event line proves the daemon half of both paths.
         let store = Arc::new(crate::store_lock::StoreMutex::new(
@@ -5326,11 +3998,11 @@ mod tests {
 
     #[test]
     fn forward_runner_event_persists_a_well_formed_marker_and_skips_malformed_ones() {
-        // `forward_runner_event` is what both the tmux pane poll loop
-        // (`run_via_tmux_attempt`) and the reattach path call for each
+        // `forward_runner_event` is what both the cell transcript poll loop
+        // (`run_direct_attempt`) and the reattach path call for each
         // `RALPHUS_EVENT:` line they see — exercised directly here rather
         // than via a raw stderr pipe reader, which no longer exists now that
-        // every spec (prompt and command alike) runs tmux-wrapped (RAL-151).
+        // every spec (prompt and command alike) runs direct (RAL-151).
         let store = Arc::new(crate::store_lock::StoreMutex::new(
             Store::open_in_memory().unwrap(),
         ));
@@ -5421,8 +4093,8 @@ prompt = "make it build"
     /// `codex`, `pi`) while the machine providers forward a generic
     /// `llm-invoke`. The capture keys on the payload rather than the source so
     /// all four land, and so renaming a backend cannot silently sever it —
-    /// without this, "Open Agent" stays disabled for the whole life of a
-    /// running cell and `resumable_agent_session_id` never reaches the tmux
+    /// without this, the id stays unknown for the whole life of a
+    /// running cell and `resumable_agent_session_id` never reaches the session
     /// auto-reattach retry.
     #[test]
     fn forward_runner_event_captures_session_id_from_every_backend_source() {
@@ -5457,7 +4129,7 @@ prompt = "make it build"
     }
 
     /// The live-usage half of the same capture (RAL-161). The returned
-    /// snapshot is what `run_via_tmux_attempt`'s cost-cap check compares
+    /// snapshot is what `run_direct_attempt`'s cost-cap check compares
     /// against `maximum_budget_usd`, so a miss here silently disables every
     /// configured cost cap.
     #[test]
@@ -5649,62 +4321,6 @@ prompt = "make it build"
         assert_eq!(tail_lines("\n\n", 5), "");
     }
 
-    /// RAL-264: a "no result file" failure folds the last pane tail into the
-    /// message, and that message becomes the branch `detail` (surfaced by
-    /// `ralphus review show`/`worktrees` and persisted to SQLite). When the
-    /// pane shows the agent's own `$env:... = 'sk-or-v1-...'` assignment — the
-    /// exact leak this ticket exists for — the resolved secret must be
-    /// scrubbed out of the failure message before it is returned.
-    ///
-    /// Exercises the true leak site (`read_tmux_result`) directly: a write-time
-    /// reproduction of the incident, where a `from_env`-sourced token value
-    /// landed in `last_pane` while the session vanished without writing a
-    /// result file.
-    #[test]
-    fn read_tmux_result_redacts_secret_values_from_folded_pane_text() {
-        crate::redact::with_registry_lock(|| {
-            crate::redact::clear_for_tests();
-            crate::redact::register("sk-or-v1-ral264-unit-test-token");
-
-            let missing = std::env::temp_dir().join(format!(
-                "ralphus-test-missing-result-{}.json",
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .expect("time")
-                    .as_nanos()
-            ));
-            let _ = std::fs::remove_file(&missing);
-
-            let pane = concat!(
-                "some prior work output\n",
-                "$env:ANTHROPIC_AUTH_TOKEN = 'sk-or-v1-ral264-unit-test-token'\n",
-                "still printing...\n",
-            );
-            let result = <SubprocessRunner>::read_tmux_result(&missing, Some(pane));
-            // The failure is surfaced (there was no result file) and the secret
-            // value is gone from the `detail`, replaced by the placeholder.
-            assert!(
-                result
-                    .error
-                    .as_deref()
-                    .unwrap_or("")
-                    .contains("no result file"),
-                "expected a no-result-file failure, got {:?}",
-                result.error
-            );
-            let detail = result.error.unwrap_or_default();
-            assert!(
-                !detail.contains("sk-or-v1-ral264-unit-test-token"),
-                "secret leaked into failure detail: {detail}"
-            );
-            assert!(
-                detail.contains(crate::redact::REDACTED),
-                "expected the redaction placeholder in detail: {detail}"
-            );
-            let _ = std::fs::remove_file(&missing);
-        });
-    }
-
     #[test]
     fn command_line_splits_program_and_args() {
         let r = SubprocessRunner::new("python -m ralphus.runner");
@@ -5736,7 +4352,7 @@ prompt = "make it build"
     fn backfill_live_usage_rescues_tokens_from_a_failed_attempt() {
         // RAL-187: the real case from `run-000000000151` — a Codex session
         // completed several turns (so live usage was already persisted
-        // mid-run), then lost its tmux pane before writing a result file.
+        // mid-run), then lost its cell transcript before writing a result file.
         // Without the backfill, the zeroed failure result overwrites those
         // tokens and the board reports 0 forever.
         let live = LiveUsage {
@@ -5818,1120 +4434,8 @@ prompt = "make it build"
         assert_eq!(capped.turns, Some(2));
     }
 
-    #[cfg_attr(windows, ignore = "CI-only on Windows: exercises a real psmux server")]
-    #[test]
-    fn live_tmux_registers_pid_while_the_subprocess_is_alive_and_clears_it_after() {
-        // A real, briefly-lived subprocess: the runner must register its PID for
-        // the resource view while it runs, and drop it once it exits (RAL-11).
-        //
-        // Every spec now runs tmux-wrapped (RAL-151), so this is a real
-        // live-tmux test — serialized under `LIVE_TMUX_TEST_LOCK` and given a
-        // per-invocation-unique run_id (RAL-177) for the same reason every
-        // other live-tmux test below is: a real tmux session name is
-        // machine-wide shared state, and a hardcoded literal would collide
-        // with an identical test running concurrently in a sibling worktree.
-        //
-        // The pane's command (a bare `powershell`/`sleep` call) never speaks
-        // the runner result-file/`RALPHUS_TMUX_DONE` protocol real
-        // `ralphus-runner` invocations do, so the tmux session itself outlives
-        // it (`remain-on-exit`) — a short `timeout_sec` is what eventually
-        // ends the attempt, not a natural "done". That's fine: RAL-11's PID
-        // registration/deregistration is scoped to the whole tmux-wrapped
-        // attempt's lifetime (`find_server_pid`, tied to the session, not the
-        // inner command), not to a successful "done" outcome specifically.
-        if !tmux_and_python_available() {
-            println!("SKIP: tmux and/or python not found on PATH");
-            return;
-        }
-        let _tmux_guard = crate::tmux::LIVE_TMUX_TEST_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        crate::tmux::sweep_dead_test_sessions_once();
-        let run_id = crate::tmux::unique_test_tag("run-x");
-        let _cleanup =
-            crate::tmux::KillSessionOnDrop(crate::tmux::session_name(&run_id, "t", "s0"));
-        let reg = crate::procreg::ProcRegistry::new();
-        #[cfg(target_os = "windows")]
-        let runner = SubprocessRunner {
-            program: "powershell".to_string(),
-            args: vec![
-                "-NoProfile".to_string(),
-                "-Command".to_string(),
-                "Start-Sleep -Milliseconds 700".to_string(),
-            ],
-            registry: Some(reg.clone()),
-            cartographer: None,
-            detachments: None,
-            waypoint_halts: None,
-            arbiter_stops: None,
-            force_tmux: true,
-        };
-        #[cfg(not(target_os = "windows"))]
-        let runner = SubprocessRunner {
-            program: "sleep".to_string(),
-            args: vec!["1".to_string()],
-            registry: Some(reg.clone()),
-            cartographer: None,
-            detachments: None,
-            waypoint_halts: None,
-            arbiter_stops: None,
-            force_tmux: true,
-        };
-        let row = CellRow {
-            task_idx: 0,
-            idx: 0,
-            task_name: "t".to_string(),
-            cell_id: "s0".to_string(),
-            cwd: Some(".".to_string()),
-            subprojects: vec![],
-            prompt: None,
-            command: Some("noop".to_string()),
-            agent: "claude".to_string(),
-            model: None,
-            system_prompt: None,
-            system_prompt_position: None,
-            depends_on: vec![],
-            // Only a backstop now: the test cancels as soon as it has
-            // observed the PID, so this is never normally reached. It still
-            // has to stay above `PID_POLL_BUDGET`, or a slow-starting session
-            // would race its own timeout-kill (which clears the registered
-            // PID) against the poll loop's first chance to see it — the
-            // original RAL-171/RAL-177 failure signature. Earlier revisions
-            // balanced these two numbers against each other (20s/10s); with
-            // cancel-on-observe the balance no longer costs runtime, so the
-            // margin is simply generous.
-            timeout_sec: Some(120),
-            budget_tokens: None,
-            maximum_budget_usd: None,
-            maximum_context: None,
-            auto_compact_threshold: None,
-            maximum_tool_output_tokens: None,
-            effort: None,
-            temperature: None,
-            upstream: None,
-            machine: None,
-            share_session: false,
-            maximum_timeout_sec: None,
-            task_maximum_timeout_sec: None,
-            mode: None,
-            remediation_attempts: None,
-        };
-        let spec = RunnerSpec::from_row(&run_id, &row);
-        // See the sibling `..._for_a_command_kind_spec` test: cancel on
-        // observation so runtime tracks startup, not `timeout_sec`.
-        let cancel = CancelToken::new();
-        let cancel_for_worker = cancel.clone();
-        let worker = std::thread::spawn(move || runner.run_cancellable(&spec, &cancel_for_worker));
-
-        // While the session is alive the PID is registered. Windows-only, per
-        // `find_server_pid`'s own doc comment — see
-        // `live_tmux_registers_and_clears_pid_for_a_command_kind_spec` for
-        // the same platform-conditional pattern.
-        if cfg!(target_os = "windows") {
-            let seen = await_registered_pid(&reg, &run_id, "s0", &worker, PID_POLL_BUDGET);
-            assert!(seen.is_some(), "PID should be registered during the run");
-        } else {
-            std::thread::sleep(Duration::from_millis(300));
-        }
-        cancel.cancel();
-
-        let _ = worker.join();
-        assert_eq!(
-            reg.pid_of(&run_id, "s0"),
-            None,
-            "PID should be cleared once the tmux-wrapped session ends"
-        );
-    }
-
-    #[cfg_attr(windows, ignore = "CI-only on Windows: exercises a real psmux server")]
-    #[test]
-    fn live_tmux_missing_program_fails_gracefully() {
-        // Every spec runs tmux-wrapped since RAL-151, so this is a real
-        // live-tmux test — serialized under `LIVE_TMUX_TEST_LOCK` and given a
-        // per-invocation-unique run_id (RAL-177), same as every other
-        // live-tmux test in this module. An unresolvable runner program is
-        // typed into the pane via `send-keys`/`respawn-pane` rather than
-        // spawned directly, so it now surfaces as a bounded timeout (the
-        // pane just shows a shell "command not found" error) rather than an
-        // immediate "could not spawn" — see
-        // `live_tmux_missing_program_times_out_instead_of_spawn_error` below
-        // for the identical, already-established pattern this mirrors.
-        if !tmux_and_python_available() {
-            println!("SKIP: tmux and/or python not found on PATH");
-            return;
-        }
-        let _tmux_guard = crate::tmux::LIVE_TMUX_TEST_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        crate::tmux::sweep_dead_test_sessions_once();
-        let run_id = crate::tmux::unique_test_tag("run-1");
-        let _cleanup = crate::tmux::KillSessionOnDrop(crate::tmux::session_name(&run_id, "t", "s"));
-        let runner = SubprocessRunner::new("definitely-not-a-real-program-xyz").forced_tmux();
-        let row = CellRow {
-            task_idx: 0,
-            idx: 0,
-            task_name: "t".to_string(),
-            cell_id: "s".to_string(),
-            cwd: Some(".".to_string()),
-            subprojects: vec![],
-            prompt: None,
-            command: Some("echo hi".to_string()),
-            agent: "claude".to_string(),
-            model: None,
-            system_prompt: None,
-            system_prompt_position: None,
-            depends_on: vec![],
-            // Every spec runs tmux-wrapped (RAL-151), so a nonexistent
-            // program doesn't fail spawn itself — the shell inside the pane
-            // reports "not recognized" and stays open (no done sentinel is
-            // ever printed). Without a bound, the runner would only give up
-            // once the underlying tmux server's own idle-exit kicks in,
-            // which is both slow and non-deterministic. Bound it here so the
-            // test fails via the runner's own timeout path instead. Kept at
-            // 1s (rather than a more generous bound) to prevent concurrent
-            // tests from breaking each other.
-            timeout_sec: Some(1),
-            budget_tokens: None,
-            maximum_budget_usd: None,
-            maximum_context: None,
-            auto_compact_threshold: None,
-            maximum_tool_output_tokens: None,
-            effort: None,
-            temperature: None,
-            upstream: None,
-            machine: None,
-            share_session: false,
-            maximum_timeout_sec: None,
-            task_maximum_timeout_sec: None,
-            mode: None,
-            remediation_attempts: None,
-        };
-        let result = runner.run(&RunnerSpec::from_row(&run_id, &row));
-        assert!(!result.is_done());
-        let err = result.error.unwrap();
-        assert!(
-            err.contains("timed out"),
-            "expected a timeout error, got: {err}"
-        );
-    }
-
-    // ── tmux-wrapped path (RAL-102, and RAL-151 for `command`-kind specs) ──
-    //
-    // These exercise `run_via_tmux` against the real `tmux` binary with a
-    // tiny fake "runner" program (a one-line Python script) standing in for
-    // `ralphus-runner`, so no dependency on pydantic-ai/Claude is needed.
-    // Skips (rather than fails) when `tmux` or `python` isn't on PATH,
-    // mirroring the project's live-Ollama-integration-test skip idiom.
-
-    fn tmux_and_python_available() -> bool {
-        let has_tmux = std::env::var_os("PATH").is_some_and(|path| {
-            std::env::split_paths(&path).any(|dir| {
-                dir.join("tmux").is_file()
-                    || dir.join("tmux.exe").is_file()
-                    || dir.join("tmux.cmd").is_file()
-            })
-        });
-        let has_python = std::process::Command::new("python")
-            .arg("--version")
-            .output()
-            .is_ok_and(|o| o.status.success());
-        has_tmux && has_python
-    }
-
-    /// A fake `ralphus-runner`: reads no real spec, just writes a canned
-    /// `CellResult` to whatever `--result-file` path it was given and
-    /// prints the `RALPHUS_TMUX_DONE` sentinel — mirroring
-    /// `cli/src/ralphus/runner/__main__.py`'s `--result-file` contract
-    /// exactly (RAL-102).
-    // A single logical line (no embedded newlines): the runner's command is
-    // delivered by typing it into an interactive pane via `send-keys` on
-    // Windows, and an embedded newline there is indistinguishable from a
-    // literal Enter keypress, splitting the command into separate lines the
-    // shell executes independently instead of one `python -c ...` call.
-    //
-    // The sentinel string is built via concatenation (`"RALPHUS_TMUX" +
-    // "_DONE: done"`) rather than written out whole: `capture-pane` sees the
-    // *typed command itself* (this script's own source) echoed into the pane
-    // before it ever runs, so a literal `RALPHUS_TMUX_DONE` in the source
-    // would false-positive the sentinel scan on the echoed input, not just
-    // the eventual real output. Real `ralphus-runner` invocations never hit
-    // this — their command line is just `<program> <args>`, never Python
-    // source containing the marker — so this is a test-fake-only concern.
-    const FAKE_RUNNER_SCRIPT: &str = "import sys,json; \
-        rp=sys.argv[sys.argv.index(\"--result-file\")+1]; \
-        open(rp,\"w\").write(json.dumps({\"status\":\"done\",\"tokens_in\":1,\"tokens_out\":2,\"cost_usd\":0.01,\"summary\":\"fake\",\"error\":None,\"proofed\":None,\"agent_session_id\":None})); \
-        print(\"RALPHUS_TMUX\" + \"_DONE: done\")";
-
-    /// A fake runner that never finishes, to exercise the timeout path.
-    const HANGING_RUNNER_SCRIPT: &str = "import time; time.sleep(30)";
-
-    /// Wall-clock budget the PID-registration tests allow for a tmux-wrapped
-    /// session to start and become visible in the process table.
-    ///
-    /// Generous on purpose: it is only ever fully consumed when the test is
-    /// about to fail anyway (see [`await_registered_pid`], which returns as
-    /// soon as the PID appears *or* the session dies). The predecessor was an
-    /// iteration count of 100 × 100 ms — a hard 10 s ceiling that a machine
-    /// running the rest of the suite in parallel could genuinely exceed just
-    /// on tmux-server + Python startup, producing a flake indistinguishable
-    /// from a real regression.
-    const PID_POLL_BUDGET: Duration = Duration::from_secs(60);
-
-    /// Poll `reg` until `cell_id`'s PID is registered, the `worker` thread
-    /// finishes, or `budget` elapses — whichever happens first.
-    ///
-    /// The `is_finished` check is what keeps a genuine failure fast: once the
-    /// cell has ended, no later poll can make a PID appear, so there is no
-    /// reason to burn the remaining budget. That in turn is what lets `budget`
-    /// be large enough to absorb heavy-load startup without making a real
-    /// breakage slow to detect.
-    fn await_registered_pid(
-        reg: &ProcRegistry,
-        squad_id: &str,
-        cell_id: &str,
-        worker: &std::thread::JoinHandle<RunnerResult>,
-        budget: Duration,
-    ) -> Option<u32> {
-        let deadline = Instant::now() + budget;
-        loop {
-            if let Some(pid) = reg.pid_of(squad_id, cell_id) {
-                return Some(pid);
-            }
-            if worker.is_finished() || Instant::now() >= deadline {
-                return reg.pid_of(squad_id, cell_id);
-            }
-            std::thread::sleep(Duration::from_millis(50));
-        }
-    }
-
-    /// The real `run_via_tmux_attempt` path unconditionally persists a pane
-    /// snapshot to the *real* `state_dir()` (`~/.ralphus/pane_snapshots`),
-    /// not a test-isolated location — appropriate for production (the whole
-    /// point is durability past the process/daemon lifetime, see
-    /// `crate::tmux::write_pane_snapshot`'s doc comment), but a live-tmux
-    /// test using this crate's real `SubprocessRunner` unavoidably writes
-    /// there too. Removes the one file this test's own deterministic session
-    /// name would have produced, on drop, so running the suite doesn't leave
-    /// test fixtures behind in the user's real state directory.
-    ///
-    /// Also kills the real tmux session itself on drop (RAL-177 AC #3) —
-    /// covers both a normal test-fn return and a panic/unwind mid-test.
-    /// Fields are owned `String`s (not `&'static str`) so each test can pass
-    /// its own [`crate::tmux::unique_test_tag`]-derived, per-invocation-
-    /// unique run_id instead of a hardcoded literal.
-    struct SnapshotCleanup {
-        squad_id: String,
-        task: String,
-        cell_id: String,
-    }
-    impl Drop for SnapshotCleanup {
-        fn drop(&mut self) {
-            let name = crate::tmux::session_name(&self.squad_id, &self.task, &self.cell_id);
-            let _ = std::fs::remove_file(crate::tmux::pane_snapshot_path(&name));
-            if let Ok(tmux) = Tmux::resolve() {
-                let _ = tmux.kill_session(&name);
-            }
-        }
-    }
-
-    #[cfg_attr(
-        windows,
-        ignore = "opt-in: real tmux/psmux session, can flake under concurrent load on Windows, see PSMUX_CRASH_NOTES.local.md"
-    )]
-    #[test]
-    fn live_tmux_run_via_tmux_full_roundtrip() {
-        if !tmux_and_python_available() {
-            println!("SKIP: tmux and/or python not found on PATH");
-            return;
-        }
-        let _tmux_guard = crate::tmux::LIVE_TMUX_TEST_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        crate::tmux::sweep_dead_test_sessions_once();
-        let run_id = crate::tmux::unique_test_tag("run-tmux-1");
-        let _cleanup = SnapshotCleanup {
-            squad_id: run_id.clone(),
-            task: "build".to_string(),
-            cell_id: "fake-session".to_string(),
-        };
-        let runner = SubprocessRunner {
-            program: "python".to_string(),
-            args: vec!["-c".to_string(), FAKE_RUNNER_SCRIPT.to_string()],
-            registry: None,
-            cartographer: None,
-            detachments: None,
-            waypoint_halts: None,
-            arbiter_stops: None,
-            force_tmux: true,
-        };
-        let cwd = std::env::temp_dir().to_string_lossy().into_owned();
-        let spec = RunnerSpec::for_proof(
-            &run_id,
-            "build",
-            "fake-session",
-            &cwd,
-            "do something",
-            "claude",
-            None,
-            Some(60),
-            None,
-            None,
-        );
-        let result = runner.run(&spec);
-        assert!(result.is_done(), "expected done, got: {result:?}");
-        assert_eq!(result.tokens_in, 1);
-        assert_eq!(result.tokens_out, 2);
-        assert_eq!(result.summary, "fake");
-    }
-
-    #[cfg_attr(
-        windows,
-        ignore = "opt-in: real tmux/psmux session, can flake under concurrent load on Windows, see PSMUX_CRASH_NOTES.local.md"
-    )]
-    #[test]
-    fn live_tmux_command_kind_spec_runs_via_tmux() {
-        // RAL-151: a `command`-kind spec (no `prompt`) must run tmux-wrapped
-        // exactly like a `prompt`-kind one now — this is the "blanket, no
-        // opt-in" behavior the ticket calls for, so a live view is available
-        // for command cells/proof steps too. Reuses the same fake
-        // runner as `live_tmux_run_via_tmux_full_roundtrip`; the only
-        // difference is `command` is set and `prompt` is not.
-        if !tmux_and_python_available() {
-            println!("SKIP: tmux and/or python not found on PATH");
-            return;
-        }
-        let _tmux_guard = crate::tmux::LIVE_TMUX_TEST_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        crate::tmux::sweep_dead_test_sessions_once();
-        let run_id = crate::tmux::unique_test_tag("run-tmux-cmd");
-        let _cleanup = SnapshotCleanup {
-            squad_id: run_id.clone(),
-            task: "build".to_string(),
-            cell_id: "fake-command-session".to_string(),
-        };
-        let runner = SubprocessRunner {
-            program: "python".to_string(),
-            args: vec!["-c".to_string(), FAKE_RUNNER_SCRIPT.to_string()],
-            registry: None,
-            cartographer: None,
-            detachments: None,
-            waypoint_halts: None,
-            arbiter_stops: None,
-            force_tmux: true,
-        };
-        let cwd = std::env::temp_dir().to_string_lossy().into_owned();
-        let spec = RunnerSpec::for_command_proof(
-            &run_id,
-            "build",
-            "fake-command-session",
-            &cwd,
-            "echo hi",
-            "claude",
-            Some(60),
-        );
-        assert!(spec.prompt.is_none(), "this must be a command-kind spec");
-        let result = runner.run(&spec);
-        assert!(result.is_done(), "expected done, got: {result:?}");
-        assert_eq!(result.summary, "fake");
-    }
-
-    #[cfg_attr(
-        windows,
-        ignore = "opt-in: real tmux/psmux session, can flake under concurrent load on Windows, see PSMUX_CRASH_NOTES.local.md"
-    )]
-    #[test]
-    fn live_tmux_registers_and_clears_pid_for_a_command_kind_spec() {
-        // RAL-151 follow-up: now that `command`-kind specs run tmux-wrapped
-        // too (no raw child process left to register a PID from directly),
-        // PID registration for the resource view (RAL-11) comes from
-        // `crate::tmux::find_server_pid` instead. That lookup is Windows-only
-        // (see its doc comment), so only assert the "registered while
-        // running" half there; "cleared after" holds on every platform.
-        if !tmux_and_python_available() {
-            println!("SKIP: tmux and/or python not found on PATH");
-            return;
-        }
-        let _tmux_guard = crate::tmux::LIVE_TMUX_TEST_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        crate::tmux::sweep_dead_test_sessions_once();
-        let run_id = crate::tmux::unique_test_tag("run-tmux-pid");
-        let _cleanup = SnapshotCleanup {
-            squad_id: run_id.clone(),
-            task: "build".to_string(),
-            cell_id: "pid-session".to_string(),
-        };
-        let reg = crate::procreg::ProcRegistry::new();
-        let runner = SubprocessRunner {
-            program: "python".to_string(),
-            args: vec!["-c".to_string(), HANGING_RUNNER_SCRIPT.to_string()],
-            registry: Some(reg.clone()),
-            cartographer: None,
-            detachments: None,
-            waypoint_halts: None,
-            arbiter_stops: None,
-            force_tmux: true,
-        };
-        let cwd = std::env::temp_dir().to_string_lossy().into_owned();
-        // Backstop only — see the identical note on
-        // `live_tmux_registers_pid_while_the_subprocess_is_alive_and_clears_it_after`.
-        // Must stay above `PID_POLL_BUDGET` so a slow-starting session never
-        // races its own timeout-kill against the poll loop (the RAL-171
-        // failure signature); the test itself cancels on observation, so this
-        // value costs no runtime.
-        let spec = RunnerSpec::for_command_proof(
-            &run_id,
-            "build",
-            "pid-session",
-            &cwd,
-            "noop",
-            "claude",
-            Some(120),
-        );
-        let run_id_for_poll = run_id.clone();
-        // Cancel once the PID has been observed rather than waiting out
-        // `timeout_sec`: this test's runtime then tracks how long startup
-        // actually took, not the timeout budget, so that budget can be set
-        // generously without making the test slow.
-        let cancel = CancelToken::new();
-        let cancel_for_worker = cancel.clone();
-        let worker = std::thread::spawn(move || runner.run_cancellable(&spec, &cancel_for_worker));
-
-        if cfg!(target_os = "windows") {
-            let seen = await_registered_pid(
-                &reg,
-                &run_id_for_poll,
-                "pid-session",
-                &worker,
-                PID_POLL_BUDGET,
-            );
-            assert!(
-                seen.is_some(),
-                "PID should be registered while the tmux-wrapped session runs"
-            );
-        } else {
-            // No process-table lookup off Windows, so there is nothing to wait
-            // for -- just let the session get far enough to have something to
-            // tear down before cancelling.
-            std::thread::sleep(Duration::from_millis(300));
-        }
-        cancel.cancel();
-
-        let _ = worker.join();
-        assert_eq!(
-            reg.pid_of(&run_id, "pid-session"),
-            None,
-            "PID should be cleared once the tmux-wrapped session ends"
-        );
-    }
-
-    #[cfg_attr(
-        windows,
-        ignore = "opt-in: real tmux/psmux session, can flake under concurrent load on Windows, see PSMUX_CRASH_NOTES.local.md"
-    )]
-    #[test]
-    fn live_tmux_missing_program_times_out_instead_of_spawn_error() {
-        // Once a `command`-kind spec is spawned via `send-keys`/`respawn-pane`
-        // inside a tmux pane rather than as a direct child process, an
-        // unresolvable program no longer surfaces as an immediate "could not
-        // spawn" error (there's nothing left in this crate that calls
-        // `Command::spawn` for it) — the pane just shows a shell error and
-        // the daemon's poll loop bounds the wait with the spec's own
-        // timeout, exactly as it would for any other stuck session.
-        if !tmux_and_python_available() {
-            println!("SKIP: tmux and/or python not found on PATH");
-            return;
-        }
-        crate::tmux::sweep_dead_test_sessions_once();
-        let run_id = crate::tmux::unique_test_tag("run-tmux-missing");
-        let _cleanup = SnapshotCleanup {
-            squad_id: run_id.clone(),
-            task: "build".to_string(),
-            cell_id: "missing-session".to_string(),
-        };
-        let runner = SubprocessRunner::new("definitely-not-a-real-program-xyz").forced_tmux();
-        let cwd = std::env::temp_dir().to_string_lossy().into_owned();
-        let spec = RunnerSpec::for_command_proof(
-            &run_id,
-            "build",
-            "missing-session",
-            &cwd,
-            "noop",
-            "claude",
-            Some(1),
-        );
-        let result = runner.run(&spec);
-        assert!(!result.is_done());
-        assert!(result.error.unwrap().contains("timed out"));
-    }
-
-    #[cfg_attr(
-        windows,
-        ignore = "opt-in: real tmux/psmux session, can flake under concurrent load on Windows, see PSMUX_CRASH_NOTES.local.md"
-    )]
-    #[test]
-    fn live_tmux_run_via_tmux_times_out() {
-        if !tmux_and_python_available() {
-            println!("SKIP: tmux and/or python not found on PATH");
-            return;
-        }
-        crate::tmux::sweep_dead_test_sessions_once();
-        let run_id = crate::tmux::unique_test_tag("run-tmux-2");
-        let _cleanup = SnapshotCleanup {
-            squad_id: run_id.clone(),
-            task: "build".to_string(),
-            cell_id: "hanging-session".to_string(),
-        };
-        let runner = SubprocessRunner {
-            program: "python".to_string(),
-            args: vec!["-c".to_string(), HANGING_RUNNER_SCRIPT.to_string()],
-            registry: None,
-            cartographer: None,
-            detachments: None,
-            waypoint_halts: None,
-            arbiter_stops: None,
-            force_tmux: true,
-        };
-        let cwd = std::env::temp_dir().to_string_lossy().into_owned();
-        let spec = RunnerSpec::for_proof(
-            &run_id,
-            "build",
-            "hanging-session",
-            &cwd,
-            "do something",
-            "claude",
-            None,
-            Some(1),
-            None,
-            None,
-        );
-        let started = Instant::now();
-        let result = runner.run(&spec);
-        assert!(!result.is_done());
-        assert!(result.error.unwrap().contains("timed out"));
-        // Generous ceiling: this only guards against a genuine hang, not
-        // brisk enforcement -- the actual 1s budget is checked by the log
-        // line above firing near-instantly. The subsequent tmux/subprocess
-        // kill+reap this measures also includes can itself take tens of
-        // seconds when this test runs alongside the rest of the suite's
-        // git/tmux subprocess load, so a tight bound here is a false alarm
-        // waiting to happen, not a real regression signal.
-        assert!(
-            started.elapsed() < Duration::from_secs(90),
-            "timeout enforcement should eventually fire, took {:?}",
-            started.elapsed()
-        );
-    }
-
-    #[cfg_attr(
-        windows,
-        ignore = "opt-in: real tmux/psmux session, can flake under concurrent load on Windows, see PSMUX_CRASH_NOTES.local.md"
-    )]
-    #[test]
-    fn live_tmux_run_via_tmux_is_cancellable() {
-        if !tmux_and_python_available() {
-            println!("SKIP: tmux and/or python not found on PATH");
-            return;
-        }
-        crate::tmux::sweep_dead_test_sessions_once();
-        let run_id = crate::tmux::unique_test_tag("run-tmux-3");
-        let _cleanup = SnapshotCleanup {
-            squad_id: run_id.clone(),
-            task: "build".to_string(),
-            cell_id: "cancel-session".to_string(),
-        };
-        let runner = SubprocessRunner {
-            program: "python".to_string(),
-            args: vec!["-c".to_string(), HANGING_RUNNER_SCRIPT.to_string()],
-            registry: None,
-            cartographer: None,
-            detachments: None,
-            waypoint_halts: None,
-            arbiter_stops: None,
-            force_tmux: true,
-        };
-        let cwd = std::env::temp_dir().to_string_lossy().into_owned();
-        let spec = RunnerSpec::for_proof(
-            &run_id,
-            "build",
-            "cancel-session",
-            &cwd,
-            "do something",
-            "claude",
-            None,
-            None,
-            None,
-            None,
-        );
-        let cancel = CancelToken::new();
-        let cancel_clone = cancel.clone();
-        std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(300));
-            cancel_clone.cancel();
-        });
-        let result = runner.run_cancellable(&spec, &cancel);
-        assert!(!result.is_done());
-        assert_eq!(result.error.as_deref(), Some("cancelled"));
-    }
-
-    #[cfg_attr(
-        windows,
-        ignore = "opt-in: real tmux/psmux session, can flake under concurrent load on Windows, see PSMUX_CRASH_NOTES.local.md"
-    )]
-    #[test]
-    fn live_tmux_cancel_kills_the_real_process_tree() {
-        // RAL-321: `Tmux::kill_session` used to only free the tmux/psmux
-        // session *name* -- the pane's real process tree (the psmux server
-        // and everything it spawned into the pane) kept running underneath
-        // it. `live_tmux_run_via_tmux_is_cancellable` above only asserts the
-        // runner reports "cancelled"; this asserts the actual OS process is
-        // gone too, via `crate::tmux::find_server_pid` +
-        // `crate::tmux::test_pid_is_alive` (both Windows-only, see their own
-        // doc comments -- there is no equivalent confinement on Unix, see
-        // `tmux.rs`'s module doc comment).
-        if !tmux_and_python_available() {
-            println!("SKIP: tmux and/or python not found on PATH");
-            return;
-        }
-        let _tmux_guard = crate::tmux::LIVE_TMUX_TEST_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        crate::tmux::sweep_dead_test_sessions_once();
-        let run_id = crate::tmux::unique_test_tag("run-tmux-killtree");
-        let _cleanup = SnapshotCleanup {
-            squad_id: run_id.clone(),
-            task: "build".to_string(),
-            cell_id: "killtree-session".to_string(),
-        };
-        let session_name = crate::tmux::session_name(&run_id, "build", "killtree-session");
-        let runner = SubprocessRunner {
-            program: "python".to_string(),
-            args: vec!["-c".to_string(), HANGING_RUNNER_SCRIPT.to_string()],
-            registry: None,
-            cartographer: None,
-            detachments: None,
-            waypoint_halts: None,
-            arbiter_stops: None,
-            force_tmux: true,
-        };
-        let cwd = std::env::temp_dir().to_string_lossy().into_owned();
-        let spec = RunnerSpec::for_proof(
-            &run_id,
-            "build",
-            "killtree-session",
-            &cwd,
-            "do something",
-            "claude",
-            None,
-            None,
-            None,
-            None,
-        );
-        let cancel = CancelToken::new();
-        let cancel_for_worker = cancel.clone();
-        let worker = std::thread::spawn(move || runner.run_cancellable(&spec, &cancel_for_worker));
-
-        if !cfg!(target_os = "windows") {
-            // No process-table lookup off Windows (`find_server_pid` always
-            // returns `None` there), so there is nothing to assert real OS
-            // death against -- still exercise the cancel path itself.
-            std::thread::sleep(Duration::from_millis(300));
-            cancel.cancel();
-            let result = worker.join().unwrap();
-            assert!(!result.is_done());
-            assert_eq!(result.error.as_deref(), Some("cancelled"));
-            return;
-        }
-
-        let deadline = Instant::now() + PID_POLL_BUDGET;
-        let pid = loop {
-            if let Some(pid) = crate::tmux::find_server_pid(&session_name) {
-                break Some(pid);
-            }
-            if worker.is_finished() || Instant::now() >= deadline {
-                break crate::tmux::find_server_pid(&session_name);
-            }
-            std::thread::sleep(Duration::from_millis(50));
-        }
-        .expect("tmux server pid should be found while the session is running");
-        assert!(
-            crate::tmux::test_pid_is_alive(pid),
-            "tmux server pid={pid} should be alive before cancel"
-        );
-
-        cancel.cancel();
-        let result = worker.join().unwrap();
-        assert!(!result.is_done());
-        assert_eq!(result.error.as_deref(), Some("cancelled"));
-
-        // Bounded poll, not a fixed sleep: `kill_session`'s own wait loop
-        // already bounds how long `has-session` takes to clear, so this
-        // should resolve almost immediately once `run_cancellable` returns --
-        // the point of RAL-321 is that this used to never become true at all.
-        let death_deadline = Instant::now() + Duration::from_secs(10);
-        while crate::tmux::test_pid_is_alive(pid) && Instant::now() < death_deadline {
-            std::thread::sleep(Duration::from_millis(100));
-        }
-        assert!(
-            !crate::tmux::test_pid_is_alive(pid),
-            "tmux server pid={pid} should be dead after cancel (RAL-321: process-tree confinement)"
-        );
-    }
-
-    #[cfg_attr(windows, ignore = "CI-only on Windows: exercises a real psmux server")]
-    #[test]
-    fn live_tmux_run_via_tmux_is_detachable() {
-        if !tmux_and_python_available() {
-            println!("SKIP: tmux and/or python not found on PATH");
-            return;
-        }
-        crate::tmux::sweep_dead_test_sessions_once();
-        let run_id = crate::tmux::unique_test_tag("run-tmux-detach");
-        let _cleanup = SnapshotCleanup {
-            squad_id: run_id.clone(),
-            task: "build".to_string(),
-            cell_id: "detach-session".to_string(),
-        };
-        let detachments = crate::cancel::Detachments::new();
-        let runner = SubprocessRunner {
-            program: "python".to_string(),
-            args: vec!["-c".to_string(), HANGING_RUNNER_SCRIPT.to_string()],
-            registry: None,
-            cartographer: None,
-            detachments: Some(detachments.clone()),
-            waypoint_halts: None,
-            arbiter_stops: None,
-            force_tmux: true,
-        };
-        let cwd = std::env::temp_dir().to_string_lossy().into_owned();
-        let spec = RunnerSpec::for_proof(
-            &run_id,
-            "build",
-            "detach-session",
-            &cwd,
-            "do something",
-            "claude",
-            None,
-            None,
-            None,
-            None,
-        );
-        // RAL-288 Stage 6: an HTTP handler doesn't have the runner's own
-        // computed session name -- it only knows (squad_id, task, cell_id),
-        // same as every other tmux-keyed endpoint (`attach_tmux_terminal`,
-        // `capture_pane_reply`) already recomputes it.
-        let session_name = crate::tmux::session_name(&spec.squad_id, &spec.task, &spec.cell_id);
-        let _cleanup_session = crate::tmux::KillSessionOnDrop(session_name.clone());
-        std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(300));
-            detachments.cancel(&session_name);
-        });
-        let result = runner.run_cancellable(&spec, &CancelToken::never());
-        assert!(!result.is_done());
-        assert!(result.is_detached());
-        assert_eq!(result.error, None);
-    }
-
-    /// A fake runner for the auto-reattach test (RAL-102 follow-up): reads
-    /// its own spec file back and behaves differently depending on whether
-    /// `resume_agent_session_id` is set. On a fresh (non-resumed) attempt it
-    /// announces a agent_session_id over the `RALPHUS_EVENT:` marker — same
-    /// as the real `claude-code` backend's stream-json init event — then
-    /// hangs, standing in for a cell whose tmux pane the test kills out
-    /// from under it. On a resumed attempt (the daemon's own retry, which
-    /// sets `resume_agent_session_id` in the spec it writes) it completes
-    /// immediately with a distinguishable summary, proving the reattach
-    /// actually happened and carried the right id.
-    const REATTACH_RUNNER_SCRIPT: &str = "import sys,json,time; \
-        sp=sys.argv[sys.argv.index(\"--result-file\")-1]; \
-        rp=sys.argv[sys.argv.index(\"--result-file\")+1]; \
-        spec=json.load(open(sp)); \
-        resumed=spec.get(\"resume_agent_session_id\"); \
-        sys.stderr.write(\"RALPHUS_EVENT: \" + json.dumps({\"source\":\"llm-invoke\",\"message\":\"sid known\",\"payload\":{\"agent_session_id\":\"reattach-test-sid\"}}) + \"\\n\"); \
-        sys.stderr.flush(); \
-        (open(rp,\"w\").write(json.dumps({\"status\":\"done\",\"tokens_in\":1,\"tokens_out\":1,\"cost_usd\":0.0,\"summary\":\"resumed-and-done resume_from=\"+str(resumed),\"error\":None,\"proofed\":None,\"agent_session_id\":\"reattach-test-sid\"})), \
-         print(\"RALPHUS_TMUX\" + \"_DONE: done\")) if resumed else time.sleep(30)";
-
-    // Ignored on Windows: races the daemon's poll loop against a real
-    // psmux session kill, and has been observed to flake deterministically
-    // against the still-unexplained pane/scrollback loss documented in
-    // PSMUX_CRASH_NOTES.local.md (RAL-159 proof run, run-000000000147) even
-    // with LIVE_TMUX_TEST_LOCK held. Not gated on CI (ubuntu-latest has no
-    // tmux, so `tmux_and_python_available()` already skips it there).
-    #[cfg_attr(
-        windows,
-        ignore = "flaky: races psmux session kill against the daemon poll loop, see PSMUX_CRASH_NOTES.local.md"
-    )]
-    #[test]
-    fn live_tmux_run_via_tmux_reattaches_after_session_vanishes() {
-        if !tmux_and_python_available() {
-            println!("SKIP: tmux and/or python not found on PATH");
-            return;
-        }
-        // This test explicitly kills a real tmux session mid-flight and races
-        // the daemon's own poll loop against real wall-clock timing to prove
-        // the reattach — serialize against every other live-tmux test in the
-        // suite so a concurrently running one's own session creation/teardown
-        // (or plain CPU contention from it) can't be what makes the daemon's
-        // poll thread miss the window. Observed flaking under a full
-        // `cargo test --lib` run even with a generous post-detection buffer;
-        // isolating this test from sibling live-tmux tests is the fix that
-        // actually addresses the contention rather than just widening timeouts.
-        let _tmux_guard = crate::tmux::LIVE_TMUX_TEST_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        crate::tmux::sweep_dead_test_sessions_once();
-        let run_id = crate::tmux::unique_test_tag("run-tmux-reattach");
-        let _cleanup = SnapshotCleanup {
-            squad_id: run_id.clone(),
-            task: "build".to_string(),
-            cell_id: "reattach-session".to_string(),
-        };
-        let store = Store::open_in_memory().expect("open in-memory store");
-        let runner = SubprocessRunner {
-            program: "python".to_string(),
-            args: vec!["-c".to_string(), REATTACH_RUNNER_SCRIPT.to_string()],
-            registry: None,
-            cartographer: Some(Arc::new(crate::store_lock::StoreMutex::new(store))),
-            detachments: None,
-            waypoint_halts: None,
-            arbiter_stops: None,
-            force_tmux: true,
-        };
-        let cwd = std::env::temp_dir().to_string_lossy().into_owned();
-        let spec = RunnerSpec {
-            squad_id: run_id.clone(),
-            task: "build".to_string(),
-            cell_id: "reattach-session".to_string(),
-            cwd,
-            prompt: Some("do something".to_string()),
-            command: None,
-            shell: None,
-            agent: "claude-code".to_string(),
-            executable: None,
-            model: None,
-            system_prompt: None,
-            system_prompt_position: None,
-            timeout_sec: Some(30),
-            budget_tokens: None,
-            maximum_budget_usd: None,
-            maximum_context: None,
-            auto_compact_threshold: None,
-            maximum_tool_output_tokens: None,
-            effort: None,
-            temperature: None,
-            proof: false,
-            trace_context: None,
-            resume_agent_session_id: None,
-            assigned_agent_session_id: None,
-            env_overrides: BTreeMap::new(),
-            machine: None,
-            tool_arg_truncate_chars: None,
-            thrash_max_compactions: None,
-            thrash_min_turn_gap: None,
-            allow_personal_settings: false,
-            allow_personal_memory: false,
-            waypoint_context: true,
-            retry_attempt: 0,
-            retry_after_unknown_default_seconds:
-                crate::config::DEFAULT_RETRY_AFTER_UNKNOWN_DEFAULT_SECONDS,
-            maximum_timeout: None,
-            pass_score: None,
-        };
-        let session_name = crate::tmux::session_name(&spec.squad_id, &spec.task, &spec.cell_id);
-
-        let runner = Arc::new(runner);
-        let runner_clone = Arc::clone(&runner);
-        let spec_clone = spec.clone();
-        let started = Instant::now();
-        let handle = std::thread::spawn(move || runner_clone.run(&spec_clone));
-
-        // Wait for the first attempt's session to appear and its pane to
-        // actually show the llm-invoke event line (polled directly, rather
-        // than a fixed sleep, so this isn't flaky under parallel-test-run CPU
-        // contention — Python startup alone can take much longer than a
-        // guessed delay when other live-tmux tests are competing for the
-        // same machine), then kill it out from under the daemon — simulating
-        // the still-unexplained "mystery" pane loss from
-        // PSMUX_CRASH_NOTES.local.md.
-        let tmux = Tmux::resolve().expect("tmux resolves (already checked available)");
-        let appeared = Instant::now();
-        loop {
-            assert!(
-                appeared.elapsed() < Duration::from_secs(30),
-                "first attempt's tmux session never showed the llm-invoke event line"
-            );
-            if let Ok(pane) = tmux.capture_pane(&session_name, 2000) {
-                if pane.contains("RALPHUS_EVENT:") {
-                    break;
-                }
-            }
-            std::thread::sleep(Duration::from_millis(100));
-        }
-        // The line being visible to *this* capture-pane call doesn't mean the
-        // daemon's own independent poll loop (TMUX_POLL_INTERVAL, 500ms) has
-        // run its own capture-pane and forwarded it yet — give it a couple of
-        // full poll cycles' worth of buffer before killing, so the daemon
-        // reliably gets the event before the pane disappears out from under
-        // it. `LIVE_TMUX_TEST_LOCK` (acquired above) removes contention from
-        // sibling live-tmux tests specifically, but not from the ~480 other,
-        // unrelated tests `cargo test --lib` also runs concurrently in other
-        // threads — measured 1-in-5 full-suite flakes at 3x even with the
-        // lock held; 5x has been reliable across repeated full-suite runs.
-        std::thread::sleep(TMUX_POLL_INTERVAL * 5);
-        tmux.kill_session(&session_name)
-            .expect("kill the first attempt's session");
-
-        let result = handle.join().expect("runner thread panicked");
-        assert!(
-            result.is_done(),
-            "expected the reattach to succeed, got: {result:?}"
-        );
-        assert_eq!(
-            result.summary, "resumed-and-done resume_from=reattach-test-sid",
-            "the second attempt must have been invoked with the agent_session_id captured from the first"
-        );
-        assert!(
-            // Loose sanity bound, not a precise timing assertion -- mainly to
-            // catch a hang. `spec.timeout_sec` is 30s and this test's own
-            // event-line wait is bounded the same, so a slow-but-not-hung run
-            // under CPU contention (see the wait loop above) can legitimately
-            // take a while.
-            started.elapsed() < Duration::from_secs(60),
-            "reattach should complete, took {:?}",
-            started.elapsed()
-        );
-    }
-
-    /// Same reattach flow as
-    /// [`live_tmux_run_via_tmux_reattaches_after_session_vanishes`], but for
-    /// `agent = "codex"` -- proves the gate widened alongside `CodexBackend`
-    /// gaining a real resume mechanism (`codex exec resume <thread_id>`)
-    /// actually activates the retry path for Codex, not just Claude Code.
-    /// `REATTACH_RUNNER_SCRIPT` is itself agent-agnostic (it only reads
-    /// `resume_agent_session_id` back from the spec file), so the only
-    /// thing under test here is the `attempt_spec.agent` gate in
-    /// `run_via_tmux`.
-    // Ignored on Windows: same psmux session-kill/poll-loop race as
-    // live_tmux_run_via_tmux_reattaches_after_session_vanishes above, just
-    // parameterized for agent = "codex" -- see that test's comment and
-    // PSMUX_CRASH_NOTES.local.md for details.
-    #[cfg_attr(
-        windows,
-        ignore = "flaky: races psmux session kill against the daemon poll loop, see PSMUX_CRASH_NOTES.local.md"
-    )]
-    #[test]
-    fn live_tmux_run_via_tmux_reattaches_after_session_vanishes_for_codex() {
-        if !tmux_and_python_available() {
-            println!("SKIP: tmux and/or python not found on PATH");
-            return;
-        }
-        let _tmux_guard = crate::tmux::LIVE_TMUX_TEST_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        crate::tmux::sweep_dead_test_sessions_once();
-        let run_id = crate::tmux::unique_test_tag("run-tmux-reattach-codex");
-        let _cleanup = SnapshotCleanup {
-            squad_id: run_id.clone(),
-            task: "build".to_string(),
-            cell_id: "reattach-session-codex".to_string(),
-        };
-        let store = Store::open_in_memory().expect("open in-memory store");
-        let runner = SubprocessRunner {
-            program: "python".to_string(),
-            args: vec!["-c".to_string(), REATTACH_RUNNER_SCRIPT.to_string()],
-            registry: None,
-            cartographer: Some(Arc::new(crate::store_lock::StoreMutex::new(store))),
-            detachments: None,
-            waypoint_halts: None,
-            arbiter_stops: None,
-            force_tmux: true,
-        };
-        let cwd = std::env::temp_dir().to_string_lossy().into_owned();
-        let spec = RunnerSpec {
-            squad_id: run_id.clone(),
-            task: "build".to_string(),
-            cell_id: "reattach-session-codex".to_string(),
-            cwd,
-            prompt: Some("do something".to_string()),
-            command: None,
-            shell: None,
-            agent: "codex".to_string(),
-            executable: None,
-            model: None,
-            system_prompt: None,
-            system_prompt_position: None,
-            timeout_sec: Some(30),
-            budget_tokens: None,
-            maximum_budget_usd: None,
-            maximum_context: None,
-            auto_compact_threshold: None,
-            maximum_tool_output_tokens: None,
-            effort: None,
-            temperature: None,
-            proof: false,
-            trace_context: None,
-            resume_agent_session_id: None,
-            assigned_agent_session_id: None,
-            env_overrides: BTreeMap::new(),
-            machine: None,
-            tool_arg_truncate_chars: None,
-            thrash_max_compactions: None,
-            thrash_min_turn_gap: None,
-            allow_personal_settings: false,
-            allow_personal_memory: false,
-            waypoint_context: true,
-            retry_attempt: 0,
-            retry_after_unknown_default_seconds:
-                crate::config::DEFAULT_RETRY_AFTER_UNKNOWN_DEFAULT_SECONDS,
-            maximum_timeout: None,
-            pass_score: None,
-        };
-        let session_name = crate::tmux::session_name(&spec.squad_id, &spec.task, &spec.cell_id);
-
-        let runner = Arc::new(runner);
-        let runner_clone = Arc::clone(&runner);
-        let spec_clone = spec.clone();
-        let started = Instant::now();
-        let handle = std::thread::spawn(move || runner_clone.run(&spec_clone));
-
-        let tmux = Tmux::resolve().expect("tmux resolves (already checked available)");
-        let appeared = Instant::now();
-        loop {
-            assert!(
-                appeared.elapsed() < Duration::from_secs(30),
-                "first attempt's tmux session never showed the llm-invoke event line"
-            );
-            if let Ok(pane) = tmux.capture_pane(&session_name, 2000) {
-                if pane.contains("RALPHUS_EVENT:") {
-                    break;
-                }
-            }
-            std::thread::sleep(Duration::from_millis(100));
-        }
-        std::thread::sleep(TMUX_POLL_INTERVAL * 5);
-        tmux.kill_session(&session_name)
-            .expect("kill the first attempt's session");
-
-        let result = handle.join().expect("runner thread panicked");
-        assert!(
-            result.is_done(),
-            "expected the reattach to succeed, got: {result:?}"
-        );
-        assert_eq!(
-            result.summary, "resumed-and-done resume_from=reattach-test-sid",
-            "the second attempt must have been invoked with the agent_session_id captured from the first"
-        );
-        assert!(
-            started.elapsed() < Duration::from_secs(60),
-            "reattach should complete, took {:?}",
-            started.elapsed()
-        );
-    }
-
     /// RAL-377: a missing/misconfigured `RALPHUS_RUNNER_CMD` must fail loudly
-    /// up front rather than only surfacing once `run_via_tmux` tries and
+    /// up front rather than only surfacing once `run_direct` tries and
     /// fails to spawn it -- see `SubprocessRunner::preflight_runner_executable`.
     #[test]
     fn preflight_runner_executable_fails_for_a_missing_program() {
@@ -6953,10 +4457,8 @@ prompt = "make it build"
             args: Vec::new(),
             registry: None,
             cartographer: None,
-            detachments: None,
             waypoint_halts: None,
             arbiter_stops: None,
-            force_tmux: true,
         };
         runner
             .preflight_runner_executable(None)
@@ -7049,7 +4551,6 @@ prompt = "make it build"
         let mut session_id = None;
         let mut usage = LiveUsage::default();
         let target = TranscriptEventTarget {
-            pane_event_fallback: false,
             cartographer: Some(&store),
             squad_id: &squad_id,
             cell_id: "worker",
@@ -7127,8 +4628,8 @@ prompt = "make it build"
     }
 
     /// The `.raw` path is deterministic in `(session_name, attempt)` and
-    /// `attempt` restarts at 0 on every re-run of a cell, while `pipe-sink`
-    /// appends. Without the attempt-start reset in `run_via_tmux_attempt` a
+    /// `attempt` restarts at 0 on every re-run of a cell, while the transcript writer
+    /// appends. Without the attempt-start reset in `run_direct_attempt` a
     /// re-run tails the *previous* run's transcript and finds its completion
     /// sentinel on the first poll, ending the attempt before its own agent
     /// printed a byte. Seeding the tailer past whatever survived is the
@@ -7139,7 +4640,7 @@ prompt = "make it build"
         let path = unique_raw_path("stale-seed");
         std::fs::write(
             &path,
-            b"RALPHUS_EVENT: {\"source\":\"llm-invoke\"}\nRALPHUS_TMUX_DONE: done\n",
+            b"RALPHUS_EVENT: {\"source\":\"llm-invoke\"}\nRALPHUS_EVENT: {}\n",
         )
         .unwrap();
         let stale_len = std::fs::metadata(&path).unwrap().len();
@@ -7167,24 +4668,6 @@ prompt = "make it build"
         let _ = std::fs::remove_file(&path);
     }
 
-    /// The same stale file read from offset 0 *does* surface the previous
-    /// run's sentinel — pinning what the seeding above is protecting against,
-    /// so this can't silently stop being a real hazard.
-    #[test]
-    fn transcript_tailer_from_zero_would_replay_a_stale_done_sentinel() {
-        let path = unique_raw_path("stale-zero");
-        std::fs::write(&path, b"RALPHUS_TMUX_DONE: done\n").unwrap();
-
-        let mut tailer = TranscriptTailer::at_path(path.clone());
-        let drained = tailer.drain();
-        assert!(
-            drained.lines.iter().any(|l| line_is_done_sentinel(l)),
-            "expected the stale sentinel to be visible from offset 0, got: {:?}",
-            drained.lines
-        );
-        let _ = std::fs::remove_file(&path);
-    }
-
     #[test]
     fn transcript_tailer_restarts_from_the_top_when_the_file_shrinks() {
         let path = unique_raw_path("shrink");
@@ -7195,7 +4678,7 @@ prompt = "make it build"
         let first = tailer.drain();
         assert_eq!(first.lines.len(), 2);
 
-        // Simulate the pipe-sink byte-cap truncation (or a path reuse): the
+        // Simulate the transcript byte-cap truncation (or a path reuse): the
         // file is now shorter than the offset already consumed. The tailer
         // must reset to byte 0 rather than seek past the new end and stall.
         std::fs::write(&path, b"short\n").expect("truncate-rewrite");
@@ -7204,26 +4687,5 @@ prompt = "make it build"
         assert_eq!(after.lines, vec!["short".to_string()]);
 
         let _ = std::fs::remove_file(&path);
-    }
-
-    #[test]
-    fn line_is_done_sentinel_matches_only_a_standalone_line_start_marker() {
-        assert!(line_is_done_sentinel("RALPHUS_TMUX_DONE: ok"));
-        assert!(
-            line_is_done_sentinel("   RALPHUS_TMUX_DONE: failed"),
-            "leading whitespace is tolerated (trim_start), matching the pane scan"
-        );
-        assert!(
-            !line_is_done_sentinel("some_file.rs:42:RALPHUS_TMUX_DONE: ok"),
-            "a grep-style file:line prefix must not read as completion"
-        );
-        assert!(
-            !line_is_done_sentinel("mentioning RALPHUS_TMUX_DONE in prose"),
-            "the marker embedded mid-line is not a sentinel"
-        );
-        assert!(
-            !line_is_done_sentinel("RALPHUS_TMUX_DONEno-colon"),
-            "the marker must be followed by the exact ': ' separator"
-        );
     }
 }

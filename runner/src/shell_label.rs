@@ -4,7 +4,7 @@
 
 use serde_json::Value;
 
-/// Renders a tool call's arguments compactly for the live tmux pane
+/// Renders a tool call's arguments compactly for the live transcript
 /// (RAL-102), mirroring the old `claude_code_backend.py`'s
 /// `_format_tool_input`. `truncate_chars` (RAL-303) is the per-value
 /// character budget before a trailing `…` is appended -- configurable via

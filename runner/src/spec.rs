@@ -60,15 +60,15 @@ pub struct CellSpec {
     pub resume_agent_session_id: Option<String>,
     /// A session id the daemon pre-generated and persisted before this cell
     /// started (RAL-288 Stage 1). The claude-code backend passes it as
-    /// `--session-id` when not resuming, so "Open Agent" has something to
-    /// attach to from the very first moment of a run instead of waiting on
+    /// `--session-id` when not resuming, so the session id is known from
+    /// the very first moment of a run instead of waiting on
     /// the backend's own init event. Other backends ignore it (mirrors
     /// `resume_agent_session_id`'s "hand-rolled backends accept and ignore
     /// it" precedent).
     pub assigned_agent_session_id: Option<String>,
     /// RAL-303: the daemon's resolved `[live_view] tool_arg_truncate_chars`,
     /// forwarded so the claude-code backend's `format_tool_input` knows how
-    /// much of a `tool_use` argument to render into the Live View tmux pane
+    /// much of a `tool_use` argument to render into the Live View transcript
     /// before truncating. `None` (e.g. a hand-authored spec that omits the
     /// key) falls back to the backend's own default.
     pub tool_arg_truncate_chars: Option<u32>,
@@ -471,7 +471,7 @@ impl CellResult {
             cost_usd,
             // A rate limit carries whatever the live snapshot held at the
             // retry point, never a terminal usage event -- so it is an
-            // estimate by construction (RAL-326), same as a detach.
+            // estimate by construction (RAL-326).
             cost_is_estimated: true,
             summary: summary.into(),
             error: None,
@@ -485,60 +485,9 @@ impl CellResult {
         }
     }
 
-    /// RAL-288 Stage 6: a deliberate human-triggered detach mid-task, so a
-    /// real interactive session can take over. Neither success nor failure
-    /// -- the cell's actual goal may be nowhere near finished. Carries
-    /// whatever usage/session-id was captured live up to the detach point,
-    /// the same way [`Self::done`]'s caller fills those in, so the board's
-    /// numbers don't regress to zero.
-    #[must_use]
-    #[allow(clippy::too_many_arguments)]
-    pub fn detached(
-        tokens_in: i64,
-        tokens_out: i64,
-        cache_creation_tokens: i64,
-        cache_read_tokens: i64,
-        compaction_input_tokens: i64,
-        compaction_count: i64,
-        turns: i64,
-        cost_usd: f64,
-        agent_session_id: Option<String>,
-    ) -> Self {
-        Self {
-            status: "detached".to_string(),
-            tokens_in,
-            tokens_out,
-            cache_creation_tokens,
-            cache_read_tokens,
-            compaction_input_tokens,
-            compaction_count,
-            turns: Some(turns),
-            cost_usd,
-            // A detach carries whatever the live snapshot held at the detach
-            // point, never a terminal usage event -- so it is an estimate by
-            // construction (RAL-326).
-            cost_is_estimated: true,
-            summary: String::new(),
-            error: None,
-            proofed: None,
-            agent_session_id,
-            ghost: None,
-            retry_after_secs: None,
-            prophecies: Vec::new(),
-            appraisal: None,
-            bearing: None,
-        }
-    }
-
     #[must_use]
     pub fn ok(&self) -> bool {
         self.status == "done"
-    }
-
-    /// RAL-288 Stage 6.
-    #[must_use]
-    pub fn is_detached(&self) -> bool {
-        self.status == "detached"
     }
 
     /// RAL-435: a recognized, retryable Pi rate limit -- see

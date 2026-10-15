@@ -36,7 +36,7 @@ covers the crate's internals.
   re-implemented here.
 - `src/exclusions.rs` -- the documented-reason exclusion list for CLI leaves
   that are genuinely not portable to one MCP request/response call (spawn an
-  interactive, TTY-attached agent session: `cell open-agent`, every
+  interactive, TTY-attached agent session: every
   `quick-start` backend). **Whenever a new CLI leaf is added that can't be
   wired to a real MCP tool, add it here with a real reason** -- an empty or
   placeholder reason fails `mcp/tests/parity.rs`'s

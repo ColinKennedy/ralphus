@@ -4087,7 +4087,7 @@ pub fn run_pending_surveys(
 /// (a manual restart, say) while still carrying a stale
 /// `waypoint_halted_at_ms`. Resuming sets the cell back to `pending`; a live
 /// squad worker notices via the same Detached-revival reconciliation
-/// `resume_detached_cell` relies on (`scheduler::execute_squad_inner`'s
+/// the waypoint resume relies on (`scheduler::execute_squad_inner`'s
 /// `reclaimed_detached` check), so only a squad whose worker has already
 /// exited (`!cancellations.is_active`) needs its own row nudged back to
 /// `Pending` to be picked up by a fresh `scheduler::tick`.
@@ -4123,7 +4123,7 @@ pub fn run_pending_waypoint_resumes(
         ) {
             continue;
         }
-        // Mirror `server::resume_automation`'s pairing: a session id is only
+        // A session id is only
         // worth forcing a resume onto if one was actually captured live
         // before the halt (a cell halted before the agent ever reported a
         // session id has nothing of its own to continue) -- `run_cell_worker`
@@ -7261,7 +7261,7 @@ mod tests {
         let cancellations = Cancellations::new();
         // Still-registered token: the squad's worker thread hasn't exited,
         // so it will notice the cell's DB state flip via the same
-        // reclaimed-detached reconciliation `resume_detached_cell` relies
+        // reclaimed-detached reconciliation the waypoint resume relies
         // on -- the sweep must not also stomp the squad's own row.
         let _token = cancellations.register("squad-1");
         run_pending_waypoint_resumes(&handle, &cancellations);

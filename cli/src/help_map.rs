@@ -1021,7 +1021,7 @@ const CHECK_CHILDREN: &[HelpNode] = &[
             "--enable-live-agent-check",
             "--json",
         ],
-        "Check the local ralphus setup, grouped into Core/Harness/Machine sections (daemon, layered config, git, tmux, runner, agent backends, gh/glab, resource checks). --all-remotes also checks every configured [machine.targets.*] entry (RAL-355 Phase 9); --enable-live-agent-check additionally performs a live, cost-incurring Arbiter completion round-trip (RAL-415, off by default).",
+        "Check the local ralphus setup, grouped into Core/Harness/Machine sections (daemon, layered config, git, runner, agent backends, gh/glab, resource checks). --all-remotes also checks every configured [machine.targets.*] entry (RAL-355 Phase 9); --enable-live-agent-check additionally performs a live, cost-incurring Arbiter completion round-trip (RAL-415, off by default).",
         true, // ("check", "health") -- multi-step subprocess/filesystem work
         true, // ("check", "health")
         &[],
@@ -2137,24 +2137,6 @@ const CELL_CHILDREN: &[HelpNode] = &[
         &[],
     ),
     node(
-        "open-agent",
-        &["selector [str]"],
-        &[],
-        "Open the real interactive agent in a new terminal -- while running, cleanly detaches the cell first (RAL-288); while finished, resumes it the old way.",
-        false,
-        false,
-        &[],
-    ),
-    node(
-        "remote-terminal",
-        &["selector [str]"],
-        &[],
-        "Attach an interactive terminal to a remote cell's resumed Claude Code session over the daemon's WebSocket relay (RAL-355).",
-        false,
-        false,
-        &[],
-    ),
-    node(
         "restart",
         &["selector [str]"],
         &[],
@@ -2168,15 +2150,6 @@ const CELL_CHILDREN: &[HelpNode] = &[
         &["selector [str]"],
         &["--from [index]"],
         "Restart a cell's proof steps: resets the whole sequence to pending and re-runs from the start.",
-        false,
-        false,
-        &[],
-    ),
-    node(
-        "resume-automation",
-        &["selector [str]"],
-        &[],
-        "Hand a detached cell back to unattended execution, continuing the exact same agent conversation (RAL-288).",
         false,
         false,
         &[],
@@ -2638,7 +2611,7 @@ placeholder message; Python's `shell` argument is not read.)",
             "history",
             &["selector [str]"],
             &["--type [str]"],
-            "Show a cell/proof step's tmux history (one-shot snapshot; Python's --live \
+            "Show a cell/proof step's transcript history (one-shot snapshot; Python's --live \
 tailing and --wait-until-valid are not yet ported).",
             false,
             true, // ("history",)

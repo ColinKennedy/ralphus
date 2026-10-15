@@ -12,7 +12,7 @@
 //! env map is fully known -- `daemon/src/scheduler.rs`, right after the
 //! agent-profile env and the resolved `env_overrides` layers are merged --
 //! rather than in the hot pane-text redaction path itself:
-//! `redact::redact_all` (called from `tmux.rs`/`terminal_log.rs`/
+//! `redact::redact_all` (called from `cell_session.rs`/`terminal_log.rs`/
 //! `runner.rs` on every pane snapshot) only ever replaces *already
 //! registered* values, so it never needs to know about names or hit the DB.
 //! [`Store::secret_env_names_cached`] is what the scheduler's choke point

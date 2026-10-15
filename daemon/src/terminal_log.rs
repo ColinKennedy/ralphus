@@ -1,9 +1,9 @@
 //! Durable, per-attempt terminal-log capture (RAL-154).
 //!
-//! `crate::tmux::write_pane_snapshot`/`read_pane_snapshot` already persist a
+//! `crate::cell_session::write_pane_snapshot`/`read_pane_snapshot` already persist a
 //! session's *last* pane content as a single file that gets overwritten on
 //! every attempt — good enough for "what was there most recently", but a
-//! tmux-reattach (`crate::runner::SubprocessRunner::run_via_tmux`) can retry
+//! reattach (`crate::runner::SubprocessRunner::run_direct`) can retry
 //! the same `(run_id, task, session_id)` up to `MAX_REATTACH_ATTEMPTS` times,
 //! and each prior attempt's output was lost the moment the next one
 //! overwrote it. This module persists every attempt's terminal output as its
@@ -13,7 +13,7 @@
 //!
 //! Storage layout: `state_dir()/terminal_logs/<session_name>/<NNNN>.log`,
 //! where `<session_name>` is the same deterministic, already-sanitized name
-//! `crate::tmux::session_name` computes (so no new bookkeeping is needed to
+//! `crate::cell_session::session_name` computes (so no new bookkeeping is needed to
 //! find a session's logs — every "peek"/"open terminal" call site already
 //! recomputes this name) and `<NNNN>` is the zero-padded attempt index (`0`
 //! for the initial run, `1..` for each reattach). This layout is
@@ -32,7 +32,7 @@
 //! session exceeds `max_files` the oldest excess files are pruned too (see
 //! [`prune`]). Deleting a run or guardian also deletes every terminal log
 //! belonging to it outright, via [`delete_with_prefix`] — mirroring
-//! `crate::tmux::kill_run_tmux_sessions`'s `ralphus_<run_id>_` prefix scoping
+//! the direct runner's `ralphus_<run_id>_` prefix scoping
 //! (see `daemon/src/server.rs`'s `delete_run`/`guardian_delete`).
 
 use std::path::PathBuf;
@@ -90,7 +90,7 @@ pub fn attempt_path(session_name: &str, attempt: u32) -> PathBuf {
 }
 
 /// Path a given attempt's *raw* transcript lives (or would live) at — the
-/// continuous, verbatim byte stream `Tmux::pipe_pane` tees a pane's output
+/// continuous, verbatim byte stream the transcript writer tees a pane's output
 /// to for the attempt's whole lifetime (RAL-397 Phase 2C), as opposed to
 /// [`attempt_path`]'s `.log` file, which is a single point-in-time
 /// `capture-pane` snapshot written once the attempt ends. Deliberately the
@@ -126,13 +126,13 @@ pub struct AttemptMeta {
 
 /// Write `content` as the durable log for `session_name`'s attempt `attempt`,
 /// truncated to `max_lines` (the tail — most recent output — is kept, same
-/// convention as `crate::tmux::write_pane_snapshot`). Prefixes a one-line
+/// convention as `crate::cell_session::write_pane_snapshot`). Prefixes a one-line
 /// header identifying the session/attempt/write time so the file is
 /// self-describing when opened directly or concatenated with siblings.
 ///
 /// Idempotent per `(session_name, attempt)`: calling this again for the same
 /// pair (e.g. a fresher capture of a stale session right before it's killed —
-/// see `crate::runner::SubprocessRunner::run_via_tmux_attempt`) overwrites the
+/// see `crate::runner::SubprocessRunner::run_direct_attempt`) overwrites the
 /// prior write for that attempt, never appends. Best-effort: a write failure
 /// (e.g. disk full) is logged but never fails the session itself, matching
 /// `write_pane_snapshot`'s precedent.
@@ -148,7 +148,7 @@ pub fn write_attempt(session_name: &str, attempt: u32, content: &str, max_lines:
 
 /// Bound on how many bytes are read from the *tail* of a `.raw` transcript
 /// (RAL-397 Phase 2E) when deriving the durable, human-readable attempt log —
-/// a disk file can grow up to `ralphus-runner pipe-sink`'s own 256 MiB cap,
+/// a disk file can grow up to the transcript writer's 256 MiB cap,
 /// and reading the whole thing into memory before the existing line-based
 /// `max_lines` truncation would spike RAM for no benefit, since only the tail
 /// ever survives that truncation anyway. 8 MiB is generous relative to
@@ -167,14 +167,14 @@ const MAX_TRANSCRIPT_RANGE_LIMIT: u64 = 8 * 1024 * 1024;
 /// Derive `session_name`'s attempt `attempt` durable, human-readable log from
 /// its `.raw` pipe-pane transcript (RAL-397 Phase 2E) instead of a single
 /// point-in-time `capture-pane` snapshot — the transcript is unbounded-depth
-/// (bounded only by `pipe-sink`'s own byte cap, not by pane scrollback), so
+/// (bounded only by the transcript byte cap, not by pane scrollback), so
 /// this delivers "saved lines accessible as contiguous text" without the
 /// scrollback-depth ceiling the old capture-based path had.
 ///
 /// Reads at most the last [`RAW_TRANSCRIPT_TAIL_READ_BYTES`] of the file (a
 /// bounded-memory tail read, not the whole file), strips ANSI escape
 /// sequences (the raw transcript is a verbatim byte tee — see
-/// [`Tmux::pipe_pane`](crate::tmux::Tmux::pipe_pane) — so it carries color/
+/// [the transcript writer](the direct runner) — so it carries color/
 /// cursor codes a `capture-pane` snapshot never did), then reuses
 /// [`write_attempt`]'s existing redaction/line-truncation/header pipeline
 /// unchanged. A missing `.raw` file (no cell has run yet, or Phase 2C's
@@ -229,7 +229,7 @@ const MAX_RENDERED_LINE_COLS: usize = 10_000;
 /// # Why this exists
 ///
 /// Before Phase 2E the durable log came from `capture-pane -p` — the screen
-/// psmux had already composited. Deriving it from the raw byte stream instead
+/// runner had already composited. Deriving it from the raw byte stream instead
 /// means every frame of an in-place rewrite arrives as separate content, so a
 /// `cargo` build's progress bar contributes hundreds of near-identical passes
 /// over one line, which then push everything else out through `max_lines`
@@ -433,7 +433,7 @@ pub struct RawTranscriptRange {
 
 /// Read up to `limit` bytes starting at `offset` from `session_name`'s
 /// attempt `attempt` raw transcript (RAL-397 Phase 2F) — the file
-/// `Tmux::pipe_pane` (via Phase 2C's wiring) continuously appends to for the
+/// the transcript writer (via Phase 2C's wiring) continuously appends to for the
 /// attempt's whole lifetime, so a request against a still-running cell reads
 /// whatever has been captured so far, live. `None` when no `.raw` file
 /// exists for that attempt (the cell never ran under the Phase 2C-wired
@@ -661,7 +661,7 @@ fn write_attempt_in(
 }
 
 /// List every attempt persisted for `session_name`, ascending by attempt
-/// number. Empty (not an error) when the session never ran under tmux, or no
+/// number. Empty (not an error) when the session never ran as a direct run, or no
 /// attempt has finished writing its log yet.
 #[must_use]
 pub fn list_attempts(session_name: &str) -> Vec<AttemptMeta> {
@@ -824,10 +824,10 @@ fn delete_for_session_in(root: &std::path::Path, session_name: &str) -> bool {
 
 /// Delete every session's terminal logs whose (already-sanitized)
 /// `session_name` starts with `prefix` — the terminal-log counterpart to
-/// `crate::tmux::Tmux::kill_sessions_with_prefix`, used so deleting a run or
+/// the direct runner, used so deleting a run or
 /// guardian also deletes its durable terminal-log history (RAL-154 Q3).
 /// `prefix` is the same `ralphus_<run_id>_`/`ralphus_guardian-<guardian_id>_`
-/// scoping `server.rs`'s `kill_run_tmux_sessions`/`kill_guardian_tmux_sessions`
+/// scoping `server.rs`'s `kill_squad_cell_sessions`/`kill_guardian_cell_sessions`
 /// already use. Best-effort and silent on any I/O error, matching this
 /// module's other cleanup paths — a leftover log directory is a bounded,
 /// non-fatal disk-space cost, never worth failing a delete over.

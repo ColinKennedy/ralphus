@@ -38,7 +38,7 @@
           const cells = t.cells.map((s, si) => `
             <div class="cell selectable ${selCls("cell", ti, si)}" id="n-${ti}-${si}" data-click="onGraphNodeClick" data-ctx="openCellNodeMenu" data-squad-id="${esc(squad.id)}" data-kind="cell" data-ti="${ti}" data-si="${si}" data-vi="-1"
                  data-tip="${esc(s.name ?? s.id)} · ${esc(s.state)}\nAgent: ${esc(s.agent)}${s.model ? " · " + esc(s.model) : ""}${(s.depends_on||[]).length ? "\nDepends on: " + esc((s.depends_on||[]).join(", ")) : ""}\nClick to view details; Shift/Ctrl-click to multi-select; right-click for actions.">
-              <div class="sid">${esc(s.name ?? s.id)} ${pill(s.state)}${detachedGraphBadge(s.detached_at_ms)}${delayedGraphBadge(s.delayed_until_ms)}${runnerStalledBadge(s.runner_stalled_at_ms)}${s.error ? failLogBtn(s.error) : ""}</div>
+              <div class="sid">${esc(s.name ?? s.id)} ${pill(s.state)}${delayedGraphBadge(s.delayed_until_ms)}${runnerStalledBadge(s.runner_stalled_at_ms)}${s.error ? failLogBtn(s.error) : ""}</div>
               <div class="kv">${esc(s.agent)}${s.model ? " · " + esc(s.model) : ""}</div>
               ${cellProof(s, ti, si, selCls, squad.id)}
             </div>`).join("");
@@ -886,13 +886,8 @@
           : "";
         const terminalBtns = (() => {
           const scope = si === -1 ? "task" : "cell";
-          // RAL-102/RAL-151: every command/prompt proof step runs inside
-          // tmux, so the dropdown is available for either kind — "not
-          // currently live" is handled gracefully at click/peek time, not by
-          // pre-disabling. "Open Agent" only makes sense for a prompt-kind
-          // step (there is no agent conversation to resume for a plain
-          // shell command), so it's omitted outright for command-kind
-          // rather than shown disabled.
+          // RAL-102/RAL-151: every command/prompt proof step is live-view
+          // capable, so the dropdown is available for either kind.
           const key = `proof|${r.id}|${ti}|${scope}|${si}|${vi}`;
           const live = squadLiveCtx({
             baseKey: key,
@@ -905,16 +900,7 @@
             currentKind: v.kind === "command" ? "command" : "current",
             closeKey: key,
           });
-          const openAgentItem = v.kind === "prompt"
-            ? openAgentMenuItem(key, "openAgentProofTerminalMenuItem",
-                { squadId: r.id, ti, scope, si, vi },
-                v.state === "running", v.agent_session_id, v.agent)
-            : "";
-          const items = terminalMenuItem(key, "Open Terminal Log",
-              "openProofTerminalMenuItem", { squadId: r.id, ti, scope, si, vi },
-              "Attach an interactive terminal to this proof step's live tmux cell.\nShows the runner's own log/event stream, not the agent's actual conversation.\nOnly available while the proof step is actively running — fails gracefully otherwise.")
-            + openAgentItem
-            + terminalMenuItem(key, "View Attempt History",
+          const items = terminalMenuItem(key, "View Attempt History",
                 "toggleHistoryMenuItem", {},
                 "List every durably-persisted terminal-log attempt for this proof step, including past reattaches.\nWho/when: the pane died or reattached and you need to see what happened right before, after the live view is gone.\nEach attempt's log survives pane death and daemon restarts.");
           return `<div class="btn-row" style="position:relative;gap:0">${squadLiveOpenBtn(key, "this proof step")}${terminalMenuHtml(key, items)}</div>${squadLiveSlot(live)}${historyBox(key)}`;
@@ -1171,7 +1157,7 @@
           ${s.name ? `<div class="kv-row"><span class="k">name</span><span class="v">${esc(s.name)}</span></div>` : ""}
           <div class="kv-row"><span class="k">id</span><span class="v mono">${esc(s.id)}${copyBtn(s.id)}</span></div>
           <div class="kv-row"><span class="k">task</span><span class="v">${esc(t.name)}</span></div>
-          <div class="kv-row"><span class="k">state</span><span class="v">${pill(s.state)}${blockingBadge(s.blocking)}${detachedBadge(s.detached_at_ms)}${delayedBadge(s.delayed_until_ms)}${runnerStalledBadge(s.runner_stalled_at_ms)}${outOfDateBadge(s.env_out_of_date)}${subprojectBadge(s)}${["pending","queued"].includes(s.state) ? "" : squadLogsBtn(r.id)}${s.error ? failLogBtn(s.error) : ""}</span></div>
+          <div class="kv-row"><span class="k">state</span><span class="v">${pill(s.state)}${blockingBadge(s.blocking)}${delayedBadge(s.delayed_until_ms)}${runnerStalledBadge(s.runner_stalled_at_ms)}${outOfDateBadge(s.env_out_of_date)}${subprojectBadge(s)}${["pending","queued"].includes(s.state) ? "" : squadLogsBtn(r.id)}${s.error ? failLogBtn(s.error) : ""}</span></div>
           ${timingRows(s.started_at_ms, s.finished_at_ms, s.duration_ms ?? 0, s.active_duration_intervals ?? 0)}
           <div class="kv-row"><span class="k">agent</span>${detailValueHtml(s.agent, agentTip)}</div>
           <div class="kv-row"><span class="k">model</span>${detailValueHtml(s.model || "—", modelTip)}</div>
@@ -1199,15 +1185,7 @@
           </div>
           ${copyLinksSection(r)}
           ${(() => {
-            // RAL-102/RAL-151: every command/prompt cell runs inside
-            // tmux, so both a cell's kind is always live-view capable
-            // ("prompt" XOR "command" is enforced by the schema) — "not
-            // currently live" is handled gracefully at click/peek time
-            // rather than by pre-emptively disabling the buttons. "Open
-            // Agent" only makes sense for a prompt-kind cell (there is
-            // no agent conversation to resume for a plain shell command),
-            // so it's omitted outright for a command cell rather than
-            // shown disabled.
+            // RAL-102/RAL-151: every command/prompt cell is live-view capable.
             const key = `cell|${r.id}|${sel.taskIdx}|${sel.cellIdx}`;
             const live = squadLiveCtx({
               baseKey: key,
@@ -1220,32 +1198,7 @@
               currentKind: s.command ? "command" : "current",
               closeKey: key,
             });
-            // Open Agent spawns a window on the *daemon's own desktop* — it
-            // has no way to reach a remote cell's conversation, so a remote
-            // cell gets "Remote Terminal" (the WebSocket relay) instead of
-            // "Open Agent", never both (RAL-355 Phase 10).
-            const openAgentItem = s.command || s.machine
-              ? ""
-              : openAgentMenuItem(key, "openAgentTerminalMenuItem",
-                  { squadId: r.id, ti: sel.taskIdx, si: sel.cellIdx },
-                  s.state === "running", s.agent_session_id, s.agent, s.machine, true);
-            const remoteTerminalItem = s.command || !s.machine
-              ? ""
-              : remoteTerminalMenuItem(key, "remoteTerminalMenuItem",
-                  { squadId: r.id, ti: sel.taskIdx, si: sel.cellIdx },
-                  s.state === "running", s.agent_session_id, s.agent);
-            const resumeAutomationItem = s.command
-              ? ""
-              : resumeAutomationMenuItem(key, "resumeAutomationMenuItem",
-                  { squadId: r.id, ti: sel.taskIdx, si: sel.cellIdx },
-                  s.state === "running", s.agent_session_id);
-            const items = terminalMenuItem(key, "Open Terminal Log",
-                "openTerminalMenuItem", { squadId: r.id, ti: sel.taskIdx, si: sel.cellIdx },
-                "Attach an interactive terminal to this cell's live tmux cell.\nShows the runner's own log/event stream, not the agent's actual conversation.\nOnly available while the cell is actively running — fails gracefully otherwise.")
-              + openAgentItem
-              + remoteTerminalItem
-              + resumeAutomationItem
-              + terminalMenuItem(key, "View Attempt History",
+            const items = terminalMenuItem(key, "View Attempt History",
                   "toggleHistoryMenuItem", {},
                   "List every durably-persisted terminal-log attempt for this cell, including past reattaches.\nWho/when: the pane died or reattached and you need to see what happened right before, after the live view is gone.\nEach attempt's log survives pane death and daemon restarts.");
             return `<div class="btn-row" style="position:relative;gap:0">${squadLiveOpenBtn(key, "this cell")}${terminalMenuHtml(key, items)}</div>${squadLiveSlot(live)}${historyBox(key)}`;
@@ -1369,7 +1322,7 @@ On failure no agent starts; fix it with Edit, then Retry the squad.">Worktree in
       /**
        * Resolves a cell/proof-step peek `key`'s most recently captured raw
        * output text (RAL-295): a durably-persisted terminal-log attempt if one
-       * exists (the fuller, final record), else the live/last tmux pane
+       * exists (the fuller, final record), else the live/last pane
        * snapshot, else `null` when neither backend has ever captured anything
        * for this key. Shared by the Logs modal's cells/proofs tabs, which link
        * to this data on demand rather than carrying a separate stored/

@@ -20,15 +20,6 @@ serde_json = "1"
 toml = "0.8"
 thiserror = "2"
 tiny_http = "0.12"
-# The daemon's terminal-relay listener (RAL-355 Phase 10, Open Agent over the
-# network). Deliberately the sync/blocking core crate, not `tokio-tungstenite`
-# -- this workspace has no async runtime (see `tiny_http`/`ureq` above and the
-# root profile note on build time), and this crate works directly over a
-# blocking `std::net::TcpStream`, so it doesn't need one either. It is *not*
-# layered onto `tiny_http`'s own connections: `tiny_http` has no upgrade/
-# hijack hook, so the terminal relay binds its own dedicated port instead of
-# routing through the daemon's existing HTTP server.
-tungstenite = { version = "0.24", default-features = false, features = ["handshake"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
 # RAL-393: the daemon's single `Store` mutex is `std::sync::Mutex`, which is
 # not fair -- under sustained contention from scheduler/merge workers,
@@ -37,8 +28,7 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 # stalls on trivial reads. `parking_lot::Mutex` implements "eventual
 # fairness": a thread blocked past a short internal threshold is handed the
 # lock directly on the next unlock, bypassing barging. Already present
-# transitively (via `crossterm`, pinned at 0.12.5 in the lockfile); promoted
-# to a direct dependency here rather than left implicit.
+# transitively; promoted to a direct dependency here rather than left implicit.
 parking_lot = "0.12"
 ureq = { version = "2", default-features = false }
 ed25519-dalek = "2"
@@ -49,8 +39,7 @@ base64 = "0.22"
 gethostname = "1"
 # Process-table walk for the CLI's `quick-start --command` parent-shell
 # detection (RAL-189/RAL-110 port) -- same crate/version/feature set the
-# daemon already uses for its own Windows process-table read (see
-# `daemon/src/tmux.rs::find_server_pid_windows`), so this is not a new
+# daemon already uses for its own process-table reads, so this is not a new
 # dependency shape for the workspace, just a second consumer of one already
 # vetted here.
 sysinfo = { version = "0.36.1", default-features = false, features = ["system"] }
@@ -111,18 +100,6 @@ opentelemetry_sdk = { version = "0.32", default-features = false, features = ["t
 # Pinned to 0.15.0: 0.16+ uses the `unsigned_is_multiple_of` std feature,
 # unstable below rustc 1.87 and this workspace's MSRV CI job pins 1.86.
 cron = "=0.15.0"
-# `ralphus cell remote-terminal` (RAL-355 Phase 10): puts this process's own
-# stdin/stdout into raw pty-passthrough mode for the CLI terminal-relay
-# client (`cli/src/terminal_relay.rs`). Windows console raw mode and POSIX
-# termios raw mode are different enough (and `unsafe_code = "forbid"` bans
-# hand-rolling either syscall surface in this workspace's own crates) that a
-# small, well-audited cross-platform crate is the pragmatic choice here,
-# unlike the terminal *transport* itself (`tungstenite` above), which this
-# workspace does hand-roll the server side of. Default features kept
-# (`windows`, `events`, `bracketed-paste`) rather than trimmed -- this
-# crate's raw-mode support genuinely needs the platform backend each
-# provides, and only one binary in the workspace depends on it at all.
-crossterm = "0.28"
 # libgit2, used three ways. (1) In-process repo scaffolding for the
 # guardian_merge/worktrees/pr fixture-heavy daemon tests -- building a temp
 # repo's base commits/branches/local "remote" through libgit2 avoids one real

@@ -15,7 +15,7 @@
 //! polls the result) rather than blocking the HTTP response on the call --
 //! `crate::server`'s `ReadPool` doc comment spells out why: **every mutating
 //! request runs on the accept loop, one at a time**, so a handler that
-//! blocked there for the seconds-to-minutes a tmux-wrapped agent subprocess
+//! blocked there for the seconds-to-minutes a direct agent subprocess
 //! can take would stall every other write (submit, cancel, activate, ...)
 //! for that whole window. This module follows the same pattern as
 //! `crate::server::guardian_resolve_input`.

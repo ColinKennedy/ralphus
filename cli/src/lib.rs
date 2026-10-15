@@ -15,7 +15,6 @@ pub mod help_map;
 pub mod output;
 pub mod program_name;
 pub mod selector;
-pub mod terminal_relay;
 pub mod tutor;
 
 /// Re-exported rather than duplicated -- see `runner/src/hostos.rs`; this

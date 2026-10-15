@@ -1,25 +1,16 @@
-//! Direct (tmux-free) cell execution.
+//! Direct cell execution.
 //!
 //! The runner binary (`ralphus-runner send`) is headless: it drives the agent
 //! over piped stdio, prints `RALPHUS_EVENT:` lines on its own stdout and
-//! writes a result file. Hosting it in a tmux pane only gives the board
-//! something to look at, so this path spawns it as a plain child process and
-//! tees its stdout and stderr into the same durable `.raw` transcript a
-//! `pipe-pane` sink would write. Everything downstream -- event forwarding,
-//! stall detection, terminal logs, the Live View transcript endpoints -- reads
-//! that file and is unchanged.
+//! writes a result file. A cell runs as a plain child process of the daemon
+//! whose stdout and stderr are teed into a durable `.raw` transcript.
+//! Event forwarding, stall detection, terminal logs and the Live View
+//! transcript endpoints all read that file.
 //!
-//! Differences from the tmux path ([`SubprocessRunner::run_via_tmux`]):
-//! - completion is the child's exit status plus its result file, not a
-//!   sentinel line in a pane;
-//! - there is no pane to vanish, so no reattach loop;
+//! - completion is the child's exit status plus its result file;
 //! - cancellation kills the child's whole process tree
 //!   ([`crate::proof::ProcessTree`]);
-//! - Live View of a running cell is the transcript tail
-//!   ([`live_tail`]), not a rendered screen.
-//!
-//! `RALPHUS_RUNNER_MODE` selects the path: `tmux` forces the old path,
-//! `direct` forces this one, and unset lets [`use_direct`] decide.
+//! - Live View of a running cell is the transcript tail ([`live_tail`]).
 
 use super::*;
 use std::collections::HashMap;
@@ -39,53 +30,17 @@ const PUMP_JOIN_GRACE: Duration = Duration::from_secs(2);
 /// How many trailing transcript lines the ended-cell snapshot keeps.
 const SNAPSHOT_TAIL_LINES: usize = 200;
 
-/// Which execution path a spec takes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RunnerMode {
-    /// `RALPHUS_RUNNER_MODE=tmux`: every spec runs in a tmux pane.
-    Tmux,
-    /// `RALPHUS_RUNNER_MODE=direct`: every spec runs as a plain child.
-    Direct,
-    /// Unset or unrecognized: [`use_direct`] picks per spec.
-    Auto,
-}
-
-fn runner_mode() -> RunnerMode {
-    match std::env::var("RALPHUS_RUNNER_MODE")
-        .unwrap_or_default()
-        .trim()
-        .to_ascii_lowercase()
-        .as_str()
-    {
-        "tmux" => RunnerMode::Tmux,
-        "direct" => RunnerMode::Direct,
-        _ => RunnerMode::Auto,
-    }
-}
-
-/// Whether `spec` runs as a plain child process rather than in a tmux pane.
-pub(super) fn use_direct(_spec: &RunnerSpec) -> bool {
-    match runner_mode() {
-        RunnerMode::Tmux => false,
-        RunnerMode::Direct => true,
-        // The runner is headless for every kind of spec, so no cell needs a
-        // pane to run in.
-        RunnerMode::Auto => true,
-    }
-}
-
 /// Cells currently running through this path, keyed by session name (see
-/// [`crate::tmux::session_name`]), each with the flag that asks its run loop to
+/// [`crate::cell_session::session_name`]), each with the flag that asks its run loop to
 /// stop. The Live View endpoints use the keys to tell "running headless" from
-/// "no such session"; the cancel and status-change paths that used to kill a
-/// tmux session by name use the flags.
+/// "no such session"; the cancel and status-change paths use the flags.
 fn active() -> &'static Mutex<HashMap<String, Arc<AtomicBool>>> {
     static ACTIVE: LazyLock<Mutex<HashMap<String, Arc<AtomicBool>>>> =
         LazyLock::new(Mutex::default);
     &ACTIVE
 }
 
-/// Whether `session_name` names a cell currently running without tmux.
+/// Whether `session_name` names a cell currently running.
 #[must_use]
 pub(crate) fn is_active(session_name: &str) -> bool {
     active()
@@ -173,7 +128,7 @@ fn transcript_tail(path: &std::path::Path, lines: usize) -> Option<String> {
 }
 
 /// The transcript file shared by a child's stdout and stderr pumps. Mirrors
-/// `ralphus-runner pipe-sink`: appends up to `cap` bytes, then drops the rest
+/// the transcript writer: appends up to `cap` bytes, then drops the rest
 /// and writes one truncation marker so a reader knows the record is partial.
 struct CappedSink {
     file: std::fs::File,
@@ -208,13 +163,11 @@ impl CappedSink {
 /// The shell the runner should treat as "the shell that launched it".
 ///
 /// The runner runs a `command` with the nearest shell among its ancestor
-/// processes. In a tmux pane that was always the pane's own shell; as a direct
-/// child of the daemon it would instead be whatever shell happened to start
-/// the daemon. On Windows the pane was an interactive PowerShell, so this
-/// pins that. `None` leaves detection alone: on POSIX the pane shell was the
-/// user's login shell, which is what ancestry finds anyway, and an explicit
-/// `RALPHUS_SHELL` always wins.
-fn pane_equivalent_shell(
+/// processes, which for a direct child of the daemon would be whatever shell
+/// happened to start the daemon. On Windows this pins PowerShell. `None`
+/// leaves detection alone: on POSIX ancestry already finds the login shell,
+/// and an explicit `RALPHUS_SHELL` always wins.
+fn shell_override(
     env_overrides: &std::collections::BTreeMap<String, String>,
 ) -> Option<&'static str> {
     if !cfg!(windows)
@@ -272,18 +225,14 @@ impl SubprocessRunner {
         if let Err(e) = std::fs::create_dir_all(&io_dir) {
             return RunnerResult::failure(format!("could not create runner IO dir: {e}"));
         }
-        // Same deterministic name the tmux path uses, so the board's
-        // per-cell endpoints and the transcript/log paths line up.
-        let session_name = crate::tmux::session_name(&spec.squad_id, &spec.task, &spec.cell_id);
+        // The deterministic name keys the board's per-cell endpoints and the
+        // transcript/log paths.
+        let session_name =
+            crate::cell_session::session_name(&spec.squad_id, &spec.task, &spec.cell_id);
         let spec_path = io_dir.join(format!("{session_name}.spec.json"));
         let result_path = io_dir.join(format!("{session_name}.result.json"));
         let active_guard = ActiveGuard::new(&session_name);
 
-        let detach_token = self.detachments.as_ref().map(|d| d.register(&session_name));
-        let _detach_guard = self.detachments.as_ref().map(|d| DetachGuard {
-            detachments: d,
-            session_name: &session_name,
-        });
         let waypoint_halt_token = self
             .waypoint_halts
             .as_ref()
@@ -311,7 +260,6 @@ impl SubprocessRunner {
         let result = self.run_direct_attempt(
             spec,
             cancel,
-            detach_token.as_ref(),
             waypoint_halt_token.as_ref(),
             arbiter_stop_token.as_ref(),
             &session_name,
@@ -341,7 +289,6 @@ impl SubprocessRunner {
         &self,
         spec: &RunnerSpec,
         cancel: &CancelToken,
-        detach: Option<&crate::cancel::DetachToken>,
         waypoint_halt: Option<&crate::cancel::WaypointHaltToken>,
         arbiter_stop: Option<&crate::cancel::ArbiterStopToken>,
         session_name: &str,
@@ -399,7 +346,7 @@ impl SubprocessRunner {
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
-        if let Some(shell) = pane_equivalent_shell(&spec.env_overrides) {
+        if let Some(shell) = shell_override(&spec.env_overrides) {
             command.env("RALPHUS_SHELL", shell);
         }
         crate::proof::prepare_command(&mut command);
@@ -455,12 +402,11 @@ impl SubprocessRunner {
         let drain_interval = spec
             .maximum_budget_usd
             .map(|_| crate::config::load_budget_config().poll_interval())
-            .unwrap_or(TMUX_POLL_INTERVAL);
+            .unwrap_or(DRAIN_POLL_INTERVAL);
         let mut last_drain = Instant::now();
         let mut first_tick = true;
 
         let target = || TranscriptEventTarget {
-            pane_event_fallback: false,
             cartographer: self.cartographer.as_ref(),
             squad_id: &spec.squad_id,
             cell_id: &spec.cell_id,
@@ -492,17 +438,6 @@ impl SubprocessRunner {
                 tree.kill(&mut child);
                 self.emit_direct_note(spec, "direct run killed: stop requested", session_name);
                 decided = Some(RunnerResult::failure("cancelled"));
-            } else if detach.is_some_and(crate::cancel::DetachToken::is_cancelled) {
-                tree.kill(&mut child);
-                self.emit_direct_note(
-                    spec,
-                    "direct run killed: detached for manual takeover",
-                    session_name,
-                );
-                decided = Some(RunnerResult::detached(
-                    current_usage,
-                    resumable_agent_session_id.clone(),
-                ));
             } else if waypoint_halt.is_some_and(crate::cancel::WaypointHaltToken::is_cancelled) {
                 tree.kill(&mut child);
                 self.emit_direct_note(spec, "direct run killed: waypoint halt", session_name);
@@ -592,7 +527,7 @@ impl SubprocessRunner {
                 if drained.saw_new_bytes {
                     self.note_live_activity(session_name);
                 }
-                let (_done, stall_sample) = consume_transcript_lines(
+                let stall_sample = consume_transcript_lines(
                     &drained.lines,
                     &target(),
                     &mut resumable_agent_session_id,
@@ -638,14 +573,13 @@ impl SubprocessRunner {
 
         let tail = transcript_tail(&transcript_path, SNAPSHOT_TAIL_LINES).unwrap_or_default();
         let mut result =
-            decided.unwrap_or_else(|| Self::read_tmux_result(result_path, Some(tail.as_str())));
+            decided.unwrap_or_else(|| Self::read_result(result_path, Some(tail.as_str())));
         let _ = std::fs::remove_file(spec_path);
         let _ = std::fs::remove_file(result_path);
 
-        // The same two durable records the tmux path leaves behind: the
-        // single-slot snapshot an ended Live View box shows, and this
-        // attempt's terminal log.
-        crate::tmux::write_pane_snapshot(session_name, &tail);
+        // Two durable records: the single-slot snapshot an ended Live View
+        // box shows, and this attempt's terminal log.
+        crate::cell_session::write_pane_snapshot(session_name, &tail);
         let terminal_log_max_lines =
             crate::config::load_terminal_log_config().max_lines_per_attempt();
         write_terminal_log_preferring_raw_transcript(
@@ -730,7 +664,7 @@ mod tests {
     }
 
     fn transcript_of(spec: &RunnerSpec) -> String {
-        let session = crate::tmux::session_name(&spec.squad_id, &spec.task, &spec.cell_id);
+        let session = crate::cell_session::session_name(&spec.squad_id, &spec.task, &spec.cell_id);
         std::fs::read_to_string(crate::terminal_log::raw_transcript_path(&session, 0))
             .unwrap_or_default()
     }
@@ -767,7 +701,7 @@ mod tests {
     fn a_stop_request_by_session_name_stops_a_headless_run() {
         let (runner, dir) = stub_runner("stop", 30);
         let spec = command_spec("direct-test-stop");
-        let session = crate::tmux::session_name(&spec.squad_id, &spec.task, &spec.cell_id);
+        let session = crate::cell_session::session_name(&spec.squad_id, &spec.task, &spec.cell_id);
         let stopper = std::thread::spawn(move || {
             for _ in 0..100 {
                 if is_active(&session) {

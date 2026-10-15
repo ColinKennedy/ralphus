@@ -45,7 +45,6 @@ pub mod protocol;
 pub mod provision;
 pub mod runner_install;
 pub mod ssh;
-pub mod terminal;
 pub mod transport;
 pub mod uri;
 

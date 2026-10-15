@@ -352,10 +352,8 @@ fn sibling_exe(name: &str) -> std::io::Result<PathBuf> {
 fn start_daemon(root: &Path, kind: &str, port: u16, remote: bool) -> std::io::Result<u32> {
     let home = root.join("home");
     let config = root.join("config");
-    let psmux_data = root.join("psmux");
     std::fs::create_dir_all(&home)?;
     std::fs::create_dir_all(&config)?;
-    std::fs::create_dir_all(&psmux_data)?;
     // The private home hides the user's own git identity, and a review's
     // rebase commits as whoever git says the committer is.
     let gitconfig = home.join(".gitconfig");
@@ -375,10 +373,6 @@ fn start_daemon(root: &Path, kind: &str, port: u16, remote: bool) -> std::io::Re
         .env("HOME", &home)
         .env("RALPHUS_CONFIG_HOME", &config)
         .env("RALPHUS_LOOPBACK_STATE_ROOT", root.join("providers"))
-        // psmux otherwise shares machine-wide session state with a developer's
-        // normal daemon. Its data directory is part of an exercise's private
-        // state just like the database and token.
-        .env("PSMUX_DATA_DIR", psmux_data)
         .env("RALPHUS_RUNNER_CMD", sibling_exe("ralphus-runner")?)
         // Raw fixture commands are written once for `cmd` and `sh`; never let
         // them land in whatever shell happened to launch this command.

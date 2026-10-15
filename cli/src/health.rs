@@ -8,7 +8,7 @@
 //!   conventions, templates, agent profiles/resolver).
 //! - [`HARNESS`]: everything the actual execution harness needs to run a
 //!   cell -- `git` (only when a registered project actually uses it),
-//!   `tmux`/psmux (live session panes), the runner binary, ripgrep (`rg`,
+//!   the runner binary, ripgrep (`rg`,
 //!   optional -- agents fall back to `grep` when it's unavailable), agent
 //!   backend commands (`claude`/`codex`/`pi`/`ollama`), and the optional
 //!   `gh`/`glab` forge-auth fallbacks.
@@ -876,38 +876,6 @@ fn ripgrep_check_result(probe: &ralphus_runner::ripgrep::RipgrepVersionProbe) ->
     }
 }
 
-/// Resolves tmux/psmux exactly the way the daemon does
-/// (`ralphus_daemon::tmux::resolve_tmux_program_with_source`), reporting
-/// both the resolved value and which resolution source won (an explicit
-/// `RALPHUS_TMUX_CMD` override, the embedded vendored build, or `PATH`) --
-/// RAL-415. A missing binary is a hard `fail`: every live cell session
-/// depends on it.
-fn check_tmux_for(resolved: Result<(String, &'static str), String>) -> CheckResult {
-    match resolved {
-        Ok((program, source)) => CheckResult::harness(
-            "tmux",
-            PASS,
-            format!("{program} (source: {source})"),
-            "Live sessions/panes for running cells depend on this binary.",
-            "No action needed.",
-        )
-        .with_provenance(source),
-        Err(e) => CheckResult::harness(
-            "tmux",
-            FAIL,
-            e,
-            "Cells cannot start a live, pollable session; task execution fails wherever it depends on tmux/psmux.",
-            "Install tmux/psmux and put it on PATH, or set RALPHUS_TMUX_CMD to its full path (see docs/dependencies.md).",
-        ),
-    }
-}
-
-fn check_tmux() -> CheckResult {
-    check_tmux_for(
-        ralphus_daemon::tmux::resolve_tmux_program_with_source().map_err(|e| e.to_string()),
-    )
-}
-
 /// Lists every `.ralphus.toml`-shaped file that layers into the CLI-side
 /// `task.*`/`[daemon]` settings loader (`crate::config::load_config`), in
 /// resolution order (later wins) -- RAL-415: "which files even contribute"
@@ -1149,7 +1117,7 @@ fn read_live_view_table(path: &Path) -> Option<toml::Table> {
 
 /// Validates `.ralphus.toml`'s `[live_view] tool_arg_truncate_chars`
 /// (RAL-303) -- how many characters of a `tool_use` argument value the
-/// claude-code backend renders into the Live View tmux pane before
+/// claude-code backend renders into the Live View before
 /// truncating with a trailing `…`. Mirrors `check_max_concurrent`'s shape:
 /// PASS reports the resolved value and its source; a present-but-invalid
 /// value is a WARN, not a FAIL, since `ralphus_daemon::runner::RunnerSpec`
@@ -2063,7 +2031,6 @@ pub fn run_checks(
 
     results.push(check_runner().with_id(ID_RUNNER));
     results.push(check_ollama().with_id(ID_OLLAMA));
-    results.push(check_tmux().with_id(ID_TMUX));
     results.push(check_gh().with_id(ID_GH));
     results.push(check_glab().with_id(ID_GLAB));
     results.push(check_ripgrep());
@@ -3026,57 +2993,5 @@ mod tests {
     fn check_nvidia_smi_live_probe_never_fails() {
         let r = check_nvidia_smi();
         assert_ne!(r.status, FAIL, "{r:?}");
-    }
-
-    // ── tmux resolution (RAL-415) ───────────────────────────────────────
-
-    #[test]
-    fn check_tmux_reports_resolved_value_and_source() {
-        let result = check_tmux_for(Ok((
-            "tmux".to_string(),
-            ralphus_daemon::tmux::TMUX_SOURCE_ENV_OVERRIDE,
-        )));
-        assert_eq!(result.status, PASS);
-        assert!(result.detail.contains("tmux"));
-        assert!(
-            result
-                .detail
-                .contains(ralphus_daemon::tmux::TMUX_SOURCE_ENV_OVERRIDE)
-        );
-        assert_eq!(
-            result.provenance.as_deref(),
-            Some(ralphus_daemon::tmux::TMUX_SOURCE_ENV_OVERRIDE)
-        );
-    }
-
-    #[test]
-    fn check_tmux_reports_embedded_and_path_sources() {
-        let embedded = check_tmux_for(Ok((
-            "/tmp/tmux.exe".to_string(),
-            ralphus_daemon::tmux::TMUX_SOURCE_EMBEDDED,
-        )));
-        assert!(
-            embedded
-                .detail
-                .contains(ralphus_daemon::tmux::TMUX_SOURCE_EMBEDDED)
-        );
-
-        let on_path = check_tmux_for(Ok((
-            "tmux".to_string(),
-            ralphus_daemon::tmux::TMUX_SOURCE_PATH,
-        )));
-        assert!(
-            on_path
-                .detail
-                .contains(ralphus_daemon::tmux::TMUX_SOURCE_PATH)
-        );
-    }
-
-    #[test]
-    fn check_tmux_fails_with_remediation_when_unresolved() {
-        let result = check_tmux_for(Err("no tmux-compatible binary found".to_string()));
-        assert_eq!(result.status, FAIL);
-        assert!(result.remediation.contains("RALPHUS_TMUX_CMD"));
-        assert_eq!(result.section, HARNESS);
     }
 }

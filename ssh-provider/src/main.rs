@@ -6,7 +6,7 @@ use std::io::Read;
 
 use ralphus_ssh_provider::{
     UNIMPLEMENTED_VERBS, capabilities, channel, cleanup, exec, fileops, job, materialize, ping,
-    protocol, provision, terminal,
+    protocol, provision,
 };
 
 struct Args {
@@ -15,11 +15,6 @@ struct Args {
     ssh_config_file: Option<String>,
     handle: Option<String>,
     since: i64,
-    /// `terminal` only: the remote command to run under the allocated pty.
-    command: Option<String>,
-    /// `terminal` only: initial terminal size.
-    cols: u16,
-    lines: u16,
 }
 
 fn parse_args(argv: &[String]) -> Result<Args, String> {
@@ -28,9 +23,6 @@ fn parse_args(argv: &[String]) -> Result<Args, String> {
     let mut ssh_config_file = None;
     let mut handle = None;
     let mut since = 0_i64;
-    let mut command = None;
-    let mut cols = 80_u16;
-    let mut lines = 24_u16;
     let mut i = 0;
     while i < argv.len() {
         match argv[i].as_str() {
@@ -66,30 +58,6 @@ fn parse_args(argv: &[String]) -> Result<Args, String> {
                     .map_err(|_| "--since must be an integer".to_string())?;
                 i += 2;
             }
-            "--command" => {
-                command = Some(
-                    argv.get(i + 1)
-                        .cloned()
-                        .ok_or_else(|| "--command requires a value".to_string())?,
-                );
-                i += 2;
-            }
-            "--cols" => {
-                cols = argv
-                    .get(i + 1)
-                    .ok_or_else(|| "--cols requires a value".to_string())?
-                    .parse()
-                    .map_err(|_| "--cols must be a positive integer".to_string())?;
-                i += 2;
-            }
-            "--lines" => {
-                lines = argv
-                    .get(i + 1)
-                    .ok_or_else(|| "--lines requires a value".to_string())?
-                    .parse()
-                    .map_err(|_| "--lines must be a positive integer".to_string())?;
-                i += 2;
-            }
             value if !value.starts_with('-') && verb.is_none() => {
                 verb = Some(value.to_string());
                 i += 1;
@@ -103,9 +71,6 @@ fn parse_args(argv: &[String]) -> Result<Args, String> {
         ssh_config_file,
         handle,
         since,
-        command,
-        cols,
-        lines,
     })
 }
 
@@ -256,25 +221,6 @@ fn main() {
         "capabilities" => {
             let config = exec_config(&args);
             protocol::reply_capabilities(capabilities::run(&args.uri, &config));
-        }
-        "terminal" => {
-            // No `protocol::reply` here by design -- see `terminal`'s module
-            // docs. Any error is reported on *stderr* (never stdout, which is
-            // the raw terminal byte stream from the moment this verb starts)
-            // and this process exits non-zero so the daemon can tell the
-            // relay never even connected.
-            let config = exec_config(&args);
-            let Some(command) = args.command.clone() else {
-                eprintln!("terminal requires --command");
-                std::process::exit(1);
-            };
-            match terminal::run(&args.uri, &command, args.cols, args.lines, &config) {
-                Ok(code) => std::process::exit(code),
-                Err(e) => {
-                    eprintln!("{e}");
-                    std::process::exit(1);
-                }
-            }
         }
         "provision" => {
             let payload = read_stdin();

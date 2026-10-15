@@ -136,9 +136,8 @@
        * @property {number|null} [finished_at_ms]
        * @property {boolean} [env_out_of_date] - RAL-271: cosmetic "out of date" badge — true once this cell's own `env_overrides` has been edited since the cell last ran/retried or had its status explicitly set. No behavioral effect.
        * @property {CellBlocking} [blocking] - RAL-641: what this failed cell holds up; absent unless it has failed at least its threshold number of times and something waits on it.
-       * @property {number|null} [detached_at_ms] - RAL-288: when this cell was cleanly stopped for a real interactive agent session to take over, or absent/null while it isn't detached. State still reads `running` while this is set — the cell is paused for a human, not stuck. Clears automatically on the cell's next dispatch (a restart, or resume-automation).
        * @property {number|null} [runner_stalled_at_ms] - RAL-626: Unix epoch milliseconds the daemon's runner watchdog flagged this `running` cell as having no live runner and no recent activity, or absent/null while healthy. State still reads `running` until the watchdog's second threshold fails the cell.
-       * @property {number|null} [delayed_until_ms] - RAL-435: Unix epoch milliseconds this cell expects to automatically resume at, or absent/null while it isn't waiting out a rate limit. State still reads `running` while this is set — the daemon is waiting out a recognized, retryable provider rate limit's suggested delay before resuming the same agent session, not stuck and not waiting on a human (contrast `detached_at_ms`). Clears automatically once the delay elapses (a successful resume) or the retry thrashes and the cell fails.
+       * @property {number|null} [delayed_until_ms] - RAL-435: Unix epoch milliseconds this cell expects to automatically resume at, or absent/null while it isn't waiting out a rate limit. State still reads `running` while this is set — the daemon is waiting out a recognized, retryable provider rate limit's suggested delay before resuming the same agent session, not stuck and not waiting on a human. Clears automatically once the delay elapses (a successful resume) or the retry thrashes and the cell fails.
        */
       /**
        * @typedef {object} TaskView
@@ -184,7 +183,7 @@
       /**
        * One durably-persisted terminal-log attempt's metadata (RAL-154), from
        * `GET .../terminal-log-attempts` — `attempt` `0` is the initial run,
-       * `1..` each subsequent tmux reattach.
+       * `1..` each subsequent attempt.
        * @typedef {object} AttemptMeta
        * @property {number} attempt
        * @property {number} size_bytes

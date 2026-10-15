@@ -103,7 +103,7 @@ pub fn run_command_with_remediation(
         SnapshotGuard::none()
     };
 
-    let command_session = crate::tmux::session_name(
+    let command_session = crate::cell_session::session_name(
         &command_spec.squad_id,
         &command_spec.task,
         &command_spec.cell_id,
@@ -205,7 +205,7 @@ pub fn run_command_with_remediation(
 /// `state_dir().join("terminal_logs")` convention for daemon-owned storage
 /// that lives outside any project checkout.
 fn snapshot_dir_for(command_spec: &RunnerSpec) -> PathBuf {
-    let session_name = crate::tmux::session_name(
+    let session_name = crate::cell_session::session_name(
         &command_spec.squad_id,
         &command_spec.task,
         &command_spec.cell_id,
@@ -414,7 +414,7 @@ pub(crate) fn run_repair_pass(
     repair_agent: &RepairAgent<'_>,
     restart_guidance: Option<&str>,
 ) -> RunnerResult {
-    let session_name = crate::tmux::session_name(
+    let session_name = crate::cell_session::session_name(
         &command_spec.squad_id,
         &command_spec.task,
         &command_spec.cell_id,
@@ -778,7 +778,8 @@ mod tests {
     fn repair_prompt_points_at_the_captured_file_instead_of_inlining_it() {
         let _guard = TestRootGuard::new("remediation-repair-prompt");
         let spec = command_spec("squad-2", "cell-2", "cargo test");
-        let session_name = crate::tmux::session_name(&spec.squad_id, &spec.task, &spec.cell_id);
+        let session_name =
+            crate::cell_session::session_name(&spec.squad_id, &spec.task, &spec.cell_id);
         let huge_output = "e2e-test-marker-line\n".repeat(10_000);
         // `latest_attempt` (which the remediation loop uses to find the most
         // recent attempt number) scans `.raw` files -- write one directly,

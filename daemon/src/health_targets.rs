@@ -94,7 +94,6 @@ fn capability_check(caps: &Capabilities) -> TargetCheck {
         parts.push(format!("arch={arch}"));
     }
     parts.push(format!("async_exec={}", caps.async_exec));
-    parts.push(format!("terminal={}", caps.terminal));
     if let Some(v) = &caps.runner_version {
         parts.push(format!("runner_version={v}"));
     }

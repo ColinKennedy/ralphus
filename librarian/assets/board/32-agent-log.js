@@ -377,7 +377,7 @@
       function agentLogSource(key) {
         const w = peekTape[key];
         if (w) {
-          // Rows tmux wrapped are rejoined so a long record stays one line.
+          // Wrapped rows are rejoined so a long record stays one line.
           /** @type {string[]} */
           const logical = [];
           let carry = "";

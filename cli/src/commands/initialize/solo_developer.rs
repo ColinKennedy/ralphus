@@ -8,11 +8,9 @@
 //! `--yes` accepts every stage's default answer instead of prompting, for
 //! non-interactive/scripted runs; without it, a non-TTY stdin is rejected
 //! the same way `ralphus mcp initialize` rejects one (see `mcp.rs`).
-//! Boolean answer flags take `yes` or `no`: `--install-tmux`,
-//! `--setup-mcp`, `--register-project`, `--review-auto-submit-pr-stack`,
+//! Boolean answer flags take `yes` or `no`: `--setup-mcp`, `--register-project`, `--review-auto-submit-pr-stack`,
 //! `--require-forks`, `--force-skills`, `--create-admin`, `--setup-forge-token`, `--submit-sample`.
-//! The value flags are `--tmux-program`, repeatable
-//! `--mcp-host`, `--agent-logins` (`claude,codex`, `all`, or `none`), `--install-skills` (`claude-code,codex,pi`, `all`, or `none`), `--project-name`, `--project-description`, `--project-is-fork`,
+//! The value flags are repeatable `--mcp-host`, `--agent-logins` (`claude,codex`, `all`, or `none`), `--install-skills` (`claude-code,codex,pi`, `all`, or `none`), `--project-name`, `--project-description`, `--project-is-fork`,
 //! `--project-fork-url`, `--project-url`,
 //! `--fork-user`, `--fork-url`, `--forge-provider`,
 //! `--forge-host`, `--forge-token`, `--admin-name`,
@@ -54,8 +52,7 @@ use ralphus_core::git_remote::{default_upstream_remote, find_remote_for_url};
 use ralphus_runner::login_probe::{LoginProbe, LoginState, LoginStatus, StatusRun, login_probes};
 use ralphus_runner::skills_install::skills_harnesses;
 
-const TOTAL_STEPS: u32 = 11;
-const WINDOWS_MINIMUM_TMUX_VERSION: (u32, u32, u32) = (3, 3, 8);
+const TOTAL_STEPS: u32 = 10;
 const SAMPLE_LABEL_PREFIX: &str = "ralphus initialize solo-developer: hello world";
 
 pub(crate) fn validate_forge_host(host: &str) -> Result<(), String> {
@@ -102,14 +99,6 @@ struct InitializeSetting {
     flag: &'static str,
 }
 
-const INSTALL_TMUX: InitializeSetting = InitializeSetting {
-    prompt: "run the tmux installer",
-    flag: "--install-tmux",
-};
-const TMUX_PROGRAM: InitializeSetting = InitializeSetting {
-    prompt: "tmux program path",
-    flag: "--tmux-program",
-};
 const SETUP_MCP: InitializeSetting = InitializeSetting {
     prompt: "set up MCP",
     flag: "--setup-mcp",
@@ -212,8 +201,6 @@ const SAMPLE_MODE: InitializeSetting = InitializeSetting {
 };
 
 const INTERACTIVE_SETTINGS: &[&InitializeSetting] = &[
-    &INSTALL_TMUX,
-    &TMUX_PROGRAM,
     &SETUP_MCP,
     &MCP_HOST,
     &AGENT_LOGINS,
@@ -259,8 +246,6 @@ pub struct InitializeSoloDeveloperOptions {
     pub yes: bool,
     /// Saved answers to replay (`--answers-file`); flags still win.
     pub answers_file: Option<PathBuf>,
-    pub install_tmux: Option<bool>,
-    pub tmux_program: Option<String>,
     pub setup_mcp: Option<bool>,
     pub mcp_hosts: Vec<String>,
     /// Backends to log in to (`claude,codex`, `all`, `none`); pre-answers the
@@ -300,8 +285,6 @@ impl std::fmt::Debug for InitializeSoloDeveloperOptions {
             .debug_struct("InitializeSoloDeveloperOptions")
             .field("yes", &self.yes)
             .field("answers_file", &self.answers_file)
-            .field("install_tmux", &self.install_tmux)
-            .field("tmux_program", &self.tmux_program)
             .field("setup_mcp", &self.setup_mcp)
             .field("mcp_hosts", &self.mcp_hosts)
             .field("agent_logins", &self.agent_logins)
@@ -341,8 +324,6 @@ impl InitializeSoloDeveloperOptions {
     fn is_non_interactive(&self) -> bool {
         self.yes
             || self.answers_file.is_some()
-            || self.install_tmux.is_some()
-            || self.tmux_program.is_some()
             || self.setup_mcp.is_some()
             || !self.mcp_hosts.is_empty()
             || self.agent_logins.is_some()
@@ -390,9 +371,6 @@ pub fn dispatch(opts: &GlobalOpts, mut setup: InitializeSoloDeveloperOptions) ->
     println!("ralphus interactive solo-developer setup");
 
     let mut step = Step::new(TOTAL_STEPS);
-
-    step.begin("Check tmux/psmux");
-    step_tmux(&setup);
 
     step.begin("Set up MCP hosts (optional)");
     step_mcp(&setup);
@@ -459,7 +437,7 @@ pub fn dispatch(opts: &GlobalOpts, mut setup: InitializeSoloDeveloperOptions) ->
         answers_path.display()
     );
     println!(
-        "  note: tmux paths, MCP hosts, and project names/URLs may be specific to this machine; the forge token is not stored"
+        "  note: MCP hosts, and project names/URLs may be specific to this machine; the forge token is not stored"
     );
 
     println!();
@@ -576,135 +554,6 @@ fn default_user_name() -> String {
     std::env::var("USERNAME")
         .or_else(|_| std::env::var("USER"))
         .unwrap_or_else(|_| "default".to_string())
-}
-
-// ---- tmux/psmux -----------------------------------------------------------
-
-fn step_tmux(setup: &InitializeSoloDeveloperOptions) -> bool {
-    match ralphus_daemon::tmux::resolve_tmux_program_with_source() {
-        Ok((program, source)) => {
-            println!("  found a tmux-compatible binary: {program} (source: {source})");
-            match tmux_version(&program) {
-                Some(version) => {
-                    println!("  version: {version}");
-                    if cfg!(windows) && !version_at_least(&version, WINDOWS_MINIMUM_TMUX_VERSION) {
-                        println!(
-                            "  Windows requires psmux {}.{}.{} or later (see docs/dependencies.md); this reports {version}",
-                            WINDOWS_MINIMUM_TMUX_VERSION.0,
-                            WINDOWS_MINIMUM_TMUX_VERSION.1,
-                            WINDOWS_MINIMUM_TMUX_VERSION.2
-                        );
-                        offer_tmux_alternative(setup)
-                    } else {
-                        true
-                    }
-                }
-                None => {
-                    println!("  warning: could not determine {program}'s version");
-                    offer_tmux_alternative(setup)
-                }
-            }
-        }
-        Err(error) => {
-            println!("  tmux is not available: {error}");
-            offer_tmux_alternative(setup)
-        }
-    }
-}
-
-fn tmux_version(program: &str) -> Option<String> {
-    let output = std::process::Command::new(program)
-        .arg("-V")
-        .output()
-        .ok()?;
-    let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if !text.is_empty() {
-        return Some(text);
-    }
-    let text = String::from_utf8_lossy(&output.stderr).trim().to_string();
-    if text.is_empty() { None } else { Some(text) }
-}
-
-fn version_at_least(version_text: &str, minimum: (u32, u32, u32)) -> bool {
-    let Some(token) = version_text.split_whitespace().last() else {
-        return false;
-    };
-    let mut parts = token.split('.').map(|part| {
-        part.chars()
-            .take_while(char::is_ascii_digit)
-            .collect::<String>()
-    });
-    let major = parts
-        .next()
-        .and_then(|p| p.parse::<u32>().ok())
-        .unwrap_or(0);
-    let minor = parts
-        .next()
-        .and_then(|p| p.parse::<u32>().ok())
-        .unwrap_or(0);
-    let patch = parts
-        .next()
-        .and_then(|p| p.parse::<u32>().ok())
-        .unwrap_or(0);
-    (major, minor, patch) >= minimum
-}
-
-fn offer_tmux_alternative(setup: &InitializeSoloDeveloperOptions) -> bool {
-    if setup.yes && setup.install_tmux.is_none() && setup.tmux_program.is_none() {
-        println!(
-            "  skipping tmux install/alternative prompts (--yes); `ralphus check health` will report this below"
-        );
-        return false;
-    }
-    if cfg!(windows) {
-        println!("  install/upgrade with: winget upgrade --id marlocarlo.psmux");
-        if prompt_yes_no(
-            &INSTALL_TMUX,
-            "  run that command now?",
-            true,
-            setup.install_tmux,
-            setup.yes,
-        ) {
-            match std::process::Command::new("winget")
-                .args(["upgrade", "--id", "marlocarlo.psmux"])
-                .status()
-            {
-                Ok(status) if status.success() => {
-                    println!("  installed/upgraded psmux");
-                    return true;
-                }
-                Ok(status) => println!("  winget exited with {status}"),
-                Err(error) => println!("  could not run winget: {error}"),
-            }
-        }
-    } else {
-        println!(
-            "  install tmux with your platform's package manager (e.g. `brew install tmux`, `apt install tmux`)"
-        );
-    }
-    let alternative = prompt(
-        &TMUX_PROGRAM,
-        "  path to an existing tmux/psmux binary to use instead (blank to skip)",
-        "",
-        setup.tmux_program.as_ref(),
-        setup.yes,
-    );
-    if alternative.is_empty() {
-        return false;
-    }
-    match tmux_version(&alternative) {
-        Some(version) => {
-            println!("  {alternative} reports: {version}");
-            println!(
-                "  to use it for real runs, set RALPHUS_TMUX_CMD={alternative} -- ralphus has no config-file setting for this, only that environment variable"
-            );
-            true
-        }
-        None => {
-            println!("  could not run `{alternative} -V`; leaving tmux unresolved");
-            false
-        }
-    }
 }
 
 // ---- MCP host setup ---------------------------------------------------------
@@ -2220,7 +2069,7 @@ mod tests {
     #[test]
     fn interactive_settings_have_unique_prompt_and_flag_contracts() {
         assert!(interactive_settings_are_valid());
-        assert_eq!(INTERACTIVE_SETTINGS.len(), 27);
+        assert_eq!(INTERACTIVE_SETTINGS.len(), 25);
     }
 
     #[test]

@@ -43,7 +43,7 @@
 //!
 //! This per-attempt state (the window and the streak) is intentionally
 //! *not* persisted in `store_memory.rs`: it is scoped to one running attempt
-//! (one `run_via_tmux_attempt` call), held as a plain local variable, and
+//! (one `run_direct_attempt` call), held as a plain local variable, and
 //! discarded when that attempt ends -- exactly like `TranscriptTailer`. What
 //! *does* need to persist across attempts -- the three-consecutive-
 //! automatic-restarts counter the RAL-536 interview added on top of this
@@ -57,7 +57,7 @@
 //! agents -- it only ever sees a stream of lines and timestamps. The scope
 //! decision (which kinds of tagged-thinking agent work get checked) lives
 //! entirely in the callers that construct a detector and feed it lines:
-//! `crate::runner::SubprocessRunner::run_via_tmux_attempt` is the single
+//! `crate::runner::SubprocessRunner::run_direct_attempt` is the single
 //! choke point that covers cells, proof steps, and guardian-merge agents
 //! uniformly, since all three are just different `RunnerSpec`s run through
 //! that one function.
@@ -266,7 +266,7 @@ mod tests {
     }
 
     /// Tool-call lines are a wholly separate stream: a caller that routes
-    /// them through `reset()` (as `run_via_tmux_attempt` does) instead of
+    /// them through `reset()` (as `run_direct_attempt` does) instead of
     /// `observe_thinking_line` can never trip the detector on a repeated
     /// tool call / poll loop, even when the underlying text is exactly the
     /// content that trips the detector above when fed as thinking output.
@@ -276,7 +276,7 @@ mod tests {
         for _ in 0..20 {
             // A repeated poll/tool-call line is routed through `reset()`,
             // never `observe_thinking_line` -- this is the routing contract
-            // `run_via_tmux_attempt` relies on.
+            // `run_direct_attempt` relies on.
             never_fed_as_thinking.reset();
         }
         // No trip is even possible: the window was never fed a single line.

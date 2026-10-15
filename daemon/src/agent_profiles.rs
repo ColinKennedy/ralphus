@@ -454,7 +454,7 @@ fn resolve_agent_for_path_with(
         // `from_env`-resolved secret values must be scrubbed everywhere raw
         // pane text gets persisted. Even though the profile may already be
         // registered from a prior resolution (idempotent), registering here
-        // guarantees the values are in place before any tmux pane capture.
+        // guarantees the values are in place before any cell transcript capture.
         crate::redact::register_all(profile.secret_values.iter().cloned());
         // A legacy TOML profile that didn't author its own `executable` for
         // an overridable backend still picks up the global DB command

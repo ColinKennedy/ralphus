@@ -19,11 +19,11 @@ for the full design and how to run it.
 
 Separate from the per-action traces above, `daemon/src/daemon_health.rs` emits
 daemon-wide health spans (`daemon.heartbeat`, `daemon.store_lock.*`,
-`daemon.loop.*`, `daemon.tmux.*`, `daemon.resource.low_disk`,
+`daemon.loop.*`, `daemon.resource.low_disk`,
 `daemon.startup`/`startup_failed`/`panic`). Per-review, per-squad and per-cell
 failures stay out of OTel, and there is no Cartographer→OTel bridge. Callers
 only `try_send` onto a bounded channel drained by one emitter thread (the
 exporter is a blocking HTTP call, so it must never run on the store-lock
 path); a full queue drops. `emit` is a no-op unless OTel is enabled. Table of
-spans, thresholds and the 15-minute disk/tmux probes:
+spans and thresholds:
 [`docs/otel-tracing.md`](../docs/otel-tracing.md).
