@@ -169,9 +169,13 @@ export default {
   // this ignore.
   // proc_counts/ (RAL-604) is generated output: HTML graphs rendered from
   // stored benchmark data, never imported by the JavaScript source.
+  // shell-syntax/vendor/ holds the patched tree-sitter grammar submodules
+  // (their own Node bindings and grammar.js); they are third-party projects
+  // built by the Rust crate, not part of the board's JavaScript.
   ignore: [
     "librarian/assets/board/**",
     "librarian/assets/vendor/**",
     "proc_counts/**",
+    "shell-syntax/vendor/**",
   ],
 };
