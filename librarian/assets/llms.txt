@@ -1,0 +1,18 @@
+# ralphus
+
+> ralphus runs autonomous agent tasks described in TOML, with any model (cloud Anthropic or local Ollama), proves the results, and shows everything on a web board. A daemon owns all state; the CLI, the MCP server, and this board are clients of its HTTP/JSON API.
+
+## Vocabulary
+
+Work nests as squad -> task -> cell -> proof. A squad is one submission, a task is a unit of work inside it, a cell is one agent or command invocation inside a task, and a proof is a check that a cell or task passed. A review (the Guardian) collects finished branches into a stacked set of pull requests. The glossary is docs/glossary.md in the repository.
+
+## For API callers
+
+- [OpenAPI document](/openapi.json): every daemon route, method, parameter, request body, response type, and auth requirement as OpenAPI 3.1 JSON. The same document is served by the daemon at `GET /api/openapi.json`.
+- Authentication: every daemon route requires an `Authorization: Bearer <daemon token>` header. The `/openapi.json` path on this board is served through the board's own daemon proxy, so no token is needed to read it. The live event stream (`GET /api/events`) takes a single-use `ticket` query parameter instead, minted by `POST /api/events/ticket`.
+- API reference: docs/daemon-api.md in the repository is the human-readable companion, with behavior notes and examples.
+
+## For task authors
+
+- Task files are TOML. Run `ralphus tutor` (or call the `tutor` tool of the `ralphus-mcp` server) for the schema reference and worked examples; it is the single source for the file format.
+- `ralphus validate task.toml` checks a task file, and `ralphus submit task.toml` creates a squad.
