@@ -1080,7 +1080,8 @@ fn route_for_user(
     match (method, segs.as_slice()) {
         ("GET", ["api", "daemon"]) => health(daemon),
         // RAL-661: the canonical OpenAPI description of this very route table.
-        // ralphus[ignore-endpoint-cli]: machine-readable API description for HTTP tools and agents; the CLI has no use for its own wire spec
+        // ralphus[ignore-endpoint-cli]: machine-readable API description for HTTP
+        // tools and agents; the CLI has no use for its own wire spec
         ("GET", ["api", "openapi.json"]) => openapi_reply(),
         // ralphus[ignore-endpoint-cli]: daemon lifecycle is the `ralphus-daemon` binary's own verb (`ralphus-daemon stop`), not a task-file CLI command
         ("POST", ["api", "daemon", "shutdown"]) => shutdown(daemon, body),
