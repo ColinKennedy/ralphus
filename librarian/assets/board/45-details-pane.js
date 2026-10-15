@@ -977,14 +977,22 @@ Saving restarts the proof step and the rest of its list; an unchanged value rest
         return cellDiffs[key].summary;
       }
       /**
-       * Renders the RAL-550 "changes" key/value row from a pushed summary, or
-       * an empty string while nothing has been pushed.
+       * Renders the RAL-550 "changes" key/value row from a pushed summary. The
+       * numbers are the cell's worktree total against the worktree's fork
+       * point, so every cell sharing a worktree shows the same figures. A cell
+       * that has not started, and has no summary yet, shows "not started"; a
+       * running or finished cell with none yet renders nothing.
        * @param {CellDiffSummary|null} d
+       * @param {string} state - the cell's state
        * @returns {string}
        */
-      function cellDiffRow(d) {
-        if (!d || d.files_changed === undefined) return "";
-        const tip = "Pushed live by the runner as the cell's worktree changes (committed, uncommitted and untracked files since the cell started).\nThe full diff is pulled on demand with `ralphus cell diff`.";
+      function cellDiffRow(d, state) {
+        if (!d || d.files_changed === undefined) {
+          if (!["pending", "queued"].includes(state)) return "";
+          const tip = "This cell has not started, so its worktree has not been measured yet.\nWho/when: check back once the cell runs; the figure is the worktree's total change, shared by every cell using it.";
+          return `<div class="kv-row" data-tip="${tip}"><span class="k">changes</span><span class="v">not started</span></div>`;
+        }
+        const tip = "The worktree's net change since its fork point (committed, uncommitted and untracked files), pushed live by the runner.\nEvery cell sharing this worktree shows the same figures, and a change a later cell reverted nets out. 0 files means the worktree has no change from its base.\nThe full diff is pulled on demand with ralphus cell diff.";
         return `<div class="kv-row" data-tip="${tip}"><span class="k">changes</span><span class="v mono">${d.files_changed} files · <span style="color:var(--done)">+${d.lines_added || 0}</span> <span style="color:var(--failed)">−${d.lines_removed || 0}</span></span></div>`;
       }
       /**
@@ -1116,7 +1124,7 @@ Saving restarts the proof step and the rest of its list; an unchanged value rest
         const paths = (squadPaths[r.id] || {})[`${sel.taskIdx}:${sel.cellIdx}`];
         const project = paths ? (paths.project || "— (not a git worktree)") : "…";
         const diffRow = cellDiffRow(cellDiffSummary(r.id, sel.taskIdx, sel.cellIdx,
-          () => { if (selectedSquadId === r.id && sel.kind === "cell") preserveUserState(document.getElementById("details"), renderDetails); }));
+          () => { if (selectedSquadId === r.id && sel.kind === "cell") preserveUserState(document.getElementById("details"), renderDetails); }), s.state);
         const agentTip = cellAgentInheritanceTip(t, s);
         const modelTip = cellModelInheritanceTip(t, s);
         // Only shown once the git check resolves and confirms this cell's
