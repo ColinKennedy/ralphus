@@ -6,13 +6,37 @@ is plain HTTP + JSON over localhost (default `http://127.0.0.1:7890`), chosen so
 a Python CLI and a browser frontend can both speak it, and so it is trivially
 network-exposable when multi-user support arrives.
 
-> Status: **live reference**. All ~50 routes the daemon serves are listed in
+> Status: **live reference**. The daemon serves roughly 300 route arms; they are listed in
 > the [endpoint index](#endpoint-index) below; the sections that follow it
 > document the ones worth explaining in depth (non-obvious request/response
 > shapes, side effects, or gotchas) rather than repeating every route's full
 > JSON schema. `daemon/src/server.rs::route()` is the ground truth for exact
 > shapes if a route isn't detailed here. See also `docs/cli-reference.md` for
 > the `ralphus` CLI surface over this API.
+
+## Machine-readable description (OpenAPI)
+
+The same API is described as an OpenAPI 3.1 document, compact JSON, for AI
+agents and API tools:
+
+- **Daemon:** `GET /api/openapi.json` (bearer token required, like every route).
+- **Librarian (board):** `GET /openapi.json` — the board's daemon proxy attaches
+  the token, so no credentials are needed to read it. The document itself
+  contains no token, paths, or instance data, and uses the relative server
+  `/`.
+- **`GET /llms.txt`** on the librarian is a short plain-text index for LLM
+  agents that links the OpenAPI document, this reference, and `ralphus tutor`.
+
+The source is `daemon/src/openapi.json`, embedded in the daemon and
+re-serialized compactly once per process. It lists every route and method with
+its path parameters, and gives full schemas for a representative set (the error
+envelope, `GET /api/tasks`, `POST /api/squads`, and the `GET /api/events`
+stream); other bodies are declared as generic JSON and are detailed in this
+document. Destructive operations carry `x-ralphus-destructive: true`.
+`scripts/check_endpoint_cli_parity.py` (CI) fails when a route arm in
+`server.rs` has no operation, or an operation has no route, so the document
+cannot silently drift. Listing an operation in the document grants no access;
+authorization is enforced per request.
 
 ## Endpoint index
 

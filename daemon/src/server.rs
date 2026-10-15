@@ -1079,6 +1079,9 @@ fn route_for_user(
     }
     match (method, segs.as_slice()) {
         ("GET", ["api", "daemon"]) => health(daemon),
+        // RAL-661: the canonical OpenAPI description of this very route table.
+        // ralphus[ignore-endpoint-cli]: machine-readable API description for HTTP tools and agents; the CLI has no use for its own wire spec
+        ("GET", ["api", "openapi.json"]) => openapi_reply(),
         // ralphus[ignore-endpoint-cli]: daemon lifecycle is the `ralphus-daemon` binary's own verb (`ralphus-daemon stop`), not a task-file CLI command
         ("POST", ["api", "daemon", "shutdown"]) => shutdown(daemon, body),
         // RAL-222: mints a short-lived, single-use ticket for `/api/events`
@@ -2396,6 +2399,27 @@ fn extract_squad_id(body: &str) -> Option<String> {
         .as_str()
         .map(str::to_string)
 }
+
+/// The OpenAPI 3.1 document (`daemon/src/openapi.json`) re-serialized compactly.
+/// The checked-in source is pretty-printed for review; the compact form is
+/// computed once per process and reused for every request.
+fn openapi_reply() -> Reply {
+    static COMPACT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    let body = COMPACT.get_or_init(|| {
+        serde_json::from_str::<serde_json::Value>(OPENAPI_SOURCE)
+            .and_then(|doc| serde_json::to_string(&doc))
+            .unwrap_or_else(|_| "{}".to_string())
+    });
+    Reply {
+        status: 200,
+        body: body.clone(),
+        server_timing: None,
+    }
+}
+
+/// The checked-in OpenAPI source; `scripts/check_endpoint_cli_parity.py`
+/// compares its operations against the route arms of `route_for_user`.
+const OPENAPI_SOURCE: &str = include_str!("openapi.json");
 
 fn health(daemon: &Daemon) -> Reply {
     // RAL-393: pooled, not `daemon.lock()` -- this is the exact
@@ -21905,6 +21929,18 @@ mod tests {
         let r = route(&d, "GET", "/api/daemon", "");
         assert_eq!(r.status, 200);
         assert!(r.body.contains("\"status\":\"ok\""));
+    }
+
+    #[test]
+    fn openapi_document_is_compact_openapi_3_1_json() {
+        let d = daemon();
+        let r = route(&d, "GET", "/api/openapi.json", "");
+        assert_eq!(r.status, 200);
+        assert!(!r.body.contains('\n'), "document must be compact");
+        let doc: serde_json::Value = serde_json::from_str(&r.body).unwrap();
+        assert_eq!(doc["openapi"], "3.1.0");
+        assert!(doc["paths"]["/api/openapi.json"]["get"].is_object());
+        assert!(!r.body.contains("daemon.token"));
     }
 
     #[test]

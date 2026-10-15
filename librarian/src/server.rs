@@ -113,8 +113,33 @@ pub fn handle(daemon_url: &str, method: &str, path: &str, body: &str) -> Reply {
             None,
             daemon_token().as_deref(),
         ),
+        ("GET", "/openapi.json") => proxy(
+            daemon_url,
+            method,
+            OPENAPI_DAEMON_PATH,
+            body,
+            None,
+            daemon_token().as_deref(),
+        ),
+        ("GET", "/llms.txt") => llms_txt(),
         ("GET", _) => serve_static(path_only),
         _ => Reply::not_found(),
+    }
+}
+
+/// The daemon route behind the board's `/openapi.json`.
+const OPENAPI_DAEMON_PATH: &str = "/api/openapi.json";
+
+/// `/llms.txt`: the agent-readable index of this ralphus instance, embedded
+/// in the exe. Public to anyone who can reach the board, like the board
+/// itself; it carries no token, path or instance data.
+fn llms_txt() -> Reply {
+    Reply {
+        status: 200,
+        content_type: "text/plain; charset=utf-8",
+        cache_control: None,
+        etag: None,
+        body: include_str!("../assets/llms.txt").to_string(),
     }
 }
 
@@ -163,6 +188,16 @@ pub fn handle_with_trace_conditional(
             daemon_token().as_deref(),
             if_none_match,
         ),
+        ("GET", "/openapi.json") => proxy_conditional(
+            daemon_url,
+            method,
+            OPENAPI_DAEMON_PATH,
+            body,
+            Some(&span.cx),
+            daemon_token().as_deref(),
+            if_none_match,
+        ),
+        ("GET", "/llms.txt") => llms_txt(),
         ("GET", _) => serve_static(path_only),
         _ => Reply::not_found(),
     };
@@ -900,6 +935,44 @@ mod tests {
         handle_thread.join().unwrap();
         assert_eq!(reply.status, 200);
         assert_eq!(received.lock().unwrap().clone(), None);
+    }
+
+    /// RAL-661: `/openapi.json` is the daemon's `/api/openapi.json` reached
+    /// through the proxy, served as JSON, never echoing the bearer token.
+    #[test]
+    fn openapi_json_proxies_the_daemon_document_without_the_token() {
+        let server = tiny_http::Server::http("127.0.0.1:0").expect("bind ephemeral port");
+        let port = server.server_addr().to_ip().expect("ip addr").port();
+        let received = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let received_clone = std::sync::Arc::clone(&received);
+        let handle_thread = std::thread::spawn(move || {
+            if let Ok(req) = server.recv() {
+                *received_clone.lock().unwrap() = req.url().to_string();
+                let _ = req.respond(tiny_http::Response::from_string(r#"{"openapi":"3.1.0"}"#));
+            }
+        });
+        let daemon_url = format!("http://127.0.0.1:{port}");
+        let reply = handle(&daemon_url, "GET", "/openapi.json", "");
+        handle_thread.join().unwrap();
+        assert_eq!(reply.status, 200);
+        assert_eq!(reply.content_type, "application/json");
+        assert_eq!(received.lock().unwrap().as_str(), "/api/openapi.json");
+        if let Some(token) = daemon_token() {
+            assert!(!reply.body.contains(&token));
+        }
+    }
+
+    #[test]
+    fn llms_txt_is_served_as_text_and_is_free_of_secrets() {
+        let reply = handle("http://127.0.0.1:9", "GET", "/llms.txt", "");
+        assert_eq!(reply.status, 200);
+        assert!(reply.content_type.starts_with("text/plain"));
+        assert!(reply.body.starts_with("# ralphus"));
+        assert!(reply.body.contains("/openapi.json"));
+        assert!(reply.body.contains("docs/daemon-api.md"));
+        assert!(!reply.body.contains("Bearer ey"));
+        assert!(!reply.body.contains("C:\\"));
+        assert!(!reply.body.contains("/home/") && !reply.body.contains("/Users/"));
     }
 
     /// RAL-98 regression: the proxy must forward `?query` strings to the

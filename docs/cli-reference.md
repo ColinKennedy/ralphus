@@ -806,7 +806,7 @@ use; see `READ_ONLY_NOTE`.
         - deregister name [str]  {Remove a preset. Any preset, including a starter default, may be freely removed.}
         - (read-only-safe) get name [str]  {Show one registered preset by exact name.}
         - (read-only-safe) list  {List every registered preset.}
-        - register name [str] --auto-compact-threshold [integer] --maximum-context [integer] --maximum-tool-output-tokens [integer] --pass-score [integer] --prompt [text] --system-prompt [text] --system-prompt-position [text]  {Register (or update) a preset -- a named bundle of field defaults an "extends" sentinel stamps into a task's, cell's, or proof step's own unset fields when the squad is submitted. A name may be hierarchical (roles/judge/reviewer). prompt and system-prompt may embed <<ralphus:linked-field/./prompt>> to splice in the entity's own prompt. 
+        - register name [str] --auto-compact-threshold [integer] --maximum-context [integer] --maximum-tool-output-tokens [integer] --pass-score [integer] --prompt [text] --system-prompt [text] --system-prompt-position [text]  {Register (or update) a preset -- a named bundle of field defaults an "extends" sentinel stamps into a task's, cell's, or proof step's own unset fields when the squad is submitted. A name may be hierarchical (roles/judge/reviewer). prompt and system-prompt may embed <<ralphus:linked-field/./prompt>> to splice in the entity's own prompt.
          pass-score (1-10) is the score a prompt proof step must reach to pass.}
     - project  {Register and inspect projects known to the daemon.}
         - (read-only-safe) check-destination name [str]  {Run a manual reachability check for a project's destination repository -- its registered clone URL, else the checkout's forge remote -- against the forge REST API. SSH-style clone URLs resolve through their host/path pair (no SSH connection is opened); a URL no REST identity can be resolved from is reported as a failed check with an actionable diagnostic.}
@@ -967,7 +967,7 @@ use; see `READ_ONLY_NOTE`.
         - redo waypoint_id [id] entry_id [id]  {Re-run a squad whose finished work a closed waypoint flagged as stale, carrying its prior findings and the waypoint's bearings into the new run.}
         - reopen waypoint_id [id]  {Reopen a closed waypoint.}
         - resurvey-preview waypoint_id [id] (subagent)  {Show what 'waypoint edit --resurvey' would re-judge: which daemon-enrolled affected entries get their verdict cleared, and which human-declared entries are left alone.}
-        - roster  {Add/remove entries on a waypoint's completion list -- the work whose landing IS this 
+        - roster  {Add/remove entries on a waypoint's completion list -- the work whose landing IS this
          waypoint being carried out.}
             - add waypoint_id [id] entry_id [id] --note [text]  {Add a squad or review to a waypoint's completion list -- the work whose landing IS this waypoint being carried out. Distinct from the affected list, which is the work the waypoint lands on; nothing auto-enrolls here.}
             - remove waypoint_id [id] entry_id [id]  {Drop a squad or review from a waypoint's completion list. Removing the last unfinished goal can complete the waypoint's first phase.}
