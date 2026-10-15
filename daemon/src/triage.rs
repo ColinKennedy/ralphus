@@ -2132,6 +2132,36 @@ prompt=\"y\"
     }
 
     #[test]
+    fn triage_candidates_lists_a_multi_type_scheduled_cell_once_with_only_its_types() {
+        let mut s = store();
+        let multi = s
+            .insert_squad(&task_file_with_triage_type("bug"), None, false)
+            .unwrap();
+        s.set_cell_triage_types(&multi, 0, 0, &["bug".to_string(), "feature".to_string()])
+            .unwrap();
+        let single = s
+            .insert_squad(&task_file_with_triage_type("bug"), None, false)
+            .unwrap();
+        s.set_cell_triage_types(&single, 0, 0, &["bug".to_string()])
+            .unwrap();
+        // Not yet classified: no `triage_cell_types` rows, so not a candidate.
+        s.insert_squad(&task_file_with_triage_type("bug"), None, false)
+            .unwrap();
+
+        let candidates = s.triage_candidates().unwrap();
+        assert_eq!(candidates.len(), 2);
+        let m = candidates.iter().find(|c| c.squad_id == multi).unwrap();
+        assert_eq!(
+            m.triage_types,
+            vec!["bug".to_string(), "feature".to_string()]
+        );
+        assert_eq!(m.status, "scheduled");
+        let one = candidates.iter().find(|c| c.squad_id == single).unwrap();
+        assert_eq!(one.triage_types, vec!["bug".to_string()]);
+        assert_eq!(one.status, "scheduled");
+    }
+
+    #[test]
     fn triage_candidates_status_reflects_a_failed_proof_not_the_raw_done_state() {
         let mut s = store();
         let src = "[[task]]\nname=\"t\"\nproject=\"proj\"\n[[task.cell]]\ncwd=\"/repo\"\nprompt=\"p\"\ntriage=true\ntriage_type=\"security\"\n[[task.cell.proof]]\ncommand=\"cargo test\"\n";
