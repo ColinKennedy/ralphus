@@ -1,12 +1,7 @@
 name: release
 
 # Builds a distributable ralphus bundle (scripts/build-bundle.py) and
-# publishes it to a GitHub Release. The bundle always includes the vendorized
-# psmux build (vendor/psmux git submodule, RAL-347) -- build-release.cmd
-# builds it by default -- so a release download works out of the box without
-# a separate tmux/psmux install. RALPHUS_TMUX_CMD remains available for users
-# who want to point at a different binary; see docs/dependencies.md for why
-# that's discouraged.
+# publishes it to a GitHub Release.
 
 on:
   push:
@@ -43,7 +38,6 @@ jobs:
         with:
           workspaces: |
             . -> target
-            vendor/psmux -> target
       - name: Resolve release tag
         id: tag
         shell: pwsh
@@ -53,10 +47,9 @@ jobs:
           if (-not $tag) { $tag = '${{ github.ref_name }}' }
           if (-not $tag) { throw 'no tag resolved: pass workflow_dispatch input `tag`, or trigger via a tag push' }
           "tag=$tag" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
-      # Runs scripts/build-release.cmd (which builds the vendored psmux
-      # submodule and links it in via --features embedded-tmux by default),
-      # assembles the bundle per scripts/bundle-manifest.toml, zips it,
-      # checksums it, and smoke-tests the extracted bundle end to end.
+      # Runs scripts/build-release.cmd, assembles the bundle per
+      # scripts/bundle-manifest.toml, zips it, checksums it, and smoke-tests
+      # the extracted bundle end to end.
       - name: Build release bundle
         run: python scripts/build-bundle.py --output-dir bundle-dist --bundle-name ralphus-${{ steps.tag.outputs.tag }}
       - name: Publish GitHub release

@@ -28,7 +28,6 @@ on GitHub, or open the file locally). This page is the quick table.
 | `RALPHUS_STILL_WORKING: <reason>` | prompt cells and prompt proof steps | the runner re-invokes the same session synchronously with the reason, bounded attempts |
 | `RALPHUS_GHOST: <bullets>` | prompt cells | the handoff note; extracted into the cell's ghost record and injected as prior context into restarts and one level of dependent cells |
 | `RALPHUS_EVENT: {…}` | runner/machine-provider stderr | forwarded into the daemon's Cartographer event log |
-| `RALPHUS_TMUX_DONE: <status>` | runner's tmux pane stdout | the daemon polls for a standalone line of this exact form as real-completion proof |
 
 `<<…>>` values are **reserved** — never treated as literal branch names, and
 any unrecognized one is rejected at validation time. `depends_on` is

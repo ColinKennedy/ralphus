@@ -4728,10 +4728,7 @@ the continuous, on-disk tee of the pane's raw output `Tmux::pipe_pane`
 (`daemon/src/tmux.rs`) starts for the cell's whole lifetime, independent of
 the pane's own in-memory scrollback. It exists so the board can page through
 depth beyond a pane's `history-limit` (`TMUX_HISTORY_LIMIT`,
-`daemon/src/tmux.rs`) without raising that limit's RAM cost at all — see
-[`PSMUX_MEMORY_FIX.local.md`](../PSMUX_MEMORY_FIX.local.md) for the full
-design (that file is git-ignored; ask whoever ran that phase for a copy if
-it's not on disk).
+`daemon/src/tmux.rs`) without raising that limit's RAM cost at all.
 
 ```json
 { "content": "...", "start": 12288, "total": 40012 }

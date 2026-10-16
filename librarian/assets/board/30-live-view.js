@@ -417,8 +417,6 @@ ${state.restartNote}` : state.text;
       // tape is served raw — `/pane-transcript` does NOT strip ralphus's own
       // marker lines the way `/pane` does — so this is where they're handled.
       // Sliced out and driven standalone by test/board-tape-lines.mjs.
-      /** Internal completion sentinel; always dropped, never shown in any debug state. */
-      const RALPHUS_TAPE_DONE_PREFIX = "RALPHUS_TMUX_DONE:";
       /** Cartographer event marker, trailing space included. Matches runner/src/cartographer.rs::EVENT_MARKER. */
       const RALPHUS_TAPE_EVENT_PREFIX = "RALPHUS_EVENT: ";
       /** Structured tool-record marker, trailing space included. Matches runner/src/tool_record.rs::TOOL_MARKER. Only the Agent Log tab reads these; the terminal tape drops them. */
@@ -578,8 +576,7 @@ ${state.restartNote}` : state.text;
       }
       /**
        * Classify + render one already-ANSI-stripped line, or return null to
-       * drop it: `RALPHUS_TMUX_DONE` lines are always dropped (internal
-       * sentinel); `RALPHUS_EVENT` lines are dropped when Debug is off and
+       * drop it: `RALPHUS_EVENT` lines are dropped when Debug is off and
        * rendered inline when on; `RALPHUS_THINKING` lines (RAL-434) are
        * un-prefixed when Thinking is on and returned as the `THINKING_FOLDED`
        * sentinel when off, for renderTapeLines to collapse; everything else is
@@ -592,7 +589,6 @@ ${state.restartNote}` : state.text;
        */
       function classifyTapeLine(line, showDebug, showThinking) {
         const clean = line.replace(/\r$/, "");
-        if (clean.startsWith(RALPHUS_TAPE_DONE_PREFIX)) return null;
         if (clean.startsWith(RALPHUS_TAPE_TOOL_PREFIX)) return null;
         if (clean.startsWith(RALPHUS_TAPE_EVENT_PREFIX)) {
           if (!showDebug) return null;
@@ -716,8 +712,8 @@ ${state.restartNote}` : state.text;
       // RALPHUS-TAPE-LINES:END
 
       // ---- RAL-288 Stage 5: Live View debug/agent split ----
-      // The daemon now always strips ralphus's own `RALPHUS_EVENT:`/
-      // `RALPHUS_TMUX_DONE` marker lines before ever serving Live View pane
+      // The daemon now always strips ralphus's own `RALPHUS_EVENT:`
+      // marker lines before ever serving Live View pane
       // text (`daemon/src/server.rs::strip_ralphus_pane_markers`), and the
       // runner's own `ralphus [...]`-prefixed diagnostic prints were
       // relocated to Cartographer-only (`runner/src/{execute,agent_backend,

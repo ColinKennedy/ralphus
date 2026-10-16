@@ -131,9 +131,8 @@ one of these markers trips the parser reading its own output. Not hypothetical
 here — ralphus agents develop ralphus and read that file.
 
 Mitigation is in-tree precedent: match a **standalone line of exact form**, not
-a substring scan. That is exactly what `RALPHUS_TMUX_DONE` does, after the
-substring version false-positived. Cheaper to adopt that convention than to
-hand out a credential.
+a substring scan. Cheaper to adopt that convention than to hand out a
+credential.
 
 ### 4.4 Daemon-side writers — start here
 
@@ -380,8 +379,7 @@ model against real traffic before any prompt work exists.
 ### Phase 2 — transport
 
 - [x] Scan the agent's final reply for every standalone `RALPHUS_PROPHECY:`
-      line; match exact-form lines only, per the `RALPHUS_TMUX_DONE` precedent
-      (§4.3) — `runner/src/prophecy.rs::parse_prophecies`
+      line; match exact-form lines only (§4.3) — `runner/src/prophecy.rs::parse_prophecies`
 - [x] Forward it as a runner event; let `forward_runner_event` attribute it —
       every backend scans each assistant turn as it arrives
       (`runner/src/prophecy.rs::ProphecyScanner`; claude-code, codex and pi per
