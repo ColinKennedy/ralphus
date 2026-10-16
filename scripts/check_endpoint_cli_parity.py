@@ -29,6 +29,7 @@ endpoint accountable.
 
 from __future__ import annotations
 
+import json
 import re
 import sys
 from dataclasses import dataclass
@@ -37,6 +38,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SERVER_RS = REPO_ROOT / "daemon" / "src" / "server.rs"
 HELP_MAP_RS = REPO_ROOT / "cli" / "src" / "help_map.rs"
+OPENAPI_JSON = REPO_ROOT / "daemon" / "src" / "openapi.json"
 
 METHODS = ("GET", "POST", "PUT", "DELETE", "PATCH")
 
@@ -882,10 +884,114 @@ def violations_for_sources(server_source: str, help_source: str) -> list[str]:
     return out
 
 
+# ---------------------------------------------------------------------------
+# OpenAPI document (RAL-661)
+# ---------------------------------------------------------------------------
+
+def _normalize_path(path: str) -> str:
+    """Path template with variable names erased: `/a/{id}` == `/a/{x}`."""
+    return re.sub(r"\{[^}]*\}", "{}", path)
+
+
+def _collect_refs(node, out: list[str]) -> None:
+    if isinstance(node, dict):
+        ref = node.get("$ref")
+        if isinstance(ref, str):
+            out.append(ref)
+        for value in node.values():
+            _collect_refs(value, out)
+    elif isinstance(node, list):
+        for value in node:
+            _collect_refs(value, out)
+
+
+def _resolve_ref(doc: dict, ref: str):
+    node = doc
+    for part in ref.removeprefix("#/").split("/"):
+        if not isinstance(node, dict) or part not in node:
+            return None
+        node = node[part]
+    return node
+
+
+def openapi_violations(server_source: str, openapi_text: str) -> list[str]:
+    """Route <-> OpenAPI parity plus structural validity of the document.
+
+    Every route arm (and the `SPECIAL_ROUTES` entries) needs an operation of the
+    same method and path shape, every operation needs a route, and the document
+    must satisfy the structural invariants tools rely on (3.1 version, resolvable
+    `$ref`s, `responses` on every operation, declared path parameters, the error
+    envelope and an SSE response)."""
+    out: list[str] = []
+    try:
+        doc = json.loads(openapi_text)
+    except json.JSONDecodeError as error:
+        return [f"openapi.json is not valid JSON: {error}"]
+    if doc.get("openapi") != "3.1.0":
+        out.append(f"openapi.json: `openapi` must be \"3.1.0\", got {doc.get('openapi')!r}")
+    try:
+        endpoints = extract_route_arms(server_source)
+    except (ValueError, IndexError) as error:
+        return out + [f"server.rs route parse failed: {error}"]
+
+    routes = {(ep.method, _normalize_path(ep.key.split(" ", 1)[1])) for ep in endpoints}
+    routes |= {
+        (key.split(" ", 1)[0], _normalize_path(key.split(" ", 1)[1])) for key in SPECIAL_ROUTES
+    }
+    documented: set[tuple[str, str]] = set()
+    operation_ids: set[str] = set()
+    for path, item in doc.get("paths", {}).items():
+        for method, op in item.items():
+            if method.upper() not in METHODS:
+                continue
+            documented.add((method.upper(), _normalize_path(path)))
+            where = f"openapi.json: {method.upper()} {path}"
+            if not isinstance(op, dict) or not op.get("responses"):
+                out.append(f"{where} has no `responses`")
+                continue
+            op_id = op.get("operationId")
+            if not op_id or op_id in operation_ids:
+                out.append(f"{where} needs a unique operationId (got {op_id!r})")
+            operation_ids.add(op_id)
+            if not op.get("summary"):
+                out.append(f"{where} has no summary")
+            declared = {p.get("name") for p in op.get("parameters", []) if p.get("in") == "path"}
+            for name in re.findall(r"\{([^}]*)\}", path):
+                if name not in declared:
+                    out.append(f"{where} does not declare path parameter {name!r}")
+    for method, path in sorted(routes - documented):
+        out.append(f"openapi.json is missing {method} {path} (route exists in server.rs)")
+    for method, path in sorted(documented - routes):
+        out.append(f"openapi.json documents {method} {path}, but no such route exists (stale)")
+
+    refs: list[str] = []
+    _collect_refs(doc, refs)
+    for ref in sorted(set(refs)):
+        if not ref.startswith("#/") or _resolve_ref(doc, ref) is None:
+            out.append(f"openapi.json: unresolved $ref {ref!r}")
+
+    schemas = doc.get("components", {}).get("schemas", {})
+    envelope = schemas.get("ErrorEnvelope", {}).get("properties", {}).get("error", {})
+    if not {"code", "message", "details"} <= set(envelope.get("properties", {})):
+        out.append("openapi.json: ErrorEnvelope must describe error.code, error.message and error.details")
+    events = doc.get("paths", {}).get("/api/events", {}).get("get", {})
+    if "text/event-stream" not in events.get("responses", {}).get("200", {}).get("content", {}):
+        out.append("openapi.json: GET /api/events must declare a text/event-stream 200 response")
+    submit = doc.get("paths", {}).get("/api/squads", {}).get("post", {})
+    if "application/json" not in submit.get("requestBody", {}).get("content", {}):
+        out.append("openapi.json: POST /api/squads must declare a JSON request body")
+    if not doc.get("security"):
+        out.append("openapi.json: top-level `security` (bearer auth) is missing")
+    if "bearerAuth" not in doc.get("components", {}).get("securitySchemes", {}):
+        out.append("openapi.json: components.securitySchemes.bearerAuth is missing")
+    return out
+
+
 def main() -> int:
     server_source = SERVER_RS.read_text(encoding="utf-8")
     help_source = HELP_MAP_RS.read_text(encoding="utf-8")
     violations = violations_for_sources(server_source, help_source)
+    violations += openapi_violations(server_source, OPENAPI_JSON.read_text(encoding="utf-8"))
     for violation in violations:
         print(violation)
     if not violations:

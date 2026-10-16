@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import unittest
 from unittest import mock
 
@@ -210,6 +211,47 @@ class RealSourcesTests(unittest.TestCase):
         self.assertGreaterEqual(len(leaves), 130)
         self.assertGreaterEqual(len(c.ENDPOINT_TO_CLI), 100)
         self.assertEqual(len({e.key for e in endpoints} | set(c.SPECIAL_ROUTES)), len(endpoints) + len(c.SPECIAL_ROUTES))
+
+
+class OpenApiParityTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.server = c.SERVER_RS.read_text(encoding="utf-8")
+        self.doc = json.loads(c.OPENAPI_JSON.read_text(encoding="utf-8"))
+
+    def violations(self) -> list[str]:
+        return c.openapi_violations(self.server, json.dumps(self.doc))
+
+    def test_checked_in_document_passes(self) -> None:
+        self.assertEqual(self.violations(), [])
+
+    def test_missing_operation_is_reported(self) -> None:
+        del self.doc["paths"]["/api/tasks"]["get"]
+        self.assertTrue(any("missing GET /api/tasks" in v for v in self.violations()))
+
+    def test_stale_operation_is_reported(self) -> None:
+        self.doc["paths"]["/api/gone"] = {"get": {"operationId": "getGone", "summary": "x", "responses": {"200": {}}}}
+        self.assertTrue(any("GET /api/gone" in v and "stale" in v for v in self.violations()))
+
+    def test_method_mismatch_is_reported(self) -> None:
+        self.doc["paths"]["/api/tasks"]["delete"] = self.doc["paths"]["/api/tasks"]["get"]
+        self.assertTrue(any("DELETE /api/tasks" in v for v in self.violations()))
+
+    def test_unresolved_ref_and_missing_path_param_are_reported(self) -> None:
+        self.doc["paths"]["/api/tasks"]["get"]["responses"]["200"] = {"$ref": "#/components/responses/Nope"}
+        self.doc["paths"]["/api/squads/{id}"]["get"]["parameters"] = []
+        found = self.violations()
+        self.assertTrue(any("unresolved $ref" in v for v in found))
+        self.assertTrue(any("path parameter 'id'" in v for v in found))
+
+    def test_representative_schemas_cover_json_errors_and_streaming(self) -> None:
+        schemas = self.doc["components"]["schemas"]
+        self.assertIn("details", schemas["ErrorEnvelope"]["properties"]["error"]["properties"])
+        events = self.doc["paths"]["/api/events"]["get"]["responses"]["200"]["content"]
+        self.assertIn("text/event-stream", events)
+        submit = self.doc["paths"]["/api/squads"]["post"]
+        self.assertEqual(submit["requestBody"]["content"]["application/json"]["schema"]["$ref"], "#/components/schemas/SubmitBody")
+        self.assertEqual(self.doc["servers"], [{"url": "/"}])
+        self.assertNotIn("Bearer ey", json.dumps(self.doc))
 
 
 if __name__ == "__main__":
