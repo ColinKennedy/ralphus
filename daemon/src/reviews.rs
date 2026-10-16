@@ -2672,6 +2672,7 @@ pub fn repair_triage_pool_keys(store_handle: &crate::store_lock::StoreHandle) {
                 cell.idx,
                 &new_project,
             ) {
+                // ralphus[ignore-rlog-pair]: this row-level repair failure is retried on the next daemon startup
                 crate::rlog!(
                     ERROR,
                     "ralphus [triage] pool-key repair: failed to rekey pooled cell: {e}"
@@ -4971,7 +4972,7 @@ prompt=\"a\"
         git(&root, &["commit", "--message", "base"]);
         let remote = root.with_extension("remote.git");
         git(
-            &remote.parent().unwrap(),
+            remote.parent().unwrap(),
             &["init", "--bare", remote.to_str().unwrap()],
         );
         git(
