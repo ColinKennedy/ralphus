@@ -76,39 +76,48 @@ impl Env {
 }
 
 /// Best-effort: which shell launched this `ralphus` process. Tried in order:
-/// `$RALPHUS_SHELL`; real process ancestry; environment heuristics; the
+/// `$RALPHUS_SHELL`; environment heuristics; real process ancestry; the
 /// platform default.
+/// On Windows, environment heuristics are checked before ancestry because bash
+/// (from Git Bash/WSL) lacks access to Windows tools like cargo, while PowerShell
+/// and cmd are tightly integrated with the system.
 #[must_use]
 pub fn detect_parent_shell(env: &Env) -> String {
     if let Some(over) = env.ralphus_shell.as_deref().and_then(shell_kind_from_exe) {
         return over.to_string();
     }
 
-    if let Some(from_ancestry) = ancestor_shell(ANCESTRY_MAX_DEPTH) {
-        return from_ancestry;
+    // Check Windows environment heuristics regardless of compile-time platform,
+    // so we detect Windows shells even if the binary was compiled for non-Windows
+    // (e.g., running in WSL or on Windows with a Linux-compiled binary).
+    if env
+        .powershell_distribution_channel
+        .as_deref()
+        .is_some_and(|v| !v.is_empty())
+    {
+        return "pwsh".to_string();
+    }
+    if let Some(kind) = env
+        .comspec
+        .as_deref()
+        .and_then(|c| Path::new(c).file_name())
+        .and_then(|n| n.to_str())
+        .and_then(shell_kind_from_exe)
+    {
+        return kind.to_string();
+    }
+    if env.psmodulepath.as_deref().is_some_and(|v| !v.is_empty()) {
+        return "powershell".to_string();
     }
 
+    // If on Windows and no Windows environment heuristics matched,
+    // default to cmd rather than risking bash from ancestry.
     if is_windows() {
-        if env
-            .powershell_distribution_channel
-            .as_deref()
-            .is_some_and(|v| !v.is_empty())
-        {
-            return "pwsh".to_string();
-        }
-        if let Some(kind) = env
-            .comspec
-            .as_deref()
-            .and_then(|c| Path::new(c).file_name())
-            .and_then(|n| n.to_str())
-            .and_then(shell_kind_from_exe)
-        {
-            return kind.to_string();
-        }
-        if env.psmodulepath.as_deref().is_some_and(|v| !v.is_empty()) {
-            return "powershell".to_string();
-        }
         return "cmd".to_string();
+    }
+
+    if let Some(from_ancestry) = ancestor_shell(ANCESTRY_MAX_DEPTH) {
+        return from_ancestry;
     }
 
     env.shell
