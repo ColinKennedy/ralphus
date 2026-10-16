@@ -18453,7 +18453,7 @@ mod tests {
         if let Ok(entries) = std::fs::read_dir(&temp_dir) {
             for entry in entries.flatten() {
                 if let Ok(name) = entry.file_name().into_string() {
-                    if name.starts_with("wt-rec-") && name.contains(&format!("-{pid}")) {
+                    if name.starts_with("wt-rec-") && name.contains(&format!("-{pid}-")) {
                         let _ = std::fs::remove_dir_all(entry.path());
                     }
                 }
