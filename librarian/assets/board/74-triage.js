@@ -239,6 +239,17 @@
         const fits = typeNames.filter((t) => rest === t || rest.startsWith(t + "-"));
         return fits.sort((a, b) => b.length - a.length)[0] ?? null;
       }
+      /**
+       * Whether a flow-column candidate passes the type-visibility toggles. A
+       * cell whose classification is still pending (no types yet) can't match
+       * any toggle, so it stays visible rather than vanishing.
+       * @param {string[]} types
+       * @param {Set<string>} hidden
+       * @returns {boolean}
+       */
+      function triageTypesVisible(types, hidden) {
+        return types.length === 0 || types.some((t) => !hidden.has(t));
+      }
       // RALPHUS-TRIAGE-FLOW-LOGIC:END
 
       /**
@@ -536,7 +547,7 @@
          * @param {TriageCandidateView} c
          * @returns {boolean}
          */
-        const shown = (c) => triageMatchesQuery(c) && triageInFocus(c.project) && c.triage_types.some((t) => !triageHiddenTypes.has(t));
+        const shown = (c) => triageMatchesQuery(c) && triageInFocus(c.project) && triageTypesVisible(c.triage_types, triageHiddenTypes);
         const inflight = triageCandidates.filter((c) => c.status === "scheduled" && shown(c));
         const excluded = triageCandidates.filter((c) => c.status === "failed" && shown(c));
 
@@ -546,7 +557,7 @@
           + `</section>`;
 
         h += `<section class="tri-stage s-inflight">`
-          + triageStageHead("In flight", inflight.length, "Classified, but the cell hasn't finished — not counting toward any threshold yet.")
+          + triageStageHead("In flight", inflight.length, "The cell hasn't finished — not counting toward any threshold yet. A cell shows every type it was classified as (it is pooled under each); one still being classified shows \"type pending\".")
           + (inflight.length ? `<div class="tri-rows">${inflight.map((c) => triageCandRowHtml(c, false)).join("")}</div>` : `<div class="tri-empty">Nothing in flight.</div>`)
           + `</section>`;
 
@@ -693,6 +704,18 @@
         return `<div class="tri-triggers">${out.join("")}</div>`;
       }
       /**
+       * A badge per triage type of one cell (it is pooled under each), or a
+       * "type pending" badge while the Arbiter hasn't classified it yet.
+       * @param {string[]} types
+       * @returns {string}
+       */
+      function triageTypeBadgesHtml(types) {
+        if (!types.length) {
+          return `<span class="badge tri-type" data-tip="The Arbiter hasn't classified this cell yet, so it isn't in any pool. It joins its pool(s) once classified and finished.">type pending</span>`;
+        }
+        return types.map((t) => `<span class="badge tri-type" data-tip="This cell is pooled under '${esc(t)}'. A cell can belong to several types at once; draining one pool doesn't remove it from the others.">${esc(t)}</span>`).join("");
+      }
+      /**
        * One in-flight or excluded cell row in the flow; click jumps to it on the Squads tab.
        * @param {TriageCandidateView} c
        * @param {boolean} failed
@@ -707,7 +730,7 @@
           + `<div class="tri-r-main"><div class="tri-r-name">${esc(c.task_name)}</div>`
           + `<div class="tri-r-sub mono">${esc(c.squad_id)} · ${esc(cell)}${c.squad_label ? ` · ${esc(c.squad_label)}` : ""}</div></div>`
           + `<div class="tri-r-right">${triageFocus.sub === null ? `<span class="tri-proj-label">${esc(c.project)}</span>` : ""}`
-          + `<span class="tri-type">${c.triage_types.map(esc).join(", ")}</span>${badge}</div></div>`;
+          + `${triageTypeBadgesHtml(c.triage_types)}${badge}</div></div>`;
       }
       /**
        * One drained (Arbiter-created) review row; click opens it on the Reviews tab.

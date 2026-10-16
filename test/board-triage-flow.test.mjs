@@ -22,7 +22,7 @@ function load() {
   // eslint-disable-next-line no-new-func -- evaluating the real shipped source is the point; see the header.
   return new Function(`${html.slice(from + BEGIN.length, to)}
     return { triageSplitKey, triagePoolMath, triageParseCron, triageCronError, triageCronNextAfter,
-      triageScheduleNextFire, triageFormatNext, triageFormatIn, triageThresholdEffect, triageDrainedType };`)();
+      triageScheduleNextFire, triageFormatNext, triageFormatIn, triageThresholdEffect, triageDrainedType, triageTypesVisible };`)();
 }
 
 const T = load();
@@ -122,4 +122,15 @@ test("a drained review's type is read off its name, longest registered type firs
   assert.equal(T.triageDrainedType("triage-bug-fix", types), "bug-fix");
   assert.equal(T.triageDrainedType("triage-unknown", types), null);
   assert.equal(T.triageDrainedType("my-review", types), null);
+});
+
+test("an in-flight cell with no types yet stays visible whatever the type toggles", () => {
+  assert.equal(T.triageTypesVisible([], new Set()), true);
+  assert.equal(T.triageTypesVisible([], new Set(["bug", "feature"])), true);
+});
+
+test("a classified in-flight cell shows while any of its types is visible", () => {
+  assert.equal(T.triageTypesVisible(["bug", "feature"], new Set(["bug"])), true);
+  assert.equal(T.triageTypesVisible(["bug", "feature"], new Set(["bug", "feature"])), false);
+  assert.equal(T.triageTypesVisible(["bug"], new Set(["feature"])), true);
 });
