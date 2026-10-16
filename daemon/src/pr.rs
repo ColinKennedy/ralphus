@@ -3185,11 +3185,11 @@ pub fn forge_client_for_pr(
 pub fn forge_client_for_stack(
     store: &crate::store_lock::StoreHandle,
     root: &Path,
-    base_branch: &str,
+    upstream: &UpstreamRef,
     forge_cfg: &crate::config::ForgeConfig,
     owner: Option<&str>,
 ) -> Option<crate::forge::ForgeClient> {
-    let routing = resolve_pr_repo_routing(store, root, base_branch, forge_cfg, owner);
+    let routing = resolve_pr_repo_routing(store, root, upstream, forge_cfg, owner);
     routing.fork_client.or(routing.parent_client)
 }
 

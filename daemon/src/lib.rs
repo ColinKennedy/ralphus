@@ -47,7 +47,6 @@ pub mod health_sweep;
 pub mod health_targets;
 pub mod hidden;
 pub mod jobobject;
-pub mod legacy_upstream;
 pub mod live_actions;
 pub mod live_runs;
 pub mod logging;

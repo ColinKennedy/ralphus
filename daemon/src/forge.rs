@@ -5240,17 +5240,6 @@ pub(crate) fn resolve_remote_with_store(
 
 /// Store-aware [`resolve_remote`]: derives the remote from `upstream`, then
 /// resolves as [`resolve_remote_with_store`].
-pub(crate) fn resolve_remote_for_base_with_store(
-    store: &crate::store_lock::StoreHandle,
-    root: &Path,
-    upstream: &UpstreamRef,
-    cfg: &ForgeConfig,
-    identity: Option<&str>,
-) -> Result<ForgeClient, String> {
-    let remote_name = resolve_remote_name(root, upstream, cfg);
-    resolve_remote_with_store(store, root, &remote_name, cfg, identity)
-}
-
 /// Like [`resolve_remote_for`], but resolves the API token from
 /// `token_override` first (RAL-338 follow-up: a per-user stored forge
 /// token, see `daemon/src/user_forge_tokens.rs`) instead of the daemon-wide

@@ -1924,8 +1924,16 @@ prompt=\"y\"
             (1, 0, "b-b"),
             (1, 1, "b-b"),
         ] {
-            s.record_triage_pool_cell("proj", "bug", &squad_id, task, idx, branch, "main")
-                .unwrap();
+            s.record_triage_pool_cell(
+                "proj",
+                "bug",
+                &squad_id,
+                task,
+                idx,
+                branch,
+                &UpstreamRef::local("main"),
+            )
+            .unwrap();
             s.set_cell_review_branch(&squad_id, task, idx, branch)
                 .unwrap();
             s.set_cell_triage_types(&squad_id, task, idx, &["bug".to_string()])

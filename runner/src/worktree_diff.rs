@@ -143,31 +143,6 @@ fn head_commit_detailed(root: &Path) -> Result<String, String> {
     git_detailed(root, &["rev-parse", "--verify", "HEAD"]).map(|s| s.trim().to_string())
 }
 
-/// The commit a worktree's change counts are measured against: the frozen
-/// `ralphus.<branch>.baseline` marker the daemon writes when it claims the
-/// worktree (its fork point, moved only when the branch is rebased onto an
-/// upstream task), so every cell in the worktree agrees on it. Falls back to the
-/// commit `HEAD` points at now for a checkout that was never claimed that way.
-fn worktree_base(root: &Path) -> Result<String, String> {
-    if let Ok(branch) = git_detailed(root, &["rev-parse", "--abbrev-ref", "HEAD"]) {
-        let branch = branch.trim();
-        if !branch.is_empty() && branch != "HEAD" {
-            let key = format!("ralphus.{branch}.baseline");
-            if let Ok(marker) = git_detailed(root, &["config", "--get", &key]) {
-                let marker = format!("{}^{{commit}}", marker.trim());
-                if let Ok(sha) = git_detailed(root, &["rev-parse", "--verify", "--quiet", &marker])
-                {
-                    let sha = sha.trim();
-                    if !sha.is_empty() {
-                        return Ok(sha.to_string());
-                    }
-                }
-            }
-        }
-    }
-    head_commit_detailed(root)
-}
-
 fn count_lines(path: &Path) -> u64 {
     let Ok(meta) = std::fs::metadata(path) else {
         return 0;

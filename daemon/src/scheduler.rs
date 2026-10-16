@@ -2485,7 +2485,7 @@ fn resolve_upstream_base(
             None => {
                 return Ok(crate::reviews::worktree_upstream(&dep_cwd)
                     .ok()
-                    .map(|branch| (dep_cwd, branch)));
+                    .map(|upstream| (dep_cwd, upstream.branch)));
             }
         }
     }

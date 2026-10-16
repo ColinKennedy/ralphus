@@ -12802,7 +12802,7 @@ fn guardian_branch_forge_status(daemon: &Daemon, id: &str, branch_id: &str) -> R
     let client = crate::pr::forge_client_for_pr(
         &daemon.store_handle(),
         root,
-        &guardian.base_branch,
+        &guardian.upstream(),
         &forge_cfg,
         repo,
         guardian.owner.as_deref(),

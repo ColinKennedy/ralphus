@@ -2933,6 +2933,7 @@ mod tests {
     };
     use crate::store::{Store, TaskRow};
     use crate::workspace::Workspace;
+    use ralphus_core::schema::UpstreamRef;
 
     #[test]
     fn remote_cell_derivation_uses_the_squads_claimed_branch_not_the_base_name() {
@@ -4216,7 +4217,15 @@ prompt=\"c\"
                 .set_cell_state(&squad_id, 0, idx, crate::store::NodeState::Done)
                 .unwrap();
             guard
-                .record_triage_pool_cell("proj", "bug", &squad_id, 0, idx, "b-shared", "main")
+                .record_triage_pool_cell(
+                    "proj",
+                    "bug",
+                    &squad_id,
+                    0,
+                    idx,
+                    "b-shared",
+                    &UpstreamRef::local("main"),
+                )
                 .unwrap();
         }
         let gid = create_review_from_triage_pool(&store, "proj", "bug", |_| None)
@@ -4253,7 +4262,15 @@ prompt=\"a\"
                 .set_task_state(&squad_id, 0, crate::store::NodeState::Done)
                 .unwrap();
             guard
-                .record_triage_pool_cell("proj", "bug", &squad_id, 0, 0, "b-work", "main")
+                .record_triage_pool_cell(
+                    "proj",
+                    "bug",
+                    &squad_id,
+                    0,
+                    0,
+                    "b-work",
+                    &UpstreamRef::local("main"),
+                )
                 .unwrap();
         }
         let gid = create_review_from_triage_pool(&store, "proj", "bug", |_| None)
@@ -4376,7 +4393,7 @@ prompt=\"a\"
             task_idx: 0,
             idx: 0,
             branch: branch.to_string(),
-            upstream: "main".to_string(),
+            upstream: UpstreamRef::local("main"),
         }
     }
 
@@ -4468,7 +4485,7 @@ prompt=\"a\"
                         0,
                         0,
                         "b-followup",
-                        "main",
+                        &UpstreamRef::local("main"),
                     )
                     .unwrap();
                 guard
@@ -4479,7 +4496,7 @@ prompt=\"a\"
                         0,
                         0,
                         "b-submitted",
-                        "main",
+                        &UpstreamRef::local("main"),
                     )
                     .unwrap();
             }

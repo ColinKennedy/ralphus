@@ -321,7 +321,7 @@ fn forge_preflight(
         let Some(client) = crate::pr::forge_client_for_pr(
             store,
             &root,
-            &guardian.base_branch,
+            &guardian.upstream(),
             &forge_cfg,
             &pr.repo,
             guardian.owner.as_deref(),
