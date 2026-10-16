@@ -601,8 +601,7 @@ mod tests {
         )
         .expect("git worktree");
         drop(watcher);
-        let out = seen.lock().unwrap().clone();
-        out
+        seen.lock().unwrap().clone()
     }
 
     fn claim_base(dir: &Path) -> String {
