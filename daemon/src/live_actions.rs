@@ -440,6 +440,11 @@ pub struct LiveAction {
     pub prompt: String,
     /// URIs of the cells whose handoffs this action came from.
     pub source_cells: Vec<String>,
+    /// Stable ids of the review branches the action applies to, frozen when
+    /// the action is stored. Empty when attribution is unresolved.
+    pub branch_ids: Vec<String>,
+    /// Why `branch_ids` could not be resolved, when it could not.
+    pub attribution_error: Option<String>,
     pub created_at_ms: i64,
 }
 
@@ -449,6 +454,10 @@ pub struct NewLiveAction {
     pub label: String,
     pub prompt: String,
     pub source_cells: Vec<String>,
+    /// Frozen branch attribution (see [`LiveAction::branch_ids`]).
+    pub branch_ids: Vec<String>,
+    /// Why attribution failed, when it did.
+    pub attribution_error: Option<String>,
 }
 
 /// A review's live actions, in order.
@@ -461,16 +470,21 @@ pub fn guardian_live_actions_conn(
     guardian_id: &str,
 ) -> crate::store::Result<Vec<LiveAction>> {
     let mut stmt = conn.prepare(
-        "SELECT idx, label, prompt, source_cells, created_at_ms FROM guardian_live_actions
-         WHERE guardian_id=? ORDER BY idx",
+        "SELECT idx, label, prompt, source_cells, created_at_ms, branch_ids, attribution_error
+         FROM guardian_live_actions WHERE guardian_id=? ORDER BY idx",
     )?;
     let rows = stmt.query_map(rusqlite::params![guardian_id], |r| {
         let sources: String = r.get(3)?;
+        let branch_ids: Option<String> = r.get(5)?;
         Ok(LiveAction {
             idx: r.get(0)?,
             label: r.get(1)?,
             prompt: r.get(2)?,
             source_cells: serde_json::from_str(&sources).unwrap_or_default(),
+            branch_ids: branch_ids
+                .and_then(|j| serde_json::from_str(&j).ok())
+                .unwrap_or_default(),
+            attribution_error: r.get(6)?,
             created_at_ms: r.get(4)?,
         })
     })?;
@@ -512,17 +526,30 @@ impl crate::store::Store {
         }
         let now = crate::store::now_ms();
         for (idx, action) in actions.iter().enumerate() {
+            let (resolved_ids, resolve_error) =
+                resolve_branch_ids_conn(&self.conn, guardian_id, &action.source_cells);
+            let (branch_ids, attribution_error) = if action.branch_ids.is_empty() {
+                (
+                    resolved_ids,
+                    action.attribution_error.clone().or(resolve_error),
+                )
+            } else {
+                (action.branch_ids.clone(), action.attribution_error.clone())
+            };
             self.conn.execute(
                 "INSERT INTO guardian_live_actions
-                    (guardian_id, idx, label, prompt, source_cells, created_at_ms)
-                 VALUES (?, ?, ?, ?, ?, ?)",
+                    (guardian_id, idx, label, prompt, source_cells, created_at_ms,
+                     branch_ids, attribution_error)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                 rusqlite::params![
                     guardian_id,
                     i64::try_from(idx).unwrap_or(i64::MAX),
                     action.label,
                     action.prompt,
                     serde_json::to_string(&action.source_cells).unwrap_or_else(|_| "[]".into()),
-                    now
+                    now,
+                    serde_json::to_string(&branch_ids).unwrap_or_else(|_| "[]".into()),
+                    attribution_error
                 ],
             )?;
             // Attribution is frozen here: later cell moves never rewrite it.
@@ -541,6 +568,109 @@ impl crate::store::Store {
         }
         Ok(true)
     }
+
+    /// Resolve the branch attribution of actions stored before attribution
+    /// existed (their `branch_ids` is NULL). Each is resolved once: afterwards
+    /// it carries ids, or the reason it could not be resolved. Returns how
+    /// many were resolved.
+    ///
+    /// # Errors
+    ///
+    /// On a database failure.
+    pub fn resolve_legacy_live_actions(&self, guardian_id: &str) -> crate::store::Result<usize> {
+        let legacy: Vec<(i64, Vec<String>)> = {
+            let mut stmt = self.conn.prepare(
+                "SELECT idx, source_cells FROM guardian_live_actions
+                 WHERE guardian_id=? AND branch_ids IS NULL",
+            )?;
+            let rows = stmt.query_map(rusqlite::params![guardian_id], |r| {
+                let sources: String = r.get(1)?;
+                Ok((
+                    r.get(0)?,
+                    serde_json::from_str(&sources).unwrap_or_default(),
+                ))
+            })?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        for (idx, sources) in &legacy {
+            let (ids, error) = resolve_branch_ids_conn(&self.conn, guardian_id, sources);
+            self.conn.execute(
+                "UPDATE guardian_live_actions SET branch_ids=?, attribution_error=?
+                 WHERE guardian_id=? AND idx=?",
+                rusqlite::params![
+                    serde_json::to_string(&ids).unwrap_or_else(|_| "[]".into()),
+                    error,
+                    guardian_id,
+                    idx
+                ],
+            )?;
+        }
+        Ok(legacy.len())
+    }
+}
+
+/// The stable branch ids a set of source cells belongs to in `guardian_id`,
+/// and why any cell could not be resolved. A cell resolves through the review
+/// branch recorded on it at submission.
+#[must_use]
+pub fn resolve_branch_ids_conn(
+    conn: &rusqlite::Connection,
+    guardian_id: &str,
+    source_cells: &[String],
+) -> (Vec<String>, Option<String>) {
+    use rusqlite::OptionalExtension as _;
+    let mut ids: Vec<String> = Vec::new();
+    let mut problems: Vec<String> = Vec::new();
+    for uri in source_cells {
+        let parts: Vec<&str> = uri.rsplitn(3, ':').collect();
+        let parsed = match parts.as_slice() {
+            [cell_idx, task_idx, head] => head
+                .strip_prefix("cell:")
+                .zip(task_idx.parse::<i64>().ok())
+                .zip(cell_idx.parse::<i64>().ok())
+                .map(|((squad, t), c)| (squad.to_string(), t, c)),
+            _ => None,
+        };
+        let Some((squad, task_idx, cell_idx)) = parsed else {
+            problems.push(format!("{uri}: not a cell URI"));
+            continue;
+        };
+        let branch: Option<Option<String>> = conn
+            .query_row(
+                "SELECT review_branch FROM cells WHERE squad_id=? AND task_idx=? AND idx=?",
+                rusqlite::params![squad, task_idx, cell_idx],
+                |r| r.get(0),
+            )
+            .optional()
+            .unwrap_or(None);
+        let Some(branch) = branch else {
+            problems.push(format!("{uri}: the cell no longer exists"));
+            continue;
+        };
+        let Some(branch) = branch else {
+            problems.push(format!("{uri}: the cell has no review branch recorded"));
+            continue;
+        };
+        let id: Option<String> = conn
+            .query_row(
+                "SELECT id FROM guardian_branches WHERE guardian_id=? AND branch=?",
+                rusqlite::params![guardian_id, branch],
+                |r| r.get(0),
+            )
+            .optional()
+            .unwrap_or(None)
+            .flatten();
+        match id {
+            Some(id) => {
+                if !ids.contains(&id) {
+                    ids.push(id);
+                }
+            }
+            None => problems.push(format!("{uri}: branch {branch} is not part of this review")),
+        }
+    }
+    let error = (!problems.is_empty()).then(|| problems.join("; "));
+    (ids, error)
 }
 
 /// A short button label for a handoff that dedupe did not name: its first
@@ -566,6 +696,8 @@ pub fn undeduplicated(handoffs: &[CollectedHandoff]) -> Vec<NewLiveAction> {
             label: fallback_label(&h.text),
             prompt: h.text.clone(),
             source_cells: vec![h.source_cell.clone()],
+            branch_ids: Vec::new(),
+            attribution_error: None,
         })
         .collect()
 }
@@ -612,6 +744,7 @@ pub fn parse_dedupe_answer(
     if answer.live_actions.is_empty() {
         return None;
     }
+    // Each handoff must be assigned to exactly one action.
     let mut covered = vec![false; handoffs.len()];
     let mut out = Vec::new();
     for entry in answer.live_actions {
@@ -641,6 +774,8 @@ pub fn parse_dedupe_answer(
             },
             prompt: prompt.to_string(),
             source_cells: sources,
+            branch_ids: Vec::new(),
+            attribution_error: None,
         });
     }
     covered.iter().all(|c| *c).then_some(out)
@@ -984,11 +1119,23 @@ pub fn execute_live_run(
     // the agent profile's, which carries the agent's own credentials.
     let mut env = req.guardian.manual_checks_env.clone();
     env.extend(resolved.env.clone());
-    let system_prompt = if req.allow_commits {
-        LIVE_ACTION_COMMIT_SYSTEM_PROMPT
-    } else {
-        LIVE_ACTION_READ_ONLY_SYSTEM_PROMPT
-    };
+    let system_prompt = format!(
+        "{}
+
+{}",
+        if req.allow_commits {
+            LIVE_ACTION_COMMIT_SYSTEM_PROMPT
+        } else {
+            LIVE_ACTION_READ_ONLY_SYSTEM_PROMPT
+        },
+        crate::live_results::RESULT_INSTRUCTION
+    );
+    let sent_prompt = format!(
+        "Live action: {}
+
+{}",
+        req.label, req.prompt
+    );
     let mut spec = RunnerSpec {
         squad_id: live_run_squad_id(gid),
         task: LIVE_ACTION_TASK.to_string(),
@@ -1098,6 +1245,14 @@ pub fn execute_live_run(
         }
     }
 
+    done.judgement = Some(crate::live_results::judge(
+        done.end == LiveRunEnd::Finished,
+        &done.raw_reply,
+        &run_shell_calls(&cell_id, gid),
+        Some(req.cwd),
+        !done.commits.is_empty(),
+    ));
+
     note(
         store,
         gid,
@@ -1127,6 +1282,42 @@ pub fn execute_live_run(
         done.commits.len()
     );
     done
+}
+
+/// The shell commands a live run's agent session really ran, read from the
+/// session's raw transcripts (every attempt, in order).
+fn run_shell_calls(cell_id: &str, guardian_id: &str) -> Vec<crate::live_results::ShellCall> {
+    let session = crate::cell_session::session_name(
+        &live_run_squad_id(guardian_id),
+        LIVE_ACTION_TASK,
+        cell_id,
+    );
+    let mut text = String::new();
+    for attempt in 0.. {
+        let mut offset = 0;
+        let Some(first) =
+            crate::terminal_log::read_raw_transcript_range(&session, attempt, offset, u64::MAX)
+        else {
+            break;
+        };
+        let total = first.total;
+        offset = first.start + first.content.len() as u64;
+        text.push_str(&first.content);
+        while offset < total {
+            let Some(next) =
+                crate::terminal_log::read_raw_transcript_range(&session, attempt, offset, u64::MAX)
+            else {
+                break;
+            };
+            if next.content.is_empty() {
+                break;
+            }
+            offset += next.content.len() as u64;
+            text.push_str(&next.content);
+        }
+        text.push('\n');
+    }
+    crate::live_results::shell_calls(&text)
 }
 
 /// The agent's report without ralphus's own reply markers: everything from a
@@ -1294,7 +1485,15 @@ mod tests {
         assert!(spec.prompt.as_deref().unwrap().contains("Start the app"));
         assert_eq!(
             spec.system_prompt.as_deref(),
-            Some(LIVE_ACTION_COMMIT_SYSTEM_PROMPT)
+            Some(
+                format!(
+                    "{LIVE_ACTION_COMMIT_SYSTEM_PROMPT}
+
+{}",
+                    crate::live_results::RESULT_INSTRUCTION
+                )
+                .as_str()
+            )
         );
         let (_, _, spent) = store.lock().guardian_cost_total(&g.id).unwrap();
         assert!(
@@ -1369,7 +1568,15 @@ mod tests {
         );
         assert_eq!(
             agent.seen.lock()[0].system_prompt.as_deref(),
-            Some(LIVE_ACTION_READ_ONLY_SYSTEM_PROMPT)
+            Some(
+                format!(
+                    "{LIVE_ACTION_READ_ONLY_SYSTEM_PROMPT}
+
+{}",
+                    crate::live_results::RESULT_INSTRUCTION
+                )
+                .as_str()
+            )
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1664,6 +1871,8 @@ prompt = "second"
             label: "a".into(),
             prompt: "do a".into(),
             source_cells: vec!["c1".into()],
+            branch_ids: vec!["branch-000000000001".into()],
+            attribution_error: None,
         }];
         assert!(store.insert_guardian_live_actions(&gid, &first).unwrap());
         assert!(
@@ -1674,6 +1883,8 @@ prompt = "second"
                         label: "b".into(),
                         prompt: "do b".into(),
                         source_cells: vec![],
+                        branch_ids: vec![],
+                        attribution_error: None,
                     }]
                 )
                 .unwrap(),

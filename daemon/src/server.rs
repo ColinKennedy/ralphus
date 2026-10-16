@@ -2114,6 +2114,10 @@ fn route_for_user(
         ("POST", ["api", "guardians", id, "live-actions", "run"]) => {
             guardian_run_live_actions(daemon, id, body)
         }
+        // ralphus[ignore-endpoint-cli]: board "Retry" control for live-test results that could not be written to a PR description
+        ("POST", ["api", "guardians", id, "live-actions", "results", "refresh"]) => {
+            guardian_refresh_live_results(daemon, id)
+        }
         // ralphus[ignore-endpoint-cli]: board Live View of the agent generating a review's live actions
         ("GET", ["api", "guardians", id, "live-actions", "generation", "pane"]) => {
             guardian_live_generation_pane(daemon, id, query)
@@ -12383,6 +12387,9 @@ fn guardian_live_actions_view(daemon: &Daemon, id: &str) -> Reply {
         generation_cell: Option<String>,
         actions: Vec<crate::live_actions::LiveAction>,
         runs: Vec<crate::live_runs::LiveRunRow>,
+        /// PR descriptions whose live-test results are queued to be written
+        /// (or failed and waiting to retry).
+        pending_publications: Vec<crate::live_publish::PublishStatus>,
     }
     let guardian = match daemon.lock().get_guardian(id) {
         Ok(g) => g,
@@ -12396,6 +12403,10 @@ fn guardian_live_actions_view(daemon: &Daemon, id: &str) -> Reply {
             crate::live_runs::live_actions_generation_cell_conn(conn, id)?,
         ))
     });
+    let pending_publications = daemon
+        .lock()
+        .live_result_publish_status(id)
+        .unwrap_or_default();
     match loaded {
         Ok((actions, runs, checkout, generation_cell)) => json(
             200,
@@ -12408,10 +12419,26 @@ fn guardian_live_actions_view(daemon: &Daemon, id: &str) -> Reply {
                 generation_cell,
                 actions,
                 runs,
+                pending_publications,
             },
         ),
         Err(e) => store_error(&e),
     }
+}
+
+/// `POST /api/guardians/{id}/live-actions/results/refresh`: write the review's
+/// live-test results into its PR/MR descriptions now, skipping any retry
+/// delay. Responds with the publications still pending afterwards.
+fn guardian_refresh_live_results(daemon: &Daemon, id: &str) -> Reply {
+    if let Err(e) = daemon.lock().get_guardian(id) {
+        return store_error(&e);
+    }
+    crate::live_publish::retry_now(&daemon.store_handle(), id);
+    let pending = daemon
+        .lock()
+        .live_result_publish_status(id)
+        .unwrap_or_default();
+    json(200, &serde_json::json!({"pending": pending}))
 }
 
 /// `POST /api/guardians/{id}/live-actions/run`, body `{"index": N}` for one

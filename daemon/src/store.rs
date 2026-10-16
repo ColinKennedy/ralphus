@@ -3265,6 +3265,23 @@ impl Store {
         // Best-effort migrations for databases created before these columns
         // existed. Each fails harmlessly (duplicate column) once present.
         for stmt in [
+            // Frozen branch attribution of a live action (JSON array of
+            // stable branch ids; NULL = a legacy row not yet resolved).
+            "ALTER TABLE guardian_live_actions ADD COLUMN branch_ids TEXT",
+            "ALTER TABLE guardian_live_actions ADD COLUMN attribution_error TEXT",
+            // What a live run was given and what it concluded.
+            "ALTER TABLE guardian_live_runs ADD COLUMN prompt TEXT",
+            "ALTER TABLE guardian_live_runs ADD COLUMN system_prompt TEXT",
+            "ALTER TABLE guardian_live_runs ADD COLUMN verdict TEXT",
+            "ALTER TABLE guardian_live_runs ADD COLUMN verdict_detail TEXT",
+            "ALTER TABLE guardian_live_runs ADD COLUMN fix_attempted INTEGER",
+            "ALTER TABLE guardian_live_runs ADD COLUMN fix_confirmed INTEGER",
+            "ALTER TABLE guardian_live_runs ADD COLUMN recipe TEXT",
+            "ALTER TABLE guardian_live_runs ADD COLUMN commands TEXT",
+            "ALTER TABLE guardian_live_runs ADD COLUMN branch_ids TEXT",
+            "ALTER TABLE guardian_live_runs ADD COLUMN attribution_note TEXT",
+            "ALTER TABLE guardian_live_runs ADD COLUMN integration_branch_id TEXT",
+            "ALTER TABLE guardian_live_runs ADD COLUMN integration_pushed INTEGER",
             "ALTER TABLE presets ADD COLUMN prompt TEXT",
             // A scored-proof threshold a preset supplies to an extending
             // proof step's unset `pass_score`.

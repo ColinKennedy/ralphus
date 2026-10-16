@@ -193,6 +193,7 @@ where one exists.
 | POST | `/api/guardians/{id}/run-action-hint` | Launch a ready authored action at its prepared execution location. A `prompt` action is agent-run: it is queued as a [live run](#live-actions) and the reply is `{ok, live_run}` |
 | GET | `/api/guardians/{id}/live-actions` | The review's [live actions](#live-actions), its live runs (newest first), and whether the opt-in is on |
 | POST | `/api/guardians/{id}/live-actions/run` | Queue manual live runs: body `{"index": N}` for one, `{}` for all; `409` when no member cell posted a live handoff |
+| POST | `/api/guardians/{id}/live-actions/results/refresh` | Retry publishing the [live-test results](#live-test-results) section to the review's open PR/MR descriptions now, ignoring retry backoff; replies `{"pending": [...]}` with the PRs still failing |
 | POST | `/api/guardians/{id}/live-runs/{run_id}/cancel` | Drop a queued live run, or stop a running one |
 | GET | `/api/guardians/{id}/live-runs/{run_id}/pane` | Live pane of one live run's agent session (board Live View) |
 | GET | `/api/guardians/{id}/live-runs/{run_id}/pane-transcript` | Raw transcript range of one live run's agent session |

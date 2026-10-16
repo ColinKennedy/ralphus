@@ -94,11 +94,31 @@ pub struct LiveRunRow {
     pub queued_at_ms: i64,
     pub started_at_ms: Option<i64>,
     pub finished_at_ms: Option<i64>,
+    /// The prompt exactly as sent to the runner, preparation warning included.
+    pub prompt: Option<String>,
+    /// The system prompt sent with it. Stored, never published.
+    pub system_prompt: Option<String>,
+    /// `passed`, `failed` or `inconclusive`: what the run found, apart from
+    /// how its agent session ended. `None` until the run has finished.
+    pub verdict: Option<String>,
+    pub verdict_detail: Option<String>,
+    pub fix_attempted: Option<bool>,
+    pub fix_confirmed: Option<bool>,
+    /// The agent's proposed reproduction recipe (JSON), as proposed.
+    pub recipe: Option<String>,
+    /// Reproduction commands that matched a recorded shell call.
+    pub commands: Vec<crate::live_results::VerifiedCommand>,
+    /// Stable ids of the review branches the action was attributed to.
+    pub branch_ids: Vec<String>,
+    pub attribution_note: Option<String>,
+    /// The branch the run's commits were carried onto, once integrated.
+    pub integration_branch_id: Option<String>,
+    pub integration_pushed: Option<bool>,
 }
 
 const RUN_COLUMNS: &str = "run_id, guardian_id, kind, action_idx, label, trigger, state, cwd, \
      base_tip, live_ref, commits, report, error, cost_usd, cell_id, integration, \
-     integration_detail, queued_at_ms, started_at_ms, finished_at_ms";
+     integration_detail, queued_at_ms, started_at_ms, finished_at_ms, prompt, system_prompt,      verdict, verdict_detail, fix_attempted, fix_confirmed, recipe, commands, branch_ids,      attribution_note, integration_branch_id, integration_pushed";
 
 fn run_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<LiveRunRow> {
     let commits: Option<String> = r.get(10)?;
@@ -125,6 +145,24 @@ fn run_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<LiveRunRow> {
         queued_at_ms: r.get(17)?,
         started_at_ms: r.get(18)?,
         finished_at_ms: r.get(19)?,
+        prompt: r.get(20)?,
+        system_prompt: r.get(21)?,
+        verdict: r.get(22)?,
+        verdict_detail: r.get(23)?,
+        fix_attempted: r.get::<_, Option<i64>>(24)?.map(|v| v != 0),
+        fix_confirmed: r.get::<_, Option<i64>>(25)?.map(|v| v != 0),
+        recipe: r.get(26)?,
+        commands: r
+            .get::<_, Option<String>>(27)?
+            .and_then(|c| serde_json::from_str(&c).ok())
+            .unwrap_or_default(),
+        branch_ids: r
+            .get::<_, Option<String>>(28)?
+            .and_then(|c| serde_json::from_str(&c).ok())
+            .unwrap_or_default(),
+        attribution_note: r.get(29)?,
+        integration_branch_id: r.get(30)?,
+        integration_pushed: r.get::<_, Option<i64>>(31)?.map(|v| v != 0),
     })
 }
 
@@ -294,6 +332,79 @@ impl crate::store::Store {
                 crate::store::now_ms(),
                 run_id
             ],
+        )?;
+        Ok(())
+    }
+
+    /// Record the prompts a run was started with and the branches its action
+    /// is attributed to.
+    ///
+    /// # Errors
+    ///
+    /// On a database failure.
+    pub fn set_live_run_sent(
+        &self,
+        run_id: &str,
+        prompt: &str,
+        system_prompt: &str,
+        branch_ids: &[String],
+        attribution_note: Option<&str>,
+    ) -> crate::store::Result<()> {
+        self.conn.execute(
+            "UPDATE guardian_live_runs SET prompt=?, system_prompt=?, branch_ids=?,
+                 attribution_note=? WHERE run_id=?",
+            rusqlite::params![
+                prompt,
+                system_prompt,
+                serde_json::to_string(branch_ids).unwrap_or_else(|_| "[]".into()),
+                attribution_note,
+                run_id
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Record what ralphus concluded about a finished run.
+    ///
+    /// # Errors
+    ///
+    /// On a database failure.
+    pub fn set_live_run_judgement(
+        &self,
+        run_id: &str,
+        j: &crate::live_results::Judgement,
+    ) -> crate::store::Result<()> {
+        self.conn.execute(
+            "UPDATE guardian_live_runs SET verdict=?, verdict_detail=?, fix_attempted=?,
+                 fix_confirmed=?, recipe=?, commands=? WHERE run_id=?",
+            rusqlite::params![
+                j.verdict.as_str(),
+                j.detail,
+                i64::from(j.fix_attempted),
+                i64::from(j.fix_confirmed),
+                j.recipe_json,
+                serde_json::to_string(&j.commands).unwrap_or_else(|_| "[]".into()),
+                run_id
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Record where a run's commits were carried and whether the push worked.
+    ///
+    /// # Errors
+    ///
+    /// On a database failure.
+    pub fn set_live_run_destination(
+        &self,
+        run_id: &str,
+        branch_id: &str,
+        pushed: Option<bool>,
+    ) -> crate::store::Result<()> {
+        self.conn.execute(
+            "UPDATE guardian_live_runs SET integration_branch_id=?, integration_pushed=?
+             WHERE run_id=?",
+            rusqlite::params![branch_id, pushed.map(i64::from), run_id],
         )?;
         Ok(())
     }
@@ -690,7 +801,11 @@ pub fn ensure_live_actions(
         .guardian_live_actions(guardian_id)
         .unwrap_or_default();
     if !existing.is_empty() {
-        return existing;
+        let guard = store.lock();
+        return match guard.resolve_legacy_live_actions(guardian_id) {
+            Ok(0) | Err(_) => existing,
+            Ok(_) => guard.guardian_live_actions(guardian_id).unwrap_or(existing),
+        };
     }
     let (guardian, handoffs, checkout) = {
         let guard = store.lock();
@@ -808,6 +923,9 @@ struct RunTarget {
     label: String,
     prompt: String,
     allow_commits: bool,
+    /// The branches the action is attributed to (empty for a user action).
+    branch_ids: Vec<String>,
+    attribution_error: Option<String>,
 }
 
 fn resolve_target(
@@ -829,6 +947,8 @@ fn resolve_target(
                 label: action.label,
                 prompt: action.prompt,
                 allow_commits: true,
+                branch_ids: action.branch_ids,
+                attribution_error: action.attribution_error,
             })
         }
         Some(LiveRunKind::Action) => {
@@ -848,6 +968,8 @@ fn resolve_target(
                     .unwrap_or_else(|| format!("action {idx}")),
                 prompt,
                 allow_commits: true,
+                branch_ids: Vec::new(),
+                attribution_error: None,
             })
         }
         None => Err(format!("unknown live-run kind {:?}", run.kind)),
@@ -951,6 +1073,35 @@ fn execute_queued_run(
     }
     post_report(store, &guardian, &target.label, &outcome);
     integration == "pending"
+}
+
+/// Persist what a finished run was sent and what ralphus concluded about it,
+/// then queue the review's PR descriptions for a refresh.
+fn record_run_result(
+    store: &crate::store_lock::StoreHandle,
+    run_id: &str,
+    target: &RunTarget,
+    outcome: &crate::live_actions::LiveRunOutcome,
+) {
+    {
+        let guard = store.lock();
+        if !outcome.sent_prompt.is_empty() {
+            let _ = guard.set_live_run_sent(
+                run_id,
+                &outcome.sent_prompt,
+                &outcome.sent_system_prompt,
+                &target.branch_ids,
+                target.attribution_error.as_deref(),
+            );
+        }
+        if let Some(j) = &outcome.judgement {
+            let _ = guard.set_live_run_judgement(run_id, j);
+        }
+    }
+    let run = store.lock().live_run(run_id);
+    if let Ok(run) = run {
+        crate::live_publish::request_refresh(store, &run.guardian_id);
+    }
 }
 
 /// Most patch text handed to the resolver when a live run's commits do not

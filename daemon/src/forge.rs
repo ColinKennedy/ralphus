@@ -2209,6 +2209,121 @@ impl ForgeClient {
         }
     }
 
+    /// The PR/MR's current description as the forge has it right now (GitHub
+    /// `body`, GitLab `description`); an absent or null description is the
+    /// empty string. Used to read the live body immediately before
+    /// [`Self::update_pull_request_description`] rewrites a managed section.
+    pub fn get_pull_request_description(&self, number: i64) -> Result<String, String> {
+        // ralphus[ignore-rlog-pair]: this provider boundary has no Store; its caller records the structured workflow outcome
+        crate::rlog!(
+            DEBUG,
+            "ralphus [forge] get pr description start kind={} repo={} number={number}",
+            self.kind.as_str(),
+            self.repo_path
+        );
+        let result = self.get_pull_request_description_inner(number);
+        if let Err(e) = &result {
+            // ralphus[ignore-rlog-pair]: this provider boundary has no Store; its caller records the structured workflow outcome
+            crate::rlog!(
+                ERROR,
+                "ralphus [forge] get pr description failed kind={} repo={} number={number}: {e}",
+                self.kind.as_str(),
+                self.repo_path
+            );
+        }
+        result
+    }
+
+    fn get_pull_request_description_inner(&self, number: i64) -> Result<String, String> {
+        let token = self.require_token()?;
+        match self.kind {
+            ForgeKind::GitHub => {
+                let url = format!("{}/repos/{}/pulls/{number}", self.api_base, self.repo_path);
+                let resp = self.get(
+                    http_agent()
+                        .get(&url)
+                        .set("Authorization", &format!("Bearer {token}"))
+                        .set("Accept", "application/vnd.github+json"),
+                )?;
+                Ok(resp["body"].as_str().unwrap_or("").to_string())
+            }
+            ForgeKind::GitLab => {
+                let url = format!(
+                    "{}/projects/{}/merge_requests/{number}",
+                    self.api_base, self.repo_path
+                );
+                let resp = self.get(http_agent().get(&url).set("PRIVATE-TOKEN", token))?;
+                Ok(resp["description"].as_str().unwrap_or("").to_string())
+            }
+        }
+    }
+
+    /// Replace the PR/MR's description. Changes nothing else: not the base,
+    /// the title, the draft state or the head.
+    pub fn update_pull_request_description(
+        &self,
+        number: i64,
+        description: &str,
+    ) -> Result<(), String> {
+        // ralphus[ignore-rlog-pair]: this provider boundary has no Store; its caller records the structured workflow outcome
+        crate::rlog!(
+            INFO,
+            "ralphus [forge] update pr description start kind={} repo={} number={number} len={}",
+            self.kind.as_str(),
+            self.repo_path,
+            description.len()
+        );
+        let result = self.update_pull_request_description_inner(number, description);
+        match &result {
+            // ralphus[ignore-rlog-pair]: this provider boundary has no Store; its caller records the structured workflow outcome
+            Ok(()) => crate::rlog!(
+                INFO,
+                "ralphus [forge] update pr description done kind={} repo={} number={number}",
+                self.kind.as_str(),
+                self.repo_path
+            ),
+            // ralphus[ignore-rlog-pair]: this provider boundary has no Store; its caller records the structured workflow outcome
+            Err(e) => crate::rlog!(
+                ERROR,
+                "ralphus [forge] update pr description failed kind={} repo={} number={number}: {e}",
+                self.kind.as_str(),
+                self.repo_path
+            ),
+        }
+        result
+    }
+
+    fn update_pull_request_description_inner(
+        &self,
+        number: i64,
+        description: &str,
+    ) -> Result<(), String> {
+        let token = self.require_token()?;
+        match self.kind {
+            ForgeKind::GitHub => {
+                let url = format!("{}/repos/{}/pulls/{number}", self.api_base, self.repo_path);
+                let payload = serde_json::json!({ "body": description });
+                self.send(
+                    http_agent()
+                        .patch(&url)
+                        .set("Authorization", &format!("Bearer {token}"))
+                        .set("Accept", "application/vnd.github+json"),
+                    &payload,
+                )?;
+                Ok(())
+            }
+            ForgeKind::GitLab => {
+                let url = format!(
+                    "{}/projects/{}/merge_requests/{number}",
+                    self.api_base, self.repo_path
+                );
+                let payload = serde_json::json!({ "description": description });
+                self.send(http_agent().put(&url).set("PRIVATE-TOKEN", token), &payload)?;
+                Ok(())
+            }
+        }
+    }
+
     /// Toggle an already-open PR/MR's draft (WIP) state (RAL-196), used when
     /// a submission adopts a pre-existing PR/MR for a branch and the state
     /// the submission asked for differs from what the forge currently has --
@@ -6525,6 +6640,60 @@ mod tests {
         let client = mock.client(ForgeKind::GitLab, "group%2Fproj");
         client.update_pull_request_base(9, "main").unwrap();
         mock.finish();
+    }
+
+    #[test]
+    fn pull_request_description_round_trips_on_github() {
+        let mock = MockForge::start(move |server| {
+            let req = server.recv();
+            assert_eq!(req.method(), &tiny_http::Method::Get);
+            assert_eq!(req.url(), "/repos/acme/widget/pulls/7");
+            req.respond(
+                tiny_http::Response::from_string(r#"{"body":null,"base":{"ref":"main"}}"#)
+                    .with_status_code(200),
+            )
+            .unwrap();
+            let mut req = server.recv();
+            assert_eq!(req.method(), &tiny_http::Method::Patch);
+            assert_eq!(req.url(), "/repos/acme/widget/pulls/7");
+            let mut body = String::new();
+            req.as_reader().read_to_string(&mut body).unwrap();
+            req.respond(tiny_http::Response::from_string("{}").with_status_code(200))
+                .unwrap();
+            body
+        });
+        let client = mock.client(ForgeKind::GitHub, "acme/widget");
+        assert_eq!(client.get_pull_request_description(7).unwrap(), "");
+        client
+            .update_pull_request_description(7, "new body")
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_str(&mock.finish()).unwrap();
+        assert_eq!(body, serde_json::json!({"body": "new body"}));
+    }
+
+    #[test]
+    fn pull_request_description_round_trips_on_gitlab() {
+        let mock = MockForge::start(move |server| {
+            let req = server.recv();
+            assert_eq!(req.method(), &tiny_http::Method::Get);
+            assert_eq!(req.url(), "/projects/group%2Fproj/merge_requests/9");
+            req.respond(
+                tiny_http::Response::from_string(r#"{"description":"old"}"#).with_status_code(200),
+            )
+            .unwrap();
+            let mut req = server.recv();
+            assert_eq!(req.method(), &tiny_http::Method::Put);
+            let mut body = String::new();
+            req.as_reader().read_to_string(&mut body).unwrap();
+            req.respond(tiny_http::Response::from_string("{}").with_status_code(200))
+                .unwrap();
+            body
+        });
+        let client = mock.client(ForgeKind::GitLab, "group%2Fproj");
+        assert_eq!(client.get_pull_request_description(9).unwrap(), "old");
+        client.update_pull_request_description(9, "new").unwrap();
+        let body: serde_json::Value = serde_json::from_str(&mock.finish()).unwrap();
+        assert_eq!(body, serde_json::json!({"description": "new"}));
     }
 
     #[test]
