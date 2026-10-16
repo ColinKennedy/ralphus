@@ -608,6 +608,11 @@ pub struct CellView {
     /// has).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub triage_types: Vec<String>,
+    /// True while the cell opted into Triage and the Arbiter has not yet
+    /// written its classification (`triage_types` is still empty). Lets the
+    /// board show a "classifying" placeholder instead of nothing.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub triage_pending: bool,
     /// This cell's resolved monorepo subproject(s) (RAL-346), alphabetical,
     /// if any have been resolved -- empty when `Unresolved` (a monorepo
     /// cell the Arbiter hasn't matched yet, or found no match for) or
@@ -2863,6 +2868,19 @@ impl Store {
                 created_at_ms INTEGER NOT NULL,
                 PRIMARY KEY (squad_id, task_idx, idx, triage_type)
             );
+            -- RAL-662: a cell that opted into Triage whose Arbiter
+            -- classification has not been written yet. Set at submit time and
+            -- cleared by `set_cell_triage_types` (even when the result is the
+            -- built-in `unclassified` fallback), so the board can show a
+            -- \"classifying\" placeholder for exactly that window.
+            CREATE TABLE IF NOT EXISTS triage_pending_cells (
+                squad_id      TEXT NOT NULL,
+                task_idx      INTEGER NOT NULL,
+                idx           INTEGER NOT NULL,
+                created_at_ms INTEGER NOT NULL,
+                PRIMARY KEY (squad_id, task_idx, idx)
+            );
+            CREATE INDEX IF NOT EXISTS idx_triage_pending_cells_created_at_ms ON triage_pending_cells(squad_id, created_at_ms);
             -- RAL-346: a cell's resolved monorepo subproject(s) -- either
             -- seeded from the cell's own manually-declared `CellDef.subprojects`
             -- TOML field (`inferred = 0`), or written by the Arbiter's async
@@ -6578,6 +6596,7 @@ impl Store {
         subprojects_by_cell: &crate::triage::CellSubprojectsMap,
         db_profiles: &HashMap<String, crate::agent_profile_store::AgentProfileView>,
     ) -> Result<HashMap<i64, Vec<CellView>>> {
+        let triage_pending = Self::triage_pending_cells(conn, squad_id)?;
         let mut stmt = conn.prepare(
             "SELECT task_idx, idx, sid, name, cwd, agent, model, state, tokens_in, tokens_out, cost_usd, error, prompt, command, effective_system_prompt, depends_on, review_branch, agent_session_id, maximum_budget_usd, env_overrides, proof_env_overrides, started_at_ms, finished_at_ms, env_out_of_date, machine, maximum_context, auto_compact_threshold, cache_creation_tokens, cache_read_tokens, cost_is_estimated, maximum_tool_output_tokens, compaction_input_tokens, compaction_count, delayed_until_ms, completed_active_duration_ms, CASE WHEN state='running' THEN active_started_at_ms END, turns, waypoint_halted_at_ms, runner_stalled_at_ms, effort, temperature, init_commands, init_source, init_timeout_sec, init_state, init_duration_ms, init_exit_status, init_output, init_finished_at_ms, shell
              FROM cells WHERE squad_id=? ORDER BY task_idx, idx",
@@ -6594,6 +6613,8 @@ impl Store {
                     .get(&(task_idx, idx))
                     .cloned()
                     .unwrap_or_default();
+                let is_triage_pending =
+                    triage_types.is_empty() && triage_pending.contains(&(task_idx, idx));
                 let (subprojects, subprojects_inferred) = subprojects_by_cell
                     .get(&(task_idx, idx))
                     .cloned()
@@ -6653,6 +6674,7 @@ impl Store {
                         proof: Vec::new(),
                         reviews,
                         triage_types,
+                        triage_pending: is_triage_pending,
                         subprojects,
                         subprojects_inferred,
                         agent_session_id: r.get::<_, Option<String>>(17)?,

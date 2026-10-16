@@ -1030,10 +1030,13 @@ Saving restarts the proof step and the rest of its list; an unchanged value rest
        * hasn't been swept into an actual review yet, shown in the cell
        * details pane's "in reviews" section in place of a real review link.
        * Empty once a real review exists (`s.reviews` non-empty) or the cell
-       * never opted into Triage (`s.triage_types` empty) -- `cellView()`
-       * only calls this as the fallback when `s.reviews` is empty.
+       * never opted into Triage (`s.triage_types` empty and
+       * `s.triage_pending` false) -- `cellView()` only calls this as the
+       * fallback when `s.reviews` is empty.
        *
-       * Three states, matching the cell's own `state` rather than any
+       * Four states: "classifying" (opted in but the Arbiter has not written
+       * a type yet, `s.triage_pending`; the next re-render replaces it with
+       * one of the states below, `unclassified` at worst), matching the cell's own `state` rather than any
        * stored Triage/pool field (there's nothing to poll for beyond what
        * `CellView` already carries -- and `CellView.state` is already the
        * proof-aware effective state, not the raw persisted column): "failed"
@@ -1051,7 +1054,15 @@ Saving restarts the proof step and the rest of its list; an unchanged value rest
        */
       function triagePlaceholderSection(s) {
         const types = s.triage_types || [];
-        if (!types.length || (s.reviews || []).length) return "";
+        if ((s.reviews || []).length) return "";
+        if (!types.length) {
+          if (!s.triage_pending) return "";
+          const tip = "This cell opted into Triage and the Arbiter is still classifying it into a Triage type.\nOnce it resolves (to 'unclassified' if classification fails or is ambiguous), this becomes 'Scheduled for auto-review' with the type name.";
+          return `<h3 class="section">in reviews</h3><div class="kv-row" data-tip="${tip}">` +
+            `<span style="opacity:0.55"><span class="dot" style="background:${cvar("--arbiter")}"></span></span>` +
+            `<span class="v" style="flex:1"><div>⏳ Classifying for auto-review…</div></span>` +
+            `</div>`;
+        }
         const typeList = types.join(", ");
         if (s.state === "failed") {
           const tip = `This cell opted into Triage (type(s): ${typeList}) but failed.\nA failed cell can never pass review, so it is permanently excluded from being swept into an automatic review.`;
