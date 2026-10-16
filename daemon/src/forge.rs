@@ -1576,7 +1576,7 @@ impl ForgeClient {
             .filter(|run| {
                 matches!(
                     run["conclusion"].as_str().unwrap_or_default(),
-                    "failure" | "timed_out" | "cancelled" | "action_required"
+                    "failure" | "timed_out" | "action_required"
                 )
             })
             .map(|run| FailedCheck {
@@ -1604,6 +1604,16 @@ impl ForgeClient {
         if runs
             .iter()
             .any(|r| r["status"].as_str() != Some("completed"))
+        {
+            return Ok(PrCiState::Pending);
+        }
+        // A cancelled run has no failure to fix. When every check was
+        // cancelled there is no verdict either, so wait for a re-run; a
+        // cancelled check beside completed ones never overrides them.
+        if !runs.is_empty()
+            && runs
+                .iter()
+                .all(|r| r["conclusion"].as_str() == Some("cancelled"))
         {
             return Ok(PrCiState::Pending);
         }
@@ -1758,13 +1768,8 @@ impl ForgeClient {
                     ..build_pr_failure(checks, "job")
                 }))
             }
-            "canceled" | "skipped" => Ok(PrCiState::Failing(PrFailure {
-                reason: format!("pipeline {pipeline_status}"),
-                job_url: pipeline["web_url"].as_str().map(str::to_string),
-                log_text: None,
-                checks: vec![],
-                ..Default::default()
-            })),
+            // Neither status leaves a failed job to repair: wait for a re-run.
+            "canceled" | "skipped" => Ok(PrCiState::Pending),
             // "running" | "pending" | "created" | "waiting_for_resource" | "preparing" | ...
             _ => Ok(PrCiState::Pending),
         }
@@ -1907,7 +1912,7 @@ impl ForgeClient {
             .find(|s| {
                 matches!(
                     s["conclusion"].as_str().unwrap_or_default(),
-                    "failure" | "timed_out" | "cancelled" | "action_required"
+                    "failure" | "timed_out" | "action_required"
                 )
             })
             .and_then(|s| s["name"].as_str())
@@ -8374,7 +8379,7 @@ mod tests {
     }
 
     #[test]
-    fn check_pr_ci_status_still_fails_on_a_cancelled_job_of_the_newest_workflow_run() {
+    fn check_pr_ci_status_waits_when_every_check_was_cancelled_and_never_replaced() {
         let mock = MockForge::start(move |server| {
             let req = server.recv();
             req.respond(
@@ -8388,7 +8393,7 @@ mod tests {
             req.respond(
                 tiny_http::Response::from_string(
                     r#"{"check_runs": [
-                        {"id": 1, "name": "scope", "app": {"id": 15368}, "details_url": "https://github.com/a/b/actions/runs/100/job/1", "status": "completed", "conclusion": "success"},
+                        {"id": 1, "name": "scope", "app": {"id": 15368}, "details_url": "https://github.com/a/b/actions/runs/100/job/1", "status": "completed", "conclusion": "cancelled"},
                         {"id": 2, "name": "build (linux)", "app": {"id": 15368}, "details_url": "https://github.com/a/b/actions/runs/100/job/2", "status": "completed", "conclusion": "cancelled"}
                     ]}"#,
                 )
@@ -8397,10 +8402,38 @@ mod tests {
             .unwrap();
         });
         let client = mock.client(ForgeKind::GitHub, "acme/widget");
-        assert!(matches!(
-            client.check_pr_ci_status(4).unwrap(),
-            PrCiState::Failing(_)
-        ));
+        assert_eq!(client.check_pr_ci_status(4).unwrap(), PrCiState::Pending);
+        mock.finish();
+    }
+
+    #[test]
+    fn check_pr_ci_status_cancelled_check_does_not_hide_a_genuine_failure() {
+        let mock = MockForge::start(move |server| {
+            let req = server.recv();
+            req.respond(
+                tiny_http::Response::from_string(
+                    r#"{"mergeable_state": "clean", "head": {"sha": "deadbeef"}}"#,
+                )
+                .with_status_code(200),
+            )
+            .unwrap();
+            let req = server.recv();
+            req.respond(
+                tiny_http::Response::from_string(
+                    r#"{"check_runs": [
+                        {"id": 1, "name": "scope", "app": {"id": 15368}, "details_url": "https://github.com/a/b/actions/runs/100/job/1", "status": "completed", "conclusion": "cancelled"},
+                        {"id": 2, "name": "lint", "app": {"id": 15368}, "details_url": "https://github.com/a/b/actions/runs/100/job/2", "status": "completed", "conclusion": "failure"}
+                    ]}"#,
+                )
+                .with_status_code(200),
+            )
+            .unwrap();
+        });
+        let client = mock.client(ForgeKind::GitHub, "acme/widget");
+        match client.check_pr_ci_status(4).unwrap() {
+            PrCiState::Failing(f) => assert_eq!(f.checks.len(), 1),
+            other => panic!("expected Failing, got {other:?}"),
+        }
         mock.finish();
     }
 
@@ -9174,6 +9207,29 @@ mod tests {
         let client = mock.client(ForgeKind::GitLab, "group%2Fproj");
         assert_eq!(client.check_pr_ci_status(9).unwrap(), PrCiState::Passing);
         mock.finish();
+    }
+
+    #[test]
+    fn check_pr_ci_status_waits_on_an_unreplaced_canceled_or_skipped_gitlab_pipeline() {
+        for status in ["canceled", "skipped"] {
+            let mock = MockForge::start(move |server| {
+                let req = server.recv();
+                req.respond(
+                    tiny_http::Response::from_string(format!(
+                        r#"{{"merge_status": "can_be_merged", "sha": "head-sha", "head_pipeline": {{"id": 54, "ref": "feature", "sha": "head-sha", "status": "{status}", "web_url": "https://gitlab.example/pipelines/54"}}}}"#
+                    ))
+                    .with_status_code(200),
+                )
+                .unwrap();
+            });
+            let client = mock.client(ForgeKind::GitLab, "group%2Fproj");
+            assert_eq!(
+                client.check_pr_ci_status(9).unwrap(),
+                PrCiState::Pending,
+                "{status}"
+            );
+            mock.finish();
+        }
     }
 
     #[test]
