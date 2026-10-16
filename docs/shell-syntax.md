@@ -77,15 +77,24 @@ the grammar with the fewest wins.
 
 ### Missing-command warning (RAL-671)
 
-For a submission that runs locally (no `machine` anywhere in it names a
-non-local machine), each distinct executable -- the grammar's command-name
-nodes for the selected shell -- is resolved on the daemon host by that shell:
-`command -v` for sh-compatible commands, `Get-Command` for PowerShell, or
-CMD's `help` catalog and `where.exe`. A missing name gets a `missing_command`
-warning once per validation. Shell built-ins, cmdlets and aliases count as
-commands when the shell resolves them. Dynamic names, paths and globs are
-skipped; commands defined only in a later execution environment can still
-warn falsely.
+The same parse also finds the executable each command invokes (the grammar's
+`command_name` nodes, never a split on spaces). Every local command that cannot
+be found on the **daemon host** produces a warning of kind `missing_command`
+telling the user to check the selected shell or correct the command name.
+
+- Checked fields: cell/proof `command`, `initialization_commands`, review
+  preparation commands, review action `command` / `cleanup_command`,
+  `before_reset_command`, and `auto_build` commands. A command is checked only
+  when its effective `machine` (proof, then cell, then task) is unset or `local`.
+- Each distinct `(shell, executable)` is looked up once per validation.
+- Not checked: names from variables, substitutions or `{name}` / `<<...>>`
+  placeholders, anything with a path separator, shell built-ins and keywords,
+  PowerShell aliases and `Verb-Noun` cmdlets (cannot be listed without starting
+  PowerShell). Lookup follows `PATH` (plus `PATHEXT` for cmd/PowerShell on
+  Windows). Aliases, functions or tools that only exist where the command runs
+  can still produce a false warning.
+- Without the `shell-syntax` feature, or for a shell with no grammar, nothing
+  is reported.
 
 ## Vendored grammars
 

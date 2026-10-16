@@ -43,8 +43,8 @@ pub enum ErrorKind {
     /// A `command` looks like it was written for a different shell than the
     /// one it runs under, or is not valid syntax for it (always a warning).
     ShellMismatch,
-    /// A `command`'s executable cannot be found on this machine (always a
-    /// warning, only for submissions that run locally).
+    /// A local command invokes an executable the daemon host cannot find
+    /// (always a warning; only produced when the shell parser is built in).
     MissingCommand,
 }
 
@@ -110,14 +110,44 @@ struct Ctx<'a> {
     raw: &'a str,
     idx: HeaderIndex,
     report: &'a mut ValidationReport,
-    /// Whether every command runs on the daemon's own host, so executables can
-    /// be looked up here.
-    local_only: bool,
-    /// `shell:executable` keys already looked up during this validation.
-    seen_executables: std::collections::HashSet<String>,
+    /// Executable lookups already made during this validation.
+    availability: crate::shell_check::CommandAvailability,
+}
+
+/// Whether a command whose `machine` resolves through `tables` (innermost
+/// first) runs on the local host; an unset machine is local.
+fn machine_is_local(tables: &[&toml::Table]) -> bool {
+    for table in tables {
+        if let Some(machine) = table.get("machine").and_then(toml::Value::as_str) {
+            let machine = machine.trim();
+            if !machine.is_empty() {
+                return machine.eq_ignore_ascii_case(crate::schema::LOCAL_MACHINE);
+            }
+        }
+    }
+    true
 }
 
 impl Ctx<'_> {
+    /// Warns for each executable in a local `command` that this host cannot
+    /// find. Non-local commands are never checked.
+    fn check_availability(
+        &mut self,
+        path: &str,
+        command: &str,
+        shell: Option<&str>,
+        local: bool,
+        line: Option<u32>,
+    ) {
+        if !local {
+            return;
+        }
+        for message in self.availability.missing(command, shell) {
+            self.report
+                .warning(path, ErrorKind::MissingCommand, message, line);
+        }
+    }
+
     fn error(&mut self, path: &str, kind: ErrorKind, msg: impl Into<String>, line: Option<u32>) {
         self.report.error(path, kind, msg, line);
     }
@@ -128,28 +158,6 @@ impl Ctx<'_> {
 
     fn key_line(&self, header: Option<u32>, key: &str) -> Option<u32> {
         self.idx.find_key_line(self.raw, header, key)
-    }
-}
-
-/// Whether no `machine` anywhere in the submission names a non-local machine.
-/// Machines are inherited down the task/cell/proof levels, so any remote one
-/// disables the local executable lookup for the whole submission.
-fn runs_locally(value: &toml::Value) -> bool {
-    match value {
-        toml::Value::Table(t) => t.iter().all(|(k, v)| {
-            if k == "machine" {
-                v.as_str().is_none_or(|m| {
-                    matches!(
-                        crate::schema::parse_machine(m),
-                        Ok(crate::schema::MachineRef::Local)
-                    )
-                })
-            } else {
-                runs_locally(v)
-            }
-        }),
-        toml::Value::Array(a) => a.iter().all(runs_locally),
-        _ => true,
     }
 }
 
@@ -186,8 +194,7 @@ pub fn validate_toml(raw: &str) -> ValidationReport {
         raw,
         idx,
         report: &mut report,
-        local_only: runs_locally(&value),
-        seen_executables: std::collections::HashSet::new(),
+        availability: crate::shell_check::CommandAvailability::default(),
     };
 
     for key in table.keys() {
@@ -616,6 +623,7 @@ fn check_pass_score(ctx: &mut Ctx, table: &toml::Table, path: &str, header: Opti
 fn check_command_mode(
     ctx: &mut Ctx,
     table: &toml::Table,
+    parents: &[&toml::Table],
     has_command: bool,
     path: &str,
     header: Option<u32>,
@@ -657,21 +665,12 @@ fn check_command_mode(
                 line,
             );
         }
-        if ctx.local_only {
-            for message in crate::shell_check::missing_command_warnings(
-                command,
-                shell,
-                &mut ctx.seen_executables,
-            ) {
-                let line = ctx.key_line(header, "command");
-                ctx.warning(
-                    &format!("{path}.command"),
-                    ErrorKind::MissingCommand,
-                    message,
-                    line,
-                );
-            }
-        }
+        let chain: Vec<&toml::Table> = std::iter::once(table)
+            .chain(parents.iter().rev().copied())
+            .collect();
+        let local = machine_is_local(&chain);
+        let line = ctx.key_line(header, "command");
+        ctx.check_availability(&format!("{path}.command"), command, shell, local, line);
     }
 
     let mode = table.get("mode").and_then(toml::Value::as_str);
@@ -889,7 +888,7 @@ fn validate_defaults(value: Option<&toml::Value>, ctx: &mut Ctx) {
         unknown_keys(ctx, table, DEFAULT_KEYS, &path, header);
         check_type(ctx, table, "depends_on", Ty::StrArray, &path, header);
         check_environment_lenient(ctx, table, &path, header);
-        check_initialization(ctx, table, &path, header);
+        check_initialization(ctx, table, None, &path, header);
     }
 }
 
@@ -899,7 +898,33 @@ fn validate_defaults(value: Option<&toml::Value>, ctx: &mut Ctx) {
 /// contain a newline, and the timeout must be a positive integer. An empty
 /// string is accepted here as the explicit "disable the inherited command"
 /// value; the daemon rejects it at submit time when nothing is inherited.
-fn check_initialization(ctx: &mut Ctx, table: &toml::Table, path: &str, header: Option<u32>) {
+///
+/// `parents` is `Some` (outermost first) for a task or cell, whose commands
+/// are checked for missing executables on the machine they resolve to, and
+/// `None` for a `[[default]]` block, whose machine is not yet known.
+fn check_initialization(
+    ctx: &mut Ctx,
+    table: &toml::Table,
+    parents: Option<&[&toml::Table]>,
+    path: &str,
+    header: Option<u32>,
+) {
+    if let (Some(parents), Some(commands)) = (parents, initialization_value(table)) {
+        let chain: Vec<&toml::Table> = std::iter::once(table)
+            .chain(parents.iter().rev().copied())
+            .collect();
+        let local = machine_is_local(&chain);
+        let line = ctx.key_line(header, "initialization_commands");
+        for command in &commands {
+            ctx.check_availability(
+                &format!("{path}.initialization_commands"),
+                command,
+                None,
+                local,
+                line,
+            );
+        }
+    }
     check_type(
         ctx,
         table,
@@ -1209,7 +1234,7 @@ fn validate_tasks(value: Option<&toml::Value>, ctx: &mut Ctx) {
         check_environment_lenient(ctx, table, &path, header);
         check_type(ctx, table, "no_commit_required", Ty::Bool, &path, header);
         check_type(ctx, table, "share_session", Ty::Bool, &path, header);
-        check_initialization(ctx, table, &path, header);
+        check_initialization(ctx, table, Some(&[]), &path, header);
         check_type(ctx, table, "extends", Ty::StrArray, &path, header);
         check_extends(ctx, table, &path, header);
 
@@ -1408,7 +1433,7 @@ fn validate_cells(
                 check_type(ctx, table, "command", Ty::Str, &path, header);
             }
         }
-        check_command_mode(ctx, table, has_command, &path, header);
+        check_command_mode(ctx, table, &[task_scope.table], has_command, &path, header);
 
         if let Some(id_v) = table.get("id") {
             if let Some(id) = id_v.as_str() {
@@ -1489,7 +1514,7 @@ fn validate_cells(
         check_upstream_task_ref_exists(ctx, table, &path, header, task_cell_index);
 
         check_type(ctx, table, "share_session", Ty::Bool, &path, header);
-        check_initialization(ctx, table, &path, header);
+        check_initialization(ctx, table, Some(&[task_scope.table]), &path, header);
         if let Some(placeholder) = table
             .get("cwd")
             .and_then(toml::Value::as_str)
@@ -2934,6 +2959,9 @@ fn validate_auto_build_table(table: &toml::Table, rpath: &str, ctx: &mut Ctx, he
             _ => {
                 check_type(ctx, auto_build, "command", Ty::Str, &abpath, None);
                 check_type(ctx, auto_build, "prompt", Ty::Str, &abpath, None);
+                if let Some(command) = auto_build.get("command").and_then(toml::Value::as_str) {
+                    ctx.check_availability(&format!("{abpath}.command"), command, None, true, None);
+                }
             }
         }
 
@@ -3080,6 +3108,7 @@ fn check_preparation_command(ctx: &mut Ctx, step: &toml::Table, path: &str) {
                 );
             }
             check_worktree_text_placeholders(ctx, &format!("{path}.command"), command);
+            ctx.check_availability(&format!("{path}.command"), command, None, true, None);
         }
         toml::Value::Array(commands) => {
             if commands.is_empty() {
@@ -3110,6 +3139,7 @@ fn check_preparation_command(ctx: &mut Ctx, step: &toml::Table, path: &str) {
                     );
                 }
                 check_worktree_text_placeholders(ctx, &command_path, command);
+                ctx.check_availability(&command_path, command, None, true, None);
             }
         }
         _ => ctx.error(
@@ -3288,6 +3318,7 @@ fn validate_review_action_array(value: Option<&toml::Value>, path: &str, ctx: &m
         for key in ["command", "cleanup_command"] {
             if let Some(value) = table.get(key).and_then(toml::Value::as_str) {
                 check_worktree_text_placeholders(ctx, &format!("{apath}.{key}"), value);
+                ctx.check_availability(&format!("{apath}.{key}"), value, None, true, None);
             }
         }
         validate_review_action_branches(table.get("branches"), &format!("{apath}.branches"), ctx);
@@ -3446,9 +3477,12 @@ fn validate_review_action_lifecycle(value: Option<&toml::Value>, path: &str, ctx
             return;
         };
         for (index, command) in commands.iter().enumerate() {
-            if !command.is_str() {
+            let command_path = format!("{path}.before_reset_command[{index}]");
+            if let Some(text) = command.as_str() {
+                ctx.check_availability(&command_path, text, None, true, None);
+            } else {
                 ctx.error(
-                    &format!("{path}.before_reset_command[{index}]"),
+                    &command_path,
                     ErrorKind::WrongType,
                     "before_reset_command entries must be strings",
                     None,
@@ -3943,7 +3977,15 @@ fn validate_proof_array(
                 None,
             ),
         }
-        check_command_mode(ctx, table, table.contains_key("command"), &vpath, None);
+        let parent_tables: Vec<&toml::Table> = parent_chain.iter().map(|s| s.table).collect();
+        check_command_mode(
+            ctx,
+            table,
+            &parent_tables,
+            table.contains_key("command"),
+            &vpath,
+            None,
+        );
         check_pass_score(ctx, table, &vpath, None);
 
         check_type(ctx, table, "budget_tokens", Ty::Int, &vpath, None);
@@ -8104,40 +8146,73 @@ mod shell_check_tests {
         );
     }
 
-    #[test]
-    fn missing_executable_warns_only_for_local_submissions() {
-        let local = "[[task]]
-name = \"t\"
-
-[[task.cell]]
-id = \"c\"
-cwd = \"/w\"
-remediation_attempts = 1
-shell = \"bash\"
-command = \"zz-no-such-tool-671 a && zz-no-such-tool-671 b\"
-";
-        let report = validate_toml(local);
+    fn missing(raw: &str) -> Vec<ValidationError> {
+        let report = validate_toml(raw);
         assert!(report.is_ok(), "{:?}", report.errors);
-        let missing = report
+        report
             .warnings
-            .iter()
+            .into_iter()
             .filter(|w| w.kind == ErrorKind::MissingCommand)
-            .count();
-        assert_eq!(missing, 1, "{:?}", report.warnings);
+            .collect()
+    }
 
-        let remote = local.replace(
-            "[[task.cell]]",
-            "[[task.cell]]
-machine = \"ssh:box\"",
+    // No hyphen: PowerShell treats `Verb-Noun` names as cmdlets and skips them.
+    const NOPE: &str = "ralphusnosuchtoolxyz";
+
+    #[test]
+    fn local_cell_and_proof_commands_warn_once_per_executable() {
+        let raw = format!(
+            "[[task]]\nname = \"t\"\n[[task.cell]]\ncwd = \"/w\"\nshell = \"bash\"\nmode = \"raw\"
+command = \"{NOPE} a\"\n[[task.cell.proof]]\nshell = \"bash\"\nmode = \"raw\"
+command = \"{NOPE} b\"\n[[task.cell.proof]]\nshell = \"cmd\"\nmode = \"raw\"
+command = \"{NOPE} c\"\n"
         );
-        let report = validate_toml(&remote);
-        assert!(
-            report
-                .warnings
-                .iter()
-                .all(|w| w.kind != ErrorKind::MissingCommand),
-            "{:?}",
-            report.warnings
+        let found = missing(&raw);
+        // Bash lookup is shared by the cell and first proof; cmd is separate.
+        assert_eq!(found.len(), 2, "{found:?}");
+        assert_eq!(found[0].path, "task[0].cell[0].command");
+        assert!(found[0].message.contains("daemon host"));
+    }
+
+    #[test]
+    fn remote_commands_are_not_checked() {
+        let raw = format!(
+            "[[task]]\nname = \"t\"\nmachine = \"incredibuild:A\"\n[[task.cell]]\ncwd = \"/w\"\nmode = \"raw\"
+command = \"{NOPE} a\"\ninitialization_commands = \"{NOPE} i\"\n[[task.cell.proof]]\nmode = \"raw\"
+command = \"{NOPE} b\"\n"
         );
+        assert!(missing(&raw).is_empty());
+    }
+
+    #[test]
+    fn proof_machine_overrides_the_cell() {
+        let raw = format!(
+            "[[task]]\nname = \"t\"\nmachine = \"incredibuild:A\"\n[[task.cell]]\ncwd = \"/w\"\nmode = \"raw\"
+command = \"{NOPE} a\"\n[[task.cell.proof]]\nmachine = \"local\"\nmode = \"raw\"
+command = \"{NOPE} b\"\n"
+        );
+        let found = missing(&raw);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].path, "task[0].cell[0].proof[0].command");
+    }
+
+    #[test]
+    fn initialization_and_review_commands_are_checked() {
+        let raw = format!(
+            "[[task]]\nname = \"t\"\ninitialization_commands = \"{NOPE} i\"\n[[task.cell]]\ncwd = \"/w\"\nprompt = \"p\"\nreview = \"<<review:r>>\"\n[[review]]\nid = \"r\"\n[[review.action]]\nlabel = \"Serve\"\ncommand = \"{NOPE}serve\"\ncleanup_command = \"{NOPE}stop\"\n[[review.action.prepare]]\ncommand = [\"{NOPE}prep\"]\n[review.action.lifecycle]\nbefore_reset_command = [\"{NOPE}reset\"]\n"
+        );
+        let paths: Vec<String> = missing(&raw).into_iter().map(|w| w.path).collect();
+        for expected in [
+            "task[0].initialization_commands",
+            "review[0].action[0].command",
+            "review[0].action[0].cleanup_command",
+            "review[0].action[0].prepare[0].command[0]",
+            "review[0].action[0].lifecycle.before_reset_command[0]",
+        ] {
+            assert!(
+                paths.iter().any(|p| p == expected),
+                "{expected} in {paths:?}"
+            );
+        }
     }
 }
