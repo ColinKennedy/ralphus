@@ -681,12 +681,12 @@
         const body = attempts === undefined
           ? `<div style="padding:8px;font-size:11px;color:var(--muted)">Loading…</div>`
           : attempts.length === 0
-            ? `<div style="padding:8px;font-size:11px;color:var(--muted)">No persisted attempts yet — a durable log is written once this cell's first tmux attempt finishes.</div>`
-            : `<div class="history-list">${attempts.map((a) => `<div class="history-item" data-click="viewHistoryAttempt" data-key="${esc(key)}" data-attempt="${a.attempt}" data-tip="Open attempt ${a.attempt}'s full, durably-persisted terminal-log content.\nEach reattach gets its own attempt file, so this survives pane death and daemon restarts.">
+            ? `<div style="padding:8px;font-size:11px;color:var(--muted)">No persisted attempts yet — a durable log is written once this cell's first attempt finishes.</div>`
+            : `<div class="history-list">${attempts.map((a) => `<div class="history-item" data-click="viewHistoryAttempt" data-key="${esc(key)}" data-attempt="${a.attempt}" data-tip="Open attempt ${a.attempt}'s full, durably-persisted terminal-log content.\nEach reattach gets its own attempt file, so this survives daemon restarts.">
                 <span>Attempt ${a.attempt}${a.attempt === 0 ? " (initial)" : " (reattach)"}</span>
                 <span style="color:var(--muted)">${fmtAttemptSize(a.size_bytes)} · ${new Date(a.modified_ms).toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" })}</span>
               </div>`).join("")}</div>`;
-        return `<div class="history-box" data-tip="Every durably-persisted terminal-log attempt for this cell (RAL-154), including reattaches — kept on disk independent of whether the live tmux pane is still around.">
+        return `<div class="history-box" data-tip="Every durably-persisted terminal-log attempt for this cell (RAL-154), including reattaches — kept on disk across daemon restarts.">
             <div class="history-head"><span>Attempt history</span><button class="btn" style="padding:1px 7px;font-size:11px" data-click="toggleHistory" data-key="${esc(key)}" data-tip="Collapse this attempt history.">✕ Hide</button></div>
             ${body}
           </div>`;

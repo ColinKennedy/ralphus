@@ -1373,7 +1373,7 @@ host alongside real `[machine.targets.*]` rows from
 `null`/`[]` if the daemon hasn't completed a sweep yet (`[health].enabled =
 false`, or a fresh restart racing the first sweep). Deliberately scoped to a
 subset of `Free`/daemon-local catalog entries whose probe is self-contained
-inside the daemon process (`git`, `tmux`, `runner`, `gh`, `glab`,
+inside the daemon process (`git`, `runner`, `gh`, `glab`,
 `nvidia-smi`, `ollama`) — see that module's own doc comment for why the
 CLI's `.ralphus.toml`-shape checks aren't part of this sweep.
 ```json
@@ -1634,16 +1634,11 @@ on a squad (RAL-150). Body:
 ```
 At least one of `set`/`unset` must be non-empty (`400` otherwise). Every key in
 either map/list must be a valid environment-variable identifier
-(`[A-Za-z_][A-Za-z0-9_]*`) — checked with `crate::config::is_valid_env_key`,
-both to catch typos early and because
-`crate::tmux::build_command_line_with_env` relies on the same validation as a
-shell-injection backstop for the tmux-wrapped runner path. Every `set` value
-must also be free of control characters (`\n`, `\r`, ESC, NUL, ...) — checked
-with `crate::config::is_valid_env_value` (`400` otherwise) — since on Windows
-a cell's launch command is delivered via `send-keys` typed
-keystroke-by-keystroke into a live pty, where an embedded `\n` would act like
-pressing Enter mid-command (RAL-227). `set` entries win over `unset` when a
-key appears in both. Overrides are **persistent** (not a
+(`[A-Za-z_][A-Za-z0-9_]*`) — checked with `crate::config::is_valid_env_key`
+to catch typos early. Every `set` value must also be free of control
+characters (`\n`, `\r`, ESC, NUL, ...) — checked with
+`crate::config::is_valid_env_value` (`400` otherwise). `set` entries win over
+`unset` when a key appears in both. Overrides are **persistent** (not a
 one-shot retry parameter): once set, a key stays applied to every
 cell/proof-step subprocess this squad spawns — across any number of future
 retries/restarts — until explicitly unset. They do not themselves trigger a
@@ -3884,8 +3879,8 @@ that backend (RAL-187):
   therefore per completed turn — both counts read `0` until the first turn
   finishes. Proof steps have no live channel; their counts appear once the
   step completes.
-- A cell that **fails mid-run** (cancelled, timed out, or its tmux pane
-  died before the runner wrote a result) still reports the tokens it had
+- A cell that **fails mid-run** (cancelled, timed out, or its child process
+  exited before the runner wrote a result) still reports the tokens it had
   already spent, carried over from the last live snapshot, rather than
   collapsing to `0`.
 - The values reflect the cell's **current** run only. A restart overwrites
@@ -4492,7 +4487,7 @@ Four equivalent routes, one per entity kind, matching the same
     "scope": "cell",
     "task": "build",
     "cell_id": "worker",
-    "message": "tmux session started",
+    "message": "direct run started",
     "log_path": null,
     "log_excerpt": null
   },
@@ -4628,15 +4623,12 @@ documented above; RAL-140 deliberately adds no new daemon routes or storage
 tables of its own:
 
 - **`ralphus history <ID>` (no `--live`)** — a one-shot, non-blocking
-  snapshot. If the id's tmux session is currently live, this is the same
+  snapshot. If the id's cell is currently running, this is the same
   `.../pane` content the board's Live view reads (see `GET
   .../cells/{ti}/{si}/pane` / `GET .../proofs/{task_idx}/{scope}/{cell_idx}/{proof_idx}/pane`
-  above). Once the tmux session is gone, `.../pane` itself may still return a
-  persisted last-pane-content snapshot (RAL-102 follow-up —
-  `crate::tmux::write_pane_snapshot`/`read_pane_snapshot`, a read-only
-  historical record of what the pane last showed) if one was captured, but
-  `ralphus history` prefers a more stable, curated record over a raw
-  transcript replay — it falls back to whatever was already durably
+  above). Once the cell finishes, `.../pane` may still return a persisted
+  last-content snapshot, but `ralphus history` prefers a more stable,
+  curated record over a raw transcript replay — it falls back to whatever was already durably
   persisted for that entity by mechanisms that predate this ticket:
   - A **cell**'s fallback is its RAL-136 ghost — `GET
     /api/ghosts/cell:{squad_id}:{task_idx}:{cell_idx}` (see above). A
@@ -4656,13 +4648,13 @@ tables of its own:
   live for the id (`--wait-until-valid [SECONDS]` opts into waiting instead).
   Once the pane goes inactive, the cell/proof's ghost/output (see above)
   is printed as one final, separately labelled block — it's a short curated
-  note, not a continuation of the raw tmux transcript just tailed, so it is
+  note, not a continuation of the raw transcript just tailed, so it is
   never diffed against the tailing cursor.
 - **`ralphus listen <ID> --until <status>`** — polls the existing `GET
   /api/squads/{id}` (for a squad/task/cell/proof selector) or `GET
   /api/guardians/{id}` (for a review/review-worktree selector) endpoint once
   a second until the resolved entity's status equals the caller-supplied
-  `--until` value, then exits. No log/tmux content is involved.
+  `--until` value, then exits. No log content is involved.
 
 ### Live View liveness signal (RAL-170)
 
@@ -4677,58 +4669,25 @@ alongside `active`/`content`:
 ```
 
 `last_activity_ms` is the Unix-epoch-milliseconds time the daemon last
-observed *fresh* pane output (strictly more lines than the previous poll)
-for this session — `null` once the session has ended or before it has
-produced any output yet. The board's Live View (the live-view widget) uses it to show
+observed new transcript bytes for this session — `null` once the session has
+ended or before it has produced any output yet. The board's Live View uses it to show
 an absolute "last activity" timestamp and to distinguish a quiet-but-healthy
 long-running command (e.g. a `cargo test` pass inside a Guardian
 quality-check) from one that has silently stopped producing output.
 
-**Design decision: tracked continuously, daemon-side, in-memory only —
-not on-demand only while a Live View is open.**
-`SubprocessRunner::run_via_tmux_attempt` already polls every running
-tmux-wrapped session's pane on a fixed 500ms cadence regardless of whether
-any client is watching (it needs to, to detect the completion sentinel and
-forward `RALPHUS_EVENT:` marker lines) — RAL-170 piggybacks on that existing
-poll, storing the timestamp as an in-process `Store` field
-(`Store::note_live_activity`/`live_activity_ms`/`clear_live_activity`,
-`daemon/src/store.rs`) keyed by the same deterministic `crate::tmux::session_name`
-used for task cells, proof steps, and Guardian resolver/manual-check
-sessions alike. Two consequences of that choice:
-
-- **Always fresh when read.** Because tracking never depends on a Live View
-  being open, there's no "stale from before the view opened" problem to
-  solve — the value read by any `GET .../pane` call is whatever the poll
-  loop most recently observed, full stop.
-- **Deliberately not a DB column.** A SQLite `UPDATE` on every pane-growth
-  tick would scale with the number of *concurrently running* sessions —
-  fine at "hundreds" (a few hundred writes/sec against the single
-  `Store` mutex, comfortably inside SQLite WAL throughput), a real
-  contention/write-amplification risk at "thousands" sharing that one
-  mutex, for a value nobody needs once the process exits. An in-process
-  `HashMap<String, i64>` entry is a pointer-sized insert instead of a WAL
-  write, and is removed (`clear_live_activity`) as soon as the owning
-  `run_via_tmux` call returns for good — so memory stays bounded by
-  currently-running sessions, not lifetime history, and the write cost is
-  independent of how many Live Views happen to be open (zero, one, or many
-  clients polling the same pane all read the same already-computed value).
-
-If the "thousands of concurrent processes" scale is ever actually reached
-and the per-tick `HashMap` insert itself becomes measurable (unlikely — it's
-already gated to at most once per 500ms per session by the same poll
-interval that drives event forwarding), the next step would be debouncing
-the insert further (e.g. only update if the value has advanced by more than
-some threshold), not switching to persistent storage.
+The direct runner checks the growing `.raw` transcript while the child
+process runs. When it reads new bytes, it calls `Store::note_live_activity`.
+The timestamp is held in memory under the cell's session key and cleared
+when the run ends. Live View reads that timestamp regardless of whether a
+client was watching when the output arrived.
 
 ### Live View deep scrollback via the raw transcript (RAL-397 Phase 2F)
 
 `GET /api/squads/{id}/cells/{ti}/{si}/pane-transcript?attempt=&offset=&limit=`
-reads a byte range directly from a task cell's `.raw` pipe-pane transcript —
-the continuous, on-disk tee of the pane's raw output `Tmux::pipe_pane`
-(`daemon/src/tmux.rs`) starts for the cell's whole lifetime, independent of
-the pane's own in-memory scrollback. It exists so the board can page through
-depth beyond a pane's `history-limit` (`TMUX_HISTORY_LIMIT`,
-`daemon/src/tmux.rs`) without raising that limit's RAM cost at all.
+reads a byte range directly from a task cell's `.raw` transcript. The direct
+runner tees the child process's stdout and stderr into that file while the
+cell runs. The board can page through it without holding the full output in
+memory.
 
 ```json
 { "content": "...", "start": 12288, "total": 40012 }
@@ -4798,20 +4757,18 @@ response, 404 semantics, and RAL-247 redaction as the squad-cell form above:
 - Guardian branch resolver: `GET /api/guardians/{id}/branches/{branch_id}/pane-transcript`
 - Guardian manual-checks: `GET /api/guardians/{id}/manual-checks/pane-transcript`
 
-Each resolves the same tmux session its sibling `.../pane` route does and
+Each resolves the same cell session key its sibling `.../pane` route does and
 delegates to the one shared range helper, so the four stay byte-identical in
 behavior.
 
 ### Live View debug-line filtering (RAL-232)
 
-Every tmux-wrapped cell/proof/resolver runs its `ralphus-runner` subprocess
-directly inside the pane the board's Live View reads, so the pane's raw text
-interleaves the agent's own output with ralphus's own diagnostic/telemetry
+The direct runner captures child process output in a durable transcript. Its
+raw text interleaves the agent's output with ralphus's diagnostic/telemetry
 lines: the `ralphus [TYPE] message ...` convention
 ([`.agent/logging-policy.md`](../.agent/logging-policy.md)'s log-format table),
-`RALPHUS_EVENT:` Cartographer markers (`runner/src/cartographer.rs`), and the
-`RALPHUS_TMUX_DONE` tmux-completion sentinel (`daemon/src/runner.rs`). A
-per-pane "Show Debug Messages" checkbox lets a viewer choose whether to see
+`RALPHUS_EVENT:` Cartographer markers (`runner/src/cartographer.rs`). A
+"Show Debug Messages" checkbox lets a viewer choose whether to see
 those lines or just the agent's.
 
 **This is a rendering-only concern — nothing about capture or persistence
@@ -5385,7 +5342,7 @@ on for an already prepared review starts it at once.
 *Runs.* Each execution is a live run, queued and run one at a time per review
 in the review's prepared checkout, which is held for the run's duration (a newer
 preparation goes to a sibling directory). The agent runs as a plain child
-process (the runner's tmux-free path), keyed `guardian-{id}` / task
+process through the direct runner path, keyed `guardian-{id}` / task
 `live-action` / cell `live-{index}-{run_id}`; the board's Live View follows its
 durable transcript. `GET /api/guardians/{id}/live-actions` returns:
 

@@ -72,7 +72,9 @@ Treat typing `git stash` as a stop-and-ask trigger.
 
 ## tmux and psmux are gone
 
-Cells, proofs and checks run through the runner's tmux-free path,
+The multiplexer was removed because it spawned too many processes.
+
+Cells, proofs and checks run through the runner's direct path,
 `daemon/src/runner/direct.rs`: a plain child process whose output is teed into
 the durable `.raw` transcript, with the whole process tree killed on cancel.
 Live View is built on that transcript (the `pane` / `pane-transcript` endpoints
@@ -165,7 +167,7 @@ ones do not, and these stay short:
   rejected by both.
 - `git ls-tree -r`/`-z`, `git ls-files -z`, `git clean -d` -- no long forms
   (`--recursive`/`--directories` are rejected).
-- `ssh`, `ssh-keygen`, `scp`, `tmux` -- these accept single-dash options
+- `ssh`, `ssh-keygen`, `scp` -- these accept single-dash options
   only, repo-wide.
 - `sh -c` / `cmd /C` -- the shell's own invocation flag.
 - POSIX coreutils in `scripts/*.sh` (`mkdir -p`, `rm -rf`, `tail -n`): the

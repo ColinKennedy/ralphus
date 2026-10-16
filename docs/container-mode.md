@@ -134,7 +134,8 @@ This mode closes the *filesystem* half of the problem. It does **not**:
 ## Agent subprocess execution in container mode
 
 Agent-kind cell/proof runs execute as plain child processes (RAL-658: the
-tmux/psmux multiplexer was removed). The runner spawns the agent subprocess,
+tmux/psmux multiplexer was removed because it spawned too many processes).
+The runner spawns the agent subprocess,
 captures its output to a durable transcript file, and the board's Live View
 reads from that transcript in real time.
 

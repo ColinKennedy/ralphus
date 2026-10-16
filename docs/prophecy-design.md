@@ -45,7 +45,7 @@ most useful section: most of the subsystem is assembly, not invention.
 |---|---|---|---|
 | **Shipped** | **Ghost** (RAL-136) — the prototype | An agent writes `RALPHUS_GHOST:` + bullets; the runner parses it into the `ghosts` table. Framed explicitly as "not a changelog — what the diff can't show." This *is* the idea, at cell scope, already working. | `daemon/src/ghost.rs`; parsed at `runner/src/execute.rs:884` |
 | **Shipped** | **Cartographer** (RAL-98) — structured storage | Rows carry timestamp, level, source, message, scope, `squad_id`, `guardian_id`, `cell_id`, `task`, `log_path`, free JSON payload. Filterable/paginated over HTTP. | `daemon/src/cartographer.rs` |
-| **Shipped** | **An agent→daemon event channel** | `RALPHUS_EVENT: {json}` on stderr, parsed by the daemon. Survives the hard cases: tmux panes (via the `.raw` transcript) and remote hosts through a machine provider. | `daemon/src/runner.rs:27`; `daemon/src/remote_runner.rs:468` |
+| **Shipped** | **An agent→daemon event channel** | `RALPHUS_EVENT: {json}` on stderr, parsed by the daemon. Survives the hard cases: local child processes (via the `.raw` transcript) and remote hosts through a machine provider. | `daemon/src/runner.rs:27`; `daemon/src/remote_runner.rs:468` |
 | **Shipped** | **Daemon-side attribution** | `forward_runner_event` fills a missing `squad_id`/`cell_id`/`task` from the owning `RunnerSpec`. Identity comes from the daemon's bookkeeping, not from what the agent claims. | `daemon/src/runner.rs:2789` |
 | **Shipped** | **Uniform addressing** | `squad:<id>`, `task:<id>:<i>`, `cell:<id>:<i>:<j>`, `proof:…`, `guardian:<id>`. A prophecy's owner key is this string. | `daemon/src/entity_uri.rs` (RAL-155) |
 | **Partial** | **The squad → review → PR chain** | `guardians.squad_id` exists but is **nullable**, and a review aggregates branches that may come from different squads. The chain breaks exactly at the seam we want it to hold. | `daemon/src/store.rs:1360` |
@@ -90,7 +90,7 @@ Two consequences worth stating:
 
 | Transport | Covers | Captures | Verdict |
 |---|---|---|---|
-| `RALPHUS_PROPHECY:` marker | Every backend — ollama, native, tmux, remote | The moment; stderr is read line by line, not at exit | **Primary.** No credential, no endpoint. Attribution is unforgeable. |
+| `RALPHUS_PROPHECY:` marker | Every backend — ollama, native, remote | The moment; stderr is read line by line, not at exit | **Primary.** No credential, no endpoint. Attribution is unforgeable. |
 | `RunnerResult` field | Every backend, local and remote — it's in the `exec` reply | Everything the cell collected, at exit | **Primary backstop.** A typed contract rather than best-effort stderr. Exactly how `ghost` already crosses the provider boundary. |
 | Daemon-side writes | Rebase, merge, auto-fix | Decisions ralphus itself made | **Free.** No agent cooperation needed. |
 | MCP tool | claude-code, codex, pi — and only where the daemon is reachable | The moment, with a delivery acknowledgment | Later. Better ergonomics, but the agent must hold a token. |

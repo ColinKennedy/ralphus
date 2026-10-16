@@ -223,7 +223,7 @@ test("stripThinkingPrefixes untags a whole block of text, leaving other lines al
 // (ralphus_squad-000000000206_ral-507.../0000.raw: 24 bare markers and 75
 // leaked reasoning fragments in that one cell).
 //
-// 1. tmux trims each captured row's trailing whitespace, so a line of *empty*
+// 1. A captured row can lack trailing whitespace, so a line of *empty*
 //    reasoning arrives as a bare "RALPHUS_THINKING:" -- which the old
 //    space-carrying prefix missed, rendering the raw marker as agent output.
 // 2. The pane is 500 columns wide (a deliberate
@@ -231,7 +231,7 @@ test("stripThinkingPrefixes untags a whole block of text, leaving other lines al
 //    the FIRST row carries the marker. The tail rows were classified as agent
 //    output and shown verbatim -- mid-word, which is how this was spotted
 //    ("...com|pare equality) -- robust.").
-// tmux marks a wrapped row by ending it with a backspace; renderPaneLine
+// A wrapped row can end with a backspace; renderPaneLine
 // consumes that as a cursor move, so renderTapeLines reads it off the raw row.
 
 test("a bare thinking marker with no trailing space still folds when Thinking is off", () => {
@@ -263,7 +263,7 @@ test("a wrapped line of ordinary agent output is untouched by the thinking fold"
   assert.equal(renderTapeLines(raw, false, true), "ordinary output\nand its tail\nafter");
 });
 
-test("excluding a tagged line also hides its tmux wrap tails, but not continuation output", () => {
+test("excluding a tagged line also hides its wrap tails, but not continuation output", () => {
   const raw = ["[usage] noisy totals\b", "continued totals", "[error] failed", "stderr continuation"];
   assert.equal(
     renderTapeLines(raw, false, true, parseLiveViewTypeFilter("-usage")),
