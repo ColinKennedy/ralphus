@@ -117,6 +117,16 @@ pub struct TriageCandidateView {
     /// whether the cell would actually be included in the next drain.
     pub status: String,
     pub triage_types: Vec<String>,
+    /// Exact pool keys that currently contain this candidate. Classified
+    /// candidates can remain visible after their pool has drained.
+    pub pools: Vec<TriagePoolMembership>,
+}
+
+/// One current `(project, triage_type)` membership for a candidate.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct TriagePoolMembership {
+    pub project: String,
+    pub triage_type: String,
 }
 
 /// One configured cron-style schedule entry for a `(project, triage_type)` pool.
@@ -394,6 +404,19 @@ impl Store {
     /// # Errors
     /// Propagates any SQLite failure.
     pub fn triage_candidates(&self) -> StoreResult<Vec<TriageCandidateView>> {
+        let mut pooled_by_cell: std::collections::HashMap<
+            (String, i64, i64),
+            Vec<TriagePoolMembership>,
+        > = std::collections::HashMap::new();
+        for (project, triage_type, row) in self.all_pooled_cells()? {
+            pooled_by_cell
+                .entry((row.squad_id, row.task_idx, row.idx))
+                .or_default()
+                .push(TriagePoolMembership {
+                    project,
+                    triage_type,
+                });
+        }
         let mut stmt = self.conn.prepare(
             "SELECT DISTINCT c.squad_id, c.task_idx, c.idx, c.sid, c.name, c.state, c.cwd,
                     t.name, t.project, sq.label, c.review_branch
@@ -465,6 +488,15 @@ impl Store {
                             first.triage_types.push(t);
                         }
                     }
+                    if let Some(memberships) =
+                        pooled_by_cell.get(&(squad_id.clone(), task_idx, idx))
+                    {
+                        for membership in memberships {
+                            if !first.pools.contains(membership) {
+                                first.pools.push(membership.clone());
+                            }
+                        }
+                    }
                     let rank = |s: &str| match s {
                         "failed" => 0,
                         "scheduled" => 1,
@@ -477,6 +509,9 @@ impl Store {
                 }
                 by_worktree.insert(key, out.len());
             }
+            let pools = pooled_by_cell
+                .remove(&(squad_id.clone(), task_idx, idx))
+                .unwrap_or_default();
             out.push(TriageCandidateView {
                 squad_id,
                 squad_label,
@@ -488,6 +523,7 @@ impl Store {
                 project,
                 status,
                 triage_types,
+                pools,
             });
         }
         Ok(out)
@@ -1862,6 +1898,13 @@ prompt=\"y\"
         let candidates = s.triage_candidates().unwrap();
         assert_eq!(candidates.len(), 2, "one candidate per worktree");
         assert!(candidates.iter().all(|c| c.status == "queued"));
+        assert!(candidates.iter().all(|c| {
+            c.pools
+                == vec![TriagePoolMembership {
+                    project: "proj".to_string(),
+                    triage_type: "bug".to_string(),
+                }]
+        }));
         // Draining still returns every cell so each one gets its review link.
         assert_eq!(s.drain_triage_pool("proj", "bug").unwrap().len(), 5);
     }
@@ -2230,7 +2273,12 @@ prompt=\"y\"
         // A passing proof instead reports "queued" -- a genuine live candidate.
         s.set_proof_state(&squad_id, 0, "cell", 0, 0, crate::store::NodeState::Done)
             .unwrap();
-        assert_eq!(s.triage_candidates().unwrap()[0].status, "queued");
+        let candidate = &s.triage_candidates().unwrap()[0];
+        assert_eq!(candidate.status, "queued");
+        assert!(
+            candidate.pools.is_empty(),
+            "classification alone is not a live pool membership"
+        );
     }
 
     #[test]

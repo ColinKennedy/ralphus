@@ -930,6 +930,12 @@
        * @property {string} project
        * @property {"scheduled"|"queued"|"failed"} status - "scheduled" (not done yet), "queued" (done and viable, a live candidate for the next pool drain), or "failed" (done but its proof failed -- permanently excluded from ever being swept into an auto-review).
        * @property {string[]} triage_types
+       * @property {TriagePoolMembership[]} pools - exact pool keys that currently contain this candidate
+       */
+      /**
+       * @typedef {object} TriagePoolMembership
+       * @property {string} project
+       * @property {string} triage_type
        */
       /**
        * Derived state of one Triage pool (`triagePoolMath`). A count threshold

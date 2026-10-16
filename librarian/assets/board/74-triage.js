@@ -16,6 +16,15 @@
         return i < 0 ? { proj: key, sub: null } : { proj: key.slice(0, i), sub: key.slice(i + 2) };
       }
       /**
+       * Whether a candidate still has a row in this exact live pool.
+       * @param {TriageCandidateView} candidate
+       * @param {TriagePoolView} pool
+       * @returns {boolean}
+       */
+      function triageCandidateInPool(candidate, pool) {
+        return candidate.pools.some((membership) => membership.project === pool.project && membership.triage_type === pool.triage_type);
+      }
+      /**
        * Everything the pool card, the rail, and the summary derive from one
        * pool. A count threshold drains in threshold-sized batches, so `ready`
        * is the cells sitting in full batches (each batch becomes its own
@@ -323,7 +332,18 @@
        * @returns {TriageCandidateView[]}
        */
       function triageCandidatesFor(p, status) {
-        return triageCandidates.filter((c) => c.project === p.project && c.triage_types.includes(p.triage_type) && c.status === status);
+        return triageCandidates.filter((c) => triageCandidateInPool(c, p) && c.status === status);
+      }
+      /**
+       * Classified candidates for this project and type that have not yet
+       * acquired a live pool row.
+       * @param {TriagePoolView} p
+       * @param {"scheduled"|"queued"|"failed"} status
+       * @returns {TriageCandidateView[]}
+       */
+      function triageUnpooledCandidatesFor(p, status) {
+        return triageCandidates.filter((c) => c.project === p.project && c.triage_types.includes(p.triage_type)
+          && c.status === status && !triageCandidateInPool(c, p));
       }
       /**
        * Whether a candidate matches the toolbar's name search.
@@ -774,11 +794,16 @@
         if (triagePaneEdit) return h + triagePaneEditFormHtml();
 
         const queued = triageCandidatesFor(p, "queued");
+        const unpooled = triageUnpooledCandidatesFor(p, "queued");
         const inflight = triageCandidatesFor(p, "scheduled");
         h += `<h3 class="section">Triggers</h3>${triageTriggersHtml(p, true)}`;
         h += `<h3 class="section">Pooled cells <span style="color:var(--faint)">${queued.length}</span></h3>`
           + (queued.length ? queued.map((c) => triageCellRowHtml(c, "Jump to this cell on the Squads tab — selects its squad, task, and cell.")).join("")
             : `<div class="kv-row"><span class="v" style="color:var(--muted)">None</span></div>`);
+        if (unpooled.length) {
+          h += `<h3 class="section" data-tip="These cells have a Triage type and are done, but have no live row in this pool. The count and Drain now use only live pool rows.">Eligible candidates not in pool <span style="color:var(--faint)">${unpooled.length}</span></h3>`
+            + unpooled.map((c) => triageCellRowHtml(c, "Classified and done, but not recorded in this live pool. Drain now cannot include it until the daemon adds a pool row.")).join("");
+        }
         if (inflight.length) {
           h += `<h3 class="section">In flight <span style="color:var(--faint)">${inflight.length}</span></h3>`
             + inflight.map((c) => triageCellRowHtml(c, "Jump to this cell on the Squads tab. It hasn't finished, so it isn't counting toward the threshold yet.")).join("");

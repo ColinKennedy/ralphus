@@ -21,7 +21,7 @@ function load() {
   }
   // eslint-disable-next-line no-new-func -- evaluating the real shipped source is the point; see the header.
   return new Function(`${html.slice(from + BEGIN.length, to)}
-    return { triageSplitKey, triagePoolMath, triageParseCron, triageCronError, triageCronNextAfter,
+    return { triageSplitKey, triageCandidateInPool, triagePoolMath, triageParseCron, triageCronError, triageCronNextAfter,
       triageScheduleNextFire, triageFormatNext, triageFormatIn, triageThresholdEffect, triageDrainedType, triageTypesVisible };`)();
 }
 
@@ -31,6 +31,16 @@ const utc = (s) => Date.parse(s);
 test("splitKey separates a subproject composite key", () => {
   assert.deepEqual(T.triageSplitKey("proj::core"), { proj: "proj", sub: "core" });
   assert.deepEqual(T.triageSplitKey("proj"), { proj: "proj", sub: null });
+});
+
+test("a candidate belongs in the pool list only while its exact pool membership exists", () => {
+  const pool = { project: "ralphus", triage_type: "bug", count: 3, threshold: 6 };
+  const candidate = {
+    pools: [{ project: "ralphus", triage_type: "bug" }],
+  };
+  assert.equal(T.triageCandidateInPool(candidate, pool), true);
+  assert.equal(T.triageCandidateInPool({ pools: [] }, pool), false);
+  assert.equal(T.triageCandidateInPool({ pools: [{ project: "ralphus", triage_type: "feature" }] }, pool), false);
 });
 
 test("pool math splits ready full batches from the pooled remainder", () => {
