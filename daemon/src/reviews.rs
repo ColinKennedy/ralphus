@@ -55,8 +55,14 @@ fn git(dir: &Path, args: &[&str]) -> std::result::Result<String, String> {
 /// The project root for a cell `cwd`, or `None` when it is not inside a git
 /// worktree. Used by the API to show the project (shared root) as a field
 /// distinct from the worktree (the cell's own working copy) — see CCTL-148.
+///
+/// A claimed worktree that has not been created yet has no checkout for git to
+/// answer for, so its claim names the project root instead.
 #[must_use]
 pub fn project_root_of(cwd: &str) -> Option<String> {
+    if let Some(pending) = crate::worktrees::pending_worktree_at(Path::new(cwd)) {
+        return Some(pending.root.to_string_lossy().into_owned());
+    }
     worktree_project(Path::new(cwd))
         .ok()
         .map(|p| p.to_string_lossy().into_owned())

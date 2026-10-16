@@ -3053,6 +3053,18 @@ fn init_spec_for_worktree(
     })
 }
 
+/// The placeholder text behind a `cwd` that is exactly one placeholder: the
+/// bare `ralphus:new-worktree/...` form, or the same text wrapped in a single
+/// `<<...>>` that spans the whole value (the form task files are written in).
+/// `None` when text surrounds the wrapper.
+fn whole_cwd_placeholder(cwd: &str) -> Option<&str> {
+    if !cwd.starts_with("<<") {
+        return Some(cwd);
+    }
+    let close = ralphus_core::schema::placeholder_close(cwd, 2)?;
+    (close + 2 == cwd.len()).then(|| &cwd[2..close])
+}
+
 /// A local git worktree one of this submission's cells needs, decided (RAL-337
 /// branch claim + `w/<short>` directory assignment) and durably claimed, but
 /// not yet created -- see [`plan_local_worktree_jobs`]'s doc comment.
@@ -3095,6 +3107,26 @@ pub(crate) fn plan_local_worktree_jobs(
         .collect();
     let mut on_disk: HashMap<PathBuf, HashMap<String, String>> = HashMap::new();
     let mut jobs: HashMap<String, LocalWorktreeJob> = HashMap::new();
+    // A cell this skips falls back to being created at submit, which is
+    // correct but slow -- say why, so a squad that is slow to materialize can
+    // be explained from the Cartographer instead of guessed at.
+    let skip = |cell: &CellRow, reason: &str| {
+        crate::cartographer::Note::new("worktrees")
+            .level(crate::logging::LogLevel::INFO)
+            .scope("materialize")
+            .squad(squad_id)
+            .task(&cell.task_name)
+            .cell(&cell.cell_id)
+            .emit(
+                store,
+                format!(
+                    "cell {squad_id}/{} worktree is not deferred and will be created during \
+                     submit: {reason}",
+                    cell.cell_id
+                ),
+                serde_json::json!({ "reason": reason }),
+            );
+    };
     for cell in cells {
         if cell
             .machine
@@ -3106,32 +3138,50 @@ pub(crate) fn plan_local_worktree_jobs(
         let Some(cwd) = cell.cwd.as_deref() else {
             continue;
         };
-        // Only a cwd that IS a placeholder directly -- the rarer case of one
-        // embedded via `<<...>>` inside a larger string (env-override
-        // expansion) isn't worth this fast path's complexity.
-        let Ok(Some(branch)) = classify_placeholder(cwd) else {
+        // Only a cwd that IS one placeholder -- bare, or wrapped in a single
+        // `<<...>>` spanning the whole value. One embedded in larger text
+        // (env-override expansion) isn't worth this fast path's complexity.
+        let Some(placeholder) = whole_cwd_placeholder(cwd) else {
+            if cwd.contains(ralphus_core::schema::WORKTREE_PLACEHOLDER_PREFIX) {
+                skip(cell, "the placeholder is embedded in a larger cwd string");
+            }
             continue;
         };
-        let cache_key = placeholder_cache_key(None, cwd);
+        let Ok(Some(branch)) = classify_placeholder(placeholder) else {
+            continue;
+        };
+        // Keyed on the unwrapped text: that is what the live resolution's
+        // cache is keyed on for a wrapped cwd, so the claimed path is found
+        // there instead of being created again.
+        let cache_key = placeholder_cache_key(None, placeholder);
         if jobs.contains_key(&cache_key) {
             continue;
         }
         let Some(project_name) = task_projects.get(&cell.task_idx).copied().flatten() else {
+            skip(cell, "its task has no project");
             continue;
         };
         let Ok(Some(project)) = store.resolve_project(project_name) else {
+            skip(cell, &format!("project {project_name:?} is not registered"));
             continue;
         };
         if project_startup_adapter(&project.vcs).is_none() {
+            skip(cell, &format!("project {project_name:?} does not use git"));
             continue;
         }
-        let Some(raw_upstream) = ralphus_core::schema::parse_worktree_placeholder_upstream(cwd)
+        let Some(raw_upstream) =
+            ralphus_core::schema::parse_worktree_placeholder_upstream(placeholder)
         else {
+            skip(cell, "the placeholder has no ?upstream=");
             continue;
         };
         let root = PathBuf::from(&project.path);
-        let Ok(upstream) = resolve_upstream(&root, raw_upstream) else {
-            continue;
+        let upstream = match resolve_upstream(&root, raw_upstream) {
+            Ok(upstream) => upstream,
+            Err(e) => {
+                skip(cell, &format!("could not resolve its upstream: {e}"));
+                continue;
+            }
         };
         let upstream = prefetched_upstreams
             .get(&(project.name.clone(), upstream.clone()))
@@ -3144,16 +3194,24 @@ pub(crate) fn plan_local_worktree_jobs(
             let snapshot = on_disk.get(&root).expect("just inserted above");
             resolve_squad_branch_claim(store, &project, branch, squad_id, snapshot)
         };
-        let Ok(branch) = branch_result else {
-            continue;
+        let branch = match branch_result {
+            Ok(branch) => branch,
+            Err(e) => {
+                skip(cell, &format!("could not allocate a branch: {e}"));
+                continue;
+            }
         };
-        let Ok(plan) = claim_worktree_slot(
+        let plan = match claim_worktree_slot(
             &root,
             &branch,
             &upstream,
             on_disk.get_mut(&root).expect("populated above"),
-        ) else {
-            continue;
+        ) {
+            Ok(plan) => plan,
+            Err(e) => {
+                skip(cell, &format!("could not claim a worktree directory: {e}"));
+                continue;
+            }
         };
         // Only cache newly-planned worktrees, not pre-existing ones. Pre-existing
         // worktrees need to go through ensure_worktree_tracked to resync to the
@@ -6041,6 +6099,95 @@ mod tests {
             .expect("restart no-op");
         let after: Vec<String> = cells.iter().map(|c| c.cwd.clone().unwrap()).collect();
         assert_eq!(before, after);
+    }
+
+    /// Task files write the placeholder wrapped in `<<...>>` (the bare form is a
+    /// validation error for new TOML), so the claim-and-defer path has to take
+    /// that form too: nothing is created while claiming or resolving, and two
+    /// cells of one task naming the same worktree share a single claim.
+    #[test]
+    fn wrapped_placeholders_are_claimed_and_deferred_like_bare_ones() {
+        let repo = init_repo("prefetch-wrapped");
+        let store = std::sync::Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
+        store
+            .lock()
+            .register_project("proj", "", &repo.to_string_lossy(), "git")
+            .unwrap();
+        let mut cells = vec![
+            cell_row(
+                0,
+                0,
+                "work",
+                Some("<<ralphus:new-worktree/feat-a?upstream=main>>"),
+            ),
+            cell_row(
+                0,
+                1,
+                "finalize",
+                Some("<<ralphus:new-worktree/feat-a?upstream=main>>"),
+            ),
+            cell_row(
+                1,
+                0,
+                "work",
+                Some("<<ralphus:new-worktree/feat-b?upstream=main>>"),
+            ),
+        ];
+        let tasks = vec![task_row(0, Some("proj")), task_row(1, Some("proj"))];
+
+        let jobs =
+            plan_local_worktree_jobs(&store.lock(), "squad-1", &cells, &tasks, &HashMap::new());
+        assert_eq!(jobs.len(), 2, "one claim per distinct branch");
+        let planned = planned_worktree_paths(&jobs);
+        for path in planned.values() {
+            assert!(!Path::new(path).exists(), "claiming must not create {path}");
+        }
+
+        resolve_placeholders_with_full_prefetch(
+            &store,
+            "squad-1",
+            &mut cells,
+            &tasks,
+            &HashMap::new(),
+            &planned,
+            &Context::new(),
+        )
+        .expect("resolution seeded entirely from the claims");
+
+        assert_eq!(cells[0].cwd, cells[1].cwd, "one worktree per placeholder");
+        assert_ne!(cells[0].cwd, cells[2].cwd);
+        for cell in &cells {
+            let cwd = cell.cwd.as_deref().expect("resolved");
+            assert!(!Path::new(cwd).exists(), "{cwd} is created lazily");
+            assert!(
+                pending_worktree_at(Path::new(cwd)).is_some(),
+                "{cwd} stays a pending claim until a cell needs it"
+            );
+        }
+    }
+
+    #[test]
+    fn whole_cwd_placeholder_unwraps_only_a_single_spanning_wrapper() {
+        let bare = "ralphus:new-worktree/feat?upstream=main";
+        assert_eq!(whole_cwd_placeholder(bare), Some(bare));
+        assert_eq!(
+            whole_cwd_placeholder(&format!("<<{bare}>>")),
+            Some(bare),
+            "the wrapped form unwraps to the bare text"
+        );
+        assert_eq!(
+            whole_cwd_placeholder("<<ralphus:new-worktree/feat?upstream=<<default>>>>"),
+            Some("ralphus:new-worktree/feat?upstream=<<default>>"),
+            "a nested sentinel stays inside the body"
+        );
+        assert_eq!(
+            whole_cwd_placeholder(&format!("<<{bare}>>/sub")),
+            None,
+            "text after the wrapper is not a whole-value placeholder"
+        );
+        assert_eq!(whole_cwd_placeholder(&format!("<<{bare}")), None);
     }
 
     /// Two branches whose short names collide, claimed by two SEPARATE planning
