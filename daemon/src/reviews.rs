@@ -2628,10 +2628,9 @@ pub fn repair_review_project_identities(store: &Store) {
 /// startup, self-heals" idiom `Store::init_schema`'s other backfills use),
 /// so there is no separate "have I run this" marker to track.
 ///
-/// A pooled cell whose proof has definitively failed is dropped from the
-/// pool outright rather than migrated (a failed cell can never pass review);
-/// it remains visible forever in the Triage candidate list with a "failed"
-/// status regardless (`Store::triage_candidates`). Every other pooled cell
+/// Pool membership is kept while a cell's proof is failed: a proof restart can
+/// make it viable again, and the pool count excludes it until then. A drain
+/// removes failed rows without including them in a review. Every pooled cell
 /// is moved onto its corrected key. Thresholds and cron schedules are moved
 /// the same way; if two old keys collide onto the same corrected key with
 /// two *different* non-null threshold values, the corrected key's threshold
@@ -2663,39 +2662,6 @@ pub fn repair_triage_pool_keys(store_handle: &crate::store_lock::StoreHandle) {
         }
     };
     for (old_project, triage_type, cell) in cells {
-        let effective = match store.effective_state_for_cell(
-            &cell.squad_id,
-            cell.task_idx,
-            cell.idx,
-        ) {
-            Ok(s) => s.unwrap_or_default(),
-            Err(e) => {
-                // ralphus[ignore-rlog-pair]: transient per-cell read diagnostic; migrated cells each log their own structured outcome
-                crate::rlog!(
-                    ERROR,
-                    "ralphus [triage] pool-key repair: failed to read cell state for {}/{}/{}: {e}",
-                    cell.squad_id,
-                    cell.task_idx,
-                    cell.idx
-                );
-                continue;
-            }
-        };
-        if effective == "failed" {
-            if let Err(e) = store.remove_triage_pool_cell(
-                &old_project,
-                &triage_type,
-                &cell.squad_id,
-                cell.task_idx,
-                cell.idx,
-            ) {
-                crate::rlog!(
-                    ERROR,
-                    "ralphus [triage] pool-key repair: failed to drop failed cell from pool: {e}"
-                );
-            }
-            continue;
-        }
         let new_project = crate::triage::pool_key_for_path(&store, Path::new(&old_project));
         if new_project != old_project {
             if let Err(e) = store.rekey_triage_pool_cell(
@@ -2714,6 +2680,104 @@ pub fn repair_triage_pool_keys(store_handle: &crate::store_lock::StoreHandle) {
             }
         }
         touched_keys.insert((new_project, triage_type));
+    }
+
+    // Recover eligible classified cells whose pool rows were lost by an older
+    // startup repair. A drained cell has a guardian and is absent from this
+    // candidate list, so this only restores outstanding Triage work.
+    let candidates = match store.triage_candidates() {
+        Ok(rows) => rows,
+        Err(e) => {
+            crate::rlog!(
+                ERROR,
+                "ralphus [triage] pool repair: failed to list candidates: {e}"
+            );
+            Vec::new()
+        }
+    };
+    for candidate in candidates
+        .into_iter()
+        .filter(|candidate| candidate.status == "queued" && candidate.pools.is_empty())
+    {
+        let cell = match store.cells_of(&candidate.squad_id) {
+            Ok(rows) => rows
+                .into_iter()
+                .find(|row| row.task_idx == candidate.task_idx && row.idx == candidate.cell_idx),
+            Err(e) => {
+                crate::rlog!(
+                    ERROR,
+                    "ralphus [triage] pool repair: failed to read cell {}: {e}",
+                    candidate.cell_id
+                );
+                None
+            }
+        };
+        let Some(cwd) = cell.and_then(|row| row.cwd) else {
+            continue;
+        };
+        let cwd = Path::new(&cwd);
+        let (Ok(branch), Ok(upstream), Ok(project)) = (
+            worktree_branch(cwd),
+            worktree_upstream(cwd),
+            worktree_project(cwd),
+        ) else {
+            continue;
+        };
+        let Ok(subprojects) = crate::triage::resolve_cell_subprojects(
+            &store,
+            &candidate.squad_id,
+            candidate.task_idx,
+            candidate.cell_idx,
+            &project,
+        ) else {
+            continue;
+        };
+        let pool_keys = crate::triage::pool_keys_for_cell(&store, &project, &subprojects);
+        if let Err(e) = store.set_cell_review_branch(
+            &candidate.squad_id,
+            candidate.task_idx,
+            candidate.cell_idx,
+            &branch,
+        ) {
+            crate::rlog!(
+                ERROR,
+                "ralphus [triage] pool repair: failed to restore branch for {}: {e}",
+                candidate.cell_id
+            );
+            continue;
+        }
+        for pool_key in pool_keys {
+            for triage_type in &candidate.triage_types {
+                if let Err(e) = store.record_triage_pool_cell(
+                    &pool_key,
+                    triage_type,
+                    &candidate.squad_id,
+                    candidate.task_idx,
+                    candidate.cell_idx,
+                    &branch,
+                    &upstream,
+                ) {
+                    crate::rlog!(
+                        ERROR,
+                        "ralphus [triage] pool repair: failed to restore {} as {triage_type}: {e}",
+                        candidate.cell_id
+                    );
+                    continue;
+                }
+                touched_keys.insert((pool_key.clone(), triage_type.clone()));
+                crate::cartographer::Note::new("arbiter")
+                    .squad(&candidate.squad_id)
+                    .cell(&candidate.cell_id)
+                    .emit(
+                        &store,
+                        format!(
+                            "restored missing Triage pool membership for cell {}",
+                            candidate.cell_id
+                        ),
+                        serde_json::json!({"project": pool_key, "triage_type": triage_type}),
+                    );
+            }
+        }
     }
 
     let thresholds = match store.all_triage_pool_thresholds() {
@@ -4841,7 +4905,7 @@ prompt=\"a\"
     }
 
     #[test]
-    fn repair_triage_pool_keys_drops_a_failed_cell_without_migrating_it() {
+    fn repair_triage_pool_keys_keeps_a_failed_cell_for_proof_retry() {
         let root = temp_repo();
         let store = std::sync::Arc::new(crate::store_lock::StoreMutex::new(
             Store::open_in_memory().unwrap(),
@@ -4869,15 +4933,86 @@ prompt=\"a\"
             .lock()
             .record_triage_pool_cell(&stale_key, "bug", &squad_id, 0, 0, "b1", "main")
             .unwrap();
+        store
+            .lock()
+            .set_triage_pool_threshold(&stale_key, "bug", Some(1))
+            .unwrap();
 
         repair_triage_pool_keys(&store);
 
-        assert!(
-            store.lock().triage_pool_keys().unwrap().is_empty(),
-            "a failed cell must be dropped from the pool, never migrated to the corrected key"
+        assert_eq!(
+            store.lock().triage_pool_keys().unwrap(),
+            vec![("proj".to_string(), "bug".to_string())],
+            "a failed proof keeps its pool membership and the membership is rekeyed"
+        );
+        assert_eq!(store.lock().triage_pool_count("proj", "bug").unwrap(), 0);
+
+        store
+            .lock()
+            .set_proof_state(&squad_id, 0, "cell", 0, 0, crate::store::NodeState::Done)
+            .unwrap();
+        assert_eq!(
+            store.lock().triage_pool_count("proj", "bug").unwrap(),
+            1,
+            "a successful proof retry makes the retained pool row eligible"
         );
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn repair_triage_pool_keys_restores_a_missing_membership_for_a_queued_candidate() {
+        let root = temp_repo();
+        git(&root, &["init", "--initial-branch", "main"]);
+        git(&root, &["config", "user.name", "ralphus"]);
+        git(&root, &["config", "user.email", "ralphus@example.com"]);
+        std::fs::write(root.join("base.txt"), "base\n").unwrap();
+        git(&root, &["add", "."]);
+        git(&root, &["commit", "--message", "base"]);
+        let remote = root.with_extension("remote.git");
+        git(
+            &remote.parent().unwrap(),
+            &["init", "--bare", remote.to_str().unwrap()],
+        );
+        git(
+            &root,
+            &["remote", "add", "origin", remote.to_str().unwrap()],
+        );
+        git(&root, &["push", "--set-upstream", "origin", "main"]);
+
+        let store = std::sync::Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
+        store
+            .lock()
+            .register_project("proj", "", &root.to_string_lossy(), "git")
+            .unwrap();
+        let file: ralphus_core::schema::TaskFile = toml::from_str(&format!(
+            "[[task]]\nname=\"t\"\n[[task.cell]]\nid=\"work\"\ncwd={:?}\nprompt=\"do it\"\ntriage=true\n",
+            root.to_string_lossy()
+        ))
+        .unwrap();
+        let squad_id = store.lock().insert_squad(&file, None, false).unwrap();
+        store
+            .lock()
+            .set_cell_state(&squad_id, 0, 0, crate::store::NodeState::Done)
+            .unwrap();
+        store
+            .lock()
+            .set_cell_triage_types(&squad_id, 0, 0, &["bug".to_string()])
+            .unwrap();
+
+        repair_triage_pool_keys(&store);
+
+        let candidates = store.lock().triage_candidates().unwrap();
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].pools.len(), 1);
+        assert_eq!(candidates[0].pools[0].project, "proj");
+        assert_eq!(candidates[0].pools[0].triage_type, "bug");
+        assert_eq!(store.lock().triage_pool_count("proj", "bug").unwrap(), 1);
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(remote);
     }
 
     #[test]
