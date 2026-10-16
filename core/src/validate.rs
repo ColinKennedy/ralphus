@@ -1507,9 +1507,14 @@ fn check_triage_dep_worktrees(
     ctx: &mut Ctx,
 ) {
     for (from, dep) in edges {
-        let (Some(&to), Some((true, from_wt))) = (ids.get(dep), cell_worktrees.get(from)) else {
+        let (Some(&to), Some((from_triaged, from_wt))) =
+            (ids.get(dep), cell_worktrees.get(from))
+        else {
             continue;
         };
+        if !from_triaged {
+            continue;
+        }
         let Some((dep_triaged, dep_wt)) = cell_worktrees.get(&to) else {
             continue;
         };
