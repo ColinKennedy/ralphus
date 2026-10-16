@@ -74,3 +74,30 @@ the grammar with the fewest wins.
   grammar nothing is said.
 - Shells with no grammar are not checked. Without the feature the check is
   skipped silently.
+
+## Vendored grammars
+
+The crates.io releases of the three grammars reject valid commands, so
+ralphus builds patched copies. They are git submodules under
+`shell-syntax/vendor/`, each pinned to a branch of the `ColinKennedy` fork:
+
+| Submodule | Fork branch | Fixes |
+|---|---|---|
+| `tree-sitter-powershell` | `fix/native-command-arguments` | bare `--` / `-` arguments, `--opt=value`, `-A5`, comma lists (`Select-Object Id, Name`), trailing `&` |
+| `tree-sitter-bash` | `fix/heredoc-delimiter-prefix` | a heredoc body line that merely starts with the delimiter (`Err(x)` under `<<'E'`) ended the body |
+| `tree-sitter-batch` | `fix/trailing-ampersand` | `cmd &` with nothing after the `&` |
+
+Each fix has tree-sitter corpus tests (`test/corpus/*.txt`) in its fork and is
+offered upstream as a pull request.
+
+`shell-syntax/grammars` (`ralphus-grammars`) chooses per grammar at build time:
+the submodule when `vendor/tree-sitter-<name>/src/parser.c` exists, otherwise the
+crates.io release. A missing submodule never breaks the build. It prints a
+`cargo:warning=` naming the grammars that fell back, the daemon logs the same
+warning and a Cartographer note at startup, and parse results may differ from
+the vendored ones. Run `git submodule update --init` to get the patched copies.
+CI checks submodules out.
+
+To change a grammar: edit the fork, regenerate with `tree-sitter generate`
+(batch: `--abi 14`), run `tree-sitter test`, push, then move the submodule
+pointer here with `git -C shell-syntax/vendor/tree-sitter-<name> pull` and commit it.

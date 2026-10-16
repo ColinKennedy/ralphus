@@ -13,11 +13,13 @@ workspace = true
 # Embeds tree-sitter and the Bash + PowerShell + cmd (batch) grammars (C, built with `cc`).
 # Display-only and optional -- see docs/shell-syntax.md. Off: `parse` reports
 # `unavailable` and nothing else changes.
-parser = ["dep:tree-sitter", "dep:tree-sitter-bash", "dep:tree-sitter-powershell", "dep:tree-sitter-batch"]
+parser = ["dep:tree-sitter", "dep:ralphus-grammars"]
 
 [dependencies]
 serde = { workspace = true }
 tree-sitter = { version = "0.25", optional = true }
-tree-sitter-bash = { version = "=0.25.1", optional = true }
-tree-sitter-powershell = { version = "=0.26.4", optional = true }
-tree-sitter-batch = { version = "=0.11.1", optional = true }
+# The Bash/PowerShell/batch grammars: patched submodules when checked out, else crates.io.
+ralphus-grammars = { path = "grammars", optional = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }

@@ -19762,6 +19762,17 @@ pub fn serve<A: ToSocketAddrs>(
             "schema_open_ms": schema_open_ms,
         }),
     );
+    // The shell-syntax grammars fall back to the crates.io releases when the
+    // vendored submodules were not checked out; say so once at startup.
+    if let Some(warning) = ralphus_shell_syntax::grammar_warning() {
+        crate::cartographer::Note::new("daemon").emit(
+            &store,
+            format!("shell-syntax: {warning}"),
+            serde_json::json!({ "shell_syntax_fallback": true }),
+        );
+        // ralphus[ignore-rlog-pair]: the Cartographer note above is the structured record of this warning
+        crate::rlog!(WARNING, "ralphus [daemon] shell-syntax: {warning}");
+    }
     // RAL-332: apply `[daemon].default_user_is_admin` before serving any
     // request, so `GET /api/whoami` reflects it on the very first poll.
     bootstrap_default_user_admin(&store);

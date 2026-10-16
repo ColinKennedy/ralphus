@@ -1,0 +1,12 @@
+[submodule "shell-syntax/vendor/tree-sitter-powershell"]
+	path = shell-syntax/vendor/tree-sitter-powershell
+	url = https://github.com/ColinKennedy/tree-sitter-powershell.git
+	branch = fix/native-command-arguments
+[submodule "shell-syntax/vendor/tree-sitter-bash"]
+	path = shell-syntax/vendor/tree-sitter-bash
+	url = https://github.com/ColinKennedy/tree-sitter-bash.git
+	branch = fix/heredoc-delimiter-prefix
+[submodule "shell-syntax/vendor/tree-sitter-batch"]
+	path = shell-syntax/vendor/tree-sitter-batch
+	url = https://github.com/ColinKennedy/tree-sitter-batch.git
+	branch = fix/trailing-ampersand

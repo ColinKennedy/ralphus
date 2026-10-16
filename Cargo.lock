@@ -1005,6 +1005,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "ralphus-grammars"
+version = "0.1.0"
+dependencies = [
+ "cc",
+ "tree-sitter-bash",
+ "tree-sitter-batch",
+ "tree-sitter-language",
+ "tree-sitter-powershell",
+]
+
+[[package]]
 name = "ralphus-keygen"
 version = "0.1.0"
 dependencies = [
@@ -1065,11 +1076,10 @@ dependencies = [
 name = "ralphus-shell-syntax"
 version = "0.1.0"
 dependencies = [
+ "ralphus-grammars",
  "serde",
+ "serde_json",
  "tree-sitter",
- "tree-sitter-bash",
- "tree-sitter-batch",
- "tree-sitter-powershell",
 ]
 
 [[package]]
@@ -1604,9 +1614,9 @@ dependencies = [
 
 [[package]]
 name = "tree-sitter-language"
-version = "0.1.9"
+version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d0af592be68c579aa78a16846bd19422978c3c52e438523d45ff5d1bff1f9d4a"
+checksum = "c4013970217383f67b18aef68f6fb2e8d409bc5755227092d32efb0422ba24b8"
 
 [[package]]
 name = "tree-sitter-powershell"
