@@ -27,7 +27,6 @@
        */
       /** Tools whose `command` argument is a shell command line. */
       const AGENT_LOG_SHELL_TOOLS = ["Bash", "bash", "PowerShell", "powershell", "exec"];
-<<<<<<< HEAD
       /** Argument names tried in order for a non-shell call's collapsed row; the first argument is the last resort. */
       const AGENT_LOG_PREVIEW_KEYS = ["file_path", "path", "pattern", "command", "url", "query"];
       /** How many of the newest entries are drawn before "show earlier" is pressed. */
@@ -114,17 +113,6 @@
           text = (picked !== undefined ? picked : e.args[0]).value;
         }
         return text.trimStart().split("\n")[0].slice(0, 120);
-      }
-      /**
-       * Masks the values of an entry's named arguments. A credential-named
-       * argument is masked whole; every other value goes through `redact`.
-       * @param {AgentLogEntry} e
-       * @param {(s: string) => string} redact
-       * @returns {void}
-       */
-      function agentLogRedactArgs(e, redact) {
-        const secretKey = /token|secret|passw(?:or)?d|api[_-]?key|credential|authorization/i;
-        for (const a of e.args) a.value = secretKey.test(a.key) ? "[REDACTED]" : redact(a.value);
       }
       /**
        * Pretty-prints a JSON object/array input; anything else is returned as is.
