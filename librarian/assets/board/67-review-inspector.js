@@ -85,6 +85,18 @@
 
       /** @type {string|null} Review whose auto-actions generation the inspector shows in place of a branch, or null. */
       let inspectorAutoActionsGid = null;
+      /** @type {"generation"|"preparation"} Which tab the auto-actions pane shows. */
+      let inspectorAutoActionsTab = "generation";
+      /**
+       * Switches the auto-actions pane between its generation and
+       * preparation-error tabs. Reads state already on the board; fetches nothing.
+       * @param {string} tab - "generation" or "preparation".
+       * @returns {void}
+       */
+      function setAutoActionsTab(tab) {
+        inspectorAutoActionsTab = tab === "preparation" ? "preparation" : "generation";
+        renderReviewInspector();
+      }
       /**
        * The auto-actions generation's live-view peek key.
        * @param {string} gid - The review id.
@@ -105,6 +117,9 @@
         const key = autoActionsPeekKey(gid);
         closeLiveRunPane();
         closeLiveGenerationPane();
+        // A failed preparation is what the user most needs to see, so it opens first.
+        const opened = guardians.find((x) => x.id === gid);
+        inspectorAutoActionsTab = opened && opened.post_merge_status === "failed" ? "preparation" : "generation";
         inspectorAutoActionsGid = gid;
         inspectorBranchId = null;
         selectedBranch[gid] = null;
@@ -133,7 +148,14 @@
        */
       function autoActionsInspectorHtml(g) {
         const key = autoActionsPeekKey(g.id);
-        return `<div class="insp-head"><div class="insp-title"><span class="t" data-tip="The agent that writes this review's auto actions from its changes.">Auto actions generation</span></div></div>
+        const failed = g.post_merge_status === "failed";
+        const tab = failed ? inspectorAutoActionsTab : "generation";
+        const tabs = failed ? `<div class="insp-tabs">
+            <button class="insp-tab${tab === "generation" ? " on" : ""}" data-click="setAutoActionsTab" data-tab="generation" data-tip="The agent that writes this review's auto actions from its changes.">Generation</button>
+            <button class="insp-tab${tab === "preparation" ? " on" : ""}" data-click="setAutoActionsTab" data-tab="preparation" data-tip="Action preparation failed. Shows the recorded error.">Preparation error</button>
+          </div>` : "";
+        if (tab === "preparation") return preparationInspectorHtml(g, tabs);
+        return `<div class="insp-head"><div class="insp-title"><span class="t" data-tip="The agent that writes this review's auto actions from its changes.">Auto actions generation</span></div>${tabs}</div>
           <div class="insp-body">${squadLiveSlot(squadLiveCtx({
             baseKey: key,
             title: "auto actions generation",
@@ -145,6 +167,25 @@
             currentMeta: g.manual_checks_finished_at_ms ? "finished" : "running",
             closeKey: "",
           }))}</div>`;
+      }
+
+      /**
+       * The auto-actions pane's preparation-error tab: the full recorded
+       * detail in a scrollable wrapped block, with copy and review-log links.
+       * @param {GuardianView} g - The review.
+       * @param {string} tabsHtml - The pane's tab strip markup.
+       * @returns {string}
+       */
+      function preparationInspectorHtml(g, tabsHtml) {
+        const detail = g.post_merge_detail || "See review logs for details.";
+        return `<div class="insp-head"><div class="insp-title"><span class="t" data-tip="Action preparation failed. It is advisory and never blocks approval; only the affected actions are disabled.">Action preparation failed</span></div>${tabsHtml}</div>
+          <div class="insp-body">
+            <div class="row" style="gap:6px;margin-bottom:8px">
+              <button class="btn" data-copy="${esc(detail)}" onclick="copyText(event)" data-tip="Copy the full preparation error to the clipboard.">⧉ Copy</button>
+              <button class="btn" data-click="openReviewHeaderLogs" data-guardian-id="${esc(g.id)}" data-tip="Open this review's activity log, where preparation output is recorded.">Open review logs</button>
+            </div>
+            <pre class="prep-error" data-tip="The recorded preparation error, exactly as the daemon stored it.">${esc(detail)}</pre>
+          </div>`;
       }
 
       // ---------- live actions: agent-run live tests of a review's tip ----------

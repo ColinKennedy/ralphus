@@ -2154,19 +2154,6 @@ Press Accept on the note to create it.">Squad pending</span>`;
             ${detail}
           </div>`;
         }).join("");
-        const manualSurfaceStates = [...(g.action_hints || []), ...(g.manual_commands || [])]
-          .map((check) => check.preparation_state);
-        const hasRevokedPreparation = manualSurfaceStates.some((state) => state === "stale" || state === "waiting");
-        const preparationState = hasRevokedPreparation ? "waiting" : (g.post_merge_status || "waiting");
-        const preparationCount = (g.preparation || []).length;
-        const preparationText = preparationState === "ok"
-          ? `Ready${preparationCount ? ` — ${preparationCount} review preparation step(s) completed.` : "."}`
-          : preparationState === "failed"
-            ? `Preparation failed: ${esc(g.post_merge_detail || "See review logs for details.")}`
-            : preparationState === "running"
-              ? "Preparing actions now. Run buttons unlock when every action is ready."
-              : "Waiting for the combined review checkout before preparation starts.";
-        const preparationClass = preparationState === "failed" ? "warn" : "";
         // RAL-410 moved skip-per-branch-worktrees, squash,
         // resolver agent/model and proof scope into the "Edit Details" modal
         // but left a column of read-only kv-rows behind for them. Those now
@@ -2214,8 +2201,6 @@ Press Accept on the note to create it.">Squad pending</span>`;
               ? `<div class="warn" style="margin:8px 0 4px">Some branches are not yet ready (still running or never submitted). Merge / rebase will offer to continue with just the ready branches.</div>`
               : "";
           })()}
-          <h3 class="section" data-tip="Preparation runs automatically before you arrive. It builds the combined review, expands prompt actions, and places declared files so user and auto actions launch immediately.">action preparation</h3>
-          <div class="${preparationClass}" data-tip="Preparation is advisory and never blocks approval. A failure keeps its details visible and disables only the affected action.">${preparationText}</div>
           ${g.detail ? `<div class="warn">${detailSummary(g.detail, "Review detail")}</div>` : ""}
           ${(() => {
             // RAL-77: user actions, declared as [[review.action]] in TOML.
@@ -2327,7 +2312,7 @@ Press Accept on the note to create it.">Squad pending</span>`;
             // as a different, older widget than the populated case.
             const noActions = state === "no_actions" || (isReady && !cmds.length);
             const waitingNote = autoActionsStateBadge(g, state, noActions);
-            const headAttrs = `data-click="openAutoActionsPane" data-guardian-id="${esc(g.id)}" style="cursor:pointer" data-tip="${esc(inspectorAutoActionsGid === g.id ? "The details pane on the right is showing the agent that computes auto actions. Click a branch to go back to its details." : "Show the agent that computes auto actions in the details pane: what it did, when it ran, and how it ended.")}"`;
+            const headAttrs = `data-click="openAutoActionsPane" data-guardian-id="${esc(g.id)}" style="cursor:pointer" data-tip="${esc(inspectorAutoActionsGid === g.id ? "The details pane on the right is showing the agent that computes auto actions" + (g.post_merge_status === "failed" ? " and the preparation error" : "") + ". Click a branch to go back to its details." : "Show the agent that computes auto actions in the details pane: what it did, when it ran, and how it ended." + (g.post_merge_status === "failed" ? "\nAction preparation failed: the pane also has a tab with the error." : ""))}"`;
             return `<h3 class="section" data-tip="Auto actions: checks the AI writes from this review's changes.\nThey can change when the stack's changes change; regenerate them from the ⋯ menu.\nAdvisory — they never block Approve or Merge / rebase.">auto actions${sectionMenuBtn(g.id, "manual")}</h3>
               ${isReady && cmds.length
                 ? reviewRunGroup(
