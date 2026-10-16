@@ -1218,6 +1218,71 @@ pub const CI_DEFERRAL_VALUES: &[&str] = &[
     CI_DEFERRAL_BOTTOM_AND_TOP,
 ];
 
+/// Valid values for `[[review]] base_update_mode`: when the automatic
+/// base-branch-update pass rebuilds a review's stack. `always` rebuilds on
+/// every upstream change, `never` leaves the stack alone, and `required`
+/// rebuilds only when the forge merge path cannot land the stack as it is.
+pub const BASE_UPDATE_MODE_ALWAYS: &str = "always";
+pub const BASE_UPDATE_MODE_REQUIRED: &str = "required";
+pub const BASE_UPDATE_MODE_NEVER: &str = "never";
+
+/// Every accepted `base_update_mode` literal, in the order shown to a user.
+pub const BASE_UPDATE_MODE_VALUES: &[&str] = &[
+    BASE_UPDATE_MODE_ALWAYS,
+    BASE_UPDATE_MODE_REQUIRED,
+    BASE_UPDATE_MODE_NEVER,
+];
+
+/// The parsed form of a `base_update_mode` literal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum BaseUpdateMode {
+    /// Rebuild the stack on every upstream change.
+    #[default]
+    Always,
+    /// Rebuild only when the forge merge path needs it.
+    Required,
+    /// Never rebuild automatically.
+    Never,
+}
+
+impl BaseUpdateMode {
+    /// Parses one of [`BASE_UPDATE_MODE_VALUES`]; anything else is `None`.
+    #[must_use]
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            BASE_UPDATE_MODE_ALWAYS => Some(Self::Always),
+            BASE_UPDATE_MODE_REQUIRED => Some(Self::Required),
+            BASE_UPDATE_MODE_NEVER => Some(Self::Never),
+            _ => None,
+        }
+    }
+
+    /// The literal this mode is stored and shown as.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Always => BASE_UPDATE_MODE_ALWAYS,
+            Self::Required => BASE_UPDATE_MODE_REQUIRED,
+            Self::Never => BASE_UPDATE_MODE_NEVER,
+        }
+    }
+
+    /// The mode a legacy `skip_base_updates` flag stands for.
+    #[must_use]
+    pub fn from_legacy_skip(skip: bool) -> Self {
+        if skip { Self::Never } else { Self::Always }
+    }
+
+    /// Resolves one settings layer: an explicit recognised `mode` wins over
+    /// the legacy `skip` flag, which maps `true` to `never` and `false` to
+    /// `always`. `None` when the layer states neither.
+    #[must_use]
+    pub fn for_layer(mode: Option<&str>, skip: Option<bool>) -> Option<Self> {
+        mode.and_then(Self::parse)
+            .or_else(|| skip.map(Self::from_legacy_skip))
+    }
+}
+
 /// The label a review puts on every PR/MR whose full CI run `ci_deferral`
 /// defers. A missing label means "run everything", so a project that never
 /// opts in, or a label someone removed, costs CI minutes rather than coverage.
@@ -1831,6 +1896,12 @@ pub struct ReviewDef {
     /// Whether this review skips automatic base-branch update rebuilds.
     #[serde(default)]
     pub skip_base_updates: Option<bool>,
+    /// When the automatic base-branch-update pass rebuilds this review's
+    /// stack: one of [`BASE_UPDATE_MODE_VALUES`]. Wins over the legacy
+    /// [`Self::skip_base_updates`] when both are set; unset inherits the
+    /// project and daemon defaults.
+    #[serde(default)]
+    pub base_update_mode: Option<String>,
     /// RAL-507: this review's own cap on how many times the automatic
     /// base-branch-update rebuild may retry one unresolved base shift before
     /// it stops dispatching rebuilds for that campaign and asks a human via

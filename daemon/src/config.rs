@@ -18,6 +18,7 @@ use std::time::Duration;
 
 use chrono::{NaiveTime, Utc};
 use ralphus_core::cors::CorsConfig;
+pub use ralphus_core::schema::BaseUpdateMode;
 use serde::{Deserialize, Serialize};
 
 /// Ark's worktree-retention policy. Durations are expressed in whole days so
@@ -199,6 +200,13 @@ pub struct ReviewConfig {
     /// `Guardian::skip_base_updates` in `guardian.rs`) wins over this.
     #[serde(default)]
     pub skip_base_updates: Option<bool>,
+    /// When the automatic base-branch-update pass rebuilds a review's stack:
+    /// one of [`ralphus_core::schema::BASE_UPDATE_MODE_VALUES`]. At any one
+    /// layer an explicit mode wins over the legacy `skip_base_updates` flag
+    /// (see [`Self::base_update_mode_override`]); per-project scalars win over
+    /// the global layer.
+    #[serde(default)]
+    pub base_update_mode: Option<String>,
     /// RAL-307: whether a newly submitted PR's branch defaults to the exact
     /// worktree/feature branch name (`branch.branch`) instead of the
     /// convention-derived alias (`apply_pr_branch_convention`). `None` means
@@ -491,6 +499,7 @@ pub const REVIEW_CONFIG_KEYS: &[&str] = &[
     "match_pr_branch_name",
     "skip_worktrees",
     "skip_base_updates",
+    "base_update_mode",
     "proof_skip_auto_clean",
     "checks",
     "auto_build",
@@ -589,6 +598,23 @@ impl ReviewConfig {
     #[must_use]
     pub fn skip_base_updates(&self) -> bool {
         self.skip_base_updates.unwrap_or(false)
+    }
+
+    /// The base-update mode this single layer states, if any: an explicit
+    /// recognised `base_update_mode` wins, otherwise the legacy
+    /// `skip_base_updates` flag maps `true` to `never` and `false` to
+    /// `always`. `None` when the layer says nothing, or the mode is not one
+    /// of the accepted values.
+    #[must_use]
+    pub fn base_update_mode_override(&self) -> Option<BaseUpdateMode> {
+        BaseUpdateMode::for_layer(self.base_update_mode.as_deref(), self.skip_base_updates)
+    }
+
+    /// The base-update mode this layer resolves to; unset resolves to
+    /// `always`.
+    #[must_use]
+    pub fn base_update_mode(&self) -> BaseUpdateMode {
+        self.base_update_mode_override().unwrap_or_default()
     }
 
     /// Whether a newly submitted PR defaults to the worktree/feature branch
@@ -820,7 +846,20 @@ impl ReviewConfig {
             default_maximum_budget_usd: over
                 .default_maximum_budget_usd
                 .or(self.default_maximum_budget_usd),
-            skip_base_updates: over.skip_base_updates.or(self.skip_base_updates),
+            // The mode and the legacy flag merge as one setting so a project
+            // layer stating either one fully replaces the global layer's.
+            skip_base_updates: if over.base_update_mode.is_some() {
+                over.skip_base_updates
+            } else {
+                over.skip_base_updates.or(self.skip_base_updates)
+            },
+            base_update_mode: if over.base_update_mode.is_some() {
+                over.base_update_mode
+            } else if over.skip_base_updates.is_some() {
+                None
+            } else {
+                self.base_update_mode
+            },
             match_pr_branch_name: over.match_pr_branch_name.or(self.match_pr_branch_name),
             auto_submit_pr_stack: over.auto_submit_pr_stack.or(self.auto_submit_pr_stack),
             separate_pr_branch: over.separate_pr_branch.or(self.separate_pr_branch),
@@ -948,6 +987,10 @@ pub const REVIEW_FIELD_PARITY: &[(&str, ReviewFieldDefault)] = &[
     (
         "skip_base_updates",
         ReviewFieldDefault::ProjectDefault(|c| c.skip_base_updates.is_some()),
+    ),
+    (
+        "base_update_mode",
+        ReviewFieldDefault::ProjectDefault(|c| c.base_update_mode.is_some()),
     ),
     (
         "base_shift_maximum_rebuilds",

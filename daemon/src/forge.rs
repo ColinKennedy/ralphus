@@ -1161,6 +1161,66 @@ impl ForgeClient {
         }
     }
 
+    /// One live read of a PR/MR's rebase need ([`PrMergeability`]). The caller
+    /// owns retrying a [`PrRebaseNeed::Computing`] answer and comparing
+    /// `head`/`base_ref` against what it expects. Logs the outbound call.
+    pub fn pr_mergeability(&self, number: i64) -> Result<PrMergeability, String> {
+        // ralphus[ignore-rlog-pair]: this provider boundary has no Store; its caller records the structured workflow outcome
+        crate::rlog!(
+            DEBUG,
+            "ralphus [forge] pr mergeability start kind={} repo={} number={number}",
+            self.kind.as_str(),
+            self.repo_path
+        );
+        let result = self.poll_rotated(
+            |e: &String| is_string_rejection(e),
+            string_all_rejected,
+            |c| c.pr_mergeability_inner(number),
+        );
+        match &result {
+            // ralphus[ignore-rlog-pair]: this provider boundary has no Store; its caller records the structured workflow outcome
+            Ok(m) => crate::rlog!(
+                DEBUG,
+                "ralphus [forge] pr mergeability done kind={} repo={} number={number} need={:?}",
+                self.kind.as_str(),
+                self.repo_path,
+                m.need
+            ),
+            // ralphus[ignore-rlog-pair]: this provider boundary has no Store; its caller records the structured workflow outcome
+            Err(e) => crate::rlog!(
+                ERROR,
+                "ralphus [forge] pr mergeability failed kind={} repo={} number={number}: {e}",
+                self.kind.as_str(),
+                self.repo_path
+            ),
+        }
+        result
+    }
+
+    fn pr_mergeability_inner(&self, number: i64) -> Result<PrMergeability, String> {
+        let token = self.require_token()?;
+        match self.kind {
+            ForgeKind::GitHub => {
+                let url = format!("{}/repos/{}/pulls/{number}", self.api_base, self.repo_path);
+                let pr = self.get(
+                    http_agent()
+                        .get(&url)
+                        .set("Authorization", &format!("Bearer {token}"))
+                        .set("Accept", "application/vnd.github+json"),
+                )?;
+                Ok(classify_github_mergeability(&pr))
+            }
+            ForgeKind::GitLab => {
+                let url = format!(
+                    "{}/projects/{}/merge_requests/{number}",
+                    self.api_base, self.repo_path
+                );
+                let mr = self.get(http_agent().get(&url).set("PRIVATE-TOKEN", token))?;
+                Ok(classify_gitlab_mergeability(&mr))
+            }
+        }
+    }
+
     /// Fetch a PR/MR's *live* base/target branch from the forge (RAL-273,
     /// RAL-279), unprefixed (GitHub's `base.ref` / GitLab's `target_branch`
     /// are both already bare branch names, matching the convention
@@ -4503,6 +4563,84 @@ pub struct PrRoute {
     /// `target_project_id` makes the parent allocate the MR's `iid`
     /// (RAL-496) even though the create call itself POSTs to the fork.
     pub repo: String,
+}
+
+/// What the forge says about whether a PR/MR's head must be rebuilt on its
+/// base ([`ForgeClient::pr_mergeability`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PrRebaseNeed {
+    /// Mergeable as far as the head and base go. CI, approvals, policy and
+    /// draft state are deliberately not rebase reasons and land here.
+    Clean,
+    /// The forge reports a conflict or explicitly asks for a rebase.
+    Required(String),
+    /// The forge has not finished computing mergeability yet.
+    Computing,
+    /// The response carried no usable verdict.
+    Unknown(String),
+}
+
+/// One PR/MR's mergeability answer plus the head SHA and base ref it was
+/// computed for, so a caller can discard it when either has moved.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrMergeability {
+    pub need: PrRebaseNeed,
+    /// GitHub's `head.sha`, GitLab's `sha`.
+    pub head: Option<String>,
+    /// GitHub's `base.ref`, GitLab's `target_branch`.
+    pub base_ref: Option<String>,
+}
+
+/// GitHub half of [`ForgeClient::pr_mergeability`]. `dirty` is a conflict and
+/// `behind` is a branch the repository requires to be up to date; `blocked`,
+/// `unstable`, `has_hooks` and `clean` are approval, CI or policy states.
+pub(crate) fn classify_github_mergeability(pr: &serde_json::Value) -> PrMergeability {
+    let need = match pr["mergeable_state"].as_str() {
+        Some("dirty") => PrRebaseNeed::Required("merge conflicts with the base branch".into()),
+        Some("behind") => PrRebaseNeed::Required("the branch is behind its base".into()),
+        Some("unknown") | None => PrRebaseNeed::Computing,
+        Some(_) => PrRebaseNeed::Clean,
+    };
+    PrMergeability {
+        need,
+        head: pr["head"]["sha"].as_str().map(str::to_string),
+        base_ref: pr["base"]["ref"].as_str().map(str::to_string),
+    }
+}
+
+/// GitLab half of [`ForgeClient::pr_mergeability`]. `detailed_merge_status`
+/// is preferred; `merge_status` is the fallback for an older instance.
+/// `need_rebase` is GitLab's explicit rebase request; every other detailed
+/// status that is not still being computed is a CI, approval or policy gate.
+pub(crate) fn classify_gitlab_mergeability(mr: &serde_json::Value) -> PrMergeability {
+    let need = if mr["has_conflicts"].as_bool() == Some(true) {
+        PrRebaseNeed::Required("merge conflicts with the target branch".into())
+    } else {
+        match mr["detailed_merge_status"].as_str() {
+            Some("need_rebase") => PrRebaseNeed::Required("GitLab requests a rebase".into()),
+            Some("conflict") => {
+                PrRebaseNeed::Required("merge conflicts with the target branch".into())
+            }
+            Some("checking" | "unchecked" | "preparing") => PrRebaseNeed::Computing,
+            Some(_) => PrRebaseNeed::Clean,
+            None => match mr["merge_status"].as_str() {
+                Some("cannot_be_merged") => {
+                    PrRebaseNeed::Required("merge conflicts with the target branch".into())
+                }
+                Some("can_be_merged") => PrRebaseNeed::Clean,
+                Some("unchecked" | "checking") => PrRebaseNeed::Computing,
+                _ => PrRebaseNeed::Unknown("the MR carries no merge status".into()),
+            },
+        }
+    };
+    PrMergeability {
+        need,
+        head: mr["sha"]
+            .as_str()
+            .or_else(|| mr["diff_refs"]["head_sha"].as_str())
+            .map(str::to_string),
+        base_ref: mr["target_branch"].as_str().map(str::to_string),
+    }
 }
 
 /// One PR/MR's live forge answer ([`ForgeClient::get_pull_request_live`]).

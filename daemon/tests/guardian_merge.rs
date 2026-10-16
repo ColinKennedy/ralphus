@@ -5094,6 +5094,123 @@ fn skip_base_updates_prevents_auto_rebuild_on_base_shift() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+// RAL-660: in `required` mode a base shift that the stack absorbs cleanly is
+// left alone and the built-base record is not advanced.
+#[test]
+fn required_mode_leaves_a_clean_stack_untouched_on_base_shift() {
+    let (root, store, id) = single_feature_repo();
+    run_merge(&store, &NoopRunner, &id);
+    let base_before = store
+        .lock()
+        .get_guardian(&id)
+        .unwrap()
+        .base_commit
+        .expect("base recorded");
+    store
+        .lock()
+        .set_guardian_base_update_mode(&id, Some("required"))
+        .unwrap();
+    assert_eq!(
+        store
+            .lock()
+            .get_guardian(&id)
+            .unwrap()
+            .effective_base_update_mode,
+        "required"
+    );
+
+    advance_main(&root, "c.txt", "on base\n", "base moves forward");
+    let sem = Semaphore::new(4);
+    for _ in 0..2 {
+        assert!(
+            !rebuild_on_base_shift(&store, &NoopRunner, &id, &sem, &CancelToken::never()),
+            "a non-conflicting shift needs no rebuild"
+        );
+    }
+    let after = store.lock().get_guardian(&id).unwrap();
+    assert_eq!(after.status, "in_review");
+    assert_eq!(after.base_commit.as_deref(), Some(base_before.as_str()));
+
+    // Switching to `always` catches the review up from the preserved record.
+    store
+        .lock()
+        .set_guardian_base_update_mode(&id, Some("always"))
+        .unwrap();
+    assert!(rebuild_on_base_shift(
+        &store,
+        &NoopRunner,
+        &id,
+        &sem,
+        &CancelToken::never()
+    ));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+// RAL-660: a shift whose merge conflicts with the stack is rebuilt in `required` mode.
+#[test]
+fn required_mode_rebuilds_when_the_shift_conflicts() {
+    let (root, store, id) = conflicting_base_shift_repo();
+    run_merge(&store, &NoopRunner, &id);
+    store
+        .lock()
+        .set_guardian_base_update_mode(&id, Some("required"))
+        .unwrap();
+    advance_main(&root, "shared.txt", "moved on\n", "conflicting advance");
+    let sem = Semaphore::new(4);
+    assert!(rebuild_on_base_shift(
+        &store,
+        &FailingAgentRunner,
+        &id,
+        &sem,
+        &CancelToken::never()
+    ));
+    assert_eq!(
+        store.lock().get_guardian(&id).unwrap().status,
+        "merge_failed"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+// RAL-660: `never` set through the mode (not the legacy flag) skips, and
+// `always` rebuilds a shift the stack would have absorbed.
+#[test]
+fn explicit_never_and_always_modes_keep_their_behavior() {
+    let (root, store, id) = single_feature_repo();
+    run_merge(&store, &NoopRunner, &id);
+    store
+        .lock()
+        .set_guardian_base_update_mode(&id, Some("never"))
+        .unwrap();
+    assert!(
+        store
+            .lock()
+            .get_guardian(&id)
+            .unwrap()
+            .effective_skip_base_updates
+    );
+    advance_main(&root, "c.txt", "on base\n", "base moves forward");
+    let sem = Semaphore::new(4);
+    assert!(!rebuild_on_base_shift(
+        &store,
+        &NoopRunner,
+        &id,
+        &sem,
+        &CancelToken::never()
+    ));
+    store
+        .lock()
+        .set_guardian_base_update_mode(&id, Some("always"))
+        .unwrap();
+    assert!(rebuild_on_base_shift(
+        &store,
+        &NoopRunner,
+        &id,
+        &sem,
+        &CancelToken::never()
+    ));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 // ─── RAL-507: the base-shift rebuild retry budget ───
 
 /// A runner whose agent dispatch always fails, so every automatic base-shift

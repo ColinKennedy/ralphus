@@ -558,6 +558,8 @@
        * @property {boolean} [skip_worktrees]
        * @property {boolean|null} [skip_base_updates] - RAL-250: this review's own override for whether the automatic base-branch auto-update rebuild is skipped, or null to inherit the project/global default.
        * @property {boolean} [effective_skip_base_updates] - RAL-250: skip_base_updates resolved against the project/global default -- what the automatic base-shift sweep actually gates on.
+       * @property {string|null} [base_update_mode] - This review's own base-update override ("always"|"required"|"never"), or null to inherit the project default.
+       * @property {string} [effective_base_update_mode] - base_update_mode resolved against the project and global defaults -- always "always"|"required"|"never".
        * @property {number} [conflicts_found]
        * @property {number} [conflicts_fixed]
        * @property {number} [conflicts_committed]
@@ -1011,6 +1013,7 @@
        * @property {boolean|null|undefined} verify_skip_auto_clean
        * @property {boolean|null|undefined} skip_worktrees
        * @property {boolean|null|undefined} skip_base_updates
+       * @property {string|null|undefined} base_update_mode - "always"|"required"|"never"; null/absent = inherit.
        * @property {number|null|undefined} base_shift_maximum_rebuilds
        * @property {boolean|null|undefined} match_pr_branch_name
        * @property {boolean|null|undefined} separate_pr_branch
@@ -1042,6 +1045,7 @@
        * @property {boolean} skip_auto_clean
        * @property {boolean} skip_worktrees
        * @property {boolean} skip_base_updates
+       * @property {string|undefined} base_update_mode - "always"|"required"|"never" when the daemon resolves one.
        * @property {number} base_shift_maximum_rebuilds
        * @property {boolean} match_pr_branch_name
        * @property {boolean} separate_pr_branch

@@ -25,6 +25,7 @@ MAPPING = {
     "ci_deferral": "ci_deferral",
     "proof_skip_auto_clean": "skip_auto_clean",
     "skip_base_updates": "skip_base_updates",
+    "base_update_mode": "base_update_mode",
     "match_pr_branch_name": "match_pr_branch_name",
     "auto_submit_pr_stack": "auto_submit_pr_stack",
     "auto_pr_feedback": "auto_pr_feedback",

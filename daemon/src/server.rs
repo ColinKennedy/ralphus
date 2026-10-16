@@ -3029,6 +3029,9 @@ struct EffectiveReviewDefaults {
     skip_auto_clean: bool,
     skip_worktrees: bool,
     skip_base_updates: bool,
+    /// The resolved base-update mode (database default > `.ralphus.toml` >
+    /// global > `always`).
+    base_update_mode: String,
     /// RAL-507: the resolved base-shift rebuild cap (per-review override >
     /// database default > `.ralphus.toml`/global > the built-in 3).
     base_shift_maximum_rebuilds: u32,
@@ -3076,6 +3079,7 @@ impl EffectiveReviewDefaults {
             skip_auto_clean: cfg.proof_skip_auto_clean(),
             skip_worktrees: cfg.skip_worktrees(),
             skip_base_updates: cfg.skip_base_updates(),
+            base_update_mode: cfg.base_update_mode().as_str().to_string(),
             base_shift_maximum_rebuilds: cfg.base_shift_maximum_rebuilds(),
             match_pr_branch_name: cfg.match_pr_branch_name(),
             separate_pr_branch: cfg.separate_pr_branch(),
@@ -3172,6 +3176,10 @@ struct ProjectReviewSettingsBody {
     skip_worktrees: Option<bool>,
     #[serde(default)]
     skip_base_updates: Option<bool>,
+    /// Project default base-update mode (`always`/`required`/`never`); an
+    /// empty string clears it back to inheriting.
+    #[serde(default)]
+    base_update_mode: Option<String>,
     #[serde(default)]
     match_pr_branch_name: Option<bool>,
     #[serde(default)]
@@ -3306,6 +3314,9 @@ fn set_project_review_settings(daemon: &Daemon, name: &str, body: &str) -> Reply
             );
         }
     }
+    if let Some(reply) = reject_invalid_base_update_mode(req.base_update_mode.as_deref()) {
+        return reply;
+    }
     if let Some(mode) = req.default_ci_deferral.as_deref().filter(|s| !s.is_empty()) {
         if !ralphus_core::schema::CI_DEFERRAL_VALUES.contains(&mode) {
             return error(
@@ -3406,6 +3417,14 @@ fn set_project_review_settings(daemon: &Daemon, name: &str, body: &str) -> Reply
     }
     if let Some(v) = req.skip_base_updates {
         settings.skip_base_updates = Some(v);
+        // The legacy flag written alone is the newest statement of intent, so
+        // it must not stay shadowed by an older stored mode.
+        if req.base_update_mode.is_none() {
+            settings.base_update_mode = None;
+        }
+    }
+    if let Some(v) = req.base_update_mode {
+        settings.base_update_mode = clear_if_empty(v);
     }
     if req.clear_base_shift_maximum_rebuilds {
         settings.base_shift_maximum_rebuilds = None;
@@ -14191,6 +14210,12 @@ struct GuardianSettingsBody {
     /// absent) means "inherit the project/global default".
     #[serde(default)]
     skip_base_updates: Option<bool>,
+    /// This review's own base-update mode (`always`/`required`/`never`); an
+    /// empty string clears it back to inheriting. Wins over
+    /// [`Self::skip_base_updates`] when stored; writing only
+    /// `skip_base_updates` clears a stored mode so the newer write applies.
+    #[serde(default)]
+    base_update_mode: Option<String>,
     /// RAL-307: this review's own override for whether a newly submitted
     /// PR's branch defaults to the exact worktree/feature branch name
     /// instead of the convention-derived alias. `None` (or the field being
@@ -14319,6 +14344,47 @@ fn reject_invalid_ci_deferral(value: Option<&str>) -> Option<Reply> {
     ))
 }
 
+/// The 400 for a `base_update_mode` outside the closed set, or `None` when the
+/// request carries none, the empty string (which clears it), or a valid mode.
+fn reject_invalid_base_update_mode(value: Option<&str>) -> Option<Reply> {
+    let mode = value.filter(|m| !m.is_empty())?;
+    if ralphus_core::schema::BASE_UPDATE_MODE_VALUES.contains(&mode) {
+        return None;
+    }
+    Some(error(
+        400,
+        "invalid_base_update_mode",
+        &format!(
+            "base_update_mode must be one of {} -- got \"{mode}\"",
+            ralphus_core::schema::BASE_UPDATE_MODE_VALUES.join(", ")
+        ),
+        vec![],
+    ))
+}
+
+/// Stores a review's `base_update_mode` write. An explicit mode (empty clears)
+/// is saved as sent; a request that carried only the legacy
+/// `skip_base_updates` clears any stored mode so that newer write is the one
+/// that applies.
+fn apply_base_update_mode(
+    store: &Store,
+    id: &str,
+    skip_base_updates: Option<bool>,
+    base_update_mode: Option<&str>,
+) -> Result<(), Reply> {
+    let mode = match (base_update_mode, skip_base_updates) {
+        (Some(mode), _) => Some(Some(mode).filter(|m| !m.is_empty())),
+        (None, Some(_)) => Some(None),
+        (None, None) => None,
+    };
+    match mode {
+        Some(mode) => store
+            .set_guardian_base_update_mode(id, mode)
+            .map_err(|e| store_error(&e)),
+        None => Ok(()),
+    }
+}
+
 /// The 400 for a `rebuild_on` list outside the closed set, or `None` when the
 /// request carries no list or a valid one.
 fn reject_invalid_rebuild_on(value: &Option<Option<Vec<String>>>) -> Option<Reply> {
@@ -14360,6 +14426,9 @@ struct GuardianDetailsBody {
     /// RAL-514: see [`GuardianSettingsBody::skip_base_updates`].
     #[serde(default)]
     skip_base_updates: Option<bool>,
+    /// See [`GuardianSettingsBody::base_update_mode`].
+    #[serde(default)]
+    base_update_mode: Option<String>,
     #[serde(default)]
     separate_pr_branch: Option<bool>,
     #[serde(default)]
@@ -14861,6 +14930,9 @@ fn guardian_settings(daemon: &Daemon, id: &str, body: &str) -> Reply {
     if let Some(reply) = reject_invalid_ci_deferral(req.ci_deferral.as_deref()) {
         return reply;
     }
+    if let Some(reply) = reject_invalid_base_update_mode(req.base_update_mode.as_deref()) {
+        return reply;
+    }
     let store = daemon.lock();
     if let Some(skip) = req.skip_worktrees {
         if let Err(e) = store.set_guardian_skip_worktrees(id, skip) {
@@ -14908,6 +14980,14 @@ fn guardian_settings(daemon: &Daemon, id: &str, body: &str) -> Reply {
         if let Err(e) = store.set_guardian_skip_base_updates(id, Some(skip)) {
             return store_error(&e);
         }
+    }
+    if let Err(reply) = apply_base_update_mode(
+        &store,
+        id,
+        req.skip_base_updates,
+        req.base_update_mode.as_deref(),
+    ) {
+        return reply;
     }
     if let Some(enabled) = req.match_pr_branch_name {
         if let Err(e) = store.set_guardian_match_pr_branch_name(id, Some(enabled)) {
@@ -15189,6 +15269,9 @@ fn guardian_details(daemon: &Daemon, id: &str, body: &str) -> Reply {
     if let Some(reply) = reject_invalid_ci_deferral(req.ci_deferral.as_deref()) {
         return reply;
     }
+    if let Some(reply) = reject_invalid_base_update_mode(req.base_update_mode.as_deref()) {
+        return reply;
+    }
 
     let store = daemon.lock();
     let guardian = match store.get_guardian(id) {
@@ -15302,6 +15385,14 @@ fn guardian_details(daemon: &Daemon, id: &str, body: &str) -> Reply {
         if let Err(e) = store.set_guardian_skip_base_updates(id, Some(skip)) {
             return store_error(&e);
         }
+    }
+    if let Err(reply) = apply_base_update_mode(
+        &store,
+        id,
+        req.skip_base_updates,
+        req.base_update_mode.as_deref(),
+    ) {
+        return reply;
     }
     if let Some(enabled) = req.separate_pr_branch {
         if let Err(e) = store.set_guardian_separate_pr_branch(id, Some(enabled)) {
