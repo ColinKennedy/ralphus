@@ -239,10 +239,7 @@ indented under its own heading:
   (timeouts, concurrency, forge/PR conventions, templates, agent
   profiles/resolver).
 - **Harness** -- `git` (only required when a registered project actually
-  uses it; otherwise reported `SKIP`, not `FAIL`), `tmux`/psmux (resolved the
-  same way the daemon does, reporting both the resolved binary and which
-  resolution source won: an explicit `RALPHUS_TMUX_CMD` override, the
-  embedded vendored build, or `PATH`), the runner binary, agent backend
+  uses it; otherwise reported `SKIP`, not `FAIL`), the runner binary, agent backend
   commands (`claude`/`codex`/`pi`/`ollama`), and the optional `gh`/`glab`
   forge-auth fallbacks (never fail if missing -- see
   [`docs/dependencies.md`](dependencies.md)).
@@ -332,10 +329,11 @@ the daemon's hourly Free-tier background sweep
 | `cell worktree <selector>` | The worktree/project a cell is using |
 | `cell diff <selector> [--summary]` | A running cell's live worktree diff (full diff only recomputed after the runner pushes a change) |
 | `cell reviews <selector>` | Reviews this cell's branch participates in |
-| `cell set-status <selector> <state>` | Override a cell's status |
+| `cell set-status <selector> <state>` | Override a cell's status. `ignored` (RAL-641, "ignore and continue") also sets dependents that were failed only by the dependency cascade back to pending, and a finished squad back to pending |
 | `cell restart <selector>` | Restart a cell and its downstream |
+| `cell copy <selector> [--from-branch]` | Copy a cell into a new one-task squad from a clean base (or from the cell's own branch), linked both ways (RAL-641) |
 | `cell restart-proof <selector> --from <i>` | Restart every cell-level proof step, re-running from the start |
-| `cell edit <selector> [--cwd] [--agent] [--model] [--prompt] [--command] [--system-prompt] [--initialization-commands] [--initialization-timeout-sec]` | Edit a cell's fields |
+| `cell edit <selector> [--cwd] [--agent] [--model] [--prompt] [--command] [--shell] [--system-prompt] [--initialization-commands] [--initialization-timeout-sec]` | Edit a cell's fields |
 | `cell terminal <selector> [--mode open\|readonly]` | Print the `claude --resume` command + cwd (does **not** ask the daemon to spawn a terminal — see below) |
 
 ## proof
@@ -345,7 +343,7 @@ the daemon's hourly Free-tier background sweep
 | `proof show <selector>` | Proof step detail (kind, state, spec, output) |
 | `proof set-status <selector> <state>` | Override a proof step's status |
 | `proof restart <selector>` | Restart a proof step (dispatches to the task- or cell-scoped restart endpoint) |
-| `proof edit <selector> [--agent] [--model] [--command] [--prompt] [--maximum-tool-output-tokens]` | Edit a proof step's agent/model/command/prompt/tool-output-cap overrides |
+| `proof edit <selector> [--agent] [--model] [--command] [--prompt] [--shell] [--maximum-tool-output-tokens]` | Edit a proof step's agent/model/command/prompt/shell/tool-output-cap overrides |
 
 ## review
 
@@ -357,6 +355,9 @@ the daemon's hourly Free-tier background sweep
 | `review status <selector>` | Per-branch `merge_status`/`ready`/detail + a summary verdict — "is this review ready?" |
 | `review worktrees <selector>` | Worktrees/branches this review consumes, with source cell |
 | `review create <name> <upstream_remote> <upstream_branch> <git_root> [--checks] [--skip-checks] [--skip-worktrees] [--review-type]` | Create a review |
+| `forge pool list` | List the daemon-wide forge poll tokens (label and masked tail only) |
+| `forge pool add <kind> <label> --token <t> [--host <h>]` | Add a poll token for `github`/`gitlab` (host defaults to `github.com`/`gitlab.com`); admin-only |
+| `forge pool remove <kind> <label> [--host <h>]` | Remove a poll token; admin-only |
 | `review rename <selector> <name>` | Rename |
 | `review cancel <selector>` | Cancel |
 | `review reopen <selector>` | Reopen a cancelled or merged review, immediately staging in whatever branches are already ready |
@@ -378,10 +379,13 @@ the daemon's hourly Free-tier background sweep
 | `review restart-merge <selector>` | Cancel an in-progress rebase, start fresh |
 | `review rebuild <selector>` | Tear down and rebuild a settled review's prepared build now, ignoring its `rebuild_on` setting |
 | `review stop-merge <selector>` | Stop an in-progress rebase, leaving the review resumable (not cancelled) |
+| `review stop-actioning <selector>` | Stop whatever is actioning the review worktree (feedback, merge/rebase, auto-fix), reset the worktree, and pause auto-fix |
 | `review force-start <selector>` | Disable not-yet-done branches, merge immediately |
 | `review approve <selector>` | Approve an in_review review |
 | `review feedback <selector#branch> <text> [--author name]` | Post feedback on a branch, optionally attributed to a different registered user than the one submitting it (RAL-379); defaults to the submitter when omitted |
+| `review settings <selector> [--skip-checks] [--skip-worktrees] [--resolver-agent] [--resolver-model] [--upstream-remote --upstream-branch] [--base-update-mode]` | Update opt-out settings |
 | `review dismiss-reenable <selector#branch>` | Dismiss the "can re-enable" notice |
+| `review extract-branch <selector#branch>` | Move a branch into a new review of its own + rebuild both (RAL-641) |
 | `review move-branch <selector#branch> <to_review>` | Move a branch to another review + rebuild both (RAL-118) |
 | `review upstream list <selector>` | Candidate upstream (remote, branch) pairs |
 | `review upstream set <selector> <upstream_remote> <upstream_branch>` | Change upstream remote and branch + rebuild (remote `.` = local branch) |
@@ -389,6 +393,9 @@ the daemon's hourly Free-tier background sweep
 | `review checks run <selector> [--index N...] [--all] [--input NAME=VALUE...]` | Print command(s) + cwd for one/some/all checks (not run by the daemon — see below) |
 | `review action list <selector>` | List user-declared `[[review.action]]` hints |
 | `review action run <selector> --index N [--input NAME=VALUE...]` | Print the command + cwd for a `command`-kind hint |
+| `review live list <selector>` | List the review's live actions (agent-run live tests from its cells' `RALPHUS_LIVE_ACTION` handoffs) and their runs |
+| `review live run <selector> [--index N]` | Queue a run of one live action or all of them; generates them from the finished cells' handoffs first if the review has none |
+| `review live cancel <selector> <run_id>` | Cancel a queued or running live run |
 | `review pr submit <selector> (--position N \| --combined) [--alias] [--title] [--description] [--allow-unlinked-fork]` | Submit a PR/MR (RAL-117); title/description default to an LLM suggestion. `--allow-unlinked-fork` (RAL-338) downgrades a definite "no forge relationship" fork pre-flight result from a hard error to a logged warning; ignored for a project with no registered fork |
 | `review pr list <selector>` | List PRs submitted for a review |
 | `review pr show <pr_id>` | Show one PR row |
@@ -404,8 +411,7 @@ the daemon's hourly Free-tier background sweep
 
 `cell terminal`, `review checks run`, and `review action run` deliberately
 print a resolved shell command + working directory instead of calling the
-daemon's `open-terminal` / `run-manual-commands` / `run-action-hint`
-endpoints. Those endpoints spawn a GUI terminal window **on whatever machine
+daemon's `run-manual-commands` / `run-action-hint` endpoints. Those endpoints spawn a GUI terminal window **on whatever machine
 runs `ralphus-daemon`** — meaningful for the browser board (same desktop
 session) but not for a headless/remote CLI invocation. Run the printed
 command yourself instead.
@@ -738,14 +744,12 @@ use; see `READ_ONLY_NOTE`.
             - update name [str] --backend [name] --executable [cmd] --link [key=target...] --model [name] --set [key=value...] --thinking-capable/--no-thinking-capable  {Administrative (RAL-473): replace an existing agent profile's backend/executable/model/env. --thinking-capable/--no-thinking-capable (RAL-516) overrides whether a Live View pane running this profile shows the "Show Thinking" checkbox at all; omitted, it inherits the backend's own default.}
     - cartographer --ascending --cell [str] --entity [uri] --for [uri] --guardian [id] --level [str] --limit [integer] --offset [integer] --q [str] --scope [str] --source [str] --squad [id] --task [str]  {Query the structured Cartographer event log (RAL-98/RAL-155).}
     - cell  {Inspect and act on cells.}
+        - copy selector [uri] --from-branch  {Copy a cell (prompt or command, agent, proofs) into a new one-task squad submitted from a clean base, linked both ways (RAL-641). --from-branch starts from the cell's own branch instead.}
         - (read-only-safe) diff selector [uri] --summary  {Show a running cell's live worktree diff (full diff computed only when changes were pushed).}
-        - edit selector [uri] --agent [name] --auto-compact-threshold [tokens] --command [cmd] --cwd [path] --effort [level] --initialization-commands [text] --initialization-timeout-sec [seconds] --maximum-context [tokens] --maximum-tool-output-tokens [tokens] --model [name] --prompt [text] --system-prompt [text] --temperature [number]  {Edit a cell's fields. --initialization-commands (one command per line; blank clears) sets the worktree initialization that runs once in the cell's freshly created worktree.}
+        - edit selector [uri] --agent [name] --auto-compact-threshold [tokens] --command [cmd] --cwd [path] --effort [level] --initialization-commands [text] --initialization-timeout-sec [seconds] --maximum-context [tokens] --maximum-tool-output-tokens [tokens] --model [name] --prompt [text] --shell [name] --system-prompt [text] --temperature [number]  {Edit a cell's fields. --shell (command cells only; blank clears to the default) picks the shell that runs the command. --initialization-commands (one command per line; blank clears) sets the worktree initialization that runs once in the cell's freshly created worktree.}
         - (read-only-safe) env selector [uri] --scope [cell|proof]  {List a cell's resolved environment variables, read-only (RAL-324); --scope proof shows what its own proof steps inherit.}
-        - open-agent selector [uri]  {Open the real interactive agent in a new terminal -- while running, cleanly detaches the cell first (RAL-288); while finished, resumes it the old way.}
-        - remote-terminal selector [uri]  {Attach an interactive terminal to a remote cell's resumed Claude Code session over the daemon's WebSocket relay (RAL-355).}
         - restart selector [uri]  {Restart a cell (and its downstream), dirtying dependent squads.}
         - restart-proof selector [uri] --from [index]  {Restart a cell's proof steps: resets the whole sequence to pending and re-runs from the start.}
-        - resume-automation selector [uri]  {Hand a detached cell back to unattended execution, continuing the exact same agent conversation (RAL-288).}
         - (read-only-safe) reviews selector [uri]  {The reviews this cell's branch participates in.}
         - set-status selector [uri] state [str]  {Manually override a cell's status.}
         - (read-only-safe) show selector [uri]  {Show a single cell's detail.}
@@ -753,14 +757,19 @@ use; see `READ_ONLY_NOTE`.
         - (read-only-safe) worktree selector [uri]  {Show the worktree/project a cell is using.}
     - check  {System and environment checks.}
         - (read-only-safe) catalog --json  {List every check ralphus_core::health_catalog knows about -- stable id, Core/Harness/Machine section, daemon/remote applicability, Free/OnDemand cost tier, Required/Optional/FallbackOnly requirement level, and impact -- without running any probes (RAL-416). Instant and side-effect-free, unlike `check health`.}
-        - (read-only-safe) health --all-remotes --enable-developer-checks --enable-live-agent-check --json (subagent)  {Check the local ralphus setup, grouped into Core/Harness/Machine sections (daemon, layered config, git, tmux, runner, agent backends, gh/glab, resource checks). --all-remotes also checks every configured [machine.targets.*] entry (RAL-355 Phase 9); --enable-live-agent-check additionally performs a live, cost-incurring Arbiter completion round-trip (RAL-415, off by default).}
+        - (read-only-safe) health --all-remotes --enable-developer-checks --enable-live-agent-check --json (subagent)  {Check the local ralphus setup, grouped into Core/Harness/Machine sections (daemon, layered config, git, runner, agent backends, gh/glab, resource checks). --all-remotes also checks every configured [machine.targets.*] entry (RAL-355 Phase 9); --enable-live-agent-check additionally performs a live, cost-incurring Arbiter completion round-trip (RAL-415, off by default).}
         - restart-thread name [str] --json  {Restart a daemon background thread that has panicked or exited (scheduler, health-sweep, pr-base-drift-poller, store-watchdog) without restarting the daemon. `check health` reports each thread's state and names this command for any that is down. Refused for a thread that is still alive.}
     - clear --all --keep-temporary --status [states] --yes (subagent)  {Delete tasks and reviews from the daemon.}
     - (read-only-safe) completion  {Print a shell tab-completion script. (Rust port: not yet implemented -- prints a placeholder message; Python's `shell` argument is not read.)}
     - (read-only-safe) configuration  {Show sourced .ralphus.toml files and resolved values. (Python's separate `configuration show` subcommand is flattened into this bare command in the Rust port; --no-local is not yet ported.)}
+    - forge  {Forge-wide settings: the poll-token pool used for read-only CI/PR polling.}
+        - pool  {Manage the daemon-wide poll-token pool that read-only forge polling rotates through when a token is rate-limited.}
+            - add kind [github|gitlab] label [str] --host [host] --token [token]  {Add a labelled personal access token to the poll pool for one forge host (default github.com / gitlab.com). Read-only polling rotates through the pool; writes always use the acting user's own token.}
+            - (read-only-safe) list  {List the poll-token pool: kind, host, label and a masked tail for each token (never the token).}
+            - remove kind [github|gitlab] label [str] --host [host]  {Remove a labelled token from the poll pool.}
     - (read-only-safe) get selector [uri] field [str, optional]  {Query one field from any entity's JSON view (jq-lite).}
     - (read-only-safe) graph squad_id [id, optional] --all --dot  {Render the task-order dependency graph. (Rust port simplifies Python's --global/--format ascii|dot choice to plain --dot/--all boolean flags.)}
-    - (read-only-safe) history selector [uri] --type [str]  {Show a cell/proof step's tmux history (one-shot snapshot; Python's --live tailing and --wait-until-valid are not yet ported).}
+    - (read-only-safe) history selector [uri] --type [str]  {Show a cell/proof step's transcript history (one-shot snapshot; Python's --live tailing and --wait-until-valid are not yet ported).}
     - initialize  {One-time local setup helpers for a repository.}
         - followup --remote --state-dir [path] --stop  {Launch an isolated daemon and run the deferred-prophecy follow-up flow with a stub agent: a review merges, offers follow-up work, the offer is accepted, and the drafted squad runs to completion. Local only (--remote is refused); --stop shuts the daemon down afterwards.}
         - git --path [path]  {Enable git rerere in a repo so review rebases replay conflict resolutions.}
@@ -814,9 +823,9 @@ use; see `READ_ONLY_NOTE`.
         - remove name [str]  {Unregister a project by exact name. Existing squads/tasks/reviews that reference it are unaffected; project-scoped settings (forks, Triage thresholds, review-settings defaults) are left in place as orphaned rows.}
         - review-settings  {Manage a project's database-backed DEFAULT review settings (RAL-408) -- resolver agent/model, machine, budget, proof scope, and the project-level equivalents of every `ralphus review settings` opt-out flag.}
             - (read-only-safe) get name [str]  {Show a project's current review-setting overrides plus the fully resolved effective value for each (file config + database).}
-            - set name [str] --auto-build [command] --auto-cancel-outdated-pr-pipelines/--no-auto-cancel-outdated-pr-pipelines --auto-fix-pr-errors/--no-auto-fix-pr-errors --auto-fix-prompt-template [str] --auto-run/--no-auto-run --auto-submit-pr-stack/--no-auto-submit-pr-stack --base-shift-maximum-rebuilds [count] --cache-manual-checks/--no-cache-manual-checks --ci-deferral [every|top|bottom+top] --clear-base-shift-maximum-rebuilds --clear-maximum-budget-usd --discourage-tests-during-auto-pr-fixes/--no-discourage-tests-during-auto-pr-fixes --dual-root-pr/--no-dual-root-pr --machine [scheme:uri] --match-pr-branch-name/--no-match-pr-branch-name --maximum-budget-usd [usd] --post-appraisals/--no-post-appraisals --proof-scope [each_branch|final_branch|nothing] --rebuild-on [none|inherit|rebase|feedback|auto_fix...] --resolver-agent [name] --resolver-model [name] --separate-pr-branch/--no-separate-pr-branch --skip-auto-clean/--no-skip-auto-clean --skip-base-updates/--no-skip-base-updates --skip-manual-checks/--no-skip-manual-checks --skip-worktrees/--no-skip-worktrees  {Update a project's DEFAULT review settings, applied to future reviews only (an Arbiter-created review with no [[review]] block, or any review whose own block leaves a field unset) -- existing reviews are unaffected.}
+            - set name [str] --auto-build [command] --auto-cancel-outdated-pr-pipelines/--no-auto-cancel-outdated-pr-pipelines --auto-fix-pr-errors/--no-auto-fix-pr-errors --auto-fix-prompt-template [str] --auto-run/--no-auto-run --auto-submit-pr-stack/--no-auto-submit-pr-stack --base-shift-maximum-rebuilds [count] --base-update-mode [always|required|never] --cache-manual-checks/--no-cache-manual-checks --ci-deferral [every|top|bottom+top] --clear-base-shift-maximum-rebuilds --clear-maximum-budget-usd --discourage-tests-during-auto-pr-fixes/--no-discourage-tests-during-auto-pr-fixes --dual-root-pr/--no-dual-root-pr --live-actions/--no-live-actions --machine [scheme:uri] --match-pr-branch-name/--no-match-pr-branch-name --maximum-budget-usd [usd] --post-appraisals/--no-post-appraisals --proof-scope [each_branch|final_branch|nothing] --rebuild-on [none|inherit|rebase|feedback|auto_fix...] --resolver-agent [name] --resolver-model [name] --separate-pr-branch/--no-separate-pr-branch --skip-auto-clean/--no-skip-auto-clean --skip-base-updates/--no-skip-base-updates --skip-manual-checks/--no-skip-manual-checks --skip-worktrees/--no-skip-worktrees  {Update a project's DEFAULT review settings, applied to future reviews only (an Arbiter-created review with no [[review]] block, or any review whose own block leaves a field unset) -- existing reviews are unaffected.}
     - proof  {Inspect and act on proof steps.}
-        - edit selector [uri] --agent [name] --command [cmd] --maximum-tool-output-tokens [tokens] --model [name] --prompt [text]  {Edit a proof step's agent/model/command/prompt overrides.}
+        - edit selector [uri] --agent [name] --command [cmd] --maximum-tool-output-tokens [tokens] --model [name] --prompt [text] --shell [name]  {Edit a proof step's agent/model/command/prompt overrides. --shell (command proof steps only; blank clears to the default) picks the shell that runs the command.}
         - (read-only-safe) env selector [uri]  {List a proof step's resolved environment variables, read-only (RAL-324); values of names registered in the Secrets tab are masked.}
         - restart selector [uri]  {Restart this proof step (and any later ones in its scope).}
         - set-status selector [uri] state [str]  {Manually override a proof step's status.}
@@ -848,10 +857,11 @@ use; see `READ_ONLY_NOTE`.
             - (read-only-safe) list selector [uri]  {List the manual checks.}
             - (read-only-safe) run selector [uri] --all --index [integer...] --input [name=value...]  {Print the command(s) + cwd to run one/some/all manual checks yourself.}
             - terminal selector [uri] --mode [open|readonly]  {Print the command to resume the manual-checks-generation agent conversation locally.}
-        - create name [str] upstream_remote [str] upstream_branch [str] git_root [str] --checks [list] --review-type [label] --skip-worktrees  {Create a new review.}
+        - create name [str] base_branch [str] git_root [str] --checks [list] --review-type [label] --skip-worktrees  {Create a new review.}
         - delete selector [uri] --yes  {Delete a review and its worktrees.}
         - dismiss-reenable selector [uri]  {Dismiss the 're-enable' notification for a branch.}
         - (read-only-safe) env selector [uri] --scope [build|tests|manual-checks|worktree]  {List a review surface's resolved environment variables, read-only (RAL-324): the auto-build step, the check gates, manual checks, or one branch's review worktree.}
+        - extract-branch selector [uri]  {Move a branch into a new review of its own, then rebuild both.}
         - feedback selector [uri] text [str] --author [name]  {Post feedback on one branch, triggering a resolver re-attempt. --author attributes the feedback to a different registered user than the one submitting it (RAL-379); defaults to the submitter when omitted.}
         - followup  {Follow-up work offered when a review merges with deferred prophecies.}
             - accept selector [uri]  {Accept a follow-up offer: draft a follow-up squad from the deferred items. The squad starts at once unless auto-start is off for the review (`review settings --followup-auto-start`, else `[followup] auto_start`).}
@@ -863,6 +873,10 @@ use; see `READ_ONLY_NOTE`.
         - force-start selector [uri]  {Disable not-yet-done branches and merge immediately (only while collecting).}
         - link-cell selector [uri] cell [uri]  {Link a cell/task to an already-attached review branch, so its readiness follows that cell finishing (RAL-392).}
         - (read-only-safe) list --pr-ready --status [statuses]  {List reviews.}
+        - live  {Live actions: agent-run live tests of the review's tip, generated from its cells' RALPHUS_LIVE_ACTION handoffs.}
+            - cancel selector [uri] run_id [str]  {Cancel a queued or running live run.}
+            - (read-only-safe) list selector [uri]  {List the review's live actions (agent-run live tests from its cells' handoffs) and their runs.}
+            - run selector [uri] --index [integer]  {Queue a run of one live action (--index) or all of them; generates the review's live actions from its finished cells' handoffs first if it has none.}
         - (read-only-safe) logs selector [uri]  {Show a review's state-transition audit log.}
         - manual-checks-env selector [uri] --clear [key...] --set [key=value...] --unset [key...]  {Set/unset/clear this review's manual-checks step environment overrides.}
         - merge selector [uri]  {Start (or continue) the stacked rebase.}
@@ -884,15 +898,16 @@ use; see `READ_ONLY_NOTE`.
         - reopen selector [uri]  {Reopen a cancelled or merged review and immediately stage in whatever branches are already ready, without waiting for the rest.}
         - reorder selector [uri] order [str] --disable [names] --enable [names]  {Set the branch order and kick off the rebase.}
         - restart-merge selector [uri]  {Cancel an in-progress rebase and start a fresh one.}
-        - settings selector [uri] --auto-cancel-outdated-pr-pipelines/--no-auto-cancel-outdated-pr-pipelines --auto-fix-pr-errors/--no-auto-fix-pr-errors --auto-fix-prompt-template [str] --auto-pr-feedback/--no-auto-pr-feedback --auto-run/--no-auto-run --auto-submit-pr-stack/--no-auto-submit-pr-stack --cache-manual-checks/--no-cache-manual-checks --ci-deferral [every|top|bottom+top] --discourage-tests-during-auto-pr-fixes/--no-discourage-tests-during-auto-pr-fixes --dual-root-pr/--no-dual-root-pr --followup [on|off|inherit] --followup-auto-start [on|off|inherit] --match-pr-branch-name/--no-match-pr-branch-name --post-appraisals/--no-post-appraisals --proof-scope [each_branch|final_branch|nothing] --rebuild-on [none|inherit|rebase|feedback|auto_fix...] --resolver-agent [name] --resolver-model [name] --separate-pr-branch/--no-separate-pr-branch --skip-auto-clean/--no-skip-auto-clean --skip-base-updates/--no-skip-base-updates --skip-manual-checks/--no-skip-manual-checks --skip-worktrees/--no-skip-worktrees --upstream-branch [branch] --upstream-remote [remote]  {Update per-review opt-out settings.}
+        - settings selector [uri] --auto-cancel-outdated-pr-pipelines/--no-auto-cancel-outdated-pr-pipelines --auto-fix-pr-errors/--no-auto-fix-pr-errors --auto-fix-prompt-template [str] --auto-pr-feedback/--no-auto-pr-feedback --auto-run/--no-auto-run --auto-submit-pr-stack/--no-auto-submit-pr-stack --base-branch [branch] --base-update-mode [always|required|never] --cache-manual-checks/--no-cache-manual-checks --ci-deferral [every|top|bottom+top] --discourage-tests-during-auto-pr-fixes/--no-discourage-tests-during-auto-pr-fixes --dual-root-pr/--no-dual-root-pr --followup [on|off|inherit] --followup-auto-start [on|off|inherit] --live-actions/--no-live-actions --match-pr-branch-name/--no-match-pr-branch-name --post-appraisals/--no-post-appraisals --proof-scope [each_branch|final_branch|nothing] --rebuild-on [none|inherit|rebase|feedback|auto_fix...] --resolver-agent [name] --resolver-model [name] --separate-pr-branch/--no-separate-pr-branch --skip-auto-clean/--no-skip-auto-clean --skip-base-updates/--no-skip-base-updates --skip-manual-checks/--no-skip-manual-checks --skip-worktrees/--no-skip-worktrees  {Update per-review opt-out settings.}
         - (read-only-safe) show selector [uri]  {Show a single review's detail.}
         - squash selector [uri] project [str] --off --on  {Enable/disable squashing one git project's task branches to a single commit each in the review worktree.}
         - (read-only-safe) status selector [uri]  {Per-branch readiness + a summary verdict ('is this review ready?').}
+        - stop-actioning selector [uri]  {Stop whatever is actioning a review's worktree (feedback, merge/rebase or auto-fix), abort a mid-rebase and reset the worktree, and pause auto-fix until the next explicit Action feedback or Merge / rebase.}
         - stop-merge selector [uri]  {Stop an in-progress rebase at the next checkpoint, leaving the review resumable instead of cancelled.}
         - sync-pr selector [uri]  {Check the forge for a stack reorder made outside ralphus and apply it if found.}
-        - upstream  {Inspect/change a review's upstream remote and branch.}
-            - (read-only-safe) list selector [uri]  {List candidate upstream (remote, branch) pairs on the review's upstream remote.}
-            - set selector [uri] upstream_remote [str] upstream_branch [str]  {Change the upstream remote and branch (remote "." names a local branch).}
+        - upstream  {Inspect/change a review's upstream branch.}
+            - (read-only-safe) list selector [uri]  {List candidate upstream branches.}
+            - set selector [uri] branch [str]  {Change the upstream branch.}
         - (read-only-safe) worktree-retirements --state [scheduled|eligible|claimed|failed|deferred|opted_out|retired]  {List review worktrees across every review by retirement state -- scheduled, eligible, claimed, failed, deferred, opted_out, retired -- with failure context and the eligible-at timestamp. Repeat --state to filter (no --state lists everything).}
         - (read-only-safe) worktrees selector [uri]  {The worktrees/branches this review consumes.}
     - show  {Print machine-readable views of ralphus itself.}

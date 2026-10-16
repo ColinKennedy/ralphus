@@ -38,7 +38,7 @@
           const cells = t.cells.map((s, si) => `
             <div class="cell selectable ${selCls("cell", ti, si)}" id="n-${ti}-${si}" data-click="onGraphNodeClick" data-ctx="openCellNodeMenu" data-squad-id="${esc(squad.id)}" data-kind="cell" data-ti="${ti}" data-si="${si}" data-vi="-1"
                  data-tip="${esc(s.name ?? s.id)} · ${esc(s.state)}\nAgent: ${esc(s.agent)}${s.model ? " · " + esc(s.model) : ""}${(s.depends_on||[]).length ? "\nDepends on: " + esc((s.depends_on||[]).join(", ")) : ""}\nClick to view details; Shift/Ctrl-click to multi-select; right-click for actions.">
-              <div class="sid">${esc(s.name ?? s.id)} ${pill(s.state)}${detachedGraphBadge(s.detached_at_ms)}${delayedGraphBadge(s.delayed_until_ms)}${runnerStalledBadge(s.runner_stalled_at_ms)}${s.error ? failLogBtn(s.error) : ""}</div>
+              <div class="sid">${esc(s.name ?? s.id)} ${pill(s.state)}${delayedGraphBadge(s.delayed_until_ms)}${runnerStalledBadge(s.runner_stalled_at_ms)}${s.error ? failLogBtn(s.error) : ""}</div>
               <div class="kv">${esc(s.agent)}${s.model ? " · " + esc(s.model) : ""}</div>
               ${cellProof(s, ti, si, selCls, squad.id)}
             </div>`).join("");
@@ -377,6 +377,29 @@
           ${generationCostSection(r)}
           ${envOverridesSection(r)}
           ${editBtn()}`;
+      }
+      /**
+       * Copied-from / copied-to links between squads (RAL-641).
+       * @param {SquadView} r
+       * @returns {string}
+       */
+      function copyLinksSection(r) {
+        /**
+         * @param {string} id
+         * @param {string} text
+         * @param {string} tip
+         * @returns {string}
+         */
+        const link = (id, text, tip) => `<a href="#" data-click="gotoSquad" data-squad-id="${esc(id)}" style="color:var(--accent)" data-tip="${esc(tip)}">${esc(text)}</a>`;
+        const rows = [];
+        if (r.copied_from) {
+          const c = r.copied_from;
+          rows.push(`<div class="kv-row"><span class="k">copied from</span><span class="v">${link(c.from_squad_id, `${c.from_squad_id} · task ${c.from_task_idx} cell ${c.from_cell_idx}`, "Open the squad this one was copied from.")}${c.from_branch ? " (from its branch)" : ""}</span></div>`);
+        }
+        for (const c of r.copied_to || []) {
+          rows.push(`<div class="kv-row"><span class="k">copied to</span><span class="v">${link(c.to_squad_id, `${c.to_squad_id} · task ${c.from_task_idx} cell ${c.from_cell_idx}`, "Open the squad this cell was copied into.")}</span></div>`);
+        }
+        return rows.length ? `<h3 class="section">copies</h3>${rows.join("")}` : "";
       }
       /**
        * Renders the squad's pre-work generation cost (RAL-420), when it has
@@ -863,13 +886,8 @@
           : "";
         const terminalBtns = (() => {
           const scope = si === -1 ? "task" : "cell";
-          // RAL-102/RAL-151: every command/prompt proof step runs inside
-          // tmux, so the dropdown is available for either kind — "not
-          // currently live" is handled gracefully at click/peek time, not by
-          // pre-disabling. "Open Agent" only makes sense for a prompt-kind
-          // step (there is no agent conversation to resume for a plain
-          // shell command), so it's omitted outright for command-kind
-          // rather than shown disabled.
+          // RAL-102/RAL-151: every command/prompt proof step is live-view
+          // capable, so the dropdown is available for either kind.
           const key = `proof|${r.id}|${ti}|${scope}|${si}|${vi}`;
           const live = squadLiveCtx({
             baseKey: key,
@@ -882,16 +900,7 @@
             currentKind: v.kind === "command" ? "command" : "current",
             closeKey: key,
           });
-          const openAgentItem = v.kind === "prompt"
-            ? openAgentMenuItem(key, "openAgentProofTerminalMenuItem",
-                { squadId: r.id, ti, scope, si, vi },
-                v.state === "running", v.agent_session_id, v.agent)
-            : "";
-          const items = terminalMenuItem(key, "Open Terminal Log",
-              "openProofTerminalMenuItem", { squadId: r.id, ti, scope, si, vi },
-              "Attach an interactive terminal to this proof step's live tmux cell.\nShows the runner's own log/event stream, not the agent's actual conversation.\nOnly available while the proof step is actively running — fails gracefully otherwise.")
-            + openAgentItem
-            + terminalMenuItem(key, "View Attempt History",
+          const items = terminalMenuItem(key, "View Attempt History",
                 "toggleHistoryMenuItem", {},
                 "List every durably-persisted terminal-log attempt for this proof step, including past reattaches.\nWho/when: the pane died or reattached and you need to see what happened right before, after the live view is gone.\nEach attempt's log survives pane death and daemon restarts.");
           return `<div class="btn-row" style="position:relative;gap:0">${squadLiveOpenBtn(key, "this proof step")}${terminalMenuHtml(key, items)}</div>${squadLiveSlot(live)}${historyBox(key)}`;
@@ -910,7 +919,10 @@
           <div class="kv-row"><span class="k">result</span><span class="v">${logBtn}</span></div>
           ${maximumToolOutputTokensRow(v)}
           ${appraisalDetailHtml(v)}
+          ${v.kind === "command" ? `<div class="kv-row" data-tip="The shell that runs this proof step's command: the declared shell, else the configured default, else cmd on Windows / sh elsewhere."><span class="k">shell</span><span class="v mono">${esc(v.effective_shell || v.shell || "—")}${v.shell ? "" : " (default)"}</span></div>` : ""}
           ${specSection}${systemPromptSection}${terminalBtns}
+          ${v.kind === "command" ? `<div class="btn-row"><button class="btn primary" onclick="startEdit()" data-tip="Edit this proof step's shell.
+Saving restarts the proof step and the rest of its list; an unchanged value restarts nothing.">✎ Edit</button></div>` : ""}
           ${envSection}`;
       }
 
@@ -965,8 +977,9 @@
         return cellDiffs[key].summary;
       }
       /**
-       * Renders the RAL-550 "changes" key/value row from a pushed summary, or
-       * an empty string while nothing has been pushed.
+       * Renders the RAL-550 "changes" key/value row from a pushed summary. The
+       * numbers are the cell's worktree total against the worktree's upstream
+       * base, so every cell sharing a worktree shows the same figures.
        * @param {CellDiffSummary|null} d
        * @returns {string}
        */
@@ -1018,10 +1031,13 @@
        * hasn't been swept into an actual review yet, shown in the cell
        * details pane's "in reviews" section in place of a real review link.
        * Empty once a real review exists (`s.reviews` non-empty) or the cell
-       * never opted into Triage (`s.triage_types` empty) -- `cellView()`
-       * only calls this as the fallback when `s.reviews` is empty.
+       * never opted into Triage (`s.triage_types` empty and
+       * `s.triage_pending` false) -- `cellView()` only calls this as the
+       * fallback when `s.reviews` is empty.
        *
-       * Three states, matching the cell's own `state` rather than any
+       * Four states: "classifying" (opted in but the Arbiter has not written
+       * a type yet, `s.triage_pending`; the next re-render replaces it with
+       * one of the states below, `unclassified` at worst), matching the cell's own `state` rather than any
        * stored Triage/pool field (there's nothing to poll for beyond what
        * `CellView` already carries -- and `CellView.state` is already the
        * proof-aware effective state, not the raw persisted column): "failed"
@@ -1039,7 +1055,15 @@
        */
       function triagePlaceholderSection(s) {
         const types = s.triage_types || [];
-        if (!types.length || (s.reviews || []).length) return "";
+        if ((s.reviews || []).length) return "";
+        if (!types.length) {
+          if (!s.triage_pending) return "";
+          const tip = "This cell opted into Triage and the Arbiter is still classifying it into a Triage type.\nOnce it resolves (to 'unclassified' if classification fails or is ambiguous), this becomes 'Scheduled for auto-review' with the type name.";
+          return `<h3 class="section">in reviews</h3><div class="kv-row" data-tip="${tip}">` +
+            `<span style="opacity:0.55"><span class="dot" style="background:${cvar("--arbiter")}"></span></span>` +
+            `<span class="v" style="flex:1"><div>⏳ Classifying for auto-review…</div></span>` +
+            `</div>`;
+        }
         const typeList = types.join(", ");
         if (s.state === "failed") {
           const tip = `This cell opted into Triage (type(s): ${typeList}) but failed.\nA failed cell can never pass review, so it is permanently excluded from being swept into an automatic review.`;
@@ -1144,11 +1168,11 @@
           ? `<h3 class="section">system prompt</h3>${promptBox(s.system_prompt, `system-prompt-box-${sel.taskIdx}-${sel.cellIdx}`, SYSTEM_PROMPT_TIP)}`
           : "";
         const initRow = worktreeInitRow(s);
-        return `<div class="dhead"><span class="k">◉ cell</span> <span>${esc(s.name ?? s.id)}</span></div>
+        return `<div class="dhead"><span class="k">◉ cell</span> <span>${esc(s.name ?? s.id)}</span><button class="icon-btn" style="margin-left:auto" data-click="openCellMenu" data-squad-id="${esc(r.id)}" data-ti="${sel.taskIdx}" data-si="${sel.cellIdx}" data-tip="Actions for this cell: edit and restart${s.blocking ? ", and Show ways to fix this block… (it is holding up other work)" : ""}.">⋯</button></div>
           ${s.name ? `<div class="kv-row"><span class="k">name</span><span class="v">${esc(s.name)}</span></div>` : ""}
           <div class="kv-row"><span class="k">id</span><span class="v mono">${esc(s.id)}${copyBtn(s.id)}</span></div>
           <div class="kv-row"><span class="k">task</span><span class="v">${esc(t.name)}</span></div>
-          <div class="kv-row"><span class="k">state</span><span class="v">${pill(s.state)}${detachedBadge(s.detached_at_ms)}${delayedBadge(s.delayed_until_ms)}${runnerStalledBadge(s.runner_stalled_at_ms)}${outOfDateBadge(s.env_out_of_date)}${subprojectBadge(s)}${["pending","queued"].includes(s.state) ? "" : squadLogsBtn(r.id)}${s.error ? failLogBtn(s.error) : ""}</span></div>
+          <div class="kv-row"><span class="k">state</span><span class="v">${pill(s.state)}${blockingBadge(s.blocking)}${delayedBadge(s.delayed_until_ms)}${runnerStalledBadge(s.runner_stalled_at_ms)}${outOfDateBadge(s.env_out_of_date)}${subprojectBadge(s)}${["pending","queued"].includes(s.state) ? "" : squadLogsBtn(r.id)}${s.error ? failLogBtn(s.error) : ""}</span></div>
           ${timingRows(s.started_at_ms, s.finished_at_ms, s.duration_ms ?? 0, s.active_duration_intervals ?? 0)}
           <div class="kv-row"><span class="k">agent</span>${detailValueHtml(s.agent, agentTip)}</div>
           <div class="kv-row"><span class="k">model</span>${detailValueHtml(s.model || "—", modelTip)}</div>
@@ -1165,6 +1189,7 @@
           ${maximumToolOutputTokensRow(s)}
           <h3 class="section">${s.command ? "command" : "prompt"}</h3>
           ${s.command ? cmdBox(s.command) : promptBox(s.prompt || "—", `prompt-box-${sel.taskIdx}-${sel.cellIdx}`)}
+          ${s.command ? `<div class="kv-row" data-tip="The shell that runs this cell's command: the declared shell, else the configured default, else cmd on Windows / sh elsewhere."><span class="k">shell</span><span class="v mono">${esc(s.effective_shell || s.shell || "—")}${s.shell ? "" : " (default)"}</span></div>` : ""}
           ${systemPromptSection}
           ${initRow}
           ${inReviews}
@@ -1174,16 +1199,9 @@
             <button class="btn primary" onclick="startEdit()" data-tip="Edit this cell — change its prompt, agent, model, command, or working directory.\nIf the squad is currently running it will be stopped and reset to Pending.">✎ Edit</button>
             <button class="btn" data-click="restartCell" data-squad-id="${esc(r.id)}" data-ti="${sel.taskIdx}" data-si="${sel.cellIdx}" data-tip="Re-run this cell and all downstream cells within this squad.\nDependent squads in other tasks are also re-queued.\nThis cannot be undone.">⟳ Restart cell</button>
           </div>
+          ${copyLinksSection(r)}
           ${(() => {
-            // RAL-102/RAL-151: every command/prompt cell runs inside
-            // tmux, so both a cell's kind is always live-view capable
-            // ("prompt" XOR "command" is enforced by the schema) — "not
-            // currently live" is handled gracefully at click/peek time
-            // rather than by pre-emptively disabling the buttons. "Open
-            // Agent" only makes sense for a prompt-kind cell (there is
-            // no agent conversation to resume for a plain shell command),
-            // so it's omitted outright for a command cell rather than
-            // shown disabled.
+            // RAL-102/RAL-151: every command/prompt cell is live-view capable.
             const key = `cell|${r.id}|${sel.taskIdx}|${sel.cellIdx}`;
             const live = squadLiveCtx({
               baseKey: key,
@@ -1196,32 +1214,7 @@
               currentKind: s.command ? "command" : "current",
               closeKey: key,
             });
-            // Open Agent spawns a window on the *daemon's own desktop* — it
-            // has no way to reach a remote cell's conversation, so a remote
-            // cell gets "Remote Terminal" (the WebSocket relay) instead of
-            // "Open Agent", never both (RAL-355 Phase 10).
-            const openAgentItem = s.command || s.machine
-              ? ""
-              : openAgentMenuItem(key, "openAgentTerminalMenuItem",
-                  { squadId: r.id, ti: sel.taskIdx, si: sel.cellIdx },
-                  s.state === "running", s.agent_session_id, s.agent, s.machine, true);
-            const remoteTerminalItem = s.command || !s.machine
-              ? ""
-              : remoteTerminalMenuItem(key, "remoteTerminalMenuItem",
-                  { squadId: r.id, ti: sel.taskIdx, si: sel.cellIdx },
-                  s.state === "running", s.agent_session_id, s.agent);
-            const resumeAutomationItem = s.command
-              ? ""
-              : resumeAutomationMenuItem(key, "resumeAutomationMenuItem",
-                  { squadId: r.id, ti: sel.taskIdx, si: sel.cellIdx },
-                  s.state === "running", s.agent_session_id);
-            const items = terminalMenuItem(key, "Open Terminal Log",
-                "openTerminalMenuItem", { squadId: r.id, ti: sel.taskIdx, si: sel.cellIdx },
-                "Attach an interactive terminal to this cell's live tmux cell.\nShows the runner's own log/event stream, not the agent's actual conversation.\nOnly available while the cell is actively running — fails gracefully otherwise.")
-              + openAgentItem
-              + remoteTerminalItem
-              + resumeAutomationItem
-              + terminalMenuItem(key, "View Attempt History",
+            const items = terminalMenuItem(key, "View Attempt History",
                   "toggleHistoryMenuItem", {},
                   "List every durably-persisted terminal-log attempt for this cell, including past reattaches.\nWho/when: the pane died or reattached and you need to see what happened right before, after the live view is gone.\nEach attempt's log survives pane death and daemon restarts.");
             return `<div class="btn-row" style="position:relative;gap:0">${squadLiveOpenBtn(key, "this cell")}${terminalMenuHtml(key, items)}</div>${squadLiveSlot(live)}${historyBox(key)}`;
@@ -1345,7 +1338,7 @@ On failure no agent starts; fix it with Edit, then Retry the squad.">Worktree in
       /**
        * Resolves a cell/proof-step peek `key`'s most recently captured raw
        * output text (RAL-295): a durably-persisted terminal-log attempt if one
-       * exists (the fuller, final record), else the live/last tmux pane
+       * exists (the fuller, final record), else the live/last pane
        * snapshot, else `null` when neither backend has ever captured anything
        * for this key. Shared by the Logs modal's cells/proofs tabs, which link
        * to this data on demand rather than carrying a separate stored/
@@ -1500,6 +1493,30 @@ On failure no agent starts; fix it with Edit, then Retry the squad.">Worktree in
       // Knip reference: used as an onchange callback string in renderAgentSelectHtml
       void onCellEditAgentChange;
       /**
+       * Finds a proof step by position; `cellIdx === -1` addresses the task's own proof list.
+       * @param {SquadView} r
+       * @param {number} ti
+       * @param {number} si
+       * @param {number} vi
+       * @returns {ProofView|undefined}
+       */
+      function proofAt(r, ti, si, vi) {
+        const t = r.tasks[ti];
+        if (!t) return undefined;
+        return si === -1 ? (t.proof || [])[vi] : ((t.cells || [])[si] || /** @type {CellView} */ ({})).proof?.[vi];
+      }
+      /**
+       * The shell combo box shared by the cell and proof edit forms; blank means the default.
+       * @param {string} id
+       * @param {string} declared
+       * @param {string} effective
+       * @returns {string}
+       */
+      function shellFieldHtml(id, declared, effective) {
+        return `<label data-tip="The shell that runs the command. Pick one or type any shell name or path. Leave blank for the default${effective ? " (currently " + esc(effective) + ")" : ""}. A shell that is not installed fails the step.">shell<input id="${id}" list="${id}-options" value="${esc(declared)}" placeholder="${esc(effective ? "default: " + effective : "(platform default)")}">
+          <datalist id="${id}-options">${NT_SHELL_CHOICES.map((sh) => `<option value="${sh}"></option>`).join("")}</datalist></label>`;
+      }
+      /**
        * Renders the edit form for the current selection (squad label, task fields, or cell fields).
        * @param {SquadView} r
        * @returns {string}
@@ -1522,6 +1539,11 @@ On failure no agent starts; fix it with Edit, then Retry the squad.">Worktree in
           fields = `<label>name<input id="e-name" value="${esc(t.name)}"></label>
             <label>project<input id="e-project" value="${esc(t.project)}"></label>`;
           envSection = taskEnvOverridesSection(r, sel.taskIdx, t) + taskProofEnvOverridesSection(r, sel.taskIdx, t);
+        } else if (sel.kind === "proof") {
+          const v = proofAt(r, sel.taskIdx, sel.cellIdx, sel.proofIdx ?? -1);
+          fields = v && v.kind === "command"
+            ? shellFieldHtml("e-shell", v.shell || "", v.effective_shell || "")
+            : `<div class="empty">Only a command proof step has editable fields here.</div>`;
         } else {
           const s = r.tasks[sel.taskIdx].cells[sel.cellIdx];
           const isCmd = !!s.command;
@@ -1540,6 +1562,7 @@ It is held back rather than shown blank, so saving cannot overwrite it with an e
             </div>
             <div id="command-fields"${isCmd ? "" : ' class="hidden"'}>
               <label>command<textarea id="e-command" rows="5">${esc(s.command || "")}</textarea></label>
+              ${shellFieldHtml("e-shell", s.shell || "", s.effective_shell || "")}
             </div>
             <label data-tip="Commands run once, in order, in this cell's freshly created worktree (one per line; blank clears an inherited value). The first failure stops the list and fails the cell. Must be idempotent. Applies to every cell sharing this worktree.">worktree init<textarea id="e-init" rows="3">${esc(s.worktree_init ? s.worktree_init.commands.join("\n") : "")}</textarea></label>
             <label data-tip="Seconds allowed for the whole worktree init list (must be > 0). Blank keeps the current value.">worktree init timeout (s)<input id="e-init-timeout" value=""></label>`;
@@ -1561,6 +1584,9 @@ It is held back rather than shown blank, so saving cannot overwrite it with an e
        * @property {string} [project]
        * @property {string} [cwd]
        * @property {string} [command]
+       * @property {string} [shell]
+       * @property {string} [proof_scope]
+       * @property {number} [proof_idx]
        * @property {string} [agent]
        * @property {string} [model]
        * @property {string} [effort]
@@ -1585,7 +1611,21 @@ It is held back rather than shown blank, so saving cannot overwrite it with an e
           const el = /** @type {{value?: string}|null} */ (document.getElementById(id));
           return (el && el.value) || "";
         };
+        /**
+         * Sets `body.shell` only when the field differs from the stored shell; blank clears.
+         * @param {string|undefined} before
+         * @returns {void}
+         */
+        const setShell = (before) => { if (val("e-shell").trim() !== (before || "")) body.shell = val("e-shell").trim(); };
         if (sel.kind === "squad") body.label = val("e-label");
+        else if (sel.kind === "proof") {
+          body.proof_scope = sel.cellIdx === -1 ? "task" : "cell";
+          body.proof_idx = sel.proofIdx ?? 0;
+          if (sel.cellIdx === -1) body.cell_idx = 0;
+          const v0 = proofAt(r, sel.taskIdx, sel.cellIdx, sel.proofIdx ?? -1);
+          if (!v0 || v0.kind !== "command") { editing = false; renderDetails(); return; }
+          setShell(v0.shell);
+        }
         else if (sel.kind === "task") { body.name = val("e-name"); body.project = val("e-project"); }
         else {
           body.cwd = val("e-cwd");
@@ -1600,6 +1640,7 @@ It is held back rather than shown blank, so saving cannot overwrite it with an e
           // the cell's pre-existing kind.
           if (val("e-mode") === "command") {
             body.command = val("e-command");
+            setShell(s0.shell);
           } else {
             body.agent = val("e-agent"); body.model = val("e-model");
             // Blank clears the field; the daemon treats an unchanged value as a no-op.
