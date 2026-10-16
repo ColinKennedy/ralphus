@@ -50,6 +50,7 @@ pub enum CellCommand {
         model: Option<String>,
         prompt: Option<String>,
         command: Option<String>,
+        shell: Option<String>,
         auto_compact_threshold: Option<String>,
         maximum_context: Option<String>,
         maximum_tool_output_tokens: Option<String>,
@@ -127,6 +128,7 @@ pub fn parse(args: &[String]) -> CellCommand {
             let model = scanner.take_value("--model").ok().flatten();
             let prompt = scanner.take_value("--prompt").ok().flatten();
             let command = scanner.take_value("--command").ok().flatten();
+            let shell = scanner.take_value("--shell").ok().flatten();
             let auto_compact_threshold = scanner
                 .take_value("--auto-compact-threshold")
                 .ok()
@@ -154,6 +156,7 @@ pub fn parse(args: &[String]) -> CellCommand {
                 model,
                 prompt,
                 command,
+                shell,
                 auto_compact_threshold,
                 maximum_context,
                 maximum_tool_output_tokens,
@@ -407,6 +410,7 @@ pub fn dispatch(cmd: CellCommand, opts: &GlobalOpts) -> i32 {
             model,
             prompt,
             command,
+            shell,
             auto_compact_threshold,
             maximum_context,
             maximum_tool_output_tokens,
@@ -426,6 +430,7 @@ pub fn dispatch(cmd: CellCommand, opts: &GlobalOpts) -> i32 {
                 model.as_deref(),
                 prompt.as_deref(),
                 command.as_deref(),
+                shell.as_deref(),
                 auto_compact_threshold.as_deref(),
                 maximum_context.as_deref(),
                 maximum_tool_output_tokens.as_deref(),
@@ -726,6 +731,16 @@ mod tests {
                 maximum_context, ..
             } => assert_eq!(maximum_context.as_deref(), Some("")),
             other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_edit_with_shell_and_empty_shell_clears() {
+        for (given, want) in [("bash", "bash"), ("", "")] {
+            match parse(&v(&["edit", "squad-1/build/cell/0", "--shell", given])) {
+                CellCommand::Edit { shell, .. } => assert_eq!(shell.as_deref(), Some(want)),
+                other => panic!("unexpected: {other:?}"),
+            }
         }
     }
 

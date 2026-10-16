@@ -297,6 +297,14 @@ pub struct ProofView {
     pub output: Option<String>,
     /// The step definition: command text or prompt text.
     pub spec: String,
+    /// The `shell` a `command` step declared; `None` when it declared none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub shell: Option<String>,
+    /// The shell a `command` step runs under: [`Self::shell`], else the
+    /// project/global `[command] shell`, else the platform default. `None`
+    /// for a `prompt` step.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub effective_shell: Option<String>,
     /// Read-only effective system prompt actually appended to this agent
     /// invocation. Omitted for the command kind and for rows
     /// created before RAL-180 first populated it.
@@ -486,6 +494,14 @@ pub struct CellView {
     pub prompt: Option<String>,
     /// Shell command, if a command cell.
     pub command: Option<String>,
+    /// The `shell` a command cell declared; `None` when it declared none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub shell: Option<String>,
+    /// The shell a command cell runs under: [`Self::shell`], else the
+    /// project/global `[command] shell`, else the platform default. `None`
+    /// for a prompt cell.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub effective_shell: Option<String>,
     /// Read-only effective system prompt actually appended to this agent
     /// invocation. Omitted for command cells and for rows created before
     /// RAL-180 first populated it.
@@ -6319,6 +6335,7 @@ impl Store {
             &db_profiles,
         )?;
         let mut tasks = Vec::with_capacity(task_rows.len());
+        let mut shell_by_cwd: HashMap<Option<String>, String> = HashMap::new();
         for (
             t_idx,
             name,
@@ -6336,14 +6353,29 @@ impl Store {
             t_error,
         ) in task_rows
         {
-            let cells = cells_by_task.remove(&t_idx).unwrap_or_default();
+            let mut cells = cells_by_task.remove(&t_idx).unwrap_or_default();
             let project = project.unwrap_or_else(|| {
                 fallback_project_identifier(cells.first().and_then(|s| s.cwd.as_deref()))
             });
-            let proof = proofs_by_scope
+            let mut proof = proofs_by_scope
                 .get(&(t_idx, "task".to_string(), -1))
                 .cloned()
                 .unwrap_or_default();
+            let task_cwd = cells.first().and_then(|c| c.cwd.clone());
+            for step in &mut proof {
+                fill_proof_effective_shell(step, task_cwd.as_deref(), &mut shell_by_cwd);
+            }
+            for cell in &mut cells {
+                let cwd = cell.cwd.clone();
+                if cell.command.is_some() {
+                    cell.effective_shell = Some(cell.shell.clone().unwrap_or_else(|| {
+                        cached_effective_shell(cwd.as_deref(), &mut shell_by_cwd)
+                    }));
+                }
+                for step in &mut cell.proof {
+                    fill_proof_effective_shell(step, cwd.as_deref(), &mut shell_by_cwd);
+                }
+            }
             let duration_ms = cells.iter().map(|cell| cell.duration_ms).sum::<i64>()
                 + proof.iter().map(|step| step.duration_ms).sum::<i64>();
             let active_duration_intervals = cells
@@ -6547,7 +6579,7 @@ impl Store {
         db_profiles: &HashMap<String, crate::agent_profile_store::AgentProfileView>,
     ) -> Result<HashMap<i64, Vec<CellView>>> {
         let mut stmt = conn.prepare(
-            "SELECT task_idx, idx, sid, name, cwd, agent, model, state, tokens_in, tokens_out, cost_usd, error, prompt, command, effective_system_prompt, depends_on, review_branch, agent_session_id, maximum_budget_usd, env_overrides, proof_env_overrides, started_at_ms, finished_at_ms, env_out_of_date, machine, maximum_context, auto_compact_threshold, cache_creation_tokens, cache_read_tokens, cost_is_estimated, maximum_tool_output_tokens, compaction_input_tokens, compaction_count, delayed_until_ms, completed_active_duration_ms, CASE WHEN state='running' THEN active_started_at_ms END, turns, waypoint_halted_at_ms, runner_stalled_at_ms, effort, temperature, init_commands, init_source, init_timeout_sec, init_state, init_duration_ms, init_exit_status, init_output, init_finished_at_ms
+            "SELECT task_idx, idx, sid, name, cwd, agent, model, state, tokens_in, tokens_out, cost_usd, error, prompt, command, effective_system_prompt, depends_on, review_branch, agent_session_id, maximum_budget_usd, env_overrides, proof_env_overrides, started_at_ms, finished_at_ms, env_out_of_date, machine, maximum_context, auto_compact_threshold, cache_creation_tokens, cache_read_tokens, cost_is_estimated, maximum_tool_output_tokens, compaction_input_tokens, compaction_count, delayed_until_ms, completed_active_duration_ms, CASE WHEN state='running' THEN active_started_at_ms END, turns, waypoint_halted_at_ms, runner_stalled_at_ms, effort, temperature, init_commands, init_source, init_timeout_sec, init_state, init_duration_ms, init_exit_status, init_output, init_finished_at_ms, shell
              FROM cells WHERE squad_id=? ORDER BY task_idx, idx",
         )?;
         let rows = stmt
@@ -6614,6 +6646,8 @@ impl Store {
                         error: r.get::<_, Option<String>>(11)?,
                         prompt: r.get::<_, Option<String>>(12)?,
                         command: r.get::<_, Option<String>>(13)?,
+                        shell: r.get::<_, Option<String>>(49)?,
+                        effective_shell: None,
                         system_prompt: r.get::<_, Option<String>>(14)?,
                         depends_on: from_json(&r.get::<_, String>(15)?),
                         proof: Vec::new(),
@@ -6792,7 +6826,7 @@ impl Store {
         db_profiles: &HashMap<String, crate::agent_profile_store::AgentProfileView>,
     ) -> Result<HashMap<(i64, String, i64), Vec<ProofView>>> {
         let mut stmt = conn.prepare(
-            "SELECT task_idx, scope, cell_idx, vid, kind, state, delayed_until_ms, delayed_reason, output, spec, effective_system_prompt, model, agent, agent_session_id, tokens_in, tokens_out, cost_usd, env_overrides, env_out_of_date, cache_creation_tokens, cache_read_tokens, cost_is_estimated, maximum_tool_output_tokens, compaction_input_tokens, compaction_count, completed_active_duration_ms, CASE WHEN state='running' THEN active_started_at_ms END, turns FROM proofs
+            "SELECT task_idx, scope, cell_idx, vid, kind, state, delayed_until_ms, delayed_reason, output, spec, effective_system_prompt, model, agent, agent_session_id, tokens_in, tokens_out, cost_usd, env_overrides, env_out_of_date, cache_creation_tokens, cache_read_tokens, cost_is_estimated, maximum_tool_output_tokens, compaction_input_tokens, compaction_count, completed_active_duration_ms, CASE WHEN state='running' THEN active_started_at_ms END, turns, shell FROM proofs
              WHERE squad_id=? ORDER BY task_idx, scope, cell_idx, idx",
         )?;
         let rows = stmt
@@ -6818,6 +6852,8 @@ impl Store {
                         delayed_reason: r.get::<_, Option<String>>(7)?,
                         output: r.get::<_, Option<String>>(8)?,
                         spec: r.get::<_, String>(9)?,
+                        shell: r.get::<_, Option<String>>(28)?,
+                        effective_shell: None,
                         system_prompt: r.get::<_, Option<String>>(10)?,
                         model: r.get::<_, Option<String>>(11)?,
                         agent,
@@ -6874,7 +6910,7 @@ impl Store {
                 .map(|p| (p.name.clone(), p))
                 .collect();
         let mut stmt = self.conn.prepare(
-            "SELECT vid, kind, state, delayed_until_ms, delayed_reason, output, spec, effective_system_prompt, model, agent, agent_session_id, tokens_in, tokens_out, cost_usd, env_overrides, env_out_of_date, cache_creation_tokens, cache_read_tokens, cost_is_estimated, maximum_tool_output_tokens, compaction_input_tokens, compaction_count, completed_active_duration_ms, CASE WHEN state='running' THEN active_started_at_ms END, turns FROM proofs
+            "SELECT vid, kind, state, delayed_until_ms, delayed_reason, output, spec, effective_system_prompt, model, agent, agent_session_id, tokens_in, tokens_out, cost_usd, env_overrides, env_out_of_date, cache_creation_tokens, cache_read_tokens, cost_is_estimated, maximum_tool_output_tokens, compaction_input_tokens, compaction_count, completed_active_duration_ms, CASE WHEN state='running' THEN active_started_at_ms END, turns, shell FROM proofs
              WHERE squad_id=? AND task_idx=? AND scope=? AND cell_idx=? ORDER BY idx",
         )?;
         let rows = stmt
@@ -6894,6 +6930,8 @@ impl Store {
                     delayed_reason: r.get::<_, Option<String>>(4)?,
                     output: r.get::<_, Option<String>>(5)?,
                     spec: r.get::<_, String>(6)?,
+                    shell: r.get::<_, Option<String>>(25)?,
+                    effective_shell: None,
                     system_prompt: r.get::<_, Option<String>>(7)?,
                     model: r.get::<_, Option<String>>(8)?,
                     agent,
@@ -8346,6 +8384,36 @@ pub(crate) fn fallback_project_identifier(cwd: Option<&str>) -> String {
         .unwrap_or_else(|| "unassigned".to_string())
 }
 
+/// [`crate::config::effective_command_shell`] for `cwd`, read from disk once
+/// per distinct `cwd` while one squad view is built.
+fn cached_effective_shell(
+    cwd: Option<&str>,
+    cache: &mut HashMap<Option<String>, String>,
+) -> String {
+    cache
+        .entry(cwd.map(str::to_string))
+        .or_insert_with(|| {
+            crate::config::effective_command_shell(std::path::Path::new(cwd.unwrap_or("")))
+        })
+        .clone()
+}
+
+/// Set a `command` proof step's [`ProofView::effective_shell`]; a `prompt`
+/// step has none.
+fn fill_proof_effective_shell(
+    step: &mut ProofView,
+    cwd: Option<&str>,
+    cache: &mut HashMap<Option<String>, String>,
+) {
+    if step.kind == "command" {
+        step.effective_shell = Some(
+            step.shell
+                .clone()
+                .unwrap_or_else(|| cached_effective_shell(cwd, cache)),
+        );
+    }
+}
+
 /// Resolve an effective timeout in seconds from a step-level and a task-level
 /// value in minutes (step wins; task is the default). `None` means no limit.
 fn resolve_timeout_sec(step_min: Option<u32>, task_min: Option<u32>) -> Option<i64> {
@@ -8613,6 +8681,11 @@ pub struct CellEdit<'a> {
     pub prompt: Option<Option<&'a str>>,
     /// Shell command.
     pub command: Option<Option<&'a str>>,
+    /// Shell a `command` cell runs under; `Some(None)` clears it back to the
+    /// project/platform default. The caller rejects setting it on a prompt
+    /// cell; switching the cell to a prompt (`command` cleared) nulls the
+    /// stored shell in the same write.
+    pub shell: Option<Option<&'a str>>,
     /// Per-cell auto-compact trigger, in tokens (RAL-304).
     pub auto_compact_threshold: Option<Option<i64>>,
     /// Per-cell context-window token limit (RAL-304). The caller
@@ -8675,6 +8748,11 @@ pub struct ProofEdit<'a> {
     /// of the two (see `core::validate`'s one-of rule). `None` leaves
     /// `kind`/`spec` untouched.
     pub body: Option<ProofBody<'a>>,
+    /// Shell a `command` step runs under; `Some(None)` clears it back to the
+    /// project/platform default. The caller rejects setting it on a prompt
+    /// step; switching the step to a prompt `body` nulls the stored shell in
+    /// the same write.
+    pub shell: Option<Option<&'a str>>,
     /// Per-step cap on a single tool-call output, in tokens (RAL-333).
     /// Gated on the step's own `agent` by the caller, the same way
     /// [`CellEdit::maximum_tool_output_tokens`] is gated on the cell's.
@@ -9629,6 +9707,9 @@ impl Store {
         let model_value = edit.model.flatten();
         let maximum_tool_output_tokens_touched = edit.maximum_tool_output_tokens.is_some();
         let maximum_tool_output_tokens_value = edit.maximum_tool_output_tokens.flatten();
+        let shell_touched = edit.shell.is_some();
+        let shell_value = edit.shell.flatten();
+        let to_prompt = matches!(edit.body, Some(ProofBody::Prompt(_)));
         // Whichever of command/prompt the caller supplied (if any)
         // replaces `kind`/`spec` outright -- mirrors `insert_proof`'s
         // derivation, including recomputing `effective_system_prompt` only
@@ -9647,9 +9728,13 @@ impl Store {
                 kind = CASE WHEN :body_touched THEN :kind ELSE kind END,
                 spec = CASE WHEN :body_touched THEN :spec ELSE spec END,
                 effective_system_prompt = CASE WHEN :body_touched THEN :effective_system_prompt ELSE effective_system_prompt END,
-                maximum_tool_output_tokens = CASE WHEN :maximum_tool_output_tokens_touched THEN :maximum_tool_output_tokens ELSE maximum_tool_output_tokens END
+                maximum_tool_output_tokens = CASE WHEN :maximum_tool_output_tokens_touched THEN :maximum_tool_output_tokens ELSE maximum_tool_output_tokens END,
+                shell = CASE WHEN :to_prompt THEN NULL WHEN :shell_touched THEN :shell ELSE shell END
              WHERE squad_id=:squad_id AND task_idx=:task_idx AND scope=:scope AND cell_idx=:cell_idx AND idx=:idx",
             named_params! {
+                ":shell_touched": shell_touched,
+                ":shell": shell_value,
+                ":to_prompt": to_prompt,
                 ":agent_touched": agent_touched,
                 ":agent": edit.agent,
                 ":model_touched": model_touched,
@@ -9736,6 +9821,9 @@ impl Store {
         let prompt_value = edit.prompt.flatten();
         let command_touched = edit.command.is_some();
         let command_value = edit.command.flatten();
+        let shell_touched = edit.shell.is_some();
+        let shell_value = edit.shell.flatten();
+        let to_prompt = command_touched && command_value.is_none();
         let auto_compact_threshold_touched = edit.auto_compact_threshold.is_some();
         let auto_compact_threshold_value = edit.auto_compact_threshold.flatten();
         let maximum_context_touched = edit.maximum_context.is_some();
@@ -9771,9 +9859,13 @@ impl Store {
                 maximum_context = CASE WHEN :maximum_context_touched THEN :maximum_context ELSE maximum_context END,
                 maximum_tool_output_tokens = CASE WHEN :maximum_tool_output_tokens_touched THEN :maximum_tool_output_tokens ELSE maximum_tool_output_tokens END,
                 effort = CASE WHEN :effort_touched THEN :effort ELSE effort END,
-                temperature = CASE WHEN :temperature_touched THEN :temperature ELSE temperature END
+                temperature = CASE WHEN :temperature_touched THEN :temperature ELSE temperature END,
+                shell = CASE WHEN :to_prompt THEN NULL WHEN :shell_touched THEN :shell ELSE shell END
              WHERE squad_id=:squad_id AND task_idx=:task_idx AND idx=:idx",
             named_params! {
+                ":shell_touched": shell_touched,
+                ":shell": shell_value,
+                ":to_prompt": to_prompt,
                 ":cwd_touched": cwd_touched,
                 ":cwd": cwd_value,
                 ":agent_touched": agent_touched,

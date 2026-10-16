@@ -58,6 +58,7 @@ pub fn execute(cmd: ProofCommand, client: &DaemonClient) -> ExecResult {
             model,
             command,
             prompt,
+            shell,
             maximum_tool_output_tokens,
         } => {
             let resolved = proof::resolve_scoped(client, &selector, "proof")?;
@@ -71,6 +72,7 @@ pub fn execute(cmd: ProofCommand, client: &DaemonClient) -> ExecResult {
                 model.as_deref(),
                 command.as_deref(),
                 prompt.as_deref(),
+                shell.as_deref(),
                 maximum_tool_output_tokens.as_deref(),
             )?)
         }

@@ -28,6 +28,7 @@ pub enum ProofCommand {
         model: Option<String>,
         command: Option<String>,
         prompt: Option<String>,
+        shell: Option<String>,
         maximum_tool_output_tokens: Option<String>,
     },
     /// RAL-324: read-only listing of this proof step's resolved environment.
@@ -60,6 +61,7 @@ pub fn parse(args: &[String]) -> ProofCommand {
             let model = scanner.take_value("--model").ok().flatten();
             let command = scanner.take_value("--command").ok().flatten();
             let prompt = scanner.take_value("--prompt").ok().flatten();
+            let shell = scanner.take_value("--shell").ok().flatten();
             let maximum_tool_output_tokens = scanner
                 .take_value("--maximum-tool-output-tokens")
                 .ok()
@@ -70,6 +72,7 @@ pub fn parse(args: &[String]) -> ProofCommand {
                 model,
                 command,
                 prompt,
+                shell,
                 maximum_tool_output_tokens,
             })
         }
@@ -191,6 +194,7 @@ pub fn dispatch(cmd: ProofCommand, opts: &GlobalOpts) -> i32 {
             model,
             command,
             prompt,
+            shell,
             maximum_tool_output_tokens,
         } => run_and_report(opts, None, || {
             let resolved = resolve_scoped(&client, &selector, "proof")?;
@@ -204,6 +208,7 @@ pub fn dispatch(cmd: ProofCommand, opts: &GlobalOpts) -> i32 {
                 model.as_deref(),
                 command.as_deref(),
                 prompt.as_deref(),
+                shell.as_deref(),
                 maximum_tool_output_tokens.as_deref(),
             )?;
             emit(opts, &result, |_| println!("{selector} updated"));
@@ -323,6 +328,7 @@ mod tests {
                 command,
                 prompt,
                 maximum_tool_output_tokens,
+                shell: _,
             } => {
                 assert_eq!(selector, "squad-1/build/proof/0");
                 assert_eq!(agent, None);
@@ -332,6 +338,16 @@ mod tests {
                 assert_eq!(maximum_tool_output_tokens, None);
             }
             other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_edit_with_shell_and_empty_shell_clears() {
+        for (given, want) in [("pwsh", "pwsh"), ("", "")] {
+            match parse(&v(&["edit", "squad-1/build/proof/0", "--shell", given])) {
+                ProofCommand::Edit { shell, .. } => assert_eq!(shell.as_deref(), Some(want)),
+                other => panic!("unexpected: {other:?}"),
+            }
         }
     }
 

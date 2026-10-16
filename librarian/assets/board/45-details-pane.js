@@ -919,7 +919,10 @@
           <div class="kv-row"><span class="k">result</span><span class="v">${logBtn}</span></div>
           ${maximumToolOutputTokensRow(v)}
           ${appraisalDetailHtml(v)}
+          ${v.kind === "command" ? `<div class="kv-row" data-tip="The shell that runs this proof step's command: the declared shell, else the configured default, else cmd on Windows / sh elsewhere."><span class="k">shell</span><span class="v mono">${esc(v.effective_shell || v.shell || "—")}${v.shell ? "" : " (default)"}</span></div>` : ""}
           ${specSection}${systemPromptSection}${terminalBtns}
+          ${v.kind === "command" ? `<div class="btn-row"><button class="btn primary" onclick="startEdit()" data-tip="Edit this proof step's shell.
+Saving restarts the proof step and the rest of its list; an unchanged value restarts nothing.">✎ Edit</button></div>` : ""}
           ${envSection}`;
       }
 
@@ -1174,6 +1177,7 @@
           ${maximumToolOutputTokensRow(s)}
           <h3 class="section">${s.command ? "command" : "prompt"}</h3>
           ${s.command ? cmdBox(s.command) : promptBox(s.prompt || "—", `prompt-box-${sel.taskIdx}-${sel.cellIdx}`)}
+          ${s.command ? `<div class="kv-row" data-tip="The shell that runs this cell's command: the declared shell, else the configured default, else cmd on Windows / sh elsewhere."><span class="k">shell</span><span class="v mono">${esc(s.effective_shell || s.shell || "—")}${s.shell ? "" : " (default)"}</span></div>` : ""}
           ${systemPromptSection}
           ${initRow}
           ${inReviews}
@@ -1477,6 +1481,30 @@ On failure no agent starts; fix it with Edit, then Retry the squad.">Worktree in
       // Knip reference: used as an onchange callback string in renderAgentSelectHtml
       void onCellEditAgentChange;
       /**
+       * Finds a proof step by position; `cellIdx === -1` addresses the task's own proof list.
+       * @param {SquadView} r
+       * @param {number} ti
+       * @param {number} si
+       * @param {number} vi
+       * @returns {ProofView|undefined}
+       */
+      function proofAt(r, ti, si, vi) {
+        const t = r.tasks[ti];
+        if (!t) return undefined;
+        return si === -1 ? (t.proof || [])[vi] : ((t.cells || [])[si] || /** @type {CellView} */ ({})).proof?.[vi];
+      }
+      /**
+       * The shell combo box shared by the cell and proof edit forms; blank means the default.
+       * @param {string} id
+       * @param {string} declared
+       * @param {string} effective
+       * @returns {string}
+       */
+      function shellFieldHtml(id, declared, effective) {
+        return `<label data-tip="The shell that runs the command. Pick one or type any shell name or path. Leave blank for the default${effective ? " (currently " + esc(effective) + ")" : ""}. A shell that is not installed fails the step.">shell<input id="${id}" list="${id}-options" value="${esc(declared)}" placeholder="${esc(effective ? "default: " + effective : "(platform default)")}">
+          <datalist id="${id}-options">${NT_SHELL_CHOICES.map((sh) => `<option value="${sh}"></option>`).join("")}</datalist></label>`;
+      }
+      /**
        * Renders the edit form for the current selection (squad label, task fields, or cell fields).
        * @param {SquadView} r
        * @returns {string}
@@ -1499,6 +1527,11 @@ On failure no agent starts; fix it with Edit, then Retry the squad.">Worktree in
           fields = `<label>name<input id="e-name" value="${esc(t.name)}"></label>
             <label>project<input id="e-project" value="${esc(t.project)}"></label>`;
           envSection = taskEnvOverridesSection(r, sel.taskIdx, t) + taskProofEnvOverridesSection(r, sel.taskIdx, t);
+        } else if (sel.kind === "proof") {
+          const v = proofAt(r, sel.taskIdx, sel.cellIdx, sel.proofIdx ?? -1);
+          fields = v && v.kind === "command"
+            ? shellFieldHtml("e-shell", v.shell || "", v.effective_shell || "")
+            : `<div class="empty">Only a command proof step has editable fields here.</div>`;
         } else {
           const s = r.tasks[sel.taskIdx].cells[sel.cellIdx];
           const isCmd = !!s.command;
@@ -1517,6 +1550,7 @@ It is held back rather than shown blank, so saving cannot overwrite it with an e
             </div>
             <div id="command-fields"${isCmd ? "" : ' class="hidden"'}>
               <label>command<textarea id="e-command" rows="5">${esc(s.command || "")}</textarea></label>
+              ${shellFieldHtml("e-shell", s.shell || "", s.effective_shell || "")}
             </div>
             <label data-tip="Commands run once, in order, in this cell's freshly created worktree (one per line; blank clears an inherited value). The first failure stops the list and fails the cell. Must be idempotent. Applies to every cell sharing this worktree.">worktree init<textarea id="e-init" rows="3">${esc(s.worktree_init ? s.worktree_init.commands.join("\n") : "")}</textarea></label>
             <label data-tip="Seconds allowed for the whole worktree init list (must be > 0). Blank keeps the current value.">worktree init timeout (s)<input id="e-init-timeout" value=""></label>`;
@@ -1538,6 +1572,9 @@ It is held back rather than shown blank, so saving cannot overwrite it with an e
        * @property {string} [project]
        * @property {string} [cwd]
        * @property {string} [command]
+       * @property {string} [shell]
+       * @property {string} [proof_scope]
+       * @property {number} [proof_idx]
        * @property {string} [agent]
        * @property {string} [model]
        * @property {string} [effort]
@@ -1562,7 +1599,21 @@ It is held back rather than shown blank, so saving cannot overwrite it with an e
           const el = /** @type {{value?: string}|null} */ (document.getElementById(id));
           return (el && el.value) || "";
         };
+        /**
+         * Sets `body.shell` only when the field differs from the stored shell; blank clears.
+         * @param {string|undefined} before
+         * @returns {void}
+         */
+        const setShell = (before) => { if (val("e-shell").trim() !== (before || "")) body.shell = val("e-shell").trim(); };
         if (sel.kind === "squad") body.label = val("e-label");
+        else if (sel.kind === "proof") {
+          body.proof_scope = sel.cellIdx === -1 ? "task" : "cell";
+          body.proof_idx = sel.proofIdx ?? 0;
+          if (sel.cellIdx === -1) body.cell_idx = 0;
+          const v0 = proofAt(r, sel.taskIdx, sel.cellIdx, sel.proofIdx ?? -1);
+          if (!v0 || v0.kind !== "command") { editing = false; renderDetails(); return; }
+          setShell(v0.shell);
+        }
         else if (sel.kind === "task") { body.name = val("e-name"); body.project = val("e-project"); }
         else {
           body.cwd = val("e-cwd");
@@ -1577,6 +1628,7 @@ It is held back rather than shown blank, so saving cannot overwrite it with an e
           // the cell's pre-existing kind.
           if (val("e-mode") === "command") {
             body.command = val("e-command");
+            setShell(s0.shell);
           } else {
             body.agent = val("e-agent"); body.model = val("e-model");
             // Blank clears the field; the daemon treats an unchanged value as a no-op.

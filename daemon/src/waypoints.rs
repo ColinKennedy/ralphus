@@ -9783,6 +9783,7 @@ mod tests {
             model: None,
             prompt: None,
             command: None,
+            shell: None,
             auto_compact_threshold: None,
             maximum_context: None,
             maximum_tool_output_tokens: None,
@@ -10007,6 +10008,7 @@ mod tests {
                     agent: None,
                     model: None,
                     body: Some(crate::store::ProofBody::Prompt("check it more carefully")),
+                    shell: None,
                     maximum_tool_output_tokens: None,
                 },
             )
