@@ -21255,8 +21255,8 @@ mod tests {
         store
             .conn
             .execute(
-                "INSERT INTO guardians(id, name, base_branch, git_root, status, created_at_ms, updated_at_ms, project)
-                 VALUES (?,'the review','main',?,'in_review',0,0,?)",
+                "INSERT INTO guardians(id, name, base_branch, git_root, status, created_at_ms, updated_at_ms, project, upstream_remote, upstream_branch)
+                 VALUES (?,'the review','main',?,'in_review',0,0,?,'origin','main')",
                 rusqlite::params![id, root.to_string_lossy(), project],
             )
             .unwrap();

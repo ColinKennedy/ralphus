@@ -841,8 +841,8 @@ mod tests {
         let store = Store::open_in_memory().unwrap();
         let root = temp_dir();
         store.conn.execute(
-            "INSERT INTO guardians(id, name, base_branch, git_root, status, created_at_ms, updated_at_ms)
-             VALUES('guardian-1', 'old open', 'main', ?1, 'in_review', 0, 0)",
+            "INSERT INTO guardians(id, name, base_branch, git_root, status, created_at_ms, updated_at_ms, upstream_remote, upstream_branch)
+             VALUES('guardian-1', 'old open', 'main', ?1, 'in_review', 0, 0, 'origin', 'main')",
             params![root.to_string_lossy()],
         ).unwrap();
         let cfg = ArkConfig {

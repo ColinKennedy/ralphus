@@ -867,8 +867,8 @@ mod tests {
         store
             .conn
             .execute(
-                "INSERT INTO guardians(id, name, base_branch, git_root, status, resolver_agent, created_at_ms, updated_at_ms)
-                 VALUES('g1', 'g', 'main', '/tmp/repo', 'Collecting', 'resolver-agent', 0, 0)",
+                "INSERT INTO guardians(id, name, base_branch, git_root, status, resolver_agent, created_at_ms, updated_at_ms, upstream_remote, upstream_branch)
+                 VALUES('g1', 'g', 'main', '/tmp/repo', 'Collecting', 'resolver-agent', 0, 0, 'origin', 'main')",
                 [],
             )
             .unwrap();

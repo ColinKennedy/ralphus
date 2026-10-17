@@ -5770,7 +5770,7 @@ mod tests {
         store
             .conn
             .execute(
-                "INSERT INTO guardians(id, name, base_branch, git_root, status, created_at_ms, updated_at_ms) VALUES(?,?,?,?,'collecting',?,?)",
+                "INSERT INTO guardians(id, name, base_branch, git_root, status, created_at_ms, updated_at_ms, upstream_remote, upstream_branch) VALUES(?,?,?,?,'collecting',?,?,'origin','main')",
                 params![id, "review", "main", "/tmp/repo", now, now],
             )
             .unwrap();
@@ -6765,7 +6765,7 @@ mod tests {
         store
             .conn
             .execute(
-                "INSERT INTO guardians(id, name, base_branch, git_root, status, created_at_ms, updated_at_ms) VALUES(?,?,?,?,?,?,?)",
+                "INSERT INTO guardians(id, name, base_branch, git_root, status, created_at_ms, updated_at_ms, upstream_remote, upstream_branch) VALUES(?,?,?,?,?,?,?,'origin','main')",
                 params![id, "review", "main", "/tmp/repo", status, now, now],
             )
             .unwrap();
@@ -7562,8 +7562,8 @@ mod tests {
         store
             .conn
             .execute(
-                "INSERT INTO guardians(id, name, base_branch, git_root, status, created_at_ms, updated_at_ms, squad_id)
-                 VALUES ('guardian-new','g','main','/repo','collecting',0,0,'squad-new')",
+                "INSERT INTO guardians(id, name, base_branch, git_root, status, created_at_ms, updated_at_ms, squad_id, upstream_remote, upstream_branch)
+                 VALUES ('guardian-new','g','main','/repo','collecting',0,0,'squad-new','origin','main')",
                 [],
             )
             .unwrap();
@@ -7589,8 +7589,8 @@ mod tests {
         store
             .conn
             .execute(
-                "INSERT INTO guardians(id, name, base_branch, git_root, status, created_at_ms, updated_at_ms, squad_id)
-                 VALUES (?,'g','main','/repo','collecting',0,0,?)",
+                "INSERT INTO guardians(id, name, base_branch, git_root, status, created_at_ms, updated_at_ms, squad_id, upstream_remote, upstream_branch)
+                 VALUES (?,'g','main','/repo','collecting',0,0,?,'origin','main')",
                 params![guardian, squad],
             )
             .unwrap();

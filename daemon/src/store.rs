@@ -14509,8 +14509,8 @@ prompt = "legacy cell, no review_guardian_id"
         )
         .expect("insert legacy proof row");
         conn.execute(
-            "INSERT INTO guardians (id, name, base_branch, manual_commands_claude_session_id)
-             VALUES ('g1', 'g', 'main', 'legacy-manual-sid')",
+            "INSERT INTO guardians (id, name, base_branch, manual_commands_claude_session_id, upstream_remote, upstream_branch)
+             VALUES ('g1', 'g', 'main', 'legacy-manual-sid', 'origin', 'main')",
             [],
         )
         .expect("insert legacy guardian row");
