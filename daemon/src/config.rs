@@ -336,6 +336,12 @@ pub struct ReviewConfig {
     /// campaign. `None` resolves to [`DEFAULT_AUTO_FIX_MAX_ATTEMPTS`].
     #[serde(default)]
     pub auto_fix_max_attempts: Option<u32>,
+    /// RAL-678: how many auto-fix attempts one continuously failing PR/MR CI
+    /// campaign may have refunded on weak, count-only log evidence. `None`
+    /// resolves to [`DEFAULT_AUTO_FIX_WEAK_PROGRESS_REFUNDS`]; `0` disables
+    /// weak-evidence refunds. Named-test transitions are never limited by it.
+    #[serde(default)]
+    pub auto_fix_weak_progress_refunds: Option<u32>,
     /// Initial delay, in seconds, before retrying an unattended PR/MR CI
     /// fix. Each later retry doubles this delay. `None` resolves to
     /// [`DEFAULT_AUTO_FIX_RETRY_BASE_SECONDS`].
@@ -472,6 +478,9 @@ pub fn auto_fix_prompt_template(custom: Option<&str>, discourage_tests: bool) ->
 
 /// Default ceiling for an unattended PR/MR CI-fix campaign.
 pub const DEFAULT_AUTO_FIX_MAX_ATTEMPTS: u32 = 3;
+
+/// Default for `[review] auto_fix_weak_progress_refunds` (RAL-678).
+pub const DEFAULT_AUTO_FIX_WEAK_PROGRESS_REFUNDS: u32 = 2;
 /// Default first retry delay for an unattended PR/MR CI-fix campaign.
 pub const DEFAULT_AUTO_FIX_RETRY_BASE_SECONDS: u64 = 60;
 
@@ -736,6 +745,13 @@ impl ReviewConfig {
             .unwrap_or(DEFAULT_AUTO_FIX_MAX_ATTEMPTS)
     }
 
+    /// Refunds one CI-fix campaign may earn from count-only log evidence.
+    #[must_use]
+    pub fn auto_fix_weak_progress_refunds(&self) -> u32 {
+        self.auto_fix_weak_progress_refunds
+            .unwrap_or(DEFAULT_AUTO_FIX_WEAK_PROGRESS_REFUNDS)
+    }
+
     /// Initial unattended CI-fix retry delay in seconds.
     #[must_use]
     pub fn auto_fix_retry_base_seconds(&self) -> u64 {
@@ -878,6 +894,9 @@ impl ReviewConfig {
                 .auto_fix_prompt_template
                 .or(self.auto_fix_prompt_template),
             auto_fix_max_attempts: over.auto_fix_max_attempts.or(self.auto_fix_max_attempts),
+            auto_fix_weak_progress_refunds: over
+                .auto_fix_weak_progress_refunds
+                .or(self.auto_fix_weak_progress_refunds),
             auto_fix_retry_base_seconds: over
                 .auto_fix_retry_base_seconds
                 .or(self.auto_fix_retry_base_seconds),

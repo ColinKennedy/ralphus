@@ -25,6 +25,7 @@ pub mod cell_session;
 pub mod channel;
 pub mod chat_client;
 pub mod checkout_hold;
+pub mod ci_progress;
 pub mod ci_watch;
 pub mod config;
 pub mod cpu_stall;

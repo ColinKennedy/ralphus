@@ -3337,7 +3337,10 @@ backoff in `.ralphus.toml`:
 [review]
 auto_fix_max_attempts = 3
 auto_fix_retry_base_seconds = 60
+auto_fix_weak_progress_refunds = 2
 ```
+
+A failed attempt is refunded (RAL-578, RAL-678) when a newly settled CI generation shows real progress: the failing check set strictly shrank, or the failing check's log shows a test that failed in the previous generation now passing (a named transition, same check and same parser; pytest and nextest logs are recognised), or the log's completed-test count rose above that check's high-water mark in a suite whose announced total is unchanged. Only that last, weaker kind of evidence draws on `auto_fix_weak_progress_refunds` (default 2; `0` disables it); its usage resets when CI passes or the PR's auto-fix budget is reset. Logs are fetched once per settled generation (GitHub through the Actions job-log REST endpoint, GitLab from the job trace), kept in the worktree's git dir (newest two per check), and every evaluated generation emits one `auto_fix_refunded` or `auto_fix_refund_denied` Cartographer event naming the rule, parser, evidence level, rejection reason and the retained log files. A log that cannot be fetched, kept or parsed never earns a refund.
 
 PR responses also include `auto_fix_last_outcome` (RAL-509): the reason
 unattended auto-fix did or did not act on the most recent CI failure it saw
