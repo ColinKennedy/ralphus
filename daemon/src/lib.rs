@@ -76,6 +76,7 @@ pub mod remote_failure;
 pub mod remote_runner;
 pub mod resources;
 pub mod review_branch;
+pub mod review_notes;
 pub mod reviews;
 pub mod runner;
 pub mod scheduler;

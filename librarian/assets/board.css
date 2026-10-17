@@ -593,6 +593,17 @@
       .fb-msg.you .fb-expand { border-color: rgba(255,255,255,.4); color: rgba(255,255,255,.9); }
       .fb-msg.you .fb-expand:hover { background: rgba(255,255,255,.18); }
       .fb-msg.resolver .fb-expand:hover { border-color: var(--accent); color: var(--accent); }
+      /* Notes tab: a card per note; its `.fb-expand` anchors to the card's top-right. */
+      .note-card { position: relative; background: var(--panel-2); border: 1px solid var(--border-soft); border-radius: 10px; padding: 8px 11px; margin-bottom: 10px; }
+      .note-card:hover .fb-expand, .note-card .fb-expand:hover { border-color: var(--accent); color: var(--accent); }
+      .note-collapsed { display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; }
+      .notes-bar { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; }
+      .note-badge {
+        font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: .6px;
+        border-radius: 20px; padding: 1px 8px; border: 1px solid var(--border); color: var(--muted);
+      }
+      .note-badge-appraisal { background: var(--accent-a); border-color: var(--accent-b); color: var(--accent); }
+      .note-badge-live_action { background: var(--amber-a); border-color: var(--amber-b); color: var(--ignored); }
       .fb-foot {
         display: flex; align-items: center; gap: 8px; margin-top: 8px; padding-top: 7px;
         border-top: 1px solid var(--border-soft); font-size: 10.5px; color: var(--faint);

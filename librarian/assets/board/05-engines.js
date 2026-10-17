@@ -279,7 +279,8 @@
       CLICK_HANDLERS.sendBranchFeedback = (e, ds) => sendBranchFeedback(ds.guardianId || "", ds.branchId || "");
       CLICK_HANDLERS.openSectionEnv = (e, ds) => openSectionEnv(ds.guardianId || "", ds.kind || "");
       CLICK_HANDLERS.showChatCopyMenu = (e, ds) => showChatCopyMenu(e, ds.guardianId || "", ds.branchId || "");
-      CLICK_HANDLERS.toggleChatBubble = (e, ds) => { e.stopPropagation(); toggleChatBubble(ds.key || ""); };
+      CLICK_HANDLERS.toggleNote = (e, ds) => { e.stopPropagation(); toggleNote(ds.key || ""); };
+      CLICK_HANDLERS.toggleChatBubble =(e, ds) => { e.stopPropagation(); toggleChatBubble(ds.key || ""); };
       CLICK_HANDLERS.gotoSquad = (e, ds) => { e.preventDefault(); gotoSquad(ds.squadId || ""); };
       CLICK_HANDLERS.selectProjectTab = (e, ds) => selectProjectTab(ds.guardianId || "", ds.project || "");
       CLICK_HANDLERS.saveReorder = (e, ds) => saveReorder(ds.guardianId || "");

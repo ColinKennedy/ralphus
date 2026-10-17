@@ -47,12 +47,27 @@
        * @property {string|null} pr_id
        */
       /**
-       * @typedef {AppraisalView & {label: string}} BranchAppraisal - RAL-588: one appraisal with the label of its proof step (its `id`, else `proof N`).
+       * @typedef {object} BranchNoteBase
+       * @property {string} id - Stable per note; keys its expanded state.
+       * @property {string} title - Proof step label, live action label, or "Ghost".
+       * @property {number} at_ms - When the note was recorded (live action: its latest run finished).
        */
       /**
-       * @typedef {object} BranchAppraisals
+       * @typedef {BranchNoteBase & AppraisalView & {type: "appraisal"}} AppraisalNote - RAL-670: an appraisal, titled with the label of its proof step (its `id`, else `proof N`).
+       */
+      /**
+       * @typedef {BranchNoteBase & {type: "live_action", prompt: string, verdict: string|null, verdict_summary: string|null, report: string|null}} LiveActionNote - RAL-670: a live action attributed to the branch, with its latest finished run's outcome (all null before one finishes).
+       */
+      /**
+       * @typedef {BranchNoteBase & {type: "ghost", owner_uri: string, content: string}} GhostNote - RAL-670: the branch's latest ghost handoff.
+       */
+      /**
+       * @typedef {AppraisalNote|LiveActionNote|GhostNote} BranchNote
+       */
+      /**
+       * @typedef {object} BranchNotes
        * @property {boolean} post_appraisals - The review's effective posting setting; false means the PR omits appraisals on purpose.
-       * @property {BranchAppraisal[]} appraisals - Latest attempt of every scored proof of this branch's cells, published or not.
+       * @property {BranchNote[]} notes - Newest first.
        */
       /**
        * @typedef {object} ProofView
