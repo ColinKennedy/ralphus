@@ -19378,6 +19378,12 @@ fn guardian_link_cell(daemon: &Daemon, id: &str, branch_id: &str, body: &str) ->
     {
         return store_error(&e);
     }
+    crate::scheduler::start_review_if_bottom_ready(
+        &daemon.store_handle(),
+        id,
+        &daemon.sem,
+        &daemon.cancellations,
+    );
     match daemon.lock().get_guardian(id) {
         Ok(g) => json(200, &g),
         Err(e) => store_error(&e),
@@ -29572,6 +29578,12 @@ remediation_attempts = 1
         let before_json: serde_json::Value = serde_json::from_str(&guardian_before.body).unwrap();
         let branch_id = before_json["branches"][0]["id"].as_str().unwrap();
 
+        // Keep the claimed merge at the semaphore so this test can observe
+        // the kickoff without running git against the fixture's fake root.
+        for _ in 0..d.max_concurrent {
+            std::mem::forget(d.sem.acquire());
+        }
+
         let link_body =
             serde_json::json!({"squad_id": squad_id, "task_idx": 0, "idx": 0}).to_string();
         let r = route(
@@ -29583,6 +29595,16 @@ remediation_attempts = 1
         assert_eq!(r.status, 200, "{}", r.body);
         let g: serde_json::Value = serde_json::from_str(&r.body).unwrap();
         assert_eq!(g["branches"][0]["merge_status"], "ready");
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            let status = d.lock().get_guardian(gid).unwrap().status;
+            if status == "merging" {
+                break;
+            }
+            assert!(Instant::now() < deadline, "ready review was not started");
+            std::thread::sleep(Duration::from_millis(2));
+        }
 
         let squad_view = route(&d, "GET", &format!("/api/squads/{squad_id}"), "");
         let squad_json: serde_json::Value = serde_json::from_str(&squad_view.body).unwrap();

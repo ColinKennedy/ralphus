@@ -106,6 +106,11 @@ tag = "review-base-update-required"
 id = "ralphus-daemon::guardian_merge required_mode_rebuilds_when_the_shift_conflicts"
 tag = "review-base-update-required-conflict"
 
+# Manual review creation: linking a completed cell starts its ready stack.
+[[test]]
+id = "ralphus-daemon server::tests::guardian_link_cell_route_links_and_promotes_when_cell_already_done"
+tag = "review-link-start"
+
 [[test]]
 id = "ralphus-daemon::guardian_merge explicit_never_and_always_modes_keep_their_behavior"
 tag = "review-base-update-modes"
