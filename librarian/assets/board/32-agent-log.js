@@ -269,9 +269,7 @@
       function redactAgentLogEntry(e, redact) {
         e.input = redact(e.input);
         e.output = redact(e.output);
-        for (const arg of e.args) {
-          arg.value = redact(`${arg.key}=x`) !== `${arg.key}=x` ? "[REDACTED]" : redact(arg.value);
-        }
+        agentLogRedactArgs(e, redact);
       }
       // RALPHUS-AGENT-LOG:END
 

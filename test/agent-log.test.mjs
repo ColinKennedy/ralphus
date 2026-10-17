@@ -66,7 +66,6 @@ test("preview skips leading cd but expanded input keeps it", () => {
   const other = parseAgentLog("[tool.Read] Read(path=a)")[0];
   assert.equal(agentLogPreview(other), "a");
 });
-});
 
 test("structured records merge call and result by tool-use id", () => {
   const rec = (o) => `RALPHUS_TOOL: ${JSON.stringify(o)}`;
