@@ -8558,6 +8558,37 @@ mod tests {
     }
 
     #[test]
+    fn check_pr_ci_status_cancelled_check_does_not_hide_a_genuine_failure() {
+        let mock = MockForge::start(move |server| {
+            let req = server.recv();
+            req.respond(
+                tiny_http::Response::from_string(
+                    r#"{"mergeable_state": "clean", "head": {"sha": "deadbeef"}}"#,
+                )
+                .with_status_code(200),
+            )
+            .unwrap();
+            let req = server.recv();
+            req.respond(
+                tiny_http::Response::from_string(
+                    r#"{"check_runs": [
+                        {"id": 1, "name": "scope", "app": {"id": 15368}, "details_url": "https://github.com/a/b/actions/runs/100/job/1", "status": "completed", "conclusion": "cancelled"},
+                        {"id": 2, "name": "lint", "app": {"id": 15368}, "details_url": "https://github.com/a/b/actions/runs/100/job/2", "status": "completed", "conclusion": "failure"}
+                    ]}"#,
+                )
+                .with_status_code(200),
+            )
+            .unwrap();
+        });
+        let client = mock.client(ForgeKind::GitHub, "acme/widget");
+        match client.check_pr_ci_status(4).unwrap() {
+            PrCiState::Failing(f) => assert_eq!(f.checks.len(), 1),
+            other => panic!("expected Failing, got {other:?}"),
+        }
+        mock.finish();
+    }
+
+    #[test]
     fn check_pr_ci_status_still_fails_when_the_newest_run_of_a_check_failed() {
         let mock = MockForge::start(move |server| {
             let req = server.recv();
