@@ -2725,6 +2725,44 @@ impl Store {
             );
             CREATE INDEX IF NOT EXISTS idx_guardian_live_runs_guardian
                 ON guardian_live_runs(guardian_id, state);
+            -- What a live run sent and concluded (RAL-672): the exact prompt
+            -- and system prompt handed to the runner, the structured verdict
+            -- the agent proposed, the recorded-command recipe, the branches
+            -- the run is attributed to (frozen when the run is queued) and
+            -- where its commits were integrated. A separate table so a run
+            -- row keeps its shape.
+            CREATE TABLE IF NOT EXISTS guardian_live_run_evidence (
+                run_id                TEXT PRIMARY KEY
+                    REFERENCES guardian_live_runs(run_id) ON DELETE CASCADE,
+                sent_prompt           TEXT,
+                sent_system_prompt    TEXT,
+                verdict               TEXT,
+                verdict_summary       TEXT,
+                fix_attempted         INTEGER,
+                fix_confirmed         INTEGER,
+                recipe                TEXT,
+                branch_ids            TEXT,
+                integration_branch_id TEXT,
+                integration_pushed    INTEGER
+            );
+            -- Branch attribution of a live action, resolved from its source
+            -- cells when the action is created and never recomputed.
+            CREATE TABLE IF NOT EXISTS guardian_live_action_branches (
+                guardian_id TEXT NOT NULL REFERENCES guardians(id) ON DELETE CASCADE,
+                action_idx  INTEGER NOT NULL,
+                branch_id   TEXT NOT NULL,
+                PRIMARY KEY (guardian_id, action_idx, branch_id)
+            );
+            -- A PR whose `## Live-Test Results` section needs re-rendering.
+            -- A row lives until the forge accepts the update.
+            CREATE TABLE IF NOT EXISTS pr_live_result_refresh (
+                pr_id           TEXT PRIMARY KEY,
+                guardian_id     TEXT NOT NULL,
+                requested_at_ms INTEGER NOT NULL,
+                attempts        INTEGER NOT NULL DEFAULT 0,
+                next_attempt_at_ms INTEGER NOT NULL,
+                last_error      TEXT
+            );
             -- Prophecy subsystem (docs/prophecy-design.md): a durable,
             -- append-only record of what an agent learned while it worked.
             -- Unlike ghosts, this is NOT one row per owner -- every write is

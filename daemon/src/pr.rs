@@ -461,6 +461,7 @@ impl Store {
                         existing_id
                     ],
                 )?;
+                let _ = self.request_live_refresh_for_pr(&existing_id, guardian_id);
                 return Ok(existing_id);
             }
         }
@@ -513,6 +514,9 @@ impl Store {
                     "pr_kind": pr_kind,
                 }),
             );
+        if pr_number.is_some() {
+            let _ = self.request_live_refresh_for_pr(&id, guardian_id);
+        }
         Ok(id)
     }
 
@@ -748,6 +752,9 @@ impl Store {
         let number_changed = new_pr_number != existing.pr_number;
         let alias_changed = new_alias != existing.branch_alias;
         let base_changed = new_base_ref != existing.base_ref;
+        if number_changed || state_changed {
+            let _ = self.request_live_refresh_for_pr(id, &existing.guardian_id);
+        }
         if state_changed || number_changed || alias_changed || base_changed {
             let mut changes = Vec::new();
             if state_changed {

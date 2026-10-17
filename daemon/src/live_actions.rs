@@ -77,7 +77,16 @@ program name (no `taskkill /IM python.exe`, `pkill python` or similar), which \
 would kill unrelated work on this machine.\n\
 \n\
 End your reply with a short report: what you tested, what you observed, what \
-you fixed (if anything), and anything still broken.";
+you fixed (if anything), and anything still broken.\n\
+\n\
+Then finish with ONE final line of the form `RALPHUS_LIVE_RESULT: ` followed by a \
+single-line JSON object: {\"verdict\": \"passed\" | \"failed\" | \"inconclusive\", \
+\"summary\": \"what you observed, in one sentence\", \"fix_attempted\": true | false, \
+\"fix_confirmed\": true | false, \"recipe\": [\"command\", ...]}. Use \"inconclusive\" \
+when you could not tell. `fix_confirmed` is true only if you re-ran the failing step \
+after your fix and saw it work. `recipe` lists the shell commands, copied exactly as \
+you ran them, that reproduce what you tested; ralphus keeps only commands it recorded \
+you running.";
 
 /// The read-only variant: the run's edits are never carried back.
 pub const LIVE_ACTION_READ_ONLY_SYSTEM_PROMPT: &str = "\
@@ -98,7 +107,15 @@ never by program name (no `taskkill /IM python.exe`, `pkill python` or \
 similar).\n\
 \n\
 End your reply with a short report: what you tested, what you observed, and \
-anything broken (with the exact error and where it comes from).";
+anything broken (with the exact error and where it comes from).\n\
+\n\
+Then finish with ONE final line of the form `RALPHUS_LIVE_RESULT: ` followed by a \
+single-line JSON object: {\"verdict\": \"passed\" | \"failed\" | \"inconclusive\", \
+\"summary\": \"what you observed, in one sentence\", \"fix_attempted\": false, \
+\"fix_confirmed\": false, \"recipe\": [\"command\", ...]}. Use \"inconclusive\" when \
+you could not tell. `recipe` lists the shell commands, copied exactly as you ran \
+them, that reproduce what you tested; ralphus keeps only commands it recorded you \
+running.";
 
 /// The marker a cell's agent writes a live handoff under.
 pub const LIVE_ACTION_MARKER: &str = "RALPHUS_LIVE_ACTION:";
@@ -492,6 +509,19 @@ impl crate::store::Store {
                     now
                 ],
             )?;
+            // Attribution is frozen here: later cell moves never rewrite it.
+            let idx = i64::try_from(idx).unwrap_or(i64::MAX);
+            for branch_id in crate::live_results::resolve_branch_ids(
+                &self.conn,
+                guardian_id,
+                &action.source_cells,
+            ) {
+                self.conn.execute(
+                    "INSERT OR IGNORE INTO guardian_live_action_branches
+                        (guardian_id, action_idx, branch_id) VALUES (?, ?, ?)",
+                    rusqlite::params![guardian_id, idx, branch_id],
+                )?;
+            }
         }
         Ok(true)
     }
@@ -578,7 +608,10 @@ pub fn parse_dedupe_answer(
             // The agent is shown 1-based numbers.
             let i = n.checked_sub(1)?;
             let handoff = handoffs.get(i)?;
-            covered[i] = true;
+            if std::mem::replace(&mut covered[i], true) {
+                // A handoff number may appear exactly once across the answer.
+                return None;
+            }
             if !sources.contains(&handoff.source_cell) {
                 sources.push(handoff.source_cell.clone());
             }
@@ -805,6 +838,14 @@ pub struct LiveRunOutcome {
     pub live_ref: Option<String>,
     /// The cell id the agent's session and transcript are keyed by.
     pub cell_id: String,
+    /// The exact prompt handed to the runner (`None` when the run never
+    /// reached the runner).
+    pub sent_prompt: Option<String>,
+    /// The exact system prompt handed to the runner.
+    pub sent_system_prompt: Option<String>,
+    /// The agent's full final reply, before marker lines are dropped from
+    /// `report`; the structured result line is parsed out of it.
+    pub raw_reply: String,
 }
 
 fn outcome(end: LiveRunEnd, cell_id: &str, error: Option<String>) -> LiveRunOutcome {
@@ -817,6 +858,9 @@ fn outcome(end: LiveRunEnd, cell_id: &str, error: Option<String>) -> LiveRunOutc
         commits: Vec::new(),
         live_ref: None,
         cell_id: cell_id.to_string(),
+        sent_prompt: None,
+        sent_system_prompt: None,
+        raw_reply: String::new(),
     }
 }
 
@@ -994,6 +1038,8 @@ pub fn execute_live_run(
         req.cwd
     );
 
+    let sent_prompt = spec.prompt.clone();
+    let sent_system_prompt = spec.system_prompt.clone();
     let result = crate::guardian_merge::run_agent_with_stall_recovery(
         store, &mut spec, runner, cancel, None,
     );
@@ -1012,6 +1058,9 @@ pub fn execute_live_run(
         result.error.clone(),
     );
     done.report = clean_report(&result.summary);
+    done.raw_reply.clone_from(&result.summary);
+    done.sent_prompt = sent_prompt;
+    done.sent_system_prompt = sent_system_prompt;
     done.cost_usd = result.cost_usd;
     done.base_tip.clone_from(&base_tip);
 
@@ -1485,6 +1534,13 @@ prompt = "second"
             r#"{"live_actions": [{"label": "x", "prompt": "a", "sources": [1, 2, 3]}]}"#,
             // Zero is not a description number.
             r#"{"live_actions": [{"label": "x", "prompt": "a", "sources": [0, 1, 2]}]}"#,
+            // Description 1 used twice in one entry.
+            r#"{"live_actions": [{"label": "x", "prompt": "a", "sources": [1, 1, 2]}]}"#,
+            // Description 1 used in two entries.
+            r#"{"live_actions": [{"label": "x", "prompt": "a", "sources": [1, 2]}, {"label": "y", "prompt": "b", "sources": [1]}]}"#,
+            // Empty prompt and empty source list.
+            r#"{"live_actions": [{"label": "x", "prompt": " ", "sources": [1, 2]}]}"#,
+            r#"{"live_actions": [{"label": "x", "prompt": "a", "sources": []}, {"label": "y", "prompt": "b", "sources": [1, 2]}]}"#,
         ] {
             assert!(parse_dedupe_answer(reply, &handoffs).is_none(), "{reply}");
         }

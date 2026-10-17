@@ -5377,3 +5377,33 @@ on its live ref, watchers notified with remediation), `skipped` (the review
 finished first) or `kept` (the review finished with the commits never carried).
 The live ref is deleted once patch-ids confirm the commits landed, and the daily
 worktree sweep retires the rest when the review finishes.
+
+*PR/MR descriptions (RAL-672).* A review's finished live runs are written into
+each open PR/MR description as one managed section between
+`<!-- ralphus:live-test-results:start -->` and `<!-- ralphus:live-test-results:end -->`,
+headed `## Live-Test Results`. The daemon reads the current description from the
+forge right before updating (GitHub `PATCH …/pulls/{n}` `body`, GitLab `PUT
+…/merge_requests/{iid}` `description`; only that field is sent, through the PR
+row's own forge and repo, fork-aware), replaces or appends the section and
+leaves all other text untouched; the local PR row's description is stored only
+after the forge accepts the update. Re-rendering unchanged data is byte-stable.
+Each entry shows the action label and run id, trigger and time, the verdict
+(`passed`, `failed` or `inconclusive`, separate from the runner `state`), the
+exact prompt sent (plus the system prompt), the observed outcome, whether a fix
+was attempted/confirmed, the commits, the integration state with the
+destination branch and push result, and a reproduction recipe. At most the
+latest 3 runs per action are shown, newest first; secrets are redacted and
+unknown details are stated as unknown. An action attributed to several branches
+(`guardian_live_action_branches`, resolved from its source cells when the
+actions are written) appears on each branch's PR but runs once.
+
+A live agent ends its reply with `RALPHUS_LIVE_RESULT: {"verdict": "...",
+"summary": "...", "fix_attempted": bool, "fix_confirmed": bool, "recipe":
+["cmd", ...]}`. Only recipe commands that match a recorded `RALPHUS_TOOL:` shell
+call of the run's transcript are kept, with that call's cwd, order and result;
+a missing or unparseable result, or a run that did not finish, is
+`inconclusive`. Refreshes are durable (`pr_live_result_refresh`): requested on
+run finish, integration end, and PR create/adopt/replace/promote; a failed
+forge call is retried with a doubling backoff (30 s up to 30 min) across
+daemon restarts, logged to stderr and Cartographer, and reported to the
+review's watchers through the remediation mailbox helper after 5 failures.
