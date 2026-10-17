@@ -16355,16 +16355,26 @@ fn pr_refresh_ci(daemon: &Daemon, pr_id: &str) -> Reply {
     };
     let root = Path::new(&guardian.git_root);
     let forge_cfg = crate::config::resolve_forge(root);
-    let identity = crate::forge::effective_forge_identity(None, guardian.owner.as_deref());
-    let client = match crate::forge::resolve_remote_for_base_with_store(
+    // Resolved from the stored PR's own `repo`, like the standing CI poll: under
+    // fork routing (RAL-338) a parent-repo MR and a fork MR can share a number,
+    // so the guardian's base-branch remote may name the wrong repository.
+    let client = match crate::pr::forge_client_for_pr(
         &daemon.store_handle(),
         root,
         &guardian.base_branch,
         &forge_cfg,
-        identity.as_deref(),
+        &pr.repo,
+        guardian.owner.as_deref(),
     ) {
-        Ok(c) => c,
-        Err(e) => return error(502, "forge_error", &e, vec![]),
+        Some(c) => c,
+        None => {
+            return error(
+                502,
+                "forge_error",
+                "no forge client could be resolved for this PR's repo",
+                vec![],
+            );
+        }
     };
     let state = match client.check_pr_ci_status(pr_number) {
         Ok(s) => s,
@@ -32869,6 +32879,110 @@ remediation_attempts=1
         let d = daemon();
         let r = route(&d, "POST", "/api/pull-requests/pr-999/refresh-ci", "");
         assert_eq!(r.status, 404);
+    }
+
+    #[test]
+    fn refresh_ci_reads_the_repository_that_owns_the_stored_pr() {
+        // A parent MR and a fork MR can share a number (!11 in both), so the
+        // refresh must read the repo named by the stored PR, not whichever
+        // repo the guardian's base branch tracks.
+        let repo = tmp_git_repo("refresh-ci-fork");
+        for (name, url) in [
+            ("origin", "https://gitlab.com/acme/widget.git"),
+            ("fork-alice", "https://gitlab.com/alice/widget.git"),
+        ] {
+            let status = std::process::Command::new("git")
+                .args(["remote", "add", name, url])
+                .current_dir(&repo)
+                .status()
+                .expect("git remote add");
+            assert!(status.success());
+        }
+        let mock = MockForge::start(move |server| {
+            let mut urls = Vec::new();
+            for req in server.requests() {
+                urls.push(req.url().to_string());
+                req.respond(tiny_http::Response::from_string("{}").with_status_code(404))
+                    .unwrap();
+            }
+            urls
+        });
+        let addr = mock.addr();
+        std::fs::write(
+            repo.join(".ralphus.toml"),
+            format!(
+                "[forge]\nkind = \"gitlab\"\napi_base = \"http://{addr}\"\ntoken_env = \"PATH\"\n"
+            ),
+        )
+        .unwrap();
+
+        let d = daemon();
+        d.lock()
+            .register_project("demo", "orchestrator", repo.to_str().unwrap(), "git")
+            .unwrap();
+        d.lock()
+            .upsert_project_fork(
+                "demo",
+                "",
+                "https://gitlab.com/alice/widget.git",
+                "fork-alice",
+                "alice",
+            )
+            .unwrap();
+        let body = serde_json::json!({
+            "name": "r",
+            "base_branch": "origin/main",
+            "git_root": repo.to_str().unwrap(),
+        })
+        .to_string();
+        route(&d, "POST", "/api/guardians", &body);
+        let gid = "guardian-000000000001".to_string();
+        let mut ids = Vec::new();
+        for repo_path in ["alice%2Fwidget", "acme%2Fwidget"] {
+            ids.push(
+                d.lock()
+                    .create_pull_request(
+                        &gid,
+                        Some("branch-000000000001"),
+                        "gitlab",
+                        repo_path,
+                        "feature/foo",
+                        "main",
+                        "T",
+                        "",
+                        Some(11),
+                        None,
+                    )
+                    .unwrap(),
+            );
+        }
+        for id in &ids {
+            let r = route(
+                &d,
+                "POST",
+                &format!("/api/pull-requests/{id}/refresh-ci"),
+                "",
+            );
+            assert_eq!(r.status, 502, "{}", r.body);
+        }
+        let urls = mock.finish();
+        assert!(
+            urls.iter().any(|u| u.contains("alice%2Fwidget")),
+            "fork MR must be read from the fork: {urls:?}"
+        );
+        assert!(
+            urls.iter().any(|u| u.contains("acme%2Fwidget")),
+            "parent MR must be read from the parent: {urls:?}"
+        );
+        let first = urls
+            .iter()
+            .position(|u| u.contains("alice%2Fwidget"))
+            .unwrap();
+        assert!(
+            urls[..first].iter().all(|u| !u.contains("acme%2Fwidget")),
+            "the fork MR's refresh must not touch the parent: {urls:?}"
+        );
+        let _ = std::fs::remove_dir_all(repo);
     }
 
     #[test]
