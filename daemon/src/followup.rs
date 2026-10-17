@@ -1523,8 +1523,8 @@ mod tests {
     fn seed_guardian(s: &Store, id: &str, root: &Path) {
         s.conn
             .execute(
-                "INSERT INTO guardians(id, name, base_branch, git_root, status, created_at_ms, updated_at_ms, project)
-                 VALUES (?,'the review','main',?,'in_review',0,0,'proj')",
+                "INSERT INTO guardians(id, name, base_branch, git_root, status, created_at_ms, updated_at_ms, project, upstream_remote, upstream_branch)
+                 VALUES (?,'the review','main',?,'in_review',0,0,'proj','origin','main')",
                 params![id, root.to_string_lossy()],
             )
             .unwrap();
