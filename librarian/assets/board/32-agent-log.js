@@ -93,9 +93,15 @@
        */
       function agentLogPreview(e) {
         let text = e.input;
+        const cmd = e.args.find((a) => a.key === "command" || a.key === "cmd");
+        if (!AGENT_LOG_SHELL_TOOLS.includes(e.tool) && e.args.length > 0) {
+          const key = AGENT_LOG_PREVIEW_KEYS.find((k) => e.args.some((a) => a.key === k));
+          const pick = key === undefined ? e.args[0] : e.args.find((a) => a.key === key);
+          if (pick !== undefined) text = pick.value;
+        }
         if (AGENT_LOG_SHELL_TOOLS.includes(e.tool)) {
-          const cmd = e.args.find((a) => a.key === "command" || a.key === "cmd");
           if (cmd !== undefined) text = cmd.value;
+          else if (e.args.length > 0) text = e.args[0].value;
           const cd =
             /^\s*(?:cd|set-location|sl)\s+(?:-(?:literalpath|path)\s+)?(?:"[^"]*"|'[^']*'|[^\s&;|]+)\s*(?:&&|;|\n)\s*/i;
           let rest = text;
@@ -252,6 +258,18 @@
         if (f.q === "") return true;
         const q = f.q.toLowerCase();
         return `${e.tool}\n${e.sub}\n${e.input}\n${e.output}`.toLowerCase().includes(q);
+      }
+      /**
+       * Masks an entry's input, output and each argument value in place. An
+       * argument whose name looks like a credential is masked whole.
+       * @param {AgentLogEntry} e
+       * @param {(text: string) => string} redact
+       * @returns {void}
+       */
+      function redactAgentLogEntry(e, redact) {
+        e.input = redact(e.input);
+        e.output = redact(e.output);
+        agentLogRedactArgs(e, redact);
       }
       // RALPHUS-AGENT-LOG:END
 
@@ -427,11 +445,7 @@
         const memo = agentLogParsed[key];
         if (memo && memo.src === src) return memo.entries;
         const entries = parseAgentLog(src);
-        for (const e of entries) {
-          e.input = redactAgentLog(e.input);
-          e.output = redactAgentLog(e.output);
-          agentLogRedactArgs(e, redactAgentLog);
-        }
+        for (const e of entries) redactAgentLogEntry(e, redactAgentLog);
         agentLogParsed[key] = { src, entries };
         return entries;
       }
