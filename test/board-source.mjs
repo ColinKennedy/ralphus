@@ -25,6 +25,6 @@ export function chunkFiles() {
 /** All chunk sources concatenated in load order. */
 export function boardScript() {
   return chunkFiles()
-    .map((f) => readFileSync(join(boardDir, f), "utf8"))
+    .map((f) => readFileSync(join(boardDir, f), "utf8").replace(/\r\n/g, "\n"))
     .join("");
 }
