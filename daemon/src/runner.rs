@@ -21,8 +21,8 @@ use crate::store::{CellRow, NodeState};
 
 mod direct;
 pub(crate) use direct::{
-    is_active as direct_session_active, live_tail as direct_live_tail,
-    request_stop as direct_request_stop,
+    CappedSink as TranscriptSink, is_active as direct_session_active,
+    live_tail as direct_live_tail, request_stop as direct_request_stop,
     request_stop_with_any_prefix as direct_request_stop_with_any_prefix,
 };
 

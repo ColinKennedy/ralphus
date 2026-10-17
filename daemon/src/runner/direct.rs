@@ -130,7 +130,7 @@ fn transcript_tail(path: &std::path::Path, lines: usize) -> Option<String> {
 /// The transcript file shared by a child's stdout and stderr pumps. Mirrors
 /// the transcript writer: appends up to `cap` bytes, then drops the rest
 /// and writes one truncation marker so a reader knows the record is partial.
-struct CappedSink {
+pub(crate) struct CappedSink {
     file: std::fs::File,
     written: u64,
     cap: u64,
@@ -138,7 +138,29 @@ struct CappedSink {
 }
 
 impl CappedSink {
-    fn write(&mut self, bytes: &[u8]) {
+    /// Start a fresh attempt-0 raw transcript for `session_name`, clearing what
+    /// a previous run of the cell left, capped by the configured
+    /// `max_transcript_bytes_per_attempt` (`0` = unbounded).
+    pub(crate) fn create(session_name: &str) -> std::io::Result<Self> {
+        let transcript_path = crate::terminal_log::raw_transcript_path(session_name, 0);
+        if let Some(parent) = transcript_path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let _ = std::fs::remove_file(&transcript_path);
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&transcript_path)?;
+        let cap = crate::config::load_terminal_log_config().max_transcript_bytes_per_attempt();
+        Ok(Self {
+            file,
+            written: 0,
+            cap: if cap == 0 { u64::MAX } else { cap },
+            marked: false,
+        })
+    }
+
+    pub(crate) fn write(&mut self, bytes: &[u8]) {
         if self.written < self.cap {
             let take = usize::try_from(self.cap - self.written)
                 .unwrap_or(usize::MAX)
@@ -308,31 +330,16 @@ impl SubprocessRunner {
         }
 
         // The transcript path is keyed on (session, attempt), and every run
-        // of a cell is attempt 0 here, so clear what a previous run left.
+        // of a cell is attempt 0 here, so `create` clears what a previous run left.
         let attempt = 0;
         let transcript_path = crate::terminal_log::raw_transcript_path(session_name, attempt);
-        if let Some(parent) = transcript_path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        let _ = std::fs::remove_file(&transcript_path);
-        let file = match std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&transcript_path)
-        {
-            Ok(f) => f,
+        let sink = match CappedSink::create(session_name) {
+            Ok(s) => Arc::new(Mutex::new(s)),
             Err(e) => {
                 let _ = std::fs::remove_file(spec_path);
                 return RunnerResult::failure(format!("could not open transcript: {e}"));
             }
         };
-        let cap = crate::config::load_terminal_log_config().max_transcript_bytes_per_attempt();
-        let sink = Arc::new(Mutex::new(CappedSink {
-            file,
-            written: 0,
-            cap: if cap == 0 { u64::MAX } else { cap },
-            marked: false,
-        }));
 
         let mut command = std::process::Command::new(&self.program);
         command
