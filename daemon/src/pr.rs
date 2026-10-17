@@ -12076,21 +12076,29 @@ mod tests {
     }
 
     fn g(root: &Path, args: &[&str]) -> String {
-        let out = Command::new("git")
-            .args(args)
-            .current_dir(root)
-            .env("GIT_AUTHOR_NAME", "t")
-            .env("GIT_AUTHOR_EMAIL", "t@t")
-            .env("GIT_COMMITTER_NAME", "t")
-            .env("GIT_COMMITTER_EMAIL", "t@t")
-            // `rebase --continue` needs these on a CI runner with no
-            // interactive terminal/EDITOR -- otherwise a conflict resolution
-            // that needs a commit message fails with "Terminal is dumb, but
-            // EDITOR unset" instead of completing.
-            .env("GIT_EDITOR", "true")
-            .env("GIT_SEQUENCE_EDITOR", "true")
-            .output()
-            .expect("git");
+        let run = || {
+            Command::new("git")
+                .args(args)
+                .current_dir(root)
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@t")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@t")
+                // `rebase --continue` needs these on a CI runner with no
+                // interactive terminal/EDITOR -- otherwise a conflict resolution
+                // that needs a commit message fails with "Terminal is dumb, but
+                // EDITOR unset" instead of completing.
+                .env("GIT_EDITOR", "true")
+                .env("GIT_SEQUENCE_EDITOR", "true")
+                .output()
+                .expect("git")
+        };
+        let mut out = run();
+        // Under a heavily loaded test run git can exit nonzero with no
+        // stderr at all; one retry absorbs that transient failure.
+        if !out.status.success() && out.stderr.is_empty() {
+            out = run();
+        }
         assert!(
             out.status.success(),
             "git {args:?} in {} failed: {}",
