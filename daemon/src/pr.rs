@@ -6341,24 +6341,8 @@ fn claim_guardian_for_forge_reorder(store: &crate::store_lock::StoreHandle, id: 
 /// order surfaces through the existing rebase-run reporting path (per-branch
 /// `merge_status`/conflicts, guardian `detail`, Cartographer).
 ///
-/// A GitHub-side reorder always wins over a review already `merging` locally
-/// (RAL-273's last-writer-wins rule): if the claim loses because some other
-/// trigger for this same guardian (a manual reorder's own rebuild, a
-/// base-shift rebuild, a manual-push restack) is in flight, that run is
-/// cancelled and the claim retried for a few seconds before giving up. A
-/// guardian notice is recorded only in that interrupted case, for the
-/// bottom-right toast; a plain (nothing was running) reorder is applied
-/// silently other than the usual Cartographer log. Returns whether a reorder
-/// was detected and applied.
-/// Whether a detected forge reorder may cancel the review's in-flight work to
-/// apply itself. A merge or rebuild can simply be redone on the new order,
-/// but a feedback round or unattended PR fix (a held worktree lease) carries
-/// a request that cancelling would drop -- the reorder waits for the next
-/// check instead.
-fn forge_reorder_may_interrupt(store: &crate::store_lock::StoreHandle, id: &str) -> bool {
-    !store.lock().guardian_has_worktree_leases(id)
-}
-
+/// An in-flight local change finishes before a forge reorder is applied. The
+/// next poll detects the remaining drift against the settled review.
 pub fn check_and_apply_forge_reorder(
     store: &crate::store_lock::StoreHandle,
     runner: &dyn Runner,
@@ -6389,43 +6373,19 @@ pub fn check_and_apply_forge_reorder(
     };
 
     let cancel_key = format!("guardian:{id}");
-    let mut claimed = claim_guardian_for_forge_reorder(store, id);
-    let mut interrupted_local = false;
-    if !claimed && !forge_reorder_may_interrupt(store, id) {
-        crate::rlog!(
-            INFO,
-            "ralphus [pr] review {id} forge drift detected while a feedback round or PR fix \
-             is editing a branch; deferring to the next check"
-        );
+    let claimed = claim_guardian_for_forge_reorder(store, id);
+    if !claimed {
         crate::cartographer::Note::new("pr").guardian(id).emit(
             &store.lock(),
-            "forge reorder deferred: a feedback round or PR fix is in flight",
+            "forge reorder deferred: review is busy",
             serde_json::json!({"order": drift.order, "base": drift.base}),
-        );
-        return false;
-    }
-    if !claimed && cancellations.is_active(&cancel_key) {
-        cancellations.cancel(&cancel_key);
-        for _ in 0..50 {
-            if claim_guardian_for_forge_reorder(store, id) {
-                claimed = true;
-                interrupted_local = true;
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(100));
-        }
-    }
-    if !claimed {
-        crate::rlog!(
-            WARNING,
-            "ralphus [pr] review {id} forge reorder detected but the review could not be claimed; will retry next check"
         );
         return false;
     }
 
     crate::rlog!(
         INFO,
-        "ralphus [pr] review {id} forge drift detected order={:?} base={} base_changed={} order_changed={} interrupted_local={interrupted_local}",
+        "ralphus [pr] review {id} forge drift detected order={:?} base={} base_changed={} order_changed={}",
         drift.order,
         drift.base,
         drift.base_changed,
@@ -6505,18 +6465,10 @@ pub fn check_and_apply_forge_reorder(
             payload: serde_json::json!({
                 "order": drift.order,
                 "base": drift.base,
-                "base_applied": base_applied,
-                "interrupted_local": interrupted_local
+                "base_applied": base_applied
             }),
             admin_only: false,
         });
-        if interrupted_local {
-            let _ = guard.enqueue_guardian_notice(
-                id,
-                "A GitHub/GitLab stack edit arrived while a local review edit was in progress; the newest base edit won.",
-                None,
-            );
-        }
     }
 
     start_resync_pr_bases(Arc::clone(store), id);
@@ -12582,6 +12534,25 @@ mod tests {
     }
 
     #[test]
+    fn stack_base_for_keeps_the_chain_when_the_last_branch_is_disabled() {
+        let a = test_branch("b-a", 0);
+        let b = test_branch("b-b", 1);
+        let c = test_branch("b-c", 2);
+        let mut disabled = test_branch("b-d", 3);
+        disabled.enabled = false;
+        let ordered: Vec<&BranchView> = [&a, &b, &c, &disabled]
+            .into_iter()
+            .filter(|branch| branch.enabled)
+            .collect();
+        let aliases = HashMap::from([
+            ("b-a".to_string(), "alias-a".to_string()),
+            ("b-b".to_string(), "alias-b".to_string()),
+        ]);
+
+        assert_eq!(stack_base_for(&ordered, &aliases, 2, "main"), "alias-b");
+    }
+
+    #[test]
     fn stack_base_for_chains_around_a_merged_mid_stack_branch() {
         // RAL-480: a branch already merged upstream (`merge_status ==
         // "merged"`) never gets a PR/MR of its own -- automation must not
@@ -16401,27 +16372,23 @@ mod tests {
         assert!(!claim_guardian_for_forge_reorder(&store, &gid));
     }
 
-    /// A forge reorder may cancel an in-flight merge to redo it on the new
-    /// order, but never a feedback round or PR fix still editing a branch:
-    /// cancelling it would drop the reviewer's request.
     #[test]
-    fn forge_reorder_never_interrupts_an_in_flight_feedback_round() {
+    fn forge_reorder_waits_for_an_in_flight_merge_to_finish() {
         let store = Arc::new(crate::store_lock::StoreMutex::new(store()));
         let gid = store
             .lock()
             .create_guardian("demo", "main", "/repo")
             .unwrap();
-        assert!(forge_reorder_may_interrupt(&store, &gid));
-        assert!(
-            store
-                .lock()
-                .try_acquire_guardian_worktree_lease(&gid, "branch-1", "feedback")
-        );
-        assert!(!forge_reorder_may_interrupt(&store, &gid));
+        let cancellations = crate::cancel::Cancellations::new();
+        let key = format!("guardian:{gid}");
+        let token = cancellations.register(&key);
         store
             .lock()
-            .release_guardian_worktree_lease(&gid, "branch-1", "feedback");
-        assert!(forge_reorder_may_interrupt(&store, &gid));
+            .set_guardian_status(&gid, crate::guardian::GuardianStatus::Merging, None)
+            .unwrap();
+        assert!(!claim_guardian_for_forge_reorder(&store, &gid));
+        assert!(!token.is_cancelled());
+        assert_eq!(store.lock().get_guardian(&gid).unwrap().status, "merging");
     }
 
     #[test]
