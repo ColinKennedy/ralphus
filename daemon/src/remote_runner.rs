@@ -800,6 +800,20 @@ impl ProviderRunner {
         let started = Instant::now();
         let budget = spec.timeout_sec.map(Duration::from_secs);
         let mut transcript = String::new();
+        // Every streamed chunk is also appended to the cell's durable raw
+        // transcript, the same file (and byte cap) a local run writes, so Live
+        // View can page the whole remote history rather than only the capped
+        // pane snapshot. A provider with no `stream` verb simply leaves it empty.
+        let mut raw_transcript = match crate::runner::TranscriptSink::create(&session_name) {
+            Ok(sink) => Some(sink),
+            Err(e) => {
+                crate::rlog!(
+                    WARNING,
+                    "ralphus [remote] could not open transcript for {session_name}: {e}"
+                );
+                None
+            }
+        };
         let mut cursor: Option<i64> = None;
         loop {
             if cancel.is_some_and(CancelToken::is_cancelled) {
@@ -900,6 +914,9 @@ impl ProviderRunner {
             match self.invoke_handle(VERB_STREAM, handle, cursor, spec) {
                 Ok(resp) => {
                     if let Some(chunk) = resp.output.filter(|c| !c.is_empty()) {
+                        if let Some(sink) = raw_transcript.as_mut() {
+                            sink.write(chunk.as_bytes());
+                        }
                         transcript.push_str(&chunk);
                         crate::cell_session::write_pane_snapshot(&session_name, &transcript);
                     }
