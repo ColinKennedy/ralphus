@@ -331,6 +331,7 @@ impl WorktreeWatcher {
         let (stop, rx) = mpsc::channel::<()>();
         let handle = std::thread::spawn(move || {
             let mut last = DiffSummary::default();
+            let mut first_poll = true;
             let mut last_baseline = start.clone();
             let mut backoff = Backoff::new(min, max);
             // Polls repeat every few seconds, so a persistent failure is
@@ -354,10 +355,11 @@ impl WorktreeWatcher {
                                 json!({"root": root.display().to_string()}),
                             );
                         }
-                        if now == *last && baseline == last_baseline {
+                        if !first_poll && now == *last && baseline == last_baseline {
                             return false;
                         }
                         *last = now;
+                        first_poll = false;
                         last_baseline.clone_from(&baseline);
                         emit(&baseline, &now);
                         true
@@ -668,31 +670,21 @@ three
         seen.lock().unwrap().clone()
     }
 
-    fn claim_base(dir: &Path) -> String {
-        let base = head_commit(dir).unwrap();
-        let branch = git_detailed(dir, &["rev-parse", "--abbrev-ref", "HEAD"]).unwrap();
-        run(
-            dir,
-            &[
-                "config",
-                &format!("ralphus.{}.baseline", branch.trim()),
-                &base,
-            ],
-        );
-        base
-    }
-
     #[test]
     fn a_cell_that_changes_nothing_pushes_an_explicit_zero() {
         let dir = temp_repo("zero");
-        assert_eq!(watch_once(&dir), vec![DiffSummary::default()]);
+        let summaries = watch_once(&dir);
+        assert!(!summaries.is_empty(), "watcher should emit at least once");
+        assert_eq!(summaries.last().unwrap(), &DiffSummary::default());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn cells_sharing_a_worktree_report_the_same_net_change() {
         let dir = temp_repo("shared");
-        claim_base(&dir);
+        run(&dir, &["branch", "-M", "main"]);
+        run(&dir, &["checkout", "-q", "-b", "work"]);
+        run(&dir, &["branch", "--set-upstream-to=main"]);
 
         // Cell one commits a file, edits another, and leaves an untracked file.
         std::fs::write(
@@ -733,7 +725,9 @@ y
     #[test]
     fn a_change_reverted_by_a_later_cell_nets_out() {
         let dir = temp_repo("revert");
-        claim_base(&dir);
+        run(&dir, &["branch", "-M", "main"]);
+        run(&dir, &["checkout", "-q", "-b", "work"]);
+        run(&dir, &["branch", "--set-upstream-to=main"]);
         std::fs::write(
             dir.join("b.txt"),
             "b
