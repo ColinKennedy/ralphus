@@ -191,6 +191,9 @@ impl Review {
             commits: vec![head],
             live_ref: Some(live_ref),
             cell_id: "live-0-x".to_string(),
+            sent_prompt: Some("test prompt".to_string()),
+            sent_system_prompt: Some("test system prompt".to_string()),
+            raw_reply: "test reply".to_string(),
         };
         {
             let guard = self.store.lock();
