@@ -189,6 +189,7 @@ where one exists.
 | POST | `/api/guardians/{id}/followup/accept` | Accept the offer: draft the follow-up squad |
 | POST | `/api/guardians/{id}/followup/decline` | Decline the offer |
 | POST | `/api/guardians/{id}/run-manual-commands` | Launch a ready manual-check command at its prepared execution location; `409` until ready |
+| POST | `/api/guardians/{id}/action-branches` | Set which branches of the review an authored action concerns. Body `{index, branch_ids}`; each id must be a current branch of the review (`400` otherwise), and an empty list makes the action review-wide. `409` on a terminal review. Earlier runs keep the attribution frozen when they were queued |
 | POST | `/api/guardians/{id}/run-action-hint` | Launch a ready authored action at its prepared execution location. A `prompt` action is agent-run: it is queued as a [live run](#live-actions) and the reply is `{ok, live_run}` |
 | GET | `/api/guardians/{id}/live-actions` | The review's [live actions](#live-actions), its live runs (newest first), and whether the opt-in is on |
 | POST | `/api/guardians/{id}/live-actions/run` | Queue manual live runs: body `{"index": N}` for one, `{}` for all; `409` when no member cell posted a live handoff |

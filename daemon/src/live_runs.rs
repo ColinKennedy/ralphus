@@ -918,12 +918,16 @@ fn execute_queued_run(
         evidence_run.cwd = Some(cwd.clone());
         crate::live_results::record_run_evidence(store, &guardian.id, &evidence_run, &outcome);
         let guard = store.lock();
-        let _ = guard.freeze_live_run_branches(
-            &run.run_id,
-            &guard
-                .live_action_branch_ids(&guardian.id, run.action_idx)
-                .unwrap_or_default(),
-        );
+        // A user-action run was frozen when it was queued; `action_idx` there
+        // indexes the review's action hints, not its live actions.
+        if run.kind == "live" {
+            let _ = guard.freeze_live_run_branches(
+                &run.run_id,
+                &guard
+                    .live_action_branch_ids(&guardian.id, run.action_idx)
+                    .unwrap_or_default(),
+            );
+        }
         let _ = guard.request_live_refresh_for_guardian(&guardian.id);
     }
     post_report(store, &guardian, &target.label, &outcome);
@@ -1473,16 +1477,33 @@ pub fn queue_action_prompt_run(
             .clone()
             .unwrap_or_else(|| format!("action {index}"))
     };
-    let id = store
-        .lock()
-        .queue_live_run(
-            guardian_id,
-            LiveRunKind::Action,
-            i64::try_from(index).unwrap_or(i64::MAX),
-            &label,
-            trigger,
-        )
-        .map_err(|e| e.to_string())?;
+    let id = {
+        let guard = store.lock();
+        // Read the association in the same critical section as the queueing so
+        // the snapshot is the one in force when the run was requested.
+        let branch_ids = guard
+            .get_guardian(guardian_id)
+            .map_err(|e| e.to_string())?
+            .action_hints
+            .get(index)
+            .map(|hint| hint.branch_ids.clone())
+            .unwrap_or_default();
+        let id = guard
+            .queue_live_run(
+                guardian_id,
+                LiveRunKind::Action,
+                i64::try_from(index).unwrap_or(i64::MAX),
+                &label,
+                trigger,
+            )
+            .map_err(|e| e.to_string())?;
+        // Frozen now (write-once): a later branch move or association edit
+        // never re-attributes this run.
+        guard
+            .freeze_live_run_branches(&id, &branch_ids)
+            .map_err(|e| e.to_string())?;
+        id
+    };
     start_worker(store, runners, guardian_id);
     Ok(id)
 }

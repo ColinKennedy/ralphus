@@ -1112,6 +1112,47 @@
         "description": "Destructive: removes or irreversibly changes state."
       }
     },
+    "/api/guardians/{id}/action-branches": {
+      "post": {
+        "operationId": "postGuardiansByIdActionBranches",
+        "summary": "Board correction of which review branches an authored action concerns; the task file's `branches` key is the CLI/MCP route.",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/JsonObject"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Success.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/JsonValue"
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
     "/api/guardians/{id}/action-generations": {
       "get": {
         "operationId": "getGuardiansByIdActionGenerations",

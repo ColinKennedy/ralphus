@@ -1211,15 +1211,9 @@ pub fn derive_reviews_with_full_prefetch(
     // Build per-review action hints, keyed by review id (or link key).
     // For now: action hints from all opted-in reviews are merged per guardian.
     // Since there is one [[review]] per submission, this is straightforward.
-    let hints_by_id: std::collections::HashMap<&str, Vec<GuardianCheck>> = file
-        .review
-        .iter()
-        .filter_map(|rv| {
-            rv.id
-                .as_deref()
-                .map(|id| (id, actions_to_hints(&rv.action)))
-        })
-        .collect();
+    // Branch references are resolved here, before any guardian exists, so a
+    // bad reference fails the submission without leaving half-built reviews.
+    let authored_actions = resolve_authored_actions(file, &memberships)?;
 
     // Split memberships into link groups (grouped within THIS submission by the
     // `ralphus:new-review/<key>` placeholder) and project groups (the classic
@@ -1296,9 +1290,14 @@ pub fn derive_reviews_with_full_prefetch(
         apply_resolver(store, &gid, &members)?;
         apply_project_review_defaults(store, &gid, project)?;
         apply_preparation(store, &gid, &members)?;
-        apply_action_hints(store, &gid, &members, &hints_by_id)?;
         // Single-project: no need to tag branches with a project (they share git_root).
         add_new_branches(store, &gid, &[], &members, false)?;
+        apply_action_hints(
+            store,
+            &gid,
+            &group_key_for_project(project),
+            &authored_actions,
+        )?;
         record_review_guardian(store, squad_id, &gid, &members, &implicit_cells_by_branch)?;
         created.push(gid);
     }
@@ -1355,10 +1354,10 @@ pub fn derive_reviews_with_full_prefetch(
         }
         apply_resolver(store, &gid, &members)?;
         apply_preparation(store, &gid, &members)?;
-        apply_action_hints(store, &gid, &members, &hints_by_id)?;
         // Freshly minted guardian: no branches attached yet. Tag each branch with
         // its project root (multi-project link group).
         add_new_branches(store, &gid, &[], &members, true)?;
+        apply_action_hints(store, &gid, &group_key_for_link(key), &authored_actions)?;
         record_review_guardian(store, squad_id, &gid, &members, &implicit_cells_by_branch)?;
         created.push(gid);
     }
@@ -1724,40 +1723,180 @@ fn apply_preparation(
     Ok(())
 }
 
+/// Identity of the review a membership group becomes, used to tell which
+/// review a branch reference lands in: a project group by its project root,
+/// a link group by its key.
+fn group_key_for_project(project: &str) -> String {
+    format!("project:{project}")
+}
+
+/// See [`group_key_for_project`].
+fn group_key_for_link(key: &str) -> String {
+    format!("link:{key}")
+}
+
+fn membership_group_key(m: &Membership) -> String {
+    match &m.link_key {
+        Some(key) => group_key_for_link(key),
+        None => group_key_for_project(&m.project.to_string_lossy()),
+    }
+}
+
+/// One `[[review.action]]` with its `branches` references resolved to the
+/// review (group) and branch names they land on.
+struct AuthoredAction {
+    hint: GuardianCheck,
+    /// `None`: review-wide. `Some((group key, branch names))`: concerns only
+    /// those branches of that one review.
+    targets: Option<(String, Vec<String>)>,
+}
+
+/// Resolve every authored action's `branches` references against the
+/// submission's memberships. Fails the submission for a reference that
+/// matches nothing, a bare branch name present in more than one review, two
+/// references reaching the same branch, or references spanning reviews.
+fn resolve_authored_actions(
+    file: &TaskFile,
+    memberships: &[Membership],
+) -> std::result::Result<Vec<AuthoredAction>, ReviewError> {
+    let mut seen_ids: HashSet<&str> = HashSet::new();
+    let mut out = Vec::new();
+    for rv in &file.review {
+        let Some(id) = rv.id.as_deref() else { continue };
+        if !seen_ids.insert(id) {
+            continue;
+        }
+        for (action, hint) in rv.action.iter().zip(actions_to_hints(&rv.action)) {
+            let targets = match &action.branches {
+                None => None,
+                Some(refs) => Some(resolve_action_targets(file, memberships, action, refs)?),
+            };
+            out.push(AuthoredAction { hint, targets });
+        }
+    }
+    Ok(out)
+}
+
+fn resolve_action_targets(
+    file: &TaskFile,
+    memberships: &[Membership],
+    action: &ReviewActionDef,
+    refs: &[String],
+) -> std::result::Result<(String, Vec<String>), ReviewError> {
+    use ralphus_core::schema::{ActionBranchRef, parse_action_branch_ref};
+
+    let fail = |detail: String| {
+        ReviewError::new(format!(
+            "review action '{}': branches: {detail}",
+            action.label
+        ))
+    };
+    let cell_matches = |m: &Membership, task: &str, cell: Option<&str>| {
+        let Some(t) = usize::try_from(m.task_idx)
+            .ok()
+            .and_then(|i| file.task.get(i))
+        else {
+            return false;
+        };
+        if t.name != task {
+            return false;
+        }
+        let Some(cell) = cell else { return true };
+        usize::try_from(m.idx)
+            .ok()
+            .and_then(|i| t.cell.get(i).map(|c| (i, c)))
+            .is_some_and(|(i, c)| c.id.clone().unwrap_or_else(|| format!("cell-{i}")) == cell)
+    };
+
+    let mut landed: Vec<(String, String)> = Vec::new();
+    for raw in refs {
+        let parsed = parse_action_branch_ref(raw).map_err(&fail)?;
+        let matches: Vec<&Membership> = match &parsed {
+            ActionBranchRef::Branch(name) => {
+                memberships.iter().filter(|m| &m.branch == name).collect()
+            }
+            ActionBranchRef::Task(task) => memberships
+                .iter()
+                .filter(|m| cell_matches(m, task, None))
+                .collect(),
+            ActionBranchRef::Cell { task, cell } => memberships
+                .iter()
+                .filter(|m| cell_matches(m, task, Some(cell)))
+                .collect(),
+        };
+        if matches.is_empty() {
+            return Err(fail(format!(
+                "\"{raw}\" does not match a branch contributed to any review by this submission"
+            )));
+        }
+        let mut here: Vec<(String, String)> = matches
+            .iter()
+            .map(|m| (membership_group_key(m), m.branch.clone()))
+            .collect();
+        here.sort();
+        here.dedup();
+        if matches!(parsed, ActionBranchRef::Branch(_))
+            && here.iter().map(|(g, _)| g).collect::<HashSet<_>>().len() > 1
+        {
+            return Err(fail(format!(
+                "branch name \"{raw}\" is ambiguous: it belongs to more than one review; \
+                 use \"task:<task name>\" or \"cell:<task name>/<cell id>\" instead"
+            )));
+        }
+        for pair in here {
+            if landed.contains(&pair) {
+                return Err(fail(format!(
+                    "\"{raw}\" reaches branch '{}' that another reference already names",
+                    pair.1
+                )));
+            }
+            landed.push(pair);
+        }
+    }
+    let group = landed[0].0.clone();
+    if landed.iter().any(|(g, _)| *g != group) {
+        return Err(fail(
+            "references span more than one review; an action belongs to exactly one".to_string(),
+        ));
+    }
+    Ok((group, landed.into_iter().map(|(_, b)| b).collect()))
+}
+
 /// Persist user-declared action hints from the top-level `[[review.action]]`
-/// entries onto the guardian. Uses the first member's review id to look up hints.
+/// entries onto the guardian. An action whose `branches` land in another
+/// review is not stored here; one that lands here is bound to this review's
+/// stable branch ids. Call after the guardian's branches are attached.
 fn apply_action_hints(
     store: &Store,
     gid: &str,
-    members: &[&Membership],
-    hints_by_id: &std::collections::HashMap<&str, Vec<GuardianCheck>>,
+    group_key: &str,
+    actions: &[AuthoredAction],
 ) -> std::result::Result<(), ReviewError> {
-    // Collect hints from the review ids referenced by the members (deduplicated).
-    // In practice there is typically one review id per group, so this is a single
-    // lookup. For link-key groups that span multiple review declarations, we merge.
-    let mut seen_ids: HashSet<String> = HashSet::new();
-    let mut all_hints: Vec<GuardianCheck> = Vec::new();
-    for m in members {
-        // Re-derive the review id: for non-link members use the name; for link
-        // members reconstruct from the link key. Actually simpler: walk the file's
-        // review map we already have via hints_by_id.
-        // The member's name is the resolved display name, not the raw id. So look up
-        // all review entries whose resolved hints match. Instead: just collect ALL
-        // unique hint sets from the known review ids for this group.
-        // Simplest: iterate ALL review ids in hints_by_id and include the ones whose
-        // link_key matches m.link_key, or whose name matches m.name.
-        // Even simpler: just iterate hints_by_id and take any entry. For the common
-        // case (one [[review]] block), this includes all action hints.
-        let _ = m; // used for ordering; hint lookup is below
-    }
-    for (id, hints) in hints_by_id {
-        if seen_ids.insert((*id).to_string()) {
-            all_hints.extend_from_slice(hints);
+    let branches = store
+        .guardian_branches(gid)
+        .map_err(|e| ReviewError::new(e.to_string()))?;
+    let mut hints: Vec<GuardianCheck> = Vec::new();
+    for action in actions {
+        let mut hint = action.hint.clone();
+        if let Some((target_group, names)) = &action.targets {
+            if target_group != group_key {
+                continue;
+            }
+            for name in names {
+                let Some(found) = branches.iter().find(|b| &b.branch == name) else {
+                    return Err(ReviewError::new(format!(
+                        "review action '{}': branch '{name}' was not attached to the review",
+                        hint.label.as_deref().unwrap_or_default()
+                    )));
+                };
+                hint.branch_ids.push(found.id.clone());
+            }
         }
+        hints.push(hint);
     }
-    if !all_hints.is_empty() {
+    if !hints.is_empty() {
         store
-            .set_guardian_action_hints(gid, &all_hints)
+            .set_guardian_action_hints(gid, &hints)
             .map_err(|e| ReviewError::new(e.to_string()))?;
     }
     Ok(())
@@ -2923,9 +3062,10 @@ mod tests {
     use std::sync::atomic::{AtomicU32, Ordering};
 
     use super::{
-        Membership, any_workspace_ahead_of_upstream, apply_arbiter_pool_order,
-        apply_project_review_defaults, apply_resolver, create_review_from_triage_pool,
-        derive_reviews_with_prefetch, derive_triage_pools, fire_ready_triage_thresholds, plan,
+        AuthoredAction, GuardianCheck, Membership, ReviewError, any_workspace_ahead_of_upstream,
+        apply_action_hints, apply_arbiter_pool_order, apply_project_review_defaults,
+        apply_resolver, create_review_from_triage_pool, derive_reviews_with_prefetch,
+        derive_triage_pools, fire_ready_triage_thresholds, group_key_for_project, plan,
         rebase_onto, repair_arbiter_review_project_roots, repair_review_project_identities,
         repair_triage_pool_keys, review_branch_order, set_worktree_commit_baseline,
         workspace_has_commits_ahead_of_upstream,
@@ -3707,6 +3847,104 @@ mod tests {
             }]
         );
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Derive a one-branch (`feat-x`) review whose single action carries
+    /// `branches` (or none when `None`); returns the store and the outcome.
+    fn derive_with_action_branches(
+        branches: Option<&str>,
+    ) -> (
+        std::sync::Arc<crate::store_lock::StoreMutex>,
+        std::result::Result<Vec<String>, ReviewError>,
+    ) {
+        let root = temp_repo();
+        git(&root, &["init", "--initial-branch", "main"]);
+        std::fs::write(root.join("base.txt"), "base\n").unwrap();
+        git(&root, &["add", "."]);
+        git(&root, &["commit", "-m", "base"]);
+        let store = std::sync::Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
+        store
+            .lock()
+            .register_project("proj", "", &root.to_string_lossy(), "git")
+            .unwrap();
+        let line = branches.map_or(String::new(), |b| format!("branches={b}\n"));
+        let src = link_review_toml(&format!(
+            "[[review.action]]\nlabel=\"look\"\nprompt=\"look\"\n{line}"
+        ));
+        let file: ralphus_core::schema::TaskFile = toml::from_str(&src).unwrap();
+        let out = derive_reviews_with_prefetch(&store, "squad-1", &file, &HashMap::new());
+        let _ = std::fs::remove_dir_all(&root);
+        (store, out)
+    }
+
+    #[test]
+    fn action_branches_resolve_to_stable_branch_ids_for_every_reference_form() {
+        for form in ["[\"feat-x\"]", "[\"task:t\"]", "[\"cell:t/cell-0\"]"] {
+            let (store, out) = derive_with_action_branches(Some(form));
+            let gid = out.unwrap().remove(0);
+            let store = store.lock();
+            let branch_id = store.guardian_branches(&gid).unwrap().remove(0).id;
+            let hints = store.get_guardian(&gid).unwrap().action_hints;
+            assert_eq!(hints[0].branch_ids, vec![branch_id], "{form}");
+        }
+    }
+
+    #[test]
+    fn action_without_branches_stays_review_wide() {
+        let (store, out) = derive_with_action_branches(None);
+        let gid = out.unwrap().remove(0);
+        let hints = store.lock().get_guardian(&gid).unwrap().action_hints;
+        assert!(hints[0].branch_ids.is_empty());
+    }
+
+    #[test]
+    fn action_branches_that_match_nothing_or_repeat_a_branch_fail_the_submission() {
+        let (_, out) = derive_with_action_branches(Some("[\"nope\"]"));
+        assert!(out.unwrap_err().message.contains("does not match"));
+        let (_, out) = derive_with_action_branches(Some("[\"task:missing\"]"));
+        assert!(out.unwrap_err().message.contains("does not match"));
+        // Two references that reach the same branch.
+        let (_, out) = derive_with_action_branches(Some("[\"feat-x\", \"task:t\"]"));
+        assert!(out.unwrap_err().message.contains("already names"));
+    }
+
+    #[test]
+    fn action_branches_reference_in_another_review_drops_the_action_here() {
+        let store = Store::open_in_memory().unwrap();
+        let a = store.create_guardian("a", "main", "/a").unwrap();
+        let b = store.create_guardian("b", "main", "/b").unwrap();
+        store
+            .add_guardian_branch_with_project(&a, "feat-a", None)
+            .unwrap();
+        store
+            .add_guardian_branch_with_project(&b, "feat-b", None)
+            .unwrap();
+        let actions = vec![
+            AuthoredAction {
+                hint: GuardianCheck {
+                    label: Some("only-a".to_string()),
+                    ..GuardianCheck::default()
+                },
+                targets: Some((group_key_for_project("/a"), vec!["feat-a".to_string()])),
+            },
+            AuthoredAction {
+                hint: GuardianCheck {
+                    label: Some("wide".to_string()),
+                    ..GuardianCheck::default()
+                },
+                targets: None,
+            },
+        ];
+        apply_action_hints(&store, &a, &group_key_for_project("/a"), &actions).unwrap();
+        apply_action_hints(&store, &b, &group_key_for_project("/b"), &actions).unwrap();
+        let in_a = store.get_guardian(&a).unwrap().action_hints;
+        let in_b = store.get_guardian(&b).unwrap().action_hints;
+        assert_eq!(in_a.len(), 2);
+        assert_eq!(in_a[0].branch_ids.len(), 1);
+        assert_eq!(in_b.len(), 1);
+        assert_eq!(in_b[0].label.as_deref(), Some("wide"));
     }
 
     // ── RAL-293: worktree_has_commits_ahead_of_upstream ──────────────────

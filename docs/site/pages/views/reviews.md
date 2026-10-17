@@ -59,6 +59,19 @@ you can watch on the daemon's machine, and its `cleanup_command` runs first. Onl
 checks whose inputs all have defaults run; one that needs a value shows a
 warning on its row instead.
 
+An action can say which branches of the review it concerns with `branches` on
+its `[[review.action]]`: a non-empty list of branch names, `"task:<task name>"`
+(every branch that task's cells contribute) or `"cell:<task name>/<cell id>"`
+(the branch one cell contributes). Leave it out and the action is review-wide.
+A submission is rejected when a reference matches nothing, a bare branch name
+belongs to more than one review, two references reach the same branch, or the
+references span reviews. Each reference is stored as the branch's stable id, and
+an expanded action row on the review page shows the branches and lets you
+change them. If a branch later leaves the review the id is kept and the row
+marks the association **stale** instead of silently picking another branch; runs
+already made keep the branches that were set when they were queued. Actions are
+not listed in PR/MR descriptions, so this association is for the board only.
+
 If a rebase, reviewer feedback or an auto-PR fix arrives while an auto-run is
 still going, nothing is killed. The row shows a warning ("Your check environment
 may be out of date. Consider closing and re-running.") and you get a

@@ -2221,7 +2221,7 @@ Press Accept on the note to create it.">Squad pending</span>`;
             // labelled button alone hid what the action would actually run,
             // which for a one-click check against someone else's branch is
             // exactly the thing you want to read before pressing it.
-            const rows = hints.map((h, i) => {
+            const actionRowHtml = (/** @type {GuardianCheck} */ h, /** @type {number} */ i) => {
               const key = `${g.id}:action:${i}`;
               const needsInput = !!(h.inputs && h.inputs.length);
               const label = esc(h.label || "Run");
@@ -2267,7 +2267,8 @@ Press Accept on the note to create it.">Squad pending</span>`;
                   <button class="cmd-expand" data-click="toggleReviewCommandFull" data-key="${esc(key)}" data-tip="${needsInput ? "Show this command in full, with its values filled in and editable beneath it." : "Show or hide this command in full beneath its row."}">${commandFullOpen[key] ? "−" : "+"}</button>
                   <button class="section-menu" data-click="openReviewCommandMenu" data-guardian-id="${esc(g.id)}" data-key="${esc(key)}" data-cmd="${esc(cmdText)}" data-tip="Actions for this check — its logs, its environment, copy it.">⋯</button>
                 </div>${commandFullBlock(key, cmdText, { g, check: h, kind: "action", i })}`;
-            }).join("");
+            };
+            const rows = hints.map((h, i) => actionRowHtml(h, i) + actionBranchScopeBlock(g, `${g.id}:action:${i}`, i, h)).join("");
             return `<h3 class="section" data-tip="User actions: checks you write yourself in the task file, as [[review.action]] blocks.\nThey stay the same on every rebase and run in the built review.\nAdvisory — they never block Approve or Merge / rebase.">user actions${sectionMenuBtn(g.id, "actions")}</h3>
               ${reviewRunGroup(
                 reviewRunControl(g, "actions", hints.some((h) => h.preparation_state === "ready" && h.command && !(h.inputs && h.inputs.length)), "▶ Run all",
@@ -3095,6 +3096,54 @@ Press Accept on the note to create it.">Squad pending</span>`;
           notify("error", ((e.error || {}).message) || `Action failed (${resp.status})`);
         }
         return resp;
+      }
+
+      /**
+       * The branch association of one user action, shown inside its expanded
+       * contents: which of the review's branches it concerns, with a toggle per
+       * branch to correct it. No branch selected means review-wide. A saved
+       * branch id that is no longer in the review is listed as stale and kept
+       * until the user removes it.
+       * @param {GuardianView} g - The review.
+       * @param {string} key - The action row's key.
+       * @param {number} i - The action's index in `action_hints`.
+       * @param {GuardianCheck} h - The action.
+       * @returns {string} HTML, or "" while the row is collapsed.
+       */
+      function actionBranchScopeBlock(g, key, i, h) {
+        if (!commandFullOpen[key]) return "";
+        const saved = h.branch_ids || [];
+        const branches = g.branches || [];
+        const inReview = new Set(branches.map((b) => String(b.id)));
+        const stale = saved.filter((id) => !inReview.has(String(id)));
+        const chips = branches.map((b) => {
+          const on = saved.includes(String(b.id));
+          return `<button class="chip${on ? " active" : ""}" data-click="toggleActionBranch" data-guardian-id="${esc(g.id)}" data-i="${i}" data-branch-id="${esc(String(b.id))}" data-tip="${esc(on ? `This action concerns ${b.branch}. Click to remove it.` : `Associate this action with ${b.branch}.`)}">${esc(b.branch)}</button>`;
+        }).join(" ");
+        const staleChips = stale.map((id) =>
+          `<button class="chip badge bad" data-click="toggleActionBranch" data-guardian-id="${esc(g.id)}" data-i="${i}" data-branch-id="${esc(String(id))}" data-tip="This branch left the review, so the association is stale. Click to remove it.">stale ${esc(String(id))}</button>`).join(" ");
+        const scope = saved.length === 0
+          ? `<span class="k" data-tip="No branch is selected, so this action applies to the whole review.">review-wide</span>`
+          : "";
+        return `<div class="cmd-full" data-tip="Which of this review's branches (worktrees) this action concerns.">
+            <span class="k">branches</span> ${chips} ${staleChips} ${scope}
+          </div>`;
+      }
+      /**
+       * Toggles one branch in a user action's association and saves the result.
+       * @param {string} gid - The review id.
+       * @param {number} index - The action's index in `action_hints`.
+       * @param {string} branchId - The branch id to add or remove.
+       * @returns {Promise<void>}
+       */
+      async function toggleActionBranch(gid, index, branchId) {
+        const g = guardians.find((x) => x.id === gid);
+        const h = g && (g.action_hints || [])[index];
+        if (!g || !h) return;
+        const cur = (h.branch_ids || []).map(String);
+        const next = cur.includes(branchId) ? cur.filter((x) => x !== branchId) : [...cur, branchId];
+        const resp = await guardianAction(`/api/guardians/${gid}/action-branches`, { index, branch_ids: next });
+        if (resp && resp.ok) tick();
       }
 
       /**

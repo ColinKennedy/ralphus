@@ -2230,6 +2230,10 @@ fn route_for_user(
         ("POST", ["api", "guardians", id, "run-action-hint"]) => {
             guardian_run_action_hint(daemon, id, body)
         }
+        // ralphus[ignore-endpoint-cli]: board correction of which review branches an authored action concerns; the task file's `branches` key is the CLI/MCP route.
+        ("POST", ["api", "guardians", id, "action-branches"]) => {
+            guardian_set_action_branches(daemon, id, body)
+        }
         // ralphus[ignore-endpoint-cli]: board readiness detail for the V1 shared-store action panel.
         ("GET", ["api", "guardians", id, "action-generations"]) => {
             guardian_action_generations(daemon, id)
@@ -18713,6 +18717,73 @@ fn guardian_regenerate_summary(daemon: &Daemon, id: &str) -> Reply {
     json(200, &OpenTerminalResponse { ok: true })
 }
 
+/// Set which branches of the review a user-declared action concerns. Body
+/// `{ "index": N, "branch_ids": [..] }`; every id must be a branch currently
+/// in this review, and an empty list makes the action review-wide. Runs
+/// already made keep the attribution frozen when they were queued.
+fn guardian_set_action_branches(daemon: &Daemon, id: &str, body: &str) -> Reply {
+    #[derive(Deserialize)]
+    struct Body {
+        index: usize,
+        branch_ids: Vec<String>,
+    }
+    let Ok(req) = serde_json::from_str::<Body>(body) else {
+        return error(
+            400,
+            "bad_request",
+            "body must be {\"index\": N, \"branch_ids\": [\"branch-id\", ...]}",
+            vec![],
+        );
+    };
+    let store = daemon.lock();
+    let g = match store.get_guardian(id) {
+        Ok(g) => g,
+        Err(e) => return store_error(&e),
+    };
+    if crate::guardian::GuardianStatus::is_terminal_status(&g.status) {
+        return error(
+            409,
+            "review_terminal",
+            "this review is terminal; its actions can no longer be changed",
+            vec![],
+        );
+    }
+    let mut hints = g.action_hints.clone();
+    let Some(hint) = hints.get_mut(req.index) else {
+        return error(
+            400,
+            "out_of_range",
+            "action hint index out of range",
+            vec![],
+        );
+    };
+    let mut unique: Vec<String> = Vec::new();
+    for branch_id in &req.branch_ids {
+        if !g.branches.iter().any(|b| &b.id == branch_id) {
+            return error(
+                400,
+                "unknown_branch",
+                &format!("'{branch_id}' is not a branch of this review"),
+                vec![],
+            );
+        }
+        if unique.contains(branch_id) {
+            return error(
+                400,
+                "duplicate_branch",
+                &format!("'{branch_id}' is listed more than once"),
+                vec![],
+            );
+        }
+        unique.push(branch_id.clone());
+    }
+    hint.branch_ids = unique;
+    match store.set_guardian_action_hints(id, &hints) {
+        Ok(()) => json(200, &serde_json::json!({"ok": true})),
+        Err(e) => store_error(&e),
+    }
+}
+
 /// Run a user-declared action hint from `[[review.action]]` (RAL-77).
 /// Body `{ "index": N, "inputs": {...}, "run_cleanup": bool }` runs the hint
 /// at position N (required). `command`-kind hints are opened in a terminal;
@@ -21977,6 +22048,70 @@ mod tests {
         );
         assert_eq!(r.status, 409);
         assert!(r.body.contains("review_terminal"));
+    }
+
+    #[test]
+    fn guardian_action_branches_endpoint_validates_and_persists() {
+        let d = daemon();
+        let id = d.lock().create_guardian("g", "main", "/r").unwrap();
+        d.lock()
+            .add_guardian_branch_with_project(&id, "b1", None)
+            .unwrap();
+        d.lock()
+            .add_guardian_branch_with_project(&id, "b2", None)
+            .unwrap();
+        d.lock()
+            .set_guardian_action_hints(
+                &id,
+                &[crate::guardian::GuardianCheck {
+                    label: Some("Look".to_string()),
+                    prompt: Some("look".to_string()),
+                    ..crate::guardian::GuardianCheck::default()
+                }],
+            )
+            .unwrap();
+        let ids: Vec<String> = d
+            .lock()
+            .guardian_branches(&id)
+            .unwrap()
+            .into_iter()
+            .map(|b| b.id)
+            .collect();
+        let url = format!("/api/guardians/{id}/action-branches");
+        let post = |body: String| route(&d, "POST", &url, &body);
+
+        let ok = post(format!(r#"{{"index":0,"branch_ids":["{}"]}}"#, ids[1]));
+        assert_eq!(ok.status, 200, "{}", ok.body);
+        let stored = d.lock().get_guardian(&id).unwrap().action_hints;
+        assert_eq!(stored[0].branch_ids, vec![ids[1].clone()]);
+
+        assert_eq!(
+            post(r#"{"index":0,"branch_ids":["branch-nope"]}"#.to_string()).status,
+            400
+        );
+        assert_eq!(
+            post(format!(
+                r#"{{"index":0,"branch_ids":["{0}","{0}"]}}"#,
+                ids[0]
+            ))
+            .status,
+            400
+        );
+        assert_eq!(
+            post(r#"{"index":5,"branch_ids":[]}"#.to_string()).status,
+            400
+        );
+        // Rejected requests left the association alone.
+        let stored = d.lock().get_guardian(&id).unwrap().action_hints;
+        assert_eq!(stored[0].branch_ids, vec![ids[1].clone()]);
+
+        // An empty list makes the action review-wide again.
+        assert_eq!(
+            post(r#"{"index":0,"branch_ids":[]}"#.to_string()).status,
+            200
+        );
+        let stored = d.lock().get_guardian(&id).unwrap().action_hints;
+        assert!(stored[0].branch_ids.is_empty());
     }
 
     // ── RAL-312: board.html's request field is `run_cleanup`, matching what
