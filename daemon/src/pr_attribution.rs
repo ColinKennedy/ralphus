@@ -1,9 +1,12 @@
 //! Ralphus attribution line for newly created PR/MR descriptions (RAL-673).
 //!
-//! Insertion is deterministic: the line goes at the end of the first
-//! overview-like section (`Overview`, `Summary`, ...), and at the bottom of the
-//! description when no such section can be located safely. It is idempotent, so
-//! a description that already carries the line is returned untouched.
+//! Insertion is attempted deterministically first: the line goes at the end of
+//! the first overview-like section (`Overview`, `Summary`, ...). When no such
+//! section can be located safely, [`place_in_intro`] reports that (`None`) so
+//! the caller can have the review agent place the line, and only if that also
+//! fails does [`with_attribution`] append it at the bottom. Every path is
+//! idempotent: a description that already carries the line is returned
+//! untouched.
 
 /// The exact attribution line.
 pub const ATTRIBUTION_LINE: &str =
@@ -89,31 +92,82 @@ fn append_at_bottom(description: &str, unclosed_fence: Option<(char, usize)>) ->
     out
 }
 
-/// Return `description` carrying the attribution line exactly once.
+/// Whether `description` already carries the attribution line outside a code fence.
 #[must_use]
-pub fn with_attribution(description: &str) -> String {
+pub fn has_attribution(description: &str) -> bool {
     let text = description.replace("\r\n", "\n");
     let lines: Vec<&str> = text.split('\n').collect();
-    let (in_fence, unclosed) = fence_flags(&lines);
-    if lines
+    let (in_fence, _) = fence_flags(&lines);
+    lines
         .iter()
         .zip(&in_fence)
         .any(|(l, f)| !f && l.trim() == ATTRIBUTION_LINE)
-    {
-        return description.to_string();
+}
+
+/// Return `description` carrying the attribution line exactly once, at the
+/// bottom when it cannot be placed in an intro section.
+#[must_use]
+pub fn with_attribution(description: &str) -> String {
+    place_in_intro(description).unwrap_or_else(|| {
+        let text = description.replace("\r\n", "\n");
+        let lines: Vec<&str> = text.split('\n').collect();
+        let (in_fence, unclosed) = fence_flags(&lines);
+        append_at_bottom(&text, unclosed_fence(&lines, &in_fence, unclosed))
+    })
+}
+
+fn unclosed_fence(lines: &[&str], in_fence: &[bool], unclosed: bool) -> Option<(char, usize)> {
+    if !unclosed {
+        return None;
     }
-    let unclosed_fence = if unclosed {
-        lines
-            .iter()
-            .zip(&in_fence)
-            .rev()
-            .find(|(l, f)| **f && fence_of(l).is_some())
-            .and_then(|(l, _)| fence_of(l))
-    } else {
-        None
+    lines
+        .iter()
+        .zip(in_fence)
+        .rev()
+        .find(|(l, f)| **f && fence_of(l).is_some())
+        .and_then(|(l, _)| fence_of(l))
+}
+
+/// Whether an agent's rewrite of `original` is acceptable: it carries the line
+/// exactly once outside a fence, and removing that line gives back `original`
+/// (ignoring blank-line and trailing-space differences).
+#[must_use]
+pub fn agent_placement_is_valid(original: &str, candidate: &str) -> bool {
+    let normalize = |text: &str| -> Vec<String> {
+        text.replace("\r\n", "\n")
+            .split('\n')
+            .map(|l| l.trim_end().to_string())
+            .filter(|l| !l.is_empty())
+            .collect()
     };
+    if !has_attribution(candidate)
+        || candidate.matches(ATTRIBUTION_LINE).count()
+            != original.matches(ATTRIBUTION_LINE).count() + 1
+    {
+        return false;
+    }
+    let mut kept = normalize(candidate);
+    let Some(at) = kept.iter().position(|l| l.trim() == ATTRIBUTION_LINE) else {
+        return false;
+    };
+    kept.remove(at);
+    kept == normalize(original)
+}
+
+/// Deterministically insert the line at the end of the first intro section.
+/// `Some` when the description already carries the line (returned unchanged)
+/// or the line was placed; `None` when no intro section can be used safely
+/// (none exists, an unclosed fence, or unbalanced HTML in the section).
+#[must_use]
+pub fn place_in_intro(description: &str) -> Option<String> {
+    if has_attribution(description) {
+        return Some(description.to_string());
+    }
+    let text = description.replace("\r\n", "\n");
+    let lines: Vec<&str> = text.split('\n').collect();
+    let (in_fence, unclosed) = fence_flags(&lines);
     if unclosed {
-        return append_at_bottom(&text, unclosed_fence);
+        return None;
     }
 
     let heading_at = |i: usize| -> bool { !in_fence[i] && heading_text(lines[i]).is_some() };
@@ -124,20 +178,18 @@ pub fn with_attribution(description: &str) -> String {
                 INTRO_HEADINGS.contains(&h.as_str())
             })
     });
-    let Some(start) = intro else {
-        return append_at_bottom(&text, None);
-    };
+    let start = intro?;
     let end = (start + 1..lines.len())
         .find(|&i| heading_at(i))
         .unwrap_or(lines.len());
     let body = &lines[start + 1..end];
     let joined = body.join("\n");
-    // Unbalanced HTML constructs would swallow the line; use the bottom instead.
+    // Unbalanced HTML constructs would swallow the line.
     if joined.matches("<!--").count() != joined.matches("-->").count()
         || joined.to_ascii_lowercase().matches("<details").count()
             != joined.to_ascii_lowercase().matches("</details>").count()
     {
-        return append_at_bottom(&text, None);
+        return None;
     }
     // Insert after the last non-blank line of the section.
     let last = (start..end)
@@ -158,9 +210,9 @@ pub fn with_attribution(description: &str) -> String {
             }
             collapsed.push(l);
         }
-        return collapsed.join("\n");
+        return Some(collapsed.join("\n"));
     }
-    out.join("\n")
+    Some(out.join("\n"))
 }
 
 #[cfg(test)]
@@ -192,6 +244,30 @@ mod tests {
             format!("## Changes\n\n- a\n\n{ATTRIBUTION_LINE}")
         );
         assert_eq!(with_attribution(""), ATTRIBUTION_LINE);
+    }
+
+    #[test]
+    fn place_in_intro_declines_when_it_cannot_place_safely() {
+        assert_eq!(place_in_intro("## Changes\n\n- a"), None);
+        assert_eq!(place_in_intro("## Summary\n\n```rust\ncode"), None);
+        assert_eq!(place_in_intro("## Summary\n\n<!-- x\n\n## N\n\n-->"), None);
+        assert!(place_in_intro("## Summary\n\nx").is_some());
+        let done = format!("## Changes\n\n{ATTRIBUTION_LINE}");
+        assert_eq!(place_in_intro(&done), Some(done.clone()));
+    }
+
+    #[test]
+    fn agent_placement_validation() {
+        let original = "## Changes\n\n- a";
+        let good = format!("## Changes\n\n- a\n\n{ATTRIBUTION_LINE}");
+        assert!(agent_placement_is_valid(original, &good));
+        assert!(!agent_placement_is_valid(original, original));
+        assert!(!agent_placement_is_valid(
+            original,
+            &format!("rewritten\n{ATTRIBUTION_LINE}")
+        ));
+        let twice = format!("{good}\n\n{ATTRIBUTION_LINE}");
+        assert!(!agent_placement_is_valid(original, &twice));
     }
 
     #[test]

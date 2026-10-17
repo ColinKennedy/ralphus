@@ -2780,6 +2780,128 @@ fn parse_suggested_pr(text: &str) -> Option<(String, String, Vec<i64>)> {
     Some((title, description, relevant_prophecy_ids))
 }
 
+/// The `RunnerSpec` for a one-shot PR-writer turn on `position`'s branch: the
+/// resolver agent, run in that branch's worktree.
+fn pr_writer_spec(
+    guardian: &GuardianView,
+    position: i64,
+    resolved: guardian_merge::ResolvedResolverAgent,
+    prompt: String,
+    trace_context: Option<&str>,
+) -> RunnerSpec {
+    let pr_cwd = guardian
+        .branches
+        .iter()
+        .find(|b| b.position == position)
+        .and_then(|b| b.worktree.clone())
+        .unwrap_or_else(|| guardian.git_root.clone());
+    // RAL-517: resolve before `cwd: pr_cwd` moves the string below.
+    let retry_after_unknown_default_seconds =
+        crate::config::resolve(std::path::Path::new(&pr_cwd)).retry_after_unknown_default_seconds();
+    RunnerSpec {
+        squad_id: "guardian".to_string(),
+        task: "pr-description".to_string(),
+        cell_id: "pr-writer".to_string(),
+        cwd: pr_cwd,
+        prompt: Some(prompt),
+        command: None,
+        shell: None,
+        agent: resolved.backend,
+        executable: resolved.executable,
+        model: resolved.model,
+        system_prompt: None,
+        system_prompt_position: None,
+        timeout_sec: None,
+        budget_tokens: None,
+        maximum_budget_usd: None,
+        maximum_context: None,
+        auto_compact_threshold: None,
+        maximum_tool_output_tokens: None,
+        effort: None,
+        temperature: None,
+        proof: false,
+        trace_context: trace_context.map(str::to_string),
+        resume_agent_session_id: None,
+        assigned_agent_session_id: None,
+        // A custom profile's `env` carries the API base/key its backend needs
+        // (RAL-191's rationale for the per-branch invocations applies equally
+        // here) -- without it a profile-backed agent authenticates against the
+        // wrong endpoint, or not at all.
+        env_overrides: resolved.env,
+        machine: None,
+        tool_arg_truncate_chars: None,
+        thrash_max_compactions: None,
+        thrash_min_turn_gap: None,
+        allow_personal_settings: false,
+        allow_personal_memory: false,
+        waypoint_context: false,
+        retry_attempt: 0,
+        retry_after_unknown_default_seconds,
+        maximum_timeout: None,
+        pass_score: None,
+    }
+}
+
+/// Add the Ralphus attribution line to a new PR description. The deterministic
+/// placement is tried first; when it cannot find a safe spot, the review agent
+/// (the same PR-writer agent that wrote the description) is asked to place the
+/// line, and its answer is accepted only if it kept the description intact and
+/// carries the line exactly once. If the agent is unavailable or answers badly,
+/// the line is appended at the bottom so it is never missing.
+fn attribute_description(
+    runner: &dyn Runner,
+    guardian: &GuardianView,
+    position: i64,
+    trace_context: Option<&str>,
+    description: &str,
+) -> String {
+    if let Some(placed) = crate::pr_attribution::place_in_intro(description) {
+        return placed;
+    }
+    let root = PathBuf::from(&guardian.git_root);
+    match guardian_merge::resolve_resolver_agent_from_config(
+        guardian.resolver_agent.as_deref(),
+        guardian.resolver_model.as_deref(),
+        &root,
+    ) {
+        Ok(resolved) => {
+            let prompt = format!(
+                "Insert this exact line, unchanged, into the pull request description below, \
+                 as its own paragraph at the end of the introductory section (the first \
+                 Overview/Summary/Description-like section, or the opening text if there is \
+                 none) and not inside a code fence, HTML comment, or <details> block. Change \
+                 nothing else in the description. Respond with ONLY the complete resulting \
+                 description -- no commentary, no code fence around it.\n\n\
+                 LINE:\n{}\n\nDESCRIPTION:\n{description}",
+                crate::pr_attribution::ATTRIBUTION_LINE
+            );
+            let spec = pr_writer_spec(guardian, position, resolved, prompt, trace_context);
+            let result = runner.run(&spec);
+            if result.is_done() {
+                let candidate = result.summary.trim_matches(['\r', '\n']);
+                if crate::pr_attribution::agent_placement_is_valid(description, candidate) {
+                    return candidate.to_string();
+                }
+            }
+            // ralphus[ignore-rlog-pair]: this low-level helper has no Store; its Store-owning caller records the structured workflow outcome
+            crate::rlog!(
+                WARNING,
+                "ralphus [pr] attribution: agent placement unusable (status={:?}); \
+                 appending at the bottom",
+                result.status
+            );
+        }
+        Err(e) => {
+            // ralphus[ignore-rlog-pair]: this low-level helper has no Store; its Store-owning caller records the structured workflow outcome
+            crate::rlog!(
+                WARNING,
+                "ralphus [pr] attribution: no agent available ({e}); appending at the bottom"
+            );
+        }
+    }
+    crate::pr_attribution::with_attribution(description)
+}
+
 /// Synthesize a suggested PR title + description from one branch's unique
 /// commit range, using the same `Runner`/`RunnerSpec` mechanism
 /// `guardian_merge::generate_final_summary` uses for the change summary.
@@ -2945,57 +3067,7 @@ fn synthesize_pr_text(
          intent rather than file-level detail. Keep it under {MAX_PR_DESCRIPTION_CHARS} \
          characters.{template_note}{prophecy_note}"
     );
-    let pr_cwd = guardian
-        .branches
-        .iter()
-        .find(|b| b.position == position)
-        .and_then(|b| b.worktree.clone())
-        .unwrap_or_else(|| guardian.git_root.clone());
-    // RAL-517: resolve before `cwd: pr_cwd` moves the string below.
-    let retry_after_unknown_default_seconds =
-        crate::config::resolve(std::path::Path::new(&pr_cwd)).retry_after_unknown_default_seconds();
-    let spec = RunnerSpec {
-        squad_id: "guardian".to_string(),
-        task: "pr-description".to_string(),
-        cell_id: "pr-writer".to_string(),
-        cwd: pr_cwd,
-        prompt: Some(prompt),
-        command: None,
-        shell: None,
-        agent: resolved.backend,
-        executable: resolved.executable,
-        model: resolved.model,
-        system_prompt: None,
-        system_prompt_position: None,
-        timeout_sec: None,
-        budget_tokens: None,
-        maximum_budget_usd: None,
-        maximum_context: None,
-        auto_compact_threshold: None,
-        maximum_tool_output_tokens: None,
-        effort: None,
-        temperature: None,
-        proof: false,
-        trace_context: trace_context.map(str::to_string),
-        resume_agent_session_id: None,
-        assigned_agent_session_id: None,
-        // A custom profile's `env` carries the API base/key its backend needs
-        // (RAL-191's rationale for the per-branch invocations applies equally
-        // here) -- without it a profile-backed agent authenticates against the
-        // wrong endpoint, or not at all.
-        env_overrides: resolved.env,
-        machine: None,
-        tool_arg_truncate_chars: None,
-        thrash_max_compactions: None,
-        thrash_min_turn_gap: None,
-        allow_personal_settings: false,
-        allow_personal_memory: false,
-        waypoint_context: false,
-        retry_attempt: 0,
-        retry_after_unknown_default_seconds,
-        maximum_timeout: None,
-        pass_score: None,
-    };
+    let spec = pr_writer_spec(guardian, position, resolved, prompt, trace_context);
     // ralphus[ignore-rlog-pair]: this low-level helper has no Store; its Store-owning caller records the structured workflow outcome
     crate::rlog!(
         DEBUG,
@@ -8437,7 +8509,8 @@ fn submit_stacked_branch_pr(
                 trace_context,
                 &unpublished_prophecies,
             );
-            let description = crate::pr_attribution::with_attribution(&description);
+            let description =
+                attribute_description(runner, guardian, position, trace_context, &description);
             let description = match format_prophecy_details_block(&reviewer_relevant_prophecies) {
                 Some(block) => format!("{description}\n\n{block}"),
                 None => description,
@@ -12274,6 +12347,47 @@ mod tests {
         assert_eq!(description, "Adds x.");
         assert_eq!(relevant.len(), 1, "{relevant:?}");
         assert_eq!(relevant[0].id, 2);
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn attribute_description_falls_back_to_the_agent_then_the_bottom() {
+        let root = tmp_dir("pr-attribution-agent");
+        g(&root, &["init", "--initial-branch", "main"]);
+        gwrite(&root, "base.txt", "base\n");
+        g(&root, &["add", "."]);
+        g(&root, &["commit", "--message", "base"]);
+        let store = store();
+        let gid = store
+            .create_guardian("demo", "main", root.to_str().unwrap())
+            .unwrap();
+        store.add_guardian_branch(&gid, "x").unwrap();
+        let guardian = store.get_guardian(&gid).unwrap();
+        let line = crate::pr_attribution::ATTRIBUTION_LINE;
+        let original = "## Changes\n\n- a";
+
+        // A deterministic placement never consults the agent.
+        let unused = ScriptedRunner("ignored".to_string());
+        assert_eq!(
+            attribute_description(&unused, &guardian, 0, None, "## Summary\n\nx"),
+            format!("## Summary\n\nx\n\n{line}")
+        );
+
+        // No intro section: the agent's valid placement is used.
+        let placed = format!("{line}\n\n## Changes\n\n- a");
+        let agent = ScriptedRunner(placed.clone());
+        assert_eq!(
+            attribute_description(&agent, &guardian, 0, None, original),
+            placed
+        );
+
+        // An agent that rewrote the description is rejected: bottom fallback.
+        let rewrite = ScriptedRunner(format!("something else\n\n{line}"));
+        assert_eq!(
+            attribute_description(&rewrite, &guardian, 0, None, original),
+            format!("{original}\n\n{line}")
+        );
 
         let _ = std::fs::remove_dir_all(root);
     }
