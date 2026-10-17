@@ -127,23 +127,24 @@ fn selected_grammar(shell: Option<&str>) -> Option<(Shell, &'static str)> {
 
 /// Warnings for executables in `command` that cannot be found on this host.
 /// `seen` holds the `shell:executable` keys already looked up during this
-/// validation: an executable already in it is neither looked up nor reported
-/// again, and new ones are added. Names that cannot be judged offline (shell
-/// built-ins, cmdlets, aliases, variables, paths) are skipped.
+/// validation: a command already in it is neither looked up nor reported
+/// again. Dynamic names and paths are skipped.
 #[must_use]
 pub fn missing_command_warnings(
     command: &str,
     shell: Option<&str>,
     seen: &mut HashSet<String>,
 ) -> Vec<String> {
-    missing_command_warnings_with(command, shell, seen, &|exe| find_executable(exe, None))
+    missing_command_warnings_with(command, shell, seen, &command_exists)
 }
+
+type CommandResolver<'a> = dyn Fn(Shell, Option<&str>, &str) -> Option<bool> + 'a;
 
 fn missing_command_warnings_with(
     command: &str,
     shell: Option<&str>,
     seen: &mut HashSet<String>,
-    exists: &dyn Fn(&str) -> bool,
+    exists: &CommandResolver<'_>,
 ) -> Vec<String> {
     let Some((grammar, shell_name)) = selected_grammar(shell) else {
         return Vec::new();
@@ -153,221 +154,72 @@ fn missing_command_warnings_with(
         if !seen.insert(format!("{shell_name}:{}", exe.to_lowercase())) {
             continue;
         }
-        if !is_checkable(grammar, &exe) || exists(&exe) {
+        if !is_checkable(&exe) || exists(grammar, shell, &exe) != Some(false) {
             continue;
         }
         out.push(format!(
-            "`{exe}` was not found on this machine's PATH for {shell_name}; check the selected shell or correct the executable name (aliases, shell functions and tools installed only in a later execution environment cannot be seen here)"
+            "`{exe}` was not found by {shell_name} on this machine; check the selected shell or correct the command name (tools installed only in a later execution environment cannot be seen here)"
         ));
     }
     out
 }
 
-/// Whether `exe` is a plain program name whose presence on `PATH` says
-/// something: not a built-in, cmdlet, alias, path, variable or glob.
-fn is_checkable(grammar: Shell, exe: &str) -> bool {
+/// Dynamic names and paths need the execution environment to resolve them.
+fn is_checkable(exe: &str) -> bool {
     if exe.contains([
-        '/', '\\', '$', '%', '`', '*', '?', '(', ')', '{', '}', '"', '\'', '~', '=',
+        '/', '\\', '$', '%', '`', '*', '?', '(', ')', '{', '}', '"', '\'', '~', '=', '&', '|', '<',
+        '>', '^', '!', ';', ' ', '\t', '\n',
     ]) {
         return false;
     }
-    let lower = exe.to_lowercase();
-    match grammar {
-        Shell::Bash => !BASH_BUILTINS.contains(&lower.as_str()),
-        Shell::Cmd => !CMD_BUILTINS.contains(&lower.as_str()),
-        Shell::PowerShell => !PS_ALIASES.contains(&lower.as_str()) && !is_cmdlet_name(&lower),
+    !exe.is_empty()
+}
+
+/// Ask the selected shell how it resolves the name. A failed shell launch is
+/// indeterminate, so validation does not turn it into a missing-command warning.
+fn command_exists(shell: Shell, selected_shell: Option<&str>, exe: &str) -> Option<bool> {
+    use std::process::{Command, Stdio};
+
+    let shell_program = selected_shell.unwrap_or(name(shell));
+    if shell == Shell::Cmd {
+        let where_status = Command::new("where.exe")
+            .arg(exe)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .ok()?;
+        if where_status.success() {
+            return Some(true);
+        }
+        let help = Command::new(shell_program)
+            .args(["/d", "/c", "help"])
+            .output()
+            .ok()?;
+        if help.stdout.is_empty() {
+            return None;
+        }
+        return Some(String::from_utf8_lossy(&help.stdout).lines().any(|line| {
+            line.split_whitespace()
+                .next()
+                .is_some_and(|name| name.eq_ignore_ascii_case(exe))
+        }));
     }
-}
-
-fn is_cmdlet_name(lower: &str) -> bool {
-    lower
-        .split_once('-')
-        .is_some_and(|(verb, _)| PS_VERBS.contains(&verb))
-}
-
-const BASH_BUILTINS: &[&str] = &[
-    ".",
-    ":",
-    "[",
-    "[[",
-    "alias",
-    "bg",
-    "bind",
-    "break",
-    "builtin",
-    "caller",
-    "cd",
-    "command",
-    "compgen",
-    "complete",
-    "continue",
-    "declare",
-    "dirs",
-    "disown",
-    "echo",
-    "enable",
-    "eval",
-    "exec",
-    "exit",
-    "export",
-    "false",
-    "fc",
-    "fg",
-    "getopts",
-    "hash",
-    "help",
-    "history",
-    "jobs",
-    "kill",
-    "let",
-    "local",
-    "logout",
-    "mapfile",
-    "popd",
-    "printf",
-    "pushd",
-    "pwd",
-    "read",
-    "readarray",
-    "readonly",
-    "return",
-    "set",
-    "shift",
-    "shopt",
-    "source",
-    "suspend",
-    "test",
-    "times",
-    "trap",
-    "true",
-    "type",
-    "typeset",
-    "ulimit",
-    "umask",
-    "unalias",
-    "unset",
-    "wait",
-];
-
-const CMD_BUILTINS: &[&str] = &[
-    "assoc", "break", "call", "cd", "chdir", "cls", "color", "copy", "date", "del", "dir", "echo",
-    "endlocal", "erase", "exit", "for", "ftype", "goto", "if", "md", "mkdir", "mklink", "move",
-    "path", "pause", "popd", "prompt", "pushd", "rd", "rem", "ren", "rename", "rmdir", "set",
-    "setlocal", "shift", "start", "time", "title", "type", "ver", "verify", "vol",
-];
-
-const PS_ALIASES: &[&str] = &[
-    "%", "?", "cat", "cd", "chdir", "clear", "cls", "copy", "cp", "curl", "del", "dir", "echo",
-    "erase", "fl", "foreach", "ft", "gc", "gci", "gi", "gl", "gm", "gp", "gps", "gv", "h",
-    "history", "icm", "iex", "irm", "iwr", "kill", "ls", "man", "md", "measure", "mi", "mkdir",
-    "move", "mv", "ni", "oss", "popd", "ps", "pushd", "pwd", "rd", "ren", "ri", "rm", "rmdir",
-    "rni", "sc", "select", "set", "si", "sl", "sleep", "sls", "sort", "start", "tee", "type",
-    "where", "wget", "write",
-];
-
-const PS_VERBS: &[&str] = &[
-    "add",
-    "clear",
-    "compare",
-    "compress",
-    "convert",
-    "convertfrom",
-    "convertto",
-    "copy",
-    "disable",
-    "enable",
-    "enter",
-    "exit",
-    "expand",
-    "export",
-    "find",
-    "foreach",
-    "format",
-    "get",
-    "group",
-    "hide",
-    "import",
-    "install",
-    "invoke",
-    "join",
-    "lock",
-    "measure",
-    "move",
-    "new",
-    "out",
-    "pop",
-    "publish",
-    "push",
-    "read",
-    "receive",
-    "register",
-    "remove",
-    "rename",
-    "resolve",
-    "restart",
-    "resume",
-    "save",
-    "select",
-    "send",
-    "set",
-    "show",
-    "sort",
-    "split",
-    "start",
-    "stop",
-    "suspend",
-    "test",
-    "uninstall",
-    "unlock",
-    "unregister",
-    "update",
-    "use",
-    "wait",
-    "where",
-    "write",
-];
-
-/// Looks `exe` up on `path` (the process `PATH` when `None`), trying the
-/// `PATHEXT` extensions on Windows.
-fn find_executable(exe: &str, path: Option<&std::ffi::OsStr>) -> bool {
-    let path = path
-        .map(std::ffi::OsStr::to_os_string)
-        .or_else(|| std::env::var_os("PATH"));
-    let Some(path) = path else {
-        return false;
+    let mut child = match shell {
+        Shell::Bash => {
+            let mut command = Command::new(shell_program);
+            command.args(["-c", "command -v \"$1\" >/dev/null 2>&1", "_", exe]);
+            command
+        }
+        Shell::PowerShell => {
+            let mut command = Command::new(shell_program);
+            command.args(["-NonInteractive", "-Command", "if (Get-Command -Name $env:RALPHUS_COMMAND_CHECK_NAME -ErrorAction SilentlyContinue) { exit 0 } else { exit 1 }"]);
+            command.env("RALPHUS_COMMAND_CHECK_NAME", exe);
+            command
+        }
+        Shell::Cmd => unreachable!(),
     };
-    let exts: Vec<String> = if cfg!(windows) {
-        let pathext =
-            std::env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_string());
-        std::iter::once(String::new())
-            .chain(
-                pathext
-                    .split(';')
-                    .filter(|e| !e.is_empty())
-                    .map(str::to_string),
-            )
-            .chain(std::iter::once(".ps1".to_string()))
-            .collect()
-    } else {
-        vec![String::new()]
-    };
-    std::env::split_paths(&path).any(|dir| {
-        exts.iter().any(|ext| {
-            let candidate = dir.join(format!("{exe}{ext}"));
-            candidate.is_file() && is_runnable(&candidate)
-        })
-    })
-}
-
-#[cfg(unix)]
-fn is_runnable(path: &std::path::Path) -> bool {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::metadata(path).is_ok_and(|m| m.permissions().mode() & 0o111 != 0)
-}
-
-#[cfg(not(unix))]
-fn is_runnable(_path: &std::path::Path) -> bool {
-    true
+    child.stdout(Stdio::null()).stderr(Stdio::null());
+    child.status().ok().map(|status| status.success())
 }
 
 #[cfg(all(test, feature = "shell-syntax"))]
@@ -376,7 +228,9 @@ mod tests {
 
     fn warnings(command: &str, shell: Option<&str>, present: &[&str]) -> Vec<String> {
         let mut seen = HashSet::new();
-        missing_command_warnings_with(command, shell, &mut seen, &|e| present.contains(&e))
+        missing_command_warnings_with(command, shell, &mut seen, &|_, _, e| {
+            Some(present.contains(&e))
+        })
     }
 
     #[test]
@@ -408,7 +262,7 @@ mod tests {
             "{}",
             w[0]
         );
-        assert!(w[0].contains("correct the executable name"), "{}", w[0]);
+        assert!(w[0].contains("correct the command name"), "{}", w[0]);
     }
 
     #[test]
@@ -420,9 +274,9 @@ mod tests {
     fn repeated_executables_are_checked_once() {
         let calls = std::cell::Cell::new(0);
         let mut seen = HashSet::new();
-        let exists = |_: &str| {
+        let exists = |_: Shell, _: Option<&str>, _: &str| {
             calls.set(calls.get() + 1);
-            false
+            Some(false)
         };
         let first = missing_command_warnings_with(
             "zzz a && zzz b; zzz c",
@@ -437,19 +291,63 @@ mod tests {
     }
 
     #[test]
-    fn shell_builtins_and_cmdlets_are_not_looked_up() {
-        assert!(warnings("cd /tmp && echo hi", Some("bash"), &[]).is_empty());
-        assert!(warnings("Get-ChildItem | ls", Some("powershell"), &[]).is_empty());
-        assert!(warnings("dir && echo hi", Some("cmd"), &[]).is_empty());
+    fn shell_resolver_checks_builtins_and_aliases() {
+        if cfg!(windows) {
+            assert_eq!(command_exists(Shell::Cmd, None, "dir"), Some(true));
+            assert_eq!(
+                command_exists(Shell::Cmd, None, "nonsuchralphuscommand"),
+                Some(false)
+            );
+            assert_eq!(
+                command_exists(Shell::PowerShell, None, "Get-Alias"),
+                Some(true)
+            );
+            assert_eq!(command_exists(Shell::PowerShell, None, "gci"), Some(true));
+            assert_eq!(
+                command_exists(
+                    Shell::PowerShell,
+                    None,
+                    "Get-DefinitelyMissingRalphusCommand"
+                ),
+                Some(false)
+            );
+        } else {
+            assert_eq!(command_exists(Shell::Bash, None, "cd"), Some(true));
+            assert_eq!(
+                command_exists(Shell::Bash, None, "definitely_missing_ralphus_command"),
+                Some(false)
+            );
+        }
     }
 
     #[test]
-    fn builtin_set_depends_on_the_shell() {
-        // `dir` is a cmd/PowerShell built-in but an external program in bash.
-        assert_eq!(warnings("dir", Some("bash"), &[]).len(), 1);
-        assert!(warnings("dir", Some("cmd"), &[]).is_empty());
-        // `export` is a bash built-in only.
-        assert!(warnings("export A=1", Some("bash"), &[]).is_empty());
+    fn resolver_result_decides_warning_without_name_lists() {
+        let mut seen = HashSet::new();
+        let warnings = missing_command_warnings_with(
+            "Get-Alias checkf; Get-FictionalThing",
+            Some("powershell"),
+            &mut seen,
+            &|_, _, name| Some(name == "Get-Alias"),
+        );
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("Get-FictionalThing"));
+    }
+
+    #[test]
+    fn resolver_receives_selected_shell() {
+        let mut seen = HashSet::new();
+        let warnings = missing_command_warnings_with(
+            "checkf",
+            Some("pwsh"),
+            &mut seen,
+            &|grammar, shell, name| {
+                assert_eq!(grammar, Shell::PowerShell);
+                assert_eq!(shell, Some("pwsh"));
+                assert_eq!(name, "checkf");
+                Some(true)
+            },
+        );
+        assert!(warnings.is_empty());
     }
 
     #[test]
@@ -459,24 +357,12 @@ mod tests {
     }
 
     #[test]
-    fn path_lookup_finds_files_in_listed_directories() {
-        let dir = std::env::temp_dir().join(format!("ralphus-shcheck-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let file = dir.join(if cfg!(windows) {
-            "mytool.exe"
-        } else {
-            "mytool"
-        });
-        std::fs::write(&file, b"").unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
-        let path = std::env::join_paths([&dir]).unwrap();
-        assert!(find_executable("mytool", Some(&path)));
-        assert!(!find_executable("othertool", Some(&path)));
-        std::fs::remove_dir_all(&dir).unwrap();
+    fn unavailable_resolver_does_not_warn() {
+        let mut seen = HashSet::new();
+        assert!(
+            missing_command_warnings_with("unknown", Some("bash"), &mut seen, &|_, _, _| None)
+                .is_empty()
+        );
     }
 
     #[test]

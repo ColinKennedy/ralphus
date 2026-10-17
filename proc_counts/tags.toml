@@ -2,6 +2,11 @@
 # `id` is "<nextest binary id> <test name>"; each test carries exactly one tag.
 # Distinct behaviours are separate tests.
 
+# Shell-backed command resolution during local submission validation.
+[[test]]
+id = "ralphus-core shell_check::tests::shell_resolver_checks_builtins_and_aliases"
+tag = "validation-command-resolution"
+
 # Command proofs (daemon-side `run_command_proof*`).
 [[test]]
 id = "ralphus-daemon proof::tests::passing_command_is_true"
