@@ -1181,9 +1181,12 @@
           if (st.quota) {
             const q = st.quota;
             const low = q.remaining <= q.limit * 0.1;
+            const pausedNow = st.backoff.active && st.backoff.resume_at_ms !== null;
             const resets = q.reset_at_ms > now ? `resets in ${fmtRelativeAge(q.reset_at_ms - now)} (${when(q.reset_at_ms)})` : "window has reopened";
             rows.push(row(
-              `${q.remaining} of ${q.limit} calls left · ${resets}`,
+              pausedNow && q.remaining > 0 && q.reset_at_ms > now
+                ? `${q.remaining} of ${q.limit} calls left at last reading · paused, see below · ${resets}`
+                : `${q.remaining} of ${q.limit} calls left · ${resets}`,
               `The quota the forge reported on the daemon's last call, ${fmtRelativeAge(Math.max(0, now - q.observed_at_ms))} ago. The quota is per token, so other reviews and other tools using it spend from the same pool. A reading older than the reset time is stale.`,
               low ? "var(--delayed)" : "",
             ));
@@ -1202,7 +1205,14 @@
           }
         }
         const b = st.backoff;
-        if (b.active && b.resume_at_ms) {
+        const exhaustedQuota = st.quota && st.quota.remaining <= 0 && st.quota.reset_at_ms > now ? st.quota : null;
+        if (!(b.active && b.resume_at_ms) && exhaustedQuota) {
+          rows.push(row(
+            `quota exhausted · calls resume in ${fmtRelativeAge(exhaustedQuota.reset_at_ms - now)} (${when(exhaustedQuota.reset_at_ms)})`,
+            "The forge's last reading says this token has no calls left until the window reopens, so requests will be refused even though the daemon has not recorded a pause yet.",
+            "var(--delayed)",
+          ));
+        } else if (b.active && b.resume_at_ms) {
           rows.push(row(
             `paused: quota exhausted · resumes in ${fmtRelativeAge(Math.max(0, b.resume_at_ms - now))} (${when(b.resume_at_ms)})`,
             "The forge said this token is out of calls, so the daemon stopped polling CI for this repo until the window reopens instead of retrying into the limit. Nothing is lost; checks resume on their own.",
