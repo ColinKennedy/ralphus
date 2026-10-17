@@ -722,7 +722,7 @@
         inspectorTab = b ? want.tab : "overview";
         if (b) {
           if (inspectorTab === "live") inspectorLiveAttached[b.id] = true;
-          if (inspectorTab === "appraisals") delete branchAppraisals[`${g.id}:${b.id}`];
+          if (inspectorTab === "notes") delete branchNotes[`${g.id}:${b.id}`];
           if (want.runIdx === null) delete liveRunIdx[b.id]; else liveRunIdx[b.id] = want.runIdx;
           liveSub[b.id] = want.liveSub;
           if (inspectorTab === "live" && want.liveSub === "system") {
@@ -763,7 +763,7 @@
         // shows the pane -- a second "Show Live View" click bought nothing,
         // since nothing had loaded before the tab was opened either way.
         const bid = inspectorBranchId;
-        if (tab === "appraisals" && bid) delete branchAppraisals[`${selectedGuardian}:${bid}`];
+        if (tab === "notes" && bid) delete branchNotes[`${selectedGuardian}:${bid}`];
         syncHash();
         if (tab === "live" && bid && attachInspectorLive(bid)) return;
         renderReviewInspector();
@@ -854,7 +854,7 @@
           ["worktree", "Worktree", "The on-disk worktree for this branch — its path, its environment layer, and what it retires with."],
           ["feedback", "Feedback", "Your conversation with the resolver agent about this branch.\nWhat you write here is routed into the branch's worktree as a change request."],
           ["live", "Live", "The resolver agent's terminal for this branch.\nNothing attaches until you open this tab."],
-          ["appraisals", "Appraisals", "The judge's scored appraisals of this branch's proof steps, read from what the daemon stored — not from the PR body.\nUse it to tell whether a PR lacks appraisals because none exist or because rendering them failed.\nNothing loads until you open this tab."],
+          ["notes", "Notes", "Everything written down about this branch: the judges' appraisals, the live actions attributed to it, and its latest ghost handoff — read from what the daemon stored, not from the PR body.\nFilter by type to find one kind of note.\nNothing loads until you open this tab."],
         ];
         host.innerHTML = `
           <div class="insp-head">
@@ -868,6 +868,7 @@
                 k === "feedback" && unread ? `<span class="insp-badge" data-tip="You left feedback the resolver has not answered yet.">1</span>` : ""}</button>`).join("")}</div>
           </div>
           <div class="insp-body">${inspectorTabBody(g, b)}</div>`;
+        if (inspectorTab === "notes") renderNotesFilter();
         restoreInspectorUiState(snap, `${g.id}:${b.id}:${inspectorTab}`);
         // The rewrite above recreated any live `.runterm` at scrollTop 0.
         restorePeekScrollPositions();
@@ -940,68 +941,168 @@
         if (inspectorTab === "worktree") return inspectorWorktreeTab(g, b);
         if (inspectorTab === "feedback") return inspectorFeedbackTab(g, b);
         if (inspectorTab === "live") return inspectorLiveTab(g, b);
-        if (inspectorTab === "appraisals") return inspectorAppraisalsTab(g, b);
+        if (inspectorTab === "notes") return inspectorNotesTab(g, b);
         return inspectorOverviewTab(g, b);
       }
       /**
-       * Appraisals per `guardianId:branchId`, fetched when the Appraisals tab
-       * is opened. `"loading"` while in flight, `"error"` on failure; dropped
-       * when the tab is opened again so each open refetches.
-       * @type {{[key: string]: BranchAppraisals|"loading"|"error"}}
+       * Notes per `guardianId:branchId`, fetched when the Notes tab is opened.
+       * `"loading"` while in flight, `"error"` on failure; dropped when the tab
+       * is opened again so each open refetches. Filtering and expanding re-render
+       * what is held here and never fetch.
+       * @type {{[key: string]: BranchNotes|"loading"|"error"}}
        */
-      const branchAppraisals = {};
+      const branchNotes = {};
+      /** @type {Set<string>} Ids of the notes the user has expanded. */
+      const expandedNotes = new Set();
+      /** @type {StatusDropdownOption[]} The note types the Notes filter offers. */
+      const NOTE_TYPE_OPTIONS = [
+        { value: "appraisal", label: "Appraisal" },
+        { value: "live_action", label: "Live action" },
+        { value: "ghost", label: "Ghost" },
+      ];
+      /** @type {Set<string>} The note types currently shown; all of them until the user narrows it. */
+      const notesTypeFilter = new Set(NOTE_TYPE_OPTIONS.map((o) => o.value));
       /**
-       * Fetches `GET /api/guardians/{id}/branches/{bid}/appraisals` -- the
-       * stored appraisals, not what the PR body rendered.
+       * Fetches `GET /api/guardians/{id}/branches/{bid}/notes` -- the stored
+       * appraisals, live actions and latest ghost, not what the PR body rendered.
        * @param {string} gid - The review id.
        * @param {string} bid - The branch id.
        * @returns {Promise<void>}
        */
-      async function loadBranchAppraisals(gid, bid) {
+      async function loadBranchNotes(gid, bid) {
         const key = `${gid}:${bid}`;
-        branchAppraisals[key] = "loading";
+        branchNotes[key] = "loading";
         try {
-          const r = await fetch(`/api/guardians/${encodeURIComponent(gid)}/branches/${encodeURIComponent(bid)}/appraisals`);
-          branchAppraisals[key] = r.ok ? await r.json() : "error";
+          const r = await fetch(`/api/guardians/${encodeURIComponent(gid)}/branches/${encodeURIComponent(bid)}/notes`);
+          branchNotes[key] = r.ok ? await r.json() : "error";
         } catch {
-          branchAppraisals[key] = "error";
+          branchNotes[key] = "error";
         }
-        if (inspectorTab === "appraisals") renderReviewInspector();
+        if (inspectorTab === "notes") renderReviewInspector();
       }
       /**
-       * The Appraisals tab: every appraisal the daemon holds for this branch's
-       * proofs, with an explicit empty state. Requests data the first time it
-       * renders after the tab is opened.
+       * Expands or collapses one note.
+       * @param {string} id - The note's id.
+       * @returns {void}
+       */
+      function toggleNote(id) {
+        if (expandedNotes.has(id)) expandedNotes.delete(id); else expandedNotes.add(id);
+        renderReviewInspector();
+      }
+      /**
+       * Renders the Notes type filter into its slot after the inspector
+       * repaint recreated it. A no-op while the slot is absent (notes not
+       * loaded yet).
+       * @returns {void}
+       */
+      function renderNotesFilter() {
+        if (!document.getElementById("notes-type-filter")) return;
+        renderStatusDropdown("notes-type-filter", {
+          id: "notes-type",
+          label: "Type",
+          mode: "multi",
+          itemNoun: "note type",
+          options: NOTE_TYPE_OPTIONS,
+          selected: notesTypeFilter,
+          optionTip: (value) => `Show or hide ${value.replace("_", " ")} notes in this branch's Notes tab.`,
+          onToggle: (value, on) => {
+            if (on) notesTypeFilter.add(value); else notesTypeFilter.delete(value);
+            renderReviewInspector();
+          },
+          onAll: () => {
+            NOTE_TYPE_OPTIONS.forEach((o) => notesTypeFilter.add(o.value));
+            renderReviewInspector();
+          },
+          onNone: () => {
+            notesTypeFilter.clear();
+            renderReviewInspector();
+          },
+        });
+      }
+      /**
+       * The type badge shown on every note.
+       * @param {BranchNote} n - The note.
+       * @returns {string}
+       */
+      function noteBadge(n) {
+        /** @type {{[type: string]: string}} */
+        const tips = {
+          appraisal: "An appraisal: a judge's scored verdict on one of this branch's proof steps.",
+          live_action: "A live action: something to try against the running program, attributed to this branch, with the outcome of its latest run.",
+          ghost: "A ghost: the latest handoff note left by a cell of this branch or by its review worktree. A ghost accumulates its own history, so only the latest is listed.",
+        };
+        const opt = NOTE_TYPE_OPTIONS.find((o) => o.value === n.type);
+        return `<span class="note-badge note-badge-${esc(n.type)}" data-tip="${esc(tips[n.type] || n.type)}">${esc(opt ? opt.label : n.type)}</span>`;
+      }
+      /**
+       * One note: header (badge, title, time), a collapsed preview, and the
+       * full body and details once expanded.
+       * @param {BranchNote} n - The note.
+       * @returns {string}
+       */
+      function noteCard(n) {
+        const expanded = expandedNotes.has(n.id);
+        const block = "white-space:pre-wrap;margin:4px 0 10px;color:var(--muted)";
+        const when = n.at_ms ? new Date(n.at_ms).toLocaleString() : "";
+        let preview = "";
+        let details = "";
+        if (n.type === "appraisal") {
+          const color = n.passed ? "var(--done)" : "var(--failed)";
+          preview = n.summary || "";
+          const sections = n.sections.map((s) => `<div class="k" data-tip="A section of the appraisal, titled and structured by the judge's role.">${esc(s.title)}</div><div class="mono" style="${block}">${esc(s.body)}</div>`).join("");
+          const published = n.published_at_ms
+            ? `${n.pr_id ? esc(n.pr_id) + " · " : ""}${esc(new Date(n.published_at_ms).toLocaleString())}`
+            : "not yet";
+          details = `<div class="kv-row" data-tip="Score the judge gave against the threshold in force when it was recorded. The proof step passes when score is at least the threshold."><span class="k">score</span><span class="v" style="color:${color}">${n.score}/10 (needs ${n.pass_score}) — ${n.passed ? "pass" : "fail"}</span></div>
+            <div class="kv-row" data-tip="Each proof restart adds an attempt; the latest one is shown."><span class="k">attempt</span><span class="v">${n.attempt}</span></div>
+            <div class="kv-row" data-tip="Whether this appraisal has been published with a PR, and which one."><span class="k">published</span><span class="v">${published}</span></div>
+            ${sections}`;
+        } else if (n.type === "live_action") {
+          preview = n.verdict_summary || n.prompt;
+          details = `<div class="kv-row" data-tip="The verdict of this action's latest finished live run."><span class="k">verdict</span><span class="v">${esc(n.verdict || "not run yet")}</span></div>
+            <div class="k" data-tip="What the live run was asked to do.">prompt</div><div class="mono" style="${block}">${esc(n.prompt)}</div>
+            ${n.report ? `<div class="k" data-tip="The agent's report from the latest finished run.">report</div><div class="mono" style="${block}">${esc(n.report)}</div>` : ""}`;
+        } else {
+          preview = n.content;
+          details = `<div class="kv-row" data-tip="The cell or review worktree that wrote this ghost."><span class="k">from</span><span class="v mono">${esc(n.owner_uri)}</span></div>`;
+        }
+        const shown = expanded || preview.length <= 160 ? preview : `${preview.slice(0, 160).trimEnd()}…`;
+        return `<div class="note-card">
+            <div class="fb-head">
+              ${noteBadge(n)}
+              <span class="k" data-tip="${esc(n.id)}">${esc(n.title)}</span>
+              ${when ? `<span class="fb-time" data-tip="When this note was recorded, in your local time.">${esc(when)}</span>` : ""}
+              <button class="fb-expand" data-click="toggleNote" data-key="${esc(n.id)}"
+                data-tip="${expanded ? "Collapse this note." : "Expand to read the whole note and its details."}">${expanded ? "−" : "+"}</button>
+            </div>
+            <div class="${expanded ? "fb-body" : "fb-body note-collapsed"}" style="white-space:pre-wrap">${esc(shown)}</div>
+            ${expanded ? details : ""}
+          </div>`;
+      }
+      /**
+       * The Notes tab: this branch's appraisals, live actions and latest ghost,
+       * filterable by type, with explicit empty states. Requests data the first
+       * time it renders after the tab is opened.
        * @param {GuardianView} g - The review.
        * @param {GuardianBranch} b - The selected branch.
        * @returns {string}
        */
-      function inspectorAppraisalsTab(g, b) {
+      function inspectorNotesTab(g, b) {
         const key = `${g.id}:${b.id}`;
-        const data = branchAppraisals[key];
-        if (data === undefined) { loadBranchAppraisals(g.id, b.id); return `<div class="empty">Loading appraisals…</div>`; }
-        if (data === "loading") return `<div class="empty">Loading appraisals…</div>`;
-        if (data === "error") return `<div class="empty" data-tip="The daemon could not return this branch's appraisals. Reopen the tab to retry.">Could not load appraisals.</div>`;
-        const note = data.post_appraisals ? "" : `<div class="insp-pr-sub" style="color:var(--ignored)" data-tip="This review's posting setting is off, so its PR omits appraisals on purpose. The appraisals below are still stored.\nChange it in the review's settings.">Posting disabled for this review — appraisals are not added to its PR.</div>`;
-        if (!data.appraisals.length) {
-          return `${note}<div class="empty" data-tip="No scored proof step of this branch's cells has recorded an appraisal. If the PR is missing appraisals, that is why.">No appraisals</div>`;
+        const data = branchNotes[key];
+        if (data === undefined) { loadBranchNotes(g.id, b.id); return `<div class="empty">Loading notes…</div>`; }
+        if (data === "loading") return `<div class="empty">Loading notes…</div>`;
+        if (data === "error") return `<div class="empty" data-tip="The daemon could not return this branch's notes. Reopen the tab to retry.">Could not load notes.</div>`;
+        const posting = data.post_appraisals ? "" : `<div class="insp-pr-sub" style="color:var(--ignored)" data-tip="This review's posting setting is off, so its PR omits appraisals on purpose. The appraisals below are still stored.\nChange it in the review's settings.">Posting disabled for this review — appraisals are not added to its PR.</div>`;
+        const shown = data.notes.filter((n) => notesTypeFilter.has(n.type));
+        const bar = `<div class="notes-bar"><span id="notes-type-filter"></span><span class="insp-pr-sub" data-tip="How many of this branch's notes pass the Type filter.">${shown.length} of ${data.notes.length} notes</span></div>`;
+        if (!data.notes.length) {
+          return `${posting}${bar}<div class="empty" data-tip="This branch has no appraisal, no live action attributed to it and no ghost yet.">No notes</div>`;
         }
-        const block = "white-space:pre-wrap;margin:4px 0 10px;color:var(--muted)";
-        const cards = data.appraisals.map((a) => {
-          const color = a.passed ? "var(--done)" : "var(--failed)";
-          const sections = a.sections.map((s) => `<div class="k" data-tip="A section of the appraisal, titled and structured by the judge's role.">${esc(s.title)}</div><div class="mono" style="${block}">${esc(s.body)}</div>`).join("");
-          const published = a.published_at_ms
-            ? `${a.pr_id ? esc(a.pr_id) + " · " : ""}${esc(new Date(a.published_at_ms).toLocaleString())}`
-            : "not yet";
-          return `<div class="dhead" data-tip="${esc(a.entity_uri)}"><span class="k">${esc(a.label)}</span></div>
-            <div class="kv-row" data-tip="Score the judge gave against the threshold in force when it was recorded. The proof step passes when score is at least the threshold."><span class="k">score</span><span class="v" style="color:${color}">${a.score}/10 (needs ${a.pass_score}) — ${a.passed ? "pass" : "fail"}</span></div>
-            <div class="kv-row" data-tip="Each proof restart adds an attempt; the latest one is shown."><span class="k">attempt</span><span class="v">${a.attempt}</span></div>
-            <div class="kv-row" data-tip="When the judge recorded this appraisal."><span class="k">recorded</span><span class="v">${esc(new Date(a.created_at_ms).toLocaleString())}</span></div>
-            <div class="kv-row" data-tip="Whether this appraisal has been published with a PR, and which one."><span class="k">published</span><span class="v">${published}</span></div>
-            ${a.summary ? `<div class="mono" style="${block}" data-tip="The judge's one-paragraph verdict.">${esc(a.summary)}</div>` : ""}
-            ${sections}`;
-        }).join("");
-        return `${note}${cards}`;
+        if (!shown.length) {
+          return `${posting}${bar}<div class="empty" data-tip="Every note type is filtered out. Use the Type filter to show some.">No notes match the filter</div>`;
+        }
+        return `${posting}${bar}${shown.map(noteCard).join("")}`;
       }
       /**
        * @typedef {object} PrPollEntry

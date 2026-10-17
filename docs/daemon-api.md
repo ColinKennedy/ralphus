@@ -165,7 +165,8 @@ where one exists.
 | GET | `/api/guardians/{id}/manual-checks-env` | Resolved environment variables for the manual-checks step (RAL-324) |
 | GET | `/api/guardians/{id}/branches/{branch_id}/conflicts` | [Live conflicting-files list](#get-apiguardiansidbranchesbranch_idconflicts) for the board's Reviews UI (RAL-148) |
 | GET | `/api/guardians/{id}/branches/{branch_id}/diff-summary` | [Files/lines changed](#get-apiguardiansidbranchesbranch_iddiff-summary) in a branch worktree against its nearest enabled upstream (RAL-634) |
-| GET | `/api/guardians/{id}/branches/{branch_id}/appraisals` | [Stored appraisals of one review branch](#get-apiguardiansidbranchesbranch_idappraisals) for the board's inspector Appraisals tab (RAL-588) |
+| GET | `/api/guardians/{id}/branches/{branch_id}/notes` | [Appraisals, live actions and the latest ghost of one review branch](#get-apiguardiansidbranchesbranch_idnotes) for the board's inspector Notes tab (RAL-670) |
+| GET | `/api/guardians/{id}/branches/{branch_id}/appraisals` | [Stored appraisals of one review branch](#get-apiguardiansidbranchesbranch_idappraisals) for the CLI and API clients (RAL-588); the board's Notes tab reads `/notes` |
 | GET | `/api/guardians/{id}/branches/{branch_id}/forge-status` | [Forge rate-limit and polling status of one review branch](#get-apiguardiansidbranchesbranch_idforge-status) for the board's inspector |
 | GET | `/api/guardians/{id}/branches/{branch_id}/debug-events` | [The resolver's current-attempt debug stream](#get-apisquadsidcellstisidebug-events-and-its-proofguardian-siblings-ral-296) (RAL-296) |
 | GET | `/api/guardians/{id}/branches/{branch_id}/system-prompt` | [The branch resolver's exact effective system prompt](#get-apisquadsidcellstisisi-system-prompt-and-its-siblings-ral-428) (RAL-428, admin) |
@@ -2665,6 +2666,39 @@ holding one of its task's cells. Board-only (no CLI command).
 - `appraisals` — ordered by `entity_uri`; `label` is the proof step's `id`,
   else `proof N`. Empty when none were recorded.
 
+`404` if `id` or `branch_id` doesn't address a real guardian/branch.
+
+### `GET /api/guardians/{id}/branches/{branch_id}/notes`
+Every note of one review branch in a single newest-first list (RAL-670), for
+the board's inspector Notes tab. Three types, each with a `type`, a stable
+`id`, a `title` and `at_ms`:
+- `appraisal` — the same rows as the `appraisals` endpoint above, with that
+  endpoint's fields alongside the common ones.
+- `live_action` — a review live action attributed to this branch (an action
+  spanning several branches appears on each). Carries `prompt`, and the
+  `verdict`, `verdict_summary` and `report` of its latest finished run (all
+  `null` before one finishes); `at_ms` is that run's finish time, else the
+  action's creation time.
+- `ghost` — the single most recently updated ghost among the branch's cells'
+  ghosts and the branch's review-worktree ghost (a ghost accumulates its own
+  history, so older ones are not listed). Carries `owner_uri` and `content`.
+
+Board-only (no CLI command).
+```json
+{
+  "post_appraisals": true,
+  "notes": [
+    { "type": "ghost", "id": "cell:squad-1:0:0", "title": "Ghost",
+      "at_ms": 1700000002000, "owner_uri": "cell:squad-1:0:0", "content": "…" },
+    { "type": "live_action", "id": "live-action:guardian-1:0", "title": "Open the board",
+      "at_ms": 1700000001000, "prompt": "…", "verdict": "pass",
+      "verdict_summary": "…", "report": "…" },
+    { "type": "appraisal", "id": "proof:squad-1:0:cell:0:0#2", "title": "judge",
+      "at_ms": 1700000000000, "score": 8, "pass_score": 7, "passed": true,
+      "summary": "…", "sections": [{ "title": "Findings", "body": "…" }] }
+  ]
+}
+```
 `404` if `id` or `branch_id` doesn't address a real guardian/branch.
 
 ### `GET /api/guardians/{id}/branches/{branch_id}/diff-summary`

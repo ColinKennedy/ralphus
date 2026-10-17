@@ -1418,6 +1418,45 @@
         }
       }
     },
+    "/api/guardians/{id}/branches/{branch_id}/notes": {
+      "get": {
+        "operationId": "getGuardiansByIdBranchesByBranchIdNotes",
+        "summary": "Board 'Notes' inspector tab for the branch (RAL-670); no CLI equivalent",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "branch_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/JsonValue"
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
     "/api/guardians/{id}/branches/{branch_id}/conflicts": {
       "get": {
         "operationId": "getGuardiansByIdBranchesByBranchIdConflicts",
