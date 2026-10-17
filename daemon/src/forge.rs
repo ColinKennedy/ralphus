@@ -1576,7 +1576,7 @@ impl ForgeClient {
             .filter(|run| {
                 matches!(
                     run["conclusion"].as_str().unwrap_or_default(),
-                    "failure" | "timed_out" | "cancelled" | "action_required"
+                    "failure" | "timed_out" | "action_required"
                 )
             })
             .map(|run| FailedCheck {
@@ -1601,10 +1601,13 @@ impl ForgeClient {
                 ..build_pr_failure(failing, "check")
             }));
         }
-        if runs
-            .iter()
-            .any(|r| r["status"].as_str() != Some("completed"))
-        {
+        // A cancelled run (manual cancel, concurrency cancel) has no failure
+        // to fix and is not a pass: keep waiting for a re-run instead of
+        // dispatching an auto-fix.
+        if runs.iter().any(|r| {
+            r["status"].as_str() != Some("completed")
+                || r["conclusion"].as_str() == Some("cancelled")
+        }) {
             return Ok(PrCiState::Pending);
         }
 
@@ -1758,13 +1761,8 @@ impl ForgeClient {
                     ..build_pr_failure(checks, "job")
                 }))
             }
-            "canceled" | "skipped" => Ok(PrCiState::Failing(PrFailure {
-                reason: format!("pipeline {pipeline_status}"),
-                job_url: pipeline["web_url"].as_str().map(str::to_string),
-                log_text: None,
-                checks: vec![],
-                ..Default::default()
-            })),
+            // A cancelled or skipped pipeline has no failure to fix: keep
+            // waiting for a re-run rather than dispatching an auto-fix.
             // "running" | "pending" | "created" | "waiting_for_resource" | "preparing" | ...
             _ => Ok(PrCiState::Pending),
         }
@@ -1907,7 +1905,7 @@ impl ForgeClient {
             .find(|s| {
                 matches!(
                     s["conclusion"].as_str().unwrap_or_default(),
-                    "failure" | "timed_out" | "cancelled" | "action_required"
+                    "failure" | "timed_out" | "action_required"
                 )
             })
             .and_then(|s| s["name"].as_str())
@@ -8361,7 +8359,7 @@ mod tests {
     }
 
     #[test]
-    fn check_pr_ci_status_still_fails_on_a_cancelled_job_of_the_newest_workflow_run() {
+    fn check_pr_ci_status_waits_on_a_cancelled_job_of_the_newest_workflow_run() {
         let mock = MockForge::start(move |server| {
             let req = server.recv();
             req.respond(
@@ -8384,10 +8382,7 @@ mod tests {
             .unwrap();
         });
         let client = mock.client(ForgeKind::GitHub, "acme/widget");
-        assert!(matches!(
-            client.check_pr_ci_status(4).unwrap(),
-            PrCiState::Failing(_)
-        ));
+        assert_eq!(client.check_pr_ci_status(4).unwrap(), PrCiState::Pending);
         mock.finish();
     }
 
@@ -9161,6 +9156,25 @@ mod tests {
         let client = mock.client(ForgeKind::GitLab, "group%2Fproj");
         assert_eq!(client.check_pr_ci_status(9).unwrap(), PrCiState::Passing);
         mock.finish();
+    }
+
+    #[test]
+    fn check_pr_ci_status_waits_on_a_canceled_or_skipped_gitlab_pipeline() {
+        for status in ["canceled", "skipped"] {
+            let mock = MockForge::start(move |server| {
+                let req = server.recv();
+                req.respond(
+                    tiny_http::Response::from_string(format!(
+                        r#"{{"merge_status": "can_be_merged", "pipeline": {{"id": 54, "status": "{status}", "web_url": "https://gitlab.example/pipelines/54"}}}}"#
+                    ))
+                    .with_status_code(200),
+                )
+                .unwrap();
+            });
+            let client = mock.client(ForgeKind::GitLab, "group%2Fproj");
+            assert_eq!(client.check_pr_ci_status(9).unwrap(), PrCiState::Pending);
+            mock.finish();
+        }
     }
 
     #[test]
