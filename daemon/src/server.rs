@@ -7261,7 +7261,25 @@ fn run_submit_followup_guarded(
     squad_id: &str,
     followup: impl FnOnce() + std::panic::UnwindSafe,
 ) {
-    if let Err(payload) = std::panic::catch_unwind(followup) {
+    crate::rlog!(
+        INFO,
+        "ralphus [submit] background materialization for squad {squad_id} started"
+    );
+    let outcome = std::panic::catch_unwind(followup);
+    // Written even when the follow-up returned early on a handled failure:
+    // what a stuck squad is missing is this row, not a particular outcome.
+    if outcome.is_ok() {
+        let guard = store_handle.lock();
+        crate::cartographer::Note::new("submit")
+            .squad(squad_id)
+            .scope("materialize")
+            .emit(
+                &guard,
+                "background materialization thread returned",
+                serde_json::json!({}),
+            );
+    }
+    if let Err(payload) = outcome {
         let detail = payload
             .downcast_ref::<&str>()
             .map(|s| (*s).to_string())
@@ -7308,6 +7326,23 @@ fn run_submit_followup(
         phase_step.set(step);
         report_materialization_phase(store_handle, &squad_id, step, label);
     };
+    // A Cartographer row at each step boundary, stamped with the time since
+    // this follow-up started. `report_phase` only marks the start of a named
+    // phase, so a thread that stops between two of them leaves no trace; with
+    // these, the last row before a gap names the step that never finished.
+    let started = std::time::Instant::now();
+    let checkpoint = |what: &str| {
+        let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        let guard = store_handle.lock();
+        crate::cartographer::Note::new("submit")
+            .scope("materialize")
+            .squad(&squad_id)
+            .emit(
+                &guard,
+                format!("{what} (+{elapsed_ms}ms)"),
+                serde_json::json!({ "elapsed_ms": elapsed_ms }),
+            );
+    };
 
     // Fetch every registered-remote project's bare `?upstream=`/declared
     // review `upstream` BEFORE taking the lock below -- see
@@ -7342,14 +7377,21 @@ fn run_submit_followup(
         }
         resolved
     };
+    checkpoint(&format!(
+        "prefetched {} remote upstream ref(s)",
+        prefetched_upstreams.len()
+    ));
 
     // Claim every LOCAL cell's worktree (branch + `w/<short>` directory) under a
     // brief lock and leave creating it to the scheduler: the squad is built
     // from the TOML alone and each cell starts as its own worktree becomes
     // ready. See `crate::worktrees::plan_local_worktree_jobs`'s doc comment.
     report_phase("Claiming worktrees");
-    let prefetched_worktrees = {
+    let lock_requested = std::time::Instant::now();
+    let (prefetched_worktrees, claim_lock_wait_ms, claim_hold_ms) = {
         let guard = store_handle.lock();
+        let lock_wait_ms = lock_requested.elapsed().as_millis();
+        let planning_started = std::time::Instant::now();
         let (cells, tasks) = crate::reviews::cells_and_tasks_from_file(&file);
         let jobs = crate::worktrees::plan_local_worktree_jobs(
             &guard,
@@ -7358,8 +7400,17 @@ fn run_submit_followup(
             &tasks,
             &prefetched_upstreams,
         );
-        crate::worktrees::planned_worktree_paths(&jobs)
+        (
+            crate::worktrees::planned_worktree_paths(&jobs),
+            lock_wait_ms,
+            planning_started.elapsed().as_millis(),
+        )
     };
+    checkpoint(&format!(
+        "claimed {} worktree slot(s): waited {claim_lock_wait_ms}ms for the store lock, \
+         planned in {claim_hold_ms}ms under it",
+        prefetched_worktrees.len()
+    ));
 
     // WS-D.8: called with the handle, not a held guard. This was the single
     // worst lock holder in the daemon -- measured at 45.9 seconds, twice, on
@@ -7385,6 +7436,7 @@ fn run_submit_followup(
         fail_materialization(store_handle, &squad_id, &e.message);
         return;
     }
+    checkpoint("review derivation finished");
 
     // RAL-400 Phase 8: create every `[[waypoint]]` this submission declared,
     // now that review derivation above has run and every same-file
@@ -7491,6 +7543,7 @@ fn run_submit_followup(
         }
     }
 
+    checkpoint("waypoint creation and enrollment finished");
     report_phase("Finishing up");
 
     // RAL-318: Triage pooling -- and the worktree placeholder resolution
