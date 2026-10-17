@@ -220,9 +220,30 @@ pub fn run_command_proof_capture_in_shell(
             builder
         }
     };
+
+    let mut env_map = env.clone();
+    if cfg!(windows) {
+        if let Some(shell_name) = shell {
+            if shell_name.contains("bash") {
+                let current_path = env_map.get("PATH").map(|s| s.as_str()).unwrap_or("");
+                if let Ok(home) = std::env::var("USERPROFILE") {
+                    let cargo_path = format!("{}/.cargo/bin", home);
+                    if !current_path.contains(&cargo_path) {
+                        let new_path = if current_path.is_empty() {
+                            cargo_path
+                        } else {
+                            format!("{};{}", cargo_path, current_path)
+                        };
+                        env_map.insert("PATH".to_string(), new_path);
+                    }
+                }
+            }
+        }
+    }
+
     builder
         .current_dir(cwd)
-        .envs(env)
+        .envs(&env_map)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
