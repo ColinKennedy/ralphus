@@ -1297,7 +1297,7 @@ fn purge_carry_refs(root: &Workspace, id: &str) -> Vec<String> {
         String::new()
     });
     for name in listed.lines().map(str::trim).filter(|s| !s.is_empty()) {
-        if let Err(e) = root.git(&["update-ref", "--delete", name]) {
+        if let Err(e) = root.git(&["update-ref", "-d", name]) {
             failures.push(format!("{name}: {e}"));
         }
     }
@@ -1334,7 +1334,7 @@ impl CarryRefs {
 impl Drop for CarryRefs {
     fn drop(&mut self) {
         for (root, name) in &self.pins {
-            let _ = git(root, &["update-ref", "--delete", name]);
+            let _ = git(root, &["update-ref", "-d", name]);
         }
     }
 }
