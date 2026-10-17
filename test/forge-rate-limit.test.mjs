@@ -107,6 +107,31 @@ test("an active backoff shows the pause, its resume, and the pushed-back next ch
   assert.doesNotMatch(out, /You are currently not being rate-limited/);
 });
 
+test("zero calls left never reads as 'not being rate-limited'", () => {
+  const out = forgeRateLimitRowsHtml(
+    status({ quota: { limit: 5000, remaining: 0, reset_at_ms: NOW + 60_000, observed_at_ms: NOW } }),
+    NOW,
+  );
+  assert.match(out, /0 of 5000 calls left/);
+  assert.match(out, /quota exhausted · calls resume in 60s/);
+  assert.doesNotMatch(out, /You are currently not being rate-limited/);
+  // Once the window has reopened the zero reading is stale and no longer a limit.
+  const reopened = forgeRateLimitRowsHtml(
+    status({ quota: { limit: 5000, remaining: 0, reset_at_ms: NOW - 1, observed_at_ms: NOW - 9_000 } }),
+    NOW,
+  );
+  assert.match(reopened, /You are currently not being rate-limited/);
+});
+
+test("a pause with a nonzero last reading labels the number as a last reading", () => {
+  const out = forgeRateLimitRowsHtml(
+    status({ backoff: { active: true, resume_at_ms: NOW + 60_000, remaining_ms: 60_000 } }),
+    NOW,
+  );
+  assert.match(out, /4000 of 5000 calls left at last reading · paused/);
+  assert.match(out, /paused: quota exhausted/);
+});
+
 test("an overdue next check reads 'due now' and an unscheduled one explains why", () => {
   const overdue = forgeRateLimitRowsHtml(
     status({ checks: { ...status().checks, next_attempt_at_ms: NOW - 1 } }),
