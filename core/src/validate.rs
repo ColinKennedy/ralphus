@@ -7703,8 +7703,8 @@ placement = "copy"
 
     #[test]
     fn triaged_dep_across_worktrees_is_rejected() {
-        let wt_a = "<<ralphus:new-worktree/a?upstream=main>>";
-        let wt_b = "<<ralphus:new-worktree/b?upstream=main>>";
+        let wt_a = "<<ralphus:new-worktree/a?upstream_remote=.&upstream_branch=main>>";
+        let wt_b = "<<ralphus:new-worktree/b?upstream_remote=.&upstream_branch=main>>";
         let src = format!(
             "{TRIAGE_DEP_HEAD}{}{}",
             triage_dep_cell("one", wt_a, true, None),
@@ -7722,7 +7722,7 @@ placement = "copy"
 
     #[test]
     fn triaged_dep_on_non_triaged_other_worktree_is_rejected() {
-        let wt_a = "<<ralphus:new-worktree/a?upstream=main>>";
+        let wt_a = "<<ralphus:new-worktree/a?upstream_remote=.&upstream_branch=main>>";
         let src = format!(
             "{TRIAGE_DEP_HEAD}{}{}",
             triage_dep_cell("one", "/repo", false, None),
@@ -7740,7 +7740,7 @@ placement = "copy"
 
     #[test]
     fn triaged_dep_within_one_worktree_is_valid() {
-        let wt_a = "<<ralphus:new-worktree/a?upstream=main>>";
+        let wt_a = "<<ralphus:new-worktree/a?upstream_remote=.&upstream_branch=main>>";
         let src = format!(
             "{TRIAGE_DEP_HEAD}{}{}",
             triage_dep_cell("one", wt_a, true, None),

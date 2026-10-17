@@ -157,7 +157,7 @@ pub fn build_copy_toml(source: &CellCopySource, base: &CopyBase, unique: &str) -
             CopyBase::Branch(b) => b.as_str(),
         };
         Some(format!(
-            "<<{WORKTREE_PLACEHOLDER_PREFIX}{}-{}-copy-{unique}?upstream={upstream}>>",
+            "<<{WORKTREE_PLACEHOLDER_PREFIX}{}-{}-copy-{unique}?upstream_remote=.&upstream_branch={upstream}>>",
             slug(&cell.task_name),
             slug(&cell.cell_id),
         ))
@@ -248,7 +248,7 @@ project = "demo"
 
 [[task.cell]]
 id = "compile"
-cwd = "ralphus:new-worktree/build?upstream=<<default>>"
+cwd = "ralphus:new-worktree/build?upstream_remote=.&upstream_branch=<<default>>"
 prompt = "make it \"compile\"\nplease"
 agent = "claude-code"
 model = "opus"
@@ -264,7 +264,7 @@ prompt = "is it good?"
 
 [[task.cell]]
 id = "other"
-cwd = "ralphus:new-worktree/other?upstream=<<default>>"
+cwd = "ralphus:new-worktree/other?upstream_remote=.&upstream_branch=<<default>>"
 command = "true"
 "#;
 
@@ -299,14 +299,19 @@ command = "true"
         assert_eq!(cell.proof[1].prompt.as_deref(), Some("is it good?"));
         assert_eq!(
             cell.cwd.as_deref(),
-            Some("<<ralphus:new-worktree/build-compile-copy-1?upstream=<<default>>>>")
+            Some(
+                "<<ralphus:new-worktree/build-compile-copy-1?upstream_remote=.&upstream_branch=<<default>>>>"
+            )
         );
     }
 
     #[test]
     fn from_branch_starts_the_copy_on_the_given_branch() {
         let toml = build_copy_toml(&source(), &CopyBase::Branch("feat/x".into()), "2");
-        assert!(toml.contains("?upstream=feat/x"), "{toml}");
+        assert!(
+            toml.contains("?upstream_remote=.&upstream_branch=feat/x"),
+            "{toml}"
+        );
         let report = ralphus_core::validate::validate_toml(&toml);
         assert!(report.is_ok(), "{:?}", report.errors);
     }
