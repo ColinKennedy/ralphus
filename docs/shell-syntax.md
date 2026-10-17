@@ -75,6 +75,16 @@ the grammar with the fewest wins.
 - Shells with no grammar are not checked. Without the feature the check is
   skipped silently.
 
+### Missing-command warning (RAL-671)
+
+For a submission that runs locally (no `machine` anywhere in it names a
+non-local machine), each distinct executable -- the grammar's command-name
+nodes for the selected shell -- is looked up on the daemon host's `PATH`
+(`PATHEXT` on Windows) and a missing one gets a `missing_command` warning,
+once per validation. Shell built-ins, PowerShell cmdlets and aliases, paths,
+variables and globs are never looked up; aliases, shell functions and tools
+present only in a later environment can still warn falsely.
+
 ## Vendored grammars
 
 The crates.io releases of the three grammars reject valid commands, so
