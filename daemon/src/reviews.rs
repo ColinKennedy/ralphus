@@ -1810,7 +1810,7 @@ fn resolve_action_targets(
 
     let mut landed: Vec<(String, String)> = Vec::new();
     for raw in refs {
-        let parsed = parse_action_branch_ref(raw).map_err(&fail)?;
+        let parsed = parse_action_branch_ref(raw).map_err(fail)?;
         let matches: Vec<&Membership> = match &parsed {
             ActionBranchRef::Branch(name) => {
                 memberships.iter().filter(|m| &m.branch == name).collect()
