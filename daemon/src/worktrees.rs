@@ -371,7 +371,7 @@ fn clean_half_created_worktree(root: &Path, wt: &Path) -> Result<(), String> {
     let _ = git(root, &["worktree", "remove", "--force", "--force", &wt_str]);
     let _ = git(root, &["worktree", "prune"]);
     if wt.exists() {
-        std::fs::remove_dir_all(wt).map_err(|e| {
+        remove_dir_all_retrying(wt).map_err(|e| {
             format!(
                 "could not remove the half-created worktree at {}: {e}",
                 wt.display()
@@ -380,6 +380,30 @@ fn clean_half_created_worktree(root: &Path, wt: &Path) -> Result<(), String> {
     }
     let _ = git(root, &["worktree", "prune"]);
     Ok(())
+}
+
+/// How many times [`remove_dir_all_retrying`] tries, and how long it waits
+/// between tries.
+const REMOVE_DIR_ATTEMPTS: u32 = 10;
+const REMOVE_DIR_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// `remove_dir_all`, retried while it keeps failing. On Windows a just-killed
+/// `git checkout` (or a virus scanner still reading what it wrote) can hold
+/// files open for a moment, so the first delete fails with "directory not
+/// empty" (os error 145) even though the next one succeeds.
+fn remove_dir_all_retrying(dir: &Path) -> std::io::Result<()> {
+    let mut attempt = 1;
+    loop {
+        match std::fs::remove_dir_all(dir) {
+            Ok(()) => return Ok(()),
+            Err(_) if !dir.exists() => return Ok(()),
+            Err(e) if attempt >= REMOVE_DIR_ATTEMPTS => return Err(e),
+            Err(_) => {
+                attempt += 1;
+                std::thread::sleep(REMOVE_DIR_RETRY_DELAY);
+            }
+        }
+    }
 }
 
 /// Where a `(root, branch)` creation currently stands; see [`WORKTREE_CREATIONS`].
@@ -3406,6 +3430,21 @@ mod tests {
     use std::sync::atomic::{AtomicU32, Ordering};
 
     static TEST_N: AtomicU32 = AtomicU32::new(0);
+
+    #[test]
+    fn remove_dir_all_retrying_removes_a_populated_tree_and_tolerates_a_missing_one() {
+        let dir = std::env::temp_dir().join(format!(
+            "ralphus-rm-retry-{}-{}",
+            std::process::id(),
+            TEST_N.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(dir.join("a/b")).unwrap();
+        std::fs::write(dir.join("a/b/file.txt"), "x").unwrap();
+
+        remove_dir_all_retrying(&dir).unwrap();
+        assert!(!dir.exists());
+        remove_dir_all_retrying(&dir).expect("an already-removed directory is success");
+    }
 
     #[test]
     fn config_write_errors_classified_as_transient() {
