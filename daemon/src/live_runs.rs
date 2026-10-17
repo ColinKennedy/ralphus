@@ -913,6 +913,19 @@ fn execute_queued_run(
     let _ = store
         .lock()
         .finish_live_run(&run.run_id, &outcome, integration);
+    {
+        let mut evidence_run = run.clone();
+        evidence_run.cwd = Some(cwd.clone());
+        crate::live_results::record_run_evidence(store, &guardian.id, &evidence_run, &outcome);
+        let guard = store.lock();
+        let _ = guard.freeze_live_run_branches(
+            &run.run_id,
+            &guard
+                .live_action_branch_ids(&guardian.id, run.action_idx)
+                .unwrap_or_default(),
+        );
+        let _ = guard.request_live_refresh_for_guardian(&guardian.id);
+    }
     post_report(store, &guardian, &target.label, &outcome);
     integration == "pending"
 }
@@ -966,6 +979,7 @@ pub fn integrate_run(store: &crate::store_lock::StoreHandle, runner: &dyn Runner
         let _ = store
             .lock()
             .set_live_run_integration(run_id, "none", Some("no commits to carry"));
+        refresh_results(store, &g.id);
         return;
     };
     if g.status.as_str() == "merge_stopped" {
@@ -983,6 +997,7 @@ pub fn integrate_run(store: &crate::store_lock::StoreHandle, runner: &dyn Runner
             "skipped",
             Some("the review finished before this run's commits could be carried"),
         );
+        refresh_results(store, &g.id);
         return;
     }
     let Some(branch) = top_branch(&g) else {
@@ -1011,6 +1026,10 @@ pub fn integrate_run(store: &crate::store_lock::StoreHandle, runner: &dyn Runner
             "integrated",
             Some("already on the top branch (the same change landed another way)"),
         );
+        let _ = store
+            .lock()
+            .record_live_run_destination(run_id, &branch_id, None);
+        refresh_results(store, &g.id);
         return;
     }
     let patch = ws
@@ -1067,6 +1086,10 @@ pub fn integrate_run(store: &crate::store_lock::StoreHandle, runner: &dyn Runner
     let _ = store
         .lock()
         .set_live_run_integration(run_id, "integrated", Some(&detail));
+    let _ = store
+        .lock()
+        .record_live_run_destination(run_id, &branch_id, Some(outcome.pushed));
+    refresh_results(store, &g.id);
     crate::cartographer::Note::new("guardian")
         .guardian(&g.id)
         .scope("live_action")
@@ -1098,6 +1121,11 @@ pub fn integrate_run(store: &crate::store_lock::StoreHandle, runner: &dyn Runner
     );
 }
 
+/// Ask for every open PR/MR of the review to re-render its live-test results.
+fn refresh_results(store: &crate::store_lock::StoreHandle, guardian_id: &str) {
+    let _ = store.lock().request_live_refresh_for_guardian(guardian_id);
+}
+
 fn fail_integration(
     store: &crate::store_lock::StoreHandle,
     g: &GuardianView,
@@ -1106,6 +1134,7 @@ fn fail_integration(
 ) {
     let guard = store.lock();
     let _ = guard.set_live_run_integration(&run.run_id, "failed", Some(reason));
+    let _ = guard.request_live_refresh_for_guardian(&g.id);
     let live_ref = run.live_ref.as_deref().unwrap_or("(none)");
     let _ = guard.enqueue_error_mailbox_message(
         crate::mailbox::MailboxPriority::High,
@@ -1239,6 +1268,7 @@ pub fn sweep_automatic_runs(store: &crate::store_lock::StoreHandle, runners: &Li
         let _ = maybe_start_automatic_run(store, runners, &gid);
     }
     retry_pending_integrations(store, runners);
+    crate::live_results::process_pr_refreshes_background(store);
 }
 
 /// Daily cleanup of live refs (called with the worktree retirement sweep).
