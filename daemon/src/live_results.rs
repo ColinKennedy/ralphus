@@ -1314,12 +1314,12 @@ mod tests {
     fn unknown_details_are_stated_and_secrets_redacted() {
         let mut item = section_run("r1", 0, 1);
         item.evidence = RunEvidence::default();
-        item.run.report = Some("ran ANTHROPIC_API_KEY=EXAMPLE_API_KEY_PLACEHOLDER run".into());
+        item.run.report = Some("ran ANTHROPIC_API_KEY=example_api_key_placeholder run".into());
         let section = render_section(&[item]).unwrap();
         assert!(section.contains("**inconclusive**"));
         assert!(section.contains("push result not recorded") || section.contains("not recorded"));
         assert!(section.contains("No reproduction commands"));
-        assert!(!section.contains("EXAMPLE_API_KEY_PLACEHOLDER"));
+        assert!(!section.contains("example_api_key_placeholder"));
     }
 
     #[test]
