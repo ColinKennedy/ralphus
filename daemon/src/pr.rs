@@ -8437,6 +8437,7 @@ fn submit_stacked_branch_pr(
                 trace_context,
                 &unpublished_prophecies,
             );
+            let description = crate::pr_attribution::with_attribution(&description);
             let description = match format_prophecy_details_block(&reviewer_relevant_prophecies) {
                 Some(block) => format!("{description}\n\n{block}"),
                 None => description,

@@ -63,6 +63,7 @@ pub mod perf_timing;
 pub mod plan;
 pub mod poller_health;
 pub mod pr;
+pub mod pr_attribution;
 pub mod preset_roles;
 pub mod presets;
 pub mod procreg;
