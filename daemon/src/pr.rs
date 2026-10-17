@@ -1056,6 +1056,8 @@ impl Store {
                  auto_fix_baseline_checks = CASE WHEN ?='passing' THEN NULL ELSE auto_fix_baseline_checks END,
                  auto_fix_baseline_generation = CASE WHEN ?='passing' THEN NULL ELSE auto_fix_baseline_generation END,
                  auto_fix_refund_evaluated_generation = CASE WHEN ?='passing' THEN NULL ELSE auto_fix_refund_evaluated_generation END,
+                 auto_fix_progress = CASE WHEN ?='passing' THEN NULL ELSE auto_fix_progress END,
+                 auto_fix_weak_refunds = CASE WHEN ?='passing' THEN 0 ELSE auto_fix_weak_refunds END,
                  ci_failing_checks = CASE WHEN ?='passing' THEN NULL ELSE ci_failing_checks END,
                  ci_failing_generation = CASE WHEN ?='passing' THEN NULL ELSE ci_failing_generation END,
                  ci_settled_since_ms = CASE WHEN ?='passing' THEN NULL ELSE ci_settled_since_ms END,
@@ -1068,6 +1070,8 @@ impl Store {
                 status,
                 job_url,
                 now_ms(),
+                status,
+                status,
                 status,
                 status,
                 status,
@@ -1200,6 +1204,79 @@ impl Store {
         now: i64,
         settle_ms: i64,
     ) -> Result<bool> {
+        self.set_pr_failing_checks_with_evidence_at(
+            id,
+            names,
+            generation,
+            settled,
+            now,
+            settle_ms,
+            &[],
+            crate::config::DEFAULT_AUTO_FIX_WEAK_PROGRESS_REFUNDS,
+        )
+    }
+
+    /// Whether [`Self::set_pr_failing_checks_with_evidence_at`] would evaluate
+    /// this snapshot now, i.e. whether a caller should fetch the failing
+    /// checks' logs for it (RAL-678). Mirrors the evaluation gate there so
+    /// routine polls of an already-decided or still-settling generation never
+    /// fetch logs.
+    pub fn pr_refund_evaluation_due(
+        &self,
+        id: &str,
+        generation: Option<&str>,
+        settled: bool,
+        now: i64,
+        settle_ms: i64,
+    ) -> Result<bool> {
+        let (prev_generation, prev_settled_since, evaluated, count): (
+            Option<String>,
+            Option<i64>,
+            Option<String>,
+            i64,
+        ) = self.conn.query_row(
+            "SELECT ci_failing_generation, ci_settled_since_ms,
+                    auto_fix_refund_evaluated_generation, auto_fix_attempt_count
+             FROM guardian_pull_requests WHERE id=?",
+            params![id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )?;
+        let Some(generation) = generation else {
+            return Ok(false);
+        };
+        if !settled || evaluated.as_deref() == Some(generation) || count <= 0 {
+            return Ok(false);
+        }
+        let since = if prev_generation.as_deref() == Some(generation) {
+            prev_settled_since.unwrap_or(now)
+        } else {
+            now
+        };
+        Ok(now.saturating_sub(since) >= settle_ms)
+    }
+
+    /// [`Self::set_pr_failing_checks_at`] with the failing checks' parsed logs
+    /// (RAL-678). When the strict-subset rule does not refund, a named
+    /// `failed -> passed` test transition in a failing check refunds
+    /// (`strong`), and a completed-count rise above the check's high-water
+    /// mark in a comparable suite refunds while fewer than `weak_limit`
+    /// refunds in the campaign were earned that way (`weak`). At most one
+    /// attempt is refunded per generation. Every evaluated generation emits
+    /// one decision event -- refund or denial -- carrying the rule, evidence
+    /// level, parser, observations and attempt counts.
+    #[allow(clippy::too_many_arguments)]
+    pub fn set_pr_failing_checks_with_evidence_at(
+        &self,
+        id: &str,
+        names: &[String],
+        generation: Option<&str>,
+        settled: bool,
+        now: i64,
+        settle_ms: i64,
+        evidence: &[crate::ci_progress::CheckEvidence],
+        weak_limit: u32,
+    ) -> Result<bool> {
+        use crate::ci_progress as cp;
         type Row = (
             Option<String>,
             Option<String>,
@@ -1207,6 +1284,8 @@ impl Store {
             Option<String>,
             Option<String>,
             Option<String>,
+            Option<String>,
+            i64,
         );
         type Names = std::collections::BTreeSet<String>;
         let pr = self.get_pull_request(id)?;
@@ -1219,10 +1298,13 @@ impl Store {
             baseline_json,
             baseline_generation,
             evaluated_generation,
+            progress_json,
+            weak_used,
         ): Row = self.conn.query_row(
             "SELECT ci_failing_checks, ci_failing_generation, ci_settled_since_ms,
                     auto_fix_baseline_checks, auto_fix_baseline_generation,
-                    auto_fix_refund_evaluated_generation
+                    auto_fix_refund_evaluated_generation, auto_fix_progress,
+                    auto_fix_weak_refunds
              FROM guardian_pull_requests WHERE id=?",
             params![id],
             |r| {
@@ -1233,6 +1315,8 @@ impl Store {
                     r.get(3)?,
                     r.get(4)?,
                     r.get(5)?,
+                    r.get(6)?,
+                    r.get(7)?,
                 ))
             },
         )?;
@@ -1258,12 +1342,90 @@ impl Store {
         let evaluate = generation.is_some()
             && evaluated_generation.as_deref() != generation
             && settled_since.is_some_and(|since| now.saturating_sub(since) >= settle_ms);
-        let refund = evaluate
-            && pr.auto_fix_attempt_count > 0
-            && baseline_gen.as_deref() != generation
+        let comparable =
+            evaluate && pr.auto_fix_attempt_count > 0 && baseline_gen.as_deref() != generation;
+        let subset_refund = comparable
             && baseline.as_ref().is_some_and(|baseline| {
                 current.len() < baseline.len() && current.iter().all(|n| baseline.contains(n))
             });
+
+        // Log-based evidence, assessed for every evaluated generation so the
+        // stored observations and high-water marks stay current.
+        let mut progress: cp::ProgressState = progress_json
+            .as_deref()
+            .and_then(|j| serde_json::from_str(j).ok())
+            .unwrap_or_default();
+        let mut assessment = None;
+        let padded: Vec<cp::CheckEvidence> = evidence
+            .iter()
+            .cloned()
+            .chain(
+                current
+                    .iter()
+                    .filter(|n| !evidence.iter().any(|e| &e.name == *n))
+                    .map(|n| cp::CheckEvidence {
+                        name: n.clone(),
+                        log: cp::CheckLog::Unavailable,
+                        log_ref: None,
+                    }),
+            )
+            .collect();
+        let evidence = padded.as_slice();
+        if evaluate {
+            let a = cp::assess(&progress, generation, evidence);
+            progress = a.next.clone();
+            assessment = Some(a);
+        }
+        let mut rule = cp::RULE_NONE;
+        let mut level = cp::EVIDENCE_NONE;
+        let mut parser = cp::PARSER_NONE;
+        let mut weak_spent = false;
+        let mut reason: Option<String> = None;
+        let mut win: Option<&cp::Win> = None;
+        let mut refund = false;
+        if subset_refund {
+            refund = true;
+            rule = cp::RULE_STRICT_SUBSET;
+            level = cp::EVIDENCE_FAILING_SET;
+        } else if let (true, Some(a)) = (comparable, assessment.as_ref()) {
+            if let Some(w) = a.strong.as_ref() {
+                refund = true;
+                rule = cp::RULE_NAMED_TEST;
+                level = cp::EVIDENCE_STRONG;
+                parser = w.parser;
+                win = Some(w);
+            } else if let Some(w) = a.weak.as_ref() {
+                rule = cp::RULE_COMPLETED_COUNT;
+                level = cp::EVIDENCE_WEAK;
+                parser = w.parser;
+                win = Some(w);
+                if i64::from(weak_limit) > weak_used {
+                    refund = true;
+                    weak_spent = true;
+                } else if weak_limit == 0 {
+                    reason = Some("weak_refunds_disabled".to_string());
+                } else {
+                    reason = Some("weak_refund_limit_reached".to_string());
+                }
+            } else {
+                parser = a.first_parser(evidence);
+                reason = Some(if a.rejections.is_empty() {
+                    "no_progress_evidence".to_string()
+                } else {
+                    a.rejections.join("; ")
+                });
+            }
+        } else if evaluate {
+            reason = Some(
+                if pr.auto_fix_attempt_count == 0 {
+                    "no_attempts_to_refund"
+                } else {
+                    "no_earlier_generation"
+                }
+                .to_string(),
+            );
+        }
+        let weak_after = weak_used + i64::from(weak_spent);
         let evaluated_generation = if evaluate {
             generation.map(str::to_string)
         } else {
@@ -1272,12 +1434,18 @@ impl Store {
         let baseline_json = baseline
             .as_ref()
             .and_then(|b| serde_json::to_string(b).ok());
+        let progress_out = if evaluate {
+            serde_json::to_string(&progress).ok()
+        } else {
+            progress_json
+        };
 
         self.conn.execute(
             "UPDATE guardian_pull_requests
              SET ci_failing_checks=?, ci_failing_generation=COALESCE(?, ci_failing_generation),
                  ci_settled_since_ms=?, auto_fix_baseline_checks=?,
-                 auto_fix_baseline_generation=?, auto_fix_refund_evaluated_generation=?
+                 auto_fix_baseline_generation=?, auto_fix_refund_evaluated_generation=?,
+                 auto_fix_progress=?, auto_fix_weak_refunds=?
              WHERE id=?",
             params![
                 json,
@@ -1286,11 +1454,12 @@ impl Store {
                 baseline_json,
                 baseline_gen,
                 evaluated_generation,
+                progress_out,
+                weak_after,
                 id
             ],
         )?;
         if refund {
-            let refunded_to = pr.auto_fix_attempt_count - 1;
             self.conn.execute(
                 "UPDATE guardian_pull_requests
                  SET auto_fix_attempt_count=MAX(auto_fix_attempt_count-1, 0),
@@ -1303,30 +1472,95 @@ impl Store {
                  WHERE id=?",
                 params![now, id],
             )?;
+        }
+        if evaluate {
+            let attempts_before = pr.auto_fix_attempt_count;
+            let attempts_after = if refund {
+                attempts_before.saturating_sub(1)
+            } else {
+                attempts_before
+            };
             let baseline_len = baseline.as_ref().map_or(0, |b| b.len());
             let generation_label = generation.unwrap_or("-");
+            let outcome = if refund { "refunded" } else { "denied" };
+            let (parser_failures, logs_unavailable) = assessment
+                .as_ref()
+                .map_or((0, 0), |a| (a.parser_failures, a.logs_unavailable));
+            let source_logs: Vec<serde_json::Value> = evidence
+                .iter()
+                .map(|e| {
+                    serde_json::json!({
+                        "check": e.name,
+                        "log_ref": e.log_ref,
+                        "status": match &e.log {
+                            cp::CheckLog::Parsed(_) => "parsed",
+                            cp::CheckLog::Unavailable => "unavailable",
+                            cp::CheckLog::Unparsed => "unparsed",
+                        },
+                    })
+                })
+                .collect();
+            let (previous_obs, current_obs) = match win {
+                Some(w) if !subset_refund => (w.previous.clone(), w.current.clone()),
+                _ => (
+                    format!("{baseline_len} failing check(s)"),
+                    format!("{} failing check(s)", current.len()),
+                ),
+            };
+            let check = win.map(|w| w.check.as_str());
+            let reason_text = reason
+                .as_deref()
+                .map_or_else(String::new, |r| format!(" reason=[{r}]"));
             crate::rlog!(
                 INFO,
-                "ralphus [pr] pr={id} auto-fix attempt refunded: generation {generation_label} settled with failing checks {baseline_len} -> {} (attempts now {refunded_to})",
-                current.len()
+                "ralphus [pr] pr={id} auto-fix refund {outcome}: generation {generation_label} rule={rule} evidence={level} parser={parser} check={} previous=[{previous_obs}] current=[{current_obs}] attempts {attempts_before} -> {attempts_after}{reason_text}",
+                check.unwrap_or("-"),
+            );
+            crate::rlog!(
+                INFO,
+                "ralphus [pr] metric ci_refund_decision outcome={outcome} rule={rule} evidence_level={level} parser={parser} parser_failures={parser_failures} logs_unavailable={logs_unavailable} attempts_restored={}",
+                u8::from(refund)
             );
             let mut note = crate::cartographer::Note::new("pr").scope("branch");
             note = note.guardian(&pr.guardian_id);
             note.emit(
                 self,
                 format!(
-                    "pr auto-fix attempt refunded pr={id} generation={generation_label} failing checks {baseline_len} -> {} attempts={refunded_to}",
-                    current.len()
+                    "pr auto-fix refund {outcome} pr={id} generation={generation_label} rule={rule} evidence={level} parser={parser} attempts {attempts_before} -> {attempts_after}"
                 ),
                 serde_json::json!({
                     "pr_id": id,
                     "pr_number": pr.pr_number,
                     "branch_id": pr.branch_id,
-                    "outcome": "auto_fix_refunded",
+                    "outcome": if refund { "auto_fix_refunded" } else { "auto_fix_refund_denied" },
+                    "decision": outcome,
+                    "rule": rule,
+                    "evidence_level": level,
+                    "parser": parser,
+                    "check": check,
                     "generation": generation,
                     "baseline_generation": baseline_gen,
                     "failing_checks": current,
-                    "attempts": refunded_to,
+                    "previous_observation": previous_obs,
+                    "current_observation": current_obs,
+                    "attempts_before": attempts_before,
+                    "attempts_after": attempts_after,
+                    "attempts": attempts_after,
+                    "weak_refunds_used": weak_after,
+                    "weak_refund_limit": weak_limit,
+                    "rejection_reason": reason,
+                    "source_logs": source_logs,
+                    "metrics": {
+                        "decision": {
+                            "outcome": outcome,
+                            "rule": rule,
+                            "evidence_level": level,
+                            "parser": parser,
+                        },
+                        "parser_failures": parser_failures,
+                        "logs_unavailable": logs_unavailable,
+                        "attempts_restored": u8::from(refund),
+                    },
                 }),
             );
         }
@@ -1827,6 +2061,7 @@ impl Store {
              SET auto_fix_attempted_at_ms=NULL, auto_fix_attempt_count=0,
                  auto_fix_baseline_checks=NULL, auto_fix_baseline_generation=NULL,
                  auto_fix_refund_evaluated_generation=NULL,
+                 auto_fix_progress=NULL, auto_fix_weak_refunds=0,
                  auto_fix_next_attempt_at_ms=NULL, auto_fix_error=NULL,
                  auto_fix_exhausted_notified_at_ms=NULL,
                  auto_fix_last_outcome = CASE WHEN auto_fix_last_outcome='exhausted' THEN NULL ELSE auto_fix_last_outcome END,
@@ -1853,6 +2088,7 @@ impl Store {
              SET auto_fix_attempted_at_ms=NULL, auto_fix_attempt_count=0,
                  auto_fix_baseline_checks=NULL, auto_fix_baseline_generation=NULL,
                  auto_fix_refund_evaluated_generation=NULL,
+                 auto_fix_progress=NULL, auto_fix_weak_refunds=0,
                  auto_fix_next_attempt_at_ms=NULL, auto_fix_error=NULL,
                  auto_fix_exhausted_notified_at_ms=NULL, auto_fix_last_outcome=NULL,
                  updated_at_ms=?
@@ -16796,6 +17032,269 @@ mod tests {
             s.claim_pr_auto_fix_attempt(&id, 1, 0).unwrap(),
             AutoFixClaim::Claimed { attempt: 1 }
         );
+    }
+
+    fn pytest_ev(
+        check: &str,
+        total: u64,
+        passed: &[&str],
+        failed: &[&str],
+    ) -> crate::ci_progress::CheckEvidence {
+        let mut text = format!(
+            "collected {total} items
+"
+        );
+        for p in passed {
+            text.push_str(&format!(
+                "tests/t.py::{p} PASSED [ 1%]
+"
+            ));
+        }
+        for f in failed {
+            text.push_str(&format!(
+                "tests/t.py::{f} FAILED [ 1%]
+"
+            ));
+        }
+        crate::ci_progress::CheckEvidence {
+            name: check.into(),
+            log: crate::ci_progress::parse_log(&text).map_or(
+                crate::ci_progress::CheckLog::Unparsed,
+                crate::ci_progress::CheckLog::Parsed,
+            ),
+            log_ref: Some(format!("/tmp/{check}.log")),
+        }
+    }
+
+    /// One poll carrying log evidence, a zero settle window.
+    fn poll_ev(
+        s: &Store,
+        id: &str,
+        set: &[&str],
+        generation: &str,
+        ev: &[crate::ci_progress::CheckEvidence],
+        limit: u32,
+    ) -> bool {
+        s.set_pr_failing_checks_with_evidence_at(
+            id,
+            &names(set),
+            Some(generation),
+            true,
+            1,
+            0,
+            ev,
+            limit,
+        )
+        .unwrap()
+    }
+
+    fn attempts(s: &Store, id: &str) -> i64 {
+        i64::from(s.get_pull_request(id).unwrap().auto_fix_attempt_count)
+    }
+
+    #[test]
+    fn log_progress_named_test_transition_refunds_with_an_unchanged_failing_set() {
+        for forge in ["github", "gitlab"] {
+            let s = store();
+            let id = refund_test_pr(&s, forge);
+            let e0 = pytest_ev("ci", 4, &[], &["t1", "t2"]);
+            assert!(!poll_ev(&s, &id, &["ci"], "g0", &[e0], 0), "{forge}");
+            s.claim_pr_auto_fix_attempt(&id, 3, 0).unwrap();
+            // Same check still failing (fail-fast): t1 now passes, t2 fails.
+            let e1 = pytest_ev("ci", 4, &["t1"], &["t2"]);
+            assert!(poll_ev(&s, &id, &["ci"], "g1", &[e1], 0), "{forge}");
+            assert_eq!(attempts(&s, &id), 0, "{forge}");
+        }
+    }
+
+    #[test]
+    fn log_progress_reordered_or_vanished_tests_do_not_refund() {
+        let s = store();
+        let id = refund_test_pr(&s, "github");
+        poll_ev(
+            &s,
+            &id,
+            &["ci"],
+            "g0",
+            &[pytest_ev("ci", 4, &[], &["t1", "t2"])],
+            2,
+        );
+        s.claim_pr_auto_fix_attempt(&id, 3, 0).unwrap();
+        // t1 no longer appears at all; t2 fails first. No named transition.
+        let e1 = pytest_ev("ci", 4, &[], &["t2"]);
+        assert!(!poll_ev(&s, &id, &["ci"], "g1", &[e1], 2));
+        assert_eq!(attempts(&s, &id), 1);
+    }
+
+    #[test]
+    fn log_progress_missing_unavailable_or_unknown_logs_do_not_refund() {
+        let s = store();
+        let id = refund_test_pr(&s, "gitlab");
+        poll_ev(
+            &s,
+            &id,
+            &["ci"],
+            "g0",
+            &[pytest_ev("ci", 4, &[], &["t1"])],
+            2,
+        );
+        s.claim_pr_auto_fix_attempt(&id, 3, 0).unwrap();
+        let unavailable = crate::ci_progress::CheckEvidence {
+            name: "ci".into(),
+            log: crate::ci_progress::CheckLog::Unavailable,
+            log_ref: None,
+        };
+        assert!(!poll_ev(&s, &id, &["ci"], "g1", &[unavailable], 2));
+        // Wrapper-style call with no evidence at all must not refund either.
+        assert!(!poll_ev(&s, &id, &["ci"], "g2", &[], 2));
+        let unknown = crate::ci_progress::CheckEvidence {
+            name: "ci".into(),
+            log: crate::ci_progress::CheckLog::Unparsed,
+            log_ref: None,
+        };
+        assert!(!poll_ev(&s, &id, &["ci"], "g3", &[unknown], 2));
+        assert_eq!(attempts(&s, &id), 1);
+    }
+
+    #[test]
+    fn log_progress_weak_refunds_are_capped_and_cap_zero_disables_them() {
+        let s = store();
+        let id = refund_test_pr(&s, "github");
+        // Failures never named as transitions; only the completed count rises.
+        poll_ev(
+            &s,
+            &id,
+            &["ci"],
+            "g0",
+            &[pytest_ev("ci", 10, &["a"], &["x"])],
+            2,
+        );
+        for (n, passed) in [&["a", "b"][..], &["a", "b", "c"], &["a", "b", "c", "d"]]
+            .iter()
+            .enumerate()
+        {
+            s.claim_pr_auto_fix_attempt(&id, 5, 0).unwrap();
+            let e = pytest_ev("ci", 10, passed, &["x"]);
+            let refunded = poll_ev(&s, &id, &["ci"], &format!("g{}", n + 1), &[e], 2);
+            // Two weak refunds are allowed; the third is denied.
+            assert_eq!(refunded, n < 2, "generation {}", n + 1);
+        }
+
+        let s = store();
+        let id = refund_test_pr(&s, "gitlab");
+        poll_ev(
+            &s,
+            &id,
+            &["ci"],
+            "g0",
+            &[pytest_ev("ci", 10, &["a"], &["x"])],
+            0,
+        );
+        s.claim_pr_auto_fix_attempt(&id, 5, 0).unwrap();
+        let e = pytest_ev("ci", 10, &["a", "b"], &["x"]);
+        assert!(!poll_ev(&s, &id, &["ci"], "g1", &[e], 0));
+    }
+
+    #[test]
+    fn log_progress_weak_refund_usage_resets_when_ci_passes() {
+        let s = store();
+        let id = refund_test_pr(&s, "github");
+        poll_ev(
+            &s,
+            &id,
+            &["ci"],
+            "g0",
+            &[pytest_ev("ci", 10, &["a"], &["x"])],
+            1,
+        );
+        s.claim_pr_auto_fix_attempt(&id, 5, 0).unwrap();
+        assert!(poll_ev(
+            &s,
+            &id,
+            &["ci"],
+            "g1",
+            &[pytest_ev("ci", 10, &["a", "b"], &["x"])],
+            1
+        ));
+        s.claim_pr_auto_fix_attempt(&id, 5, 0).unwrap();
+        assert!(!poll_ev(
+            &s,
+            &id,
+            &["ci"],
+            "g2",
+            &[pytest_ev("ci", 10, &["a", "b", "c"], &["x"])],
+            1
+        ));
+        s.set_pr_ci_status(&id, "passing", None).unwrap();
+        s.set_pr_ci_status(&id, "failing", None).unwrap();
+        poll_ev(
+            &s,
+            &id,
+            &["ci"],
+            "h0",
+            &[pytest_ev("ci", 10, &["a"], &["x"])],
+            1,
+        );
+        s.claim_pr_auto_fix_attempt(&id, 5, 0).unwrap();
+        assert!(poll_ev(
+            &s,
+            &id,
+            &["ci"],
+            "h1",
+            &[pytest_ev("ci", 10, &["a", "b"], &["x"])],
+            1
+        ));
+    }
+
+    #[test]
+    fn log_progress_regression_below_the_high_water_mark_is_denied() {
+        let s = store();
+        let id = refund_test_pr(&s, "github");
+        poll_ev(
+            &s,
+            &id,
+            &["ci"],
+            "g0",
+            &[pytest_ev("ci", 10, &["a"], &["x"])],
+            5,
+        );
+        s.claim_pr_auto_fix_attempt(&id, 9, 0).unwrap();
+        assert!(poll_ev(
+            &s,
+            &id,
+            &["ci"],
+            "g1",
+            &[pytest_ev("ci", 10, &["a", "b", "c"], &["x"])],
+            5
+        ));
+        s.claim_pr_auto_fix_attempt(&id, 9, 0).unwrap();
+        // Drops back, then recovers to a count that is up on the previous
+        // generation but not above the earlier peak.
+        assert!(!poll_ev(
+            &s,
+            &id,
+            &["ci"],
+            "g2",
+            &[pytest_ev("ci", 10, &["a"], &["x"])],
+            5
+        ));
+        assert!(!poll_ev(
+            &s,
+            &id,
+            &["ci"],
+            "g3",
+            &[pytest_ev("ci", 10, &["a", "b"], &["x"])],
+            5
+        ));
+    }
+
+    #[test]
+    fn log_progress_strict_subset_still_refunds_without_any_logs() {
+        let s = store();
+        let id = refund_test_pr(&s, "github");
+        poll_ev(&s, &id, &["a", "b"], "g0", &[], 0);
+        s.claim_pr_auto_fix_attempt(&id, 3, 0).unwrap();
+        assert!(poll_ev(&s, &id, &["a"], "g1", &[], 0));
     }
 
     #[test]

@@ -494,7 +494,7 @@ fn run_watch(store: &crate::store_lock::StoreHandle, guardian_id: &str, branch_i
                     failure.job_url.as_deref(),
                 );
                 warn_on_pr_store_error(store, guardian_id, pr, "set_pr_ci_status", result);
-                record_failing_checks(store, guardian_id, pr, &failure);
+                record_failing_checks(store, &client, &guardian, pr, &failure);
                 enqueue_ci_failure_notice(store, &guardian, branch, pr, &failure);
                 return;
             }
@@ -538,30 +538,167 @@ fn run_watch(store: &crate::store_lock::StoreHandle, guardian_id: &str, branch_i
     }
 }
 
-/// RAL-578/RAL-591: persist this poll's failing check names with its
+/// RAL-578/RAL-591/RAL-678: persist this poll's failing check names with its
 /// generation key and settled flag; the store refunds an auto-fix attempt when
 /// a newly settled generation's set strictly shrank against the settled
-/// baseline.
+/// baseline, or when the failing checks' logs show named-test or comparable
+/// count progress. Logs are fetched only when the store is about to evaluate
+/// this generation, never on a routine poll.
 fn record_failing_checks(
     store: &crate::store_lock::StoreHandle,
-    guardian_id: &str,
+    client: &crate::forge::ForgeClient,
+    guardian: &GuardianView,
     pr: &PullRequestView,
     failure: &PrFailure,
 ) {
     let names: Vec<String> = failure.checks.iter().map(|c| c.name.clone()).collect();
-    let result = store.lock().set_pr_failing_checks(
+    let generation = failure.generation.as_deref();
+    let settled = failure.settled();
+    let now = now_ms();
+    let due = store
+        .lock()
+        .pr_refund_evaluation_due(
+            &pr.id,
+            generation,
+            settled,
+            now,
+            crate::pr::REFUND_SETTLE_MS,
+        )
+        .unwrap_or(false);
+    let (evidence, weak_limit) = if due {
+        let worktree = pr
+            .branch_id
+            .as_deref()
+            .and_then(|id| guardian.branches.iter().find(|b| b.id == id))
+            .and_then(|b| b.worktree.as_deref());
+        let limit = store
+            .lock()
+            .resolve_review_config(Path::new(&guardian.git_root))
+            .auto_fix_weak_progress_refunds();
+        (
+            collect_progress_evidence(client, worktree, failure, generation.unwrap_or("-")),
+            limit,
+        )
+    } else {
+        (
+            Vec::new(),
+            crate::config::DEFAULT_AUTO_FIX_WEAK_PROGRESS_REFUNDS,
+        )
+    };
+    let result = store.lock().set_pr_failing_checks_with_evidence_at(
         &pr.id,
         &names,
-        failure.generation.as_deref(),
-        failure.settled(),
+        generation,
+        settled,
+        now,
+        crate::pr::REFUND_SETTLE_MS,
+        &evidence,
+        weak_limit,
     );
     warn_on_pr_store_error(
         store,
-        guardian_id,
+        &guardian.id,
         pr,
         "set_pr_failing_checks",
         result.map(|_| ()),
     );
+}
+
+/// How many retained progress logs per check survive pruning: the current
+/// generation's and the previous one's, which the last decision event may
+/// still reference.
+const RETAINED_PROGRESS_LOGS_PER_CHECK: usize = 2;
+
+/// Fetch, retain and parse each failing check's log for one generation
+/// (RAL-678). GitHub's poll only carries check-run summary text, so the
+/// Actions job log is fetched through the REST client; a GitLab job's trace
+/// already arrives in `log_text`. A log that cannot be fetched or written
+/// to disk is [`CheckLog::Unavailable`](crate::ci_progress::CheckLog) and
+/// earns no log-based refund.
+fn collect_progress_evidence(
+    client: &crate::forge::ForgeClient,
+    worktree: Option<&str>,
+    failure: &PrFailure,
+    generation: &str,
+) -> Vec<crate::ci_progress::CheckEvidence> {
+    use crate::ci_progress::{CheckEvidence, CheckLog, parse_log};
+    let unusable = |text: &String| text.trim().is_empty();
+    failure
+        .checks
+        .iter()
+        .map(|check| {
+            let text = match client.kind() {
+                crate::forge::ForgeKind::GitHub => check
+                    .job_url
+                    .as_deref()
+                    .and_then(|url| client.github_job_log(url))
+                    .or_else(|| check.log_text.clone()),
+                crate::forge::ForgeKind::GitLab => check.log_text.clone(),
+            }
+            .filter(|t| !unusable(t));
+            let retained = text.as_deref().and_then(|text| {
+                let path = progress_log_path(worktree?, &check.name, generation)?;
+                write_ci_failure_log(&path, text)?;
+                prune_progress_logs(&path);
+                Some(path)
+            });
+            match (text, retained) {
+                (Some(text), Some(path)) => CheckEvidence {
+                    name: check.name.clone(),
+                    log: parse_log(&text).map_or(CheckLog::Unparsed, CheckLog::Parsed),
+                    log_ref: Some(path.display().to_string()),
+                },
+                _ => CheckEvidence {
+                    name: check.name.clone(),
+                    log: CheckLog::Unavailable,
+                    log_ref: None,
+                },
+            }
+        })
+        .collect()
+}
+
+/// `.ralphus-ci-progress-<check>-<generation>.log` in the worktree's own git
+/// dir (never its working tree, for the reason [`ci_failure_log_path`] gives).
+/// Unlike the single auto-fix failure log, each generation gets its own file
+/// so the earlier generation's evidence is not overwritten.
+fn progress_log_path(worktree: &str, check_name: &str, generation: &str) -> Option<PathBuf> {
+    let dir = crate::vcs_refs::worktree_git_dir(Path::new(worktree))?;
+    let generation: String = sanitize_path_segment(generation).chars().take(16).collect();
+    Some(dir.join(format!(
+        "{}{generation}.log",
+        progress_log_prefix(check_name)
+    )))
+}
+
+fn progress_log_prefix(check_name: &str) -> String {
+    format!(
+        ".ralphus-ci-progress-{}-",
+        sanitize_path_segment(check_name)
+    )
+}
+
+/// Keep only the newest [`RETAINED_PROGRESS_LOGS_PER_CHECK`] retained logs of
+/// the check that `kept` belongs to.
+fn prune_progress_logs(kept: &Path) {
+    let (Some(dir), Some(name)) = (kept.parent(), kept.file_name().and_then(|n| n.to_str())) else {
+        return;
+    };
+    let Some(prefix) = name.rsplit_once('-').map(|(head, _)| format!("{head}-")) else {
+        return;
+    };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut siblings: Vec<(std::time::SystemTime, PathBuf)> = entries
+        .filter_map(Result::ok)
+        .filter(|e| e.file_name().to_string_lossy().starts_with(&prefix))
+        .filter_map(|e| Some((e.metadata().ok()?.modified().ok()?, e.path())))
+        .collect();
+    siblings.sort_by_key(|s| std::cmp::Reverse(s.0));
+    for (_, path) in siblings.into_iter().skip(RETAINED_PROGRESS_LOGS_PER_CHECK) {
+        let _ = std::fs::remove_file(path);
+    }
 }
 
 /// Enqueue the `"review"`-category mailbox notice for a terminal CI/merge
@@ -976,7 +1113,7 @@ pub fn poll_open_pr_ci_status(
             .set_pr_ci_status(&pr.id, state.as_str(), job_url.as_deref());
         warn_on_pr_store_error(store, guardian_id, &pr, "set_pr_ci_status", result);
         if let PrCiState::Failing(failure) = &state {
-            record_failing_checks(store, guardian_id, &pr, failure);
+            record_failing_checks(store, &client, &guardian, &pr, failure);
         }
         let result = store.lock().set_pr_draft(&pr.id, probe.draft);
         warn_on_pr_store_error(store, guardian_id, &pr, "set_pr_draft", result);

@@ -1142,6 +1142,7 @@ impl ProjectReviewSettings {
             live_actions: self.live_actions,
             rebuild_on: self.rebuild_on,
             auto_fix_max_attempts: None,
+            auto_fix_weak_progress_refunds: None,
             auto_fix_retry_base_seconds: None,
             // Database-backed project settings don't cover this setting --
             // same "left at their defaults" treatment as `checks`/
@@ -4135,6 +4136,12 @@ impl Store {
             "ALTER TABLE guardian_pull_requests ADD COLUMN auto_fix_baseline_checks TEXT",
             "ALTER TABLE guardian_pull_requests ADD COLUMN auto_fix_baseline_generation TEXT",
             "ALTER TABLE guardian_pull_requests ADD COLUMN auto_fix_refund_evaluated_generation TEXT",
+            // RAL-678: log-based progress evidence (`crate::ci_progress`):
+            // `auto_fix_progress` is the JSON `ProgressState` of the last
+            // evaluated generation; `auto_fix_weak_refunds` counts refunds
+            // earned solely from count evidence in the current campaign.
+            "ALTER TABLE guardian_pull_requests ADD COLUMN auto_fix_progress TEXT",
+            "ALTER TABLE guardian_pull_requests ADD COLUMN auto_fix_weak_refunds INTEGER NOT NULL DEFAULT 0",
             // RAL-476: the user who submitted this squad, resolved once at
             // submit time (explicit TOML `submitter`, else the acting
             // request's identity) -- see `server::resolve_submitter`.
