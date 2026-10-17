@@ -8,7 +8,9 @@
 //! check answers `None`, and a shell with no grammar is never checked.
 //! Findings are advisory: the caller reports them as warnings.
 
-use ralphus_shell_syntax::{Parsed, Shell, Status, parse, shell_for_tool};
+use std::collections::HashSet;
+
+use ralphus_shell_syntax::{Parsed, Shell, SpanKind, Status, parse, shell_for_tool};
 
 use crate::shellcmd::shell_kind_from_exe;
 
@@ -92,9 +94,276 @@ pub fn check_command(command: &str, shell: Option<&str>) -> Option<String> {
     ))
 }
 
+/// Executable names of the commands in `command`, in order of appearance,
+/// taken from the grammar's command-name nodes for the selected shell
+/// (explicit `shell`, else the host default). Empty when the shell has no
+/// grammar, the command does not parse cleanly, or the parser is not built in.
+#[must_use]
+pub fn executable_names(command: &str, shell: Option<&str>) -> Vec<String> {
+    let Some((grammar, _)) = selected_grammar(shell) else {
+        return Vec::new();
+    };
+    let parsed = parse(grammar, command);
+    if parsed.status != Status::Ok {
+        return Vec::new();
+    }
+    parsed
+        .spans
+        .iter()
+        .filter(|s| s.kind == SpanKind::CommandName)
+        .filter_map(|s| command.get(s.start..s.end))
+        .map(|n| n.trim().to_string())
+        .filter(|n| !n.is_empty())
+        .collect()
+}
+
+fn selected_grammar(shell: Option<&str>) -> Option<(Shell, &'static str)> {
+    let grammar = match shell {
+        Some(shell) => grammar_for(shell)?,
+        None => shell_for_tool("exec", cfg!(windows))?,
+    };
+    Some((grammar, name(grammar)))
+}
+
+/// Warnings for executables in `command` that cannot be found on this host.
+/// `seen` holds the `shell:executable` keys already looked up during this
+/// validation: a command already in it is neither looked up nor reported
+/// again. Dynamic names and paths are skipped.
+#[must_use]
+pub fn missing_command_warnings(
+    command: &str,
+    shell: Option<&str>,
+    seen: &mut HashSet<String>,
+) -> Vec<String> {
+    missing_command_warnings_with(command, shell, seen, &command_exists)
+}
+
+type CommandResolver<'a> = dyn Fn(Shell, Option<&str>, &str) -> Option<bool> + 'a;
+
+fn missing_command_warnings_with(
+    command: &str,
+    shell: Option<&str>,
+    seen: &mut HashSet<String>,
+    exists: &CommandResolver<'_>,
+) -> Vec<String> {
+    let Some((grammar, shell_name)) = selected_grammar(shell) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for exe in executable_names(command, shell) {
+        if !seen.insert(format!("{shell_name}:{}", exe.to_lowercase())) {
+            continue;
+        }
+        if !is_checkable(&exe) || exists(grammar, shell, &exe) != Some(false) {
+            continue;
+        }
+        out.push(format!(
+            "`{exe}` was not found by {shell_name} on this machine; check the selected shell or correct the command name (tools installed only in a later execution environment cannot be seen here)"
+        ));
+    }
+    out
+}
+
+/// Dynamic names and paths need the execution environment to resolve them.
+fn is_checkable(exe: &str) -> bool {
+    if exe.contains([
+        '/', '\\', '$', '%', '`', '*', '?', '(', ')', '{', '}', '"', '\'', '~', '=', '&', '|', '<',
+        '>', '^', '!', ';', ' ', '\t', '\n',
+    ]) {
+        return false;
+    }
+    !exe.is_empty()
+}
+
+/// Ask the selected shell how it resolves the name. A failed shell launch is
+/// indeterminate, so validation does not turn it into a missing-command warning.
+fn command_exists(shell: Shell, selected_shell: Option<&str>, exe: &str) -> Option<bool> {
+    use std::process::{Command, Stdio};
+
+    let shell_program = selected_shell.unwrap_or(name(shell));
+    if shell == Shell::Cmd {
+        let where_status = Command::new("where.exe")
+            .arg(exe)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .ok()?;
+        if where_status.success() {
+            return Some(true);
+        }
+        let help = Command::new(shell_program)
+            .args(["/d", "/c", "help"])
+            .output()
+            .ok()?;
+        if help.stdout.is_empty() {
+            return None;
+        }
+        return Some(String::from_utf8_lossy(&help.stdout).lines().any(|line| {
+            line.split_whitespace()
+                .next()
+                .is_some_and(|name| name.eq_ignore_ascii_case(exe))
+        }));
+    }
+    let mut child = match shell {
+        Shell::Bash => {
+            let mut command = Command::new(shell_program);
+            command.args(["-c", "command -v \"$1\" >/dev/null 2>&1", "_", exe]);
+            command
+        }
+        Shell::PowerShell => {
+            let mut command = Command::new(shell_program);
+            command.args(["-NonInteractive", "-Command", "if (Get-Command -Name $env:RALPHUS_COMMAND_CHECK_NAME -ErrorAction SilentlyContinue) { exit 0 } else { exit 1 }"]);
+            command.env("RALPHUS_COMMAND_CHECK_NAME", exe);
+            command
+        }
+        Shell::Cmd => unreachable!(),
+    };
+    child.stdout(Stdio::null()).stderr(Stdio::null());
+    child.status().ok().map(|status| status.success())
+}
+
 #[cfg(all(test, feature = "shell-syntax"))]
 mod tests {
     use super::*;
+
+    fn warnings(command: &str, shell: Option<&str>, present: &[&str]) -> Vec<String> {
+        let mut seen = HashSet::new();
+        missing_command_warnings_with(command, shell, &mut seen, &|_, _, e| {
+            Some(present.contains(&e))
+        })
+    }
+
+    #[test]
+    fn extracts_executables_across_chains_and_pipes() {
+        assert_eq!(
+            executable_names("cargo build && npm test | tee out; ls", Some("bash")),
+            ["cargo", "npm", "tee", "ls"]
+        );
+    }
+
+    #[test]
+    fn extracts_powershell_and_cmd_executables() {
+        assert_eq!(
+            executable_names(
+                "git status; Get-ChildItem | Select-Object Name",
+                Some("powershell")
+            ),
+            ["git", "Get-ChildItem", "Select-Object"]
+        );
+        assert_eq!(executable_names("cargo test", Some("cmd")), ["cargo"]);
+    }
+
+    #[test]
+    fn missing_executable_warns_with_guidance() {
+        let w = warnings("nosuchtool --flag", Some("bash"), &[]);
+        assert_eq!(w.len(), 1);
+        assert!(
+            w[0].contains("nosuchtool") && w[0].contains("selected shell"),
+            "{}",
+            w[0]
+        );
+        assert!(w[0].contains("correct the command name"), "{}", w[0]);
+    }
+
+    #[test]
+    fn present_executable_is_silent() {
+        assert!(warnings("cargo test", Some("bash"), &["cargo"]).is_empty());
+    }
+
+    #[test]
+    fn repeated_executables_are_checked_once() {
+        let calls = std::cell::Cell::new(0);
+        let mut seen = HashSet::new();
+        let exists = |_: Shell, _: Option<&str>, _: &str| {
+            calls.set(calls.get() + 1);
+            Some(false)
+        };
+        let first = missing_command_warnings_with(
+            "zzz a && zzz b; zzz c",
+            Some("bash"),
+            &mut seen,
+            &exists,
+        );
+        let second = missing_command_warnings_with("zzz d", Some("bash"), &mut seen, &exists);
+        assert_eq!(first.len(), 1);
+        assert!(second.is_empty());
+        assert_eq!(calls.get(), 1);
+    }
+
+    #[test]
+    fn shell_resolver_checks_builtins_and_aliases() {
+        if cfg!(windows) {
+            assert_eq!(command_exists(Shell::Cmd, None, "dir"), Some(true));
+            assert_eq!(
+                command_exists(Shell::Cmd, None, "nonsuchralphuscommand"),
+                Some(false)
+            );
+            assert_eq!(
+                command_exists(Shell::PowerShell, None, "Get-Alias"),
+                Some(true)
+            );
+            assert_eq!(command_exists(Shell::PowerShell, None, "gci"), Some(true));
+            assert_eq!(
+                command_exists(
+                    Shell::PowerShell,
+                    None,
+                    "Get-DefinitelyMissingRalphusCommand"
+                ),
+                Some(false)
+            );
+        } else {
+            assert_eq!(command_exists(Shell::Bash, None, "cd"), Some(true));
+            assert_eq!(
+                command_exists(Shell::Bash, None, "definitely_missing_ralphus_command"),
+                Some(false)
+            );
+        }
+    }
+
+    #[test]
+    fn resolver_result_decides_warning_without_name_lists() {
+        let mut seen = HashSet::new();
+        let warnings = missing_command_warnings_with(
+            "Get-Alias checkf; Get-FictionalThing",
+            Some("powershell"),
+            &mut seen,
+            &|_, _, name| Some(name == "Get-Alias"),
+        );
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("Get-FictionalThing"));
+    }
+
+    #[test]
+    fn resolver_receives_selected_shell() {
+        let mut seen = HashSet::new();
+        let warnings = missing_command_warnings_with(
+            "checkf",
+            Some("pwsh"),
+            &mut seen,
+            &|grammar, shell, name| {
+                assert_eq!(grammar, Shell::PowerShell);
+                assert_eq!(shell, Some("pwsh"));
+                assert_eq!(name, "checkf");
+                Some(true)
+            },
+        );
+        assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn unparsable_or_unknown_shell_is_not_checked() {
+        assert!(warnings("if then ((", Some("bash"), &[]).is_empty());
+        assert!(warnings("nosuchtool", Some("fish"), &[]).is_empty());
+    }
+
+    #[test]
+    fn unavailable_resolver_does_not_warn() {
+        let mut seen = HashSet::new();
+        assert!(
+            missing_command_warnings_with("unknown", Some("bash"), &mut seen, &|_, _, _| None)
+                .is_empty()
+        );
+    }
 
     #[test]
     fn ambiguous_command_is_silent() {

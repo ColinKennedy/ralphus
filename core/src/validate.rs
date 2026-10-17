@@ -43,6 +43,9 @@ pub enum ErrorKind {
     /// A `command` looks like it was written for a different shell than the
     /// one it runs under, or is not valid syntax for it (always a warning).
     ShellMismatch,
+    /// A `command`'s executable cannot be found on this machine (always a
+    /// warning, only for submissions that run locally).
+    MissingCommand,
 }
 
 /// A single validation finding.
@@ -107,6 +110,11 @@ struct Ctx<'a> {
     raw: &'a str,
     idx: HeaderIndex,
     report: &'a mut ValidationReport,
+    /// Whether every command runs on the daemon's own host, so executables can
+    /// be looked up here.
+    local_only: bool,
+    /// `shell:executable` keys already looked up during this validation.
+    seen_executables: std::collections::HashSet<String>,
 }
 
 impl Ctx<'_> {
@@ -120,6 +128,28 @@ impl Ctx<'_> {
 
     fn key_line(&self, header: Option<u32>, key: &str) -> Option<u32> {
         self.idx.find_key_line(self.raw, header, key)
+    }
+}
+
+/// Whether no `machine` anywhere in the submission names a non-local machine.
+/// Machines are inherited down the task/cell/proof levels, so any remote one
+/// disables the local executable lookup for the whole submission.
+fn runs_locally(value: &toml::Value) -> bool {
+    match value {
+        toml::Value::Table(t) => t.iter().all(|(k, v)| {
+            if k == "machine" {
+                v.as_str().is_none_or(|m| {
+                    matches!(
+                        crate::schema::parse_machine(m),
+                        Ok(crate::schema::MachineRef::Local)
+                    )
+                })
+            } else {
+                runs_locally(v)
+            }
+        }),
+        toml::Value::Array(a) => a.iter().all(runs_locally),
+        _ => true,
     }
 }
 
@@ -156,6 +186,8 @@ pub fn validate_toml(raw: &str) -> ValidationReport {
         raw,
         idx,
         report: &mut report,
+        local_only: runs_locally(&value),
+        seen_executables: std::collections::HashSet::new(),
     };
 
     for key in table.keys() {
@@ -581,6 +613,21 @@ fn check_command_mode(
                 message,
                 line,
             );
+        }
+        if ctx.local_only {
+            for message in crate::shell_check::missing_command_warnings(
+                command,
+                shell,
+                &mut ctx.seen_executables,
+            ) {
+                let line = ctx.key_line(header, "command");
+                ctx.warning(
+                    &format!("{path}.command"),
+                    ErrorKind::MissingCommand,
+                    message,
+                    line,
+                );
+            }
         }
     }
 
@@ -7825,6 +7872,43 @@ mod shell_check_tests {
                 .warnings
                 .iter()
                 .any(|w| w.kind == ErrorKind::ShellMismatch && w.line.is_some()),
+            "{:?}",
+            report.warnings
+        );
+    }
+
+    #[test]
+    fn missing_executable_warns_only_for_local_submissions() {
+        let local = "[[task]]
+name = \"t\"
+
+[[task.cell]]
+id = \"c\"
+cwd = \"/w\"
+remediation_attempts = 1
+shell = \"bash\"
+command = \"zz-no-such-tool-671 a && zz-no-such-tool-671 b\"
+";
+        let report = validate_toml(local);
+        assert!(report.is_ok(), "{:?}", report.errors);
+        let missing = report
+            .warnings
+            .iter()
+            .filter(|w| w.kind == ErrorKind::MissingCommand)
+            .count();
+        assert_eq!(missing, 1, "{:?}", report.warnings);
+
+        let remote = local.replace(
+            "[[task.cell]]",
+            "[[task.cell]]
+machine = \"ssh:box\"",
+        );
+        let report = validate_toml(&remote);
+        assert!(
+            report
+                .warnings
+                .iter()
+                .all(|w| w.kind != ErrorKind::MissingCommand),
             "{:?}",
             report.warnings
         );
