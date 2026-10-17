@@ -2388,6 +2388,132 @@ impl ForgeClient {
         }
     }
 
+    /// Read a PR/MR's current description (RAL-672). Returns an empty string
+    /// when the forge reports none. Logs the outbound call (start/done/error)
+    /// via `rlog!`.
+    pub fn get_pull_request_description(&self, number: i64) -> Result<String, String> {
+        // ralphus[ignore-rlog-pair]: this provider boundary has no Store; its caller records the structured workflow outcome
+        crate::rlog!(
+            INFO,
+            "ralphus [forge] get pr description start kind={} repo={} number={number}",
+            self.kind.as_str(),
+            self.repo_path
+        );
+        let result = self.get_pull_request_description_inner(number);
+        match &result {
+            // ralphus[ignore-rlog-pair]: this provider boundary has no Store; its caller records the structured workflow outcome
+            Ok(_) => crate::rlog!(
+                INFO,
+                "ralphus [forge] get pr description done kind={} repo={} number={number}",
+                self.kind.as_str(),
+                self.repo_path
+            ),
+            // ralphus[ignore-rlog-pair]: this provider boundary has no Store; its caller records the structured workflow outcome
+            Err(e) => crate::rlog!(
+                ERROR,
+                "ralphus [forge] get pr description failed kind={} repo={} number={number}: {e}",
+                self.kind.as_str(),
+                self.repo_path
+            ),
+        }
+        result
+    }
+
+    fn get_pull_request_description_inner(&self, number: i64) -> Result<String, String> {
+        let token = self.require_token()?;
+        let (value, field) = match self.kind {
+            ForgeKind::GitHub => {
+                let url = format!("{}/repos/{}/pulls/{number}", self.api_base, self.repo_path);
+                let value = self.get(
+                    http_agent()
+                        .get(&url)
+                        .set("Authorization", &format!("Bearer {token}"))
+                        .set("Accept", "application/vnd.github+json"),
+                )?;
+                (value, "body")
+            }
+            ForgeKind::GitLab => {
+                let url = format!(
+                    "{}/projects/{}/merge_requests/{number}",
+                    self.api_base, self.repo_path
+                );
+                let value = self.get(http_agent().get(&url).set("PRIVATE-TOKEN", token))?;
+                (value, "description")
+            }
+        };
+        Ok(value
+            .get(field)
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_string())
+    }
+
+    /// Replace a PR/MR's description and nothing else (RAL-672): the base
+    /// branch, title and stack are untouched. Logs the outbound call
+    /// (start/done/error) via `rlog!`.
+    pub fn update_pull_request_description(
+        &self,
+        number: i64,
+        description: &str,
+    ) -> Result<(), String> {
+        // ralphus[ignore-rlog-pair]: this provider boundary has no Store; its caller records the structured workflow outcome
+        crate::rlog!(
+            INFO,
+            "ralphus [forge] update pr description start kind={} repo={} number={number}",
+            self.kind.as_str(),
+            self.repo_path
+        );
+        let result = self.update_pull_request_description_inner(number, description);
+        match &result {
+            // ralphus[ignore-rlog-pair]: this provider boundary has no Store; its caller records the structured workflow outcome
+            Ok(()) => crate::rlog!(
+                INFO,
+                "ralphus [forge] update pr description done kind={} repo={} number={number}",
+                self.kind.as_str(),
+                self.repo_path
+            ),
+            // ralphus[ignore-rlog-pair]: this provider boundary has no Store; its caller records the structured workflow outcome
+            Err(e) => crate::rlog!(
+                ERROR,
+                "ralphus [forge] update pr description failed kind={} repo={} number={number}: {e}",
+                self.kind.as_str(),
+                self.repo_path
+            ),
+        }
+        result
+    }
+
+    fn update_pull_request_description_inner(
+        &self,
+        number: i64,
+        description: &str,
+    ) -> Result<(), String> {
+        let token = self.require_token()?;
+        match self.kind {
+            ForgeKind::GitHub => {
+                let url = format!("{}/repos/{}/pulls/{number}", self.api_base, self.repo_path);
+                let payload = serde_json::json!({ "body": description });
+                self.send(
+                    http_agent()
+                        .patch(&url)
+                        .set("Authorization", &format!("Bearer {token}"))
+                        .set("Accept", "application/vnd.github+json"),
+                    &payload,
+                )?;
+                Ok(())
+            }
+            ForgeKind::GitLab => {
+                let url = format!(
+                    "{}/projects/{}/merge_requests/{number}",
+                    self.api_base, self.repo_path
+                );
+                let payload = serde_json::json!({ "description": description });
+                self.send(http_agent().put(&url).set("PRIVATE-TOKEN", token), &payload)?;
+                Ok(())
+            }
+        }
+    }
+
     /// Add (`present = true`) or remove (`present = false`) one label on an
     /// open PR/MR. Idempotent in both directions: adding a label already on
     /// the PR/MR and removing one that is not both succeed, so a reconcile pass
@@ -6315,6 +6441,51 @@ mod tests {
         );
         let err = client.require_token().unwrap_err();
         assert!(err.contains("RALPHUS_GITHUB_TOKEN"), "{err}");
+    }
+
+    #[test]
+    fn pr_description_read_and_update_use_each_forges_field() {
+        for (kind, repo, path, field, method) in [
+            (
+                ForgeKind::GitHub,
+                "acme/widget",
+                "/repos/acme/widget/pulls/7",
+                "body",
+                tiny_http::Method::Patch,
+            ),
+            (
+                ForgeKind::GitLab,
+                "acme%2Fwidget",
+                "/projects/acme%2Fwidget/merge_requests/7",
+                "description",
+                tiny_http::Method::Put,
+            ),
+        ] {
+            let mock = MockForge::start(move |server| {
+                let get = server.recv();
+                assert_eq!(get.method(), &tiny_http::Method::Get);
+                assert_eq!(get.url(), path);
+                let body = serde_json::json!({ field: "old text", "base": "keep" }).to_string();
+                get.respond(tiny_http::Response::from_string(body).with_status_code(200))
+                    .unwrap();
+                let mut put = server.recv();
+                assert_eq!(put.method(), &method);
+                assert_eq!(put.url(), path);
+                let mut sent = String::new();
+                std::io::Read::read_to_string(put.as_reader(), &mut sent).unwrap();
+                let sent: serde_json::Value = serde_json::from_str(&sent).unwrap();
+                // Only the description field is sent: never the base or state.
+                assert_eq!(sent, serde_json::json!({ field: "new text" }));
+                put.respond(tiny_http::Response::from_string("{}").with_status_code(200))
+                    .unwrap();
+            });
+            let client = mock.client(kind, repo);
+            assert_eq!(client.get_pull_request_description(7).unwrap(), "old text");
+            client
+                .update_pull_request_description(7, "new text")
+                .unwrap();
+            mock.finish();
+        }
     }
 
     #[test]

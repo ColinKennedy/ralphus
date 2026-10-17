@@ -506,6 +506,11 @@ tool guidance, but without the waypoint section (`waypoint_context` false). The 
   and one level of dependent cells' prompts — that is its whole routing
   scope. The bullet-count and "not a changelog" framing are prompt
   conventions, not parser-enforced shapes; only the marker line is parsed.
+- **`RALPHUS_LIVE_RESULT: {json}`** — the last line of a live run agent's reply: its
+  proposed `verdict` (`passed`/`failed`/`inconclusive`), `summary`, `fix_attempted`,
+  `fix_confirmed` and `recipe` (commands). Parsed by `live_results::parse_result_line`;
+  recipe commands are kept only when they match a recorded shell tool call. Written into
+  PR/MR descriptions' `## Live-Test Results` section (see `daemon-api.md`).
 - **`RALPHUS_LIVE_ACTION: <how to test this live>`** (or
   `RALPHUS_LIVE_ACTION: (nothing to test live)`) — a **live handoff**: how a
   prompt cell's agent says it would test its work live. Only prompt cells are
