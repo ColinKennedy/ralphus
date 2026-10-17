@@ -1761,6 +1761,189 @@ prompt = "first"
     }
 
     #[test]
+    fn one_live_run_is_published_to_each_attributed_branch_pr() {
+        use crate::live_actions::NewLiveAction;
+        use crate::live_results::{RefreshOutcome, SECTION_START, refresh_pr_with};
+
+        let f = fixture(
+            "multi-branch-prs",
+            "RALPHUS_LIVE_RESULT: {\"verdict\":\"passed\",\"summary\":\"Both changes work\"}",
+        );
+        let second_file: ralphus_core::schema::TaskFile = toml::from_str(
+            r#"
+[[task]]
+name = "second"
+[[task.cell]]
+id = "two"
+cwd = "/repo"
+prompt = "second"
+"#,
+        )
+        .unwrap();
+        let second_squad = f
+            .store
+            .lock()
+            .insert_squad(&second_file, None, false)
+            .unwrap();
+        let (branch_a, branch_b, branch_c) = {
+            let guard = f.store.lock();
+            guard.add_guardian_branch(&f.gid, "feature/a").unwrap();
+            guard.add_guardian_branch(&f.gid, "feature/b").unwrap();
+            guard.add_guardian_branch(&f.gid, "feature/c").unwrap();
+            guard
+                .conn
+                .execute(
+                    "UPDATE cells SET review_branch='feature/a' WHERE squad_id=?",
+                    rusqlite::params![f.squad],
+                )
+                .unwrap();
+            guard
+                .conn
+                .execute(
+                    "UPDATE cells SET state='done', finished_at_ms=1,
+                     review_guardian_id=?, review_branch='feature/b' WHERE squad_id=?",
+                    rusqlite::params![f.gid, second_squad],
+                )
+                .unwrap();
+            let branches = guard.get_guardian(&f.gid).unwrap().branches;
+            let action = NewLiveAction {
+                label: "Shared greeting".into(),
+                prompt: "Check both changes live".into(),
+                source_cells: vec![
+                    format!("cell:{}:0:0", f.squad),
+                    format!("cell:{second_squad}:0:0"),
+                ],
+            };
+            assert!(
+                guard
+                    .insert_guardian_live_actions(&f.gid, &[action])
+                    .unwrap()
+            );
+            (
+                branches[0].id.clone(),
+                branches[1].id.clone(),
+                branches[2].id.clone(),
+            )
+        };
+        assert_eq!(
+            f.store.lock().live_action_branch_ids(&f.gid, 0).unwrap(),
+            [branch_a.clone(), branch_b.clone()]
+        );
+        let prs: Vec<_> = [(&branch_a, 7), (&branch_b, 8)]
+            .into_iter()
+            .map(|(branch, number)| {
+                f.store
+                    .lock()
+                    .create_pull_request(
+                        &f.gid,
+                        Some(branch),
+                        "github",
+                        "acme/widget",
+                        "alias",
+                        "main",
+                        "Shared greeting",
+                        "Reviewer notes.",
+                        Some(number),
+                        None,
+                    )
+                    .unwrap()
+            })
+            .collect();
+        let unrelated_pr = f
+            .store
+            .lock()
+            .create_pull_request(
+                &f.gid,
+                Some(&branch_c),
+                "github",
+                "acme/widget",
+                "alias",
+                "main",
+                "Unrelated change",
+                "Other notes.",
+                Some(9),
+                None,
+            )
+            .unwrap();
+        f.store
+            .lock()
+            .set_live_checkout(&f.gid, &f.dir.to_string_lossy(), None)
+            .unwrap();
+        assert_eq!(
+            maybe_start_automatic_run(&f.store, &f.runners, &f.gid),
+            AutoRunDecision::Started
+        );
+        let runs = settle(&f);
+        assert_eq!(runs.len(), 1);
+        let run_id = &runs[0].run_id;
+        assert_eq!(f.agent.prompts.lock().len(), 1);
+        assert_eq!(
+            f.store.lock().live_run_evidence(run_id).unwrap().branch_ids,
+            [branch_a, branch_b]
+        );
+        assert_eq!(f.store.lock().pending_pr_live_refreshes().unwrap().len(), 3);
+
+        for (pr_id, number) in prs.iter().zip([7, 8]) {
+            let path = format!("/repos/acme/widget/pulls/{number}");
+            let mock = crate::mock_forge::MockForge::start(move |server| {
+                let read = server.recv();
+                assert_eq!(read.url(), path);
+                read.respond(
+                    tiny_http::Response::from_string(r#"{"body":"Reviewer notes."}"#)
+                        .with_status_code(200),
+                )
+                .unwrap();
+                let mut write = server.recv();
+                assert_eq!(write.url(), path);
+                assert_eq!(write.method(), &tiny_http::Method::Patch);
+                let mut body = String::new();
+                std::io::Read::read_to_string(write.as_reader(), &mut body).unwrap();
+                write
+                    .respond(tiny_http::Response::from_string("{}").with_status_code(200))
+                    .unwrap();
+                body
+            });
+            let client = std::cell::RefCell::new(Some(
+                mock.client(crate::forge::ForgeKind::GitHub, "acme/widget"),
+            ));
+            assert_eq!(
+                refresh_pr_with(&f.store, pr_id, &|_, _| client.borrow_mut().take()).unwrap(),
+                RefreshOutcome::Updated
+            );
+            let sent: serde_json::Value = serde_json::from_str(&mock.finish()).unwrap();
+            let description = sent["body"].as_str().unwrap();
+            assert!(description.starts_with("Reviewer notes."));
+            assert!(description.contains(SECTION_START));
+            assert!(description.contains(run_id));
+            assert!(description.contains("Both changes work"));
+            assert_eq!(
+                f.store.lock().get_pull_request(pr_id).unwrap().description,
+                description
+            );
+        }
+        assert_eq!(
+            refresh_pr_with(&f.store, &unrelated_pr, &|_, _| {
+                panic!("unrelated PR should not contact the forge")
+            })
+            .unwrap(),
+            RefreshOutcome::Skipped
+        );
+        assert_eq!(
+            f.store
+                .lock()
+                .get_pull_request(&unrelated_pr)
+                .unwrap()
+                .description,
+            "Other notes."
+        );
+        assert_eq!(f.agent.prompts.lock().len(), 1);
+        assert_eq!(
+            maybe_start_automatic_run(&f.store, &f.runners, &f.gid),
+            AutoRunDecision::AlreadyRan
+        );
+    }
+
+    #[test]
     fn a_preparation_failure_is_handed_to_the_live_run() {
         let f = fixture("prep-failed", "found it");
         on_preparation_finished(
