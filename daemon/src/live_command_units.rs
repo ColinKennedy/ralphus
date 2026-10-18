@@ -10,7 +10,7 @@
 //! * output redirections (`> file`, `>> file`, `2>&1`, `*>&1`, ...) and
 //!   output-only filters (`| head`, `| sort`, `| Out-Null`, ...) are variants:
 //!   they are shown as written but never needed to match;
-//! * wrappers (`timeout`, `nice`, `time`, `env -u`, `bash -c`, `( ... )`, ...)
+//! * wrappers (`timeout`, `sudo`, `nice`, `time`, `env -u`, `bash -c`, `( ... )`, ...)
 //!   are variants of the command they wrap;
 //! * environment settings (`MODE=x`, `$env:MODE='x'`, `export`) stay part of
 //!   the unit they precede, so they are never silently lost;
@@ -125,6 +125,7 @@ static ALLOWLIST: &[Row] = &[
     row!(Variant, Filter(awk_filter), "awk"),
     // -- process wrappers ---------------------------------------------------
     row!(Variant, Wrapper(wrap_timeout), "timeout", "gtimeout"),
+    row!(Variant, Wrapper(wrap_sudo), "sudo", "doas"),
     row!(Variant, Wrapper(wrap_nice), "nice"),
     row!(Variant, Wrapper(wrap_ionice), "ionice"),
     row!(Variant, Wrapper(wrap_chrt), "chrt"),
@@ -461,6 +462,33 @@ fn wrap_timeout(w: &[String]) -> Option<Strip> {
     Some(Strip {
         retained: true,
         ..Strip::plain(i + 1)
+    })
+}
+
+/// `sudo [-n] [-E] [-H] [-u user] [-g group] cmd`. Like `timeout`, the wrapper
+/// is retained: a recipe may omit it, but the shown command restores it, and a
+/// recipe that names one must name the identical wrapper (same user, same flags).
+/// `-S`/`-i`/`-s`/`-l`/`-e` read input, start a shell or are not a run: not wrappers.
+fn wrap_sudo(w: &[String]) -> Option<Strip> {
+    let mut i = 1;
+    while let Some(a) = w.get(i) {
+        match a.as_str() {
+            "-n" | "--non-interactive" | "-E" | "--preserve-env" | "-H" | "--set-home" | "--" => {
+                i += 1;
+            }
+            "-u" | "--user" | "-g" | "--group" => {
+                if !is_command_word(w.get(i + 1)) {
+                    return None;
+                }
+                i += 2;
+            }
+            _ if a.starts_with("--user=") || a.starts_with("--group=") => i += 1,
+            _ => break,
+        }
+    }
+    is_command_word(w.get(i)).then(|| Strip {
+        retained: true,
+        ..Strip::plain(i)
     })
 }
 
@@ -1468,7 +1496,7 @@ mod tests {
     #[test]
     fn near_misses_are_not_allowlisted() {
         assert!(!matches("foo --bar", "foo --baz"));
-        assert!(!matches("foo", "sudo foo"));
+        assert!(!matches("foo", "sudo -i foo"));
         assert!(!matches("foo", "runas /user:x foo"));
         assert!(!matches("foo", "foo &"));
         assert!(!matches("foo", "foo || true"));
@@ -1739,6 +1767,672 @@ mod tests {
         assert!(matches("foo --a b", "foo `\n --a `\n b"));
         assert!(matches("foo --a b", "foo ^\r\n --a ^\r\n b"));
         assert!(!matches("echo a/b", "echo a\\b"));
+    }
+
+    // ---- compound commands and nesting ---------------------------------------
+
+    fn all_match(proposed: &str, recorded: &[&str]) {
+        for rec in recorded {
+            assert!(
+                matches(proposed, rec),
+                "{proposed:?} should stand for {rec:?}"
+            );
+        }
+    }
+
+    fn none_match(proposed: &str, recorded: &[&str]) {
+        for rec in recorded {
+            assert!(
+                !matches(proposed, rec),
+                "{proposed:?} must not stand for {rec:?}"
+            );
+        }
+    }
+
+    /// Compound shapes: command names and the separator between them.
+    const SHAPES: &[(&[&str], &str)] = &[
+        (&["a", "b"], "&&"),
+        (&["a", "b"], ";"),
+        (&["a", "b"], "||"),
+        (&["a", "b"], "\n"),
+        (&["a", "b", "c"], "&&"),
+        (&["a", "b", "c"], ";"),
+        (&["a", "b", "c"], "||"),
+        (&["a", "b", "c"], "\n"),
+    ];
+
+    fn compose(names: &[String], separator: &str) -> String {
+        names.join(&format!(" {separator} "))
+    }
+
+    fn owned(names: &[&str]) -> Vec<String> {
+        names.iter().map(|n| (*n).to_string()).collect()
+    }
+
+    /// Decorations a recipe may leave off any command of a compound.
+    const VARIANTS: &[fn(&str) -> String] = &[
+        |x| format!("{x} | head"),
+        |x| format!("{x} | sort | uniq"),
+        |x| format!("{x} 2>&1"),
+        |x| format!("{x} > out.log 2>&1"),
+        |x| format!("{x} *>&1"),
+        |x| format!("{x} | Out-Null"),
+        |x| format!("timeout 9 {x}"),
+        |x| format!("nice -n 5 {x}"),
+        |x| format!("time {x}"),
+        |x| format!("env -u HOME {x}"),
+        |x| format!("stdbuf -oL {x}"),
+        |x| format!("sudo {x}"),
+        |x| format!("sudo -n timeout 9 nice {x}"),
+        |x| format!("({x})"),
+        |x| format!("{{ {x}; }}"),
+        |x| format!("bash -c '{x}'"),
+        |x| format!("sh -lc \"{x}\""),
+        |x| format!("pwsh -NoProfile -Command \"{x}\""),
+        |x| format!("cmd /c {x}"),
+        |x| format!("Measure-Command {{ {x} }}"),
+        |x| format!("cd /tmp && {x}"),
+        |x| format!("Push-Location app; {x}; Pop-Location"),
+    ];
+
+    /// Decorations that change what runs: a recipe may not drop them.
+    const SIGNIFICANT: &[fn(&str) -> String] = &[
+        |x| format!("FOO=1 {x}"),
+        |x| format!("env FOO=1 {x}"),
+        |x| format!("{x} < in.txt"),
+        |x| format!("{x} || true"),
+        |x| format!("{x} ; true"),
+        |x| format!("yes | {x}"),
+        |x| format!("sudo -i {x}"),
+        |x| format!("runas /user:x {x}"),
+        |x| format!("timeout 9 {x} || true"),
+        |x| format!("({x} || true)"),
+        |x| format!("bash -c '{x} || true'"),
+        |x| format!("bash -c '{x} < in.txt'"),
+        |x| format!("bash -c 'FOO=1 {x}'"),
+    ];
+
+    /// `names` with `decorate` applied to the commands at `positions`.
+    fn decorated(names: &[&str], positions: &[usize], decorate: fn(&str) -> String) -> Vec<String> {
+        names
+            .iter()
+            .enumerate()
+            .map(|(i, n)| {
+                if positions.contains(&i) {
+                    decorate(n)
+                } else {
+                    (*n).to_string()
+                }
+            })
+            .collect()
+    }
+
+    /// Each single position, then all of them.
+    fn position_sets(len: usize) -> Vec<Vec<usize>> {
+        let mut sets: Vec<Vec<usize>> = (0..len).map(|i| vec![i]).collect();
+        sets.push((0..len).collect());
+        sets
+    }
+
+    #[test]
+    fn variants_on_any_command_of_a_compound_may_be_left_out() {
+        for (names, sep) in SHAPES {
+            let bare = compose(&owned(names), sep);
+            for (v, variant) in VARIANTS.iter().enumerate() {
+                for positions in position_sets(names.len()) {
+                    let rec = compose(&decorated(names, &positions, *variant), sep);
+                    assert!(
+                        matches(&bare, &rec),
+                        "variant #{v} at {positions:?}: {bare:?} should stand for {rec:?}"
+                    );
+                    assert!(
+                        matches(&rec, &rec),
+                        "variant #{v} at {positions:?}: {rec:?} should stand for itself"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn significant_forms_on_any_command_of_a_compound_are_kept() {
+        for (names, sep) in SHAPES {
+            let bare = compose(&owned(names), sep);
+            for (v, significant) in SIGNIFICANT.iter().enumerate() {
+                for positions in position_sets(names.len()) {
+                    let rec = compose(&decorated(names, &positions, *significant), sep);
+                    assert!(
+                        !command_units(&rec).is_empty(),
+                        "significant #{v} at {positions:?}: {rec:?} must be readable"
+                    );
+                    assert!(
+                        !matches(&bare, &rec),
+                        "significant #{v} at {positions:?}: {bare:?} must not stand for {rec:?}"
+                    );
+                    assert!(
+                        matches(&rec, &rec),
+                        "significant #{v} at {positions:?}: {rec:?} should stand for itself"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn stacked_variants_on_one_command_may_all_be_left_out() {
+        for (names, sep) in SHAPES {
+            let bare = compose(&owned(names), sep);
+            for (i, outer) in VARIANTS.iter().enumerate() {
+                for (j, inner) in VARIANTS.iter().enumerate() {
+                    let rec = compose(
+                        &decorated(names, &[0], |x| x.to_string())
+                            .iter()
+                            .enumerate()
+                            .map(|(k, n)| if k == 0 { outer(&inner(n)) } else { n.clone() })
+                            .collect::<Vec<_>>(),
+                        sep,
+                    );
+                    assert!(
+                        matches(&bare, &rec),
+                        "outer #{i} over inner #{j}: {bare:?} should stand for {rec:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_significant_form_under_a_variant_is_still_kept() {
+        for (names, sep) in SHAPES {
+            let bare = compose(&owned(names), sep);
+            for (i, significant) in SIGNIFICANT.iter().enumerate() {
+                for (j, variant) in VARIANTS.iter().enumerate() {
+                    let rec = compose(
+                        &owned(names)
+                            .iter()
+                            .enumerate()
+                            .map(|(k, n)| {
+                                if k == 0 {
+                                    variant(&significant(n))
+                                } else {
+                                    n.clone()
+                                }
+                            })
+                            .collect::<Vec<_>>(),
+                        sep,
+                    );
+                    assert!(
+                        !matches(&bare, &rec),
+                        "variant #{j} over significant #{i}: {bare:?} must not stand for {rec:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn cosmetic_differences_hold_inside_compounds() {
+        all_match(
+            "foo --a \"x y\" && bar C:\\a\\b",
+            &[
+                "foo --a 'x y' && bar C:/a/b",
+                "foo.exe --a 'x y'; bar.exe C:/a/b",
+                "foo   --a   'x y'\nbar C:/a/b",
+                "foo --a \\\n  'x y' && bar \\\n C:/a/b",
+                "foo --a `\n 'x y' && bar `\n C:/a/b",
+                "foo --a ^\r\n 'x y' && bar ^\r\n C:/a/b",
+            ],
+        );
+        none_match(
+            "foo --a \"x y\" && bar",
+            &[
+                "foo --a 'x  y' && bar",
+                "foo --A 'x y' && bar",
+                "Foo --a 'x y' && bar",
+            ],
+        );
+        all_match(
+            "Get-Service && Get-Process",
+            &["get-service && GET-PROCESS"],
+        );
+    }
+
+    #[test]
+    fn a_changed_command_in_a_compound_never_matches() {
+        for (names, sep) in SHAPES {
+            let names = owned(names);
+            let bare = compose(&names, sep);
+            for i in 0..names.len() {
+                let mut swapped = names.clone();
+                swapped[i] = "x".to_string();
+                let rec = compose(&swapped, sep);
+                assert!(!matches(&bare, &rec), "{bare:?} vs {rec:?}");
+                assert!(matches(&rec, &rec));
+            }
+            // A recipe naming a command that never ran does not match; a
+            // recipe naming fewer of the commands that ran does.
+            let shorter = compose(&names[..names.len() - 1], sep);
+            assert!(!matches(&bare, &shorter), "{bare:?} vs {shorter:?}");
+            assert!(matches(&shorter, &bare), "{shorter:?} vs {bare:?}");
+        }
+    }
+
+    #[test]
+    fn separators_need_no_surrounding_space() {
+        assert_eq!(keys("a&&b"), ["a", "b"]);
+        assert_eq!(keys("a;b"), ["a", "b"]);
+        assert_eq!(keys("a||b"), ["a", "b"]);
+        assert_eq!(keys("a|b"), ["a | b"]);
+        assert_eq!(keys("a&b"), ["a &", "b"]);
+        assert_eq!(keys("a;b;c"), ["a", "b", "c"]);
+        assert!(matches("a && b", "a&&b"));
+        assert!(matches("a;b", "a ; b"));
+    }
+
+    #[test]
+    fn mixed_separators_each_split() {
+        assert_eq!(keys("a && b || c"), ["a", "b", "c"]);
+        assert_eq!(keys("a && b; c || d & e"), ["a", "b", "c", "d &", "e"]);
+        assert_eq!(keys("a\nb\n\nc"), ["a", "b", "c"]);
+        assert_eq!(keys("a && b | head && c | tail -n 3"), ["a", "b", "c"]);
+        assert_eq!(keys("a | head && b"), ["a", "b"]);
+        assert_eq!(keys("a 2>&1 && b >out.log; c"), ["a", "b", "c"]);
+    }
+
+    #[test]
+    fn trailing_and_leading_separators_add_no_commands() {
+        assert_eq!(keys("a;"), ["a"]);
+        assert_eq!(keys("a ;"), ["a"]);
+        assert_eq!(keys("a\n"), ["a"]);
+        assert_eq!(keys("\n\na && b\n"), ["a", "b"]);
+        assert!(keys("").is_empty());
+        assert!(keys("   \n  ").is_empty());
+        assert!(keys("cd app").is_empty());
+        assert!(keys("cd app && cd ..").is_empty());
+        assert!(!matches("", "a"));
+    }
+
+    #[test]
+    fn pipelines_inside_compounds_keep_their_non_filter_stages() {
+        assert_eq!(keys("a | b"), ["a | b"]);
+        assert_eq!(keys("a | b | c"), ["a | b | c"]);
+        assert_eq!(keys("a | b | head"), ["a | b"]);
+        assert_eq!(keys("a | head | b"), ["a | b"]);
+        assert_eq!(keys("a | b && c | d | tail"), ["a | b", "c | d"]);
+        assert!(!matches("a", "a | b"));
+        assert!(!matches("b", "a | b"));
+        assert!(!matches("a | b", "a | c"));
+        assert!(!matches("a | b", "b | a"));
+        assert!(matches("a | b", "a | b | sort"));
+        assert!(matches(
+            "a | b && c",
+            "cd x && a | b 2>&1 | tee log && c > o"
+        ));
+    }
+
+    #[test]
+    fn failure_masking_binds_to_the_command_it_follows() {
+        assert_eq!(keys("a && b || true"), ["a", "b || true"]);
+        assert_eq!(keys("a || true && b"), ["a || true", "b"]);
+        assert_eq!(keys("a; true; b"), ["a; true", "b"]);
+        assert_eq!(keys("a || exit 0"), ["a || exit 0"]);
+        assert_eq!(keys("a | b || true"), ["a | b || true"]);
+        assert_eq!(keys("a || : && b"), ["a || :", "b"]);
+        assert!(!matches("a && b", "a && b || true"));
+        assert!(!matches("a && b", "a || true && b"));
+        assert!(!matches("a && b", "a && b; true"));
+        assert!(matches("a && b || true", "a && b || true"));
+        assert!(!matches("a && b || true", "a || true && b"));
+        // `true` as the first command is not failure masking.
+        assert_eq!(keys("true && a"), ["true", "a"]);
+        assert_eq!(keys("a && true"), ["a", "true"]);
+    }
+
+    #[test]
+    fn backgrounding_binds_to_the_command_it_follows() {
+        assert_eq!(keys("a & b"), ["a &", "b"]);
+        assert_eq!(keys("a && b & c"), ["a", "b &", "c"]);
+        assert_eq!(keys("(a; b) & c"), ["a", "b &", "c"]);
+        assert!(!matches("a && b", "a && b &"));
+        assert!(!matches("a && b", "a & b"));
+        assert!(matches("a & b", "a & b"));
+        assert!(!matches("a", "a & b"));
+        assert!(matches("b", "a & b"));
+    }
+
+    #[test]
+    fn navigation_chains_vanish_wherever_they_appear() {
+        assert_eq!(keys("cd a && cd b && pushd c && a"), ["a"]);
+        assert_eq!(keys("cd a; popd; a; cd ..; b"), ["a", "b"]);
+        assert_eq!(keys("a && cd b && c"), ["a", "c"]);
+        assert_eq!(
+            keys("cd /d C:\\app & dir & cd .. & dir /b"),
+            ["dir &", "dir /b"]
+        );
+        assert!(matches("a && c", "a && cd b && c"));
+        assert!(matches("cd x && a", "a"));
+    }
+
+    #[test]
+    fn standalone_commands_in_compounds() {
+        let rec = "set -e && source .venv/bin/activate && cd app && a | head && b 2>&1";
+        let standalone: Vec<bool> = command_units(rec)
+            .iter()
+            .map(super::Unit::is_standalone)
+            .collect();
+        assert_eq!(standalone, [true, true, false, false]);
+        all_match("a && b", &[rec]);
+        all_match("a", &[rec]);
+        all_match("set -e && a && b", &[rec]);
+        all_match("source .venv/bin/activate && a", &[rec]);
+        all_match("set -e && source .venv/bin/activate && a && b", &[rec]);
+        none_match("set +e && a && b", &[rec]);
+        none_match("source other/bin/activate && a", &[rec]);
+        none_match("set -u && a", &[rec]);
+        none_match("a && b && c", &[rec]);
+        // A standalone command that was never run cannot be added.
+        none_match("set -e && a", &["a"]);
+        none_match("nvm use 20 && a", &["nvm use 18 && a"]);
+        all_match(
+            "nvm use 20 && a",
+            &["nvm use 20 && a", "nvm use 20; cd x; a"],
+        );
+        // Several setup commands, in any combination, may be left out.
+        all_match(
+            "a",
+            &[
+                "set -e; set -o pipefail; echo --- ; source x; a",
+                "$ErrorActionPreference = 'Stop'; . .\\.venv\\Scripts\\Activate.ps1; a",
+                "@echo off & chcp 65001 >NUL & call vcvars64.bat & a",
+            ],
+        );
+    }
+
+    #[test]
+    fn environment_settings_in_compounds() {
+        assert_eq!(keys("A=1 a && B=2 b"), ["A=1 a", "B=2 b"]);
+        assert_eq!(keys("A=1 B=2 a | head"), ["A=1 B=2 a"]);
+        assert!(!matches("a && b", "A=1 a && b"));
+        assert!(!matches("a && b", "a && B=2 b"));
+        assert!(!matches("a && b", "export A=1; a && b"));
+        assert!(!matches("a && b", "$env:A='1'; a; b"));
+        assert!(!matches("a && b", "env A=1 a && b"));
+        assert!(matches("A=1 a && b", "A=1 a && b | head"));
+        assert!(matches("A=1 a && B=2 b", "A=1 timeout 5 a && B=2 nice b"));
+        assert!(!matches("A=2 a && b", "A=1 a && b"));
+        assert!(!matches("B=2 A=1 a", "A=1 B=2 a"));
+        assert!(matches("env A=1 a", "A=1 a"));
+        assert!(matches("A=1 a", "env -u HOME A=1 a"));
+    }
+
+    #[test]
+    fn retained_wrappers_in_compounds_are_per_command() {
+        let rec = command_units("timeout 5 a && timeout 7 b && c");
+        assert_eq!(rec.len(), 3);
+        let bare = command_units("a && b && c");
+        assert_eq!(bare[0].shown_for(&rec[0]), "timeout 5 a");
+        assert_eq!(bare[1].shown_for(&rec[1]), "timeout 7 b");
+        assert_eq!(bare[2].shown_for(&rec[2]), "c");
+        assert!(matches("a && b && c", "timeout 5 a && timeout 7 b && c"));
+        assert!(matches(
+            "timeout 5 a && timeout 7 b",
+            "timeout 5 a && timeout 7 b && c"
+        ));
+        assert!(!matches("timeout 7 a && b", "timeout 5 a && timeout 7 b"));
+        assert!(!matches(
+            "timeout 5 a && timeout 5 b",
+            "timeout 5 a && timeout 7 b"
+        ));
+        assert!(!matches("timeout 5 a && b", "a && b"));
+        // The same command run twice under different bounds.
+        assert!(matches("timeout 5 a", "timeout 5 a; timeout 7 a"));
+        assert!(matches("timeout 7 a", "timeout 5 a; timeout 7 a"));
+        assert!(!matches("timeout 9 a", "timeout 5 a; timeout 7 a"));
+        // Sudo is restored the same way.
+        let rec = command_units("sudo a && sudo -u bob b");
+        let bare = command_units("a && b");
+        assert_eq!(bare[0].shown_for(&rec[0]), "sudo a");
+        assert_eq!(bare[1].shown_for(&rec[1]), "sudo -u bob b");
+        assert!(!matches("sudo -u alice b", "sudo -u bob b"));
+        assert!(!matches("sudo a", "a"));
+        assert!(!matches("sudo a", "sudo -E a"));
+    }
+
+    #[test]
+    fn sudo_is_a_retained_wrapper() {
+        for rec in [
+            "sudo foo",
+            "doas foo",
+            "sudo -n foo",
+            "sudo -E foo",
+            "sudo -H -n foo",
+            "sudo -u root foo",
+            "sudo --user=root foo",
+            "sudo --user root foo",
+            "sudo -g wheel foo",
+            "sudo -- foo",
+            "sudo foo | head",
+            "sudo timeout 5 foo",
+            "sudo nice -n 5 foo",
+        ] {
+            assert!(matches("foo", rec), "{rec}");
+            let shown = command_units("foo")[0].shown_for(&command_units(rec)[0]);
+            assert!(
+                shown.starts_with(rec.split(" foo").next().unwrap()),
+                "{shown}"
+            );
+        }
+        assert_eq!(
+            command_units("foo")[0].shown_for(&command_units("sudo -u root foo --x")[0]),
+            "sudo -u root foo"
+        );
+        assert!(matches("sudo foo", "sudo foo"));
+        assert!(!matches("sudo foo", "foo"));
+        assert!(!matches("sudo -u a foo", "sudo -u b foo"));
+        assert!(!matches("sudo foo", "sudo -E foo"));
+        assert!(!matches("sudo foo", "doas foo"));
+        assert!(!matches("timeout 5 foo", "sudo timeout 5 foo"));
+        assert!(matches("A=1 foo", "A=1 sudo foo"));
+        assert!(!matches("foo", "A=1 sudo foo"));
+        // Not wrappers: a login shell, a shell, stdin passwords, other verbs.
+        for rec in [
+            "sudo -i foo",
+            "sudo -s foo",
+            "sudo -S foo",
+            "sudo -l",
+            "sudo -v",
+            "sudo -u root",
+            "sudo",
+            "runas /user:x foo",
+        ] {
+            assert!(!matches("foo", rec), "{rec}");
+        }
+    }
+
+    #[test]
+    fn grouping_and_subshells_in_compounds() {
+        assert_eq!(keys("(a && b)"), ["a", "b"]);
+        assert_eq!(keys("(a; b) && c"), ["a", "b", "c"]);
+        assert_eq!(keys("{ a; b; } | head"), ["a", "b"]);
+        assert_eq!(keys("(cd x && a)"), ["a"]);
+        assert_eq!(keys("(cd x; a) > out.log 2>&1"), ["a"]);
+        assert_eq!(keys("(a) && (b)"), ["a", "b"]);
+        assert_eq!(keys("(a || true)"), ["a || true"]);
+        assert_eq!(keys("(a; b || true)"), ["a", "b || true"]);
+        assert_eq!(keys("(a & b)"), ["a &", "b"]);
+        assert_eq!(keys("(a; b) &"), ["a", "b &"]);
+        assert_eq!(keys("(a | b)"), ["a | b"]);
+        assert_eq!(keys("(a | head)"), ["a"]);
+        assert!(matches("a && b", "(a; b)"));
+        assert!(matches("a && b", "(cd x; a) && (b | head)"));
+        assert!(!matches("a", "(a || true)"));
+        assert!(!matches("a && b", "(a; b) &"));
+        assert!(!matches("a && b", "(a; b) < in.txt"));
+        // A group that is part of a larger pipeline is not unwrapped.
+        assert!(!matches("a", "(a) | b"));
+        assert!(!matches("a", "b | (a)"));
+    }
+
+    #[test]
+    fn shell_invocations_nested_in_compounds() {
+        assert_eq!(keys("bash -c 'a && b'"), ["a", "b"]);
+        assert_eq!(keys("bash -c 'a; b' && c"), ["a", "b", "c"]);
+        assert_eq!(keys("c && bash -c 'a && b'"), ["c", "a", "b"]);
+        assert_eq!(keys("bash -c 'cd x && a'"), ["a"]);
+        assert_eq!(keys("bash -c 'A=1 a'"), ["A=1 a"]);
+        assert_eq!(keys("bash -c 'a | b'"), ["a | b"]);
+        assert_eq!(keys("bash -c 'a | head' | tail"), ["a"]);
+        assert_eq!(keys("bash -c 'a' 2>&1 | tee log"), ["a"]);
+        assert_eq!(keys("bash -c 'a || true'"), ["a || true"]);
+        assert_eq!(keys("bash -c 'a &' && b"), ["a &", "b"]);
+        assert_eq!(keys("bash -c 'a' & b"), ["a &", "b"]);
+        assert_eq!(keys("bash -c 'source x && a | head'"), ["source x", "a"]);
+        assert!(matches("a && b", "bash -c 'a && b | head' 2>&1"));
+        assert!(matches("a", "bash -c 'a || b'"));
+        assert!(!matches("a", "bash -c 'a || true'"));
+        assert!(!matches("a", "bash -c 'a' | b"));
+        assert!(!matches("a", "bash -c 'a' < in.txt"));
+        assert!(!matches("a", "bash -c 'a' &"));
+        assert!(!matches("a && b", "bash -c 'a' && x"));
+        assert!(matches("bash -c 'a'", "bash -c 'a'"));
+        assert!(matches("bash -c 'a && b'", "bash -c 'a && b'"));
+    }
+
+    #[test]
+    fn shell_invocations_nested_in_shell_invocations() {
+        for rec in [
+            "bash -c \"sh -c 'foo'\"",
+            "sh -c \"bash -c 'foo'\"",
+            "bash -c '(foo)'",
+            "bash -c \"(sh -c 'foo')\"",
+            "pwsh -NoProfile -Command \"bash -c 'foo'\"",
+            "pwsh -Command \"cmd /c foo\"",
+            "cmd /c \"pwsh -Command foo\"",
+            "cmd /c \"bash -c 'foo'\"",
+            "bash -c \"pwsh -NoProfile -NonInteractive -Command 'foo'\"",
+            "((foo))",
+            "({ foo; })",
+            "bash -c '{ foo; }'",
+        ] {
+            assert!(matches("foo", rec), "{rec}");
+            assert_eq!(keys(rec), ["foo"], "{rec}");
+        }
+        assert_eq!(keys("bash -c \"sh -c 'a && b'\""), ["a", "b"]);
+        assert_eq!(keys("pwsh -Command \"cmd /c 'a && b'\""), ["a", "b"]);
+        assert_eq!(
+            keys("bash -c \"cd x && sh -c 'a; b' && c\""),
+            ["a", "b", "c"]
+        );
+        assert_eq!(keys("bash -c \"sh -c 'a || true'\""), ["a || true"]);
+        assert_eq!(keys("bash -c \"sh -c 'a &'; b\""), ["a &", "b"]);
+        assert_eq!(keys("bash -c \"sh -c 'FOO=1 a'\""), ["FOO=1 a"]);
+        assert!(!matches("a", "bash -c \"sh -c 'a < in.txt'\""));
+        assert!(!matches("a", "bash -c \"sh -c 'a || true'\""));
+        assert!(!matches("a", "bash -c \"sh -c 'a | b'\""));
+        assert!(!matches("a", "bash -c \"sh -c 'FOO=1 a'\""));
+        assert!(matches("a", "bash -c \"sh -c 'a | head'\""));
+        assert!(matches("a && b", "bash -c \"sh -c 'a' && (b)\""));
+    }
+
+    #[test]
+    fn wrappers_around_shell_invocations_are_not_unwrapped() {
+        // A bound, a user or an environment on the outside applies to the
+        // whole inner command line, so the pieces are not compared one by one.
+        for rec in [
+            "timeout 5 bash -c 'foo'",
+            "sudo bash -c 'foo'",
+            "sudo -u bob sh -c 'foo'",
+            "A=1 bash -c 'foo'",
+            "env A=1 bash -c 'foo'",
+            "time timeout 5 bash -c 'foo'",
+        ] {
+            assert!(!matches("foo", rec), "{rec}");
+            assert!(matches(rec, rec), "{rec}");
+        }
+        // Wrappers that carry nothing do not stop the unwrap of `bash -c`.
+        assert!(matches("foo", "nice bash -c 'foo'"));
+        assert!(matches("foo", "time bash -c 'foo'"));
+        assert!(matches("foo", "env -u HOME bash -c 'foo'"));
+        assert!(matches("foo", "nice -n 5 time bash -c 'foo'"));
+    }
+
+    #[test]
+    fn nesting_depth_is_bounded_and_fails_closed() {
+        fn nest(depth: usize) -> String {
+            let mut command = "foo".to_string();
+            for _ in 0..depth {
+                command = format!("({command})");
+            }
+            command
+        }
+        assert_eq!(keys(&nest(1)), ["foo"]);
+        assert_eq!(keys(&nest(super::MAX_DEPTH)), ["foo"]);
+        assert!(keys(&nest(super::MAX_DEPTH + 1)).is_empty());
+        assert!(keys(&nest(super::MAX_DEPTH + 4)).is_empty());
+        assert!(!matches("foo", &nest(super::MAX_DEPTH + 1)));
+        assert!(!matches(&nest(super::MAX_DEPTH + 1), "foo"));
+        // Too deep anywhere in a compound makes the whole line unreadable.
+        let too_deep = format!("a && {} && b", nest(super::MAX_DEPTH + 1));
+        assert!(keys(&too_deep).is_empty());
+        assert!(!matches("a && b", &too_deep));
+        assert!(!matches("a", &too_deep));
+    }
+
+    #[test]
+    fn anything_unreadable_in_a_compound_makes_it_all_unreadable() {
+        for rec in [
+            "a && bash -c 'b",
+            "a && (b",
+            "a && 'b",
+            "a && \"b",
+            "a && cat <<EOF\nx\nEOF",
+            "a && grep x <<< y",
+            "a && (b; cat <<EOF\nx\nEOF)",
+            "a && bash -c 'cat <<EOF\nx\nEOF'",
+            "a && $x = @'\nx\n'@",
+            "(a && (b; $x = @\"\nx\n\"@))",
+        ] {
+            assert!(keys(rec).is_empty(), "{rec}");
+            assert!(!matches("a", rec), "{rec}");
+            assert!(!matches(rec, rec), "{rec}");
+        }
+        // And a recipe that cannot be read matches nothing.
+        assert!(!matches("a && (b", "a && b"));
+        assert!(!matches("a && bash -c 'b", "a && b"));
+    }
+
+    #[test]
+    fn compounds_in_powershell_and_cmd() {
+        assert_eq!(
+            keys("Push-Location app; $env:MODE='x'; dotnet test | Out-Null; Pop-Location"),
+            ["$env:MODE='x'; dotnet test"]
+        );
+        assert_eq!(
+            keys("cd /d C:\\app && npm ci && npm test > t.log 2>&1"),
+            ["npm ci", "npm test"]
+        );
+        assert_eq!(
+            keys("call setup.bat && cargo test"),
+            ["call setup.bat", "cargo test"]
+        );
+        assert!(matches(
+            "Get-Service; Get-Process",
+            "get-service ; GET-PROCESS | Out-Null"
+        ));
+        assert!(matches(
+            "dotnet build && dotnet test",
+            "pwsh -NoProfile -Command \"cd app; dotnet build; dotnet test\""
+        ));
+        assert!(matches(
+            "npm ci && npm test",
+            "cmd /d /c \"cd /d C:\\app && npm ci && npm test\""
+        ));
+        assert!(!matches(
+            "dotnet build && dotnet test",
+            "pwsh -Command \"dotnet build; dotnet test || true\""
+        ));
+        assert!(!matches("npm test", "cmd /c \"npm test < in.txt\""));
+        assert!(!matches("npm test", "$env:MODE='x'; npm test"));
     }
 
     #[test]
