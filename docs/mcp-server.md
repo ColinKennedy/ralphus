@@ -219,6 +219,7 @@ Swap the second line for a `tools/call` to prove it reaches the daemon:
 | Connects, but every tool call errors with `unauthorized` | The daemon is up but the token did not resolve. Check `~/.ralphus/daemon.token` exists, or set `RALPHUS_DAEMON_TOKEN`. |
 | Connects, but tool calls fail with a connection error | No daemon is listening on the URL. Start one, or pass `--daemon-url`. |
 | Server registered but no tools in the session | The session was already running when it was added. Restart the client. |
+| A tool lacks a field the CLI has (e.g. `cell_edit` without `initialization_commands`) | The registered `ralphus-mcp` binary predates the field, or the client cached the old tool list. Rebuild (`cargo build -p ralphus-mcp`, or re-copy to `dist/`), then restart the client or reconnect the server (`/mcp` in Claude Code). Confirm with the `tools/list` probe above. CLI flag `--initialization-commands` is the property `initialization_commands`; an empty string clears it. |
 | Mutating tools missing | The server was registered with `--read-only`. |
 | `cargo build` fails to relink `ralphus-mcp` | The client is holding the binary open. Register the copy in `dist/`, not the one in `target/`. |
 

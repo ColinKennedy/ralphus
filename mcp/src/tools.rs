@@ -396,4 +396,44 @@ mod tests {
             vec!["cell", "restart-proof", "squad-1/build/0", "--from", "2"]
         );
     }
+
+    /// RAL-681: `cell_edit` advertises both worktree-initialization fields
+    /// with real descriptions, and an empty `initialization_commands` (the
+    /// clear request) survives `build_argv` -> `parse_args` as `Some("")`.
+    #[test]
+    fn cell_edit_exposes_initialization_fields_and_keeps_empty_clear() {
+        use ralphus_cli::commands::cell::CellCommand;
+        use ralphus_cli::commands::{self, Command};
+
+        let tools = all_tools();
+        let tool = tools
+            .iter()
+            .find(|t| t.name == "cell_edit")
+            .expect("cell_edit tool");
+        for key in ["initialization_commands", "initialization_timeout_sec"] {
+            let description = tool.input_schema["properties"][key]["description"]
+                .as_str()
+                .unwrap_or_else(|| panic!("{key} missing from cell_edit schema"));
+            assert!(
+                !description.contains("shown value type"),
+                "{key}: {description}"
+            );
+        }
+        let mut args = Map::new();
+        args.insert("selector".to_string(), json!("squad-1/build/0"));
+        args.insert("initialization_commands".to_string(), json!(""));
+        args.insert("initialization_timeout_sec".to_string(), json!(300));
+        let argv = tool.build_argv(&args).unwrap();
+        match commands::parse_args(&argv) {
+            Command::Cell(CellCommand::Edit {
+                initialization_commands,
+                initialization_timeout_sec,
+                ..
+            }) => {
+                assert_eq!(initialization_commands.as_deref(), Some(""));
+                assert_eq!(initialization_timeout_sec.as_deref(), Some("300"));
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
 }
