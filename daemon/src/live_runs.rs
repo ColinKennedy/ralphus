@@ -499,13 +499,17 @@ pub enum AutoRunDecision {
     AlreadyRan,
     ReviewStopped,
     NoCheckout,
+    /// The initial stacked rebase has not settled every enabled branch yet
+    /// (`first_ready_at_ms` is unset), so the tip is not the integrated result.
+    StackNotSettled,
     NoMemberCells,
     CellsStillRunning,
     OverBudget,
 }
 
 /// Start review `guardian_id`'s one automatic live-action run when it is due:
-/// opted in, never run, a prepared checkout exists, the review is not stopped
+/// opted in, never run, a prepared checkout exists, the initial stacked rebase
+/// has settled every enabled branch, the review is not stopped
 /// or finished, it has member cells and every one has finished, and its budget
 /// is not spent. Claims the run (write-once) before doing anything else, then
 /// deduplicates the handoffs and queues every resulting live action on a
@@ -579,6 +583,9 @@ pub fn automatic_run_decision(
     {
         return AutoRunDecision::NoCheckout;
     }
+    if !stack_settled(&guard.conn, guardian_id) {
+        return AutoRunDecision::StackNotSettled;
+    }
     let members =
         crate::live_actions::review_member_cells_conn(&guard.conn, guardian_id).unwrap_or_default();
     if members.is_empty() {
@@ -594,6 +601,18 @@ pub fn automatic_run_decision(
         return AutoRunDecision::OverBudget;
     }
     AutoRunDecision::Due
+}
+
+/// Whether the review's initial stacked rebase has settled every enabled branch
+/// (the write-once `first_ready_at_ms` marker). A branch being `ready` or an
+/// older prepared checkout existing does not count.
+fn stack_settled(conn: &rusqlite::Connection, guardian_id: &str) -> bool {
+    conn.query_row(
+        "SELECT first_ready_at_ms IS NOT NULL FROM guardians WHERE id=?",
+        rusqlite::params![guardian_id],
+        |r| r.get::<_, bool>(0),
+    )
+    .unwrap_or(false)
 }
 
 fn over_budget(store: &crate::store::Store, guardian_id: &str) -> bool {
@@ -1629,6 +1648,13 @@ prompt = "first"
                 )
                 .unwrap();
             guard.set_guardian_live_actions(&gid, Some(true)).unwrap();
+            guard
+                .conn
+                .execute(
+                    "UPDATE guardians SET first_ready_at_ms=1 WHERE id=?",
+                    rusqlite::params![gid],
+                )
+                .unwrap();
         }
         let agent = Arc::new(Agent {
             reply: reply.to_string(),
@@ -1723,6 +1749,45 @@ prompt = "first"
         assert_eq!(
             automatic_run_decision(&f.store, &f.gid),
             AutoRunDecision::OverBudget
+        );
+    }
+
+    #[test]
+    fn the_automatic_run_waits_for_the_initial_stack_to_settle() {
+        let f = fixture("stack", "ok");
+        f.store
+            .lock()
+            .set_live_checkout(&f.gid, &f.dir.to_string_lossy(), None)
+            .unwrap();
+        let set_marker = |value: &str| {
+            f.store
+                .lock()
+                .conn
+                .execute(
+                    &format!("UPDATE guardians SET first_ready_at_ms={value} WHERE id=?"),
+                    rusqlite::params![f.gid],
+                )
+                .unwrap();
+        };
+        // A prepared checkout alone is not permission to consume the claim.
+        set_marker("NULL");
+        assert_eq!(
+            maybe_start_automatic_run(&f.store, &f.runners, &f.gid),
+            AutoRunDecision::StackNotSettled
+        );
+        assert!(
+            f.store
+                .lock()
+                .get_guardian(&f.gid)
+                .unwrap()
+                .live_actions_auto_ran_at_ms
+                .is_none(),
+            "the claim stays unconsumed"
+        );
+        set_marker("1");
+        assert_eq!(
+            automatic_run_decision(&f.store, &f.gid),
+            AutoRunDecision::Due
         );
     }
 

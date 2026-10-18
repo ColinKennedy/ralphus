@@ -4318,6 +4318,11 @@ impl Store {
             // the "review is ready" banner shows only for reviews carrying it.
             // Never cleared, so a re-merge or feedback round cannot re-arm it.
             "ALTER TABLE guardians ADD COLUMN first_ready_at_ms INTEGER",
+            // Live actions are on by default for reviews created through
+            // `create_guardian`, which stamps 1. NULL on every earlier row, so
+            // a review that predates the default keeps resolving an unset
+            // `live_actions` to off.
+            "ALTER TABLE guardians ADD COLUMN live_actions_default_on INTEGER",
             // RAL-<pending>: coarse-grained progress reporting for a squad
             // sitting in `materializing` (`run_submit_followup`'s named
             // phases -- fetching upstream refs, creating worktrees,

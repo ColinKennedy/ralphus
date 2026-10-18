@@ -587,7 +587,9 @@ Tip: validate before submitting -- `ralphus validate file.toml`
                 merged and an agent runs each against the review's tip --
                 once, automatically, then only by hand. Fixes it commits
                 are carried onto the top branch. Unset inherits the
-                project's .ralphus.toml [review] live_actions, then false.
+                project's .ralphus.toml [review] live_actions, then true for
+                a review created now (a review that predates this default
+                keeps false). Set false to disable.
  rebuild_on
         string[] Which events tear down and rebuild this review's prepared
                 build (its preparation, then its actions): any of "rebase"

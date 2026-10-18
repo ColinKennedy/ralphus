@@ -431,7 +431,7 @@
         if (!g.effective_live_actions && !(view && view.enabled) && !actions.length && !runs.length) return "";
         const headTip = "Live actions: things the cells' agents asked to have tried against the finished review, posted as handoffs when they finished.\nAn agent runs each one against the review's prepared tip and writes a report. Runs cost money.\nAdvisory — they never block Approve or Merge / rebase.";
         const autoRan = view ? view.auto_ran_at_ms : g.live_actions_auto_ran_at_ms;
-        const statusTip = "Live actions run once automatically, when every cell has finished and the build is prepared. After that they run only when you press Run.\nEach run is an agent session, so it costs money.\nAn agent may commit a fix while testing; ralphus carries those commits onto the review's top branch.";
+        const statusTip = "Live actions run once automatically, when every cell has finished and the review's branches have been rebased and its build is prepared. After that they run only when you press Run.\nEach run is an agent session, so it costs money.\nAn agent may commit a fix while testing; ralphus carries those commits onto the review's top branch.";
         const status = autoRan
           ? `<span data-tip="${esc(`${statusTip}\nThe automatic run started ${new Date(autoRan).toLocaleString()}.`)}">automatic run done</span>`
           : `<span data-tip="${esc(statusTip)}">runs once automatically when every cell has finished and the build is prepared</span>`;

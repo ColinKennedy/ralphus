@@ -133,13 +133,13 @@ test the same thing, and has an agent run each against the review's tip: start
 the real program, drive it, report what happened. That is what catches the
 change that passes its tests but does not actually work.
 
-Opt in per review with `[[review]] live_actions = true`, `ralphus review
+Live actions are on by default for new reviews. Set them per review with `[[review]] live_actions = true`, `ralphus review
 settings <selector> --live-actions`, or the "run live actions" checkbox in the
 review's Setup modal; or for a whole project with `[review] live_actions =
-true` in `.ralphus.toml` or the project's Review Settings. It is off by default:
-each run is an agent session and costs accordingly.
+true` (or `false` to disable) in `.ralphus.toml` or the project's Review Settings; the review's own setting wins. A review that predates the default stays off
+unless set. Each run is an agent session and costs accordingly.
 
-Live actions run **once, automatically**: the first time the review's build has
+Live actions run **once, automatically**: the first time the review's branches have been rebased into the completed stack and its build has
 been prepared while every one of its cells has finished. They never wait for CI.
 A rebase, feedback, an auto-fix or a daemon restart never runs them again; after
 that, use **▶ Run all** or a row's **▶ Run** in the review's live actions
