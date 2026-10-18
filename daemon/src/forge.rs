@@ -1610,6 +1610,16 @@ impl ForgeClient {
         }) {
             return Ok(PrCiState::Pending);
         }
+        // A cancelled run has no failure to fix. When every check was
+        // cancelled there is no verdict either, so wait for a re-run; a
+        // cancelled check beside completed ones never overrides them.
+        if !runs.is_empty()
+            && runs
+                .iter()
+                .all(|r| r["conclusion"].as_str() == Some("cancelled"))
+        {
+            return Ok(PrCiState::Pending);
+        }
 
         let status_url = format!(
             "{}/repos/{}/commits/{sha}/status",
@@ -1763,6 +1773,7 @@ impl ForgeClient {
             }
             // A cancelled or skipped pipeline has no failure to fix: keep
             // waiting for a re-run rather than dispatching an auto-fix.
+            "canceled" | "skipped" => Ok(PrCiState::Pending),
             // "running" | "pending" | "created" | "waiting_for_resource" | "preparing" | ...
             _ => Ok(PrCiState::Pending),
         }
@@ -8530,7 +8541,7 @@ mod tests {
     }
 
     #[test]
-    fn check_pr_ci_status_waits_on_a_cancelled_job_of_the_newest_workflow_run() {
+    fn check_pr_ci_status_waits_when_every_check_was_cancelled_and_never_replaced() {
         let mock = MockForge::start(move |server| {
             let req = server.recv();
             req.respond(
@@ -8544,7 +8555,7 @@ mod tests {
             req.respond(
                 tiny_http::Response::from_string(
                     r#"{"check_runs": [
-                        {"id": 1, "name": "scope", "app": {"id": 15368}, "details_url": "https://github.com/a/b/actions/runs/100/job/1", "status": "completed", "conclusion": "success"},
+                        {"id": 1, "name": "scope", "app": {"id": 15368}, "details_url": "https://github.com/a/b/actions/runs/100/job/1", "status": "completed", "conclusion": "cancelled"},
                         {"id": 2, "name": "build (linux)", "app": {"id": 15368}, "details_url": "https://github.com/a/b/actions/runs/100/job/2", "status": "completed", "conclusion": "cancelled"}
                     ]}"#,
                 )
@@ -9361,20 +9372,24 @@ mod tests {
     }
 
     #[test]
-    fn check_pr_ci_status_waits_on_a_canceled_or_skipped_gitlab_pipeline() {
+    fn check_pr_ci_status_waits_on_an_unreplaced_canceled_or_skipped_gitlab_pipeline() {
         for status in ["canceled", "skipped"] {
             let mock = MockForge::start(move |server| {
                 let req = server.recv();
                 req.respond(
                     tiny_http::Response::from_string(format!(
-                        r#"{{"merge_status": "can_be_merged", "pipeline": {{"id": 54, "status": "{status}", "web_url": "https://gitlab.example/pipelines/54"}}}}"#
+                        r#"{{"merge_status": "can_be_merged", "sha": "head-sha", "head_pipeline": {{"id": 54, "ref": "feature", "sha": "head-sha", "status": "{status}", "web_url": "https://gitlab.example/pipelines/54"}}}}"#
                     ))
                     .with_status_code(200),
                 )
                 .unwrap();
             });
             let client = mock.client(ForgeKind::GitLab, "group%2Fproj");
-            assert_eq!(client.check_pr_ci_status(9).unwrap(), PrCiState::Pending);
+            assert_eq!(
+                client.check_pr_ci_status(9).unwrap(),
+                PrCiState::Pending,
+                "{status}"
+            );
             mock.finish();
         }
     }
