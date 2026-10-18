@@ -13,7 +13,8 @@
 //! * wrappers (`timeout`, `sudo`, `nice`, `time`, `env -u`, `bash -c`, `( ... )`, ...)
 //!   are variants of the command they wrap;
 //! * environment settings (`MODE=x`, `$env:MODE='x'`, `export`) stay part of
-//!   the unit they precede, so they are never silently lost;
+//!   every later unit of the same scope (a group or `bash -c` payload is its
+//!   own scope), so they are never silently lost;
 //! * input-changing forms (`< file`, `yes |`) and failure masking
 //!   (`|| true`, `; true`) or backgrounding (`&`) are part of the command.
 //!
@@ -1156,8 +1157,9 @@ fn masks_failure(core: &[String]) -> bool {
 enum Analysis {
     Navigation,
     Command(Box<Command>),
-    /// The units a wrapper's payload expands to.
-    Unwrapped(Vec<Unit>),
+    /// The units a wrapper's payload expands to; `true` when a bound, user or
+    /// environment outside the shell was folded into the single unit.
+    Unwrapped(Vec<Unit>, bool),
 }
 
 struct Command {
@@ -1186,10 +1188,27 @@ fn analyze(head: &Stage, allow_unwrap: bool, depth: usize) -> Option<Analysis> {
         };
         let Some(s) = strip(words) else { break };
         if let Some(payload) = s.payload {
-            if lead > 0 || retained.is_some() || !kept.is_empty() || !allow_unwrap {
+            if !allow_unwrap {
                 break;
             }
-            return unwrap_payload(&payload, depth);
+            let Some(Analysis::Unwrapped(mut inner, _)) = unwrap_payload(&payload, depth) else {
+                return None;
+            };
+            let outer_words: Vec<String> = core[..lead].iter().chain(&kept).cloned().collect();
+            if outer_words.is_empty() && retained.is_none() {
+                return Some(Analysis::Unwrapped(inner, false));
+            }
+            // A bound, a user or an environment outside the shell applies to
+            // what it runs; that is only comparable for a single command.
+            let [only] = inner.as_mut_slice() else { break };
+            if !outer_words.is_empty() {
+                only.key = format!("{} {}", outer_words.join(" "), only.key);
+            }
+            only.retained = match (retained, only.retained.take()) {
+                (Some(outer), Some(inner)) => Some(format!("{outer} {inner}")),
+                (outer, inner) => outer.or(inner),
+            };
+            return Some(Analysis::Unwrapped(inner, true));
         }
         if s.retained {
             let text = words[..s.consumed].join(" ");
@@ -1224,7 +1243,7 @@ fn analyze(head: &Stage, allow_unwrap: bool, depth: usize) -> Option<Analysis> {
 }
 
 fn unwrap_payload(payload: &str, depth: usize) -> Option<Analysis> {
-    Some(Analysis::Unwrapped(units_of(payload, depth + 1)?))
+    Some(Analysis::Unwrapped(units_of(payload, depth + 1)?, false))
 }
 
 fn units_of(command: &str, depth: usize) -> Option<Vec<Unit>> {
@@ -1281,7 +1300,10 @@ fn units_of(command: &str, depth: usize) -> Option<Vec<Unit>> {
         }
     }
     let mut units: Vec<Unit> = Vec::new();
-    let mut pending: Vec<(String, String)> = Vec::new();
+    // Environment settings (`export A=1`, `$env:A='1'`), as written and as keyed.
+    // They stay in force for every later command of this scope, so each of
+    // those commands carries them.
+    let mut settings: Vec<(String, String)> = Vec::new();
     let mut previous: Option<usize> = None;
     let backgrounded: Vec<bool> = segments
         .iter()
@@ -1306,7 +1328,7 @@ fn units_of(command: &str, depth: usize) -> Option<Vec<Unit>> {
             }
         }
         if is_environment_setting(&head.core) {
-            pending.push((head.all.join(" "), normalize_words(&head.core)));
+            settings.push((head.all.join(" "), normalize_words(&head.core)));
             continue;
         }
         let tail_stages = &stages[1..];
@@ -1316,13 +1338,13 @@ fn units_of(command: &str, depth: usize) -> Option<Vec<Unit>> {
             .map(|s| format!(" | {}", s.all.join(" ")))
             .collect();
         let suffix = if backgrounded[k] { " &" } else { "" };
-        match analyze(head, tail_filters && pending.is_empty(), depth)? {
+        match analyze(head, tail_filters && settings.is_empty(), depth)? {
             Analysis::Navigation => {}
-            Analysis::Unwrapped(mut inner) => {
+            Analysis::Unwrapped(mut inner, decorated) => {
                 if let [only] = inner.as_mut_slice() {
-                    if only.retained.is_none() {
+                    if only.retained.is_none() || decorated {
                         only.first = head.all.clone();
-                        only.env_len = 0;
+                        only.env_len = leading_assignments(&head.all);
                         only.prefix.clear();
                         only.tail = tail_visible;
                     }
@@ -1348,12 +1370,11 @@ fn units_of(command: &str, depth: usize) -> Option<Vec<Unit>> {
                 }
                 key.push_str(suffix);
                 let mut prefix = String::new();
-                if !standalone && !pending.is_empty() {
-                    let visible: Vec<&str> = pending.iter().map(|p| p.0.as_str()).collect();
-                    let keys: Vec<&str> = pending.iter().map(|p| p.1.as_str()).collect();
+                if !standalone && !settings.is_empty() {
+                    let visible: Vec<&str> = settings.iter().map(|p| p.0.as_str()).collect();
+                    let keys: Vec<&str> = settings.iter().map(|p| p.1.as_str()).collect();
                     prefix = format!("{}; ", visible.join("; "));
                     key = format!("{}; {key}", keys.join("; "));
-                    pending.clear();
                 }
                 units.push(Unit {
                     prefix,
@@ -1396,11 +1417,20 @@ mod tests {
             .collect()
     }
 
-    /// Whether a recipe `proposed` stands for a unit of `recorded`.
+    /// Whether a recipe `proposed` stands for the units of `recorded`: each of
+    /// its commands matches a distinct recorded command, in the order they ran.
     fn matches(proposed: &str, recorded: &str) -> bool {
         let rec = command_units(recorded);
         let prop = command_units(proposed);
-        !prop.is_empty() && prop.iter().all(|p| rec.iter().any(|r| p.matches(r)))
+        let mut next = 0;
+        !prop.is_empty()
+            && prop.iter().all(|p| {
+                let Some(offset) = rec[next..].iter().position(|r| p.matches(r)) else {
+                    return false;
+                };
+                next += offset + 1;
+                true
+            })
     }
 
     #[test]
@@ -1850,6 +1880,10 @@ mod tests {
         |x| format!("bash -c '{x} || true'"),
         |x| format!("bash -c '{x} < in.txt'"),
         |x| format!("bash -c 'FOO=1 {x}'"),
+        |x| format!("export FOO=1; {x}"),
+        |x| format!("$env:FOO='1'; {x}"),
+        |x| format!("set FOO=1 && {x}"),
+        |x| format!("bash -c 'export FOO=1; {x}'"),
     ];
 
     /// `names` with `decorate` applied to the commands at `positions`.
@@ -1924,14 +1958,14 @@ mod tests {
             let bare = compose(&owned(names), sep);
             for (i, outer) in VARIANTS.iter().enumerate() {
                 for (j, inner) in VARIANTS.iter().enumerate() {
-                    let rec = compose(
-                        &decorated(names, &[0], |x| x.to_string())
-                            .iter()
-                            .enumerate()
-                            .map(|(k, n)| if k == 0 { outer(&inner(n)) } else { n.clone() })
-                            .collect::<Vec<_>>(),
-                        sep,
-                    );
+                    // Two layers of the same quote kind would need escaping.
+                    let (o, n) = (outer("x"), inner("x"));
+                    if ['\'', '"'].iter().any(|q| o.contains(*q) && n.contains(*q)) {
+                        continue;
+                    }
+                    let mut stacked = owned(names);
+                    stacked[0] = outer(&inner(names[0]));
+                    let rec = compose(&stacked, sep);
                     assert!(
                         matches(&bare, &rec),
                         "outer #{i} over inner #{j}: {bare:?} should stand for {rec:?}"
@@ -2166,6 +2200,121 @@ mod tests {
     }
 
     #[test]
+    fn an_environment_setting_applies_to_every_later_command() {
+        assert_eq!(
+            texts("export A=1; a && b"),
+            ["export A=1; a", "export A=1; b"]
+        );
+        assert_eq!(
+            texts("$env:A='1'; a; b | head"),
+            ["$env:A='1'; a", "$env:A='1'; b | head"]
+        );
+        assert_eq!(texts("set X=1 && a && b"), ["set X=1; a", "set X=1; b"]);
+        assert_eq!(
+            texts("export A=1\na\nb\nc"),
+            ["export A=1; a", "export A=1; b", "export A=1; c"]
+        );
+        for rec in [
+            "export A=1; a && b",
+            "export A=1; a; b",
+            "export A=1; a || b",
+            "export A=1\na\nb",
+            "export A=1; cd x; a; cd y; b",
+            "export A=1; a | head && b 2>&1",
+            "export A=1; set -e; a; b",
+            "cd x && export A=1 && a && b",
+        ] {
+            none_match("a", &[rec]);
+            none_match("b", &[rec]);
+            none_match("a && b", &[rec]);
+            all_match("export A=1; a && b", &[rec]);
+            all_match("export A=1; b", &[rec]);
+            all_match("export A=1; a", &[rec]);
+        }
+        none_match("$env:A='1'; b", &["export A=1; a; b"]);
+        none_match("export A=2; b", &["export A=1; a; b"]);
+        none_match("export B=1; b", &["export A=1; a; b"]);
+        all_match("$env:A='1'; b", &["$env:A='1'; a; b"]);
+        all_match("set X=1 && b", &["cd d && set X=1 && a && b"]);
+    }
+
+    #[test]
+    fn an_environment_setting_does_not_reach_earlier_commands() {
+        assert_eq!(texts("a; export A=1; b"), ["a", "export A=1; b"]);
+        assert_eq!(
+            texts("a && b && $env:A='1'; c"),
+            ["a", "b", "$env:A='1'; c"]
+        );
+        all_match("a", &["a; export A=1; b"]);
+        all_match("a && export A=1; b", &["a; export A=1; b"]);
+        none_match("b", &["a; export A=1; b"]);
+        none_match("export A=1; a", &["a; export A=1; b"]);
+        none_match("a && b", &["a; export A=1; b"]);
+    }
+
+    #[test]
+    fn environment_settings_accumulate() {
+        assert_eq!(
+            texts("export A=1; a; export B=2; b; c"),
+            [
+                "export A=1; a",
+                "export A=1; export B=2; b",
+                "export A=1; export B=2; c"
+            ]
+        );
+        none_match("a", &["export A=1; a; export B=2; b"]);
+        all_match("export A=1; a", &["export A=1; a; export B=2; b"]);
+        none_match("export B=2; b", &["export A=1; a; export B=2; b"]);
+        none_match("export A=1; b", &["export A=1; a; export B=2; b"]);
+        all_match(
+            "export A=1; export B=2; b",
+            &["export A=1; a; export B=2; b"],
+        );
+        // The order the settings were made in is part of the command.
+        none_match("export B=2; export A=1; b", &["export A=1; export B=2; b"]);
+    }
+
+    #[test]
+    fn an_environment_setting_is_scoped_to_its_group_or_shell() {
+        // A subshell's settings die with it.
+        all_match("b", &["(export A=1; a); b"]);
+        none_match("a", &["(export A=1; a); b"]);
+        all_match("export A=1; a", &["(export A=1; a); b"]);
+        all_match("b", &["bash -c 'export A=1; a' && b"]);
+        none_match("a", &["bash -c 'export A=1; a' && b"]);
+        all_match("export A=1; a", &["bash -c 'export A=1; a' && b"]);
+        // Settings made outside reach into a group, so it is not unwrapped.
+        none_match("a", &["export A=1; (a)", "export A=1; bash -c 'a'"]);
+        none_match("a && b", &["export A=1; (a; b)"]);
+        // Within a payload they reach every later payload command.
+        assert_eq!(
+            texts("bash -c 'export A=1; a && b'"),
+            ["export A=1; a", "export A=1; b"]
+        );
+        none_match("b", &["bash -c 'export A=1; a && b'"]);
+        none_match("a", &["bash -c \"sh -c 'export A=1; a; b'\""]);
+        all_match("export A=1; b", &["bash -c \"sh -c 'export A=1; a; b'\""]);
+    }
+
+    #[test]
+    fn an_environment_setting_combines_with_other_decorations() {
+        let rec = "export A=1; timeout 5 a | head && sudo b 2>&1 && FOO=2 c";
+        all_match("export A=1; b", &[rec]);
+        all_match("export A=1; a", &[rec]);
+        all_match("export A=1; FOO=2 c", &[rec]);
+        none_match("b", &[rec]);
+        none_match("FOO=2 c", &[rec]);
+        none_match("export A=1; c", &[rec]);
+        // Failure masking and backgrounding still bind to the command.
+        none_match("export A=1; a", &["export A=1; a || true"]);
+        all_match("export A=1; b", &["export A=1; a || true; b"]);
+        none_match("b", &["export A=1; a || true; b"]);
+        none_match("export A=1; a", &["export A=1; a &"]);
+        none_match("b", &["export A=1; a & b"]);
+        all_match("export A=1; b", &["export A=1; a & b"]);
+    }
+
+    #[test]
     fn retained_wrappers_in_compounds_are_per_command() {
         let rec = command_units("timeout 5 a && timeout 7 b && c");
         assert_eq!(rec.len(), 3);
@@ -2335,20 +2484,58 @@ mod tests {
     }
 
     #[test]
-    fn wrappers_around_shell_invocations_are_not_unwrapped() {
-        // A bound, a user or an environment on the outside applies to the
-        // whole inner command line, so the pieces are not compared one by one.
+    fn wrappers_around_shell_invocations_unwrap_a_single_command() {
+        // A bound or user outside the shell is restored on the command inside.
+        for (rec, shown) in [
+            ("timeout 5 bash -c 'foo'", "timeout 5 foo"),
+            ("sudo bash -c 'foo'", "sudo foo"),
+            ("sudo -u bob sh -c 'foo'", "sudo -u bob foo"),
+            ("time timeout 5 bash -c 'foo'", "timeout 5 foo"),
+            ("sudo bash -c 'foo | head'", "sudo foo"),
+            ("sudo bash -c 'timeout 5 foo'", "sudo timeout 5 foo"),
+            ("sudo timeout 5 bash -c 'foo'", "sudo timeout 5 foo"),
+        ] {
+            assert!(matches("foo", rec), "{rec}");
+            assert!(matches(rec, rec), "{rec}");
+            assert_eq!(
+                command_units("foo")[0].shown_for(&command_units(rec)[0]),
+                shown,
+                "{rec}"
+            );
+        }
+        assert!(matches("sudo foo", "sudo bash -c 'foo'"));
+        assert!(matches("sudo foo", "sudo sh -c foo"));
+        assert!(matches("timeout 5 foo", "timeout 5 bash -c 'foo'"));
+        assert!(!matches("timeout 6 foo", "timeout 5 bash -c 'foo'"));
+        assert!(!matches("sudo -u alice foo", "sudo -u bob bash -c 'foo'"));
+        assert!(!matches("sudo foo", "bash -c 'foo'"));
+        assert!(!matches("sudo foo", "bash -c 'sudo -E foo'"));
+        assert!(!matches("foo", "sudo -i bash -c 'foo'"));
+        assert!(!matches("bar", "sudo bash -c 'foo'"));
+        // An environment outside the shell is part of the command inside.
         for rec in [
-            "timeout 5 bash -c 'foo'",
-            "sudo bash -c 'foo'",
-            "sudo -u bob sh -c 'foo'",
             "A=1 bash -c 'foo'",
             "env A=1 bash -c 'foo'",
-            "time timeout 5 bash -c 'foo'",
+            "A=1 sudo bash -c 'foo'",
         ] {
             assert!(!matches("foo", rec), "{rec}");
+            assert!(matches("A=1 foo", rec), "{rec}");
             assert!(matches(rec, rec), "{rec}");
         }
+        assert!(!matches("A=2 foo", "A=1 bash -c 'foo'"));
+        // Several commands under one bound are not compared piece by piece:
+        // the bound would apply to the group, not to each command.
+        for rec in [
+            "timeout 5 bash -c 'a && b'",
+            "sudo bash -c 'a; b'",
+            "A=1 bash -c 'a && b'",
+        ] {
+            assert!(!matches("a", rec), "{rec}");
+            assert!(!matches("a && b", rec), "{rec}");
+            assert!(matches(rec, rec), "{rec}");
+        }
+        // The outside layers also stop at a pipeline that is not a filter.
+        assert!(!matches("foo", "sudo bash -c 'foo' | bar"));
         // Wrappers that carry nothing do not stop the unwrap of `bash -c`.
         assert!(matches("foo", "nice bash -c 'foo'"));
         assert!(matches("foo", "time bash -c 'foo'"));

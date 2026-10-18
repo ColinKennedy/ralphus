@@ -256,7 +256,9 @@ pub fn extract_shell_calls(transcript: &str) -> Vec<RecordedCall> {
 /// shell call (see [`command_units`]), each recorded command at most once,
 /// ordered as they were run. A step carries the proposed command and, as
 /// evidence, the whole recorded invocation with its cwd (or `default_cwd`) and
-/// result. An unmatched command is dropped without affecting the others.
+/// result. An unmatched command is dropped without affecting the others. The
+/// commands of one proposed entry must match in the order they were written and
+/// ran; one written out of order is dropped.
 #[must_use]
 pub fn match_recipe(
     proposed: &[String],
@@ -267,16 +269,22 @@ pub fn match_recipe(
     let mut used: Vec<Vec<bool>> = recorded.iter().map(|u| vec![false; u.len()]).collect();
     let mut matched: Vec<(usize, usize, String)> = Vec::new();
     for entry in proposed {
+        // The commands of one entry run in the order written, so each must
+        // match a recorded command later than the one before it.
+        let mut after: Option<(usize, usize)> = None;
         for unit in command_units(entry) {
             let found = recorded.iter().enumerate().find_map(|(i, units)| {
                 units
                     .iter()
                     .enumerate()
-                    .find(|(j, u)| !used[i][*j] && unit.matches(u))
+                    .find(|(j, u)| {
+                        !used[i][*j] && after.is_none_or(|a| (i, *j) > a) && unit.matches(u)
+                    })
                     .map(|(j, _)| (i, j))
             });
             if let Some((i, j)) = found {
                 used[i][j] = true;
+                after = Some((i, j));
                 matched.push((i, j, unit.shown_for(&recorded[i][j])));
             }
         }
@@ -1336,6 +1344,60 @@ mod tests {
                 (3, "ls", "/w", "no result recorded"),
             ]
         );
+    }
+
+    #[test]
+    fn a_compound_recipe_must_keep_the_order_the_commands_ran_in() {
+        let call = |c: &str| RecordedCall {
+            command: c.into(),
+            cwd: Some("/w".into()),
+            succeeded: Some(true),
+        };
+        let commands = |proposed: &[&str], recorded: &[&str]| -> Vec<String> {
+            let proposed: Vec<String> = proposed.iter().map(|p| (*p).to_string()).collect();
+            let recorded: Vec<RecordedCall> = recorded.iter().map(|r| call(r)).collect();
+            match_recipe(&proposed, &recorded, "/d")
+                .into_iter()
+                .map(|s| s.command)
+                .collect()
+        };
+        assert_eq!(commands(&["a && b"], &["a && b"]), ["a", "b"]);
+        assert_eq!(commands(&["a && c"], &["a && b && c"]), ["a", "c"]);
+        // Written out of order: the out-of-order command is not matched.
+        assert_eq!(commands(&["b && a"], &["a && b"]), ["b"]);
+        assert_eq!(commands(&["c && a && b"], &["a && b && c"]), ["c"]);
+        assert_eq!(commands(&["b && a"], &["a", "b"]), ["b"]);
+        // Separate entries are independent; the result is in run order.
+        assert_eq!(commands(&["b", "a"], &["a && b"]), ["a", "b"]);
+        // A repeated command matches once per time it ran.
+        assert_eq!(commands(&["a && a"], &["a"]), ["a"]);
+        assert_eq!(commands(&["a && a"], &["a && b && a"]), ["a", "a"]);
+    }
+
+    #[test]
+    fn a_wrapper_outside_a_shell_invocation_still_unwraps_a_single_command() {
+        let call = |c: &str| RecordedCall {
+            command: c.into(),
+            cwd: Some("/w".into()),
+            succeeded: Some(true),
+        };
+        let run = |proposed: &str, recorded: &str| -> Vec<RecipeStep> {
+            match_recipe(&[proposed.to_string()], &[call(recorded)], "/d")
+        };
+        let steps = run("foo", "sudo bash -c 'foo'");
+        assert_eq!(steps.len(), 1);
+        assert_eq!(steps[0].command, "sudo foo");
+        assert_eq!(steps[0].recorded_command, "sudo bash -c 'foo'");
+        assert_eq!(run("sudo foo", "sudo bash -c 'foo'").len(), 1);
+        assert_eq!(
+            run("foo", "timeout 5 bash -c 'foo'")[0].command,
+            "timeout 5 foo"
+        );
+        assert!(run("timeout 9 foo", "timeout 5 bash -c 'foo'").is_empty());
+        assert!(run("foo", "FOO=1 bash -c 'foo'").is_empty());
+        assert_eq!(run("FOO=1 foo", "FOO=1 bash -c 'foo'").len(), 1);
+        // Several commands under one bound are not compared piece by piece.
+        assert!(run("a", "sudo bash -c 'a && b'").is_empty());
     }
 
     #[test]
