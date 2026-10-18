@@ -1367,9 +1367,13 @@ fn units_of(command: &str, depth: usize) -> Option<Vec<Unit>> {
             && matches!(seg.sep_before, Sep::Or | Sep::Semi)
         {
             if let Some(u) = before {
-                units[u].tail.push_str(&joined_with(seg.sep_before, &head.all.join(" ")));
+                units[u]
+                    .tail
+                    .push_str(&joined_with(seg.sep_before, &head.all.join(" ")));
                 units[u].tail.push_str(&tail_visible);
-                units[u].key.push_str(&joined_with(seg.sep_before, &head.core.join(" ")));
+                units[u]
+                    .key
+                    .push_str(&joined_with(seg.sep_before, &head.core.join(" ")));
                 previous = Some(u);
                 continue;
             }
