@@ -3331,6 +3331,10 @@ pub fn chip_description(chip: &str, option: bool) -> String {
                 "Resolve this squad/task/cell/proof selector and filter to its entity URI, \
                  {SELECTOR_GRAMMAR}."
             ),
+            "--initialization-commands" => "Worktree initialization commands run once in the                 cell's freshly created worktree, one command per line; an empty string clears them."
+                .to_string(),
+            "--initialization-timeout-sec" => "Seconds the worktree initialization commands may                 run before they are timed out, e.g. 300."
+                .to_string(),
             _ if chip.contains('[') => format!("Set the {key} value using the shown value type."),
             _ => format!("Enable {key}."),
         }
