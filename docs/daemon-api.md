@@ -5440,8 +5440,13 @@ actions are written) appears on each branch's PR but runs once.
 
 A live agent ends its reply with `RALPHUS_LIVE_RESULT: {"verdict": "...",
 "summary": "...", "fix_attempted": bool, "fix_confirmed": bool, "recipe":
-["cmd", ...]}`. Only recipe commands that match a recorded `RALPHUS_TOOL:` shell
-call of the run's transcript are kept, with that call's cwd, order and result;
+["cmd", ...]}`. Each recipe command is matched piece by piece against the commands inside
+the run's recorded `RALPHUS_TOOL:` shell calls (split on `&&`, `||`, `;`, `&`
+and line breaks; `cd`-style navigation, redirection and output-only pipeline
+stages such as `head`, `grep`, `Select-Object`, `findstr` are ignored;
+environment settings are not); matched commands are kept, unmatched ones
+dropped, each with the recorded call's cwd, order and result and the complete
+recorded invocation (rendered collapsed);
 a missing or unparseable result, or a run that did not finish, is
 `inconclusive`. Refreshes are durable (`pr_live_result_refresh`): requested on
 run finish, integration end, and PR create/adopt/replace/promote; a failed
