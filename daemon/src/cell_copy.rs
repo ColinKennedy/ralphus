@@ -141,6 +141,7 @@ pub fn build_copy_toml(source: &CellCopySource, base: &CopyBase, unique: &str) -
     }
 
     let mut out = Table::new();
+    out.insert("no_review".into(), Value::Boolean(true));
     out.insert("task".into(), Value::Array(vec![Value::Table(task)]));
     let task = out
         .get_mut("task")

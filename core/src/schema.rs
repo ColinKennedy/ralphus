@@ -54,6 +54,11 @@ pub struct TaskFile {
     /// and the submitter-resolution order documented on RAL-476).
     #[serde(default)]
     pub submitter: Option<String>,
+    /// Explicit opt-out of review: `no_review = true` declares that this
+    /// submission deliberately has no review. Mutually exclusive with any
+    /// cell that selects a review or sets `triage = true`.
+    #[serde(default)]
+    pub no_review: Option<bool>,
     /// The tasks in this submission.
     #[serde(default)]
     pub task: Vec<TaskDef>,
@@ -67,6 +72,35 @@ pub struct TaskFile {
     #[serde(default)]
     pub waypoint: Vec<WaypointDef>,
 }
+
+impl TaskFile {
+    /// Whether any cell selects a review (`review = "<<...>>"`) or opts into
+    /// Triage (`triage = true`). A declared but unused `[[review]]` block does
+    /// not count.
+    #[must_use]
+    pub fn selects_review(&self) -> bool {
+        self.task
+            .iter()
+            .flat_map(|t| &t.cell)
+            .any(|c| c.triage || c.review.is_some())
+    }
+
+    /// Whether the submission explicitly opts out of review (`no_review = true`).
+    #[must_use]
+    pub fn declares_no_review(&self) -> bool {
+        self.no_review == Some(true)
+    }
+
+    /// Whether the submission states review intent: it selects a review or
+    /// declares `no_review = true`.
+    #[must_use]
+    pub fn has_review_intent(&self) -> bool {
+        self.selects_review() || self.declares_no_review()
+    }
+}
+
+/// Error message for a submission that states no review intent.
+pub const MISSING_REVIEW_INTENT_MESSAGE: &str = "this submission does not say whether it wants a review: add a review (declare a top-level [[review]] with an id and set `review = \"<<review:<id>>>\"` on a cell, ideally one cell per worktree) or set `triage = true` on a cell, or set top-level `no_review = true` to explicitly choose no review";
 
 /// One task: a unit of work made of one or more agent cells plus proof steps.
 #[derive(Debug, Clone, Deserialize)]

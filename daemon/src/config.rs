@@ -1679,9 +1679,20 @@ pub struct DaemonConfig {
     /// unset.
     #[serde(default)]
     pub initialization_timeout_sec: Option<i64>,
+    /// Whether a submitted squad must state review intent: select a review
+    /// (an authored review or Triage on at least one cell) or set top-level
+    /// `no_review = true`. Defaults to `true`; TOML-only.
+    #[serde(default)]
+    pub validate_submit_review: Option<bool>,
 }
 
 impl DaemonConfig {
+    /// Whether submissions must state review intent. Unset means `true`.
+    #[must_use]
+    pub fn validate_submit_review(&self) -> bool {
+        self.validate_submit_review.unwrap_or(true)
+    }
+
     /// The daemon-option initialization timeout, `None` when unset or not
     /// positive (callers then fall back to
     /// [`DEFAULT_INITIALIZATION_TIMEOUT_SEC`]).
@@ -3215,6 +3226,7 @@ fn merge_daemon_config(base: DaemonConfig, over: DaemonConfig) -> DaemonConfig {
         initialization_timeout_sec: over
             .initialization_timeout_sec
             .or(base.initialization_timeout_sec),
+        validate_submit_review: over.validate_submit_review.or(base.validate_submit_review),
     }
 }
 
@@ -4120,6 +4132,26 @@ mod tests {
             monorepo_from_toml_str("[arbiter]\nagent = \"claude\"\n"),
             MonorepoConfig::default()
         );
+    }
+
+    #[test]
+    fn validate_submit_review_defaults_on_and_layers() {
+        assert!(DaemonConfig::default().validate_submit_review());
+        let off = daemon_from_toml_str(
+            "[daemon]
+validate_submit_review = false
+",
+        );
+        assert!(!off.validate_submit_review());
+        let on = daemon_from_toml_str(
+            "[daemon]
+validate_submit_review = true
+",
+        );
+        assert!(on.validate_submit_review());
+        let merged = merge_daemon_config(off.clone(), DaemonConfig::default());
+        assert!(!merged.validate_submit_review());
+        assert!(merge_daemon_config(off, on).validate_submit_review());
     }
 
     #[test]

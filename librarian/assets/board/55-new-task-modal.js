@@ -762,7 +762,8 @@
        * `[[review.prepare]]` and manual-check
        * `[[review.action]]` entries); `"auto"` sets `triage = true` on the
        * work cell instead, with no `[[review]]` block (the daemon's Arbiter
-       * pools and auto-creates the review later); `"none"` sets neither.
+       * pools and auto-creates the review later); `"none"` sets top-level
+       * `no_review = true` instead.
        * @returns {{toml: string, naming: NtNaming, taskName: string, fallbackName: string}}
        *   the assembled TOML plus the naming decision `submitTaskSimple`
        *   needs to pick the squad label and decide whether to fire
@@ -796,6 +797,10 @@
         const fallbackName = naming.taskName || branch;
         /** @type {string[]} */
         const lines = [];
+        if (ntSimple.reviewMode === "none") {
+          lines.push("no_review = true");
+          lines.push("");
+        }
         lines.push("[[task]]");
         lines.push(`name = ${tomlStr(taskName)}`);
         lines.push(`project = ${tomlStr(ntSimple.project)}`);

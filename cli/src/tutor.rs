@@ -22,6 +22,21 @@ Tip: validate before submitting -- `ralphus validate file.toml`
 (runs offline, no daemon needed).
 
 ---------------------------------------------------------------
+ Review intent   (top-level; required by default)
+---------------------------------------------------------------
+ The daemon rejects a submission that does not say whether it wants a
+ review (`[daemon] validate_submit_review = true`, the default). Either:
+   * have at least one cell select a review -- declare a top-level
+     [[review]] with an `id` and set review = "<<review:<id>>>" on a cell
+     -- or opt it into Triage with triage = true; or
+   * set top-level `no_review = true` (before any [[...]] table) to
+     explicitly choose no review.
+ `no_review = true` together with a cell that selects a review or sets
+ triage = true is a validation error. A [[review]] block that no cell
+ selects does not count. Convention: put at least one reviewed or
+ triaged cell on each worktree; every cell need not select a review.
+
+---------------------------------------------------------------
  [[default]]   (optional; only the first block is used)
 ---------------------------------------------------------------
  Key         Type           Notes
