@@ -1895,6 +1895,7 @@ impl ForgeClient {
             "{}/repos/{}/actions/jobs/{job_id}/logs",
             self.api_base, self.repo_path
         );
+        self.count_call("GET", &url, false);
         let text = http_agent()
             .get(&url)
             .set("Authorization", &format!("Bearer {token}"))
@@ -1914,6 +1915,7 @@ impl ForgeClient {
             "{}/projects/{}/jobs/{job_id}/trace",
             self.api_base, self.repo_path
         );
+        self.count_call("GET", &url, false);
         http_agent()
             .get(&url)
             .set("PRIVATE-TOKEN", token)
@@ -2032,6 +2034,7 @@ impl ForgeClient {
                 "{}/repos/{}/actions/runs/{run_id}/force-cancel",
                 self.api_base, self.repo_path
             );
+            self.count_call("POST", &cancel_url, false);
             match http_agent()
                 .post(&cancel_url)
                 .set("Authorization", &format!("Bearer {token}"))
@@ -2543,6 +2546,7 @@ impl ForgeClient {
                     self.repo_path,
                     encode_path_segment(label)
                 );
+                self.count_call("DELETE", &url, false);
                 match http_agent()
                     .delete(&url)
                     .set("Authorization", &format!("Bearer {token}"))
@@ -2783,6 +2787,7 @@ impl ForgeClient {
                         "{}/repos/{}/actions/runs/{id}/force-cancel",
                         self.api_base, self.repo_path
                     );
+                    self.count_call("POST", &url, false);
                     match http_agent()
                         .post(&url)
                         .set("Authorization", &format!("Bearer {token}"))
@@ -3008,6 +3013,7 @@ impl ForgeClient {
             "{}/repos/{}/stacks/{stack_number}",
             self.api_base, self.repo_path
         );
+        self.count_call("GET", &url, false);
         let result = match http_agent()
             .get(&url)
             .set("Authorization", &format!("Bearer {token}"))
@@ -3056,6 +3062,7 @@ impl ForgeClient {
             "{}/repos/{}/stacks/{stack_number}",
             self.api_base, self.repo_path
         );
+        self.count_call("GET", &url, false);
         let result = match http_agent()
             .get(&url)
             .set("Authorization", &format!("Bearer {token}"))
@@ -3158,6 +3165,7 @@ impl ForgeClient {
             "{}/repos/{}/stacks/{stack_number}/unstack",
             self.api_base, self.repo_path
         );
+        self.count_call("POST", &url, false);
         http_agent()
             .post(&url)
             .set("Authorization", &format!("Bearer {token}"))
@@ -3422,6 +3430,7 @@ impl ForgeClient {
         if let Some(t) = token {
             req = req.set("PRIVATE-TOKEN", t);
         }
+        self.count_call("GET", &url, false);
         req.call().ok()?.into_string().ok()
     }
 }
@@ -3482,20 +3491,27 @@ impl ForgeClient {
         req: ureq::Request,
         payload: &serde_json::Value,
     ) -> Result<serde_json::Value, String> {
-        let resp = req
+        let (method, url) = (req.method().to_string(), req.url().to_string());
+        let result = req
             .set("Content-Type", "application/json")
-            .send_string(&payload.to_string())
-            .map_err(|e| self.describe_evicting(e))?;
-        self.record_quota_headers(&resp);
-        parse_body(resp)
+            .send_string(&payload.to_string());
+        if let Ok(resp) = &result {
+            self.record_quota_headers(resp);
+        }
+        self.count_response(&method, &url, &result);
+        parse_body(result.map_err(|e| self.describe_evicting(e))?)
     }
 
     /// `GET`, parsing the JSON response body. See [`Self::send`]'s doc for
     /// why every read call in this file routes through this.
     fn get(&self, req: ureq::Request) -> Result<serde_json::Value, String> {
-        let resp = req.call().map_err(|e| self.describe_evicting(e))?;
-        self.record_quota_headers(&resp);
-        parse_body(resp)
+        let url = req.url().to_string();
+        let result = req.call();
+        if let Ok(resp) = &result {
+            self.record_quota_headers(resp);
+        }
+        self.count_response("GET", &url, &result);
+        parse_body(result.map_err(|e| self.describe_evicting(e))?)
     }
 
     /// `GET` with conditional-request support (RAL-366): sets `If-None-Match`
@@ -3517,13 +3533,15 @@ impl ForgeClient {
         if let Some(etag) = etag {
             req = req.set("If-None-Match", etag);
         }
-        match req.call() {
-            Ok(resp) if resp.status() == 304 => {
-                self.record_quota_headers(&resp);
-                Ok(ConditionalGet::NotModified)
-            }
+        let url = req.url().to_string();
+        let result = req.call();
+        if let Ok(resp) = &result {
+            self.record_quota_headers(resp);
+        }
+        self.count_response("GET", &url, &result);
+        match result {
+            Ok(resp) if resp.status() == 304 => Ok(ConditionalGet::NotModified),
             Ok(resp) => {
-                self.record_quota_headers(&resp);
                 let etag = resp.header("ETag").map(str::to_string);
                 let body = resp
                     .into_string()
@@ -3650,6 +3668,82 @@ impl ForgeClient {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(&self.rate_limit_key())
             .copied()
+    }
+
+    /// Count one API call of `method` to `url` in this client's quota window
+    /// ([`Self::call_counts`]); `free` marks a `304 Not Modified` answer. Call
+    /// after [`Self::record_quota_headers`] so a new window is noticed.
+    fn count_call(&self, method: &str, url: &str, free: bool) {
+        let now = crate::store::now_ms();
+        let reset = self
+            .quota_snapshot()
+            .map(|q| q.reset_at_ms)
+            .filter(|reset| *reset > now);
+        let mut tallies = CALL_TALLIES
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let tally = tallies.entry(self.rate_limit_key()).or_default();
+        if now >= tally.window_end_ms {
+            *tally = CallTally {
+                window_end_ms: reset.unwrap_or_else(|| {
+                    now.saturating_add(
+                        i64::try_from(CALL_TALLY_FALLBACK_WINDOW.as_millis()).unwrap_or(i64::MAX),
+                    )
+                }),
+                by_shape: std::collections::BTreeMap::new(),
+            };
+        } else if let Some(reset) = reset {
+            tally.window_end_ms = reset;
+        }
+        let counts = tally.by_shape.entry(call_shape(method, url)).or_default();
+        if free {
+            counts.free += 1;
+        } else {
+            counts.counted += 1;
+        }
+    }
+
+    /// Count a finished request ([`Self::count_call`]): any HTTP answer is a
+    /// call the forge saw, a `304` a free one; a transport failure never
+    /// reached it and is not counted.
+    fn count_response(
+        &self,
+        method: &str,
+        url: &str,
+        result: &std::result::Result<ureq::Response, ureq::Error>,
+    ) {
+        match result {
+            Ok(resp) => self.count_call(method, url, resp.status() == 304),
+            Err(ureq::Error::Status(code, resp)) => {
+                // A refusal still carries the quota headers that name the
+                // window this call belongs to.
+                self.record_quota_headers(resp);
+                self.count_call(method, url, *code == 304);
+            }
+            Err(ureq::Error::Transport(_)) => {}
+        }
+    }
+
+    /// This daemon's calls against this client's quota in the current window,
+    /// by [`call_shape`], with the window's end (epoch milliseconds). `None`
+    /// before any call, or once the window has ended.
+    #[must_use]
+    pub fn call_counts(&self) -> Option<(i64, Vec<(String, CallCounts)>)> {
+        let tallies = CALL_TALLIES
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let tally = tallies.get(&self.rate_limit_key())?;
+        if crate::store::now_ms() >= tally.window_end_ms {
+            return None;
+        }
+        Some((
+            tally.window_end_ms,
+            tally
+                .by_shape
+                .iter()
+                .map(|(shape, counts)| (shape.clone(), *counts))
+                .collect(),
+        ))
     }
 
     /// Registry key for the quota this client draws on: GitHub's primary limit
@@ -3877,6 +3971,70 @@ pub struct QuotaSnapshot {
 /// empty after a restart until the next response arrives.
 static QUOTA_SNAPSHOTS: std::sync::LazyLock<Mutex<HashMap<String, QuotaSnapshot>>> =
     std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// API calls of one shape ([`call_shape`]) in the current quota window.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CallCounts {
+    /// Calls the forge counts against the quota.
+    pub counted: u64,
+    /// `304 Not Modified` answers, which GitHub does not count.
+    pub free: u64,
+}
+
+/// This process's calls against one quota in its current window, by shape.
+#[derive(Debug, Clone, Default)]
+struct CallTally {
+    /// When the window ends, epoch milliseconds: GitHub's `X-RateLimit-Reset`
+    /// once known, otherwise [`CALL_TALLY_FALLBACK_WINDOW`] after its first call.
+    window_end_ms: i64,
+    by_shape: std::collections::BTreeMap<String, CallCounts>,
+}
+
+/// The window a [`CallTally`] uses while no quota reading names one (GitLab,
+/// or GitHub before its first response): GitHub's own window length.
+const CALL_TALLY_FALLBACK_WINDOW: Duration = Duration::from_secs(60 * 60);
+
+/// [`CallTally`] by [`ForgeClient::rate_limit_key`]. In memory only, and only
+/// this daemon's calls: other tools spending the same token are not seen.
+static CALL_TALLIES: std::sync::LazyLock<Mutex<HashMap<String, CallTally>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// A call's method plus its API path with the repository prefix dropped and
+/// numbers and commit SHAs generalized, e.g. `GET pulls/{n}` or
+/// `GET commits/{sha}/check-runs`, so the calls the daemon repeats group
+/// together.
+fn call_shape(method: &str, url: &str) -> String {
+    let path = url
+        .split_once("://")
+        .map_or(url, |(_, rest)| rest.find('/').map_or("", |i| &rest[i..]));
+    let path = path.split(['?', '#']).next().unwrap_or_default();
+    let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+    let skip = segments
+        .iter()
+        .position(|s| *s == "repos")
+        .map(|i| i + 3)
+        .or_else(|| {
+            segments
+                .iter()
+                .position(|s| *s == "projects")
+                .map(|i| i + 2)
+        })
+        .unwrap_or(0);
+    let shaped: Vec<&str> = segments
+        .iter()
+        .skip(skip)
+        .map(|s| {
+            if !s.is_empty() && s.chars().all(|c| c.is_ascii_digit()) {
+                "{n}"
+            } else if matches!(s.len(), 40 | 64) && s.chars().all(|c| c.is_ascii_hexdigit()) {
+                "{sha}"
+            } else {
+                s
+            }
+        })
+        .collect();
+    format!("{method} {}", shaped.join("/"))
+}
 
 /// How long a `429` with no wait header holds a token off.
 const DEFAULT_QUOTA_BACKOFF: Duration = Duration::from_secs(60);
@@ -9524,6 +9682,73 @@ mod tests {
         let req = http_agent().get(&format!("http://{addr}/x"));
         let result = client.get_conditional(req, Some("\"v1\"")).unwrap();
         assert!(matches!(result, ConditionalGet::NotModified));
+        mock.finish();
+    }
+
+    #[test]
+    fn call_shape_groups_repeated_calls() {
+        assert_eq!(
+            call_shape("GET", "https://api.github.com/repos/acme/widget/pulls/774"),
+            "GET pulls/{n}"
+        );
+        assert_eq!(
+            call_shape(
+                "GET",
+                "https://api.github.com/repos/acme/widget/commits/0123456789abcdef0123456789abcdef01234567/check-runs?per_page=100&page=2"
+            ),
+            "GET commits/{sha}/check-runs"
+        );
+        assert_eq!(
+            call_shape(
+                "GET",
+                "https://gitlab.com/api/v4/projects/acme%2Fwidget/merge_requests/12/notes?per_page=100"
+            ),
+            "GET merge_requests/{n}/notes"
+        );
+        assert_eq!(
+            call_shape(
+                "GET",
+                "https://ghe.example/api/v3/repos/o/r/issues/5/comments"
+            ),
+            "GET issues/{n}/comments"
+        );
+    }
+
+    /// A 304 is tallied as free and a 200 as counted, under the same shape.
+    #[test]
+    fn calls_are_tallied_by_shape_with_304s_free() {
+        let mock = MockForge::start(move |server| {
+            let first = server.recv();
+            first
+                .respond(
+                    tiny_http::Response::from_string(r#"{"state":"open","merged":false}"#)
+                        .with_status_code(200)
+                        .with_header(
+                            tiny_http::Header::from_bytes(&b"ETag"[..], &b"\"t1\""[..]).unwrap(),
+                        ),
+                )
+                .unwrap();
+            let second = server.recv();
+            second
+                .respond(tiny_http::Response::from_string("").with_status_code(304))
+                .unwrap();
+        });
+        let client = mock.client(ForgeKind::GitHub, "acme/tally");
+        client.get_pull_request_live(3).unwrap();
+        client.get_pull_request_live(3).unwrap();
+        let (_, by_shape) = client.call_counts().expect("calls were made");
+        let counts = by_shape
+            .iter()
+            .find(|(shape, _)| shape == "GET pulls/{n}")
+            .map(|(_, c)| *c)
+            .expect("pull reads tallied");
+        assert_eq!(
+            counts,
+            CallCounts {
+                counted: 1,
+                free: 1
+            }
+        );
         mock.finish();
     }
 

@@ -2737,8 +2737,17 @@ plus each PR's stored last-poll errors. Board-only (no CLI command).
   "checks": {
     "ci_standing": { "interval_ms": 120000, "next_due_at_ms": 1700000030000 },
     "fast_watch_active": false,
-    "forge_cache": { "enabled": true, "interval_ms": 300000 },
+    "forge_cache": { "enabled": true, "interval_ms": 300000,
+                     "comments_min_interval_ms": 60000,
+                     "comments_max_interval_ms": 86400000 },
     "next_attempt_at_ms": 1700000030000
+  },
+  "calls": {
+    "window_end_ms": 1700000600000,
+    "by_shape": [
+      { "shape": "GET pulls/{n}", "counted": 40, "free": 300 },
+      { "shape": "GET issues/{n}/comments", "counted": 2, "free": 0 }
+    ]
   },
   "pull_requests": [
     { "pr_id": "pr-1", "pr_number": 616, "state": "open", "repo": "acme/widget",
@@ -2761,6 +2770,16 @@ plus each PR's stored last-poll errors. Board-only (no CLI command).
   `next_attempt_at_ms` is that time pushed back to the end of any `backoff`.
   `fast_watch_active` is `true` while a short-interval watch after a push or
   PR open is running for the branch.
+- `checks.forge_cache` — `interval_ms` is the drift poll's cadence. Each PR's
+  comments are polled every `comments_min_interval_ms` after its comments
+  change or its branch is pushed, doubling after each poll that finds
+  nothing new, up to `comments_max_interval_ms`.
+- `calls` — this daemon's API calls against the token's quota in the current
+  window (ending `window_end_ms`: GitHub's reset time, or an hour after the
+  first call when no reset is known), grouped by method and path shape and
+  sorted by `counted` descending. `free` calls were `304 Not Modified`
+  answers, which GitHub does not count. `null` before any call in the window.
+  Other tools spending the same token are not included.
 - `pull_requests` — the branch's PRs, with each poll's last stored error.
 
 `404` if `id` or `branch_id` doesn't address a real guardian/branch.

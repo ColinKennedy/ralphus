@@ -12808,6 +12808,26 @@ fn branch_forge_status_json(
         (due, resume) => due.or(resume),
     };
     let quota = client.and_then(crate::forge::ForgeClient::quota_snapshot);
+    let calls = client.and_then(crate::forge::ForgeClient::call_counts).map(
+        |(window_end_ms, mut by_shape)| {
+            by_shape.sort_by(|(a_shape, a), (b_shape, b)| {
+                (b.counted, b.free)
+                    .cmp(&(a.counted, a.free))
+                    .then_with(|| a_shape.cmp(b_shape))
+            });
+            serde_json::json!({
+                "window_end_ms": window_end_ms,
+                "by_shape": by_shape
+                    .into_iter()
+                    .map(|(shape, c)| serde_json::json!({
+                        "shape": shape,
+                        "counted": c.counted,
+                        "free": c.free,
+                    }))
+                    .collect::<Vec<_>>(),
+            })
+        },
+    );
     serde_json::json!({
         "now_ms": now_ms,
         "client_resolved": client.is_some(),
@@ -12837,9 +12857,18 @@ fn branch_forge_status_json(
                 "enabled": pr_cache.enabled(),
                 "interval_ms": i64::try_from(pr_cache.poll_interval().as_millis())
                     .unwrap_or(i64::MAX),
+                "comments_min_interval_ms": i64::try_from(
+                    crate::pr::COMMENT_POLL_MIN_INTERVAL.as_millis()
+                )
+                .unwrap_or(i64::MAX),
+                "comments_max_interval_ms": i64::try_from(
+                    crate::pr::COMMENT_POLL_MAX_INTERVAL.as_millis()
+                )
+                .unwrap_or(i64::MAX),
             },
             "next_attempt_at_ms": next_attempt,
         },
+        "calls": calls,
         "pull_requests": pull_requests,
     })
 }
@@ -27523,6 +27552,14 @@ remediation_attempts=1
         );
         assert!(resume > now + 30_000);
         assert_eq!(v["checks"]["fast_watch_active"], true);
+        // The refused call still reached the forge, so it is tallied.
+        assert_eq!(v["calls"]["by_shape"][0]["shape"], "GET pulls/{n}");
+        assert_eq!(v["calls"]["by_shape"][0]["counted"], 1);
+        assert_eq!(v["calls"]["by_shape"][0]["free"], 0);
+        assert_eq!(
+            v["calls"]["window_end_ms"],
+            i64::try_from(reset).unwrap() * 1000
+        );
         mock.finish();
     }
 

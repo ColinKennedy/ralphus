@@ -6964,11 +6964,13 @@ fn start_backoff(client: &crate::forge::ForgeClient, retry_after: Option<std::ti
 
 /// Fastest comment-poll interval: right after a PR's comments changed or its
 /// branch was pushed, since comments tend to arrive in bursts.
-const COMMENT_POLL_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+pub(crate) const COMMENT_POLL_MIN_INTERVAL: std::time::Duration =
+    std::time::Duration::from_secs(60);
 
 /// Slowest comment-poll interval: a PR with no comment activity for a long
 /// time is still polled once a day.
-const COMMENT_POLL_MAX_INTERVAL: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
+pub(crate) const COMMENT_POLL_MAX_INTERVAL: std::time::Duration =
+    std::time::Duration::from_secs(24 * 60 * 60);
 
 /// When a PR's comments are next polled, and the interval that got it there.
 struct CommentPollSchedule {
