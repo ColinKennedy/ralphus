@@ -271,6 +271,33 @@
         e.output = redact(e.output);
         agentLogRedactArgs(e, redact);
       }
+      /**
+       * Whether a list is scrolled to (within a few pixels of) its bottom, i.e.
+       * the reader is following the tail.
+       * @param {number} scrollTop
+       * @param {number} clientHeight
+       * @param {number} scrollHeight
+       * @returns {boolean}
+       */
+      function agentLogAtBottom(scrollTop, clientHeight, scrollHeight) {
+        return scrollTop + clientHeight >= scrollHeight - 24;
+      }
+      /**
+       * The `scrollTop` a refreshed list should get, or null to leave it alone.
+       * A reader at the bottom keeps following the tail; otherwise the
+       * remembered widget stays at its old offset from the viewport top, and
+       * with no widget to anchor on the position is untouched.
+       * @param {boolean} stick - The reader was at the bottom before the update.
+       * @param {number} scrollTop
+       * @param {number} scrollHeight
+       * @param {number} clientHeight
+       * @param {{now: number, rel: number}|null} anchor - Widget's content offset now, and its offset from the viewport top before.
+       * @returns {number|null}
+       */
+      function agentLogScrollTarget(stick, scrollTop, scrollHeight, clientHeight, anchor) {
+        const want = stick ? Math.max(0, scrollHeight - clientHeight) : anchor === null ? scrollTop : anchor.now - anchor.rel;
+        return Math.abs(want - scrollTop) >= 1 ? want : null;
+      }
       // RALPHUS-AGENT-LOG:END
 
       // Optional tree-sitter parse of a shell call (RAL-644). The daemon splits
@@ -696,15 +723,19 @@
         const f = agentLogFilter[key] || { tool: "", status: "", q: "" };
         const redraw = full || f.q !== "" || f.tool !== "" || f.status !== "" || (!agentLogAll[key] && entries.length > AGENT_LOG_PAGE);
         if (redraw) {
-          const top = host.scrollTop;
-          host.innerHTML = agentLogListHtml(key, entries);
-          host.scrollTop = top;
+          const html = agentLogListHtml(key, entries);
+          if (agentLogLastHtml.get(host) === html) return;
+          const view = captureAgentLogView(host);
+          host.innerHTML = html;
+          agentLogLastHtml.set(host, html);
+          applyAgentLogView(host, view);
           return;
         }
+        agentLogLastHtml.delete(host);
         const nodes = new Map();
         host.querySelectorAll("details.alog-w").forEach((n) => nodes.set(Number(/** @type {HTMLElement} */ (n).dataset.idx), n));
         if (nodes.size === 0) { host.innerHTML = agentLogListHtml(key, entries); return; }
-        const stick = host.scrollTop + host.clientHeight >= host.scrollHeight - 24;
+        const view = captureAgentLogView(host);
         for (const e of entries) {
           const html = agentLogWidget(key, e);
           const n = nodes.get(e.index);
@@ -714,5 +745,43 @@
             n.outerHTML = html;
           }
         }
-        if (stick) host.scrollTop = host.scrollHeight;
+        applyAgentLogView(host, view);
+      }
+      /** @type {WeakMap<Element, string>} The list HTML last written into each redrawn Agent Log. */
+      const agentLogLastHtml = new WeakMap();
+      /**
+       * Notes where the reader is: pinned to the bottom, or reading from the
+       * first widget that is at least partly visible.
+       * @param {HTMLElement} host
+       * @returns {{stick: boolean, idx: number, rel: number}}
+       */
+      function captureAgentLogView(host) {
+        const stick = agentLogAtBottom(host.scrollTop, host.clientHeight, host.scrollHeight);
+        const hostTop = host.getBoundingClientRect().top;
+        let idx = -1;
+        let rel = 0;
+        if (!stick) {
+          for (const n of host.querySelectorAll("details.alog-w")) {
+            const r = n.getBoundingClientRect();
+            if (r.bottom > hostTop) { idx = Number(/** @type {HTMLElement} */ (n).dataset.idx); rel = r.top - hostTop; break; }
+          }
+        }
+        return { stick, idx, rel };
+      }
+      /**
+       * Puts the reader back where {@link captureAgentLogView} found them,
+       * writing `scrollTop` only if it must move (a write cancels momentum).
+       * @param {HTMLElement} host
+       * @param {{stick: boolean, idx: number, rel: number}} view
+       * @returns {void}
+       */
+      function applyAgentLogView(host, view) {
+        /** @type {{now: number, rel: number}|null} */
+        let anchor = null;
+        if (!view.stick && view.idx >= 0) {
+          const n = host.querySelector(`details.alog-w[data-idx="${view.idx}"]`);
+          if (n) anchor = { now: n.getBoundingClientRect().top - host.getBoundingClientRect().top + host.scrollTop, rel: view.rel };
+        }
+        const top = agentLogScrollTarget(view.stick, host.scrollTop, host.scrollHeight, host.clientHeight, anchor);
+        if (top !== null) host.scrollTop = top;
       }

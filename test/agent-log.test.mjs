@@ -7,8 +7,8 @@ const src = boardScript();
 const a = src.indexOf("// RALPHUS-AGENT-LOG:BEGIN");
 const b = src.indexOf("// RALPHUS-AGENT-LOG:END");
 if (a === -1 || b < a) throw new Error("agent-log markers not found");
-const { parseAgentLog, agentLogEntryVisible, agentLogPrettyInput } = new Function(
-  `${src.slice(a, b)}\nreturn { parseAgentLog, agentLogEntryVisible, agentLogPrettyInput };`,
+const { parseAgentLog, agentLogEntryVisible, agentLogPrettyInput, agentLogAtBottom, agentLogScrollTarget } = new Function(
+  `${src.slice(a, b)}\nreturn { parseAgentLog, agentLogEntryVisible, agentLogPrettyInput, agentLogAtBottom, agentLogScrollTarget };`,
 )();
 
 test("pairs results to calls by order and splits tool/sub", () => {
@@ -221,4 +221,27 @@ test("argument values are redacted on the record and text paths", () => {
     assert.equal(e.args.find((x) => x.key === "url").value, "u");
   }
   assert.equal(r.args.find((x) => x.key === "note").value, "[REDACTED]");
+});
+
+test("a reader at the bottom keeps following the tail across refreshes", () => {
+  assert.equal(agentLogAtBottom(900, 100, 1000), true);
+  assert.equal(agentLogAtBottom(870, 100, 1000), false);
+  // content grew from 1000 to 1300: follow it
+  assert.equal(agentLogScrollTarget(true, 900, 1300, 100, null), 1200);
+  // unchanged poll: no write
+  assert.equal(agentLogScrollTarget(true, 900, 1000, 100, null), null);
+});
+
+test("a reader mid-log stays on the same widget across refreshes", () => {
+  // anchor widget was 40px below the viewport top and is now 500px lower in the content
+  let top = 300;
+  const t = agentLogScrollTarget(false, top, 3000, 100, { now: 840, rel: 40 });
+  assert.equal(t, 800);
+  top = t;
+  // repeated unchanged polls: no drift, no scroll write
+  for (let i = 0; i < 5; i++) assert.equal(agentLogScrollTarget(false, top, 3000, 100, { now: 840, rel: 40 }), null);
+  // appended output below does not pull the reader down
+  assert.equal(agentLogScrollTarget(false, top, 5000, 100, { now: 840, rel: 40 }), null);
+  // no anchor available: position is untouched
+  assert.equal(agentLogScrollTarget(false, 300, 3000, 100, null), null);
 });
