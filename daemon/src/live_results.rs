@@ -731,7 +731,24 @@ fn render_run(out: &mut String, item: &SectionRun) {
     let run = &item.run;
     let ev = &item.evidence;
     let verdict = ev.verdict.as_deref().unwrap_or("inconclusive");
-    let _ = writeln!(out, "#### {} (`{}`)\n", one_line(&run.label), run.run_id);
+    let destination = item
+        .destination_branch
+        .as_deref()
+        .or(ev.integration_branch_id.as_deref())
+        .map(|b| format!("`{b}`"));
+    let _ = writeln!(out, "#### {}\n", one_line(&run.label));
+    let _ = write!(out, "- Verdict: **{verdict}**");
+    match ev.verdict_summary.as_deref() {
+        Some(summary) => {
+            let _ = writeln!(out, " - {}", one_line(summary));
+        }
+        None => {
+            let _ = writeln!(out, " (the agent reported no summary)");
+        }
+    }
+    let _ = writeln!(out, "- {}\n", fix_line(item, destination.as_deref()));
+    let _ = writeln!(out, "<details><summary>Run details</summary>\n");
+    let _ = writeln!(out, "- Live run: `{}`", run.run_id);
     let _ = writeln!(
         out,
         "- Run: {} at {}; runner state `{}`",
@@ -743,24 +760,13 @@ fn render_run(out: &mut String, item: &SectionRun) {
         when(run.started_at_ms.or(Some(run.queued_at_ms))),
         run.state
     );
-    let _ = write!(out, "- Verdict: **{verdict}**");
-    match ev.verdict_summary.as_deref() {
-        Some(summary) => {
-            let _ = writeln!(out, " - {}", one_line(summary));
-        }
-        None => {
-            let _ = writeln!(out, " (the agent reported no summary)");
-        }
-    }
     let _ = writeln!(
         out,
         "- Fix attempted: {}; fix confirmed: {}",
         yes_no(ev.fix_attempted),
         yes_no(ev.fix_confirmed)
     );
-    if run.commits.is_empty() {
-        let _ = writeln!(out, "- Commits: none");
-    } else {
+    if !run.commits.is_empty() {
         let shas: Vec<String> = run
             .commits
             .iter()
@@ -768,23 +774,20 @@ fn render_run(out: &mut String, item: &SectionRun) {
             .collect();
         let _ = writeln!(out, "- Commits: {}", shas.join(", "));
     }
-    let _ = write!(out, "- Integration: `{}`", run.integration);
-    if let Some(detail) = run.integration_detail.as_deref() {
-        let _ = write!(out, " - {}", one_line(detail));
-    }
-    let _ = writeln!(out);
     if run.integration != "none" {
-        let destination = item
-            .destination_branch
-            .as_deref()
-            .or(ev.integration_branch_id.as_deref())
-            .map_or_else(|| "not recorded".to_string(), |b| format!("`{b}`"));
+        if let Some(detail) = run.integration_detail.as_deref() {
+            let _ = writeln!(out, "- Carrying the fix: {}", one_line(detail));
+        }
         let pushed = match ev.integration_pushed {
             Some(true) => "pushed",
             Some(false) => "not pushed",
             None => "push result not recorded",
         };
-        let _ = writeln!(out, "- Destination branch: {destination} ({pushed})");
+        let _ = writeln!(
+            out,
+            "- Destination branch: {} ({pushed})",
+            destination.as_deref().unwrap_or("not recorded")
+        );
     }
     if let Some(error) = run.error.as_deref() {
         let _ = writeln!(out, "- Runner error: {}", one_line(error));
@@ -843,10 +846,33 @@ fn render_run(out: &mut String, item: &SectionRun) {
             let _ = writeln!(out, "Not recorded.\n");
         }
     }
+    let _ = writeln!(out, "</details>\n");
     if let Some(system) = ev.sent_system_prompt.as_deref() {
-        let _ = writeln!(out, "System prompt:\n\n{}\n", fenced(&clip(system)));
+        let _ = writeln!(
+            out,
+            "<details><summary>System prompt sent</summary>\n\n{}\n\n</details>\n",
+            fenced(&clip(system))
+        );
     }
     let _ = writeln!(out, "</details>\n");
+}
+
+/// The one-sentence fix outcome shown beside the verdict.
+fn fix_line(item: &SectionRun, destination: Option<&str>) -> String {
+    let run = &item.run;
+    let ev = &item.evidence;
+    let onto = destination.map_or_else(|| "the top branch".to_string(), str::to_string);
+    if ev.fix_confirmed == Some(true) {
+        return match run.integration.as_str() {
+            "integrated" => format!("Fix: confirmed and carried onto {onto}"),
+            "pending" | "integrating" => format!("Fix: confirmed; being carried onto {onto}"),
+            _ => "Fix: confirmed but could not be carried".to_string(),
+        };
+    }
+    if ev.fix_attempted == Some(true) || !run.commits.is_empty() {
+        return "Fix: attempted but not confirmed".to_string();
+    }
+    "Fix: not required".to_string()
 }
 
 /// The managed section for a set of runs, markers included, or `None` when
@@ -1435,6 +1461,65 @@ mod tests {
         assert!(section.contains("Live action: x\n\nstart it"));
         assert!(section.contains("Destination branch: `feature-top` (pushed)"));
         assert!(section.contains("2. in `/w`"));
+    }
+
+    #[test]
+    fn the_verdict_and_fix_line_precede_the_collapsed_details() {
+        let section = render_section(&[section_run("lr9-1", 0, 1)]).unwrap();
+        let heading = section.find("#### Board shows reviews\n").unwrap();
+        let verdict = section
+            .find("- Verdict: **passed** - greeting shown")
+            .unwrap();
+        let details = section
+            .find("<details><summary>Run details</summary>")
+            .unwrap();
+        assert!(heading < verdict && verdict < details);
+        // The heading is free of the internal id; the id sits inside the details.
+        assert!(!section[heading..verdict].contains("lr9-1"));
+        assert!(section.find("lr9-1").unwrap() > details);
+        assert!(!section.contains("Integration:") && !section.contains("Commits: none"));
+        // The system prompt is its own disclosure nested in the run details.
+        let system = section
+            .find("<summary>System prompt sent</summary>")
+            .unwrap();
+        assert!(details < system);
+        assert_eq!(
+            section.matches("<details>").count(),
+            section.matches("</details>").count()
+        );
+        let last_close = section.rfind("</details>").unwrap();
+        let system_close = section[system..].find("</details>").unwrap() + system;
+        assert!(system_close < last_close);
+    }
+
+    #[test]
+    fn the_fix_line_reflects_what_happened() {
+        let fix = |confirmed, attempted, integration: &str, commits: bool| {
+            let mut item = section_run("r1", 0, 1);
+            item.evidence.fix_confirmed = confirmed;
+            item.evidence.fix_attempted = attempted;
+            item.run.integration = integration.into();
+            if !commits {
+                item.run.commits.clear();
+            }
+            fix_line(&item, Some("`top`"))
+        };
+        assert_eq!(
+            fix(Some(true), Some(true), "integrated", true),
+            "Fix: confirmed and carried onto `top`"
+        );
+        assert_eq!(
+            fix(Some(true), Some(true), "failed", true),
+            "Fix: confirmed but could not be carried"
+        );
+        assert_eq!(
+            fix(Some(false), Some(true), "none", true),
+            "Fix: attempted but not confirmed"
+        );
+        assert_eq!(
+            fix(Some(false), Some(false), "none", false),
+            "Fix: not required"
+        );
     }
 
     #[test]
