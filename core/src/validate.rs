@@ -392,6 +392,7 @@ const REVIEW_ACTION_KEYS: &[&str] = &[
     "shared_store",
     "lifecycle",
     "auto_run",
+    "branches",
 ];
 const REVIEW_ACTION_SHARED_STORE_KEYS: &[&str] = &["store", "path"];
 const REVIEW_ACTION_LIFECYCLE_KEYS: &[&str] =
@@ -3247,6 +3248,7 @@ fn validate_review_action_array(value: Option<&toml::Value>, path: &str, ctx: &m
                 check_worktree_text_placeholders(ctx, &format!("{apath}.{key}"), value);
             }
         }
+        validate_review_action_branches(table.get("branches"), &format!("{apath}.branches"), ctx);
         validate_preparation_array(table.get("prepare"), &format!("{apath}.prepare"), ctx);
 
         validate_review_action_input_array(table.get("input"), &format!("{apath}.input"), ctx);
@@ -3260,6 +3262,60 @@ fn validate_review_action_array(value: Option<&toml::Value>, path: &str, ctx: &m
             &format!("{apath}.lifecycle"),
             ctx,
         );
+    }
+}
+
+/// `branches` is optional; when present it is a non-empty array of distinct,
+/// well-formed branch references. Whether each reference names a branch of
+/// the owning review is only knowable at submission, when the review is
+/// derived.
+fn validate_review_action_branches(value: Option<&toml::Value>, path: &str, ctx: &mut Ctx) {
+    let Some(value) = value else { return };
+    let Some(items) = value.as_array() else {
+        ctx.error(
+            path,
+            ErrorKind::WrongType,
+            "branches must be an array of strings",
+            None,
+        );
+        return;
+    };
+    if items.is_empty() {
+        ctx.error(
+            path,
+            ErrorKind::InvalidValue,
+            "branches must not be empty; omit it to make the action review-wide",
+            None,
+        );
+        return;
+    }
+    let mut seen: Vec<crate::schema::ActionBranchRef> = Vec::new();
+    for (i, item) in items.iter().enumerate() {
+        let ipath = format!("{path}[{i}]");
+        let Some(raw) = item.as_str() else {
+            ctx.error(
+                &ipath,
+                ErrorKind::WrongType,
+                "each branch reference must be a string",
+                None,
+            );
+            continue;
+        };
+        match crate::schema::parse_action_branch_ref(raw) {
+            Err(detail) => ctx.error(&ipath, ErrorKind::InvalidValue, detail, None),
+            Ok(parsed) => {
+                if seen.contains(&parsed) {
+                    ctx.error(
+                        &ipath,
+                        ErrorKind::InvalidValue,
+                        format!("duplicate branch reference \"{raw}\""),
+                        None,
+                    );
+                } else {
+                    seen.push(parsed);
+                }
+            }
+        }
     }
 }
 
@@ -6630,6 +6686,68 @@ project = "ralphus"
             "{:?}",
             r.errors
         );
+    }
+
+    fn action_with_branches(branches: &str) -> String {
+        format!(
+            "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nreview=\"<<review:r>>\"\n[[review]]\nid=\"r\"\n[[review.action]]\nlabel=\"x\"\ncommand=\"y\"\nbranches={branches}\n"
+        )
+    }
+
+    #[test]
+    fn review_action_branches_valid_forms() {
+        let src = action_with_branches("[\"feat-a\", \"task:t\", \"cell:t/cell-0\"]");
+        assert!(
+            validate_toml(&src).is_ok(),
+            "{:?}",
+            validate_toml(&src).errors
+        );
+    }
+
+    #[test]
+    fn review_action_branches_empty_rejected() {
+        let r = validate_toml(&action_with_branches("[]"));
+        assert!(
+            r.errors
+                .iter()
+                .any(|e| e.kind == ErrorKind::InvalidValue && e.message.contains("empty")),
+            "{:?}",
+            r.errors
+        );
+    }
+
+    #[test]
+    fn review_action_branches_wrong_type_rejected() {
+        let r = validate_toml(&action_with_branches("\"feat-a\""));
+        assert!(
+            r.errors.iter().any(|e| e.kind == ErrorKind::WrongType),
+            "{:?}",
+            r.errors
+        );
+        let r = validate_toml(&action_with_branches("[1]"));
+        assert!(
+            r.errors.iter().any(|e| e.kind == ErrorKind::WrongType),
+            "{:?}",
+            r.errors
+        );
+    }
+
+    #[test]
+    fn review_action_branches_duplicates_and_malformed_rejected() {
+        let r = validate_toml(&action_with_branches("[\"a\", \"a\"]"));
+        assert!(
+            r.errors.iter().any(|e| e.message.contains("duplicate")),
+            "{:?}",
+            r.errors
+        );
+        for bad in ["[\"\"]", "[\"task:\"]", "[\"cell:t\"]", "[\"cell:/c\"]"] {
+            let r = validate_toml(&action_with_branches(bad));
+            assert!(
+                r.errors.iter().any(|e| e.kind == ErrorKind::InvalidValue),
+                "{bad}: {:?}",
+                r.errors
+            );
+        }
     }
 
     #[test]

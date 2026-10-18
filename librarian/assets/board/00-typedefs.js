@@ -370,6 +370,7 @@
        * @property {string} [cleanup_command]
        * @property {CheckInput[]} [inputs]
        * @property {boolean} [auto_run] - RAL-565: this check's own auto-run setting; absent inherits the review's `effective_auto_run`.
+       * @property {string[]} [branch_ids] - RAL-674: ids of the review branches this action concerns; absent or empty means review-wide. An id no longer among the review's branches is a stale association.
        * @property {string} [auto_run_note] - RAL-565: why auto-run skipped this check, or why its last auto-run may be out of date (a rebase, feedback pass or auto-PR fix arrived while it ran). Cleared when the check is prepared again.
        */
       /**

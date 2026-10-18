@@ -276,6 +276,7 @@
       CLICK_HANDLERS.selectReviewCommandRow = (e, ds) => selectReviewCommandRow(ds.guardianId || "", ds.key || "", ds.cmd || "");
       CLICK_HANDLERS.scopeReviewDockToCommand = (e, ds) => scopeReviewDockToCommand(ds.guardianId || "", ds.key || "", ds.cmd || "");
       CLICK_HANDLERS.toggleReviewCommandFull = (e, ds) => toggleReviewCommandFull(ds.key || "");
+      CLICK_HANDLERS.toggleActionBranch = (e, ds) => toggleActionBranch(ds.guardianId || "", Number(ds.i), ds.branchId || "");
       CLICK_HANDLERS.sendBranchFeedback = (e, ds) => sendBranchFeedback(ds.guardianId || "", ds.branchId || "");
       CLICK_HANDLERS.openSectionEnv = (e, ds) => openSectionEnv(ds.guardianId || "", ds.kind || "");
       CLICK_HANDLERS.showChatCopyMenu = (e, ds) => showChatCopyMenu(e, ds.guardianId || "", ds.branchId || "");

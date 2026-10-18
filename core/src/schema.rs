@@ -2148,6 +2148,63 @@ pub struct ReviewActionDef {
     /// auto-run.
     #[serde(default)]
     pub auto_run: Option<bool>,
+    /// Branches of the owning review this action concerns, as
+    /// [`ActionBranchRef`] strings (`"<branch name>"`, `"task:<task name>"`
+    /// or `"cell:<task name>/<cell id>"`). Unset means the action is
+    /// review-wide; an empty list is rejected by the validator.
+    #[serde(default)]
+    pub branches: Option<Vec<String>>,
+}
+
+/// One authored reference in a [`ReviewActionDef`]'s `branches` list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ActionBranchRef {
+    /// A contributing branch, by name.
+    Branch(String),
+    /// Every branch the named task's cells contribute to the review.
+    Task(String),
+    /// The branch one specific cell contributes to the review.
+    Cell {
+        /// The owning task's `name`.
+        task: String,
+        /// The cell's `id`, or `cell-<index>` when it declares none.
+        cell: String,
+    },
+}
+
+/// Parse one `branches` entry. A bare string is a branch name; `task:` and
+/// `cell:` prefixes select by task/cell (`cell:` splits at the last `/`).
+///
+/// # Errors
+///
+/// A human-readable reason when the entry is empty or a prefixed form is
+/// missing a part.
+pub fn parse_action_branch_ref(raw: &str) -> Result<ActionBranchRef, String> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Err("a branch reference must not be empty".to_string());
+    }
+    if let Some(task) = raw.strip_prefix("task:") {
+        let task = task.trim();
+        if task.is_empty() {
+            return Err("'task:' needs a task name, e.g. \"task:build\"".to_string());
+        }
+        return Ok(ActionBranchRef::Task(task.to_string()));
+    }
+    if let Some(rest) = raw.strip_prefix("cell:") {
+        let Some((task, cell)) = rest.rsplit_once('/') else {
+            return Err("'cell:' needs \"<task name>/<cell id>\"".to_string());
+        };
+        let (task, cell) = (task.trim(), cell.trim());
+        if task.is_empty() || cell.is_empty() {
+            return Err("'cell:' needs \"<task name>/<cell id>\"".to_string());
+        }
+        return Ok(ActionBranchRef::Cell {
+            task: task.to_string(),
+            cell: cell.to_string(),
+        });
+    }
+    Ok(ActionBranchRef::Branch(raw.to_string()))
 }
 
 /// A logical network store and a relative path within the provider-owned root.

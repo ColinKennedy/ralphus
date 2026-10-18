@@ -186,6 +186,11 @@ pub struct GuardianCheck {
     /// cleared when the check is prepared again.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auto_run_note: Option<String>,
+    /// Stable review-branch ids (`guardian_branches.id`) this action concerns.
+    /// Empty means review-wide. An id whose branch has since left the review
+    /// is kept as is (never remapped); the board flags it stale.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub branch_ids: Vec<String>,
 }
 
 /// Persisted logical shared-store declaration. The provider resolves the
