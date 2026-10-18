@@ -21,6 +21,16 @@ name: Review-input races (push to race-suite)
 on:
   push:
     branches: [race-suite]
+  workflow_dispatch:
+    inputs:
+      seconds:
+        description: "Soak time box in seconds"
+        required: false
+        default: "3000"
+      seed:
+        description: "Replay this seed (leave empty for a fresh one)"
+        required: false
+        default: ""
 
 permissions:
   contents: read
@@ -75,7 +85,10 @@ jobs:
       - name: Run the seeded soak
         env:
           RALPHUS_RACE_NIGHTLY: "1"
-          RALPHUS_RACE_SOAK_SECONDS: "3000"
+          RALPHUS_RACE_SOAK_SECONDS: ${{ inputs.seconds || '3000' }}
+          # A push has no inputs: set the `RACE_SEED` repository variable to
+          # replay a seed on push runs; leave it unset for a fresh seed each push.
+          RALPHUS_RACE_SEED: ${{ inputs.seed || vars.RACE_SEED }}
         run: >
           cargo nextest run -P review-races -p ralphus-daemon --features race-suite
           --run-ignored only --no-capture
