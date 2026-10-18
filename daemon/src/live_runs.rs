@@ -107,7 +107,7 @@ pub struct LiveRunRow {
     /// The agent's proposed reproduction recipe (JSON), as proposed.
     pub recipe: Option<String>,
     /// Reproduction commands that matched a recorded shell call.
-    pub commands: Vec<crate::live_results::VerifiedCommand>,
+    pub commands: Vec<crate::live_publish::results::VerifiedCommand>,
     /// Stable ids of the review branches the action was attributed to.
     pub branch_ids: Vec<String>,
     pub attribution_note: Option<String>,
@@ -372,7 +372,7 @@ impl crate::store::Store {
     pub fn set_live_run_judgement(
         &self,
         run_id: &str,
-        j: &crate::live_results::Judgement,
+        j: &crate::live_publish::results::Judgement,
     ) -> crate::store::Result<()> {
         self.conn.execute(
             "UPDATE guardian_live_runs SET verdict=?, verdict_detail=?, fix_attempted=?,
@@ -1069,8 +1069,8 @@ fn execute_queued_run(
                     .unwrap_or_default(),
             );
         }
-        let _ = guard.request_live_refresh_for_guardian(&guardian.id);
     }
+    record_run_result(store, &run.run_id, &target, &outcome);
     post_report(store, &guardian, &target.label, &outcome);
     integration == "pending"
 }
@@ -1153,7 +1153,7 @@ pub fn integrate_run(store: &crate::store_lock::StoreHandle, runner: &dyn Runner
         let _ = store
             .lock()
             .set_live_run_integration(run_id, "none", Some("no commits to carry"));
-        refresh_results(store, &g.id);
+        crate::live_publish::request_refresh(store, &g.id);
         return;
     };
     if g.status.as_str() == "merge_stopped" {
@@ -1171,7 +1171,7 @@ pub fn integrate_run(store: &crate::store_lock::StoreHandle, runner: &dyn Runner
             "skipped",
             Some("the review finished before this run's commits could be carried"),
         );
-        refresh_results(store, &g.id);
+        crate::live_publish::request_refresh(store, &g.id);
         return;
     }
     let Some(branch) = top_branch(&g) else {
@@ -1203,7 +1203,10 @@ pub fn integrate_run(store: &crate::store_lock::StoreHandle, runner: &dyn Runner
         let _ = store
             .lock()
             .record_live_run_destination(run_id, &branch_id, None);
-        refresh_results(store, &g.id);
+        let _ = store
+            .lock()
+            .set_live_run_destination(run_id, &branch_id, None);
+        crate::live_publish::request_refresh(store, &g.id);
         return;
     }
     let patch = ws
@@ -1263,7 +1266,10 @@ pub fn integrate_run(store: &crate::store_lock::StoreHandle, runner: &dyn Runner
     let _ = store
         .lock()
         .record_live_run_destination(run_id, &branch_id, Some(outcome.pushed));
-    refresh_results(store, &g.id);
+    let _ = store
+        .lock()
+        .set_live_run_destination(run_id, &branch_id, Some(outcome.pushed));
+    crate::live_publish::request_refresh(store, &g.id);
     crate::cartographer::Note::new("guardian")
         .guardian(&g.id)
         .scope("live_action")
@@ -1296,10 +1302,6 @@ pub fn integrate_run(store: &crate::store_lock::StoreHandle, runner: &dyn Runner
 }
 
 /// Ask for every open PR/MR of the review to re-render its live-test results.
-fn refresh_results(store: &crate::store_lock::StoreHandle, guardian_id: &str) {
-    let _ = store.lock().request_live_refresh_for_guardian(guardian_id);
-}
-
 fn fail_integration(
     store: &crate::store_lock::StoreHandle,
     g: &GuardianView,
@@ -1308,7 +1310,7 @@ fn fail_integration(
 ) {
     let guard = store.lock();
     let _ = guard.set_live_run_integration(&run.run_id, "failed", Some(reason));
-    let _ = guard.request_live_refresh_for_guardian(&g.id);
+    let _ = guard.enqueue_live_result_refresh(&g.id);
     let live_ref = run.live_ref.as_deref().unwrap_or("(none)");
     let _ = guard.enqueue_error_mailbox_message(
         crate::mailbox::MailboxPriority::High,
@@ -1442,7 +1444,7 @@ pub fn sweep_automatic_runs(store: &crate::store_lock::StoreHandle, runners: &Li
         let _ = maybe_start_automatic_run(store, runners, &gid);
     }
     retry_pending_integrations(store, runners);
-    crate::live_results::process_pr_refreshes_background(store);
+    crate::live_publish::process_due_refreshes(store);
 }
 
 /// Daily cleanup of live refs (called with the worktree retirement sweep).
@@ -1998,9 +2000,8 @@ prompt = "first"
     }
 
     #[test]
-    fn one_live_run_is_published_to_each_attributed_branch_pr() {
+    fn one_live_run_queues_a_publish_for_each_open_pr_of_the_review() {
         use crate::live_actions::NewLiveAction;
-        use crate::live_results::{RefreshOutcome, SECTION_START, refresh_pr_with};
 
         let f = fixture(
             "multi-branch-prs",
@@ -2050,6 +2051,8 @@ prompt = "second"
                     format!("cell:{}:0:0", f.squad),
                     format!("cell:{second_squad}:0:0"),
                 ],
+                branch_ids: Vec::new(),
+                attribution_error: None,
             };
             assert!(
                 guard
@@ -2118,61 +2121,18 @@ prompt = "second"
             f.store.lock().live_run_evidence(run_id).unwrap().branch_ids,
             [branch_a, branch_b]
         );
-        assert_eq!(f.store.lock().pending_pr_live_refreshes().unwrap().len(), 3);
-
-        for (pr_id, number) in prs.iter().zip([7, 8]) {
-            let path = format!("/repos/acme/widget/pulls/{number}");
-            let mock = crate::mock_forge::MockForge::start(move |server| {
-                let read = server.recv();
-                assert_eq!(read.url(), path);
-                read.respond(
-                    tiny_http::Response::from_string(r#"{"body":"Reviewer notes."}"#)
-                        .with_status_code(200),
-                )
-                .unwrap();
-                let mut write = server.recv();
-                assert_eq!(write.url(), path);
-                assert_eq!(write.method(), &tiny_http::Method::Patch);
-                let mut body = String::new();
-                std::io::Read::read_to_string(write.as_reader(), &mut body).unwrap();
-                write
-                    .respond(tiny_http::Response::from_string("{}").with_status_code(200))
-                    .unwrap();
-                body
-            });
-            let client = std::cell::RefCell::new(Some(
-                mock.client(crate::forge::ForgeKind::GitHub, "acme/widget"),
-            ));
-            assert_eq!(
-                refresh_pr_with(&f.store, pr_id, &|_, _| client.borrow_mut().take()).unwrap(),
-                RefreshOutcome::Updated
-            );
-            let sent: serde_json::Value = serde_json::from_str(&mock.finish()).unwrap();
-            let description = sent["body"].as_str().unwrap();
-            assert!(description.starts_with("Reviewer notes."));
-            assert!(description.contains(SECTION_START));
-            assert!(description.contains(run_id));
-            assert!(description.contains("Both changes work"));
-            assert_eq!(
-                f.store.lock().get_pull_request(pr_id).unwrap().description,
-                description
-            );
+        let queued: Vec<String> = f
+            .store
+            .lock()
+            .live_result_publish_status(&f.gid)
+            .unwrap()
+            .into_iter()
+            .map(|status| status.pr_id)
+            .collect();
+        assert_eq!(queued.len(), 3);
+        for pr_id in prs.iter().chain([&unrelated_pr]) {
+            assert!(queued.contains(pr_id), "{pr_id} is not queued: {queued:?}");
         }
-        assert_eq!(
-            refresh_pr_with(&f.store, &unrelated_pr, &|_, _| {
-                panic!("unrelated PR should not contact the forge")
-            })
-            .unwrap(),
-            RefreshOutcome::Skipped
-        );
-        assert_eq!(
-            f.store
-                .lock()
-                .get_pull_request(&unrelated_pr)
-                .unwrap()
-                .description,
-            "Other notes."
-        );
         assert_eq!(f.agent.prompts.lock().len(), 1);
         assert_eq!(
             maybe_start_automatic_run(&f.store, &f.runners, &f.gid),

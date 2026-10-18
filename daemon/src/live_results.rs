@@ -1194,8 +1194,8 @@ pub fn record_run_evidence(
     let guard = store.lock();
     let _ = guard.record_live_run_sent(
         &run.run_id,
-        outcome.sent_prompt.as_deref(),
-        outcome.sent_system_prompt.as_deref(),
+        Some(outcome.sent_prompt.as_str()),
+        Some(outcome.sent_system_prompt.as_str()),
     );
     let _ = guard.record_live_run_verdict(&run.run_id, verdict, parsed.as_ref(), &recipe);
 }
@@ -1226,6 +1226,18 @@ mod tests {
             queued_at_ms: queued,
             started_at_ms: Some(queued),
             finished_at_ms: Some(queued + 1),
+            prompt: None,
+            system_prompt: None,
+            verdict: None,
+            verdict_detail: None,
+            fix_attempted: None,
+            fix_confirmed: None,
+            recipe: None,
+            commands: Vec::new(),
+            branch_ids: Vec::new(),
+            attribution_note: None,
+            integration_branch_id: None,
+            integration_pushed: None,
         }
     }
 

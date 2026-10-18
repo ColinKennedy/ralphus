@@ -50,6 +50,7 @@ pub mod hidden;
 pub mod jobobject;
 pub mod live_actions;
 pub mod live_command_units;
+pub mod live_publish;
 pub mod live_results;
 pub mod live_runs;
 pub mod logging;

@@ -989,14 +989,15 @@ pub struct LiveRunOutcome {
     pub live_ref: Option<String>,
     /// The cell id the agent's session and transcript are keyed by.
     pub cell_id: String,
-    /// The exact prompt handed to the runner (`None` when the run never
-    /// reached the runner).
-    pub sent_prompt: Option<String>,
-    /// The exact system prompt handed to the runner.
-    pub sent_system_prompt: Option<String>,
     /// The agent's full final reply, before marker lines are dropped from
     /// `report`; the structured result line is parsed out of it.
     pub raw_reply: String,
+    /// The user prompt exactly as sent to the runner.
+    pub sent_prompt: String,
+    /// The system prompt exactly as sent to the runner.
+    pub sent_system_prompt: String,
+    /// What ralphus concluded about the run.
+    pub judgement: Option<crate::live_publish::results::Judgement>,
 }
 
 fn outcome(end: LiveRunEnd, cell_id: &str, error: Option<String>) -> LiveRunOutcome {
@@ -1009,9 +1010,10 @@ fn outcome(end: LiveRunEnd, cell_id: &str, error: Option<String>) -> LiveRunOutc
         commits: Vec::new(),
         live_ref: None,
         cell_id: cell_id.to_string(),
-        sent_prompt: None,
-        sent_system_prompt: None,
         raw_reply: String::new(),
+        sent_prompt: String::new(),
+        sent_system_prompt: String::new(),
+        judgement: None,
     }
 }
 
@@ -1128,7 +1130,7 @@ pub fn execute_live_run(
         } else {
             LIVE_ACTION_READ_ONLY_SYSTEM_PROMPT
         },
-        crate::live_results::RESULT_INSTRUCTION
+        crate::live_publish::results::RESULT_INSTRUCTION
     );
     let sent_prompt = format!(
         "Live action: {}
@@ -1141,7 +1143,7 @@ pub fn execute_live_run(
         task: LIVE_ACTION_TASK.to_string(),
         cell_id: cell_id.clone(),
         cwd: req.cwd.to_string(),
-        prompt: Some(format!("Live action: {}\n\n{}", req.label, req.prompt)),
+        prompt: Some(sent_prompt.clone()),
         command: None,
         shell: None,
         agent: resolved.backend.clone(),
@@ -1201,8 +1203,8 @@ pub fn execute_live_run(
         req.cwd
     );
 
-    let sent_prompt = spec.prompt.clone();
-    let sent_system_prompt = spec.system_prompt.clone();
+    let sent_prompt = spec.prompt.clone().unwrap_or_default();
+    let sent_system_prompt = spec.system_prompt.clone().unwrap_or_default();
     let result = crate::guardian_merge::run_agent_with_stall_recovery(
         store, &mut spec, runner, cancel, None,
     );
@@ -1245,7 +1247,7 @@ pub fn execute_live_run(
         }
     }
 
-    done.judgement = Some(crate::live_results::judge(
+    done.judgement = Some(crate::live_publish::results::judge(
         done.end == LiveRunEnd::Finished,
         &done.raw_reply,
         &run_shell_calls(&cell_id, gid),
@@ -1286,7 +1288,10 @@ pub fn execute_live_run(
 
 /// The shell commands a live run's agent session really ran, read from the
 /// session's raw transcripts (every attempt, in order).
-fn run_shell_calls(cell_id: &str, guardian_id: &str) -> Vec<crate::live_results::ShellCall> {
+fn run_shell_calls(
+    cell_id: &str,
+    guardian_id: &str,
+) -> Vec<crate::live_publish::results::ShellCall> {
     let session = crate::cell_session::session_name(
         &live_run_squad_id(guardian_id),
         LIVE_ACTION_TASK,
@@ -1317,7 +1322,7 @@ fn run_shell_calls(cell_id: &str, guardian_id: &str) -> Vec<crate::live_results:
         }
         text.push('\n');
     }
-    crate::live_results::shell_calls(&text)
+    crate::live_publish::results::shell_calls(&text)
 }
 
 /// The agent's report without ralphus's own reply markers: everything from a
@@ -1490,7 +1495,7 @@ mod tests {
                     "{LIVE_ACTION_COMMIT_SYSTEM_PROMPT}
 
 {}",
-                    crate::live_results::RESULT_INSTRUCTION
+                    crate::live_publish::results::RESULT_INSTRUCTION
                 )
                 .as_str()
             )
@@ -1573,7 +1578,7 @@ mod tests {
                     "{LIVE_ACTION_READ_ONLY_SYSTEM_PROMPT}
 
 {}",
-                    crate::live_results::RESULT_INSTRUCTION
+                    crate::live_publish::results::RESULT_INSTRUCTION
                 )
                 .as_str()
             )

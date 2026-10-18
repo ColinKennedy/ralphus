@@ -2726,6 +2726,17 @@ impl Store {
             );
             CREATE INDEX IF NOT EXISTS idx_guardian_live_runs_guardian
                 ON guardian_live_runs(guardian_id, state);
+            -- Durable per-PR queue of pending `## Live-Test Results` description
+            -- updates (`crate::live_publish`): a row exists until the forge has
+            -- accepted the section, and carries its own retry backoff.
+            CREATE TABLE IF NOT EXISTS live_result_refreshes (
+                pr_id           TEXT PRIMARY KEY REFERENCES guardian_pull_requests(id) ON DELETE CASCADE,
+                guardian_id     TEXT NOT NULL REFERENCES guardians(id) ON DELETE CASCADE,
+                attempts        INTEGER NOT NULL DEFAULT 0,
+                next_attempt_ms INTEGER NOT NULL,
+                last_error      TEXT,
+                requested_at_ms INTEGER NOT NULL
+            );
             -- What a live run sent and concluded (RAL-672): the exact prompt
             -- and system prompt handed to the runner, the structured verdict
             -- the agent proposed, the recorded-command recipe, the branches

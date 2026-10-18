@@ -1,6 +1,6 @@
 //! Publishing live-test results into the descriptions of a review's PRs/MRs.
 //!
-//! [`crate::live_results`] renders the managed `## Live-Test Results` section;
+//! [`crate::live_publish::results`] renders the managed `## Live-Test Results` section;
 //! this module decides which PRs get which actions and writes the section
 //! through the forge REST API. A publish is a row in `live_result_refreshes`
 //! (one per PR), so it survives a daemon restart and is retried with bounded
@@ -15,7 +15,9 @@
 use std::path::Path;
 
 use crate::live_actions::LiveAction;
-use crate::live_results::{ActionEntry, MAX_RUNS_PER_ACTION, merge_section, render_section};
+use crate::live_publish::results::{
+    ActionEntry, MAX_RUNS_PER_ACTION, merge_section, render_section,
+};
 use crate::live_runs::{LiveRunRow, guardian_live_runs_conn};
 use crate::pr::PullRequestView;
 use crate::store_lock::StoreHandle;
@@ -77,19 +79,6 @@ impl crate::store::Store {
             "UPDATE live_result_refreshes SET next_attempt_ms=0 WHERE guardian_id=?",
             rusqlite::params![guardian_id],
         )?)
-    }
-
-    /// Record the description the forge accepted.
-    ///
-    /// # Errors
-    ///
-    /// On a database failure.
-    pub fn set_pr_description(&self, pr_id: &str, description: &str) -> crate::store::Result<()> {
-        self.conn.execute(
-            "UPDATE guardian_pull_requests SET description=?, updated_at_ms=? WHERE id=?",
-            rusqlite::params![description, crate::store::now_ms(), pr_id],
-        )?;
-        Ok(())
     }
 
     /// Queued (not yet published) refreshes of the review.
@@ -347,5 +336,6 @@ fn record_failure(store: &StoreHandle, guardian_id: &str, pr_id: &str, attempts:
     }
 }
 
+pub mod results;
 #[cfg(test)]
 mod tests;
