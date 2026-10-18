@@ -5365,14 +5365,14 @@ at `GET /api/squads/{id}/cells/{ti}/{si}/live-handoffs` as
 actions are its member cells' handoffs -- the latest-finished cell of each task
 only -- deduplicated once by the review's resolver agent and then fixed.
 
-`live_actions` (boolean, default `false`) opts a review in: per review (`POST
+`live_actions` (boolean, default `true` for reviews created after the default changed; reviews that predate it resolve an unset value to `false`) enables or disables a review: per review (`POST
 /api/guardians/{id}/settings` or `/details`, `[[review]] live_actions`), with a
 project default (`POST /api/projects/{name}/review-settings`, `.ralphus.toml
 [review] live_actions`). `GuardianView` carries `live_actions` (the review's own
 value or `null`), `effective_live_actions`, and `live_actions_auto_ran_at_ms`.
 
 *One automatic run.* An opted-in review runs its live actions once, by itself,
-the first time it has a prepared checkout while every member cell has finished
+the first time its initial stacked rebase has settled every enabled branch (`first_ready_at_ms`) and it has a prepared checkout while every member cell has finished
 (done, failed, cancelled or ignored), it is not stopped or finished, and its
 `maximum_budget_usd` is not spent. It never waits for PR CI. The claim is
 write-once (`live_actions_auto_ran_at_ms`), so a restart, rebase, feedback pass

@@ -307,8 +307,9 @@ pub struct ReviewConfig {
     #[serde(default)]
     pub auto_run: Option<bool>,
     /// Live actions: project default for whether a review runs its live
-    /// actions. `None` resolves to `false` (see [`Self::live_actions`]); a
-    /// review's own `live_actions` wins over this.
+    /// actions. `None` resolves to `true` for reviews created under the
+    /// enabled-by-default policy (see [`Self::live_actions`]); a review's own
+    /// `live_actions` wins over this.
     #[serde(default)]
     pub live_actions: Option<bool>,
     /// Which events tear down and rebuild a review's prepared build (any of
@@ -699,10 +700,11 @@ impl ReviewConfig {
         self.auto_run.unwrap_or(false)
     }
 
-    /// Whether reviews run their live actions when no layer sets it (`false`).
+    /// Whether new reviews run their live actions when no layer sets it
+    /// (`true`).
     #[must_use]
     pub fn live_actions(&self) -> bool {
-        self.live_actions.unwrap_or(false)
+        self.live_actions.unwrap_or(true)
     }
 
     /// The events that rebuild a review's prepared build when neither the

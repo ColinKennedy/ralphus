@@ -605,7 +605,7 @@
        * @property {number|null} [post_merge_finished_at_ms] - epoch-ms when the post-merge phase most recently finished, or null while it is still running.
        * @property {boolean|null} [skip_manual_checks] - this review's own override for whether manual-check generation is skipped; null = inherit the project default.
        * @property {boolean|null} [auto_run] - this review's own override for whether ready manual checks run automatically after their build succeeds; null = inherit the project default.
-       * @property {boolean} [effective_auto_run] - `auto_run` resolved against the project/global defaults (false when nothing sets it).
+       * @property {boolean} [effective_auto_run] - `auto_run` resolved against the project/global defaults (true for a review created now when nothing sets it; false for one that predates the default).
        * @property {boolean|null} [live_actions] - This review's own live-actions opt-in; null inherits.
        * @property {boolean} [effective_live_actions] - `live_actions` resolved against the project/global defaults (false when nothing sets it).
        * @property {number|null} [live_actions_auto_ran_at_ms] - When the review's one automatic live-action run started; null until then.
