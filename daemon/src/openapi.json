@@ -2928,6 +2928,37 @@
         }
       }
     },
+    "/api/guardians/{id}/live-actions/results/refresh": {
+      "post": {
+        "operationId": "postGuardiansByIdLiveActionsResultsRefresh",
+        "summary": "Retry publishing live-test results into the review's PR/MR descriptions now.",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/JsonValue"
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
     "/api/guardians/{id}/live-actions/run": {
       "post": {
         "operationId": "postGuardiansByIdLiveActionsRun",
