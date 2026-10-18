@@ -350,6 +350,8 @@ fn run_watch(store: &crate::store_lock::StoreHandle, guardian_id: &str, branch_i
     let Some(number) = pr.pr_number else {
         return;
     };
+    // A watch starts right after a push, which tends to bring review comments.
+    crate::pr::reset_comment_poll(&pr.id);
 
     let root = PathBuf::from(&guardian.git_root);
     let forge_cfg = crate::config::resolve_forge(&root);

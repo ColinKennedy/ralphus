@@ -6962,6 +6962,82 @@ fn start_backoff(client: &crate::forge::ForgeClient, retry_after: Option<std::ti
         .insert(key, resume_at);
 }
 
+/// Fastest comment-poll interval: right after a PR's comments changed or its
+/// branch was pushed, since comments tend to arrive in bursts.
+const COMMENT_POLL_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Slowest comment-poll interval: a PR with no comment activity for a long
+/// time is still polled once a day.
+const COMMENT_POLL_MAX_INTERVAL: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
+
+/// When a PR's comments are next polled, and the interval that got it there.
+struct CommentPollSchedule {
+    interval: std::time::Duration,
+    next_due: std::time::Instant,
+}
+
+/// Per PR id: its comment-poll backoff. A PR with no entry is due now.
+fn comment_poll_schedules() -> &'static parking_lot::Mutex<HashMap<String, CommentPollSchedule>> {
+    static SCHEDULES: std::sync::OnceLock<
+        parking_lot::Mutex<HashMap<String, CommentPollSchedule>>,
+    > = std::sync::OnceLock::new();
+    SCHEDULES.get_or_init(Default::default)
+}
+
+/// Whether `pr_id`'s comments are due for a poll.
+fn comment_poll_due(pr_id: &str) -> bool {
+    comment_poll_schedules()
+        .lock()
+        .get(pr_id)
+        .is_none_or(|s| std::time::Instant::now() >= s.next_due)
+}
+
+/// Schedule `pr_id`'s next comment poll after one just ran: back to
+/// [`COMMENT_POLL_MIN_INTERVAL`] when the comments changed, doubled (capped at
+/// [`COMMENT_POLL_MAX_INTERVAL`]) when they did not, and unchanged when the
+/// poll failed (`None`).
+fn record_comment_poll(pr_id: &str, changed: Option<bool>) {
+    let now = std::time::Instant::now();
+    let mut schedules = comment_poll_schedules().lock();
+    let schedule = schedules
+        .entry(pr_id.to_string())
+        .or_insert(CommentPollSchedule {
+            interval: COMMENT_POLL_MIN_INTERVAL,
+            next_due: now,
+        });
+    match changed {
+        Some(true) => schedule.interval = COMMENT_POLL_MIN_INTERVAL,
+        Some(false) => {
+            schedule.interval = (schedule.interval * 2).min(COMMENT_POLL_MAX_INTERVAL);
+        }
+        None => {}
+    }
+    schedule.next_due = now + schedule.interval;
+}
+
+/// Poll `pr_id`'s comments at the fastest rate again, starting
+/// [`COMMENT_POLL_MIN_INTERVAL`] from now: its branch was just pushed, which
+/// tends to bring review comments.
+pub(crate) fn reset_comment_poll(pr_id: &str) {
+    comment_poll_schedules().lock().insert(
+        pr_id.to_string(),
+        CommentPollSchedule {
+            interval: COMMENT_POLL_MIN_INTERVAL,
+            next_due: std::time::Instant::now() + COMMENT_POLL_MIN_INTERVAL,
+        },
+    );
+}
+
+/// What one [`poll_pr_comments`] call learned.
+struct CommentPollResult {
+    etag_conversation: Option<String>,
+    etag_review: Option<String>,
+    /// Set when a call actually failed.
+    error: Option<String>,
+    /// Whether any endpoint returned a fresh (non-304) body.
+    changed: bool,
+}
+
 /// Poll one PR's comment endpoint(s) -- both of GitHub's conversation/review
 /// endpoints, or GitLab's single notes endpoint -- via
 /// [`crate::forge::ForgeClient::list_pr_comments_conditional`], replacing
@@ -6977,21 +7053,24 @@ fn poll_pr_comments(
     number: i64,
     etag_conversation: Option<String>,
     etag_review: Option<String>,
-) -> (Option<String>, Option<String>, Option<String>) {
+) -> CommentPollResult {
     if is_backed_off(client) {
-        return (
+        return CommentPollResult {
             etag_conversation,
             etag_review,
-            Some("forge rate-limited; backing off".to_string()),
-        );
+            error: Some("forge rate-limited; backing off".to_string()),
+            changed: false,
+        };
     }
     let mut error = None;
-    let poll_one =
+    let mut changed = false;
+    let mut poll_one =
         |endpoint: crate::forge::PrCommentEndpoint, prior_etag: Option<String>| match client
             .list_pr_comments_conditional(number, endpoint, prior_etag.as_deref())
         {
             Ok(crate::forge::CommentsPoll::NotModified) => (prior_etag, None),
             Ok(crate::forge::CommentsPoll::Modified { comments, etag }) => {
+                changed = true;
                 let table_endpoint = match endpoint {
                     crate::forge::PrCommentEndpoint::Conversation => "conversation",
                     crate::forge::PrCommentEndpoint::Review => "review",
@@ -7026,7 +7105,12 @@ fn poll_pr_comments(
     } else {
         etag_review
     };
-    (new_conv, new_review, error)
+    CommentPollResult {
+        etag_conversation: new_conv,
+        etag_review: new_review,
+        error,
+        changed,
+    }
 }
 
 /// Refresh cached forge state for every currently-open, forge-numbered PR
@@ -7067,7 +7151,16 @@ fn poll_pr_comments(
 /// guardians would mean restructuring this whole poll loop from per-guardian
 /// to per-root across every guardian in the daemon, which isn't worth the
 /// risk for what is already an N-to-1 reduction per guardian's own stack.
-fn refresh_pr_forge_cache_for_guardian(store: &crate::store_lock::StoreHandle, id: &str) {
+///
+/// Comments are only polled for PRs whose backoff says they are due
+/// ([`comment_poll_due`]). With `include_drift` false the drift pass (and its
+/// git fetch) is skipped, for the between-cycle ticks that exist only to give
+/// comment polling its faster cadence.
+fn refresh_pr_forge_cache_for_guardian(
+    store: &crate::store_lock::StoreHandle,
+    id: &str,
+    include_drift: bool,
+) {
     let Ok(guardian) =
         store.with_read_snapshot(|conn| crate::store::Store::get_guardian_conn(conn, id))
     else {
@@ -7107,7 +7200,7 @@ fn refresh_pr_forge_cache_for_guardian(store: &crate::store_lock::StoreHandle, i
         .into_iter()
         .filter(|p| p.state == "open" && p.pr_number.is_some())
         .collect();
-    if prs.is_empty() {
+    if prs.is_empty() || (!include_drift && !prs.iter().any(|pr| comment_poll_due(&pr.id))) {
         return;
     }
     let root = PathBuf::from(&guardian.git_root);
@@ -7139,7 +7232,9 @@ fn refresh_pr_forge_cache_for_guardian(store: &crate::store_lock::StoreHandle, i
     // drift, so the poller still never makes foreground work wait.
     type DriftReading =
         std::result::Result<(bool, bool, bool, Option<String>, Option<String>), String>;
-    let drift_by_pr: Vec<Option<DriftReading>> = {
+    let drift_by_pr: Vec<Option<DriftReading>> = if !include_drift {
+        prs.iter().map(|_| None).collect()
+    } else {
         let locks: Vec<Arc<Mutex<()>>> =
             prs.iter().map(|p| sync_fetch_lock(&root, &p.id)).collect();
         let guards: Vec<Option<std::sync::MutexGuard<'_, ()>>> =
@@ -7213,6 +7308,36 @@ fn refresh_pr_forge_cache_for_guardian(store: &crate::store_lock::StoreHandle, i
     let mut cycle_error: Option<String> = None;
     for (pr, drift) in prs.iter().zip(drift_by_pr) {
         let number = pr.pr_number.expect("filtered to pr_number.is_some() above");
+        if !comment_poll_due(&pr.id) {
+            // Not due for comments: write only this pass's drift, if any,
+            // leaving the comments half and its timestamp untouched.
+            if drift.is_none() {
+                continue;
+            }
+            if let Some(Err(fetch_failure)) = &drift {
+                cycle_ok = false;
+                if cycle_error.is_none() {
+                    cycle_error = Some(format!(
+                        "git fetch of the PR branches failed: {fetch_failure}"
+                    ));
+                }
+            }
+            let drift_half: HalfOutcome<DriftObservation<'_>> = drift.as_ref().map(|r| match r {
+                Ok((in_sync, pr_ahead, worktree_ahead, remote_sha, local_sha)) => {
+                    Ok(DriftObservation {
+                        in_sync: *in_sync,
+                        pr_ahead: *pr_ahead,
+                        worktree_ahead: *worktree_ahead,
+                        remote_sha: remote_sha.as_deref(),
+                        local_sha: local_sha.as_deref(),
+                    })
+                }
+                Err(e) => Err(e.clone()),
+            });
+            let result = store.lock().upsert_pr_forge_cache(&pr.id, drift_half, None);
+            warn_on_store_write(store, "upsert_pr_forge_cache", &pr.id, false, result);
+            continue;
+        }
 
         // Fetched before either write path below so the post-write
         // comparison reflects an actual state transition, not this pass's
@@ -7234,7 +7359,7 @@ fn refresh_pr_forge_cache_for_guardian(store: &crate::store_lock::StoreHandle, i
                         .lock()
                         .pr_forge_cache_etags(&pr.id)
                         .unwrap_or((None, None));
-                    let (new_conversation_etag, new_review_etag, comment_error) = poll_pr_comments(
+                    let polled = poll_pr_comments(
                         store,
                         client,
                         &pr.id,
@@ -7242,22 +7367,26 @@ fn refresh_pr_forge_cache_for_guardian(store: &crate::store_lock::StoreHandle, i
                         etag_conversation,
                         etag_review,
                     );
+                    record_comment_poll(&pr.id, polled.error.is_none().then_some(polled.changed));
                     (
-                        comment_error.is_none(),
-                        comment_error,
-                        new_conversation_etag,
-                        new_review_etag,
+                        polled.error.is_none(),
+                        polled.error,
+                        polled.etag_conversation,
+                        polled.etag_review,
                     )
                 }
                 // No resolvable forge client (missing token, unregistered
                 // remote, ...) -- degrade the comments half to "unknown" but
                 // still persist whatever drift this pass computed.
-                None => (
-                    false,
-                    Some("no forge client could be resolved for this PR's repo".to_string()),
-                    None,
-                    None,
-                ),
+                None => {
+                    record_comment_poll(&pr.id, None);
+                    (
+                        false,
+                        Some("no forge client could be resolved for this PR's repo".to_string()),
+                        None,
+                        None,
+                    )
+                }
             };
 
         let drift_half: HalfOutcome<DriftObservation<'_>> = drift.as_ref().map(|r| match r {
@@ -7407,7 +7536,7 @@ fn run_pr_forge_poll_cycle(store: &crate::store_lock::StoreHandle, cache_enabled
             }
         }
         if cache_enabled {
-            refresh_pr_forge_cache_for_guardian(store, &id);
+            refresh_pr_forge_cache_for_guardian(store, &id, true);
         }
     }
     if cache_enabled {
@@ -7424,6 +7553,24 @@ fn run_pr_forge_poll_cycle(store: &crate::store_lock::StoreHandle, cache_enabled
             Ok(_) => {}
             Err(e) => crate::rlog!(WARNING, "ralphus [pr] forge cache prune failed: {e}"),
         }
+    }
+}
+
+/// Between full [`run_pr_forge_poll_cycle`]s: poll the comments of every open
+/// PR whose backoff says it is due, with no drift pass and no git fetch.
+fn run_pr_comment_poll_tick(store: &crate::store_lock::StoreHandle) {
+    let ids = match store.lock().guardian_ids_with_open_pull_requests() {
+        Ok(ids) => ids,
+        Err(e) => {
+            crate::rlog!(
+                ERROR,
+                "ralphus [pr] comment poll: listing guardians failed: {e}"
+            );
+            return;
+        }
+    };
+    for id in ids {
+        refresh_pr_forge_cache_for_guardian(store, &id, false);
     }
 }
 
@@ -7447,12 +7594,32 @@ pub fn spawn_pr_base_drift_poller(store: crate::store_lock::StoreHandle) {
         },
         std::sync::Arc::clone(&store),
         std::sync::Arc::new(move || {
+            let mut last_full_cycle: Option<std::time::Instant> = None;
             loop {
                 let cache_cfg = crate::config::load_pr_cache_config();
-                std::thread::sleep(cache_cfg.poll_interval());
+                let interval = cache_cfg.poll_interval();
+                // Woken at least every `COMMENT_POLL_MIN_INTERVAL` so a PR
+                // with recent comment activity is polled that often; the full
+                // drift + base-drift cycle still runs once per `interval`.
+                std::thread::sleep(interval.min(COMMENT_POLL_MIN_INTERVAL));
                 if crate::config::scheduler_in_downtime() {
                     continue;
                 }
+                if last_full_cycle.is_some_and(|at| at.elapsed() < interval) {
+                    if cache_cfg.enabled() {
+                        let pass = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            run_pr_comment_poll_tick(&store);
+                        }));
+                        if pass.is_err() {
+                            crate::rlog!(
+                                ERROR,
+                                "ralphus [pr] comment poll tick panicked; the poller continues"
+                            );
+                        }
+                    }
+                    continue;
+                }
+                last_full_cycle = Some(std::time::Instant::now());
                 // `[pr_cache].enabled = false` turns off the RAL-366 cache
                 // refresh only. RAL-279's base-drift reconciliation shares this
                 // thread but is unrelated functionality with real consequences --
@@ -11568,6 +11735,7 @@ pub fn sync_remote_pr_commits(
             .map_err(|e| format!("could not pull remote commits for PR {}: {e}", pr.id))?
         {
             pulled += 1;
+            reset_comment_poll(&pr.id);
         }
     }
     Ok(pulled)
@@ -12225,6 +12393,43 @@ mod tests {
         // Missing information always fetches.
         assert!(!pr_fetch_floor_holds(None, None, Some("abc"), recent));
         assert!(!pr_fetch_floor_holds(None, Some("abc"), Some("abc"), None));
+    }
+
+    #[test]
+    fn comment_polls_back_off_to_a_day_and_reset_on_activity() {
+        use std::time::Instant;
+        let pr = "pr-comment-backoff-test";
+        comment_poll_schedules().lock().remove(pr);
+        assert!(comment_poll_due(pr), "a PR never polled is due now");
+        let interval = || comment_poll_schedules().lock().get(pr).unwrap().interval;
+
+        record_comment_poll(pr, Some(false));
+        assert_eq!(interval(), COMMENT_POLL_MIN_INTERVAL * 2);
+        assert!(!comment_poll_due(pr));
+        record_comment_poll(pr, Some(false));
+        assert_eq!(interval(), COMMENT_POLL_MIN_INTERVAL * 4);
+        for _ in 0..20 {
+            record_comment_poll(pr, Some(false));
+        }
+        assert_eq!(interval(), COMMENT_POLL_MAX_INTERVAL, "capped at a day");
+
+        // A failed poll keeps the interval.
+        record_comment_poll(pr, None);
+        assert_eq!(interval(), COMMENT_POLL_MAX_INTERVAL);
+
+        // New comments drop straight back to the fastest rate.
+        record_comment_poll(pr, Some(true));
+        assert_eq!(interval(), COMMENT_POLL_MIN_INTERVAL);
+
+        // A push resets to the fastest rate, due one interval from now.
+        for _ in 0..5 {
+            record_comment_poll(pr, Some(false));
+        }
+        reset_comment_poll(pr);
+        assert_eq!(interval(), COMMENT_POLL_MIN_INTERVAL);
+        let next = comment_poll_schedules().lock().get(pr).unwrap().next_due;
+        assert!(next > Instant::now());
+        comment_poll_schedules().lock().remove(pr);
     }
 
     #[test]
@@ -24609,7 +24814,7 @@ token_env = "RALPHUS_TEST_FORGE_TOKEN"
         let (_root, store, pr_id, sha) = cache_poll_fixture("cache-drift");
         let guardian_id = store.lock().get_pull_request(&pr_id).unwrap().guardian_id;
 
-        refresh_pr_forge_cache_for_guardian(&store, &guardian_id);
+        refresh_pr_forge_cache_for_guardian(&store, &guardian_id, true);
 
         let cache = store
             .lock()
@@ -24655,7 +24860,7 @@ token_env = "RALPHUS_TEST_FORGE_TOKEN"
         let held = sync_fetch_lock(&root, &pr_id);
         let _guard = held.lock().unwrap();
 
-        refresh_pr_forge_cache_for_guardian(&store, &guardian_id);
+        refresh_pr_forge_cache_for_guardian(&store, &guardian_id, true);
 
         let cache = store.lock().get_pr_forge_cache(&pr_id).unwrap().unwrap();
         assert_eq!(
