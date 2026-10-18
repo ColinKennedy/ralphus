@@ -1,4 +1,31 @@
 ﻿      // ---------- helpers ----------
+      // RALPHUS-GUARDED-ACTION:BEGIN
+      /** How long a guarded action stays locked after it settles, so a rapid double click cannot re-issue it. */
+      const GUARDED_ACTION_COOLDOWN_MS = 1000;
+      /** @type {Map<string, number>} guard key -> epoch ms the lock is held until (Infinity while in flight) */
+      const guardedActionUntil = new Map();
+      /**
+       * Runs a user-triggered refresh/check action unless the same `key` is in
+       * flight or settled less than `GUARDED_ACTION_COOLDOWN_MS` ago. The lock
+       * is released when the action settles, success or failure, so a later
+       * click retries. Every manual refresh control must go through this.
+       * @param {string} key one stable key per control (per entity for row-scoped controls)
+       * @param {() => *} fn the action; may return a promise
+       * @param {() => number} [now] clock, injectable for tests
+       * @returns {Promise<boolean>} false when the click was swallowed by the guard
+       */
+      async function guardedAction(key, fn, now = Date.now) {
+        const until = guardedActionUntil.get(key);
+        if (until !== undefined && now() < until) return false;
+        guardedActionUntil.set(key, Infinity);
+        try {
+          await fn();
+        } finally {
+          guardedActionUntil.set(key, now() + GUARDED_ACTION_COOLDOWN_MS);
+        }
+        return true;
+      }
+      // RALPHUS-GUARDED-ACTION:END
       /**
        * Gets an element by id, asserting it is present. Use only where the
        * element is guaranteed to exist by the page's static structure (or by

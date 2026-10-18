@@ -107,7 +107,7 @@
         el.innerHTML =
           `${agentProfiles.length} agent ${agentProfiles.length === 1 ? "profile" : "profiles"}, `
           + `${overrideCount} backend command ${overrideCount === 1 ? "override" : "overrides"} `
-          + `<button class="btn" style="margin-left:8px;padding:2px 8px;font-size:12px" onclick="refreshAgentsTab()" data-tip="Re-query the daemon for agent profiles and backend command overrides.">⟳ Refresh</button>`;
+          + `<button class="btn" style="margin-left:8px;padding:2px 8px;font-size:12px" onclick="guardedAction('refresh-agents', () => refreshAgentsTab())" data-tip="Re-query the daemon for agent profiles and backend command overrides.">⟳ Refresh</button>`;
       }
 
       /**

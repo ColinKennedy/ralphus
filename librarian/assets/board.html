@@ -203,7 +203,7 @@
             <input type="checkbox" id="queue-hide-running" onchange="queueSetHideRunning(this.checked)"> hide running
           </label>
           <span class="spacer"></span>
-          <button class="queue-btn" onclick="pollQueue()" data-tip="Re-query the daemon for the current queue.\nThe Queue does not refresh on its own unless auto-update is on, so click this after tasks complete to see the latest.">⟳ Refresh</button>
+          <button class="queue-btn" onclick="guardedAction('refresh-queue', pollQueue)" data-tip="Re-query the daemon for the current queue.\nThe Queue does not refresh on its own unless auto-update is on, so click this after tasks complete to see the latest.">⟳ Refresh</button>
           <label data-tip="When on, the Queue re-queries the daemon as squad changes are pushed to the board and reconciles the list in place (adds newly-ready work, drops finished work) without discarding your unsaved reordering.\nOff by default to avoid churn while you organize.">
             <input type="checkbox" id="queue-autoupdate" onchange="queueSetAutoUpdate(this.checked)"> auto-update
           </label>
@@ -346,7 +346,7 @@
         <label class="tri-flow-only tri-check" data-tip="Include cells permanently excluded because their proof failed.\nA failed cell never counts toward a threshold and is never swept into a review, but it stays listed as a record."><input type="checkbox" onchange="onTriageShowExcluded(this.checked)" /> show excluded</label>
         <span style="flex:1"></span>
         <button class="btn" onclick="setTriageView('cfg')" data-tip="Register a new triage type, or edit an existing one, on the Configuration view.\nA type's description is fed to the Arbiter's classification prompt — write it so the Arbiter can tell this type apart from the others.">＋ Register type</button>
-        <button class="btn" onclick="pollTriage()" data-tip="Re-query the daemon for triage types, pool state, schedules, and candidates.">⟳ Refresh</button>
+        <button class="btn" onclick="guardedAction('refresh-triage', pollTriage)" data-tip="Re-query the daemon for triage types, pool state, schedules, and candidates.">⟳ Refresh</button>
       </div>
       <div class="tri-summary" id="triage-summary"></div>
       <div id="triage"><div class="empty">Loading…</div></div>
@@ -358,7 +358,7 @@
         <b data-tip="Presets — named bundles of field defaults an &quot;extends = [&quot;&lt;&lt;ralphus:presets/&lt;name&gt;&gt;&gt;&quot;]&quot; entry stamps into a task's, cell's, or proof step's own unset fields at submit time.\nA field the author already set explicitly is never overridden; when more than one named preset in the list sets the same field, the last one wins.">🧩 Presets</b>
         <span class="row" style="gap:12px">
           <span style="color:var(--muted)" id="presets-summary"></span>
-          <button class="btn" onclick="pollPresets()" data-tip="Re-query the daemon for registered presets.">↻ Refresh</button>
+          <button class="btn" onclick="guardedAction('refresh-presets', pollPresets)" data-tip="Re-query the daemon for registered presets.">↻ Refresh</button>
         </span>
       </div>
       <div class="presets-intro" data-tip="A field the extending entity already sets explicitly always wins over a preset. When several presets in one extends list set the same field, the last one wins.">Named bundles of field defaults. A task, cell, or proof step that lists one in <code>extends</code> gets its unset fields stamped from it at submit time.</div>
@@ -368,7 +368,7 @@
     <main id="worktree-retirement-page" style="display:none">
       <div class="row" style="justify-content:space-between;margin-bottom:12px">
         <b data-tip="Review worktrees idle for 30 days are retired by a daily daemon sweep.\nscheduled = too young; eligible = old enough -- watchers of the review get one mailbox heads-up, then the sweep after that removes it; claimed = kept because a live task/proof/review still needs it; failed = the last attempt failed; deferred = a machine provider asked to try again later; opted_out = a machine provider or policy declined to ever retire this worktree; retired = removed (kept here as history for as long as the review exists).">Worktree retirement</b>
-        <button class="btn" onclick="pollWorktreeRetirements()" data-tip="Re-fetch the retirement view from the daemon.">↻ Refresh</button>
+        <button class="btn" onclick="guardedAction('refresh-worktree-retirement', pollWorktreeRetirements)" data-tip="Re-fetch the retirement view from the daemon.">↻ Refresh</button>
       </div>
       <div id="worktree-retirement"><div class="empty">Loading…</div></div>
     </main>
@@ -376,7 +376,7 @@
     <main id="health-page" style="display:none">
       <div class="row" style="justify-content:space-between;margin-bottom:12px">
         <b data-tip="Every check ralphus_core::health_catalog knows about (RAL-416): stable id, Core/Harness/Machine section, daemon/remote applicability, Free/OnDemand cost tier, Required/Optional/FallbackOnly requirement level.\nThis daemon's own row is kept fresh by an hourly Free-tier background sweep; remote [machine.targets.*] rows are checked on demand, same as the Machines tab.">Health</b>
-        <button class="btn" onclick="pollHealth()" data-tip="Re-fetch the catalog and cached report from the daemon.">↻ Refresh</button>
+        <button class="btn" onclick="guardedAction('refresh-health', pollHealth)" data-tip="Re-fetch the catalog and cached report from the daemon.">↻ Refresh</button>
       </div>
       <div id="health"><div class="empty">Loading…</div></div>
     </main>

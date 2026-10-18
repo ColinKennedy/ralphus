@@ -306,3 +306,15 @@ Rules:
   [`docs/colors.md`](../docs/colors.md) "Form controls & buttons".
 - Every new UI element also needs a `data-tip` tooltip — see "UI Tooltip Rule
   (RAL-40)" above.
+
+## Refresh Controls Must Be Debounced
+
+Every user-triggered refresh, re-check, or "check now" control in the board
+(button or menu item) **must run through `guardedAction(key, fn)`**
+(`board/20-util.js`). It ignores repeat clicks while the action is in flight
+and for about a second after it settles, releases on failure so a retry works,
+and takes one stable `key` per control (include the entity id for row-scoped
+controls). Persistent multi-action surfaces (e.g. the Follow-ups modal) stay
+open and need the guard per action; a transient single-action popup may
+instead close on activation. A new refresh control without the guard is a
+regression — each one fans out to the daemon and often to a forge.
