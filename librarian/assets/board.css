@@ -507,6 +507,8 @@
       /* A note explaining the control above it, not a statement in its own
          right -- so it reads at the muted register, never at body weight. */
       .hint { font-size: 12.5px; color: var(--muted); line-height: 1.45; margin-top: 6px; }
+      .hint.live-sources { display: flex; flex-wrap: wrap; align-items: center; gap: 4px; min-width: 0; overflow-wrap: anywhere; }
+      .hint.live-sources .btn { max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
       /* `.empty` is tuned for a whole tab having nothing in it -- centered under
          40px of air. Inside a review that register is wrong: these are section
          placeholders sitting between populated sections, and each one pushed the

@@ -450,7 +450,7 @@
           const rowTip = r
             ? "Click to show this action's newest agent run in Live View in the details pane.\nUse + for its prompt, report and commits."
             : "This action has not run yet. Click to see its prompt.";
-          const sources = a.source_cells.length ? a.source_cells.join(", ") : "unknown";
+          const sources = liveActionSourcesHtml(a.source_cells);
           return `<div class="cmd-row selectable${r && inspectorLiveRun && inspectorLiveRun.runId === r.run_id ? " sel" : ""}" ${rowClick} data-tip="${esc(rowTip)}">
               <button class="cmd-run" data-click="runLiveAction" data-guardian-id="${esc(g.id)}" data-i="${a.idx}" data-tip="${esc(`Queue an agent run of this live action against the review's tip.\nIt costs money, and any fix the agent commits is carried onto the top branch.\nTry: ${a.prompt}`)}">▶</button>
               <span class="cmd-label">${esc(a.label)}</span>
@@ -459,7 +459,7 @@
               <button class="cmd-expand" data-click="toggleLiveActionDetails" data-key="${esc(key)}" data-tip="Show or hide this live action's prompt, where it came from, and its newest run's report.">${open ? "−" : "+"}</button>
             </div>${open ? `<div class="cmd-full">
               <div class="cmd-preview mono" data-tip="What the agent is told to try against the review's tip.">${esc(a.prompt)}</div>
-              <div class="hint" data-tip="The cells whose agents posted this handoff when they finished.">from ${esc(sources)}</div>
+              <div class="hint live-sources" data-tip="The cells whose agents posted this handoff when they finished.">from ${sources}</div>
               ${r ? liveRunDetailsHtml(g, r) : ""}
             </div>` : ""}`;
         }).join("");
