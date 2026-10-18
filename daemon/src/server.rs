@@ -12848,9 +12848,10 @@ fn branch_forge_status_json(
         },
         "checks": {
             "ci_standing": {
-                "interval_ms": i64::try_from(crate::ci_watch::STANDING_POLL_INTERVAL.as_millis())
+                "interval_ms": i64::try_from(crate::ci_watch::standing_poll_interval().as_millis())
                     .unwrap_or(i64::MAX),
                 "next_due_at_ms": standing_due,
+                "slowed_for_quota": crate::forge::quota_under_pressure(),
             },
             "fast_watch_active": fast_watch_active,
             "forge_cache": {
@@ -16183,7 +16184,7 @@ fn pr_poll_status(daemon: &Daemon, pr_id: &str) -> Reply {
             "ci",
             pr_open,
             true,
-            crate::ci_watch::STANDING_POLL_INTERVAL,
+            crate::ci_watch::standing_poll_interval(),
             c.and_then(|c| c.ci_checked_at_ms),
             c.and_then(|c| c.ci_check_status.as_deref()),
             c.and_then(|c| c.ci_check_error.as_deref()),

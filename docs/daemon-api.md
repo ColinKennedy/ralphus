@@ -2735,7 +2735,8 @@ plus each PR's stored last-poll errors. Board-only (no CLI command).
              "reset_at_ms": 1700000600000, "observed_at_ms": 1700000000000 },
   "backoff": { "active": false, "resume_at_ms": null, "remaining_ms": null },
   "checks": {
-    "ci_standing": { "interval_ms": 120000, "next_due_at_ms": 1700000030000 },
+    "ci_standing": { "interval_ms": 120000, "next_due_at_ms": 1700000030000,
+                     "slowed_for_quota": false },
     "fast_watch_active": false,
     "forge_cache": { "enabled": true, "interval_ms": 300000,
                      "comments_min_interval_ms": 60000,
@@ -2767,6 +2768,9 @@ plus each PR's stored last-poll errors. Board-only (no CLI command).
   skip the forge until `resume_at_ms`.
 - `checks.ci_standing.next_due_at_ms` — when the standing CI poll is next due,
   `null` until this daemon process has polled the review once.
+  `slowed_for_quota` is `true` while some token has less than half its fair
+  share of calls left for the time remaining in its window; the standing poll
+  then runs every 5 minutes instead of every 2 (`interval_ms` reflects it).
   `next_attempt_at_ms` is that time pushed back to the end of any `backoff`.
   `fast_watch_active` is `true` while a short-interval watch after a push or
   PR open is running for the branch.

@@ -3972,6 +3972,34 @@ pub struct QuotaSnapshot {
 static QUOTA_SNAPSHOTS: std::sync::LazyLock<Mutex<HashMap<String, QuotaSnapshot>>> =
     std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
 
+/// Whether any token's last quota reading shows its calls running out faster
+/// than the window refills them ([`quota_snapshot_under_pressure`]). Pollers
+/// stretch their intervals on this as a last resort, within their own caps.
+#[must_use]
+pub fn quota_under_pressure() -> bool {
+    let now = crate::store::now_ms();
+    QUOTA_SNAPSHOTS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .values()
+        .any(|q| quota_snapshot_under_pressure(q, now))
+}
+
+/// Whether `q` has less than half of its fair share of calls left: the share
+/// of the limit proportional to the time left in a one-hour window. A reading
+/// whose window has already reset is never under pressure.
+fn quota_snapshot_under_pressure(q: &QuotaSnapshot, now_ms: i64) -> bool {
+    const WINDOW_MS: u128 = 60 * 60 * 1000;
+    let Ok(left_ms) = u128::try_from(q.reset_at_ms.saturating_sub(now_ms)) else {
+        return false;
+    };
+    if left_ms == 0 || q.limit == 0 {
+        return false;
+    }
+    // remaining < (limit * left / window) / 2, in integers.
+    u128::from(q.remaining) * WINDOW_MS * 2 < u128::from(q.limit) * left_ms.min(WINDOW_MS)
+}
+
 /// API calls of one shape ([`call_shape`]) in the current quota window.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct CallCounts {
@@ -9683,6 +9711,23 @@ mod tests {
         let result = client.get_conditional(req, Some("\"v1\"")).unwrap();
         assert!(matches!(result, ConditionalGet::NotModified));
         mock.finish();
+    }
+
+    #[test]
+    fn quota_pressure_means_less_than_half_the_fair_share_left() {
+        let at = |remaining: u64, minutes_left: i64| QuotaSnapshot {
+            limit: 5000,
+            remaining,
+            reset_at_ms: minutes_left * 60_000,
+            observed_at_ms: 0,
+        };
+        // 30 minutes left: the fair share is 2500, so pressure below 1250.
+        assert!(quota_snapshot_under_pressure(&at(1207, 30), 0));
+        assert!(!quota_snapshot_under_pressure(&at(1300, 30), 0));
+        // Near the reset even a small remainder is fine.
+        assert!(!quota_snapshot_under_pressure(&at(100, 1), 0));
+        // A window that already reset is never under pressure.
+        assert!(!quota_snapshot_under_pressure(&at(0, -1), 0));
     }
 
     #[test]

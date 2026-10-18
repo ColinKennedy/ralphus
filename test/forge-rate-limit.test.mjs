@@ -96,6 +96,20 @@ test("lists this daemon's calls this window, biggest first, with free calls note
   assert.doesNotMatch(none, /API calls this window/);
 });
 
+test("a CI check slowed for a low quota says so in the delayed colour", () => {
+  const out = forgeRateLimitRowsHtml(
+    status({
+      checks: {
+        ...status().checks,
+        ci_standing: { interval_ms: 300_000, next_due_at_ms: NOW + 30_000, slowed_for_quota: true },
+      },
+    }),
+    NOW,
+  );
+  assert.match(out, /style="color:var\(--delayed\)"[^>]*>next CI check in 30s \(.*\) · slowed: quota running low/);
+  assert.doesNotMatch(forgeRateLimitRowsHtml(status(), NOW), /slowed: quota running low/);
+});
+
 test("describes the comment backoff alongside the drift interval", () => {
   const out = forgeRateLimitRowsHtml(status(), NOW);
   assert.match(out, /branch drift refreshes every 300s · PR comments every 60s after activity, slowing to every 86400s when quiet/);

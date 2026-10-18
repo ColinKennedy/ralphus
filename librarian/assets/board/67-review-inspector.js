@@ -1259,7 +1259,7 @@
        * @property {boolean} quota_tracked
        * @property {ForgeQuota|null} quota
        * @property {{active: boolean, resume_at_ms: number|null, remaining_ms: number|null}} backoff
-       * @property {{ci_standing: {interval_ms: number, next_due_at_ms: number|null}, fast_watch_active: boolean, forge_cache: {enabled: boolean, interval_ms: number, comments_min_interval_ms: number, comments_max_interval_ms: number}, next_attempt_at_ms: number|null}} checks
+       * @property {{ci_standing: {interval_ms: number, next_due_at_ms: number|null, slowed_for_quota?: boolean}, fast_watch_active: boolean, forge_cache: {enabled: boolean, interval_ms: number, comments_min_interval_ms: number, comments_max_interval_ms: number}, next_attempt_at_ms: number|null}} checks
        * @property {ForgeCalls|null} calls
        * @property {ForgeStatusPr[]} pull_requests
        */
@@ -1341,9 +1341,11 @@
         const nextText = next === null
           ? "next CI check: not scheduled yet (this daemon has not polled the review since it started)"
           : (next > now ? `next CI check in ${fmtRelativeAge(next - now)} (${when(next)})` : "next CI check: due now");
+        const slowed = Boolean(c.ci_standing.slowed_for_quota);
         rows.push(row(
-          nextText,
-          `The earliest the daemon will next ask the forge for CI status on this review. CI is polled at most every ${fmtRelativeAge(c.ci_standing.interval_ms)}${b.active ? ", pushed back to the end of the pause above" : ""}.`,
+          slowed ? `${nextText} · slowed: quota running low` : nextText,
+          `The earliest the daemon will next ask the forge for CI status on this review. CI is polled at most every ${fmtRelativeAge(c.ci_standing.interval_ms)}${b.active ? ", pushed back to the end of the pause above" : ""}.${slowed ? " The quota is running out faster than it refills, so this check is slowed down; it is never slowed past 5 minutes." : ""}`,
+          slowed ? "var(--delayed)" : "",
         ));
         if (c.fast_watch_active) {
           rows.push(row(
