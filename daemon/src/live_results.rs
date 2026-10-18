@@ -23,7 +23,7 @@ use std::fmt::Write as _;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::live_actions::LiveRunEnd;
-use crate::live_command_units::command_units;
+use crate::live_command_units::{Unit, command_units};
 use crate::live_runs::LiveRunRow;
 use crate::store::{Result, Store, now_ms};
 
@@ -263,7 +263,7 @@ pub fn match_recipe(
     calls: &[RecordedCall],
     default_cwd: &str,
 ) -> Vec<RecipeStep> {
-    let recorded: Vec<Vec<String>> = calls.iter().map(|c| command_units(&c.command)).collect();
+    let recorded: Vec<Vec<Unit>> = calls.iter().map(|c| command_units(&c.command)).collect();
     let mut used: Vec<Vec<bool>> = recorded.iter().map(|u| vec![false; u.len()]).collect();
     let mut matched: Vec<(usize, usize, String)> = Vec::new();
     for entry in proposed {
@@ -272,12 +272,12 @@ pub fn match_recipe(
                 units
                     .iter()
                     .enumerate()
-                    .find(|(j, u)| !used[i][*j] && **u == unit)
+                    .find(|(j, u)| !used[i][*j] && unit.matches(u))
                     .map(|(j, _)| (i, j))
             });
             if let Some((i, j)) = found {
                 used[i][j] = true;
-                matched.push((i, j, unit));
+                matched.push((i, j, unit.shown_for(&recorded[i][j])));
             }
         }
     }
@@ -1336,6 +1336,39 @@ mod tests {
                 (3, "ls", "/w", "no result recorded"),
             ]
         );
+    }
+
+    #[test]
+    fn a_bounding_wrapper_is_restored_and_a_standalone_command_is_kept() {
+        let call = |c: &str| RecordedCall {
+            command: c.into(),
+            cwd: Some("/w".into()),
+            succeeded: Some(true),
+        };
+        let run = |proposed: &str, recorded: &str| -> Vec<RecipeStep> {
+            match_recipe(&[proposed.to_string()], &[call(recorded)], "/d")
+        };
+        let steps = run("foo --bar", "timeout 100 foo --bar | head");
+        assert_eq!(steps.len(), 1);
+        assert_eq!(steps[0].command, "timeout 100 foo --bar");
+        assert_eq!(steps[0].recorded_command, "timeout 100 foo --bar | head");
+        assert_eq!(
+            run("pytest", "source .venv/bin/activate && pytest").len(),
+            1
+        );
+        let kept = run(
+            "source .venv/bin/activate && pytest",
+            "source .venv/bin/activate && pytest",
+        );
+        assert_eq!(kept.len(), 2);
+        assert!(
+            run(
+                "source other/bin/activate",
+                "source .venv/bin/activate && pytest"
+            )
+            .is_empty()
+        );
+        assert!(run("foo", "yes | foo").is_empty());
     }
 
     #[test]

@@ -1,32 +1,181 @@
 //! Reduce a shell command line to the commands it runs, for matching a live
-//! agent's recipe against the recorded tool calls (RAL-682).
+//! agent's recipe against the recorded tool calls (RAL-682, RAL-685).
 //!
 //! One combined, quote-aware pass serves Bash, PowerShell and cmd alike -- it
 //! does not try to tell the shells apart and does not need the optional
-//! display-only shell parser. A command line becomes a list of units:
-//! * `&&`, `||`, `;`, `&` and line breaks separate units;
-//! * directory navigation (`cd`, `cd /d`, `Set-Location`, `Push-Location`,
-//!   `Pop-Location`, ...) is dropped;
-//! * redirections (`> file`, `>> file`, `2>&1`, ...) are dropped;
-//! * pipeline stages after the first that only filter or display output
-//!   (`head`, `grep`, `Select-Object`, `findstr`, `more`, ...) are dropped;
-//! * environment settings (`MODE=x`, `$env:MODE='x'`, `export`, `set`) stay
-//!   part of the unit they precede, so they are never silently lost.
+//! display-only shell parser. A command line becomes a list of [`Unit`]s:
+//! * `&&`, `||`, `;`, `&` and line breaks separate units (line continuations
+//!   `\`, `` ` `` and `^` join lines first);
+//! * directory navigation (`cd`, `Set-Location`, ...) is dropped;
+//! * output redirections (`> file`, `>> file`, `2>&1`, `*>&1`, ...) and
+//!   output-only filters (`| head`, `| sort`, `| Out-Null`, ...) are variants:
+//!   they are shown as written but never needed to match;
+//! * wrappers (`timeout`, `nice`, `time`, `env -u`, `bash -c`, `( ... )`, ...)
+//!   are variants of the command they wrap;
+//! * environment settings (`MODE=x`, `$env:MODE='x'`, `export`) stay part of
+//!   the unit they precede, so they are never silently lost;
+//! * input-changing forms (`< file`, `yes |`) and failure masking
+//!   (`|| true`, `; true`) or backgrounding (`&`) are part of the command.
 //!
-//! Quoted text and text inside `(...)`/`{...}` is never an operator.
+//! Every recognised form is a row of [`ALLOWLIST`] with an explicit
+//! [`Category`]. A [`Category::Variant`] only decorates a command and may be
+//! left out of a recipe. A [`Category::Standalone`] row is a command in its own
+//! right (`source .venv/bin/activate`, `set -e`): a recipe may leave it out,
+//! but one it includes is kept as written and only matches an identical
+//! recorded command.
+//!
+//! Quoted text and text inside `(...)`/`{...}` is never an operator, and
+//! anything the pass cannot read with certainty (heredocs, here-strings,
+//! unterminated quotes, too-deep nesting) yields no units at all.
 
-/// Output-only stages a pipeline may add after a command.
-const FILTER_COMMANDS: &[&str] = &[
-    "head",
-    "tail",
-    "grep",
-    "rg",
-    "tee",
-    "select-object",
-    "where-object",
-    "select-string",
-    "findstr",
-    "more",
+/// How an allowlisted form relates to the command around it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Category {
+    /// Wrappers, filters and redirections: decoration a recipe may omit.
+    Variant,
+    /// A real command (activation, shell options): a recipe may omit it, but
+    /// when it includes one the recorded command must be identical.
+    Standalone,
+}
+
+const MAX_DEPTH: usize = 4;
+
+/// What a wrapper row removed from the front of a command.
+struct Strip {
+    /// Leading words the wrapper (and its options) occupy.
+    consumed: usize,
+    /// The wrapper bounds the command (`timeout`): omitting it from a recipe
+    /// would publish a less safe command, so it is restored in the shown text.
+    retained: bool,
+    /// Environment assignments the wrapper carried (`env A=1 cmd`).
+    kept: Vec<String>,
+    /// A command line the wrapper runs (`bash -c "..."`), matched piece by piece.
+    payload: Option<String>,
+}
+
+impl Strip {
+    fn plain(consumed: usize) -> Self {
+        Self {
+            consumed,
+            retained: false,
+            kept: Vec::new(),
+            payload: None,
+        }
+    }
+}
+
+enum Form {
+    /// A pipeline stage that only filters or displays output.
+    Filter(fn(&[String]) -> bool),
+    /// A prefix in front of the command it runs.
+    Wrapper(fn(&[String]) -> Option<Strip>),
+    /// A command that is meaningful on its own.
+    Standalone(fn(&[String]) -> bool),
+}
+
+struct Row {
+    names: &'static [&'static str],
+    category: Category,
+    form: Form,
+}
+
+macro_rules! row {
+    ($cat:ident, $form:ident($f:expr), $($name:literal),+) => {
+        Row { names: &[$($name),+], category: Category::$cat, form: Form::$form($f) }
+    };
+}
+
+/// Every form that may be omitted or must be kept, one row per form. Later
+/// additions are rows, not new code paths.
+static ALLOWLIST: &[Row] = &[
+    // -- output filters and display stages -------------------------------
+    row!(
+        Variant,
+        Filter(any_args),
+        "head",
+        "tail",
+        "grep",
+        "egrep",
+        "fgrep",
+        "rg",
+        "tee",
+        "uniq",
+        "wc",
+        "cut",
+        "jq",
+        "less",
+        "more",
+        "findstr",
+        "select-object",
+        "where-object",
+        "select-string",
+        "out-string",
+        "format-table",
+        "format-list",
+        "out-host",
+        "out-file",
+        "out-null",
+        "tee-object",
+        "measure-object",
+        "sort-object"
+    ),
+    row!(Variant, Filter(no_args), "cat"),
+    row!(Variant, Filter(sort_filter), "sort"),
+    row!(Variant, Filter(sed_filter), "sed"),
+    row!(Variant, Filter(awk_filter), "awk"),
+    // -- process wrappers ---------------------------------------------------
+    row!(Variant, Wrapper(wrap_timeout), "timeout", "gtimeout"),
+    row!(Variant, Wrapper(wrap_nice), "nice"),
+    row!(Variant, Wrapper(wrap_ionice), "ionice"),
+    row!(Variant, Wrapper(wrap_chrt), "chrt"),
+    row!(Variant, Wrapper(wrap_time), "time"),
+    row!(Variant, Wrapper(wrap_stdbuf), "stdbuf"),
+    row!(Variant, Wrapper(wrap_unbuffer), "unbuffer"),
+    row!(Variant, Wrapper(wrap_script), "script"),
+    row!(Variant, Wrapper(wrap_env), "env"),
+    row!(Variant, Wrapper(wrap_measure_command), "measure-command"),
+    // -- shell invocations ----------------------------------------------
+    row!(
+        Variant,
+        Wrapper(wrap_posix_shell),
+        "bash",
+        "sh",
+        "zsh",
+        "dash",
+        "ksh"
+    ),
+    row!(Variant, Wrapper(wrap_powershell), "pwsh", "powershell"),
+    row!(Variant, Wrapper(wrap_cmd), "cmd"),
+    // -- shell option noise -----------------------------------------------
+    row!(Standalone, Standalone(shell_option), "set"),
+    row!(
+        Standalone,
+        Standalone(always),
+        "$erroractionpreference",
+        "@echo",
+        "chcp",
+        "clear",
+        "cls"
+    ),
+    row!(Standalone, Standalone(echo_separator), "echo"),
+    // -- activation and setup ---------------------------------------------
+    row!(Standalone, Standalone(has_argument), "source", "."),
+    row!(Standalone, Standalone(use_subcommand), "nvm", "fnm"),
+    row!(
+        Standalone,
+        Standalone(activate_subcommand),
+        "conda",
+        "mamba",
+        "micromamba"
+    ),
+    row!(Standalone, Standalone(call_setup_script), "call"),
+    row!(
+        Standalone,
+        Standalone(always),
+        "activate",
+        "activate.ps1",
+        "activate.bat"
+    ),
 ];
 
 /// Directory navigation, which a recipe may leave out.
@@ -40,15 +189,594 @@ const NAVIGATION_COMMANDS: &[&str] = &[
     "pop-location",
 ];
 
+/// cmd built-ins and common PowerShell verbs: their names are
+/// case-insensitive, unlike an ordinary program's.
+const CMD_BUILTINS: &[&str] = &[
+    "dir", "type", "echo", "copy", "del", "erase", "md", "mkdir", "rd", "rmdir", "ren", "rename",
+    "move", "cls", "set", "call", "start", "mklink", "ver", "vol", "path", "title", "tree",
+    "findstr", "where",
+];
+
+const CMDLET_VERBS: &[&str] = &[
+    "add",
+    "clear",
+    "compare",
+    "convertfrom",
+    "convertto",
+    "copy",
+    "enter",
+    "exit",
+    "export",
+    "find",
+    "format",
+    "get",
+    "group",
+    "import",
+    "install",
+    "invoke",
+    "join",
+    "measure",
+    "move",
+    "new",
+    "out",
+    "pop",
+    "push",
+    "read",
+    "register",
+    "remove",
+    "rename",
+    "resolve",
+    "restart",
+    "select",
+    "set",
+    "show",
+    "sort",
+    "split",
+    "start",
+    "stop",
+    "tee",
+    "test",
+    "unregister",
+    "update",
+    "use",
+    "wait",
+    "where",
+    "write",
+];
+
+/// Commands whose arguments are text, where `\` is not a path separator.
+const TEXT_COMMANDS: &[&str] = &["echo", "write-host", "write-output"];
+
+fn find_row(name: &str, category: Category) -> Option<&'static Row> {
+    ALLOWLIST
+        .iter()
+        .find(|r| r.category == category && r.names.contains(&name))
+}
+
+// ---- filters ---------------------------------------------------------------
+
+fn any_args(_: &[String]) -> bool {
+    true
+}
+
+fn no_args(words: &[String]) -> bool {
+    words.len() == 1
+}
+
+fn sort_filter(words: &[String]) -> bool {
+    !words
+        .iter()
+        .skip(1)
+        .any(|a| a.starts_with("-o") || a.starts_with("--output"))
+}
+
+fn unquote(word: &str) -> String {
+    let b = word.as_bytes();
+    if b.len() >= 2 && (b[0] == b'"' || b[0] == b'\'') && b[b.len() - 1] == b[0] {
+        let inner = &word[1..word.len() - 1];
+        if b[0] == b'"' {
+            return inner.replace("\\\"", "\"");
+        }
+        return inner.to_string();
+    }
+    word.to_string()
+}
+
+/// `sed` that only reads: `-n`/`-E` options and an `-e` or positional script of
+/// `p`/`d`/`q`/`=` and `s///flags` commands, no file arguments.
+fn sed_filter(words: &[String]) -> bool {
+    let mut script: Option<String> = None;
+    let mut i = 1;
+    while i < words.len() {
+        let a = words[i].as_str();
+        match a {
+            "-n" | "-E" | "-r" | "-u" | "--quiet" | "--silent" | "--regexp-extended"
+            | "--unbuffered" => {}
+            "-e" | "--expression" => {
+                i += 1;
+                let Some(s) = words.get(i) else { return false };
+                script = Some(match script {
+                    Some(prev) => format!("{prev};{}", unquote(s)),
+                    None => unquote(s),
+                });
+            }
+            _ if a.starts_with('-') && a.len() > 1 => return false,
+            _ => {
+                if script.is_some() {
+                    return false;
+                }
+                script = Some(unquote(a));
+            }
+        }
+        i += 1;
+    }
+    script.is_some_and(|s| sed_script_reads_only(&s))
+}
+
+fn sed_script_reads_only(script: &str) -> bool {
+    script.split(';').all(|part| {
+        let part = part.trim();
+        if part.is_empty() {
+            return true;
+        }
+        let chars: Vec<char> = part.chars().collect();
+        let mut i = 0;
+        // Address: line numbers, `$`, `/re/`, ranges.
+        loop {
+            match chars.get(i) {
+                Some(c) if c.is_ascii_digit() || *c == '$' => i += 1,
+                Some('/') => {
+                    i += 1;
+                    while i < chars.len() && chars[i] != '/' {
+                        if chars[i] == '\\' {
+                            i += 1;
+                        }
+                        i += 1;
+                    }
+                    if i >= chars.len() {
+                        return false;
+                    }
+                    i += 1;
+                }
+                _ => break,
+            }
+            if chars.get(i) == Some(&',') {
+                i += 1;
+            } else {
+                break;
+            }
+        }
+        while chars.get(i).is_some_and(|c| c.is_whitespace() || *c == '!') {
+            i += 1;
+        }
+        match chars.get(i) {
+            Some('p' | 'd' | 'q' | 'Q' | '=') => chars[i + 1..].iter().all(|c| c.is_whitespace()),
+            Some('s') => {
+                let Some(&delim) = chars.get(i + 1) else {
+                    return false;
+                };
+                if delim.is_alphanumeric() || delim == '\\' || delim.is_whitespace() {
+                    return false;
+                }
+                let mut j = i + 2;
+                for _ in 0..2 {
+                    while j < chars.len() && chars[j] != delim {
+                        if chars[j] == '\\' {
+                            j += 1;
+                        }
+                        j += 1;
+                    }
+                    if j >= chars.len() {
+                        return false;
+                    }
+                    j += 1;
+                }
+                chars[j..]
+                    .iter()
+                    .all(|c| c.is_ascii_digit() || "gpiImM".contains(*c))
+            }
+            _ => false,
+        }
+    })
+}
+
+/// `awk` with a plain program: no output redirection, pipes, `system()` or
+/// `getline`, no `-f` file, no file arguments.
+fn awk_filter(words: &[String]) -> bool {
+    let mut program: Option<String> = None;
+    let mut i = 1;
+    while i < words.len() {
+        let a = words[i].as_str();
+        if a == "-F" || a == "-v" {
+            i += 2;
+            continue;
+        }
+        if a.starts_with("-F") || (a.starts_with("-v") && a.len() > 2) {
+            i += 1;
+            continue;
+        }
+        if a.starts_with('-') && a.len() > 1 {
+            return false;
+        }
+        if program.is_some() {
+            return false;
+        }
+        program = Some(unquote(a));
+        i += 1;
+    }
+    program.is_some_and(|p| {
+        !["system", ">", "|", "getline", "close"]
+            .iter()
+            .any(|s| p.contains(s))
+    })
+}
+
+// ---- wrappers ----------------------------------------------------------------
+
+fn is_duration(s: &str) -> bool {
+    let body = s.strip_suffix(['s', 'm', 'h', 'd']).unwrap_or(s);
+    let mut parts = body.splitn(2, '.');
+    let whole = parts.next().unwrap_or_default();
+    let frac = parts.next();
+    !whole.is_empty()
+        && whole.chars().all(|c| c.is_ascii_digit())
+        && frac.is_none_or(|f| !f.is_empty() && f.chars().all(|c| c.is_ascii_digit()))
+}
+
+fn is_command_word(word: Option<&String>) -> bool {
+    word.is_some_and(|w| !w.starts_with('-') && !w.starts_with('/'))
+}
+
+fn wrap_timeout(w: &[String]) -> Option<Strip> {
+    let mut i = 1;
+    while let Some(a) = w.get(i) {
+        match a.as_str() {
+            "--preserve-status" | "--foreground" | "-v" | "--verbose" => i += 1,
+            "-s" | "--signal" => i += 2,
+            "-k" | "--kill-after" => {
+                if !w.get(i + 1).is_some_and(|d| is_duration(d)) {
+                    return None;
+                }
+                i += 2;
+            }
+            _ if a.starts_with("--signal=") || (a.starts_with("-s") && a.len() > 2) => i += 1,
+            _ if a.starts_with("--kill-after=") => {
+                if !is_duration(&a["--kill-after=".len()..]) {
+                    return None;
+                }
+                i += 1;
+            }
+            _ if a.starts_with("-k") && a.len() > 2 => {
+                if !is_duration(&a[2..]) {
+                    return None;
+                }
+                i += 1;
+            }
+            _ => break,
+        }
+    }
+    if !is_duration(w.get(i)?) || !is_command_word(w.get(i + 1)) {
+        return None;
+    }
+    Some(Strip {
+        retained: true,
+        ..Strip::plain(i + 1)
+    })
+}
+
+fn is_int(s: &str) -> bool {
+    let s = s.strip_prefix(['-', '+']).unwrap_or(s);
+    !s.is_empty() && s.chars().all(|c| c.is_ascii_digit())
+}
+
+fn wrap_nice(w: &[String]) -> Option<Strip> {
+    let mut i = 1;
+    while let Some(a) = w.get(i) {
+        if a == "-n" || a == "--adjustment" {
+            if !w.get(i + 1).is_some_and(|v| is_int(v)) {
+                return None;
+            }
+            i += 2;
+        } else if a.starts_with("--adjustment=")
+            || (a.starts_with("-n") && is_int(&a[2..]))
+            || (a.len() > 1 && a.starts_with('-') && is_int(&a[1..]))
+        {
+            i += 1;
+        } else {
+            break;
+        }
+    }
+    is_command_word(w.get(i)).then(|| Strip::plain(i))
+}
+
+fn wrap_ionice(w: &[String]) -> Option<Strip> {
+    let mut i = 1;
+    while let Some(a) = w.get(i) {
+        match a.as_str() {
+            "-c" | "-n" | "--class" | "--classdata" => i += 2,
+            "-t" | "--ignore" => i += 1,
+            _ if (a.starts_with("-c") || a.starts_with("-n")) && is_int(&a[2..]) => i += 1,
+            _ => break,
+        }
+    }
+    is_command_word(w.get(i)).then(|| Strip::plain(i))
+}
+
+fn wrap_chrt(w: &[String]) -> Option<Strip> {
+    let mut i = 1;
+    while let Some(a) = w.get(i) {
+        match a.as_str() {
+            "-f" | "-r" | "-o" | "-b" | "-i" | "-d" | "-R" | "-v" | "--fifo" | "--rr"
+            | "--other" | "--batch" | "--idle" | "--reset-on-fork" => i += 1,
+            _ => break,
+        }
+    }
+    if i == 1
+        || !w
+            .get(i)
+            .is_some_and(|p| p.chars().all(|c| c.is_ascii_digit()) && !p.is_empty())
+    {
+        return None;
+    }
+    is_command_word(w.get(i + 1)).then(|| Strip::plain(i + 1))
+}
+
+fn wrap_time(w: &[String]) -> Option<Strip> {
+    let i = if w.get(1).is_some_and(|a| a == "-p") {
+        2
+    } else {
+        1
+    };
+    is_command_word(w.get(i)).then(|| Strip::plain(i))
+}
+
+fn wrap_stdbuf(w: &[String]) -> Option<Strip> {
+    let mut i = 1;
+    while let Some(a) = w.get(i) {
+        match a.as_str() {
+            "-i" | "-o" | "-e" => i += 2,
+            _ if a.starts_with("--input=")
+                || a.starts_with("--output=")
+                || a.starts_with("--error=") =>
+            {
+                i += 1;
+            }
+            _ if ["-i", "-o", "-e"].iter().any(|p| a.starts_with(p)) && a.len() > 2 => i += 1,
+            _ => break,
+        }
+    }
+    (i > 1 && is_command_word(w.get(i))).then(|| Strip::plain(i))
+}
+
+fn wrap_unbuffer(w: &[String]) -> Option<Strip> {
+    let i = if w.get(1).is_some_and(|a| a == "-p") {
+        2
+    } else {
+        1
+    };
+    is_command_word(w.get(i)).then(|| Strip::plain(i))
+}
+
+/// `script -q /dev/null cmd args` and `script -q -c "cmd" /dev/null`.
+fn wrap_script(w: &[String]) -> Option<Strip> {
+    let mut i = 1;
+    let mut quiet = false;
+    let mut payload = None;
+    while let Some(a) = w.get(i) {
+        match a.as_str() {
+            "-q" | "--quiet" => {
+                quiet = true;
+                i += 1;
+            }
+            "-e" | "-f" | "-a" | "--return" | "--flush" | "--append" => i += 1,
+            "-c" | "--command" => {
+                payload = Some(unquote(w.get(i + 1)?));
+                i += 2;
+            }
+            _ => break,
+        }
+    }
+    if !quiet {
+        return None;
+    }
+    match payload {
+        Some(payload) => {
+            // Optional typescript file, then nothing else.
+            if w.len() > i + 1 {
+                return None;
+            }
+            Some(Strip {
+                payload: Some(payload),
+                ..Strip::plain(w.len())
+            })
+        }
+        None => {
+            w.get(i)?;
+            is_command_word(w.get(i + 1)).then(|| Strip::plain(i + 1))
+        }
+    }
+}
+
+fn is_assignment(word: &str) -> bool {
+    word.split_once('=').is_some_and(|(name, _)| {
+        !name.is_empty()
+            && !name.starts_with(|c: char| c.is_ascii_digit())
+            && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+    })
+}
+
+fn wrap_env(w: &[String]) -> Option<Strip> {
+    let mut i = 1;
+    let mut kept = Vec::new();
+    while let Some(a) = w.get(i) {
+        match a.as_str() {
+            "-i" | "--ignore-environment" | "-" | "--" => i += 1,
+            "-u" | "--unset" => i += 2,
+            _ if a.starts_with("--unset=") => i += 1,
+            _ if is_assignment(a) => {
+                kept.push(a.clone());
+                i += 1;
+            }
+            _ => break,
+        }
+    }
+    is_command_word(w.get(i)).then(|| Strip {
+        kept,
+        ..Strip::plain(i)
+    })
+}
+
+fn is_group(word: &str) -> bool {
+    word.len() >= 2
+        && ((word.starts_with('(') && word.ends_with(')'))
+            || (word.starts_with('{') && word.ends_with('}')))
+}
+
+fn group_payload(word: &str) -> String {
+    word[1..word.len() - 1]
+        .trim()
+        .trim_end_matches(';')
+        .trim()
+        .to_string()
+}
+
+fn wrap_measure_command(w: &[String]) -> Option<Strip> {
+    (w.len() == 2 && w[1].starts_with('{') && is_group(&w[1])).then(|| Strip {
+        payload: Some(group_payload(&w[1])),
+        ..Strip::plain(2)
+    })
+}
+
+fn wrap_posix_shell(w: &[String]) -> Option<Strip> {
+    (w.len() == 3 && matches!(w[1].as_str(), "-c" | "-lc" | "-cl")).then(|| Strip {
+        payload: Some(unquote(&w[2])),
+        ..Strip::plain(3)
+    })
+}
+
+fn joined_payload(words: &[String]) -> Option<String> {
+    match words {
+        [] => None,
+        [one] => Some(unquote(one)),
+        many => Some(many.join(" ")),
+    }
+}
+
+fn wrap_powershell(w: &[String]) -> Option<Strip> {
+    let mut i = 1;
+    while w.get(i).is_some_and(|a| {
+        a.eq_ignore_ascii_case("-NoProfile") || a.eq_ignore_ascii_case("-NonInteractive")
+    }) {
+        i += 1;
+    }
+    if !w.get(i).is_some_and(|a| a.eq_ignore_ascii_case("-Command")) {
+        return None;
+    }
+    Some(Strip {
+        payload: Some(joined_payload(&w[i + 1..])?),
+        ..Strip::plain(w.len())
+    })
+}
+
+fn wrap_cmd(w: &[String]) -> Option<Strip> {
+    let mut i = 1;
+    if w.get(i).is_some_and(|a| a.eq_ignore_ascii_case("/d")) {
+        i += 1;
+    }
+    if !w.get(i).is_some_and(|a| a.eq_ignore_ascii_case("/c")) {
+        return None;
+    }
+    Some(Strip {
+        payload: Some(joined_payload(&w[i + 1..])?),
+        ..Strip::plain(w.len())
+    })
+}
+
+// ---- standalone commands ---------------------------------------------------------
+
+fn always(_: &[String]) -> bool {
+    true
+}
+
+fn has_argument(w: &[String]) -> bool {
+    w.len() >= 2
+}
+
+fn shell_option(w: &[String]) -> bool {
+    w.get(1).is_some_and(|a| a.starts_with(['-', '+']))
+}
+
+fn separator_like(arg: &str) -> bool {
+    let arg = unquote(arg);
+    arg.len() >= 2 && arg.chars().all(|c| "-=_*#~.".contains(c))
+}
+
+fn echo_separator(w: &[String]) -> bool {
+    w.len() > 1 && w[1..].iter().all(|a| separator_like(a))
+}
+
+fn use_subcommand(w: &[String]) -> bool {
+    w.get(1).is_some_and(|a| a == "use")
+}
+
+fn activate_subcommand(w: &[String]) -> bool {
+    w.get(1).is_some_and(|a| a == "activate")
+}
+
+fn base_name_lower(word: &str) -> String {
+    word.rsplit(['/', '\\'])
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+}
+
+fn call_setup_script(w: &[String]) -> bool {
+    w.get(1).is_some_and(|t| {
+        let base = base_name_lower(&unquote(t));
+        ["vcvars", "vsdevcmd", "activate"]
+            .iter()
+            .any(|p| base.starts_with(p))
+    })
+}
+
+/// A script named `activate`/`Activate.ps1` run by path.
+fn activation_path(word: &str) -> bool {
+    matches!(
+        base_name_lower(&unquote(word)).as_str(),
+        "activate" | "activate.ps1" | "activate.bat"
+    )
+}
+
+// ---- tokens ----------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Sep {
+    And,
+    Or,
+    Semi,
+    Amp,
+}
+
+impl Sep {
+    fn text(self) -> &'static str {
+        match self {
+            Sep::And => "&&",
+            Sep::Or => "||",
+            Sep::Semi => ";",
+            Sep::Amp => "&",
+        }
+    }
+}
+
 #[derive(Debug, PartialEq, Eq)]
 enum ShellTok {
     Word(String),
-    /// `&&`, `||`, `;`, `&` or a line break.
-    Separator,
+    Separator(Sep),
     Pipe,
 }
 
-fn shell_tokens(command: &str) -> Vec<ShellTok> {
+/// `None` for an unterminated quote or bracket.
+fn shell_tokens(command: &str) -> Option<Vec<ShellTok>> {
     let chars: Vec<char> = command.chars().collect();
     let mut out = Vec::new();
     let mut cur = String::new();
@@ -62,9 +790,9 @@ fn shell_tokens(command: &str) -> Vec<ShellTok> {
             *has_word = false;
         }
     };
-    let separate = |out: &mut Vec<ShellTok>| {
-        if out.last() != Some(&ShellTok::Separator) {
-            out.push(ShellTok::Separator);
+    let separate = |out: &mut Vec<ShellTok>, sep: Sep| {
+        if !matches!(out.last(), Some(ShellTok::Separator(_))) {
+            out.push(ShellTok::Separator(sep));
         }
     };
     while i < chars.len() {
@@ -79,6 +807,14 @@ fn shell_tokens(command: &str) -> Vec<ShellTok> {
                 }
             } else if c == q {
                 quote = None;
+            }
+            i += 1;
+            continue;
+        }
+        if matches!(c, '\\' | '`' | '^') && matches!(next, Some('\n' | '\r')) {
+            i += 1;
+            if chars[i] == '\r' && chars.get(i + 1) == Some(&'\n') {
+                i += 1;
             }
             i += 1;
             continue;
@@ -105,13 +841,13 @@ fn shell_tokens(command: &str) -> Vec<ShellTok> {
             }
             '\n' | '\r' | ';' => {
                 flush(&mut out, &mut cur, &mut has_word);
-                separate(&mut out);
+                separate(&mut out, Sep::Semi);
             }
             c if c.is_whitespace() => flush(&mut out, &mut cur, &mut has_word),
             '&' => {
                 if next == Some('&') {
                     flush(&mut out, &mut cur, &mut has_word);
-                    separate(&mut out);
+                    separate(&mut out, Sep::And);
                     i += 1;
                 } else if cur.ends_with(['>', '<']) || next == Some('>') {
                     // `2>&1`, `>&2`, `&>file`: part of a redirection.
@@ -119,13 +855,13 @@ fn shell_tokens(command: &str) -> Vec<ShellTok> {
                     has_word = true;
                 } else {
                     flush(&mut out, &mut cur, &mut has_word);
-                    separate(&mut out);
+                    separate(&mut out, Sep::Amp);
                 }
             }
             '|' => {
                 flush(&mut out, &mut cur, &mut has_word);
                 if next == Some('|') {
-                    separate(&mut out);
+                    separate(&mut out, Sep::Or);
                     i += 1;
                 } else {
                     out.push(ShellTok::Pipe);
@@ -141,154 +877,881 @@ fn shell_tokens(command: &str) -> Vec<ShellTok> {
         }
         i += 1;
     }
-    flush(&mut out, &mut cur, &mut has_word);
-    out
-}
-
-/// `Some(true)` for a redirection that takes the next word as its target,
-/// `Some(false)` for a self-contained one (`2>&1`, `>out.txt`), `None` for a
-/// word that is not a redirection.
-fn redirection(word: &str) -> Option<bool> {
-    let rest = word.trim_start_matches(|c: char| c.is_ascii_digit() || c == '&' || c == '*');
-    let rest = rest
-        .strip_prefix(">>")
-        .or_else(|| rest.strip_prefix(['>', '<']))?;
-    Some(rest.is_empty())
-}
-
-fn first_word_lower(words: &[String]) -> String {
-    words
-        .first()
-        .map(|w| w.to_ascii_lowercase())
-        .unwrap_or_default()
-}
-
-fn is_environment_setting(stage: &[String]) -> bool {
-    let first = first_word_lower(stage);
-    if first.starts_with("$env:") || ["export", "set", "setx"].contains(&first.as_str()) {
-        return true;
+    if quote.is_some() || depth > 0 {
+        return None;
     }
-    stage.iter().all(|w| {
-        w.split_once('=').is_some_and(|(name, _)| {
-            !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
-        })
+    flush(&mut out, &mut cur, &mut has_word);
+    Some(out)
+}
+
+enum Redir {
+    None,
+    /// `<<`, `<<<`, `<(`: carries content, so the command is not read.
+    Content,
+    /// Dropped output redirection; `true` when the next word is its target.
+    Output(bool),
+    /// Input redirection, which changes what the command reads and is kept.
+    Input(bool),
+}
+
+fn redirection(word: &str) -> Redir {
+    let rest = word.trim_start_matches(|c: char| c.is_ascii_digit() || c == '&' || c == '*');
+    if rest.starts_with("<<") || rest.starts_with("<(") {
+        return Redir::Content;
+    }
+    if let Some(r) = rest.strip_prefix('<') {
+        return Redir::Input(r.is_empty());
+    }
+    match rest.strip_prefix(">>").or_else(|| rest.strip_prefix('>')) {
+        Some(r) => Redir::Output(r.is_empty()),
+        None => Redir::None,
+    }
+}
+
+// ---- words -----------------------------------------------------------------------
+
+/// The name a command is looked up under: lower-case, without `.exe`.
+fn lookup_name(word: &str) -> String {
+    let lower = word.to_ascii_lowercase();
+    lower.strip_suffix(".exe").unwrap_or(&lower).to_string()
+}
+
+fn is_cmdlet(lower: &str) -> bool {
+    lower.split_once('-').is_some_and(|(verb, noun)| {
+        CMDLET_VERBS.contains(&verb)
+            && !noun.is_empty()
+            && noun.chars().all(|c| c.is_ascii_alphanumeric())
     })
 }
 
-/// The commands a command line is made of; see the module docs.
-#[must_use]
-pub fn command_units(command: &str) -> Vec<String> {
-    let mut segments: Vec<Vec<Vec<String>>> = vec![vec![Vec::new()]];
-    let mut skip_target = false;
-    for tok in shell_tokens(command) {
+/// Comparison form of a command name, and whether it is Windows-style.
+fn command_name(word: &str) -> (String, bool) {
+    let mut name = word;
+    let mut windows = false;
+    if name.len() > 4 && name[name.len() - 4..].eq_ignore_ascii_case(".exe") {
+        name = &name[..name.len() - 4];
+        windows = true;
+    }
+    let lower = name.to_ascii_lowercase();
+    if is_cmdlet(&lower) || CMD_BUILTINS.contains(&lower.as_str()) {
+        return (lower, true);
+    }
+    if [".ps1", ".bat", ".cmd"].iter().any(|e| lower.ends_with(e)) || name.contains('\\') {
+        windows = true;
+    }
+    (name.to_string(), windows)
+}
+
+fn plain_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || "_./:=,+@%^-".contains(c)
+}
+
+/// One quoted word reduced to its canonical quoting. `'$HOME'` and `"$HOME"`
+/// stay different; `"a b"` and `'a b'` are the same.
+fn canonical_quotes(word: &str) -> String {
+    let b = word.as_bytes();
+    if b.len() >= 2 && (b[0] == b'"' || b[0] == b'\'') && b[b.len() - 1] == b[0] {
+        let inner = &word[1..word.len() - 1];
+        let safe = !inner.contains(['\'', '"'])
+            && (b[0] == b'\'' || !inner.contains(['$', '`', '\\', '!']));
+        if safe {
+            if !inner.is_empty() && inner.chars().all(plain_char) {
+                return inner.to_string();
+            }
+            return format!("'{inner}'");
+        }
+    }
+    word.to_string()
+}
+
+/// Comparison text for a command's words: command name case/`.exe`-normalised
+/// where the shell ignores them, path separators unified for Windows-style
+/// commands, quoting canonicalised.
+fn normalize_words(words: &[String]) -> String {
+    let Some(first) = words.first() else {
+        return String::new();
+    };
+    let (name, windows) = command_name(first);
+    let windows = windows && !TEXT_COMMANDS.contains(&name.as_str());
+    let fix = |w: &str| {
+        if windows && !w.contains(['$', '`']) {
+            w.replace('\\', "/")
+        } else {
+            w.to_string()
+        }
+    };
+    let mut out = vec![canonical_quotes(&fix(&name))];
+    out.extend(words[1..].iter().map(|w| canonical_quotes(&fix(w))));
+    out.join(" ")
+}
+
+fn leading_assignments(words: &[String]) -> usize {
+    words.iter().take_while(|w| is_assignment(w)).count()
+}
+
+// ---- units -----------------------------------------------------------------------
+
+/// One command of a command line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Unit {
+    /// Environment settings that precede the command, as written (`A=1; `).
+    prefix: String,
+    /// The command's first pipeline stage, as written.
+    first: Vec<String>,
+    /// Leading environment-assignment words in `first`.
+    env_len: usize,
+    /// The rest of the pipeline and any failure-masking/background suffix, as written.
+    tail: String,
+    /// What it is compared by: variants removed, text normalised.
+    key: String,
+    standalone: bool,
+    /// A bounding wrapper (`timeout 100`) the command ran under.
+    retained: Option<String>,
+}
+
+impl Unit {
+    /// The command as written (what a recipe that included it shows).
+    #[must_use]
+    pub fn text(&self) -> String {
+        self.render(None)
+    }
+
+    /// The comparison key; variants a recipe may leave out are not in it.
+    #[must_use]
+    pub fn key(&self) -> &str {
+        &self.key
+    }
+
+    /// Whether the command is meaningful on its own (activation, shell options).
+    #[must_use]
+    pub fn is_standalone(&self) -> bool {
+        self.standalone
+    }
+
+    fn render(&self, insert: Option<&str>) -> String {
+        let mut words: Vec<&str> = self.first.iter().map(String::as_str).collect();
+        if let Some(extra) = insert {
+            words.insert(self.env_len.min(words.len()), extra);
+        }
+        format!("{}{}{}", self.prefix, words.join(" "), self.tail)
+    }
+
+    /// Whether this (recommended) unit stands for `recorded`: same command, and
+    /// a bounding wrapper it names is the one that ran.
+    #[must_use]
+    pub fn matches(&self, recorded: &Unit) -> bool {
+        self.key == recorded.key
+            && self.standalone == recorded.standalone
+            && (self.retained.is_none() || self.retained == recorded.retained)
+    }
+
+    /// The command to show for this recommendation matched to `recorded`: as
+    /// written, with a bounding wrapper it left out restored.
+    #[must_use]
+    pub fn shown_for(&self, recorded: &Unit) -> String {
+        match (&self.retained, &recorded.retained) {
+            (None, Some(wrapper)) => self.render(Some(wrapper)),
+            _ => self.text(),
+        }
+    }
+}
+
+#[derive(Default, Clone)]
+struct Stage {
+    /// Every word, redirections included.
+    all: Vec<String>,
+    /// Words that are part of the command (output redirections removed).
+    core: Vec<String>,
+}
+
+struct Segment {
+    sep_before: Sep,
+    stages: Vec<Stage>,
+}
+
+fn is_environment_setting(core: &[String]) -> bool {
+    let first = core
+        .first()
+        .map(|w| w.to_ascii_lowercase())
+        .unwrap_or_default();
+    if first == "set" && shell_option(core) {
+        return false;
+    }
+    if first.starts_with("$env:") || ["export", "set", "setx"].contains(&first.as_str()) {
+        return true;
+    }
+    core.iter().all(|w| is_assignment(w))
+}
+
+fn is_filter(stage: &Stage) -> bool {
+    let Some(first) = stage.core.first() else {
+        return false;
+    };
+    match find_row(&lookup_name(first), Category::Variant) {
+        Some(Row {
+            form: Form::Filter(check),
+            ..
+        }) => check(&stage.core),
+        _ => false,
+    }
+}
+
+fn is_standalone_command(words: &[String]) -> bool {
+    let Some(first) = words.first() else {
+        return false;
+    };
+    let name = lookup_name(first);
+    if name.starts_with("$erroractionpreference") {
+        return true;
+    }
+    if activation_path(first) {
+        return true;
+    }
+    matches!(
+        find_row(&name, Category::Standalone),
+        Some(Row { form: Form::Standalone(check), .. }) if check(words)
+    )
+}
+
+fn masks_failure(core: &[String]) -> bool {
+    let lower: Vec<String> = core.iter().map(|w| w.to_ascii_lowercase()).collect();
+    matches!(
+        lower
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+            .as_slice(),
+        ["true"] | [":"] | ["exit", "0"]
+    )
+}
+
+enum Analysis {
+    Navigation,
+    Command(Box<Command>),
+    /// The units a wrapper's payload expands to.
+    Unwrapped(Vec<Unit>),
+}
+
+struct Command {
+    key: String,
+    standalone: bool,
+    retained: Option<String>,
+}
+
+fn analyze(head: &Stage, allow_unwrap: bool, depth: usize) -> Option<Analysis> {
+    let core = &head.core;
+    let lead = leading_assignments(core);
+    if lead == 0 && core.len() == 1 && is_group(&core[0]) && allow_unwrap {
+        return unwrap_payload(&group_payload(&core[0]), depth);
+    }
+    let mut idx = lead;
+    let mut retained: Option<String> = None;
+    let mut kept: Vec<String> = Vec::new();
+    while idx < core.len() {
+        let words = &core[idx..];
+        let Some(Row {
+            form: Form::Wrapper(strip),
+            ..
+        }) = find_row(&lookup_name(&words[0]), Category::Variant)
+        else {
+            break;
+        };
+        let Some(s) = strip(words) else { break };
+        if let Some(payload) = s.payload {
+            if lead > 0 || retained.is_some() || !kept.is_empty() || !allow_unwrap {
+                break;
+            }
+            return unwrap_payload(&payload, depth);
+        }
+        if s.retained {
+            let text = words[..s.consumed].join(" ");
+            retained = Some(match retained {
+                Some(prev) => format!("{prev} {text}"),
+                None => text,
+            });
+        }
+        kept.extend(s.kept);
+        idx += s.consumed;
+    }
+    let words = &core[idx..];
+    let first = words.first()?;
+    if NAVIGATION_COMMANDS.contains(&lookup_name(first).as_str()) {
+        return Some(Analysis::Navigation);
+    }
+    let standalone = is_standalone_command(words);
+    let mut key_words: Vec<String> = core[..lead].to_vec();
+    key_words.extend(kept);
+    let mut key = normalize_words(words);
+    if standalone && words[0] == "." {
+        key = format!("source{}", &key[1..]);
+    }
+    if !key_words.is_empty() {
+        key = format!("{} {key}", key_words.join(" "));
+    }
+    Some(Analysis::Command(Box::new(Command {
+        key,
+        standalone,
+        retained,
+    })))
+}
+
+fn unwrap_payload(payload: &str, depth: usize) -> Option<Analysis> {
+    Some(Analysis::Unwrapped(units_of(payload, depth + 1)?))
+}
+
+fn units_of(command: &str, depth: usize) -> Option<Vec<Unit>> {
+    if depth > MAX_DEPTH {
+        return None;
+    }
+    let mut segments = vec![Segment {
+        sep_before: Sep::Semi,
+        stages: vec![Stage::default()],
+    }];
+    let mut skip: Option<bool> = None;
+    for tok in shell_tokens(command)? {
         match tok {
-            ShellTok::Separator => {
-                skip_target = false;
-                segments.push(vec![Vec::new()]);
+            ShellTok::Separator(sep) => {
+                skip = None;
+                segments.push(Segment {
+                    sep_before: sep,
+                    stages: vec![Stage::default()],
+                });
             }
             ShellTok::Pipe => {
-                skip_target = false;
-                if let Some(last) = segments.last_mut() {
-                    last.push(Vec::new());
-                }
+                skip = None;
+                segments.last_mut()?.stages.push(Stage::default());
             }
             ShellTok::Word(word) => {
-                if skip_target {
-                    skip_target = false;
-                } else if let Some(takes_target) = redirection(&word) {
-                    skip_target = takes_target;
-                } else if let Some(stage) = segments.last_mut().and_then(|s| s.last_mut()) {
-                    stage.push(word);
+                if word.starts_with("@'") || word.starts_with("@\"") {
+                    return None;
+                }
+                let stage = segments.last_mut()?.stages.last_mut()?;
+                if let Some(keep) = skip.take() {
+                    stage.all.push(word.clone());
+                    if keep {
+                        stage.core.push(word);
+                    }
+                    continue;
+                }
+                match redirection(&word) {
+                    Redir::Content => return None,
+                    Redir::None => {
+                        stage.all.push(word.clone());
+                        stage.core.push(word);
+                    }
+                    Redir::Output(target) => {
+                        stage.all.push(word);
+                        skip = target.then_some(false);
+                    }
+                    Redir::Input(target) => {
+                        stage.all.push(word.clone());
+                        stage.core.push(word);
+                        skip = target.then_some(true);
+                    }
                 }
             }
         }
     }
-    let mut units = Vec::new();
-    let mut environment: Vec<String> = Vec::new();
-    for stages in segments {
-        let mut stages = stages.into_iter().filter(|s| !s.is_empty());
-        let Some(head) = stages.next() else { continue };
-        if NAVIGATION_COMMANDS.contains(&first_word_lower(&head).as_str()) {
+    let mut units: Vec<Unit> = Vec::new();
+    let mut pending: Vec<(String, String)> = Vec::new();
+    let mut previous: Option<usize> = None;
+    let backgrounded: Vec<bool> = segments
+        .iter()
+        .skip(1)
+        .map(|s| s.sep_before == Sep::Amp)
+        .chain(std::iter::once(false))
+        .collect();
+    for (k, seg) in segments.iter().enumerate() {
+        let before = previous.take();
+        let stages: Vec<&Stage> = seg.stages.iter().filter(|s| !s.core.is_empty()).collect();
+        let Some(head) = stages.first() else { continue };
+        if stages.len() == 1
+            && masks_failure(&head.core)
+            && matches!(seg.sep_before, Sep::Or | Sep::Semi)
+        {
+            if let Some(u) = before {
+                let suffix = format!(" {} {}", seg.sep_before.text(), head.all.join(" "));
+                units[u].tail.push_str(&suffix);
+                units[u].key.push_str(&suffix);
+                previous = Some(u);
+                continue;
+            }
+        }
+        if is_environment_setting(&head.core) {
+            pending.push((head.all.join(" "), normalize_words(&head.core)));
             continue;
         }
-        let mut text = head.join(" ");
-        if !is_environment_setting(&head) {
-            for stage in stages {
-                if !FILTER_COMMANDS.contains(&first_word_lower(&stage).as_str()) {
-                    text.push_str(" | ");
-                    text.push_str(&stage.join(" "));
+        let tail_stages = &stages[1..];
+        let tail_filters = tail_stages.iter().all(|s| is_filter(s));
+        let tail_visible: String = tail_stages
+            .iter()
+            .map(|s| format!(" | {}", s.all.join(" ")))
+            .collect();
+        let suffix = if backgrounded[k] { " &" } else { "" };
+        match analyze(head, tail_filters && pending.is_empty(), depth)? {
+            Analysis::Navigation => {}
+            Analysis::Unwrapped(mut inner) => {
+                if let [only] = inner.as_mut_slice() {
+                    if only.retained.is_none() {
+                        only.first = head.all.clone();
+                        only.env_len = 0;
+                        only.prefix.clear();
+                        only.tail = tail_visible;
+                    }
                 }
+                if let Some(last) = inner.last_mut() {
+                    last.tail.push_str(suffix);
+                    last.key.push_str(suffix);
+                }
+                units.extend(inner);
+                previous = Some(units.len().wrapping_sub(1)).filter(|_| !units.is_empty());
+            }
+            Analysis::Command(cmd) => {
+                let Command {
+                    mut key,
+                    standalone,
+                    retained,
+                } = *cmd;
+                for stage in tail_stages {
+                    if !is_filter(stage) {
+                        key.push_str(" | ");
+                        key.push_str(&normalize_words(&stage.core));
+                    }
+                }
+                key.push_str(suffix);
+                let mut prefix = String::new();
+                if !standalone && !pending.is_empty() {
+                    let visible: Vec<&str> = pending.iter().map(|p| p.0.as_str()).collect();
+                    let keys: Vec<&str> = pending.iter().map(|p| p.1.as_str()).collect();
+                    prefix = format!("{}; ", visible.join("; "));
+                    key = format!("{}; {key}", keys.join("; "));
+                    pending.clear();
+                }
+                units.push(Unit {
+                    prefix,
+                    env_len: leading_assignments(&head.all),
+                    first: head.all.clone(),
+                    tail: format!("{tail_visible}{suffix}"),
+                    key,
+                    standalone,
+                    retained,
+                });
+                previous = Some(units.len() - 1);
             }
         }
-        environment.push(text);
-        if !is_environment_setting(&head) {
-            units.push(environment.join("; "));
-            environment.clear();
-        }
     }
-    units
+    Some(units)
+}
+
+/// The commands a command line is made of; see the module docs. Empty when the
+/// line cannot be read with certainty.
+#[must_use]
+pub fn command_units(command: &str) -> Vec<Unit> {
+    units_of(command, 0).unwrap_or_default()
 }
 
 #[cfg(test)]
 mod tests {
-    use super::command_units;
+    use super::{Category, command_units};
 
-    fn units(command: &str) -> Vec<String> {
+    fn keys(command: &str) -> Vec<String> {
         command_units(command)
+            .iter()
+            .map(|u| u.key().to_string())
+            .collect()
+    }
+
+    fn texts(command: &str) -> Vec<String> {
+        command_units(command)
+            .iter()
+            .map(super::Unit::text)
+            .collect()
+    }
+
+    /// Whether a recipe `proposed` stands for a unit of `recorded`.
+    fn matches(proposed: &str, recorded: &str) -> bool {
+        let rec = command_units(recorded);
+        let prop = command_units(proposed);
+        !prop.is_empty() && prop.iter().all(|p| rec.iter().any(|r| p.matches(r)))
     }
 
     #[test]
     fn filters_navigation_and_redirection_are_dropped() {
         assert_eq!(
-            units("fizz buzz --count 300 | head -n 10"),
+            keys("fizz buzz --count 300 | head -n 10"),
             ["fizz buzz --count 300"]
         );
         assert_eq!(
-            units("cargo test -p app 2>&1 | grep -E 'FAILED|error'"),
+            keys("cargo test -p app 2>&1 | grep -E 'FAILED|error'"),
             ["cargo test -p app"]
         );
         assert_eq!(
-            units("Get-Content a.log | Where-Object { $_ -match 'e' } | Select-Object -Last 5"),
-            ["Get-Content a.log"]
+            keys("Get-Content a.log | Where-Object { $_ -match 'e' } | Select-Object -Last 5"),
+            ["get-content a.log"]
         );
-        assert_eq!(units("dir /b | findstr /i \".rs\""), ["dir /b"]);
-        assert_eq!(units("x --check 2>&1 | more"), ["x --check"]);
-        assert_eq!(units("cd /d C:\\app & dir"), ["dir"]);
+        assert_eq!(keys("dir /b | findstr /i \".rs\""), ["dir /b"]);
+        assert_eq!(keys("x --check 2>&1 | more"), ["x --check"]);
+        assert_eq!(keys("cd /d C:\\app & dir"), ["dir"]);
         assert_eq!(
-            units("Push-Location app; dotnet test > r.txt; Pop-Location"),
+            keys("Push-Location app; dotnet test > r.txt; Pop-Location"),
             ["dotnet test"]
         );
-        assert_eq!(units("a >> out.log 2>&1"), ["a"]);
+        assert_eq!(keys("a >> out.log 2>&1"), ["a"]);
+    }
+
+    #[test]
+    fn what_the_recipe_wrote_is_shown_as_written() {
+        assert_eq!(
+            texts("fizz buzz --count 300 | head -n 10"),
+            ["fizz buzz --count 300 | head -n 10"]
+        );
+        assert_eq!(texts("a >> out.log 2>&1"), ["a >> out.log 2>&1"]);
+        assert_eq!(texts("cd app && npm test"), ["npm test"]);
+        assert_eq!(texts("time  nice -n 5   foo"), ["time nice -n 5 foo"]);
     }
 
     #[test]
     fn every_separator_splits() {
-        for sep in ["&&", ";", "||", "&", "\n"] {
-            assert_eq!(units(&format!("a {sep} b")), ["a", "b"], "{sep:?}");
+        for sep in ["&&", ";", "||", "\n"] {
+            assert_eq!(keys(&format!("a {sep} b")), ["a", "b"], "{sep:?}");
         }
+        assert_eq!(keys("a & b"), ["a &", "b"]);
     }
 
     #[test]
     fn quoted_text_is_never_an_operator() {
-        assert_eq!(units("echo 'a && b' | head"), ["echo 'a && b'"]);
-        assert_eq!(units("echo \"a ; b\" > \"o u t\""), ["echo \"a ; b\""]);
-        assert_eq!(units("echo 'x > y'"), ["echo 'x > y'"]);
+        assert_eq!(keys("echo 'a && b' | head"), ["echo 'a && b'"]);
+        assert_eq!(keys("echo \"a ; b\" > \"o u t\""), ["echo 'a ; b'"]);
+        assert_eq!(keys("echo 'x > y'"), ["echo 'x > y'"]);
+        assert_eq!(keys("echo 'foo | head'"), ["echo 'foo | head'"]);
+        assert!(!matches("foo", "\"timeout 100 foo\""));
+        assert!(!matches("foo", "echo 'x' '| sort'"));
+        assert!(!matches("echo a", "echo 'a && b'"));
     }
 
     #[test]
     fn environment_settings_stay_with_their_command() {
         assert_eq!(
-            units("MODE=production npm test | head"),
+            keys("MODE=production npm test | head"),
             ["MODE=production npm test"]
         );
         assert_eq!(
-            units("cd app; $env:MODE='x'; npm test"),
+            keys("cd app; $env:MODE='x'; npm test"),
             ["$env:MODE='x'; npm test"]
         );
+        assert!(!matches("npm test", "MODE=production npm test"));
+        assert!(!matches("npm test", "env MODE=production npm test"));
+        assert!(matches(
+            "MODE=production npm test",
+            "env MODE=production npm test"
+        ));
+        assert!(!matches("npm test", "export MODE=1; npm test"));
+        assert!(!matches("foo", "FOO=1 timeout 5 foo"));
+        assert!(matches("FOO=1 foo", "FOO=1 timeout 5 foo"));
     }
 
     #[test]
-    fn non_filter_pipelines_are_kept() {
-        assert_eq!(units("cat a | sort"), ["cat a | sort"]);
+    fn standalone_commands_may_be_omitted_but_are_kept_when_included() {
+        assert!(matches("app run", "source foo && app run"));
+        assert!(matches("source foo && app run", "source foo && app run"));
+        assert!(!matches("source bar && app run", "source foo && app run"));
+        assert!(!matches("source foo", "app run"));
+        let units = command_units("source foo && app run");
+        assert!(units[0].is_standalone() && !units[1].is_standalone());
+        assert_eq!(texts("source foo && app run"), ["source foo", "app run"]);
+        assert!(!matches("set -e", "set +e"));
+        assert!(matches("set -e", "set -e; foo"));
+        // A standalone command is not mistaken for a variant of a normal one.
+        assert!(!matches("source", "source foo"));
+    }
+
+    #[test]
+    fn near_misses_are_not_allowlisted() {
+        assert!(!matches("foo --bar", "foo --baz"));
+        assert!(!matches("foo", "sudo foo"));
+        assert!(!matches("foo", "runas /user:x foo"));
+        assert!(!matches("foo", "foo &"));
+        assert!(!matches("foo", "foo || true"));
+        assert!(!matches("foo", "foo; true"));
+        assert!(!matches("foo", "foo || :"));
+        assert!(matches("foo || true", "foo || true"));
+        assert!(!matches("foo", "cd /tmp2 && ./foo"));
+        assert!(!matches("jest", "./node_modules/.bin/jest"));
+        assert!(!matches("foo", "yes | foo"));
+        assert!(!matches("foo", "foo < /dev/null"));
+        assert!(!matches("foo", "foo < input.txt"));
+        assert!(matches("foo < input.txt", "foo < input.txt"));
+        assert!(matches("foo", "foo | sort"));
+    }
+
+    #[test]
+    fn timeout_wraps_without_changing_the_command() {
+        for rec in [
+            "timeout 100 foo --bar",
+            "gtimeout 100 foo --bar",
+            "timeout -s KILL 5.5s foo --bar",
+            "timeout --signal=TERM -k 10 2m foo --bar",
+            "timeout --preserve-status --foreground -v 1h foo --bar",
+            "timeout -k5 3d foo --bar",
+            "timeout 10 foo --bar | head",
+        ] {
+            assert!(matches("foo --bar", rec), "{rec}");
+            let unit = &command_units("foo --bar")[0];
+            let shown = unit.shown_for(&command_units(rec)[0]);
+            assert!(
+                shown.starts_with(rec.split(" foo").next().unwrap()),
+                "{shown}"
+            );
+        }
+        assert_eq!(
+            command_units("foo --bar")[0].shown_for(&command_units("timeout 100 foo --bar")[0]),
+            "timeout 100 foo --bar"
+        );
+        assert_eq!(
+            command_units("A=1 foo")[0].shown_for(&command_units("A=1 timeout 5 foo")[0]),
+            "A=1 timeout 5 foo"
+        );
+        // The bound the recipe names must be the one that ran.
+        assert!(matches("timeout 100 foo", "timeout 100 foo"));
+        assert!(!matches("timeout 50 foo", "timeout 100 foo"));
+        assert!(!matches("timeout 100 foo", "foo"));
+        // Not wrappers: sleeps, bare durations, quoted text, bad options.
+        assert!(!matches("foo", "timeout /t 5"));
+        assert_eq!(keys("timeout 5"), ["timeout 5"]);
+        assert_eq!(keys("timeout /t 5 /nobreak"), ["timeout /t 5 /nobreak"]);
+        assert!(!matches("foo", "timeout 5x foo"));
+        assert!(!matches("foo", "timeout -x 5 foo"));
+    }
+
+    #[test]
+    fn process_wrappers_are_variants() {
+        for rec in [
+            "nice foo",
+            "nice -n 10 foo",
+            "nice -10 foo",
+            "ionice -c 3 foo",
+            "ionice -c3 -n 7 foo",
+            "chrt -f 10 foo",
+            "chrt -o 0 foo",
+            "time foo",
+            "time -p foo",
+            "stdbuf -oL foo",
+            "stdbuf -o L -e0 foo",
+            "unbuffer foo",
+            "script -q /dev/null foo",
+            "script -q -c foo /dev/null",
+            "env -u HOME foo",
+            "env -i foo",
+            "Measure-Command { foo }",
+            "nice -n 5 time stdbuf -oL foo",
+        ] {
+            assert!(matches("foo", rec), "{rec}");
+        }
+        // The option value is never read as the wrapped command.
+        assert_eq!(keys("nice -n 10 foo"), ["foo"]);
+        assert!(!matches("10 foo", "nice -n 10 foo"));
+        // Not wrappers.
+        assert!(!matches("foo", "nice"));
+        assert!(!matches("foo", "time /t"));
+        assert!(!matches("foo", "chrt -p 1234"));
+        assert!(!matches("foo", "env"));
+        assert!(!matches("foo", "script foo"));
+        // A wrapper the recipe includes is kept as written.
+        assert_eq!(texts("time foo"), ["time foo"]);
+    }
+
+    #[test]
+    fn output_filters_and_redirections_expand() {
+        for rec in [
+            "foo | sort",
+            "foo | sort -u",
+            "foo | uniq -c",
+            "foo | wc -l",
+            "foo | cut -d, -f1",
+            "foo | jq .a",
+            "foo | less",
+            "foo | cat",
+            "foo | Out-String",
+            "foo | Format-Table -AutoSize",
+            "foo | Out-Host",
+            "foo | Out-File x.txt",
+            "foo | Out-Null",
+            "foo | Tee-Object -FilePath x",
+            "foo | Sort-Object Name",
+            "foo | Measure-Object",
+            "foo | sed -n '1,5p'",
+            "foo | sed 's/a/b/g'",
+            "foo | sed -e 's/a/b/' -e '/x/d'",
+            "foo | awk '{print $1}'",
+            "foo | awk -F, '{print $2}'",
+            "foo >> out.log",
+            "foo &> out.log",
+            "foo |& tee x",
+            "foo 2>/dev/null",
+            "foo >NUL 2>&1",
+            "foo *>&1",
+            "foo | head | sort | uniq",
+        ] {
+            assert!(matches("foo", rec), "{rec}");
+        }
+        for rec in [
+            "foo | sed -i 's/a/b/'",
+            "foo | sed 's/a/b/w out'",
+            "foo | sed 's/a/b/e'",
+            "foo | sed -f script.sed",
+            "foo | sed 'w out'",
+            "foo | sed p file",
+            "foo | awk '{print > \"x\"}'",
+            "foo | awk '{system(\"rm x\")}'",
+            "foo | awk '{print | \"sh\"}'",
+            "foo | awk -f prog.awk",
+            "foo | sort -o out.txt",
+            "foo | cat file",
+            "foo | bar",
+        ] {
+            assert!(!matches("foo", rec), "{rec}");
+        }
+    }
+
+    #[test]
+    fn shell_option_noise_is_standalone() {
+        for rec in [
+            "set -e && foo",
+            "set -o pipefail; foo",
+            "$ErrorActionPreference = 'Stop'; foo",
+            "@echo off\nfoo",
+            "chcp 65001 >NUL & foo",
+            "clear; foo",
+            "cls & foo",
+            "echo --- ; foo",
+            "echo '=====' && foo",
+        ] {
+            assert!(matches("foo", rec), "{rec}");
+            assert!(command_units(rec)[0].is_standalone(), "{rec}");
+        }
+        assert!(matches("set -e && foo", "set -e && foo"));
+        assert!(!matches("set -u && foo", "set -e && foo; bar"));
+        // Real output and cmd's `set` are not noise.
+        assert!(!command_units("echo hello")[0].is_standalone());
+        assert!(!command_units("echo")[0].is_standalone());
+        assert!(!matches("foo", "set X=1 & foo"));
+    }
+
+    #[test]
+    fn activation_commands_are_standalone() {
+        for rec in [
+            "source .venv/bin/activate && pytest",
+            ". .venv/bin/activate; pytest",
+            "nvm use 20 && pytest",
+            "conda activate base && pytest",
+            ". .\\.venv\\Scripts\\Activate.ps1; pytest",
+            ".venv\\Scripts\\activate.bat && pytest",
+            "call vcvars64.bat && pytest",
+        ] {
+            assert!(matches("pytest", rec), "{rec}");
+            assert!(command_units(rec)[0].is_standalone(), "{rec}");
+        }
+        assert!(matches(
+            "source .venv/bin/activate && pytest",
+            "source .venv/bin/activate && pytest"
+        ));
+        assert!(matches("source x/activate", ". x/activate"));
+        assert!(matches(". x/activate", "source x/activate"));
+        assert_eq!(texts(". x/activate && pytest"), [". x/activate", "pytest"]);
+        assert!(!matches(
+            "source .venv/bin/activate",
+            "source other/bin/activate"
+        ));
+        assert!(!matches("nvm use 18", "nvm use 20"));
+        assert!(!matches("conda activate b", "conda activate a"));
+        // A build script run with `call` is a command, not setup.
+        assert!(!command_units("call build.bat")[0].is_standalone());
+    }
+
+    #[test]
+    fn shell_invocations_unwrap_piece_by_piece() {
+        for rec in [
+            "bash -c 'foo'",
+            "sh -lc \"foo\"",
+            "bash -cl 'foo'",
+            "pwsh -NoProfile -NonInteractive -Command \"foo\"",
+            "powershell -Command foo",
+            "cmd /c foo",
+            "cmd /d /c \"foo\"",
+            "(foo)",
+            "{ foo; }",
+            "bash -c '(foo)'",
+        ] {
+            assert!(matches("foo", rec), "{rec}");
+        }
+        assert!(matches("a", "bash -c 'a && b'") && matches("b", "bash -c 'a && b'"));
+        assert!(matches("a && b", "(a; b)"));
+        assert!(matches("foo", "bash -c \"foo | head\""));
+        assert!(matches("foo", "bash -c 'source x && foo'"));
+        assert_eq!(texts("bash -c 'foo'"), ["bash -c 'foo'"]);
+        // Other flags stay meaningful; env or a bound is not unwrapped.
+        assert!(!matches("foo", "bash -x -c 'foo'"));
+        assert!(!matches("foo", "bash -ec 'foo'"));
+        assert!(!matches("foo", "pwsh -ExecutionPolicy Bypass -Command foo"));
+        assert!(!matches("foo", "cmd /k foo"));
+        assert!(!matches("foo", "A=1 bash -c foo"));
+        assert!(!matches("foo", "bash -c 'foo' arg"));
+        assert!(!matches("foo", "bash -c 'foo' | bar"));
+        // Fail closed.
+        assert!(keys("bash -c 'foo").is_empty());
+        assert!(keys("bash -c 'cat <<EOF\nx\nEOF'").is_empty());
+        let deep = "bash -c \"bash -c 'bash -c \\\"bash -c \\\\\\\"bash -c foo\\\\\\\"\\\"'\"";
+        assert!(keys(deep).len() <= 1);
+        let mut nested = "foo".to_string();
+        for _ in 0..8 {
+            nested = format!("({nested})");
+        }
+        assert!(keys(&nested).is_empty());
+    }
+
+    #[test]
+    fn heredocs_and_here_strings_are_not_read() {
+        assert!(keys("cat <<EOF\nhello\nEOF").is_empty());
+        assert!(keys("cat <<-EOF\nhello\nEOF").is_empty());
+        assert!(keys("grep x <<< \"a b\"").is_empty());
+        assert!(keys("$x = @'\nhello\n'@").is_empty());
+        assert!(keys("$x = @\"\nhello\n\"@").is_empty());
+        assert!(!matches("cat", "cat <<EOF\nhello\nEOF"));
+    }
+
+    #[test]
+    fn cosmetic_differences_do_not_matter() {
+        assert!(matches("foo", "foo.exe"));
+        assert!(matches("Get-Service", "get-service"));
+        assert!(matches("DIR /b", "dir /b"));
+        assert!(!matches("Foo", "foo"));
+        assert!(!matches("foo --Bar", "foo --bar"));
+        assert!(matches("type C:\\a\\b.txt", "type C:/a/b.txt"));
+        assert!(matches("foo.exe C:\\a\\b", "foo C:/a/b"));
+        assert!(!matches("foo C:\\a\\b", "foo C:/a/b"));
+        assert!(matches("foo --a \"x y\"", "foo --a 'x y'"));
+        assert!(matches("foo \"x\"", "foo x"));
+        assert!(matches("foo   --a    b", "foo --a b"));
+        assert!(!matches("foo '$HOME'", "foo \"$HOME\""));
+        assert!(!matches("foo '$HOME'", "foo $HOME"));
+        assert!(!matches("jest", "./node_modules/.bin/jest"));
+        assert!(matches("foo --a b", "foo \\\n  --a \\\n  b"));
+        assert!(matches("foo --a b", "foo `\n --a `\n b"));
+        assert!(matches("foo --a b", "foo ^\r\n --a ^\r\n b"));
+        assert!(!matches("echo a/b", "echo a\\b"));
+    }
+
+    #[test]
+    fn the_table_declares_each_category() {
+        for row in super::ALLOWLIST {
+            let consistent = matches!(
+                (&row.form, row.category),
+                (
+                    super::Form::Filter(_) | super::Form::Wrapper(_),
+                    Category::Variant
+                ) | (super::Form::Standalone(_), Category::Standalone)
+            );
+            assert!(consistent, "{:?}", row.names);
+        }
     }
 }
