@@ -797,6 +797,14 @@ impl Sep {
     }
 }
 
+/// A separator and the words after it, written the way a command line writes them.
+fn joined_with(sep: Sep, words: &str) -> String {
+    match sep {
+        Sep::Semi => format!("; {words}"),
+        _ => format!(" {} {words}", sep.text()),
+    }
+}
+
 #[derive(Debug, PartialEq, Eq)]
 enum ShellTok {
     Word(String),
@@ -1191,24 +1199,14 @@ fn analyze(head: &Stage, allow_unwrap: bool, depth: usize) -> Option<Analysis> {
             if !allow_unwrap {
                 break;
             }
-            let Some(Analysis::Unwrapped(mut inner, _)) = unwrap_payload(&payload, depth) else {
+            let Some(Analysis::Unwrapped(inner, _)) = unwrap_payload(&payload, depth) else {
                 return None;
             };
-            let outer_words: Vec<String> = core[..lead].iter().chain(&kept).cloned().collect();
-            if outer_words.is_empty() && retained.is_none() {
-                return Some(Analysis::Unwrapped(inner, false));
+            let outer = outer_words(core, lead, &kept);
+            if let Some(folded) = under_outer(inner, &outer, retained.as_deref()) {
+                return Some(folded);
             }
-            // A bound, a user or an environment outside the shell applies to
-            // what it runs; that is only comparable for a single command.
-            let [only] = inner.as_mut_slice() else { break };
-            if !outer_words.is_empty() {
-                only.key = format!("{} {}", outer_words.join(" "), only.key);
-            }
-            only.retained = match (retained, only.retained.take()) {
-                (Some(outer), Some(inner)) => Some(format!("{outer} {inner}")),
-                (outer, inner) => outer.or(inner),
-            };
-            return Some(Analysis::Unwrapped(inner, true));
+            break;
         }
         if s.retained {
             let text = words[..s.consumed].join(" ");
@@ -1221,6 +1219,19 @@ fn analyze(head: &Stage, allow_unwrap: bool, depth: usize) -> Option<Analysis> {
         idx += s.consumed;
     }
     let words = &core[idx..];
+    // A setting a wrapper carries itself (`timeout 5 export A=1`) is not one
+    // the shell applies, and it cannot be read with certainty.
+    if idx > 0 && is_environment_setting(words) {
+        return None;
+    }
+    // A group a wrapper runs (`timeout 5 (a)`) unwraps as a payload does.
+    if idx > 0 && allow_unwrap && words.len() == 1 && is_group(&words[0]) {
+        let inner = units_of(&group_payload(&words[0]), depth + 1)?;
+        let outer = outer_words(core, lead, &kept);
+        if let Some(folded) = under_outer(inner, &outer, retained.as_deref()) {
+            return Some(folded);
+        }
+    }
     let first = words.first()?;
     if NAVIGATION_COMMANDS.contains(&lookup_name(first).as_str()) {
         return Some(Analysis::Navigation);
@@ -1240,6 +1251,32 @@ fn analyze(head: &Stage, allow_unwrap: bool, depth: usize) -> Option<Analysis> {
         standalone,
         retained,
     })))
+}
+
+/// The words in front of a command that apply to what it runs: its leading
+/// environment settings and any a wrapper carried.
+fn outer_words(core: &[String], lead: usize, kept: &[String]) -> Vec<String> {
+    core[..lead].iter().chain(kept).cloned().collect()
+}
+
+/// Folds the outer words of a payload or group (a bound, a user, environment
+/// settings) into the single command it runs. Those apply to what runs, so
+/// they are only comparable for one command; several commands are not folded.
+fn under_outer(mut inner: Vec<Unit>, outer: &[String], retained: Option<&str>) -> Option<Analysis> {
+    if outer.is_empty() && retained.is_none() {
+        return Some(Analysis::Unwrapped(inner, false));
+    }
+    let [only] = inner.as_mut_slice() else {
+        return None;
+    };
+    if !outer.is_empty() {
+        only.key = format!("{} {}", outer.join(" "), only.key);
+    }
+    only.retained = match (retained, only.retained.take()) {
+        (Some(bound), Some(own)) => Some(format!("{bound} {own}")),
+        (bound, own) => bound.map(str::to_string).or(own),
+    };
+    Some(Analysis::Unwrapped(inner, true))
 }
 
 fn unwrap_payload(payload: &str, depth: usize) -> Option<Analysis> {
@@ -1304,6 +1341,8 @@ fn units_of(command: &str, depth: usize) -> Option<Vec<Unit>> {
     // They stay in force for every later command of this scope, so each of
     // those commands carries them.
     let mut settings: Vec<(String, String)> = Vec::new();
+    // Set by a setting that no later command has taken yet.
+    let mut settings_unapplied = false;
     let mut previous: Option<usize> = None;
     let backgrounded: Vec<bool> = segments
         .iter()
@@ -1315,28 +1354,31 @@ fn units_of(command: &str, depth: usize) -> Option<Vec<Unit>> {
         let before = previous.take();
         let stages: Vec<&Stage> = seg.stages.iter().filter(|s| !s.core.is_empty()).collect();
         let Some(head) = stages.first() else { continue };
-        if stages.len() == 1
-            && masks_failure(&head.core)
-            && matches!(seg.sep_before, Sep::Or | Sep::Semi)
-        {
-            if let Some(u) = before {
-                let suffix = format!(" {} {}", seg.sep_before.text(), head.all.join(" "));
-                units[u].tail.push_str(&suffix);
-                units[u].key.push_str(&suffix);
-                previous = Some(u);
-                continue;
-            }
-        }
-        if is_environment_setting(&head.core) {
-            settings.push((head.all.join(" "), normalize_words(&head.core)));
-            continue;
-        }
         let tail_stages = &stages[1..];
         let tail_filters = tail_stages.iter().all(|s| is_filter(s));
         let tail_visible: String = tail_stages
             .iter()
             .map(|s| format!(" | {}", s.all.join(" ")))
             .collect();
+        // A failure mask binds to the pipeline before it: `a || true | head`
+        // masks `a` as `a || true` does, the output filters being decoration.
+        if tail_filters
+            && masks_failure(&head.core)
+            && matches!(seg.sep_before, Sep::Or | Sep::Semi)
+        {
+            if let Some(u) = before {
+                units[u].tail.push_str(&joined_with(seg.sep_before, &head.all.join(" ")));
+                units[u].tail.push_str(&tail_visible);
+                units[u].key.push_str(&joined_with(seg.sep_before, &head.core.join(" ")));
+                previous = Some(u);
+                continue;
+            }
+        }
+        if is_environment_setting(&head.core) {
+            settings.push((head.all.join(" "), normalize_words(&head.core)));
+            settings_unapplied = true;
+            continue;
+        }
         let suffix = if backgrounded[k] { " &" } else { "" };
         match analyze(head, tail_filters && settings.is_empty(), depth)? {
             Analysis::Navigation => {}
@@ -1352,6 +1394,9 @@ fn units_of(command: &str, depth: usize) -> Option<Vec<Unit>> {
                 if let Some(last) = inner.last_mut() {
                     last.tail.push_str(suffix);
                     last.key.push_str(suffix);
+                }
+                if inner.iter().any(|u| !u.standalone) {
+                    settings_unapplied = false;
                 }
                 units.extend(inner);
                 previous = (!units.is_empty()).then_some(units.len().wrapping_sub(1));
@@ -1370,6 +1415,9 @@ fn units_of(command: &str, depth: usize) -> Option<Vec<Unit>> {
                 }
                 key.push_str(suffix);
                 let mut prefix = String::new();
+                if !standalone {
+                    settings_unapplied = false;
+                }
                 if !standalone && !settings.is_empty() {
                     let visible: Vec<&str> = settings.iter().map(|p| p.0.as_str()).collect();
                     let keys: Vec<&str> = settings.iter().map(|p| p.1.as_str()).collect();
@@ -1389,7 +1437,8 @@ fn units_of(command: &str, depth: usize) -> Option<Vec<Unit>> {
             }
         }
     }
-    Some(units)
+    // A setting no command came after applies to nothing that can be read.
+    (!settings_unapplied).then_some(units)
 }
 
 /// The commands a command line is made of; see the module docs. Empty when the
@@ -2006,8 +2055,9 @@ mod tests {
 
     #[test]
     fn cosmetic_differences_hold_inside_compounds() {
+        // Only a Windows-style command unifies `\` and `/` (see above).
         all_match(
-            "foo --a \"x y\" && bar C:\\a\\b",
+            "foo --a \"x y\" && bar.exe C:\\a\\b",
             &[
                 "foo --a 'x y' && bar C:/a/b",
                 "foo.exe --a 'x y'; bar.exe C:/a/b",
@@ -2362,7 +2412,6 @@ mod tests {
             "sudo -- foo",
             "sudo foo | head",
             "sudo timeout 5 foo",
-            "sudo nice -n 5 foo",
         ] {
             assert!(matches("foo", rec), "{rec}");
             let shown = command_units("foo")[0].shown_for(&command_units(rec)[0]);
@@ -2371,6 +2420,12 @@ mod tests {
                 "{shown}"
             );
         }
+        // `nice` is a plain variant, so only the `sudo` in front of it is shown.
+        assert!(matches("foo", "sudo nice -n 5 foo"));
+        assert_eq!(
+            command_units("foo")[0].shown_for(&command_units("sudo nice -n 5 foo")[0]),
+            "sudo foo"
+        );
         assert_eq!(
             command_units("foo")[0].shown_for(&command_units("sudo -u root foo --x")[0]),
             "sudo -u root foo"
