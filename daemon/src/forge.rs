@@ -1197,16 +1197,9 @@ impl ForgeClient {
     }
 
     fn get_pull_request_state_inner(&self, number: i64) -> Result<LivePullRequest, String> {
-        let token = self.require_token()?;
+        let resp = self.fetch_pull_request_object(number)?;
         match self.kind {
             ForgeKind::GitHub => {
-                let url = format!("{}/repos/{}/pulls/{number}", self.api_base, self.repo_path);
-                let resp = self.get(
-                    http_agent()
-                        .get(&url)
-                        .set("Authorization", &format!("Bearer {token}"))
-                        .set("Accept", "application/vnd.github+json"),
-                )?;
                 let head = resp["head"]["sha"].as_str().map(str::to_string);
                 let source_branch = resp["head"]["ref"].as_str().map(str::to_string);
                 let state = if resp["merged"].as_bool().unwrap_or(false) {
@@ -1221,11 +1214,6 @@ impl ForgeClient {
                 })
             }
             ForgeKind::GitLab => {
-                let url = format!(
-                    "{}/projects/{}/merge_requests/{number}",
-                    self.api_base, self.repo_path
-                );
-                let resp = self.get(http_agent().get(&url).set("PRIVATE-TOKEN", token))?;
                 let head = resp["sha"]
                     .as_str()
                     .or_else(|| resp["diff_refs"]["head_sha"].as_str())
@@ -1281,27 +1269,11 @@ impl ForgeClient {
     }
 
     fn pr_mergeability_inner(&self, number: i64) -> Result<PrMergeability, String> {
-        let token = self.require_token()?;
-        match self.kind {
-            ForgeKind::GitHub => {
-                let url = format!("{}/repos/{}/pulls/{number}", self.api_base, self.repo_path);
-                let pr = self.get(
-                    http_agent()
-                        .get(&url)
-                        .set("Authorization", &format!("Bearer {token}"))
-                        .set("Accept", "application/vnd.github+json"),
-                )?;
-                Ok(classify_github_mergeability(&pr))
-            }
-            ForgeKind::GitLab => {
-                let url = format!(
-                    "{}/projects/{}/merge_requests/{number}",
-                    self.api_base, self.repo_path
-                );
-                let mr = self.get(http_agent().get(&url).set("PRIVATE-TOKEN", token))?;
-                Ok(classify_gitlab_mergeability(&mr))
-            }
-        }
+        let object = self.fetch_pull_request_object(number)?;
+        Ok(match self.kind {
+            ForgeKind::GitHub => classify_github_mergeability(&object),
+            ForgeKind::GitLab => classify_gitlab_mergeability(&object),
+        })
     }
 
     /// Fetch a PR/MR's *live* base/target branch from the forge (RAL-273,
@@ -1359,16 +1331,9 @@ impl ForgeClient {
         &self,
         number: i64,
     ) -> Result<PullRequestBaseState, String> {
-        let token = self.require_token()?;
+        let resp = self.fetch_pull_request_object(number)?;
         let (base, updated_at) = match self.kind {
             ForgeKind::GitHub => {
-                let url = format!("{}/repos/{}/pulls/{number}", self.api_base, self.repo_path);
-                let resp = self.get(
-                    http_agent()
-                        .get(&url)
-                        .set("Authorization", &format!("Bearer {token}"))
-                        .set("Accept", "application/vnd.github+json"),
-                )?;
                 let base = resp["base"]["ref"]
                     .as_str()
                     .map(str::to_string)
@@ -1380,11 +1345,6 @@ impl ForgeClient {
                 (base, updated_at)
             }
             ForgeKind::GitLab => {
-                let url = format!(
-                    "{}/projects/{}/merge_requests/{number}",
-                    self.api_base, self.repo_path
-                );
-                let resp = self.get(http_agent().get(&url).set("PRIVATE-TOKEN", token))?;
                 let base = resp["target_branch"]
                     .as_str()
                     .map(str::to_string)
@@ -1422,14 +1382,7 @@ impl ForgeClient {
         let (ci, object) = self.check_pr_ci_status_with_object(number)?;
         let object = match object {
             Some(object) => object,
-            None => {
-                let token = self.require_token()?;
-                let url = format!(
-                    "{}/projects/{}/merge_requests/{number}",
-                    self.api_base, self.repo_path
-                );
-                self.get(http_agent().get(&url).set("PRIVATE-TOKEN", token))?
-            }
+            None => self.fetch_pull_request_object(number)?,
         };
         Ok(PrCiProbe {
             ci,
@@ -1490,9 +1443,7 @@ impl ForgeClient {
     }
 
     fn fetch_github_pull_request(&self, number: i64) -> Result<serde_json::Value, String> {
-        let token = self.require_token()?;
-        let url = format!("{}/repos/{}/pulls/{number}", self.api_base, self.repo_path);
-        self.get_github_cached(&url, token)
+        self.fetch_pull_request_object(number)
     }
 
     /// GitHub half of [`Self::check_pr_ci_status`], given the already-fetched PR
@@ -1693,11 +1644,7 @@ impl ForgeClient {
     /// when its SHA matches the current merge-ref commit.
     fn check_gitlab_pr_ci_status(&self, number: i64) -> Result<PrCiState, String> {
         let token = self.require_token()?;
-        let mr_url = format!(
-            "{}/projects/{}/merge_requests/{number}",
-            self.api_base, self.repo_path
-        );
-        let mr = self.get(http_agent().get(&mr_url).set("PRIVATE-TOKEN", token))?;
+        let mr = self.fetch_pull_request_object(number)?;
         if mr["merge_status"].as_str() == Some("cannot_be_merged") {
             return Ok(PrCiState::Failing(PrFailure {
                 reason: "merge conflicts with the target branch".to_string(),
@@ -2659,51 +2606,35 @@ impl ForgeClient {
     }
 
     fn get_pull_request_ci_state_inner(&self, number: i64) -> Result<PullRequestCiState, String> {
-        let token = self.require_token()?;
+        let resp = self.fetch_pull_request_object(number)?;
         match self.kind {
-            ForgeKind::GitHub => {
-                let url = format!("{}/repos/{}/pulls/{number}", self.api_base, self.repo_path);
-                let resp = self.get(
-                    http_agent()
-                        .get(&url)
-                        .set("Authorization", &format!("Bearer {token}"))
-                        .set("Accept", "application/vnd.github+json"),
-                )?;
-                Ok(PullRequestCiState {
-                    labels: resp["labels"]
-                        .as_array()
-                        .map(|labels| {
-                            labels
-                                .iter()
-                                .filter_map(|label| label["name"].as_str().map(str::to_string))
-                                .collect()
-                        })
-                        .unwrap_or_default(),
-                    head_sha: resp["head"]["sha"].as_str().map(str::to_string),
-                })
-            }
-            ForgeKind::GitLab => {
-                let url = format!(
-                    "{}/projects/{}/merge_requests/{number}",
-                    self.api_base, self.repo_path
-                );
-                let resp = self.get(http_agent().get(&url).set("PRIVATE-TOKEN", token))?;
-                Ok(PullRequestCiState {
-                    labels: resp["labels"]
-                        .as_array()
-                        .map(|labels| {
-                            labels
-                                .iter()
-                                .filter_map(|label| label.as_str().map(str::to_string))
-                                .collect()
-                        })
-                        .unwrap_or_default(),
-                    head_sha: resp["sha"]
-                        .as_str()
-                        .or_else(|| resp["diff_refs"]["head_sha"].as_str())
-                        .map(str::to_string),
-                })
-            }
+            ForgeKind::GitHub => Ok(PullRequestCiState {
+                labels: resp["labels"]
+                    .as_array()
+                    .map(|labels| {
+                        labels
+                            .iter()
+                            .filter_map(|label| label["name"].as_str().map(str::to_string))
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                head_sha: resp["head"]["sha"].as_str().map(str::to_string),
+            }),
+            ForgeKind::GitLab => Ok(PullRequestCiState {
+                labels: resp["labels"]
+                    .as_array()
+                    .map(|labels| {
+                        labels
+                            .iter()
+                            .filter_map(|label| label.as_str().map(str::to_string))
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                head_sha: resp["sha"]
+                    .as_str()
+                    .or_else(|| resp["diff_refs"]["head_sha"].as_str())
+                    .map(str::to_string),
+            }),
         }
     }
 
@@ -3609,31 +3540,39 @@ impl ForgeClient {
         }
     }
 
-    /// `GET` a GitHub CI read with `If-None-Match`, so an unchanged resource
-    /// answers `304` and spends no quota. The previous body is replayed on a
-    /// `304`; a response without an `ETag` is returned but not cached.
+    /// `GET` a GitHub read with `If-None-Match` ([`Self::get_cached`]).
     fn get_github_cached(&self, url: &str, token: &str) -> Result<serde_json::Value, String> {
-        let key = format!("{}|{url}", self.rate_limit_key());
-        let prior = CI_ETAG_CACHE
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(&key)
-            .cloned();
         let req = http_agent()
             .get(url)
             .set("Authorization", &format!("Bearer {token}"))
             .set("Accept", "application/vnd.github+json");
+        self.get_cached(url, req)
+    }
+
+    /// `GET` `req` (a request for `url`) with `If-None-Match`, so an
+    /// unchanged resource answers `304` and spends no quota. The previous body
+    /// is replayed on a `304` -- the forge itself has just confirmed it is
+    /// current, so it is never stale. A response without an `ETag` is returned
+    /// but not cached.
+    fn get_cached(&self, url: &str, req: ureq::Request) -> Result<serde_json::Value, String> {
+        let key = format!("{}|{url}", self.rate_limit_key());
+        let prior = FORGE_ETAG_CACHE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&key)
+            .cloned();
         match self.get_conditional(req, prior.as_ref().map(|(etag, _)| etag.as_str()))? {
             ConditionalGet::NotModified => prior.map(|(_, body)| body).ok_or_else(|| {
                 "forge API 304 for a request that sent no If-None-Match".to_string()
             }),
             ConditionalGet::Modified { value, etag } => {
-                let mut cache = CI_ETAG_CACHE
+                let mut cache = FORGE_ETAG_CACHE
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
                 match etag {
                     Some(etag) => {
-                        if cache.len() >= CI_ETAG_CACHE_MAX_ENTRIES && !cache.contains_key(&key) {
+                        if cache.len() >= FORGE_ETAG_CACHE_MAX_ENTRIES && !cache.contains_key(&key)
+                        {
                             cache.clear();
                         }
                         cache.insert(key, (etag, value.clone()));
@@ -3643,6 +3582,27 @@ impl ForgeClient {
                     }
                 }
                 Ok(value)
+            }
+        }
+    }
+
+    /// One PR/MR object, read through [`Self::get_cached`]. Every single-PR/MR
+    /// read (merge state, base, mergeability, labels, CI) shares this URL and
+    /// cache entry, so polling a PR that has not changed costs no quota.
+    fn fetch_pull_request_object(&self, number: i64) -> Result<serde_json::Value, String> {
+        let token = self.require_token()?;
+        match self.kind {
+            ForgeKind::GitHub => {
+                let url = format!("{}/repos/{}/pulls/{number}", self.api_base, self.repo_path);
+                self.get_github_cached(&url, token)
+            }
+            ForgeKind::GitLab => {
+                let url = format!(
+                    "{}/projects/{}/merge_requests/{number}",
+                    self.api_base, self.repo_path
+                );
+                let req = http_agent().get(&url).set("PRIVATE-TOKEN", token);
+                self.get_cached(&url, req)
             }
         }
     }
@@ -3890,14 +3850,15 @@ fn parse_retry_after(value: &str) -> Option<Duration> {
     value.trim().parse::<u64>().ok().map(Duration::from_secs)
 }
 
-/// Cap on [`CI_ETAG_CACHE`]; the cache is emptied when it fills, since an
+/// Cap on [`FORGE_ETAG_CACHE`]; the cache is emptied when it fills, since an
 /// entry is only a saved call and any miss simply refetches.
-const CI_ETAG_CACHE_MAX_ENTRIES: usize = 2048;
+const FORGE_ETAG_CACHE_MAX_ENTRIES: usize = 2048;
 
-/// `(ETag, body)` of the last `200` for a GitHub CI read, keyed by
-/// [`ForgeClient::rate_limit_key`] plus the request URL. Lives in memory only:
-/// losing it on restart costs one unconditional fetch per URL.
-static CI_ETAG_CACHE: std::sync::LazyLock<Mutex<HashMap<String, (String, serde_json::Value)>>> =
+/// `(ETag, body)` of the last `200` for a conditional forge read
+/// ([`ForgeClient::get_cached`]), keyed by [`ForgeClient::rate_limit_key`] plus
+/// the request URL. Lives in memory only: losing it on restart costs one
+/// unconditional fetch per URL.
+static FORGE_ETAG_CACHE: std::sync::LazyLock<Mutex<HashMap<String, (String, serde_json::Value)>>> =
     std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// The most recent `X-RateLimit-*` reading for a GitHub token: what the board
@@ -9563,6 +9524,45 @@ mod tests {
         let req = http_agent().get(&format!("http://{addr}/x"));
         let result = client.get_conditional(req, Some("\"v1\"")).unwrap();
         assert!(matches!(result, ConditionalGet::NotModified));
+        mock.finish();
+    }
+
+    /// Every single-PR read shares one conditional cache entry: the merge
+    /// check's read stores the body, and a later base-drift read of the same
+    /// PR asks "changed?" and is answered from the cache on a 304.
+    #[test]
+    fn pr_reads_share_one_etag_entry_and_replay_it_on_304() {
+        let mock = MockForge::start(move |server| {
+            let first = server.recv();
+            assert_eq!(first.url(), "/repos/acme/etag-share/pulls/7");
+            assert_eq!(req_header(&first, "If-None-Match"), None);
+            first
+                .respond(
+                    tiny_http::Response::from_string(
+                        r#"{"state":"open","merged":false,"head":{"sha":"abc","ref":"ral-7-review"},"base":{"ref":"main"},"updated_at":"2024-01-01T00:00:00Z"}"#,
+                    )
+                    .with_status_code(200)
+                    .with_header(
+                        tiny_http::Header::from_bytes(&b"ETag"[..], &b"\"p1\""[..]).unwrap(),
+                    ),
+                )
+                .unwrap();
+            let second = server.recv();
+            assert_eq!(second.url(), "/repos/acme/etag-share/pulls/7");
+            assert_eq!(
+                req_header(&second, "If-None-Match").as_deref(),
+                Some("\"p1\"")
+            );
+            second
+                .respond(tiny_http::Response::from_string("").with_status_code(304))
+                .unwrap();
+        });
+        let client = mock.client(ForgeKind::GitHub, "acme/etag-share");
+        let live = client.get_pull_request_live(7).unwrap();
+        assert_eq!(live.state, "open");
+        assert_eq!(live.head.as_deref(), Some("abc"));
+        let base = client.get_pull_request_base_state(7).unwrap();
+        assert_eq!(base.base, "main");
         mock.finish();
     }
 
