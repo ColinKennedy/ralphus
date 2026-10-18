@@ -196,6 +196,7 @@ pub fn validate_toml(raw: &str) -> ValidationReport {
             && key != "review"
             && key != "waypoint"
             && key != "submitter"
+            && key != "no_review"
         {
             let line = ctx.idx.find_toplevel_key(ctx.raw, key);
             ctx.error(
@@ -209,6 +210,7 @@ pub fn validate_toml(raw: &str) -> ValidationReport {
 
     validate_defaults(table.get("default"), &mut ctx);
     validate_submitter(table.get("submitter"), &mut ctx);
+    validate_no_review(table, &mut ctx);
     validate_tasks(table.get("task"), &mut ctx);
     validate_review_blocks(table.get("review"), &mut ctx);
     validate_waypoint_blocks(table, table.get("waypoint"), &mut ctx);
@@ -238,6 +240,46 @@ fn validate_submitter(value: Option<&toml::Value>, ctx: &mut Ctx<'_>) {
             "'submitter' must be a string",
             line,
         ),
+    }
+}
+
+/// `no_review` must be a boolean, and `no_review = true` contradicts any cell
+/// that selects a review or sets `triage = true`.
+fn validate_no_review(table: &toml::map::Map<String, toml::Value>, ctx: &mut Ctx<'_>) {
+    let Some(value) = table.get("no_review") else {
+        return;
+    };
+    let line = ctx.key_line(None, "no_review");
+    let Some(flag) = value.as_bool() else {
+        ctx.error(
+            "no_review",
+            ErrorKind::WrongType,
+            "'no_review' must be a boolean",
+            line,
+        );
+        return;
+    };
+    if !flag {
+        return;
+    }
+    let selects = table
+        .get("task")
+        .and_then(toml::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|t| t.get("cell").and_then(toml::Value::as_array))
+        .flatten()
+        .any(|c| {
+            c.get("triage").and_then(toml::Value::as_bool) == Some(true)
+                || c.get("review").is_some()
+        });
+    if selects {
+        ctx.error(
+            "no_review",
+            ErrorKind::ConflictingKeys,
+            "'no_review = true' conflicts with a cell that sets `review` or `triage = true`; remove one or the other",
+            line,
+        );
     }
 }
 
@@ -7886,6 +7928,73 @@ placement = "copy"
     }
 
     // ── RAL-476: submitter ───────────────────────────────────────────────────
+
+    const NO_REVIEW_CELL: &str = "[[task]]
+name=\"t\"
+[[task.cell]]
+cwd=\"/r\"
+prompt=\"p\"
+";
+
+    #[test]
+    fn no_review_true_is_accepted() {
+        let r = validate_toml(&format!(
+            "no_review = true
+{NO_REVIEW_CELL}"
+        ));
+        assert!(r.is_ok(), "{:?}", r.errors);
+    }
+
+    #[test]
+    fn no_review_wrong_type_rejected() {
+        let r = validate_toml(&format!(
+            "no_review = \"yes\"
+{NO_REVIEW_CELL}"
+        ));
+        assert!(
+            r.errors
+                .iter()
+                .any(|e| e.kind == ErrorKind::WrongType && e.path == "no_review")
+        );
+    }
+
+    #[test]
+    fn no_review_conflicts_with_triage_or_review_cell() {
+        for extra in [
+            "triage = true
+",
+            "review = \"<<review:r>>\"
+",
+        ] {
+            let r = validate_toml(&format!(
+                "no_review = true
+[[review]]
+id=\"r\"
+{NO_REVIEW_CELL}{extra}"
+            ));
+            assert!(
+                r.errors
+                    .iter()
+                    .any(|e| e.kind == ErrorKind::ConflictingKeys && e.path == "no_review"),
+                "{extra}: {:?}",
+                r.errors
+            );
+        }
+    }
+
+    #[test]
+    fn no_review_false_does_not_conflict() {
+        let r = validate_toml(&format!(
+            "no_review = false
+{NO_REVIEW_CELL}triage = true
+"
+        ));
+        assert!(
+            !r.errors.iter().any(|e| e.path == "no_review"),
+            "{:?}",
+            r.errors
+        );
+    }
 
     #[test]
     fn submitter_accepted_as_top_level_string() {

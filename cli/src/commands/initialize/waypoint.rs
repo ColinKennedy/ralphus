@@ -228,7 +228,7 @@ fn submit_completed_example(
     let (machine, cwd) =
         running_example_target(exercise, fixture, "waypoint-redo", "waypoint-completed");
     let toml = format!(
-        "[[task]]\nname = \"04-completed-before-waypoint\"\nproject = {project:?}\nmachine = {machine:?}\nno_commit_required = true\n\n[[task.cell]]\ncwd = {cwd:?}\ncommand = \"exit 0\"\nmode = \"raw\"\n"
+        "no_review = true\n\n[[task]]\nname = \"04-completed-before-waypoint\"\nproject = {project:?}\nmachine = {machine:?}\nno_commit_required = true\n\n[[task.cell]]\ncwd = {cwd:?}\ncommand = \"exit 0\"\nmode = \"raw\"\n"
     );
     std::fs::write(directory.join("04-completed-before-waypoint.toml"), &toml)
         .map_err(|e| e.to_string())?;
@@ -261,7 +261,7 @@ fn submit_underway_example(
         "sleep 3"
     };
     let toml = format!(
-        "[[task]]\nname = \"03-underway-before-waypoint\"\nproject = {project:?}\nmachine = {machine:?}\nno_commit_required = true\n\n[[task.cell]]\nid = \"wait\"\ncwd = {cwd:?}\ncommand = {wait:?}\nmode = \"raw\"\n\n[[task.cell]]\nid = \"after-guidance\"\ncwd = {cwd:?}\ncommand = \"exit 0\"\nmode = \"raw\"\ndepends_on = [\"wait\"]\n"
+        "no_review = true\n\n[[task]]\nname = \"03-underway-before-waypoint\"\nproject = {project:?}\nmachine = {machine:?}\nno_commit_required = true\n\n[[task.cell]]\nid = \"wait\"\ncwd = {cwd:?}\ncommand = {wait:?}\nmode = \"raw\"\n\n[[task.cell]]\nid = \"after-guidance\"\ncwd = {cwd:?}\ncommand = \"exit 0\"\nmode = \"raw\"\ndepends_on = [\"wait\"]\n"
     );
     std::fs::write(directory.join("03-underway-before-waypoint.toml"), &toml)
         .map_err(|e| e.to_string())?;
@@ -413,7 +413,7 @@ fn has_injection_delivery(client: &DaemonClient, waypoint_id: &str, squad_id: &s
 
 fn example_toml(name: &str, cwd: &str, purpose: &str) -> String {
     format!(
-        "[[task]]\nname = {name:?}\n\n[[task.cell]]\ncwd = {cwd:?}\ncommand = \"echo ralphus waypoint exercise\"\nremediation_attempts = 1\n\n# {purpose}\n"
+        "no_review = true\n\n[[task]]\nname = {name:?}\n\n[[task.cell]]\ncwd = {cwd:?}\ncommand = \"echo ralphus waypoint exercise\"\nremediation_attempts = 1\n\n# {purpose}\n"
     )
 }
 

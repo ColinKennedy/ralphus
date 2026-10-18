@@ -129,7 +129,7 @@ fn cell_failure_toml(exercise: &Exercise, fixture: &Fixture) -> String {
     let machine = exercise.machine_line();
     let cwd = exercise.cell_cwd(fixture, "mailbox-cell-failure");
     format!(
-        "[[task]]\nname = \"mailbox-cell-failure\"\nproject = {project:?}\n{machine}no_commit_required = true\n\n[[task.cell]]\ncwd = {cwd:?}\ncommand = \"exit 1\"\nmode = \"raw\"\n"
+        "no_review = true\n\n[[task]]\nname = \"mailbox-cell-failure\"\nproject = {project:?}\n{machine}no_commit_required = true\n\n[[task.cell]]\ncwd = {cwd:?}\ncommand = \"exit 1\"\nmode = \"raw\"\n"
     )
 }
 
@@ -138,6 +138,6 @@ fn proof_failure_toml(exercise: &Exercise, fixture: &Fixture) -> String {
     let machine = exercise.machine_line();
     let cwd = exercise.cell_cwd(fixture, "mailbox-proof-failure");
     format!(
-        "[[task]]\nname = \"mailbox-proof-failure\"\nproject = {project:?}\n{machine}no_commit_required = true\n\n[[task.cell]]\ncwd = {cwd:?}\ncommand = \"exit 0\"\nmode = \"raw\"\n\n[[task.cell.proof]]\ncommand = \"exit 1\"\nmode = \"raw\"\n"
+        "no_review = true\n\n[[task]]\nname = \"mailbox-proof-failure\"\nproject = {project:?}\n{machine}no_commit_required = true\n\n[[task.cell]]\ncwd = {cwd:?}\ncommand = \"exit 0\"\nmode = \"raw\"\n\n[[task.cell.proof]]\ncommand = \"exit 1\"\nmode = \"raw\"\n"
     )
 }

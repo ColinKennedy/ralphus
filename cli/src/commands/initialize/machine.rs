@@ -92,7 +92,7 @@ fn fixture_toml(project: &str, cwd: &str) -> String {
         )
     };
     format!(
-        "[[task]]\nname = \"loopback-exercise\"\nproject = {project:?}\nmachine = {REMOTE_MACHINE:?}\nno_commit_required = true\n\n[[task.cell]]\ncwd = {cwd:?}\ncommand = {write:?}\nmode = \"raw\"\n\n[task.cell.environment]\nEXERCISE_ENV = {EXPECTED:?}\n\n[[task.cell.proof]]\ncommand = {check:?}\nmode = \"raw\"\n"
+        "no_review = true\n\n[[task]]\nname = \"loopback-exercise\"\nproject = {project:?}\nmachine = {REMOTE_MACHINE:?}\nno_commit_required = true\n\n[[task.cell]]\ncwd = {cwd:?}\ncommand = {write:?}\nmode = \"raw\"\n\n[task.cell.environment]\nEXERCISE_ENV = {EXPECTED:?}\n\n[[task.cell.proof]]\ncommand = {check:?}\nmode = \"raw\"\n"
     )
 }
 

@@ -116,6 +116,10 @@ pub struct Daemon {
     /// `health_sweep`'s precedent, so a plain `Daemon::new` (unit tests) gets
     /// the state without a live background thread.
     watchdog: Arc<crate::watchdog::WatchdogState>,
+    /// Whether `[daemon].validate_submit_review` is consulted at all. `false`
+    /// in [`Daemon::new`] so in-process tests that submit review-less TOML keep
+    /// working; `serve()` turns it on via [`Daemon::with_review_intent_policy`].
+    review_intent_policy: bool,
 }
 
 /// How to run a unit of background follow-up work spawned from a request
@@ -222,7 +226,21 @@ impl Daemon {
             background: BackgroundWork::Immediate,
             health_sweep: crate::health_sweep::HealthSweepState::new(),
             watchdog: crate::watchdog::WatchdogState::new(),
+            review_intent_policy: false,
         }
+    }
+
+    /// Apply `[daemon].validate_submit_review` (default on) to submissions and
+    /// validation requests.
+    #[must_use]
+    pub fn with_review_intent_policy(mut self) -> Self {
+        self.review_intent_policy = true;
+        self
+    }
+
+    /// Whether a submission must state review intent right now.
+    fn review_intent_required(&self) -> bool {
+        self.review_intent_policy && crate::config::load_daemon_config().validate_submit_review()
     }
 
     /// Override how `submit`'s materialization follow-up runs (see
@@ -2673,6 +2691,9 @@ fn validate_endpoint(daemon: &Daemon, body: &str) -> Reply {
         if let Ok(file) = toml::from_str::<ralphus_core::schema::TaskFile>(&req.toml) {
             report
                 .errors
+                .extend(review_intent_errors(&file, daemon.review_intent_required()));
+            report
+                .errors
                 .extend(crate::agent_profiles::validate_task_file_profiles(
                     &daemon.lock(),
                     &req.toml,
@@ -2688,6 +2709,23 @@ fn validate_endpoint(daemon: &Daemon, body: &str) -> Reply {
             warnings: &report.warnings,
         },
     )
+}
+
+/// The missing-review-intent finding for `file`, empty when `required` is
+/// false or the file selects a review or sets `no_review = true`.
+fn review_intent_errors(
+    file: &ralphus_core::schema::TaskFile,
+    required: bool,
+) -> Vec<ralphus_core::validate::ValidationError> {
+    if !required || file.has_review_intent() {
+        return Vec::new();
+    }
+    vec![ralphus_core::validate::ValidationError {
+        path: "no_review".to_string(),
+        kind: ralphus_core::validate::ErrorKind::MissingRequired,
+        message: ralphus_core::schema::MISSING_REVIEW_INTENT_MESSAGE.to_string(),
+        line: None,
+    }]
 }
 
 /// For every task with at least one placeholder-`cwd` cell, check that its
@@ -6898,6 +6936,15 @@ pub(crate) fn submit(daemon: &Daemon, body: &str, query: &str, user_header: Opti
             );
         }
     };
+    let intent_errors = review_intent_errors(&file, daemon.review_intent_required());
+    if !intent_errors.is_empty() {
+        return error(
+            400,
+            "validation_failed",
+            "the submitted TOML is invalid",
+            intent_errors,
+        );
+    }
     // RAL-476: resolve and stamp the squad's submitter before it's persisted
     // -- explicit TOML `submitter` if present (subject to the admin-conflict
     // check), else the resolved request identity, else `None`. See
@@ -20137,6 +20184,7 @@ pub fn serve<A: ToSocketAddrs>(
     let daemon = Arc::new(
         Daemon::new(store, max_concurrent)
             .with_token(token)
+            .with_review_intent_policy()
             .with_background_work(BackgroundWork::Threaded),
     );
     // RAL-635: load the forge poll-token pool and let it report exhaustion.
@@ -22365,6 +22413,91 @@ mod tests {
         assert_eq!(doc["openapi"], "3.1.0");
         assert!(doc["paths"]["/api/openapi.json"]["get"].is_object());
         assert!(!r.body.contains("daemon.token"));
+    }
+
+    const REVIEWED: &str = "[[review]]
+id=\"r\"
+[[task]]
+name=\"t\"
+[[task.cell]]
+cwd=\"/r\"
+prompt=\"p\"
+review=\"<<review:r>>\"
+";
+    const OPTED_OUT: &str = "no_review = true
+[[task]]
+name=\"t\"
+[[task.cell]]
+cwd=\"/r\"
+prompt=\"p\"
+";
+
+    #[test]
+    fn review_intent_required_rejects_submit_and_validate_without_intent() {
+        let d = daemon().with_review_intent_policy();
+        let r = route(&d, "POST", "/api/squads", &submit_body(GOOD));
+        assert_eq!(r.status, 400, "{}", r.body);
+        assert!(r.body.contains("no_review = true"), "{}", r.body);
+        assert!(r.body.contains("[[review]]"), "{}", r.body);
+        let r = route(&d, "POST", "/api/squads/validate", &submit_body(GOOD));
+        assert!(r.body.contains("\"valid\":false"), "{}", r.body);
+        assert!(r.body.contains("no_review = true"), "{}", r.body);
+    }
+
+    #[test]
+    fn review_intent_required_accepts_review_or_explicit_no_review() {
+        let d = daemon().with_review_intent_policy();
+        for toml in [REVIEWED, OPTED_OUT] {
+            let r = route(&d, "POST", "/api/squads/validate", &submit_body(toml));
+            assert!(r.body.contains("\"valid\":true"), "{}", r.body);
+            let r = route(&d, "POST", "/api/squads", &submit_body(toml));
+            assert_eq!(r.status, 201, "{}", r.body);
+        }
+    }
+
+    #[test]
+    fn review_intent_not_required_when_policy_disabled() {
+        let file: ralphus_core::schema::TaskFile = toml::from_str(GOOD).unwrap();
+        assert!(review_intent_errors(&file, false).is_empty());
+        assert_eq!(review_intent_errors(&file, true).len(), 1);
+        let d = daemon();
+        let r = route(&d, "POST", "/api/squads", &submit_body(GOOD));
+        assert_eq!(r.status, 201, "{}", r.body);
+    }
+
+    #[test]
+    fn review_intent_satisfied_by_authored_review_selection_only() {
+        let selected = "[[review]]
+id=\"r\"
+[[task]]
+name=\"t\"
+[[task.cell]]
+cwd=\"/r\"
+prompt=\"p\"
+review=\"<<review:r>>\"
+";
+        let declared_only = "[[review]]
+id=\"r\"
+[[task]]
+name=\"t\"
+[[task.cell]]
+cwd=\"/r\"
+prompt=\"p\"
+";
+        let f: ralphus_core::schema::TaskFile = toml::from_str(selected).unwrap();
+        assert!(review_intent_errors(&f, true).is_empty());
+        let f: ralphus_core::schema::TaskFile = toml::from_str(declared_only).unwrap();
+        assert_eq!(review_intent_errors(&f, true).len(), 1);
+        let triaged = "[[task]]
+name=\"t\"
+project=\"p\"
+[[task.cell]]
+cwd=\"/r\"
+prompt=\"p\"
+triage=true
+";
+        let f: ralphus_core::schema::TaskFile = toml::from_str(triaged).unwrap();
+        assert!(review_intent_errors(&f, true).is_empty());
     }
 
     #[test]
