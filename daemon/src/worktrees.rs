@@ -30,7 +30,8 @@
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, LazyLock};
+use std::sync::{Arc, LazyLock, Weak};
+use std::time::{Duration, Instant};
 
 use opentelemetry::Context;
 use opentelemetry::trace::{SpanKind, Status};
@@ -228,20 +229,12 @@ fn existing_task_worktree_branches(root: &Path) -> HashMap<String, String> {
 /// claimed by an in-flight materialization but not yet visible via a live
 /// `git worktree list --porcelain` query. [`resolve_task_worktree_dir_with_existing`]'s
 /// collision avoidance (and [`resolve_squad_branch`]'s "is this branch
-/// already checked out somewhere" check) used to be safe purely because the
-/// daemon's global store lock serialized a submission's whole
-/// materialization pass start to finish, INCLUDING the actual `git worktree
-/// add` -- see [`resolve_task_worktree_dir_with_existing`]'s doc comment.
-/// Splitting slot *decision* (fast, still made under the lock -- see
-/// [`plan_local_worktree_jobs`]) from slot *creation* (slow, deliberately
-/// run WITHOUT the lock so it can also run in parallel) broke that: a second
-/// submission's locked planning pass can now run before the first
-/// submission's `git worktree add` has actually landed on disk, and would
-/// otherwise see a stale, still-empty `w/` directory and pick the same slot
-/// for a different branch. This registry closes that gap -- a slot is
-/// recorded the moment a decision is made to use it, before any git command
-/// runs. Entries are never removed: once a worktree genuinely exists, a live
-/// git query agrees anyway, so a stale entry is harmless.
+/// already checked out somewhere" check) needs this because slot creation runs
+/// after the repository planning lock is released. A second submission can
+/// therefore plan before the first submission's `git worktree add` is visible
+/// on disk. A slot is recorded the moment a decision is made, before creation
+/// starts. Entries are never removed: once a worktree genuinely exists, a live
+/// git query agrees, so a stale entry is harmless.
 static RESERVED_WORKTREE_SLOTS: LazyLock<
     parking_lot::Mutex<HashMap<PathBuf, HashMap<String, String>>>,
 > = LazyLock::new(|| parking_lot::Mutex::new(HashMap::new()));
@@ -437,7 +430,109 @@ static WORKTREE_CREATIONS: LazyLock<CreationRegistry> = LazyLock::new(|| {
 /// Serializes the choose-a-slot-then-claim-it step of every creation: picking
 /// the `w/<short>` directory and writing its marker happen under this one lock,
 /// so two creations can never both decide the same free slot.
-static WORKTREE_PLAN_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+const WORKTREE_PLAN_LOCK_TIMEOUT: Duration = Duration::from_secs(60);
+
+#[derive(Debug, Clone)]
+struct WorktreePlanHolder {
+    squad_id: Option<String>,
+    phase: String,
+}
+
+#[derive(Default)]
+struct RepositoryPlanLock {
+    gate: parking_lot::Mutex<()>,
+    holder: parking_lot::Mutex<Option<WorktreePlanHolder>>,
+}
+
+/// Process-local allocation locks, keyed by the same normalized repository
+/// identity used for persisted path comparisons. Durable creation markers are
+/// still the cross-process collision guard.
+static WORKTREE_PLAN_LOCKS: LazyLock<
+    parking_lot::Mutex<HashMap<String, Weak<RepositoryPlanLock>>>,
+> = LazyLock::new(|| parking_lot::Mutex::new(HashMap::new()));
+
+struct WorktreePlanHolderGuard<'a> {
+    holder: &'a parking_lot::Mutex<Option<WorktreePlanHolder>>,
+}
+
+impl Drop for WorktreePlanHolderGuard<'_> {
+    fn drop(&mut self) {
+        *self.holder.lock() = None;
+    }
+}
+
+/// Run the snapshot-and-claim portion of worktree allocation under the lock
+/// for one normalized repository root.
+///
+/// Lock order is: registry (released immediately), repository planning lock,
+/// store lock, then reservation/creation-marker state. Callers must release
+/// the repository lock before checkout, fetch, rebase, cleanup retries,
+/// initialization, or agent execution. `parking_lot` guards are not poisoned,
+/// so panic unwinding releases both the holder breadcrumb and the gate.
+fn with_repository_plan_lock<T>(
+    root: &Path,
+    squad_id: Option<&str>,
+    phase: impl Into<String>,
+    operation: impl FnOnce() -> T,
+) -> Result<T, String> {
+    with_repository_plan_lock_for(root, squad_id, phase, WORKTREE_PLAN_LOCK_TIMEOUT, operation)
+}
+
+fn with_repository_plan_lock_for<T>(
+    root: &Path,
+    squad_id: Option<&str>,
+    phase: impl Into<String>,
+    timeout: Duration,
+    operation: impl FnOnce() -> T,
+) -> Result<T, String> {
+    let normalized_root = crate::triage::normalize_path_key(root);
+    let state = {
+        let mut registry = WORKTREE_PLAN_LOCKS.lock();
+        registry.retain(|_, entry| entry.strong_count() > 0);
+        match registry.get(&normalized_root).and_then(Weak::upgrade) {
+            Some(state) => state,
+            None => {
+                let state = Arc::new(RepositoryPlanLock::default());
+                registry.insert(normalized_root.clone(), Arc::downgrade(&state));
+                state
+            }
+        }
+    };
+    let started = Instant::now();
+    let Some(_gate) = state.gate.try_lock_for(timeout) else {
+        let waited = started.elapsed();
+        let holder = state.holder.lock().clone();
+        let owner = holder.map_or_else(
+            || "owning operation unavailable".to_string(),
+            |holder| {
+                format!(
+                    "holder squad {}, phase {}",
+                    holder.squad_id.as_deref().unwrap_or("unavailable"),
+                    holder.phase
+                )
+            },
+        );
+        let retry = squad_id.map_or_else(
+            || {
+                "retry the operation after the current repository planning work finishes"
+                    .to_string()
+            },
+            |id| format!("run `ralphus squad retry {id}`"),
+        );
+        return Err(format!(
+            "timed out after {}ms waiting to plan worktrees for repository {normalized_root} ({owner}); {retry}",
+            waited.as_millis()
+        ));
+    };
+    *state.holder.lock() = Some(WorktreePlanHolder {
+        squad_id: squad_id.map(str::to_string),
+        phase: phase.into(),
+    });
+    let _holder = WorktreePlanHolderGuard {
+        holder: &state.holder,
+    };
+    Ok(operation())
+}
 
 /// What [`ensure_worktree_tracked`] did, for the caller's Cartographer notes.
 #[derive(Debug, Clone)]
@@ -477,17 +572,14 @@ fn reserve_worktree_slot(root: &Path, plan: &WorktreePlan, branch: &str) {
 /// directories, `<short>` and `<short>-2`, instead of silently sharing one
 /// worktree and racing on its git index.
 ///
-/// Queries live git state (via [`existing_task_worktree_branches`]) rather
-/// than an in-memory set, and reuses the exact suffix scheme
+/// Uses a caller-provided live Git snapshot and reuses the exact suffix scheme
 /// [`crate::short_paths::dedupe_short_names`] uses for guardian branches
 /// (`-2`, `-3`, ...) -- but computed incrementally here since, unlike a
 /// guardian's fixed branch list, task-worktree branches are discovered one
 /// `ensure_worktree` call at a time, potentially across many squads over the
-/// project's lifetime. That live query is also what makes this safe under
-/// concurrent squads: [`resolve_placeholders`] runs its whole pass under the
-/// daemon's global store lock, so by the time a second squad's call re-reads
-/// `git worktree list`, the first squad's `git worktree add` has already
-/// landed and claims its slot.
+/// project's lifetime. Snapshot-and-claim callers serialize this decision with
+/// the repository planning lock and record it in the reservation registry and
+/// durable marker before releasing that lock.
 ///
 /// A directory already occupied by `branch` itself is reused as-is (restart
 /// safety: the branch keeps the same directory across a squad restart). A
@@ -605,10 +697,17 @@ fn resolve_squad_branch(
     project: &ProjectView,
     base_branch: &str,
     squad_id: &str,
-    on_disk: &HashMap<String, String>,
+    _on_disk: &HashMap<String, String>,
 ) -> Result<String, String> {
-    let guard = store.lock();
-    resolve_squad_branch_claim(&guard, project, base_branch, squad_id, on_disk)
+    let root = Path::new(&project.path);
+    with_repository_plan_lock(root, Some(squad_id), "allocate fallback branch", || {
+        let on_disk = existing_and_reserved_worktree_branches(root);
+        if names_remote_tracking_branch(root, base_branch) {
+            return Ok(base_branch.to_string());
+        }
+        let guard = store.lock();
+        resolve_squad_branch_claim(&guard, project, base_branch, squad_id, &on_disk)
+    })?
 }
 
 /// [`resolve_squad_branch`]'s claim decision.
@@ -621,12 +720,8 @@ fn resolve_squad_branch(
 /// branch as free and both claim it, handing two squads the same worktree --
 /// which is exactly the failure RAL-337 introduced this allocation to prevent.
 ///
-/// Also the sole gate for the remote-tracking exemption documented on
-/// [`resolve_squad_branch`] -- this function has a second, direct caller
-/// ([`plan_local_worktree_jobs`]) that already holds the store guard it would
-/// otherwise need to take itself, so the exemption lives here rather than in
-/// [`resolve_squad_branch`] alone, where that second caller would silently
-/// miss it.
+/// The caller must handle the remote-tracking exemption before acquiring the
+/// store lock because detecting it runs Git plumbing.
 fn resolve_squad_branch_claim(
     store: &Store,
     project: &ProjectView,
@@ -634,9 +729,6 @@ fn resolve_squad_branch_claim(
     squad_id: &str,
     on_disk: &HashMap<String, String>,
 ) -> Result<String, String> {
-    if names_remote_tracking_branch(Path::new(&project.path), base_branch) {
-        return Ok(base_branch.to_string());
-    }
     if let Some(existing) = store
         .task_worktree_claim_for_squad(&project.name, base_branch, squad_id)
         .map_err(|e| e.to_string())?
@@ -1633,9 +1725,10 @@ pub(crate) fn ensure_worktree_tracked(
 /// creator for this `(root, branch)`.
 ///
 /// The slot is chosen from LIVE state (`git worktree list` plus in-process
-/// reservations plus durable creation markers) under [`WORKTREE_PLAN_LOCK`] and
-/// claimed -- marker written, slot reserved -- before the lock is released, so
-/// no other creation can pick it. Then, with a slot decided:
+/// reservations plus durable creation markers) under the repository's planning
+/// lock and claimed -- marker written, slot reserved -- before the lock is
+/// released, so no other creation for that repository can pick it. Then, with
+/// a slot decided:
 ///
 /// - a marker naming this branch means an earlier creation here was
 ///   interrupted: the leftovers are provably ours, so they are removed and the
@@ -1652,58 +1745,70 @@ fn materialize_exclusively(
     upstream: &str,
 ) -> Result<Materialized, String> {
     let mut repaired = None;
-    let (plan, marker_short) = {
-        let _slot = WORKTREE_PLAN_LOCK.lock();
-        let existing = existing_and_reserved_worktree_branches(root);
-        let mut plan = plan_worktree(root, branch, &existing)?;
-        let short = plan
-            .wt
-            .file_name()
-            .and_then(|n| n.to_str())
-            .ok_or_else(|| format!("worktree path {} has no directory name", plan.wt.display()))?
-            .to_string();
-        let marker = creation_marker_path(root, &short);
-        let owned =
-            read_creation_marker(&marker).is_some_and(|(b, _)| b.eq_ignore_ascii_case(branch));
-        if marker.exists() && !owned {
-            return Err(format!(
-                "worktree slot {} is claimed by another creation (marker {}); refusing to touch it",
-                plan.wt.display(),
-                marker.display()
-            ));
-        }
-        if owned {
-            if plan.wt.exists() {
-                clean_half_created_worktree(root, &plan.wt)?;
-                repaired = Some(format!(
-                    "an interrupted creation of {} was found (ownership proven by marker {}); removed it and creating it again",
+    let (plan, marker_short, repair_owned) = with_repository_plan_lock(
+        root,
+        None,
+        format!("materialize branch {branch}"),
+        || {
+            let existing = existing_and_reserved_worktree_branches(root);
+            let mut plan = plan_worktree(root, branch, &existing)?;
+            let short = plan
+                .wt
+                .file_name()
+                .and_then(|n| n.to_str())
+                .ok_or_else(|| {
+                    format!("worktree path {} has no directory name", plan.wt.display())
+                })?
+                .to_string();
+            let marker = creation_marker_path(root, &short);
+            let owned =
+                read_creation_marker(&marker).is_some_and(|(b, _)| b.eq_ignore_ascii_case(branch));
+            if marker.exists() && !owned {
+                return Err(format!(
+                    "worktree slot {} is claimed by another creation (marker {}); refusing to touch it",
                     plan.wt.display(),
                     marker.display()
                 ));
-            } else {
-                // Registered with git but its directory is gone, or never begun.
-                let _ = git(root, &["worktree", "prune"]);
             }
-            plan.already_exists = false;
-        } else if !plan.already_exists && dir_is_non_empty(&plan.wt) {
-            return Err(format!(
-                "{} already exists and is not a worktree ralphus created for \"{branch}\" (no creation marker); refusing to overwrite or delete it -- move it aside and retry",
-                plan.wt.display()
-            ));
-        }
-        if plan.already_exists {
-            (plan, None)
-        } else {
-            if !write_creation_marker(root, &short, branch, upstream)? {
+            if owned {
+                plan.already_exists = false;
+            } else if !plan.already_exists && dir_is_non_empty(&plan.wt) {
                 return Err(format!(
-                    "worktree slot {} was claimed by another creation while this one was starting; refusing to touch it",
+                    "{} already exists and is not a worktree ralphus created for \"{branch}\" (no creation marker); refusing to overwrite or delete it -- move it aside and retry",
                     plan.wt.display()
                 ));
             }
-            reserve_worktree_slot(root, &plan, branch);
-            (plan, Some(short))
+            if plan.already_exists {
+                Ok((plan, None, false))
+            } else {
+                if !write_creation_marker(root, &short, branch, upstream)? {
+                    return Err(format!(
+                        "worktree slot {} was claimed by another creation while this one was starting; refusing to touch it",
+                        plan.wt.display()
+                    ));
+                }
+                reserve_worktree_slot(root, &plan, branch);
+                Ok((plan, Some(short), owned))
+            }
+        },
+    )??;
+    if repair_owned {
+        let marker = marker_short
+            .as_deref()
+            .map(|short| creation_marker_path(root, short))
+            .expect("an owned interrupted creation has a marker");
+        if plan.wt.exists() {
+            clean_half_created_worktree(root, &plan.wt)?;
+            repaired = Some(format!(
+                "an interrupted creation of {} was found (ownership proven by marker {}); removed it and creating it again",
+                plan.wt.display(),
+                marker.display()
+            ));
+        } else {
+            // Registered with git but its directory is gone, or never begun.
+            let _ = git(root, &["worktree", "prune"]);
         }
-    };
+    }
     let init_spec = crate::worktree_init::take(root, branch);
     let path = execute_worktree_plan(root, branch, upstream, &plan)?;
     // RAL-615: initialization runs after the worktree is fully set up and
@@ -3100,11 +3205,12 @@ pub(crate) struct LocalWorktreeJob {
 /// Decide every LOCAL (no `machine` set) worktree placeholder among `cells`'
 /// materialization up front -- the branch this squad gets (RAL-337) and the
 /// `w/<short>` directory it lands in -- WITHOUT running the slow `git
-/// worktree add`/`fetch`/rebase. Everything here is fast (DB reads/writes plus
-/// local git plumbing and one marker file per slot, no network, no checkout),
-/// so it's safe to run under the store lock. The worktrees themselves are
-/// created later, in the background or when their cell comes due, from the
-/// claims this leaves behind ([`pending_worktree_at`]).
+/// worktree add`/`fetch`/rebase. Local Git/filesystem inventory and marker
+/// claims run under a per-repository planning lock without the global store
+/// lock. The store lock is acquired only around the atomic SQLite branch-claim
+/// transaction. The worktrees themselves are created later, in the background
+/// or when their cell comes due, from the claims this leaves behind
+/// ([`pending_worktree_at`]).
 ///
 /// Each decided slot is durably claimed ([`claim_worktree_slot`]) so neither a
 /// later cell in this same call nor a concurrent submission's own planning
@@ -3117,24 +3223,32 @@ pub(crate) struct LocalWorktreeJob {
 /// unchanged locked pass through [`resolve_placeholders_with_prefetch`]
 /// resolves it exactly as it always has, live. A miss here only costs time,
 /// never correctness.
-#[must_use]
 pub(crate) fn plan_local_worktree_jobs(
-    store: &Store,
+    store: &StoreHandle,
     squad_id: &str,
     cells: &[CellRow],
     tasks: &[TaskRow],
     prefetched_upstreams: &HashMap<(String, String), String>,
-) -> Vec<LocalWorktreeJob> {
+) -> Result<Vec<LocalWorktreeJob>, String> {
+    struct Candidate<'a> {
+        cell: &'a CellRow,
+        project: ProjectView,
+        branch: String,
+        raw_upstream: String,
+        cache_key: String,
+    }
+
     let task_projects: HashMap<i64, Option<&str>> = tasks
         .iter()
         .map(|t| (t.idx, t.project.as_deref()))
         .collect();
-    let mut on_disk: HashMap<PathBuf, HashMap<String, String>> = HashMap::new();
+    let mut candidates: BTreeMap<String, (PathBuf, Vec<Candidate<'_>>)> = BTreeMap::new();
     let mut jobs: HashMap<String, LocalWorktreeJob> = HashMap::new();
     // A cell this skips falls back to being created at submit, which is
     // correct but slow -- say why, so a squad that is slow to materialize can
     // be explained from the Cartographer instead of guessed at.
     let skip = |cell: &CellRow, reason: &str| {
+        let guard = store.lock();
         crate::cartographer::Note::new("worktrees")
             .level(crate::logging::LogLevel::INFO)
             .scope("materialize")
@@ -3142,7 +3256,7 @@ pub(crate) fn plan_local_worktree_jobs(
             .task(&cell.task_name)
             .cell(&cell.cell_id)
             .emit(
-                store,
+                &guard,
                 format!(
                     "cell {squad_id}/{} worktree is not deferred and will be created during \
                      submit: {reason}",
@@ -3185,7 +3299,11 @@ pub(crate) fn plan_local_worktree_jobs(
             skip(cell, "its task has no project");
             continue;
         };
-        let Ok(Some(project)) = store.resolve_project(project_name) else {
+        let project = {
+            let guard = store.lock();
+            guard.resolve_project(project_name)
+        };
+        let Ok(Some(project)) = project else {
             skip(cell, &format!("project {project_name:?} is not registered"));
             continue;
         };
@@ -3200,58 +3318,82 @@ pub(crate) fn plan_local_worktree_jobs(
             continue;
         };
         let root = PathBuf::from(&project.path);
-        let upstream = match resolve_upstream(&root, raw_upstream) {
-            Ok(upstream) => upstream,
-            Err(e) => {
-                skip(cell, &format!("could not resolve its upstream: {e}"));
-                continue;
-            }
-        };
-        let upstream = prefetched_upstreams
-            .get(&(project.name.clone(), upstream.clone()))
-            .cloned()
-            .unwrap_or(upstream);
-        if !on_disk.contains_key(&root) {
-            on_disk.insert(root.clone(), existing_and_reserved_worktree_branches(&root));
-        }
-        let branch_result = {
-            let snapshot = on_disk.get(&root).expect("just inserted above");
-            resolve_squad_branch_claim(store, &project, branch, squad_id, snapshot)
-        };
-        let branch = match branch_result {
-            Ok(branch) => branch,
-            Err(e) => {
-                skip(cell, &format!("could not allocate a branch: {e}"));
-                continue;
-            }
-        };
-        let plan = match claim_worktree_slot(
-            &root,
-            &branch,
-            &upstream,
-            on_disk.get_mut(&root).expect("populated above"),
-        ) {
-            Ok(plan) => plan,
-            Err(e) => {
-                skip(cell, &format!("could not claim a worktree directory: {e}"));
-                continue;
-            }
-        };
-        // Only cache newly-planned worktrees, not pre-existing ones. Pre-existing
-        // worktrees need to go through ensure_worktree_tracked to resync to the
-        // latest remote state (RAL-612). See resolve_placeholders_inner's use of
-        // prefetched_worktrees as a shortcut cache.
-        if !plan.already_exists {
-            jobs.insert(
-                cache_key.clone(),
-                LocalWorktreeJob {
-                    cache_key,
-                    wt: plan.wt,
-                },
-            );
-        }
+        let normalized = crate::triage::normalize_path_key(&root);
+        candidates
+            .entry(normalized)
+            .or_insert_with(|| (root, Vec::new()))
+            .1
+            .push(Candidate {
+                cell,
+                project,
+                branch: branch.to_string(),
+                raw_upstream: raw_upstream.to_string(),
+                cache_key,
+            });
     }
-    jobs.into_values().collect()
+
+    for (_, (root, root_candidates)) in candidates {
+        with_repository_plan_lock(&root, Some(squad_id), "snapshot and claim", || {
+            let mut snapshot = existing_and_reserved_worktree_branches(&root);
+            for candidate in root_candidates {
+                let upstream = match resolve_upstream(&root, &candidate.raw_upstream) {
+                    Ok(upstream) => upstream,
+                    Err(e) => {
+                        skip(
+                            candidate.cell,
+                            &format!("could not resolve its upstream: {e}"),
+                        );
+                        continue;
+                    }
+                };
+                let upstream = prefetched_upstreams
+                    .get(&(candidate.project.name.clone(), upstream.clone()))
+                    .cloned()
+                    .unwrap_or(upstream);
+                let branch_result = if names_remote_tracking_branch(&root, &candidate.branch) {
+                    Ok(candidate.branch.clone())
+                } else {
+                    let guard = store.lock();
+                    resolve_squad_branch_claim(
+                        &guard,
+                        &candidate.project,
+                        &candidate.branch,
+                        squad_id,
+                        &snapshot,
+                    )
+                };
+                let branch = match branch_result {
+                    Ok(branch) => branch,
+                    Err(e) => {
+                        skip(candidate.cell, &format!("could not allocate a branch: {e}"));
+                        continue;
+                    }
+                };
+                let plan = match claim_worktree_slot(&root, &branch, &upstream, &mut snapshot) {
+                    Ok(plan) => plan,
+                    Err(e) => {
+                        skip(
+                            candidate.cell,
+                            &format!("could not claim a worktree directory: {e}"),
+                        );
+                        continue;
+                    }
+                };
+                // Existing worktrees go through ensure_worktree_tracked to
+                // resync to the latest remote state (RAL-612).
+                if !plan.already_exists {
+                    jobs.insert(
+                        candidate.cache_key.clone(),
+                        LocalWorktreeJob {
+                            cache_key: candidate.cache_key,
+                            wt: plan.wt,
+                        },
+                    );
+                }
+            }
+        })?;
+    }
+    Ok(jobs.into_values().collect())
 }
 
 /// How many worktrees the background creator materializes at once. A ceiling
@@ -3428,8 +3570,182 @@ fn resolve_placeholders_inner(
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::mpsc;
 
     static TEST_N: AtomicU32 = AtomicU32::new(0);
+
+    fn planning_test_root(label: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "ralphus-plan-lock-{label}-{}-{}",
+            std::process::id(),
+            TEST_N.fetch_add(1, Ordering::Relaxed)
+        ))
+    }
+
+    #[test]
+    fn repository_plan_lock_serializes_the_same_root_only_through_claim_completion() {
+        let root = planning_test_root("same-root");
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let second_entered = std::sync::atomic::AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            let held_root = root.clone();
+            scope.spawn(move || {
+                with_repository_plan_lock_for(
+                    &held_root,
+                    Some("squad-1"),
+                    "inventory",
+                    Duration::from_secs(1),
+                    || {
+                        entered_tx.send(()).unwrap();
+                        release_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+                    },
+                )
+                .unwrap();
+            });
+            entered_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+            let second = &second_entered;
+            scope.spawn(move || {
+                with_repository_plan_lock_for(
+                    &root,
+                    Some("squad-2"),
+                    "claim",
+                    Duration::from_secs(1),
+                    || second.store(true, Ordering::Release),
+                )
+                .unwrap();
+            });
+            std::thread::sleep(Duration::from_millis(30));
+            assert!(!second_entered.load(Ordering::Acquire));
+            release_tx.send(()).unwrap();
+        });
+    }
+
+    #[test]
+    fn repository_plan_locks_allow_different_roots_to_plan_concurrently() {
+        let root_a = planning_test_root("root-a");
+        let root_b = planning_test_root("root-b");
+        let (held_tx, held_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        std::thread::scope(|scope| {
+            scope.spawn(move || {
+                with_repository_plan_lock_for(
+                    &root_a,
+                    Some("squad-a"),
+                    "inventory",
+                    Duration::from_secs(1),
+                    || {
+                        held_tx.send(()).unwrap();
+                        release_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+                    },
+                )
+                .unwrap();
+            });
+            held_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+            let (other_tx, other_rx) = mpsc::channel();
+            scope.spawn(move || {
+                with_repository_plan_lock_for(
+                    &root_b,
+                    Some("squad-b"),
+                    "inventory",
+                    Duration::from_secs(1),
+                    || other_tx.send(()).unwrap(),
+                )
+                .unwrap();
+            });
+            other_rx
+                .recv_timeout(Duration::from_millis(200))
+                .expect("a different repository must not wait for the held root");
+            release_tx.send(()).unwrap();
+        });
+    }
+
+    #[test]
+    fn repository_plan_lock_timeout_reports_root_holder_and_retry() {
+        let root = planning_test_root("timeout");
+        let normalized = crate::triage::normalize_path_key(&root);
+        let (held_tx, held_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        std::thread::scope(|scope| {
+            let held_root = root.clone();
+            scope.spawn(move || {
+                with_repository_plan_lock_for(
+                    &held_root,
+                    Some("squad-holder"),
+                    "inventory",
+                    Duration::from_secs(1),
+                    || {
+                        held_tx.send(()).unwrap();
+                        release_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+                    },
+                )
+                .unwrap();
+            });
+            held_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+            let err = with_repository_plan_lock_for(
+                &root,
+                Some("squad-waiter"),
+                "claim",
+                Duration::from_millis(20),
+                || (),
+            )
+            .unwrap_err();
+            assert!(err.contains(&normalized), "{err}");
+            assert!(err.contains("squad-holder"), "{err}");
+            assert!(err.contains("inventory"), "{err}");
+            assert!(err.contains("ralphus squad retry squad-waiter"), "{err}");
+            release_tx.send(()).unwrap();
+        });
+    }
+
+    #[test]
+    fn repository_plan_lock_is_released_after_panic() {
+        let root = planning_test_root("panic");
+        let outcome = std::panic::catch_unwind(|| {
+            let _ = with_repository_plan_lock_for(
+                &root,
+                Some("squad-panic"),
+                "inventory",
+                Duration::from_millis(50),
+                || panic!("planned test panic"),
+            );
+        });
+        assert!(outcome.is_err());
+        with_repository_plan_lock_for(
+            &root,
+            Some("squad-after"),
+            "claim",
+            Duration::from_millis(50),
+            || (),
+        )
+        .expect("panic unwinding must release the repository planning lock");
+    }
+
+    #[test]
+    fn held_repository_plan_lock_does_not_block_store_access() {
+        let root = planning_test_root("store-responsive");
+        let store = crate::store_lock::StoreMutex::new(Store::open_in_memory().unwrap());
+        let (held_tx, held_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        std::thread::scope(|scope| {
+            scope.spawn(move || {
+                with_repository_plan_lock_for(
+                    &root,
+                    Some("squad-holder"),
+                    "slow inventory",
+                    Duration::from_secs(1),
+                    || {
+                        held_tx.send(()).unwrap();
+                        release_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+                    },
+                )
+                .unwrap();
+            });
+            held_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+            assert!(store.try_lock_for(Duration::from_millis(50)).is_some());
+            release_tx.send(()).unwrap();
+        });
+    }
 
     #[test]
     fn remove_dir_all_retrying_removes_a_populated_tree_and_tolerates_a_missing_one() {
@@ -6096,7 +6412,7 @@ mod tests {
         ];
 
         let jobs =
-            plan_local_worktree_jobs(&store.lock(), "squad-1", &cells, &tasks, &HashMap::new());
+            plan_local_worktree_jobs(&store, "squad-1", &cells, &tasks, &HashMap::new()).unwrap();
         assert_eq!(jobs.len(), 3, "one claim per distinct branch");
         let planned = planned_worktree_paths(&jobs);
         for path in planned.values() {
@@ -6177,7 +6493,7 @@ mod tests {
         let tasks = vec![task_row(0, Some("proj")), task_row(1, Some("proj"))];
 
         let jobs =
-            plan_local_worktree_jobs(&store.lock(), "squad-1", &cells, &tasks, &HashMap::new());
+            plan_local_worktree_jobs(&store, "squad-1", &cells, &tasks, &HashMap::new()).unwrap();
         assert_eq!(jobs.len(), 2, "one claim per distinct branch");
         let planned = planned_worktree_paths(&jobs);
         for path in planned.values() {
@@ -6252,7 +6568,7 @@ mod tests {
             )];
             let tasks = vec![task_row(0, Some("proj"))];
             let jobs =
-                plan_local_worktree_jobs(&store.lock(), squad, &cells, &tasks, &HashMap::new());
+                plan_local_worktree_jobs(&store, squad, &cells, &tasks, &HashMap::new()).unwrap();
             assert_eq!(jobs.len(), 1);
             jobs[0].wt.clone()
         };
@@ -6296,6 +6612,34 @@ mod tests {
         assert_eq!(
             (branch.as_str(), upstream.as_deref()),
             ("feat-x", Some("main"))
+        );
+    }
+
+    /// A marker created after the caller's snapshot is taken is treated as
+    /// foreign state: refresh and choose another slot without altering it.
+    #[test]
+    fn stale_snapshot_marker_collision_refreshes_without_deleting_foreign_claim() {
+        let repo = init_repo("stale-marker");
+        let mut stale_snapshot = HashMap::new();
+        let foreign_branch = "test-pr-submission-a";
+        let our_branch = "test-pr-submission-b";
+        let foreign_short = marker_short(&repo, foreign_branch);
+        assert!(write_creation_marker(&repo, &foreign_short, foreign_branch, "main").unwrap());
+
+        let plan = claim_worktree_slot(&repo, our_branch, "main", &mut stale_snapshot).unwrap();
+        assert_ne!(plan.wt, worktree_dir(&repo, foreign_branch));
+        assert_eq!(
+            read_creation_marker(&creation_marker_path(&repo, &foreign_short))
+                .unwrap()
+                .0,
+            foreign_branch
+        );
+        let our_short = plan.wt.file_name().unwrap().to_string_lossy();
+        assert_eq!(
+            read_creation_marker(&creation_marker_path(&repo, &our_short))
+                .unwrap()
+                .0,
+            our_branch
         );
     }
 
@@ -6469,7 +6813,7 @@ mod tests {
         )];
         let tasks = vec![task_row(0, Some("proj"))];
         let jobs =
-            plan_local_worktree_jobs(&store.lock(), "squad-1", &cells, &tasks, &HashMap::new());
+            plan_local_worktree_jobs(&store, "squad-1", &cells, &tasks, &HashMap::new()).unwrap();
         let wt = jobs[0].wt.clone();
         let outcomes: Vec<Option<Materialized>> = std::thread::scope(|scope| {
             let handles: Vec<_> = (0..6)

@@ -1533,15 +1533,20 @@ fn execute_squad_inner(
     // (or by the cell that needs one first), so the squad starts without
     // waiting for any checkout. See `crate::worktrees::plan_local_worktree_jobs`.
     let prefetched_worktrees = {
-        let guard = store.lock();
-        let jobs = crate::worktrees::plan_local_worktree_jobs(
-            &guard,
+        let jobs = match crate::worktrees::plan_local_worktree_jobs(
+            store,
             squad_id,
             &cells,
             &tasks,
             &prefetched_upstreams,
-        );
-        drop(guard);
+        ) {
+            Ok(jobs) => jobs,
+            Err(e) => {
+                _squad_span.set_status(opentelemetry::trace::Status::error(e.clone()));
+                finalize_all_failed(store, squad_id, &tasks, &e);
+                return;
+            }
+        };
         crate::worktrees::planned_worktree_paths(&jobs)
     };
     // Resolve every worktree-placeholder `cwd` (RAL-100) before planning: a
