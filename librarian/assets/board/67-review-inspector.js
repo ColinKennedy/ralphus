@@ -830,17 +830,20 @@
         if (inspectorAutoActionsGid === g.id) {
           host.innerHTML = autoActionsInspectorHtml(g);
           restorePeekScrollPositions();
+          restoreAgentLogScroll();
           return;
         }
         if (inspectorLiveGenGid === g.id) {
           host.innerHTML = liveGenerationInspectorHtml(g);
           restorePeekScrollPositions();
+          restoreAgentLogScroll();
           return;
         }
         const liveRun = inspectorLiveRun;
         if (liveRun && liveRun.gid === g.id) {
           host.innerHTML = liveRunInspectorHtml(g, liveRun.runId);
           restorePeekScrollPositions();
+          restoreAgentLogScroll();
           return;
         }
         const b = inspectorBranch(g);

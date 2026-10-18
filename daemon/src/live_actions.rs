@@ -87,8 +87,12 @@ when you could not tell. `fix_confirmed` is true only if you re-ran the failing 
 after your fix and saw it work. `recipe` lists the shell commands that reproduce what \
 you tested. A recipe command may leave out directory navigation (`cd`, `Push-Location`, \
 ...), output-only filters (`| head`, `| rg`, `| tee`, `| Select-Object`, `| findstr`, \
-...) and redirection (`2>&1`, `> file`), but must keep the meaningful command, its \
-arguments and its environment settings (`MODE=production npm test`, not `npm test`). \
+...), redirection (`2>&1`, `> file`) and process wrappers (`timeout`, `sudo`, `nice`, `time`, \
+`bash -c`), but must keep the meaningful command, its arguments and its environment \
+settings (`MODE=production npm test`, not `npm test`); input-changing forms \
+(`< file`, `yes |`), `&` and `|| true` are part of the command. Setup commands \
+(`source .venv/bin/activate`, `set -e`, `nvm use 20`) may be left out, but if you \
+include one, write it exactly as run. \
 Example: recorded `cd app && npm test 2>&1 | tee test.log | rg \\\"failed|error\\\"`, recipe \
 `npm test`. ralphus keeps only commands it recorded you running.";
 
@@ -120,8 +124,12 @@ single-line JSON object: {\"verdict\": \"passed\" | \"failed\" | \"inconclusive\
 you could not tell. `recipe` lists the shell commands that reproduce what you tested. \
 A recipe command may leave out directory navigation (`cd`, `Push-Location`, ...), \
 output-only filters (`| head`, `| rg`, `| tee`, `| Select-Object`, `| findstr`, ...) \
-and redirection (`2>&1`, `> file`), but must keep the meaningful command, its \
-arguments and its environment settings (`MODE=production npm test`, not `npm test`). \
+redirection (`2>&1`, `> file`) and process wrappers (`timeout`, `sudo`, `nice`, `time`, \
+`bash -c`), but must keep the meaningful command, its arguments and its environment \
+settings (`MODE=production npm test`, not `npm test`); input-changing forms \
+(`< file`, `yes |`), `&` and `|| true` are part of the command. Setup commands \
+(`source .venv/bin/activate`, `set -e`, `nvm use 20`) may be left out, but if you \
+include one, write it exactly as run. \
 Example: recorded `Push-Location app; dotnet test > results.txt; Pop-Location`, recipe \
 `dotnet test`. ralphus keeps only commands it recorded you running.";
 
