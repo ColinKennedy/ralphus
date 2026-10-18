@@ -103,6 +103,56 @@
         if (!check) return;
         el.textContent = substituteCheckInputs(check.command || "", checkInputValues(g, check, key));
       }
+      /**
+       * Renders the button that opens one squad cell in the Squads tab, shared by review
+       * branch rows and live-action attribution. Friendly name and state come from the
+       * loaded squad when present, else from the fallbacks.
+       * @param {string} squadId
+       * @param {number} ti - Task index.
+       * @param {number} si - Cell index.
+       * @param {string} fallbackState
+       * @param {string} fallbackName
+       * @param {string} tipIntro - First tooltip line: why the button is here.
+       * @returns {string}
+       */
+      function linkedCellBtn(squadId, ti, si, fallbackState, fallbackName, tipIntro) {
+        const squad = squads.find(r => r.id === squadId);
+        const t = squad && squad.tasks[ti];
+        const s = t && t.cells[si];
+        const state = s ? s.state : fallbackState;
+        const name = s ? (s.name ?? s.id) : fallbackName;
+        const taskName = t ? t.name : "";
+        const readyDot = state === "done" ? ` <span class="dot" style="background:var(--done)"></span>` : "";
+        const tip = `${tipIntro}
+Cell: ${esc(name)} · Task: ${esc(taskName)} · State: ${esc(state)}
+Switches to the Squads tab and opens this cell in the detail pane.`;
+        return `<button class="btn" data-click="gotoSquadItem" data-squad-id="${esc(squadId)}" data-kind="cell" data-ti="${ti}" data-si="${si}" data-vi="-1" data-tip="${tip}">${sdot(state)} ${esc(name)}${readyDot}</button>`;
+      }
+      /**
+       * Parses a `cell:<squad>:<task-index>:<cell-index>` URI.
+       * @param {string} uri
+       * @returns {{squadId: string, ti: number, si: number}|null} Null when malformed.
+       */
+      function parseCellUri(uri) {
+        const m = /^cell:([^:\s]+):(\d+):(\d+)$/.exec(String(uri).trim());
+        return m ? { squadId: m[1], ti: Number(m[2]), si: Number(m[3]) } : null;
+      }
+      /**
+       * Renders a live action's source-cell attribution: a linked-cell button per resolvable
+       * cell URI, readable plain text for any that is malformed or not loaded.
+       * @param {string[]} sources - Source-cell URIs.
+       * @returns {string}
+       */
+      function liveActionSourcesHtml(sources) {
+        if (!sources.length) return "unknown";
+        return sources.map((uri) => {
+          const p = parseCellUri(uri);
+          const squad = p && squads.find(r => r.id === p.squadId);
+          const cell = squad && squad.tasks[p.ti] && squad.tasks[p.ti].cells[p.si];
+          if (!p || !cell) return `<span class="mono" data-tip="This cell is not loaded on the board, so it cannot be opened.">${esc(uri)}</span>`;
+          return linkedCellBtn(p.squadId, p.ti, p.si, cell.state, uri, "Open the task cell whose agent suggested this live action.");
+        }).join(" ");
+      }
       // Render the inline cell-link button for a review branch row.
       // Prefers direct squad/task/cell indices from the API; falls back to cwd path matching.
       /**
@@ -113,16 +163,8 @@
        */
       function worktreeCellBtn(branch, menuKey) {
         if (branch.source_squad_id != null && branch.source_task_idx != null && branch.source_cell_idx != null) {
-          const ti = branch.source_task_idx, si = branch.source_cell_idx;
-          const squad = squads.find(r => r.id === branch.source_squad_id);
-          const t = squad && squad.tasks[ti];
-          const s = t && t.cells[si];
-          const state = s ? s.state : (branch.source_cell_state || "pending");
-          const name = s ? (s.name ?? s.id) : branch.branch;
-          const taskName = t ? t.name : "";
-          const readyDot = state === "done" ? ` <span class="dot" style="background:var(--done)"></span>` : "";
-          const tip = `Open the task cell that worked on this review branch.\nCell: ${esc(name)} · Task: ${esc(taskName)} · State: ${esc(state)}\nSwitches to the Squads tab and opens this cell in the detail pane.`;
-          return `<button class="btn" data-click="gotoSquadItem" data-squad-id="${esc(branch.source_squad_id)}" data-kind="cell" data-ti="${ti}" data-si="${si}" data-vi="-1" data-tip="${tip}">${sdot(state)} ${esc(name)}${readyDot}</button>`;
+          return linkedCellBtn(branch.source_squad_id, branch.source_task_idx, branch.source_cell_idx,
+            branch.source_cell_state || "pending", branch.branch, "Open the task cell that worked on this review branch.");
         }
         // Fallback: path-based linking (manually added branches with no submitted cell).
         const cells = branch.worktree ? findLinkedCells(branch.worktree) : [];
