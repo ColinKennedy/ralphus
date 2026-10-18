@@ -84,9 +84,13 @@ single-line JSON object: {\"verdict\": \"passed\" | \"failed\" | \"inconclusive\
 \"summary\": \"what you observed, in one sentence\", \"fix_attempted\": true | false, \
 \"fix_confirmed\": true | false, \"recipe\": [\"command\", ...]}. Use \"inconclusive\" \
 when you could not tell. `fix_confirmed` is true only if you re-ran the failing step \
-after your fix and saw it work. `recipe` lists the shell commands, copied exactly as \
-you ran them, that reproduce what you tested; ralphus keeps only commands it recorded \
-you running.";
+after your fix and saw it work. `recipe` lists the shell commands that reproduce what \
+you tested. A recipe command may leave out directory navigation (`cd`, `Push-Location`, \
+...), output-only filters (`| head`, `| rg`, `| tee`, `| Select-Object`, `| findstr`, \
+...) and redirection (`2>&1`, `> file`), but must keep the meaningful command, its \
+arguments and its environment settings (`MODE=production npm test`, not `npm test`). \
+Example: recorded `cd app && npm test 2>&1 | tee test.log | rg \\\"failed|error\\\"`, recipe \
+`npm test`. ralphus keeps only commands it recorded you running.";
 
 /// The read-only variant: the run's edits are never carried back.
 pub const LIVE_ACTION_READ_ONLY_SYSTEM_PROMPT: &str = "\
@@ -113,9 +117,13 @@ Then finish with ONE final line of the form `RALPHUS_LIVE_RESULT: ` followed by 
 single-line JSON object: {\"verdict\": \"passed\" | \"failed\" | \"inconclusive\", \
 \"summary\": \"what you observed, in one sentence\", \"fix_attempted\": false, \
 \"fix_confirmed\": false, \"recipe\": [\"command\", ...]}. Use \"inconclusive\" when \
-you could not tell. `recipe` lists the shell commands, copied exactly as you ran \
-them, that reproduce what you tested; ralphus keeps only commands it recorded you \
-running.";
+you could not tell. `recipe` lists the shell commands that reproduce what you tested. \
+A recipe command may leave out directory navigation (`cd`, `Push-Location`, ...), \
+output-only filters (`| head`, `| rg`, `| tee`, `| Select-Object`, `| findstr`, ...) \
+and redirection (`2>&1`, `> file`), but must keep the meaningful command, its \
+arguments and its environment settings (`MODE=production npm test`, not `npm test`). \
+Example: recorded `Push-Location app; dotnet test > results.txt; Pop-Location`, recipe \
+`dotnet test`. ralphus keeps only commands it recorded you running.";
 
 /// The marker a cell's agent writes a live handoff under.
 pub const LIVE_ACTION_MARKER: &str = "RALPHUS_LIVE_ACTION:";

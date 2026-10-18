@@ -8,7 +8,8 @@
 //! The pieces:
 //! * the structured result a live agent proposes ([`parse_result_line`]) and
 //!   the recipe commands ralphus accepts from it ([`match_recipe`]): a command
-//!   survives only if it matches a recorded `RALPHUS_TOOL:` shell call, so
+//!   survives only if it matches a command inside a recorded `RALPHUS_TOOL:`
+//!   shell call (ignoring navigation, redirection and output filters), so
 //!   there is no second model judgment;
 //! * the renderer ([`render_section`]) and the marker splice
 //!   ([`splice_section`]), both byte-stable;
@@ -22,6 +23,7 @@ use std::fmt::Write as _;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::live_actions::LiveRunEnd;
+use crate::live_command_units::command_units;
 use crate::live_runs::LiveRunRow;
 use crate::store::{Result, Store, now_ms};
 
@@ -152,7 +154,12 @@ pub struct RecordedCall {
 /// One accepted reproduction step.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct RecipeStep {
+    /// The recommended command, as matched.
     pub command: String,
+    /// The complete recorded tool call it was found in (empty on rows stored
+    /// before it was kept).
+    #[serde(default)]
+    pub recorded_command: String,
     pub cwd: String,
     /// 1-based position among the run's recorded shell calls.
     pub order: usize,
@@ -245,29 +252,41 @@ pub fn extract_shell_calls(transcript: &str) -> Vec<RecordedCall> {
         .collect()
 }
 
-/// Keep only the proposed recipe commands that match a recorded shell call,
-/// each recorded call at most once, ordered as they were run, with the
-/// recorded cwd (or `default_cwd`) and result. Unmatched commands are dropped.
+/// Keep only the proposed recipe commands that match a command in a recorded
+/// shell call (see [`command_units`]), each recorded command at most once,
+/// ordered as they were run. A step carries the proposed command and, as
+/// evidence, the whole recorded invocation with its cwd (or `default_cwd`) and
+/// result. An unmatched command is dropped without affecting the others.
 #[must_use]
 pub fn match_recipe(
     proposed: &[String],
     calls: &[RecordedCall],
     default_cwd: &str,
 ) -> Vec<RecipeStep> {
-    let mut used = vec![false; calls.len()];
-    let mut steps = Vec::new();
-    for command in proposed {
-        let wanted = command.trim();
-        if wanted.is_empty() {
-            continue;
+    let recorded: Vec<Vec<String>> = calls.iter().map(|c| command_units(&c.command)).collect();
+    let mut used: Vec<Vec<bool>> = recorded.iter().map(|u| vec![false; u.len()]).collect();
+    let mut matched: Vec<(usize, usize, String)> = Vec::new();
+    for entry in proposed {
+        for unit in command_units(entry) {
+            let found = recorded.iter().enumerate().find_map(|(i, units)| {
+                units
+                    .iter()
+                    .enumerate()
+                    .find(|(j, u)| !used[i][*j] && **u == unit)
+                    .map(|(j, _)| (i, j))
+            });
+            if let Some((i, j)) = found {
+                used[i][j] = true;
+                matched.push((i, j, unit));
+            }
         }
-        let Some(i) = (0..calls.len()).find(|&i| !used[i] && calls[i].command.trim() == wanted)
-        else {
-            continue;
-        };
-        used[i] = true;
-        steps.push(RecipeStep {
-            command: calls[i].command.trim().to_string(),
+    }
+    matched.sort_by_key(|(i, j, _)| (*i, *j));
+    matched
+        .into_iter()
+        .map(|(i, _, command)| RecipeStep {
+            command,
+            recorded_command: calls[i].command.trim().to_string(),
             cwd: calls[i]
                 .cwd
                 .clone()
@@ -279,10 +298,8 @@ pub fn match_recipe(
                 None => "no result recorded",
             }
             .to_string(),
-        });
-    }
-    steps.sort_by_key(|s| s.order);
-    steps
+        })
+        .collect()
 }
 
 /// All shell calls recorded for one live run's agent session.
@@ -791,7 +808,7 @@ fn render_run(out: &mut String, item: &SectionRun) {
         for step in &ev.recipe {
             let _ = writeln!(
                 out,
-                "{}. in `{}`: {} ({})",
+                "{}. in `{}`: {} (recorded call {})",
                 step.order,
                 clip(&step.cwd),
                 fenced(&clip(&step.command)),
@@ -799,6 +816,23 @@ fn render_run(out: &mut String, item: &SectionRun) {
             );
         }
         let _ = writeln!(out);
+        if ev.recipe.iter().any(|s| !s.recorded_command.is_empty()) {
+            let _ = writeln!(
+                out,
+                "<details><summary>Recorded invocations</summary>\n\nThe complete shell calls the commands above were found in; each result is for the whole call.\n"
+            );
+            for step in ev.recipe.iter().filter(|s| !s.recorded_command.is_empty()) {
+                let _ = writeln!(
+                    out,
+                    "Call {} in `{}` ({}):\n\n{}\n",
+                    step.order,
+                    clip(&step.cwd),
+                    step.result,
+                    fenced(&clip(&step.recorded_command))
+                );
+            }
+            let _ = writeln!(out, "</details>\n");
+        }
     }
     let _ = writeln!(out, "<details><summary>Exact prompt sent</summary>\n");
     match ev.sent_prompt.as_deref() {
@@ -1173,6 +1207,7 @@ mod tests {
                 fix_confirmed: Some(false),
                 recipe: vec![RecipeStep {
                     command: "cargo run".into(),
+                    recorded_command: "cd w && cargo run | head".into(),
                     cwd: "/w".into(),
                     order: 2,
                     result: "succeeded".into(),
@@ -1275,6 +1310,78 @@ mod tests {
                 (3, "ls", "/w", "no result recorded"),
             ]
         );
+    }
+
+    #[test]
+    fn command_variants_match_and_keep_the_recorded_call() {
+        let call = |c: &str| RecordedCall {
+            command: c.into(),
+            cwd: Some("/w".into()),
+            succeeded: Some(true),
+        };
+        let run = |proposed: &[&str], recorded: &str| -> Vec<RecipeStep> {
+            let p: Vec<String> = proposed.iter().map(|s| (*s).to_string()).collect();
+            match_recipe(&p, &[call(recorded)], "/d")
+        };
+        for (proposed, recorded) in [
+            (
+                "fizz buzz --count 300",
+                "fizz buzz --count 300 | head -n 10",
+            ),
+            (
+                "cargo test -p app",
+                "cargo test -p app 2>&1 | grep -E 'FAILED|error'",
+            ),
+            (
+                "npm test && npm run lint",
+                "npm test | tee test.log && npm run lint | tail -n 20",
+            ),
+            ("Get-Service", "Get-Service | Select-Object -First 10"),
+            (
+                "dotnet test",
+                "dotnet test 2>&1 | Select-String 'Failed|Error'",
+            ),
+            ("dir /b", "dir /b | findstr /i \".rs\""),
+            ("type app.log", "type app.log | findstr /i \"error\""),
+            ("some-command --check", "some-command --check 2>&1 | more"),
+            ("do_something foo --bar", "cd /x && do_something foo --bar"),
+            (
+                "fizz buzz --count 300 && another one",
+                "fizz buzz --count 300 | head -n 10 && another one | tail -n 20",
+            ),
+        ] {
+            let steps = run(&[proposed], recorded);
+            assert!(!steps.is_empty(), "{recorded}");
+            assert!(
+                steps
+                    .iter()
+                    .all(|s| s.recorded_command == recorded && s.cwd == "/w" && s.order == 1)
+            );
+        }
+        let steps = run(&["npm test"], "npm test && npm run deploy");
+        assert_eq!(steps.len(), 1);
+        assert_eq!(steps[0].command, "npm test");
+        let steps = run(&["npm test && npm run lint"], "npm test");
+        assert_eq!(steps.len(), 1);
+        assert!(run(&["rm -rf /"], "ls").is_empty());
+        assert!(run(&["npm test"], "MODE=production npm test").is_empty());
+        assert_eq!(
+            run(
+                &["MODE=production npm test"],
+                "MODE=production npm test | head"
+            )
+            .len(),
+            1
+        );
+        assert!(run(&["echo a"], "echo 'a && b'").is_empty());
+    }
+
+    #[test]
+    fn the_section_shows_the_recipe_and_collapses_the_recorded_call() {
+        let section = render_section(&[section_run("r1", 0, 10)]).unwrap();
+        assert!(section.contains("cargo run"));
+        assert!(section.contains("<summary>Recorded invocations</summary>"));
+        assert!(section.contains("cd w && cargo run | head"));
     }
 
     #[test]
