@@ -413,7 +413,7 @@
       }
       // RALPHUS-REVIEW-INSPECTOR-HASH:BEGIN
       /** Detail-pane tabs a `itab=` value may name. */
-      const INSPECTOR_HASH_TABS = ["overview", "worktree", "feedback", "live", "appraisals"];
+      const INSPECTOR_HASH_TABS = ["overview", "worktree", "feedback", "live", "notes"];
       /** Live sub-views an `lsub=` value may name. */
       const INSPECTOR_HASH_LIVE_SUBS = ["terminal", "prompt", "system", "agentlog"];
       /**

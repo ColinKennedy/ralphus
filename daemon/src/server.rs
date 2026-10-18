@@ -2009,6 +2009,10 @@ fn route_for_user(
         ("GET", ["api", "guardians", id, "branches", branch_id, "appraisals"]) => {
             guardian_branch_appraisals(daemon, id, branch_id)
         }
+        // ralphus[ignore-endpoint-cli]: board 'Notes' inspector tab for the branch (RAL-670); no CLI equivalent
+        ("GET", ["api", "guardians", id, "branches", branch_id, "notes"]) => {
+            guardian_branch_notes(daemon, id, branch_id)
+        }
         // ralphus[ignore-endpoint-cli]: board 'Forge rate limit' section of the branch inspector; no CLI equivalent
         (
             "GET",
@@ -12660,6 +12664,30 @@ fn guardian_branch_appraisals(daemon: &Daemon, id: &str, branch_id: &str) -> Rep
         &serde_json::json!({
             "post_appraisals": guardian.effective_post_appraisals,
             "appraisals": appraisals,
+        }),
+    )
+}
+
+/// `GET /api/guardians/{id}/branches/{branch_id}/notes` (RAL-670) -- every
+/// note of one review branch in a single newest-first list: its appraisals,
+/// the live actions attributed to it, and its latest ghost. Each note has a
+/// `type` of `appraisal`, `live_action` or `ghost`. `post_appraisals` is the
+/// review's effective posting setting, as on the appraisals endpoint.
+fn guardian_branch_notes(daemon: &Daemon, id: &str, branch_id: &str) -> Reply {
+    let guardian = match daemon.lock().get_guardian(id) {
+        Ok(g) => g,
+        Err(e) => return store_error(&e),
+    };
+    let notes = match daemon.lock().list_review_notes(id, branch_id) {
+        Ok(Some(v)) => v,
+        Ok(None) => return error(404, "not_found", "no such branch", vec![]),
+        Err(e) => return store_error(&e),
+    };
+    json(
+        200,
+        &serde_json::json!({
+            "post_appraisals": guardian.effective_post_appraisals,
+            "notes": notes,
         }),
     )
 }
