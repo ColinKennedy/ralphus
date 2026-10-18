@@ -7830,12 +7830,7 @@ fn run_merge_shared<F: Fn(GuardianStatus, Option<&str>)>(
                     fail_branch(store, id, &ob.id, &ob.branch, &e, set_status);
                     return;
                 }
-                let (status, detail): (MergeStatus, Option<String>) = match outcome {
-                    RebaseOutcome::Resolved(note) => (MergeStatus::ConflictResolved, Some(note)),
-                    // RAL-168: proofed but no conflict occurred -- still `Done`.
-                    RebaseOutcome::CleanProofed(note) => (MergeStatus::Done, Some(note)),
-                    RebaseOutcome::Clean => clean_rebase_status(post_rebase_is_empty),
-                };
+                let (status, detail) = rebased_branch_status(outcome, post_rebase_is_empty);
                 promote_branch_terminal(
                     store,
                     id,
@@ -11586,12 +11581,7 @@ fn stack_pick(
                 );
                 return Err(());
             }
-            let (status, detail): (MergeStatus, Option<String>) = match outcome {
-                RebaseOutcome::Resolved(note) => (MergeStatus::ConflictResolved, Some(note)),
-                // RAL-168: proofed but no conflict occurred -- still `Done`.
-                RebaseOutcome::CleanProofed(note) => (MergeStatus::Done, Some(note)),
-                RebaseOutcome::Clean => clean_rebase_status(post_rebase_is_empty),
-            };
+            let (status, detail) = rebased_branch_status(outcome, post_rebase_is_empty);
             promote_branch_terminal(
                 store,
                 id,
@@ -15327,6 +15317,29 @@ fn clean_rebase_status(post_rebase_is_empty: bool) -> (MergeStatus, Option<Strin
     }
 }
 
+/// The terminal status/detail for a branch whose rebase finished with `outcome`.
+///
+/// A rebase that left nothing over the stack beneath it means the branch's
+/// work is already on the base, however it got there: that is `Merged` even
+/// when the agent had to resolve conflicts on the way (a squash-merged
+/// sibling PR conflicts with the branch's own commits, and the resolution is
+/// to keep the base's version). Reporting `ConflictResolved` for it leaves a
+/// review whose every PR has landed looking like unfinished work.
+fn rebased_branch_status(
+    outcome: RebaseOutcome,
+    post_rebase_is_empty: bool,
+) -> (MergeStatus, Option<String>) {
+    if post_rebase_is_empty && !matches!(outcome, RebaseOutcome::Clean) {
+        return clean_rebase_status(true);
+    }
+    match outcome {
+        RebaseOutcome::Resolved(note) => (MergeStatus::ConflictResolved, Some(note)),
+        // RAL-168: proofed but no conflict occurred -- still `Done`.
+        RebaseOutcome::CleanProofed(note) => (MergeStatus::Done, Some(note)),
+        RebaseOutcome::Clean => clean_rebase_status(post_rebase_is_empty),
+    }
+}
+
 /// List candidate base branches for a guardian, scoped to the remote that owns
 /// the current `base_branch`.  If `base_branch` looks like a remote-tracking ref
 /// (e.g. `origin/main`) only refs under that remote are returned; otherwise local
@@ -17765,6 +17778,37 @@ mod tests {
         let (status, detail) = clean_rebase_status(false);
         assert_eq!(status, MergeStatus::Done);
         assert_eq!(detail, None);
+    }
+
+    #[test]
+    fn rebased_branch_status_is_merged_when_a_resolved_rebase_left_no_diff() {
+        // A conflict resolved by keeping the base's version leaves the branch
+        // with nothing of its own: it is merged, not `conflict_resolved`.
+        for outcome in [
+            RebaseOutcome::Resolved("resolved by agent".to_string()),
+            RebaseOutcome::CleanProofed("proof passed".to_string()),
+        ] {
+            let (status, detail) = rebased_branch_status(outcome, true);
+            assert_eq!(status, MergeStatus::Merged);
+            assert!(detail.unwrap().contains("already merged upstream"));
+        }
+    }
+
+    #[test]
+    fn rebased_branch_status_keeps_resolved_and_proofed_when_a_diff_remains() {
+        let (status, detail) = rebased_branch_status(
+            RebaseOutcome::Resolved("resolved by agent".to_string()),
+            false,
+        );
+        assert_eq!(status, MergeStatus::ConflictResolved);
+        assert_eq!(detail.as_deref(), Some("resolved by agent"));
+        let (status, _) = rebased_branch_status(
+            RebaseOutcome::CleanProofed("proof passed".to_string()),
+            false,
+        );
+        assert_eq!(status, MergeStatus::Done);
+        let (status, _) = rebased_branch_status(RebaseOutcome::Clean, false);
+        assert_eq!(status, MergeStatus::Done);
     }
 
     #[test]
