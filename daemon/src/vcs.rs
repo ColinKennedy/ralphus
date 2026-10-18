@@ -53,6 +53,31 @@ pub const DEFAULT_KIND: &str = "git";
 /// the daemon over.
 const GIT_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// Wall-clock cap on a git subcommand that writes a whole working tree
+/// (`worktree add`, `checkout`, `switch`, `clone`). Its cost scales with the
+/// tree's file count and the disk's per-file latency (about 13 ms per file under
+/// Windows Defender, so a 2,000-file tree takes 26 s alone), and the submit path
+/// runs several at once, so [`GIT_TIMEOUT`] kills checkouts that are making
+/// progress. Still bounded: a checkout wedged on a lock must not hang forever.
+const GIT_CHECKOUT_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// The wall-clock cap for `git <args>`: [`GIT_CHECKOUT_TIMEOUT`] for the
+/// subcommands that populate a working tree, [`GIT_TIMEOUT`] for the rest.
+fn timeout_for(args: &[&str]) -> Duration {
+    let populates_tree = args
+        .iter()
+        .find(|a| !a.starts_with('-'))
+        .is_some_and(|sub| {
+            matches!(*sub, "checkout" | "switch" | "clone")
+                || (*sub == "worktree" && args.contains(&"add"))
+        });
+    if populates_tree {
+        GIT_CHECKOUT_TIMEOUT
+    } else {
+        GIT_TIMEOUT
+    }
+}
+
 /// The content operations the review path needs from a project's VCS.
 pub trait Vcs: Send + Sync {
     /// The registered `vcs` kind this adapter implements, e.g. `"git"`.
@@ -252,7 +277,8 @@ impl GitVcs {
             buf
         });
 
-        let deadline = Instant::now() + GIT_TIMEOUT;
+        let timeout = timeout_for(args);
+        let deadline = Instant::now() + timeout;
         let status = loop {
             match child
                 .try_wait()
@@ -263,14 +289,14 @@ impl GitVcs {
                     // ralphus[ignore-rlog-pair]: the single git spawn site has no Store; callers record the structured failure from the returned error
                     crate::rlog!(
                         WARNING,
-                        "ralphus [vcs] git {} timed out after {GIT_TIMEOUT:?} in {}; killing it",
+                        "ralphus [vcs] git {} timed out after {timeout:?} in {}; killing it",
                         args.join(" "),
                         root.display()
                     );
                     let _ = child.kill();
                     let _ = child.wait();
                     return Err(format!(
-                        "git {} timed out after {GIT_TIMEOUT:?}",
+                        "git {} timed out after {timeout:?}",
                         args.join(" ")
                     ));
                 }
@@ -526,6 +552,26 @@ pub fn for_project_root(store: &crate::store::Store, root: &Path) -> Result<Box<
 mod tests {
     use super::*;
     use std::process::Command;
+
+    #[test]
+    fn commands_that_populate_a_working_tree_get_the_long_timeout() {
+        for args in [
+            &["worktree", "add", "--no-track", "-b", "b", "/p", "ref"][..],
+            &["checkout", "main"],
+            &["switch", "main"],
+            &["clone", "url", "dir"],
+        ] {
+            assert_eq!(timeout_for(args), GIT_CHECKOUT_TIMEOUT, "{args:?}");
+        }
+        for args in [
+            &["worktree", "remove", "/p"][..],
+            &["worktree", "list", "--porcelain"],
+            &["fetch", "origin"],
+            &["rev-parse", "HEAD"],
+        ] {
+            assert_eq!(timeout_for(args), GIT_TIMEOUT, "{args:?}");
+        }
+    }
 
     #[test]
     fn git_is_the_only_implemented_kind() {

@@ -7143,15 +7143,23 @@ pub(crate) fn submit(daemon: &Daemon, body: &str, query: &str, user_header: Opti
     let hold = req.hold;
     let acting_user = resolve_acting_user(query);
     daemon.background().spawn(move || {
-        run_submit_followup(
-            &store_handle,
-            followup_squad_id,
-            file,
-            hold,
-            pending_classifications,
-            pending_subprojects,
-            has_triage,
-            acting_user,
+        let guard_handle = store_handle.clone();
+        let guard_squad_id = followup_squad_id.clone();
+        run_submit_followup_guarded(
+            &guard_handle,
+            &guard_squad_id,
+            std::panic::AssertUnwindSafe(move || {
+                run_submit_followup(
+                    &store_handle,
+                    followup_squad_id,
+                    file,
+                    hold,
+                    pending_classifications,
+                    pending_subprojects,
+                    has_triage,
+                    acting_user,
+                );
+            }),
         );
     });
 
@@ -7204,6 +7212,95 @@ fn report_materialization_phase(
         );
 }
 
+/// Land a squad whose background materialization failed in `failed`, with
+/// `message` persisted as its error, a Cartographer row, and an urgent mailbox
+/// message carrying a `squad retry` remediation. The submitter already got a
+/// 201 for this squad id and isn't polling it, so the mailbox push is how a
+/// watcher learns about it without having to notice the squad never left
+/// `materializing`.
+fn fail_materialization(store_handle: &StoreHandle, squad_id: &str, message: &str) {
+    let guard = store_handle.lock();
+    let _ = guard.set_squad_error(squad_id, Some(message));
+    let _ = guard.set_squad_state(squad_id, SquadState::Failed);
+    crate::rlog!(
+        WARNING,
+        "ralphus [submit] background materialization for squad {squad_id} failed: {message}"
+    );
+    crate::cartographer::Note::new("submit")
+        .level(crate::logging::LogLevel::WARNING)
+        .squad(squad_id)
+        .scope("review")
+        .emit(
+            &guard,
+            format!("background materialization failed: {message}"),
+            serde_json::json!({ "error": message }),
+        );
+    let event_uri = format!("squad:{squad_id}");
+    if let Ok(message_id) = guard.notify_watchers_with_remediation(
+        crate::monitor::NotifiableEventKind::SquadFailed,
+        &event_uri,
+        crate::mailbox::MailboxPriority::Urgent,
+        &format!("squad {squad_id} failed to materialize: {message}"),
+        &crate::mailbox::Remediation::SuggestedCommand {
+            command: format!("ralphus squad retry {squad_id}"),
+            purpose: "reset the squad to pending and retry materialization".to_string(),
+        },
+        Some(squad_id),
+        None,
+        None,
+    ) {
+        crate::cartographer::Note::new("submit")
+            .squad(squad_id)
+            .scope("mailbox")
+            .emit(
+                &guard,
+                "mailbox message enqueued for materialization failure",
+                serde_json::json!({ "message_id": message_id, "priority": "urgent" }),
+            );
+    }
+}
+
+/// Run `followup` (the `run_submit_followup` call) and, if it panics, fail the
+/// squad instead of leaving it in `materializing` forever. The follow-up runs
+/// on a bare background thread whose panic nobody joins, so without this the
+/// squad keeps its last progress label and never leaves `materializing`.
+fn run_submit_followup_guarded(
+    store_handle: &StoreHandle,
+    squad_id: &str,
+    followup: impl FnOnce() + std::panic::UnwindSafe,
+) {
+    crate::rlog!(
+        INFO,
+        "ralphus [submit] background materialization for squad {squad_id} started"
+    );
+    let outcome = std::panic::catch_unwind(followup);
+    // Written even when the follow-up returned early on a handled failure:
+    // what a stuck squad is missing is this row, not a particular outcome.
+    if outcome.is_ok() {
+        let guard = store_handle.lock();
+        crate::cartographer::Note::new("submit")
+            .squad(squad_id)
+            .scope("materialize")
+            .emit(
+                &guard,
+                "background materialization thread returned",
+                serde_json::json!({}),
+            );
+    }
+    if let Err(payload) = outcome {
+        let detail = payload
+            .downcast_ref::<&str>()
+            .map(|s| (*s).to_string())
+            .or_else(|| payload.downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "unknown panic".to_string());
+        fail_materialization(
+            store_handle,
+            squad_id,
+            &format!("materialization thread panicked: {detail}"),
+        );
+    }
+}
+
 /// The background half of `submit` (RAL-<pending>, see [`BackgroundWork`]'s
 /// doc comment): everything that can be slow (`git fetch`/`git worktree
 /// add`) or depends on review derivation having already run. `squad_id`
@@ -7236,6 +7333,23 @@ fn run_submit_followup(
         let step = phase_step.get() + 1;
         phase_step.set(step);
         report_materialization_phase(store_handle, &squad_id, step, label);
+    };
+    // A Cartographer row at each step boundary, stamped with the time since
+    // this follow-up started. `report_phase` only marks the start of a named
+    // phase, so a thread that stops between two of them leaves no trace; with
+    // these, the last row before a gap names the step that never finished.
+    let started = std::time::Instant::now();
+    let checkpoint = |what: &str| {
+        let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        let guard = store_handle.lock();
+        crate::cartographer::Note::new("submit")
+            .scope("materialize")
+            .squad(&squad_id)
+            .emit(
+                &guard,
+                format!("{what} (+{elapsed_ms}ms)"),
+                serde_json::json!({ "elapsed_ms": elapsed_ms }),
+            );
     };
 
     // Fetch every registered-remote project's bare `?upstream=`/declared
@@ -7271,14 +7385,21 @@ fn run_submit_followup(
         }
         resolved
     };
+    checkpoint(&format!(
+        "prefetched {} remote upstream ref(s)",
+        prefetched_upstreams.len()
+    ));
 
     // Claim every LOCAL cell's worktree (branch + `w/<short>` directory) under a
     // brief lock and leave creating it to the scheduler: the squad is built
     // from the TOML alone and each cell starts as its own worktree becomes
     // ready. See `crate::worktrees::plan_local_worktree_jobs`'s doc comment.
     report_phase("Claiming worktrees");
-    let prefetched_worktrees = {
+    let lock_requested = std::time::Instant::now();
+    let (prefetched_worktrees, claim_lock_wait_ms, claim_hold_ms) = {
         let guard = store_handle.lock();
+        let lock_wait_ms = lock_requested.elapsed().as_millis();
+        let planning_started = std::time::Instant::now();
         let (cells, tasks) = crate::reviews::cells_and_tasks_from_file(&file);
         let jobs = crate::worktrees::plan_local_worktree_jobs(
             &guard,
@@ -7287,8 +7408,17 @@ fn run_submit_followup(
             &tasks,
             &prefetched_upstreams,
         );
-        crate::worktrees::planned_worktree_paths(&jobs)
+        (
+            crate::worktrees::planned_worktree_paths(&jobs),
+            lock_wait_ms,
+            planning_started.elapsed().as_millis(),
+        )
     };
+    checkpoint(&format!(
+        "claimed {} worktree slot(s): waited {claim_lock_wait_ms}ms for the store lock, \
+         planned in {claim_hold_ms}ms under it",
+        prefetched_worktrees.len()
+    ));
 
     // WS-D.8: called with the handle, not a held guard. This was the single
     // worst lock holder in the daemon -- measured at 45.9 seconds, twice, on
@@ -7311,53 +7441,10 @@ fn run_submit_followup(
         Some(&report_phase as &dyn Fn(&str)),
     );
     if let Err(e) = derived {
-        let guard = store_handle.lock();
-        let _ = guard.set_squad_error(&squad_id, Some(&e.message));
-        let _ = guard.set_squad_state(&squad_id, SquadState::Failed);
-        crate::rlog!(
-            WARNING,
-            "ralphus [submit] background materialization for squad {squad_id} failed: {}",
-            e.message
-        );
-        crate::cartographer::Note::new("submit")
-            .level(crate::logging::LogLevel::WARNING)
-            .squad(&squad_id)
-            .scope("review")
-            .emit(
-                &guard,
-                format!("background materialization failed: {}", e.message),
-                serde_json::json!({ "error": e.message }),
-            );
-        // Unlike a scheduler-driven runtime failure, the submitter already
-        // got a 201 for this squad id and isn't polling it -- push a mailbox
-        // message (mirrors `scheduler.rs`'s `enqueue_cell_failure_mailbox`)
-        // so a watcher learns about it without having to notice the squad
-        // never left `materializing`.
-        let event_uri = format!("squad:{squad_id}");
-        if let Ok(message_id) = guard.notify_watchers_with_remediation(
-            crate::monitor::NotifiableEventKind::SquadFailed,
-            &event_uri,
-            crate::mailbox::MailboxPriority::Urgent,
-            &format!("squad {squad_id} failed to materialize: {}", e.message),
-            &crate::mailbox::Remediation::SuggestedCommand {
-                command: format!("ralphus squad retry {squad_id}"),
-                purpose: "reset the squad to pending and retry materialization".to_string(),
-            },
-            Some(&squad_id),
-            None,
-            None,
-        ) {
-            crate::cartographer::Note::new("submit")
-                .squad(&squad_id)
-                .scope("mailbox")
-                .emit(
-                    &guard,
-                    "mailbox message enqueued for materialization failure",
-                    serde_json::json!({ "message_id": message_id, "priority": "urgent" }),
-                );
-        }
+        fail_materialization(store_handle, &squad_id, &e.message);
         return;
     }
+    checkpoint("review derivation finished");
 
     // RAL-400 Phase 8: create every `[[waypoint]]` this submission declared,
     // now that review derivation above has run and every same-file
@@ -7464,6 +7551,7 @@ fn run_submit_followup(
         }
     }
 
+    checkpoint("waypoint creation and enrollment finished");
     report_phase("Finishing up");
 
     // RAL-318: Triage pooling -- and the worktree placeholder resolution
@@ -21413,6 +21501,43 @@ mod tests {
         assert_eq!(r.status, 201, "{}", r.body);
         let v: serde_json::Value = serde_json::from_str(&r.body).unwrap();
         v["squad_id"].as_str().unwrap().to_string()
+    }
+
+    #[test]
+    fn a_panicking_submit_followup_fails_the_squad_instead_of_leaving_it_materializing() {
+        let d = daemon();
+        let id = submit_squad(&d);
+        d.lock()
+            .set_squad_state(&id, SquadState::Materializing)
+            .unwrap();
+
+        run_submit_followup_guarded(&d.store_handle(), &id, || {
+            panic!("worktree claim exploded");
+        });
+
+        let r = route(&d, "GET", &format!("/api/squads/{id}"), "");
+        let v: serde_json::Value = serde_json::from_str(&r.body).unwrap();
+        assert_eq!(v["state"], "failed", "{}", r.body);
+        let error = v["error"].as_str().unwrap_or_default();
+        assert!(
+            error.contains("panicked") && error.contains("worktree claim exploded"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_submit_followup_that_finishes_leaves_the_squad_state_alone() {
+        let d = daemon();
+        let id = submit_squad(&d);
+        d.lock()
+            .set_squad_state(&id, SquadState::Materializing)
+            .unwrap();
+
+        run_submit_followup_guarded(&d.store_handle(), &id, || {});
+
+        let r = route(&d, "GET", &format!("/api/squads/{id}"), "");
+        let v: serde_json::Value = serde_json::from_str(&r.body).unwrap();
+        assert_eq!(v["state"], "materializing", "{}", r.body);
     }
 
     /// Isolate this test's terminal-log storage (see
