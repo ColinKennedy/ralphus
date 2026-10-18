@@ -4651,8 +4651,29 @@ fn set_merge_state_unknown(id: &str, unknown: bool) {
 
 /// Whether the last merge check for `id` left some open PR's forge state
 /// unanswered.
-fn merge_state_unknown(id: &str) -> bool {
+pub(crate) fn merge_state_unknown(id: &str) -> bool {
     merge_state_unknown_reviews().lock().contains(id)
+}
+
+/// PR ids whose recorded `merged` state a forge read has confirmed: the
+/// number resolved to this PR's own branch ([`fetch_pr_merge_state`] rejects
+/// any other) and the forge reported it merged. A merged PR/MR cannot be
+/// reopened, so [`check_pr_merges`] stops asking about these. Held in memory
+/// only, so each is confirmed once more after a daemon restart.
+fn confirmed_merged_prs() -> &'static parking_lot::Mutex<std::collections::HashSet<String>> {
+    static CONFIRMED: std::sync::OnceLock<parking_lot::Mutex<std::collections::HashSet<String>>> =
+        std::sync::OnceLock::new();
+    CONFIRMED.get_or_init(Default::default)
+}
+
+/// Whether [`check_pr_merges`] still needs to ask the forge about `pr`: every
+/// open row, and a `merged` row not yet confirmed by [`confirmed_merged_prs`].
+fn needs_merge_check(pr: &PullRequestView) -> bool {
+    match pr.state.as_str() {
+        "open" => true,
+        "merged" => !confirmed_merged_prs().lock().contains(&pr.id),
+        _ => false,
+    }
 }
 
 /// Poll every PR/MR linked to `id` for a live "merged" state and settle the
@@ -4704,9 +4725,9 @@ pub fn check_pr_merges(store: &crate::store_lock::StoreHandle, id: &str) -> bool
     // local config/DB reads); the actual forge call is the only genuinely
     // slow part here, and is fired off concurrently below since one PR's
     // merge state has no bearing on any other's. A recorded `merged` is
-    // re-checked like an `open` row rather than trusted: it may have been
-    // written from another project's PR that shared the number, and a
-    // review settles as merged on it.
+    // re-checked like an `open` row until a forge read confirms it: it may
+    // have been written from another project's PR that shared the number,
+    // and a review settles as merged on it.
     struct MergeCheckJob<'a> {
         pr: &'a PullRequestView,
         client: crate::forge::ForgeClient,
@@ -4715,7 +4736,7 @@ pub fn check_pr_merges(store: &crate::store_lock::StoreHandle, id: &str) -> bool
     let mut unknown = false;
     for pr in prs
         .iter()
-        .filter(|pull_request| matches!(pull_request.state.as_str(), "open" | "merged"))
+        .filter(|pull_request| needs_merge_check(pull_request))
     {
         let project_root = pr
             .branch_id
@@ -5313,10 +5334,7 @@ fn apply_pr_merge_check(
 ) -> bool {
     let mut freshly_merged: Vec<PullRequestView> = Vec::new();
     let mut reverted = false;
-    for pr in prs
-        .iter()
-        .filter(|p| matches!(p.state.as_str(), "open" | "merged"))
-    {
+    for pr in prs.iter().filter(|p| needs_merge_check(p)) {
         let fetched = fetch_pr_merge_state(pr, client);
         reverted |= apply_pr_merge_state(store, id, pr, fetched, &mut freshly_merged);
     }
@@ -5414,6 +5432,33 @@ fn can_skip_pr_fetch(
     }
 }
 
+/// How often [`fetch_remote_pr_tip`] really fetches a PR branch when no
+/// fresh forge-reported head ([`FORGE_HEAD_FRESH_FOR`]) is available: a
+/// commit pushed straight to the PR reaches the review within this long.
+const PR_FETCH_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// Whether [`fetch_remote_pr_tip`] can skip fetching because the branch was
+/// really fetched within [`PR_FETCH_MIN_INTERVAL`]. Never while a fresh forge
+/// read is available (that read decides, via [`can_skip_pr_fetch`]), and
+/// never when the sync ref is missing or differs from what this daemon last
+/// pushed. Missing information always means "fetch".
+fn pr_fetch_floor_holds(
+    forge_head: Option<(std::time::Duration, &str)>,
+    local_sync_sha: Option<&str>,
+    last_pushed_sha: Option<&str>,
+    since_last_fetch: Option<std::time::Duration>,
+) -> bool {
+    let fresh_forge_read = forge_head.is_some_and(|(age, _)| age < FORGE_HEAD_FRESH_FOR);
+    match (local_sync_sha, since_last_fetch) {
+        (Some(local), Some(since)) => {
+            !fresh_forge_read
+                && last_pushed_sha.is_none_or(|pushed| pushed == local)
+                && since < PR_FETCH_MIN_INTERVAL
+        }
+        _ => false,
+    }
+}
+
 /// The store-writing half of a single PR's merge-state check: apply an
 /// already-fetched forge state ([`fetch_pr_merge_state`]) to the PR row and
 /// `freshly_merged`. Kept serial (unlike the fetch) since it mutates shared
@@ -5435,6 +5480,9 @@ fn apply_pr_merge_state(
     };
     if result.is_ok() {
         crate::forge_health::note_success(&pr.forge, &pr.repo);
+    }
+    if matches!(&result, Ok(state) if state == "merged") {
+        confirmed_merged_prs().lock().insert(pr.id.clone());
     }
     match result {
         Ok(state) if state == pr.state => {}
@@ -11026,11 +11074,11 @@ fn fetch_remote_pr_tip(
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let dest_ref = sync_fetch_ref(pr_id);
     // A `git fetch` is a git process, a transport process (ssh or a remote
-    // helper) and a network connection. When the forge's REST view -- read
-    // moments ago by this same maintenance pass's merge check -- says the
-    // branch head is exactly what the sync ref already holds, the fetch
-    // would write the same commit, so skip it (bounded by
-    // `PR_FETCH_MAX_SKIP`).
+    // helper) and a network connection. When a recent merge check's forge
+    // read says the branch head is exactly what the sync ref already holds,
+    // the fetch would write the same commit, so skip it (bounded by
+    // `PR_FETCH_MAX_SKIP`). Without such a read, the branch is fetched at
+    // most once per `PR_FETCH_MIN_INTERVAL`.
     let now = std::time::Instant::now();
     let forge_head = forge_heads()
         .lock()
@@ -11040,12 +11088,18 @@ fn fetch_remote_pr_tip(
         .lock()
         .get(pr_id)
         .map(|at| now.duration_since(*at));
-    if forge_head.is_some() && since_last_fetch.is_some() {
+    if since_last_fetch.is_some() {
         let local = git(&root, &["rev-parse", "--verify", "--quiet", &dest_ref])
             .ok()
             .map(|s| s.trim().to_string());
+        let forge_head = forge_head.as_ref().map(|(age, head)| (*age, head.as_str()));
         if can_skip_pr_fetch(
-            forge_head.as_ref().map(|(age, head)| (*age, head.as_str())),
+            forge_head,
+            local.as_deref(),
+            pr.last_pushed_sha.as_deref(),
+            since_last_fetch,
+        ) || pr_fetch_floor_holds(
+            forge_head,
             local.as_deref(),
             pr.last_pushed_sha.as_deref(),
             since_last_fetch,
@@ -12137,6 +12191,57 @@ mod tests {
         assert!(!can_skip_pr_fetch(None, Some("abc"), Some("abc"), recent));
         assert!(!can_skip_pr_fetch(fresh, None, Some("abc"), recent));
         assert!(!can_skip_pr_fetch(fresh, Some("abc"), Some("abc"), None));
+    }
+
+    #[test]
+    fn pr_fetch_floor_holds_only_without_a_fresh_forge_read() {
+        use std::time::Duration;
+        let recent = Some(Duration::from_secs(10));
+        let stale = Some((Duration::from_secs(30), "abc"));
+        // No fresh forge read and a real fetch 10s ago: skip.
+        assert!(pr_fetch_floor_holds(None, Some("abc"), Some("abc"), recent));
+        assert!(pr_fetch_floor_holds(stale, Some("abc"), None, recent));
+        // A fresh forge read decides instead, even when it shows a change.
+        assert!(!pr_fetch_floor_holds(
+            Some((Duration::from_secs(2), "new")),
+            Some("abc"),
+            Some("abc"),
+            recent
+        ));
+        // Floor elapsed: fetch.
+        assert!(!pr_fetch_floor_holds(
+            None,
+            Some("abc"),
+            Some("abc"),
+            Some(Duration::from_secs(21))
+        ));
+        // We pushed something the sync ref doesn't hold yet: fetch.
+        assert!(!pr_fetch_floor_holds(
+            None,
+            Some("abc"),
+            Some("new"),
+            recent
+        ));
+        // Missing information always fetches.
+        assert!(!pr_fetch_floor_holds(None, None, Some("abc"), recent));
+        assert!(!pr_fetch_floor_holds(None, Some("abc"), Some("abc"), None));
+    }
+
+    #[test]
+    fn a_confirmed_merged_pr_is_not_checked_again() {
+        let mut pr = test_pr("ral-1-review", "main");
+        pr.id = "pr-confirm-merged-test".to_string();
+        pr.state = "merged".to_string();
+        assert!(
+            needs_merge_check(&pr),
+            "an unconfirmed merged row is re-checked"
+        );
+        confirmed_merged_prs().lock().insert(pr.id.clone());
+        assert!(!needs_merge_check(&pr));
+        pr.state = "open".to_string();
+        assert!(needs_merge_check(&pr), "open rows are always checked");
+        pr.state = "closed".to_string();
+        assert!(!needs_merge_check(&pr));
     }
 
     fn tmp_dir(tag: &str) -> PathBuf {

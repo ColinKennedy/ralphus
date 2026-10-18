@@ -9830,9 +9830,48 @@ static MERGE_CHECK_LAST: LazyLock<Mutex<HashMap<String, std::time::Instant>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// How often an independent merge check runs per review. Each check is one
-/// forge request per open PR, so this bounds a 12-PR review to ~12 requests a
-/// minute -- well inside a forge's hourly budget even with several reviews.
-const MERGE_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+/// forge request per open PR, so this bounds a 12-PR review to ~144 requests
+/// an hour. A merge moves the base branch, which [`ensure_merge_check_for_base`]
+/// answers right away, so this slow check only has to catch what the base
+/// branch cannot show -- a PR closed without merging.
+const MERGE_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+
+/// Each project's base-branch tip, keyed by project root.
+type BaseTips = std::collections::BTreeMap<String, String>;
+
+/// Per guardian id: the base tip of each project at which a merge check last
+/// learned every PR's forge state. A base-shift rebuild waits until this
+/// matches the current base ([`ensure_merge_check_for_base`]).
+static MERGE_CHECK_ANSWERED_AT: LazyLock<Mutex<HashMap<String, BaseTips>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// A base tip no merge check has fully answered yet: when the first attempt
+/// against it failed, and when the latest attempt ran.
+struct UnansweredBase {
+    bases: BaseTips,
+    first_failed: std::time::Instant,
+    last_attempt: std::time::Instant,
+    /// Whether the end of [`MERGE_CHECK_OUTAGE_GRACE`] has been logged.
+    grace_reported: bool,
+}
+
+/// Per guardian id: the base tip merge checks keep failing against.
+static MERGE_CHECK_UNANSWERED: LazyLock<Mutex<HashMap<String, UnansweredBase>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// How long a base-shift rebuild waits for the forge to answer a merge check
+/// before deciding from git alone. The rebuild's own landed-content check
+/// ([`review_ref_landed`]) still recognizes a squash-merged stack, so the wait
+/// only has to cover a short forge outage.
+const MERGE_CHECK_OUTAGE_GRACE: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+
+/// Minimum gap between merge-check attempts against a base tip the forge has
+/// not answered, so an outage is not retried on every maintenance pass.
+const MERGE_CHECK_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// How long [`ensure_merge_check_for_base`] waits for a merge check already in
+/// flight (the slow [`spawn_merge_checks`] one) instead of starting its own.
+const MERGE_CHECK_IN_FLIGHT_WAIT: std::time::Duration = std::time::Duration::from_secs(90);
 
 /// When the in-flight [`MAINTAINING`] pass started per guardian id, and
 /// whether its "stuck" notice has been sent. Entries are removed when the
@@ -9885,7 +9924,147 @@ fn check_merges_claimed(store: &crate::store_lock::StoreHandle, id: &str) -> boo
     let Some(_claim) = InFlightClaim::acquire(&MERGE_CHECKING, id) else {
         return false;
     };
-    crate::pr::check_pr_merges(store, id)
+    check_merges_and_record(store, id)
+}
+
+/// Runs the merge check for `id` (the caller holds its [`MERGE_CHECKING`]
+/// claim) and, when the forge answered for every PR, records the base tips it
+/// answered against in [`MERGE_CHECK_ANSWERED_AT`]. The tips are read before
+/// the check, so a base that moves mid-check is never recorded as answered.
+fn check_merges_and_record(store: &crate::store_lock::StoreHandle, id: &str) -> bool {
+    let bases = current_base_tips(store, id);
+    let changed = crate::pr::check_pr_merges(store, id);
+    if let Some(bases) = bases {
+        if !crate::pr::merge_state_unknown(id) {
+            MERGE_CHECK_UNANSWERED.lock().expect("poisoned").remove(id);
+            MERGE_CHECK_ANSWERED_AT
+                .lock()
+                .expect("poisoned")
+                .insert(id.to_string(), bases);
+        }
+    }
+    changed
+}
+
+/// Each project's current base tip for `id`, or `None` when the review
+/// cannot be read. Unresolvable projects are left out, matching
+/// [`detect_base_shift`], which skips them too.
+fn current_base_tips(store: &crate::store_lock::StoreHandle, id: &str) -> Option<BaseTips> {
+    let guardian = store
+        .with_read_snapshot(|conn| Store::get_guardian_conn(conn, id))
+        .ok()?;
+    Some(
+        guardian
+            .projects
+            .iter()
+            .filter_map(|proj| {
+                let root = Workspace::for_guardian(store, id, Path::new(proj));
+                resolve_base(&root, &guardian.base_branch)
+                    .ok()
+                    .map(|sha| (proj.clone(), sha))
+            })
+            .collect(),
+    )
+}
+
+/// Whether a base-shift rebuild of `id` may run this pass.
+///
+/// A squash-merged PR moves the base branch without making the review's
+/// commits ancestors of it, so a rebuild started before the forge reports the
+/// merge would rebase the review onto its own squash commit. This makes sure a
+/// merge check has answered against the current base tips first: one already
+/// done for these tips is reused, one in flight is waited for, and otherwise a
+/// new one runs now. When the forge cannot answer (rate limit, outage), the
+/// rebuild waits, retrying every [`MERGE_CHECK_RETRY_INTERVAL`], until
+/// [`MERGE_CHECK_OUTAGE_GRACE`] has passed for this base tip; after that it
+/// may proceed and relies on its own git-based landed-content check.
+fn ensure_merge_check_for_base(store: &crate::store_lock::StoreHandle, id: &str) -> bool {
+    let Some(bases) = current_base_tips(store, id) else {
+        return true;
+    };
+    let answered = |bases: &BaseTips| {
+        MERGE_CHECK_ANSWERED_AT
+            .lock()
+            .expect("poisoned")
+            .get(id)
+            .is_some_and(|prev| prev == bases)
+    };
+    if answered(&bases) {
+        return true;
+    }
+    let retry_due = MERGE_CHECK_UNANSWERED
+        .lock()
+        .expect("poisoned")
+        .get(id)
+        .filter(|u| u.bases == bases)
+        .is_none_or(|u| u.last_attempt.elapsed() >= MERGE_CHECK_RETRY_INTERVAL);
+    if retry_due {
+        let deadline = std::time::Instant::now() + MERGE_CHECK_IN_FLIGHT_WAIT;
+        loop {
+            if let Some(_claim) = InFlightClaim::acquire(&MERGE_CHECKING, id) {
+                if !answered(&bases) {
+                    check_merges_and_record(store, id);
+                }
+                break;
+            }
+            if answered(&bases) || std::time::Instant::now() >= deadline {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(250));
+        }
+        if answered(&bases) {
+            return true;
+        }
+    }
+    let now = std::time::Instant::now();
+    let (newly_waiting, grace_just_expired, allow) = {
+        let mut unanswered = MERGE_CHECK_UNANSWERED.lock().expect("poisoned");
+        match unanswered.get_mut(id) {
+            Some(entry) if entry.bases == bases => {
+                if retry_due {
+                    entry.last_attempt = now;
+                }
+                let expired = entry.first_failed.elapsed() >= MERGE_CHECK_OUTAGE_GRACE;
+                let just_expired = expired && !entry.grace_reported;
+                entry.grace_reported |= expired;
+                (false, just_expired, expired)
+            }
+            _ => {
+                unanswered.insert(
+                    id.to_string(),
+                    UnansweredBase {
+                        bases: bases.clone(),
+                        first_failed: now,
+                        last_attempt: now,
+                        grace_reported: false,
+                    },
+                );
+                (true, false, false)
+            }
+        }
+    };
+    if newly_waiting || grace_just_expired {
+        let message = if newly_waiting {
+            "base-shift rebuild waiting for the forge to answer a merge check"
+        } else {
+            "forge still not answering merge checks; base-shift rebuild proceeds on git's \
+             landed-content check"
+        };
+        crate::rlog!(WARNING, "ralphus [guardian] review {id} {message}");
+        crate::cartographer::Note::new("guardian")
+            .level(crate::logging::LogLevel::WARNING)
+            .scope("guardian")
+            .guardian(id)
+            .emit(
+                &store.lock(),
+                message,
+                serde_json::json!({
+                    "bases": bases,
+                    "grace_secs": MERGE_CHECK_OUTAGE_GRACE.as_secs(),
+                }),
+            );
+    }
+    allow
 }
 
 /// Starts an independent merge check, on its own thread, for every candidate
@@ -9896,6 +10075,14 @@ fn spawn_merge_checks(store: &crate::store_lock::StoreHandle, candidates: &[(Str
         let mut last = MERGE_CHECK_LAST.lock().expect("poisoned");
         let live: HashSet<&str> = candidates.iter().map(|(id, _)| id.as_str()).collect();
         last.retain(|id, _| live.contains(id.as_str()));
+        MERGE_CHECK_ANSWERED_AT
+            .lock()
+            .expect("poisoned")
+            .retain(|id, _| live.contains(id.as_str()));
+        MERGE_CHECK_UNANSWERED
+            .lock()
+            .expect("poisoned")
+            .retain(|id, _| live.contains(id.as_str()));
         candidates
             .iter()
             .filter(|(id, _)| {
@@ -10290,13 +10477,16 @@ fn review_maintenance_staggered(
                 key: format!("guardian:{id}"),
             };
             // RAL-300: ask "have the linked PRs merged?" before deciding to
-            // rebase at all. When this approves the review outright (every
-            // linked PR merged, review was idle in `in_review`) or drops a
-            // stale mid-flight PR, it already updated guardian/PR state --
-            // the base-shift/manual-push calls below re-read guardian.status
+            // rebase at all -- but only when the base branch has moved since
+            // the forge last answered, which is the only time a rebuild can
+            // start. When this approves the review outright (every linked PR
+            // merged, review was idle in `in_review`) or drops a stale
+            // mid-flight PR, it already updated guardian/PR state -- the
+            // base-shift/manual-push calls below re-read guardian.status
             // themselves and naturally no-op once it's no longer
-            // `in_review`/`merge_failed`, so no extra branching is needed here.
-            check_merges_claimed(&store, &id);
+            // `in_review`/`merge_failed`. A base move the forge has not
+            // answered for yet holds back the base-shift rebuild below.
+            let base_shift_rebuild_allowed = ensure_merge_check_for_base(&store, &id);
             // A PR/MR merged, closed or dropped -- or any other change to the
             // stack that no request of ours made -- can move the bottom or the
             // top, so the CI-deferral labels are checked here, before any pass
@@ -10393,7 +10583,9 @@ fn review_maintenance_staggered(
             }
             // A base-shift rebuild (full re-derive) subsumes any manual push via
             // carry-forward, so only look for a manual push when no rebuild ran.
-            if !rebuild_on_base_shift(&store, runner.as_ref(), &id, &sem, &token) {
+            if !(base_shift_rebuild_allowed
+                && rebuild_on_base_shift(&store, runner.as_ref(), &id, &sem, &token))
+            {
                 rebase_on_manual_push(&store, runner.as_ref(), &id, &sem);
             }
             // RAL-285: a restack rebuilds branch worktree tips in place but
@@ -18227,6 +18419,117 @@ mod tests {
         // Free again: reaches `check_pr_merges`, which finds no such review.
         assert!(!check_merges_claimed(&store, id));
         assert!(InFlightClaim::acquire(&MERGE_CHECKING, id).is_some());
+    }
+
+    /// The base-shift rebuild gate: reuses an answer for the same base tips,
+    /// holds back while the forge has not answered (without re-asking inside
+    /// the retry gap), proceeds once the outage grace ends, re-asks when the
+    /// base moves, and waits for a check already in flight. One test, since
+    /// every scenario shares the same process-wide maps and guardian id.
+    #[test]
+    fn base_shift_rebuild_waits_for_a_merge_check_against_the_current_base() {
+        use std::time::{Duration, Instant};
+        let (base, repo, _fwt) = make_repo("merge-check-gate");
+        let store = Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
+        let id = store
+            .lock()
+            .create_guardian("r", "main", repo.to_str().unwrap())
+            .unwrap();
+        let reset = || {
+            MERGE_CHECK_ANSWERED_AT.lock().unwrap().remove(&id);
+            MERGE_CHECK_UNANSWERED.lock().unwrap().remove(&id);
+        };
+        let tips = current_base_tips(&store, &id).expect("readable review");
+        assert!(!tips.is_empty(), "the review's project resolves its base");
+        let ago = |d: Duration| Instant::now().checked_sub(d).expect("clock");
+
+        // Already answered for these tips: no new check needed.
+        reset();
+        MERGE_CHECK_ANSWERED_AT
+            .lock()
+            .unwrap()
+            .insert(id.clone(), tips.clone());
+        {
+            let _held = InFlightClaim::acquire(&MERGE_CHECKING, &id).expect("free claim");
+            let started = Instant::now();
+            assert!(ensure_merge_check_for_base(&store, &id));
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "did not wait on the claim"
+            );
+        }
+
+        // Unanswered and inside the retry gap: hold back, ask nothing.
+        reset();
+        MERGE_CHECK_UNANSWERED.lock().unwrap().insert(
+            id.clone(),
+            UnansweredBase {
+                bases: tips.clone(),
+                first_failed: Instant::now(),
+                last_attempt: Instant::now(),
+                grace_reported: false,
+            },
+        );
+        assert!(!ensure_merge_check_for_base(&store, &id));
+        assert!(!MERGE_CHECK_ANSWERED_AT.lock().unwrap().contains_key(&id));
+
+        // Unanswered past the outage grace: proceed on git's own checks.
+        MERGE_CHECK_UNANSWERED
+            .lock()
+            .unwrap()
+            .get_mut(&id)
+            .unwrap()
+            .first_failed = ago(MERGE_CHECK_OUTAGE_GRACE + Duration::from_secs(1));
+        assert!(ensure_merge_check_for_base(&store, &id));
+
+        // Retry due: the check runs (no PRs, so the forge has nothing left to
+        // answer) and clears the unanswered record.
+        {
+            let mut unanswered = MERGE_CHECK_UNANSWERED.lock().unwrap();
+            let entry = unanswered.get_mut(&id).unwrap();
+            entry.first_failed = Instant::now();
+            entry.last_attempt = ago(MERGE_CHECK_RETRY_INTERVAL + Duration::from_secs(1));
+        }
+        assert!(ensure_merge_check_for_base(&store, &id));
+        assert!(!MERGE_CHECK_UNANSWERED.lock().unwrap().contains_key(&id));
+        assert_eq!(
+            MERGE_CHECK_ANSWERED_AT.lock().unwrap().get(&id),
+            Some(&tips)
+        );
+
+        // The base moves: the old answer no longer counts, a new check runs.
+        std::fs::write(repo.join("upstream.txt"), "upstream\n").unwrap();
+        g(&repo, &["add", "."]);
+        g(&repo, &["commit", "--message", "upstream"]);
+        let moved = current_base_tips(&store, &id).unwrap();
+        assert_ne!(moved, tips);
+        assert!(ensure_merge_check_for_base(&store, &id));
+        assert_eq!(
+            MERGE_CHECK_ANSWERED_AT.lock().unwrap().get(&id),
+            Some(&moved)
+        );
+
+        // A check already in flight is waited for, not skipped.
+        reset();
+        let held = InFlightClaim::acquire(&MERGE_CHECKING, &id).expect("free claim");
+        let finisher = {
+            let id = id.clone();
+            let moved = moved.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(300));
+                MERGE_CHECK_ANSWERED_AT.lock().unwrap().insert(id, moved);
+                drop(held);
+            })
+        };
+        let started = Instant::now();
+        assert!(ensure_merge_check_for_base(&store, &id));
+        assert!(started.elapsed() >= Duration::from_millis(300));
+        finisher.join().unwrap();
+
+        reset();
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]

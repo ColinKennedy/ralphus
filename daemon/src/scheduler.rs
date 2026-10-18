@@ -130,12 +130,14 @@ pub const WORKTREE_RETIREMENT_INTERVAL: Duration = Duration::from_secs(24 * 60 *
 /// branch that only moves via a direct forge-side merge, bypassing every
 /// ralphus-tracked PR, is otherwise never re-fetched by anything in the
 /// daemon. [`REVIEW_MAINT_INTERVAL`]'s own `rebuild_on_base_shift` check
-/// picks up the refreshed ref on its very next tick, unchanged. A minute is
-/// deliberately coarser than `REVIEW_MAINT_INTERVAL`: a base-branch merge is
-/// a human-timescale event, not something that needs sub-minute latency, and
-/// every guardian sharing the same (root, machine, base_branch) is deduped
-/// into a single fetch per cycle regardless of how many reviews target it.
-pub const BASE_BRANCH_FRESHNESS_POLL_INTERVAL: Duration = Duration::from_secs(60);
+/// picks up the refreshed ref on its very next tick, unchanged. It is also
+/// how a merged PR is noticed: the merge moves the base branch, and the
+/// maintenance pass asks the forge about the review's PRs only then
+/// (`guardian_merge::ensure_merge_check_for_base`). A git fetch that finds
+/// nothing new costs no forge API quota and writes nothing locally, and every
+/// guardian sharing the same (root, machine, base_branch) is deduped into a
+/// single fetch per cycle regardless of how many reviews target it.
+pub const BASE_BRANCH_FRESHNESS_POLL_INTERVAL: Duration = Duration::from_secs(10);
 
 /// How often to run the RAL-308 CPU-flat stall sweep
 /// (`crate::cpu_stall::CpuStallTracker::sweep`). A minute is fine enough
