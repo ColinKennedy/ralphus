@@ -7395,28 +7395,25 @@ fn run_submit_followup(
     // from the TOML alone and each cell starts as its own worktree becomes
     // ready. See `crate::worktrees::plan_local_worktree_jobs`'s doc comment.
     report_phase("Claiming worktrees");
-    let lock_requested = std::time::Instant::now();
-    let (prefetched_worktrees, claim_lock_wait_ms, claim_hold_ms) = {
-        let guard = store_handle.lock();
-        let lock_wait_ms = lock_requested.elapsed().as_millis();
-        let planning_started = std::time::Instant::now();
-        let (cells, tasks) = crate::reviews::cells_and_tasks_from_file(&file);
-        let jobs = crate::worktrees::plan_local_worktree_jobs(
-            &guard,
-            &squad_id,
-            &cells,
-            &tasks,
-            &prefetched_upstreams,
-        );
-        (
-            crate::worktrees::planned_worktree_paths(&jobs),
-            lock_wait_ms,
-            planning_started.elapsed().as_millis(),
-        )
+    let planning_started = std::time::Instant::now();
+    let (cells, tasks) = crate::reviews::cells_and_tasks_from_file(&file);
+    let jobs = match crate::worktrees::plan_local_worktree_jobs(
+        store_handle,
+        &squad_id,
+        &cells,
+        &tasks,
+        &prefetched_upstreams,
+    ) {
+        Ok(jobs) => jobs,
+        Err(e) => {
+            fail_materialization(store_handle, &squad_id, &e);
+            return;
+        }
     };
+    let prefetched_worktrees = crate::worktrees::planned_worktree_paths(&jobs);
+    let planning_ms = planning_started.elapsed().as_millis();
     checkpoint(&format!(
-        "claimed {} worktree slot(s): waited {claim_lock_wait_ms}ms for the store lock, \
-         planned in {claim_hold_ms}ms under it",
+        "claimed {} worktree slot(s) in {planning_ms}ms outside the global store lock",
         prefetched_worktrees.len()
     ));
 
