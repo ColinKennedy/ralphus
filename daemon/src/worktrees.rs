@@ -297,6 +297,10 @@ fn creation_markers(root: &Path) -> HashMap<String, String> {
         .filter_map(Result::ok)
         .filter_map(|entry| {
             let short = entry.file_name().to_str()?.to_string();
+            // Dot-prefixed names are in-flight staging files, never slots.
+            if short.starts_with('.') {
+                return None;
+            }
             let (branch, _) = read_creation_marker(&entry.path())?;
             Some((short, branch))
         })
@@ -314,6 +318,11 @@ fn creation_markers(root: &Path) -> HashMap<String, String> {
 /// `Ok(true)` when the slot is now claimed for `branch` (freshly, or by an
 /// earlier marker that already names `branch`); `Ok(false)` when the marker
 /// belongs to a different branch and the caller must pick another slot.
+///
+/// The contents are written to a private staging file first and then hard-linked
+/// into place. The link is atomic and fails if the marker exists, so the marker
+/// name only ever appears with its full contents: a racing claimer never reads
+/// an empty or half-written marker and mistakes it for a foreign one.
 fn write_creation_marker(
     root: &Path,
     short: &str,
@@ -321,24 +330,34 @@ fn write_creation_marker(
     upstream: &str,
 ) -> Result<bool, String> {
     use std::io::Write as _;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static STAGING_SEQ: AtomicU64 = AtomicU64::new(0);
+
     let dir = creation_marker_dir(root);
     std::fs::create_dir_all(&dir)
         .map_err(|e| format!("could not create worktree marker directory: {e}"))?;
     let path = creation_marker_path(root, short);
-    match std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&path)
-    {
-        Ok(mut file) => writeln!(
-            file,
-            "{branch}
-upstream={upstream}
-pid={}",
-            std::process::id()
-        )
-        .map(|()| true)
-        .map_err(|e| format!("could not write worktree creation marker: {e}")),
+    let staging = dir.join(format!(
+        ".{short}.{}.{}",
+        std::process::id(),
+        STAGING_SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
+    let contents = format!(
+        "{branch}\nupstream={upstream}\npid={}\n",
+        std::process::id()
+    );
+    let staged = std::fs::File::create_new(&staging).and_then(|mut file| {
+        file.write_all(contents.as_bytes())?;
+        file.sync_all()
+    });
+    if let Err(e) = staged {
+        let _ = std::fs::remove_file(&staging);
+        return Err(format!("could not write worktree creation marker: {e}"));
+    }
+    let linked = std::fs::hard_link(&staging, &path);
+    let _ = std::fs::remove_file(&staging);
+    match linked {
+        Ok(()) => Ok(true),
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
             Ok(read_creation_marker(&path).is_some_and(|(b, _)| b.eq_ignore_ascii_case(branch)))
         }
