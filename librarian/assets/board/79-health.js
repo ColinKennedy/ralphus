@@ -321,7 +321,7 @@
         }
         parts.push(`<div class="row" style="justify-content:space-between;margin-bottom:8px">
             <span style="color:var(--muted)" data-tip="This daemon's own Free-tier checks refresh automatically on an hourly background sweep (configurable via [health].poll_interval_secs). Remote targets below are always checked live -- the tab's own Refresh button re-checks them.">Local sweep is hourly by default</span>
-            <button class="btn" ${healthRefreshing ? "disabled" : ""} onclick="refreshHealthNow()" data-tip="Re-run this daemon's own Free-tier checks immediately instead of waiting for the next hourly sweep.">${healthRefreshing ? "Checking…" : "⟳ Check now (local)"}</button>
+            <button class="btn" ${healthRefreshing ? "disabled" : ""} onclick="guardedAction('health-check-now', () => refreshHealthNow())" data-tip="Re-run this daemon's own Free-tier checks immediately instead of waiting for the next hourly sweep.">${healthRefreshing ? "Checking…" : "⟳ Check now (local)"}</button>
           </div>`);
         parts.push(storeLockPanelHtml(healthDaemon));
         parts.push(daemonThreadsHtml(healthThreads));

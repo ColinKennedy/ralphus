@@ -225,8 +225,8 @@
       CLICK_HANDLERS.openReviewMenu = (e, ds) => openReviewMenu(e, ds.guardianId || "");
       CTX_HANDLERS.openReviewMenu = (e, ds) => openReviewMenu(e, ds.guardianId || "");
       CTX_HANDLERS.openPrMenu = (e, ds) => openPrMenu(e, ds.prId || "", ds.prOpen === "1");
-      CLICK_HANDLERS.refreshPrStatusMenuItem = (e, ds) => refreshPrStatusMenuItem(ds.prId || "");
-      CLICK_HANDLERS.actionPrFeedbackMenuItem = (e, ds) => actionPrFeedbackMenuItem(ds.prId || "");
+      CLICK_HANDLERS.refreshPrStatusMenuItem = (e, ds) => { closeSquadMenu(); void guardedAction(`pr-refresh:${ds.prId || ""}`, () => refreshPrStatusMenuItem(ds.prId || "")); };
+      CLICK_HANDLERS.actionPrFeedbackMenuItem = (e, ds) => { void guardedAction(`pr-feedback:${ds.prId || ""}`, () => actionPrFeedbackMenuItem(ds.prId || "")); };
       CLICK_HANDLERS.openEditReviewDetailsFromMenu = (e, ds) => { closeSquadMenu(); openEditReviewDetails(ds.guardianId || ""); };
       CLICK_HANDLERS.cancelReview = (e, ds) => cancelReview(ds.guardianId || "");
       CLICK_HANDLERS.reopenReview = (e, ds) => reopenReview(ds.guardianId || "");
@@ -357,9 +357,9 @@
       CLICK_HANDLERS.openEditReviewDetails = (e, ds) => openEditReviewDetails(ds.guardianId || "", ds.focus || "");
       CLICK_HANDLERS.openFollowupList = (e, ds) => openFollowupList(ds.guardianId || "");
       CLICK_HANDLERS.openFollowupSquad = (e, ds) => { closeModal(); gotoSquad(ds.squadId || ""); };
-      CLICK_HANDLERS.acceptFollowup = (e, ds) => acceptFollowupOffer(ds.guardianId || "", Number(ds.prophecyId));
-      CLICK_HANDLERS.ignoreFollowup = (e, ds) => setFollowupIgnored(ds.guardianId || "", Number(ds.prophecyId), true);
-      CLICK_HANDLERS.unignoreFollowup = (e, ds) => setFollowupIgnored(ds.guardianId || "", Number(ds.prophecyId), false);
+      CLICK_HANDLERS.acceptFollowup = (e, ds) => { void guardedAction(`followup:${ds.guardianId}:${ds.prophecyId}`, () => acceptFollowupOffer(ds.guardianId || "", Number(ds.prophecyId))); };
+      CLICK_HANDLERS.ignoreFollowup = (e, ds) => { void guardedAction(`followup:${ds.guardianId}:${ds.prophecyId}`, () => setFollowupIgnored(ds.guardianId || "", Number(ds.prophecyId), true)); };
+      CLICK_HANDLERS.unignoreFollowup = (e, ds) => { void guardedAction(`followup:${ds.guardianId}:${ds.prophecyId}`, () => setFollowupIgnored(ds.guardianId || "", Number(ds.prophecyId), false)); };
       CLICK_HANDLERS.openEnvOverridesEditor = (e, ds) => { closeSquadMenu(); openEnvOverridesEditor(ds.guardianId || "", ds.scope || "", ds.branchId || ""); };
       CLICK_HANDLERS.addEnvOverrideRow = (e, ds) => addEnvOverrideRow(ds.scope || "", ds.branchId || "");
       CLICK_HANDLERS.removeEnvOverrideRow = (e, ds) => removeEnvOverrideRow(ds.scope || "", ds.branchId || "", Number(ds.i));

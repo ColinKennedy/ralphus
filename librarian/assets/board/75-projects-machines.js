@@ -149,7 +149,7 @@ Who/when: after registering a provider, or when a squad failed and you need to t
       function renderMachines() {
         byId("machine-summary").innerHTML =
           `${machines.length} registered ${machines.length === 1 ? "provider" : "providers"} `
-          + `<button class="btn" style="margin-left:8px;padding:2px 8px;font-size:12px" onclick="pollMachines()" data-tip="Re-query the daemon for the registered machine provider list.">⟳ Refresh</button>`;
+          + `<button class="btn" style="margin-left:8px;padding:2px 8px;font-size:12px" onclick="guardedAction('refresh-machines', pollMachines)" data-tip="Re-query the daemon for the registered machine provider list.">⟳ Refresh</button>`;
         const el = byId("machines");
         const err = machineError
           ? `<div class="empty" style="color:var(--failed);margin-bottom:8px">${esc(machineError)}</div>`
@@ -446,7 +446,7 @@ Work submitted against it will fail — fix the machine or deregister the provid
       function renderUsers() {
         byId("user-summary").innerHTML =
           `${users.length} registered ${users.length === 1 ? "user" : "users"} `
-          + `<button class="btn" style="margin-left:8px;padding:2px 8px;font-size:12px" onclick="pollUsers()" data-tip="Re-query the daemon for the registered user list.">⟳ Refresh</button>`;
+          + `<button class="btn" style="margin-left:8px;padding:2px 8px;font-size:12px" onclick="guardedAction('refresh-users', pollUsers)" data-tip="Re-query the daemon for the registered user list.">⟳ Refresh</button>`;
         const el = byId("users");
         const err = userError
           ? `<div class="empty" style="color:var(--failed);margin-bottom:8px">${esc(userError)}</div>`
@@ -609,7 +609,7 @@ Work submitted against it will fail — fix the machine or deregister the provid
       function renderSecretEnvNames() {
         byId("secret-env-name-summary").innerHTML =
           `${secretEnvNames.length} secret env-var ${secretEnvNames.length === 1 ? "name" : "names"} `
-          + `<button class="btn" style="margin-left:8px;padding:2px 8px;font-size:12px" onclick="pollSecretEnvNames()" data-tip="Re-query the daemon for the secret env-var name list.">⟳ Refresh</button>`;
+          + `<button class="btn" style="margin-left:8px;padding:2px 8px;font-size:12px" onclick="guardedAction('refresh-secret-env', pollSecretEnvNames)" data-tip="Re-query the daemon for the secret env-var name list.">⟳ Refresh</button>`;
         const el = byId("secrets");
         const err = secretEnvNameError
           ? `<div class="empty" style="color:var(--failed);margin-bottom:8px">${esc(secretEnvNameError)}</div>`
@@ -1392,7 +1392,7 @@ Work submitted against it will fail — fix the machine or deregister the provid
           : `<div class="empty">Nothing watched.</div>`;
         byId("prefs-summary").innerHTML =
           `${hiddenItems.length} hidden item${hiddenItems.length === 1 ? "" : "s"} in ${whose} view${resolvedAs} `
-          + `<button class="btn" style="margin-left:8px;padding:2px 8px;font-size:12px" onclick="pollPrefs()" data-tip="Re-query the daemon for ${whose} hidden items.">⟳ Refresh</button>`;
+          + `<button class="btn" style="margin-left:8px;padding:2px 8px;font-size:12px" onclick="guardedAction('refresh-prefs', pollPrefs)" data-tip="Re-query the daemon for ${whose} hidden items.">⟳ Refresh</button>`;
         /** @type {HTMLInputElement} */ (byId("hidden-filter")).value = hiddenFilters.q;
         /** @type {HTMLInputElement} */ (byId("hidden-filter-squad")).checked = hiddenFilters.type.has("squad");
         /** @type {HTMLInputElement} */ (byId("hidden-filter-review")).checked = hiddenFilters.type.has("review");
@@ -1739,7 +1739,7 @@ Work submitted against it will fail — fix the machine or deregister the provid
         byId("proj-summary").innerHTML =
           `${projects.length} registered ${projects.length === 1 ? "project" : "projects"} `
           + `<button class="btn primary" style="margin-left:8px;padding:2px 8px;font-size:12px" onclick="openAddProjectModal()" data-tip="Register a new project with the daemon (equivalent to \`ralphus project git\`) so it can be picked as a task's cwd placeholder and shown across the board.\nOpens a popup to enter its name, path, and optional clone URL.">+ Add project</button>`
-          + `<button class="btn" style="margin-left:8px;padding:2px 8px;font-size:12px" onclick="refreshProjects()" data-tip="Re-query the daemon for the registered project list and re-validate every row's path.\nUseful after fixing a broken path or repository outside of ralphus.">⟳ Refresh</button>`;
+          + `<button class="btn" style="margin-left:8px;padding:2px 8px;font-size:12px" onclick="guardedAction('refresh-projects', refreshProjects)" data-tip="Re-query the daemon for the registered project list and re-validate every row's path.\nUseful after fixing a broken path or repository outside of ralphus.">⟳ Refresh</button>`;
         const warningBanner = projectSaveWarnings.length
           ? `<div class="verr" style="margin-bottom:8px">${projectSaveWarnings.map((w) => `<span class="vwarn">⚠ ${esc(w)}</span>`).join("<br/>")}</div>`
           : "";
