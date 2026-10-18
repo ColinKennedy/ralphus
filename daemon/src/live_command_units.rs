@@ -1304,7 +1304,7 @@ fn units_of(command: &str, depth: usize) -> Option<Vec<Unit>> {
                     last.key.push_str(suffix);
                 }
                 units.extend(inner);
-                previous = Some(units.len().wrapping_sub(1)).filter(|_| !units.is_empty());
+                previous = (!units.is_empty()).then_some(units.len().wrapping_sub(1));
             }
             Analysis::Command(cmd) => {
                 let Command {
