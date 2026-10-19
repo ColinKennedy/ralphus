@@ -262,6 +262,71 @@ pub fn session_check_runs(session_name: &str) -> Vec<CheckRun> {
     check_runs(&transcript)
 }
 
+/// Most checks a description no model wrote lists; the latest ones are kept.
+const FALLBACK_CHECKS: usize = 10;
+/// Last lines of output such a description shows per check.
+const FALLBACK_OUTPUT_LINES: usize = 5;
+/// Longest command text such a description shows per check.
+const FALLBACK_COMMAND_CHARS: usize = 300;
+
+/// A code fence longer than any backtick run in `text`, indented by `indent`.
+fn indented_fence(text: &str, indent: &str) -> String {
+    let longest = text.split(|c| c != '`').map(str::len).max().unwrap_or(0);
+    let fence = "`".repeat((longest + 1).max(3));
+    format!("{fence}text\n{}\n{fence}", text.trim_end())
+        .lines()
+        .map(|line| format!("{indent}{line}"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// The checks as Markdown for a description no model wrote, or `None`
+/// without any: the latest few, each with its exit status, command and the
+/// last lines of its output, redacted and clipped.
+#[must_use]
+pub fn markdown_section(checks: &[CheckRun]) -> Option<String> {
+    if checks.is_empty() {
+        return None;
+    }
+    let shown = &checks[checks.len().saturating_sub(FALLBACK_CHECKS)..];
+    let mut out = String::from(
+        "The commands the agent that wrote this branch ran to check it, in the \
+         order they last ran (commands that only read files are left out). Each \
+         exit status is the whole command line's, so one ending in a pipe such as \
+         `| tail` reports that command's: trust the output when they disagree.\n",
+    );
+    for (n, check) in shown.iter().enumerate() {
+        let number = (n + 1).to_string();
+        let indent = " ".repeat(number.len() + 2);
+        let status = match check.succeeded {
+            Some(true) => "exit status: success",
+            Some(false) => "exit status: failure",
+            None => "no result recorded",
+        };
+        let command = ralphus_core::redact::redact_secrets(&check.command);
+        let _ = std::fmt::Write::write_fmt(
+            &mut out,
+            format_args!(
+                "\n{number}. {status}\n\n{}\n",
+                indented_fence(&clip_chars(&command, FALLBACK_COMMAND_CHARS), &indent)
+            ),
+        );
+        let lines: Vec<&str> = check.output_tail.lines().collect();
+        let tail = lines[lines.len().saturating_sub(FALLBACK_OUTPUT_LINES)..].join("\n");
+        if !tail.trim().is_empty() {
+            let tail = ralphus_core::redact::redact_secrets(&tail);
+            let _ = std::fmt::Write::write_fmt(
+                &mut out,
+                format_args!(
+                    "\n{indent}End of output:\n\n{}\n",
+                    indented_fence(&tail, &indent)
+                ),
+            );
+        }
+    }
+    Some(out.trim_end().to_string())
+}
+
 /// The block the PR writer is given, or an empty string when there are no
 /// checks. Commands and output are redacted and clipped.
 #[must_use]
@@ -453,6 +518,45 @@ mod tests {
         assert!(section.contains("--- check 2 (exit status: FAILURE) ---"));
         assert!(section.contains("do not say checks were not run"));
         assert!(!section.contains("NOTAREALKEY"));
+    }
+
+    #[test]
+    fn the_fallback_section_lists_each_check_with_its_status_and_output() {
+        assert!(markdown_section(&[]).is_none());
+        let section = markdown_section(&[
+            CheckRun {
+                command: "moon run acme_service:test 2>&1 | tail -15".into(),
+                succeeded: Some(true),
+                output_tail: "a\nb\nc\nd\ne\n8 passed in 0.17s\nTasks: 8 completed".into(),
+            },
+            CheckRun {
+                command: "uses ```backticks``` and ANTHROPIC_API_KEY=NOTAREALKEY".into(),
+                succeeded: Some(false),
+                output_tail: String::new(),
+            },
+        ])
+        .unwrap();
+        assert!(section.contains(
+            "\n1. exit status: success\n\n   ```text\n   moon run acme_service:test 2>&1 | tail -15\n   ```\n\n   End of output:\n\n   ```text\n   c\n   d\n   e\n   8 passed in 0.17s\n   Tasks: 8 completed\n   ```\n"
+        ));
+        assert!(section.contains("\n2. exit status: failure\n\n   ````text\n"));
+        assert!(!section.contains("NOTAREALKEY"));
+        // A check with no recorded output gets no output block.
+        assert_eq!(section.matches("End of output:").count(), 1);
+    }
+
+    #[test]
+    fn the_fallback_section_keeps_only_the_latest_checks() {
+        let checks: Vec<CheckRun> = (0..FALLBACK_CHECKS + 3)
+            .map(|i| CheckRun {
+                command: format!("make check-{i}"),
+                succeeded: Some(true),
+                output_tail: String::new(),
+            })
+            .collect();
+        let section = markdown_section(&checks).unwrap();
+        assert!(!section.contains("make check-2\n") && section.contains("make check-3\n"));
+        assert!(section.contains(&format!("{FALLBACK_CHECKS}. exit status")));
     }
 
     #[test]

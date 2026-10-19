@@ -2928,7 +2928,10 @@ target repo's PR template when one is found
 checks the branch's source cell ran (its recorded shell calls other than file
 reads, searches and edits, each with its last result and the end of its
 output; `daemon/src/pr_test_evidence.rs`) and writes the testing section from
-them.
+them. When the writer call fails, the plain fallback description lists those
+checks itself (the latest 10, each with its exit status, command and last
+output lines) under the template's own testing heading, or in a new
+`## Testing` section.
 
 `use_worktree_branch_name` (RAL-307, optional boolean, applies to both a
 stacked and a whole-stack request) is ignored when `branch_alias` is also set

@@ -2697,6 +2697,40 @@ fn fallback_pr_description(commits: &str, diff_stat: &str, template: Option<&str
     }
 }
 
+/// `description` with a testing section built from `checks`, for a
+/// description no model wrote. It goes under the first heading that mentions
+/// testing (a repo template's own `## Testing` / `## How was this tested?`),
+/// otherwise into a new `## Testing` section at the end. Unchanged without
+/// checks.
+fn with_recorded_checks(
+    description: String,
+    checks: &[crate::pr_test_evidence::CheckRun],
+) -> String {
+    let Some(section) = crate::pr_test_evidence::markdown_section(checks) else {
+        return description;
+    };
+    let mut offset = 0usize;
+    for line in description.split_inclusive('\n') {
+        offset += line.len();
+        let trimmed = line.trim_start();
+        if trimmed.starts_with('#') && trimmed.to_ascii_lowercase().contains("test") {
+            let (head, rest) = description.split_at(offset);
+            let head = if head.ends_with('\n') {
+                head.to_string()
+            } else {
+                format!("{head}\n")
+            };
+            return format!("{head}\n{section}\n\n{}", rest.trim_start_matches('\n'))
+                .trim_end()
+                .to_string();
+        }
+    }
+    if description.trim().is_empty() {
+        return format!("## Testing\n\n{section}");
+    }
+    format!("{}\n\n## Testing\n\n{section}", description.trim_end())
+}
+
 /// Insert `body` immediately after the template's first markdown heading --
 /// the section most templates reserve for a change summary (`## Overview`,
 /// `## Summary`, ...) -- instead of appending it as a brand-new section after
@@ -2974,7 +3008,10 @@ fn synthesize_pr_text(
             deterministic_relevant_prophecies(prophecies),
         );
     };
-    let fallback_description = fallback_pr_description(&commits, &diff_stat, template);
+    let fallback_description = with_recorded_checks(
+        fallback_pr_description(&commits, &diff_stat, template),
+        checks,
+    );
 
     // The resolver agent may name a custom `[agent.profiles.*]` entry, which
     // the runner cannot interpret -- resolve it to a real backend (plus its
@@ -23823,6 +23860,69 @@ token_env = "RALPHUS_TEST_FORGE_TOKEN"
                 "{noise} leaked:\n{description}"
             );
         }
+    }
+
+    #[test]
+    fn a_fallback_description_gets_a_testing_section_from_the_checks() {
+        let checks = [crate::pr_test_evidence::CheckRun {
+            command: "moon run acme_service:test".into(),
+            succeeded: Some(true),
+            output_tail: "8 passed".into(),
+        }];
+        // No template: a new section at the end.
+        let described = with_recorded_checks("## Summary\n\n- add x".to_string(), &checks);
+        assert!(described.starts_with("## Summary\n\n- add x\n\n## Testing\n\nThe commands"));
+        assert!(described.contains("moon run acme_service:test"));
+        // A template's own testing heading receives it, ahead of what follows.
+        let template =
+            "## Overview\n\n- add x\n\n## How was this tested?\n\n## Checklist\n\n- [ ] done";
+        let described = with_recorded_checks(template.to_string(), &checks);
+        let tested = described.find("## How was this tested?").unwrap();
+        let section = described.find("The commands").unwrap();
+        let checklist = described.find("## Checklist").unwrap();
+        assert!(tested < section && section < checklist, "{described}");
+        assert_eq!(described.matches("## Testing").count(), 0);
+        // No checks: unchanged.
+        assert_eq!(with_recorded_checks("as is\n".to_string(), &[]), "as is\n");
+    }
+
+    #[test]
+    fn a_failed_writer_call_still_reports_the_recorded_checks() {
+        let root = tmp_dir("pr-text-fallback-checks");
+        g(&root, &["init", "--initial-branch", "main"]);
+        gwrite(&root, "base.txt", "base\n");
+        g(&root, &["add", "."]);
+        g(&root, &["commit", "--message", "base"]);
+        g(&root, &["checkout", "-b", "review/x"]);
+        gwrite(&root, "x.txt", "add x\n");
+        g(&root, &["add", "."]);
+        g(&root, &["commit", "--message", "add x"]);
+        g(&root, &["checkout", "main"]);
+        let store = store();
+        let gid = store
+            .create_guardian("demo", "main", root.to_str().unwrap())
+            .unwrap();
+        store.add_guardian_branch(&gid, "x").unwrap();
+        let branch_id = store.get_guardian(&gid).unwrap().branches[0].id.clone();
+        store
+            .set_branch_review(&gid, &branch_id, "review/x", "worktree-x")
+            .unwrap();
+        let guardian = store.get_guardian(&gid).unwrap();
+        let runner = CapturingFailureRunner(Mutex::new(None));
+        let checks = [crate::pr_test_evidence::CheckRun {
+            command: "cargo test -p x".into(),
+            succeeded: Some(true),
+            output_tail: "test result: ok. 3 passed".into(),
+        }];
+
+        let (_, description, _) =
+            synthesize_pr_text(&runner, &guardian, 0, None, None, &[], &checks);
+
+        assert!(description.contains("add x"), "{description}");
+        assert!(description.contains("## Testing"), "{description}");
+        assert!(description.contains("cargo test -p x"), "{description}");
+        assert!(description.contains("3 passed"), "{description}");
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
