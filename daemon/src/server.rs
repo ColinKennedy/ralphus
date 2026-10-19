@@ -20124,6 +20124,33 @@ pub fn serve<A: ToSocketAddrs>(
     // yet" invariant, so it belongs immediately alongside it rather than
     // deferred to first use.
     crate::remote_runner::reconcile_remote_exec_handles(&store);
+    // Live actions, same invariant: a row left `running` was the previous
+    // daemon's, so it was interrupted. It counts as the review's one automatic
+    // run; the user reruns it by hand. This runs before the scheduler thread
+    // and the HTTP loop start, so a run this daemon starts is never caught.
+    match store.interrupt_running_live_runs() {
+        Ok(0) => {}
+        Ok(n) => {
+            crate::rlog!(
+                WARNING,
+                "ralphus [recovery] {n} live run(s) were interrupted by the daemon restart"
+            );
+            let _ = store.cartographer_log(crate::cartographer::CartographerEntry {
+                level: crate::logging::LogLevel::WARNING,
+                source: "recovery",
+                message: "live runs interrupted by the daemon restart",
+                scope: Some("guardian"),
+                squad_id: None,
+                guardian_id: None,
+                cell_id: None,
+                task: None,
+                log_path: None,
+                payload: serde_json::json!({ "interrupted": n }),
+                admin_only: false,
+            });
+        }
+        Err(e) => crate::rlog!(ERROR, "ralphus [recovery] live run recovery failed: {e}"),
+    }
     // RAL-375: guardians stuck in `merging` after an unclean shutdown (and any
     // branch whose feedback application was interrupted mid-run) are resumed
     // by `scheduler::recover_interrupted_reviews`, run once at the top of

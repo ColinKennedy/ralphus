@@ -3607,6 +3607,10 @@ impl Store {
             // back-fills every pre-existing row for free, since they're all
             // the "parent" kind by construction.
             "ALTER TABLE guardian_pull_requests ADD COLUMN pr_kind TEXT NOT NULL DEFAULT 'parent'",
+            // The live agent's recipe commands that matched none of its
+            // recorded shell calls, kept so a PR can still show them as
+            // unverified (JSON list of strings).
+            "ALTER TABLE guardian_live_run_evidence ADD COLUMN unmatched_recipe TEXT",
         ] {
             self.run_idempotent_migration(stmt);
         }

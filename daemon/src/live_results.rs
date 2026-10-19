@@ -346,6 +346,9 @@ pub struct RunEvidence {
     pub fix_attempted: Option<bool>,
     pub fix_confirmed: Option<bool>,
     pub recipe: Vec<RecipeStep>,
+    /// Recipe entries the agent proposed that matched none of its recorded
+    /// shell calls, as written. Shown as unverified rather than dropped.
+    pub unmatched_recipe: Vec<String>,
     pub branch_ids: Vec<String>,
     pub integration_branch_id: Option<String>,
     pub integration_pushed: Option<bool>,
@@ -457,7 +460,8 @@ impl Store {
         Ok(())
     }
 
-    /// Record the verdict, fix flags and accepted recipe of a run.
+    /// Record the verdict, fix flags, accepted recipe and the recipe entries
+    /// that matched no recorded call.
     ///
     /// # Errors
     ///
@@ -468,11 +472,13 @@ impl Store {
         verdict: Verdict,
         parsed: Option<&ParsedResult>,
         recipe: &[RecipeStep],
+        unmatched_recipe: &[String],
     ) -> Result<()> {
         self.ensure_run_evidence(run_id)?;
         self.conn.execute(
             "UPDATE guardian_live_run_evidence
-             SET verdict=?, verdict_summary=?, fix_attempted=?, fix_confirmed=?, recipe=?
+             SET verdict=?, verdict_summary=?, fix_attempted=?, fix_confirmed=?, recipe=?,
+                 unmatched_recipe=?
              WHERE run_id=?",
             rusqlite::params![
                 verdict.as_str(),
@@ -480,6 +486,7 @@ impl Store {
                 opt_bool(parsed.and_then(|p| p.fix_attempted)),
                 opt_bool(parsed.and_then(|p| p.fix_confirmed)),
                 serde_json::to_string(recipe).unwrap_or_default(),
+                serde_json::to_string(unmatched_recipe).unwrap_or_default(),
                 run_id
             ],
         )?;
@@ -517,12 +524,14 @@ impl Store {
             .conn
             .query_row(
                 "SELECT sent_prompt, sent_system_prompt, verdict, verdict_summary, fix_attempted,
-                        fix_confirmed, recipe, branch_ids, integration_branch_id, integration_pushed
+                        fix_confirmed, recipe, branch_ids, integration_branch_id, integration_pushed,
+                        unmatched_recipe
                  FROM guardian_live_run_evidence WHERE run_id=?",
                 rusqlite::params![run_id],
                 |r| {
                     let recipe: Option<String> = r.get(6)?;
                     let branches: Option<String> = r.get(7)?;
+                    let unmatched: Option<String> = r.get(10)?;
                     let flag = |i| r.get::<_, Option<i64>>(i).map(|v| v.map(|n| n != 0));
                     Ok(RunEvidence {
                         sent_prompt: r.get(0)?,
@@ -532,6 +541,9 @@ impl Store {
                         fix_attempted: flag(4)?,
                         fix_confirmed: flag(5)?,
                         recipe: recipe
+                            .and_then(|s| serde_json::from_str(&s).ok())
+                            .unwrap_or_default(),
+                        unmatched_recipe: unmatched
                             .and_then(|s| serde_json::from_str(&s).ok())
                             .unwrap_or_default(),
                         branch_ids: branches
@@ -916,13 +928,26 @@ fn render_run(out: &mut String, item: &SectionRun) {
     if let Some(error) = run.error.as_deref() {
         let _ = writeln!(out, "**Runner error:** {}\n", one_line(error));
     }
-    if ev.recipe.is_empty() {
+    if !ev.recipe.is_empty() {
+        render_reproduction(out, &ev.recipe, run.cwd.as_deref());
+    }
+    if !ev.unmatched_recipe.is_empty() {
+        // The agent's own recipe is kept even when it does not match what it
+        // was recorded running (it got a step working with a workaround, or
+        // wrote a command differently), marked unverified instead of dropped.
+        let lead = if ev.recipe.is_empty() {
+            "**Reproduce** (the agent's recipe, unverified: none of it matched a command the agent was recorded running)"
+        } else {
+            "**Also in the agent's recipe** (unverified: not matched to a command the agent was recorded running)"
+        };
+        let block = fenced(&clip(&ev.unmatched_recipe.join("\n")));
+        let _ = writeln!(out, "{lead}:\n\n{block}\n");
+    }
+    if ev.recipe.is_empty() && ev.unmatched_recipe.is_empty() {
         let _ = writeln!(
             out,
             "No reproduction commands matching recorded shell calls are available for this run.\n"
         );
-    } else {
-        render_reproduction(out, &ev.recipe, run.cwd.as_deref());
     }
     let _ = writeln!(out, "<details><summary>What the agent observed</summary>\n");
     match run.report.as_deref().filter(|r| !r.trim().is_empty()) {
@@ -1297,12 +1322,16 @@ pub fn record_run_evidence(
 ) {
     let parsed = parse_result_line(&outcome.raw_reply);
     let verdict = final_verdict(outcome.end, parsed.as_ref());
-    let recipe = match (&parsed, run.cwd.as_deref()) {
+    let (recipe, unmatched) = match (&parsed, run.cwd.as_deref()) {
         (Some(p), Some(cwd)) if !p.recipe.is_empty() => {
             let calls = recorded_calls_for_run(guardian_id, &outcome.cell_id);
-            match_recipe(&p.recipe, &calls, cwd)
+            (
+                match_recipe(&p.recipe, &calls, cwd),
+                unmatched_recipe_entries(&p.recipe, &calls, cwd),
+            )
         }
-        _ => Vec::new(),
+        (Some(p), None) => (Vec::new(), p.recipe.clone()),
+        _ => (Vec::new(), Vec::new()),
     };
     let guard = store.lock();
     let _ = guard.record_live_run_sent(
@@ -1310,7 +1339,25 @@ pub fn record_run_evidence(
         outcome.sent_prompt.as_deref(),
         outcome.sent_system_prompt.as_deref(),
     );
-    let _ = guard.record_live_run_verdict(&run.run_id, verdict, parsed.as_ref(), &recipe);
+    let _ =
+        guard.record_live_run_verdict(&run.run_id, verdict, parsed.as_ref(), &recipe, &unmatched);
+}
+
+/// The proposed recipe entries none of whose commands match a recorded shell
+/// call, as written. An entry that matched even in part is already shown
+/// through [`match_recipe`]'s steps.
+#[must_use]
+pub fn unmatched_recipe_entries(
+    proposed: &[String],
+    calls: &[RecordedCall],
+    default_cwd: &str,
+) -> Vec<String> {
+    proposed
+        .iter()
+        .filter(|entry| !entry.trim().is_empty())
+        .filter(|entry| match_recipe(std::slice::from_ref(*entry), calls, default_cwd).is_empty())
+        .map(|entry| entry.trim().to_string())
+        .collect()
 }
 
 #[cfg(test)]
@@ -1787,6 +1834,77 @@ mod tests {
         assert_eq!(report_markdown("- **Build:** ok"), "- **Build:** ok");
         assert!(report_markdown("half a fence\n```\nnever closed").starts_with("```"));
         assert!(report_markdown("ends early </details> oops").starts_with("```"));
+    }
+
+    #[test]
+    fn the_unmatched_recipe_round_trips_through_the_store() {
+        let store = Store::open_in_memory().unwrap();
+        let gid = store.create_guardian("g", "main", "/tmp/x").unwrap();
+        let run_id = store
+            .queue_live_run(
+                &gid,
+                crate::live_runs::LiveRunKind::Live,
+                0,
+                "Board shows reviews",
+                "auto",
+            )
+            .unwrap();
+        let unmatched = vec!["curl http://127.0.0.1:8765/hello".to_string()];
+        store
+            .record_live_run_verdict(&run_id, Verdict::Passed, None, &[], &unmatched)
+            .unwrap();
+        let evidence = store.live_run_evidence(&run_id).unwrap();
+        assert_eq!(evidence.unmatched_recipe, unmatched);
+        assert_eq!(evidence.verdict.as_deref(), Some("passed"));
+    }
+
+    #[test]
+    fn recipe_entries_that_match_no_recorded_call_are_kept() {
+        let call = |c: &str| RecordedCall {
+            command: c.into(),
+            cwd: Some("/w".into()),
+            succeeded: Some(true),
+            shell: "bash".into(),
+        };
+        let proposed: Vec<String> = ["make check", "curl http://127.0.0.1:8765/hello", "  "]
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
+        let calls = [
+            call("make check 2>&1 | tail -5"),
+            call("curl -s http://127.0.0.1:8765/hello"),
+        ];
+        assert_eq!(
+            unmatched_recipe_entries(&proposed, &calls, "/w"),
+            ["curl http://127.0.0.1:8765/hello"]
+        );
+    }
+
+    #[test]
+    fn an_unmatched_recipe_is_shown_as_unverified_not_lost() {
+        // The hello-service live run of the monorepo test: the agent got the
+        // server running with a workaround, so its recipe matched nothing it
+        // was recorded running.
+        let mut item = section_run("r1", 0, 10);
+        item.evidence.recipe = Vec::new();
+        item.evidence.unmatched_recipe = vec![
+            "PYTHONPATH='packages/core/python' uv run python -c \"serve()\"".into(),
+            "curl \"http://127.0.0.1:8765/hello\"".into(),
+        ];
+        let section = render_section(&[item.clone()]).unwrap();
+        assert!(section.contains(
+            "**Reproduce** (the agent's recipe, unverified: none of it matched a command the agent was recorded running):\n\n```text\nPYTHONPATH='packages/core/python' uv run python -c \"serve()\"\ncurl \"http://127.0.0.1:8765/hello\"\n```\n"
+        ));
+        assert!(!section.contains("No reproduction commands"));
+
+        // Next to matched steps, the rest of the recipe follows them.
+        item.evidence.recipe = section_run("r1", 0, 10).evidence.recipe;
+        let section = render_section(&[item]).unwrap();
+        let matched = section.find("**Reproduce** (from the repo root):").unwrap();
+        let also = section
+            .find("**Also in the agent's recipe** (unverified")
+            .unwrap();
+        assert!(matched < also);
     }
 
     #[test]

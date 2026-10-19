@@ -586,17 +586,6 @@ pub fn run_loop(
     if first_run {
         crate::pr::recover_pending_auto_submits_on_startup(&store);
         recover_interrupted_reviews(&store, &sem, &cancellations);
-        // Live actions: nothing can still be running a live run in this
-        // process, so a row left `running` by the previous daemon was
-        // interrupted. It counts as the review's one automatic run; the user
-        // reruns it by hand.
-        match store.lock().interrupt_running_live_runs() {
-            Ok(0) | Err(_) => {}
-            Ok(n) => crate::rlog!(
-                WARNING,
-                "ralphus [recovery] {n} live run(s) were interrupted by the daemon restart"
-            ),
-        }
     }
     // Recovery: start collecting guardians whose contributing cells are all
     // Done. This handles the case where the daemon was restarted after the squad

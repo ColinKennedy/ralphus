@@ -5472,9 +5472,12 @@ A live agent ends its reply with `RALPHUS_LIVE_RESULT: {"verdict": "...",
 the run's recorded `RALPHUS_TOOL:` shell calls (split on `&&`, `||`, `;`, `&`
 and line breaks; `cd`-style navigation, redirection and output-only pipeline
 stages such as `head`, `grep`, `Select-Object`, `findstr` are ignored;
-environment settings are not); matched commands are kept, unmatched ones
-dropped, each with the recorded call's cwd, order and result and the complete
-recorded invocation (rendered collapsed);
+environment settings are not); matched commands are kept, each with the
+recorded call's cwd, order and result and the complete recorded invocation
+(rendered collapsed). A recipe entry none of whose commands matched is kept as
+written (`unmatched_recipe`) and shown as unverified -- as the Reproduce block
+when nothing matched, otherwise after the matched steps -- so a recipe that
+only worked with a workaround is never lost;
 a missing or unparseable result, or a run that did not finish, is
 `inconclusive`. Refreshes are durable (`pr_live_result_refresh`): requested on
 run finish, integration end, and PR create/adopt/replace/promote; a failed

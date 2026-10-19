@@ -2758,10 +2758,11 @@ fn parse_suggested_pr(text: &str) -> Option<(String, String, Vec<i64>)> {
 
     let marker_at = text.find(MARKER)?;
     let (head, tail) = text.split_at(marker_at);
-    let description = tail[MARKER.len()..]
-        .trim_start_matches(['\n', '\r'])
-        .trim_end()
-        .to_string();
+    let description = strip_agent_markers(
+        tail[MARKER.len()..]
+            .trim_start_matches(['\n', '\r'])
+            .trim_end(),
+    );
     let title = head
         .lines()
         .rev()
@@ -2778,6 +2779,70 @@ fn parse_suggested_pr(text: &str) -> Option<(String, String, Vec<i64>)> {
         })
         .unwrap_or_default();
     Some((title, description, relevant_prophecy_ids))
+}
+
+/// The fence a line opens or closes: its character and length.
+fn fence_of(line: &str) -> Option<(char, usize)> {
+    let trimmed = line.trim_start();
+    let c = trimmed.chars().next().filter(|c| *c == '`' || *c == '~')?;
+    let n = trimmed.chars().take_while(|x| *x == c).count();
+    (n >= 3).then_some((c, n))
+}
+
+/// The marker name of a line like `RALPHUS_GHOST: ...`.
+fn agent_marker(line: &str) -> Option<&str> {
+    let rest = line.trim_start().strip_prefix("RALPHUS_")?;
+    let (name, _) = rest.split_once(':')?;
+    (!name.is_empty() && name.chars().all(|c| c.is_ascii_uppercase() || c == '_')).then_some(name)
+}
+
+/// `description` without the agent protocol lines every prompt run is asked
+/// to write (`RALPHUS_GHOST:` and the bullets under it, `RALPHUS_PROPHECY:`,
+/// ...). They are read from the transcript and never belong in a PR. Lines
+/// inside code fences are kept, so a description can still quote one. The
+/// text is returned unchanged when there is nothing to drop.
+fn strip_agent_markers(description: &str) -> String {
+    let mut kept: Vec<&str> = Vec::new();
+    let mut fence: Option<(char, usize)> = None;
+    let mut in_ghost = false;
+    let mut dropped = false;
+    for line in description.lines() {
+        if let Some((c, n)) = fence {
+            kept.push(line);
+            if line.trim().chars().all(|x| x == c) && line.trim().chars().count() >= n {
+                fence = None;
+            }
+            continue;
+        }
+        if let Some(opened) = fence_of(line) {
+            fence = Some(opened);
+            in_ghost = false;
+            kept.push(line);
+            continue;
+        }
+        if in_ghost {
+            let trimmed = line.trim_start();
+            let bullet = trimmed.starts_with("- ") || trimmed.starts_with("* ");
+            let continuation = !trimmed.is_empty() && line.starts_with([' ', '\t']);
+            if bullet || continuation {
+                continue;
+            }
+            in_ghost = false;
+        }
+        if let Some(name) = agent_marker(line) {
+            in_ghost = name == "GHOST";
+            dropped = true;
+            continue;
+        }
+        if line.trim().is_empty() && kept.last().is_some_and(|l| l.trim().is_empty()) {
+            continue;
+        }
+        kept.push(line);
+    }
+    if !dropped {
+        return description.to_string();
+    }
+    kept.join("\n").trim_end().to_string()
 }
 
 /// The `RunnerSpec` for a one-shot PR-writer turn on `position`'s branch: the
@@ -23722,6 +23787,35 @@ token_env = "RALPHUS_TEST_FORGE_TOKEN"
             parse_suggested_pr("```\nTITLE: Fix bug\n===DESCRIPTION===\nFixes it.\n```").unwrap();
         assert_eq!(t, "Fix bug");
         assert_eq!(d, "Fixes it.");
+    }
+
+    #[test]
+    fn parse_suggested_pr_drops_agent_marker_lines_outside_code_fences() {
+        // The tail of the hello-service PR description from the monorepo
+        // test, where the writer echoed the markers its run was asked for.
+        let response = "TITLE: Add GET /hello route\n===DESCRIPTION===\n\
+             ## Reviewer notes\n\n\
+             - The name is interpolated into a JSON string.\n\n\
+             RALPHUS_GHOST: (nothing to report)\n\n\
+             RALPHUS_PROPHECY: unconfirmed: I did not run the new tests.\n\n\
+             RALPHUS_GHOST:\n- struggled with quoting\n  across two lines\n\n\
+             ```text\nRALPHUS_PROOF: PASS\n```\n\n\
+             Mentions `RALPHUS_GHOST:` inline, which stays.";
+        let (_, description, _) = parse_suggested_pr(response).unwrap();
+        assert_eq!(
+            description,
+            "## Reviewer notes\n\n\
+             - The name is interpolated into a JSON string.\n\n\
+             ```text\nRALPHUS_PROOF: PASS\n```\n\n\
+             Mentions `RALPHUS_GHOST:` inline, which stays."
+        );
+    }
+
+    #[test]
+    fn a_description_without_agent_markers_is_left_byte_for_byte() {
+        let description =
+            "## Summary\n\n\nTwo blank lines above stay.\n\n- RALPHUS_X is not a marker line\n";
+        assert_eq!(strip_agent_markers(description), description);
     }
 
     #[test]

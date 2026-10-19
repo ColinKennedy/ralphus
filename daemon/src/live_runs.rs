@@ -2226,4 +2226,20 @@ prompt = "second"
         assert_eq!(run.state, "interrupted");
         assert!(run.error.unwrap().contains("rerun"));
     }
+
+    #[test]
+    fn the_restart_sweep_runs_before_anything_can_start_a_run() {
+        // The sweep used to run on the scheduler's first pass, after the
+        // HTTP loop was serving: a live run queued in those first seconds was
+        // started by this daemon and then marked interrupted by it. Pin it to
+        // `serve()`'s startup recovery, ahead of the scheduler thread and the
+        // HTTP loop.
+        let server = include_str!("server.rs");
+        let serve = &server[server.find("pub fn serve<").unwrap()..];
+        let sweep = serve.find("store.interrupt_running_live_runs()").unwrap();
+        let scheduler = serve.find("crate::scheduler::run_loop(").unwrap();
+        let http = serve.find("run_http_loop(server").unwrap();
+        assert!(sweep < scheduler && sweep < http);
+        assert!(!include_str!("scheduler.rs").contains("interrupt_running_live_runs"));
+    }
 }
