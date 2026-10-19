@@ -1,6 +1,9 @@
 [workspace]
 resolver = "2"
 members = ["core", "daemon", "librarian", "auth", "keygen", "bench-types", "bench-macros", "bench-harness", "ssh-provider", "runner", "cli", "mcp", "shell-syntax", "shell-syntax/grammars", "stress"]
+# Vendored, patched dependencies (wired in by `[patch.crates-io]` below) are
+# not workspace members: the workspace lints are not theirs to meet.
+exclude = ["vendor/tiny_http"]
 
 [workspace.package]
 version = "0.1.0"
@@ -119,6 +122,13 @@ cron = "=0.15.0"
 # their libssh2/OpenSSL builds); `ralphus-daemon` turns `https` back on for
 # Windows only, where it is the system WinHTTP library.
 git2 = { version = "0.19", default-features = false }
+
+# tiny_http 0.12.0 with ralphus's HTTP hardening patches (bounded body drain,
+# request-line and header limits) -- see vendor/tiny_http/RALPHUS_PATCHES.md
+# for each change and why. Every crate that depends on `tiny_http`
+# (daemon, librarian, mock forges in tests) gets the patched copy.
+[patch.crates-io]
+tiny_http = { path = "vendor/tiny_http" }
 
 # Keep the dev profile fast to compile (this project's whole reason for the
 # Python/HTML split is that the old Rust build took minutes). Release stays lean

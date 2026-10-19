@@ -557,6 +557,39 @@ pub fn serve_with(server: tiny_http::Server, daemon_url: &str) {
 /// Handle one accepted request end to end: CORS gating, `OPTIONS` preflight,
 /// the SSE stream, or an ordinary proxied call -- exactly the branches
 /// [`serve_with`] used to run inline, now run on that request's own thread.
+/// Largest request body the librarian will read and forward (STRESS-001),
+/// the same limit the daemon enforces (`MAX_REQUEST_BODY_BYTES` in
+/// `daemon/src/server.rs`). A larger body is answered `413` unread.
+pub const MAX_REQUEST_BODY_BYTES: usize = 32 * 1024 * 1024;
+
+/// Answer `413` for a body over [`MAX_REQUEST_BODY_BYTES`] and close the
+/// connection. `size` is the declared or received length.
+fn reject_oversized_body(request: tiny_http::Request, method: &str, url: &str, size: usize) {
+    let path = url.split('?').next().unwrap_or(url);
+    eprintln!(
+        "ralphus-librarian [proxy] rejected {method} {path} with 413: body of {size} bytes exceeds the {MAX_REQUEST_BODY_BYTES}-byte limit"
+    );
+    let body = serde_json::json!({
+        "error": {
+            "code": "payload_too_large",
+            "message": format!(
+                "request body is {size} bytes; the board accepts at most {MAX_REQUEST_BODY_BYTES} bytes"
+            ),
+        }
+    })
+    .to_string();
+    let response = tiny_http::Response::from_string(body)
+        .with_status_code(413)
+        .with_header(
+            tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..])
+                .expect("valid header"),
+        )
+        .with_header(
+            tiny_http::Header::from_bytes(&b"Connection"[..], &b"close"[..]).expect("valid header"),
+        );
+    let _ = request.respond(response);
+}
+
 fn handle_request(mut request: tiny_http::Request, daemon_url: &str) {
     let method = request.method().as_str().to_string();
     let url = request.url().to_string();
@@ -610,12 +643,30 @@ fn handle_request(mut request: tiny_http::Request, daemon_url: &str) {
     let traceparent = header_value(&request, "traceparent");
     let if_none_match = header_value(&request, "If-None-Match");
 
+    // STRESS-001: refuse an oversized body before reading it, by declared
+    // length and then by what actually arrives.
+    if let Some(declared) = request
+        .body_length()
+        .filter(|n| *n > MAX_REQUEST_BODY_BYTES)
+    {
+        reject_oversized_body(request, &method, &url, declared);
+        return;
+    }
     let mut body = String::new();
-    if let Err(e) = request.as_reader().read_to_string(&mut body) {
+    let mut limited = <&mut dyn std::io::Read as std::io::Read>::take(
+        request.as_reader(),
+        MAX_REQUEST_BODY_BYTES as u64 + 1,
+    );
+    if let Err(e) = std::io::Read::read_to_string(&mut limited, &mut body) {
         let path = url.split('?').next().unwrap_or(&url);
         eprintln!(
             "ralphus-librarian [proxy] could not read request body {method} {path} error={e}"
         );
+    }
+    if body.len() > MAX_REQUEST_BODY_BYTES {
+        let received = body.len();
+        reject_oversized_body(request, &method, &url, received);
+        return;
     }
 
     let reply = handle_with_trace_conditional(
