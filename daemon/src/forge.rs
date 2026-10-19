@@ -198,6 +198,11 @@ pub struct PrComment {
 /// count silently under-reported.
 const PER_PAGE: u32 = 100;
 
+/// Comments per page on the comment endpoints ([`PER_PAGE`]): a PR holding
+/// at least this many can have new comments past the conditionally-checked
+/// first page.
+pub(crate) const COMMENTS_PER_PAGE: usize = PER_PAGE as usize;
+
 /// Upper bound on pages followed when listing a PR's check-runs / a pipeline's
 /// failed jobs, so a misbehaving forge cannot loop a poll forever.
 const MAX_CI_PAGES: u32 = 20;
@@ -1683,6 +1688,25 @@ impl ForgeClient {
                         ..Default::default()
                     }));
                 };
+                // A finished pipeline's failed jobs and their traces never
+                // change; a job retry re-runs inside the same pipeline but
+                // moves its `updated_at`, so that is part of the key.
+                let cache_key = pipeline["updated_at"].as_str().map(|updated| {
+                    format!(
+                        "{}|{}|{pipeline_id}|{updated}",
+                        self.rate_limit_key(),
+                        self.repo_path
+                    )
+                });
+                if let Some(cached) = cache_key.as_ref().and_then(|key| {
+                    FAILED_PIPELINE_CACHE
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .get(key)
+                        .cloned()
+                }) {
+                    return Ok(PrCiState::Failing(cached));
+                }
                 let jobs = self.gitlab_failed_jobs(pipeline_id, token);
                 if jobs.is_empty() {
                     return Ok(PrCiState::Failing(PrFailure {
@@ -1713,10 +1737,24 @@ impl ForgeClient {
                         }
                     })
                     .collect();
-                Ok(PrCiState::Failing(PrFailure {
+                let failure = PrFailure {
                     generation: Some(pipeline_id.to_string()),
                     ..build_pr_failure(checks, "job")
-                }))
+                };
+                // Cached only when every trace was read, so a transient trace
+                // failure is retried on the next poll.
+                let complete = failure.checks.iter().all(|c| c.log_text.is_some());
+                if let (Some(key), true) = (cache_key, complete) {
+                    let mut cache = FAILED_PIPELINE_CACHE
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    if cache.len() >= FAILED_PIPELINE_CACHE_MAX_ENTRIES && !cache.contains_key(&key)
+                    {
+                        cache.clear();
+                    }
+                    cache.insert(key, failure.clone());
+                }
+                Ok(PrCiState::Failing(failure))
             }
             // A cancelled or skipped pipeline has no failure to fix: keep
             // waiting for a re-run rather than dispatching an auto-fix.
@@ -3225,24 +3263,15 @@ impl ForgeClient {
                 // un-actioned count could never reach zero for any PR that had
                 // one.
                 let mut out = Vec::new();
-                for path in [
-                    format!("issues/{number}/comments"),
-                    format!("pulls/{number}/comments"),
-                ] {
-                    let url = format!(
-                        "{}/repos/{}/{path}?per_page={PER_PAGE}",
-                        self.api_base, self.repo_path
-                    );
-                    let resp = self.get(
-                        http_agent()
-                            .get(&url)
-                            .set("Authorization", &format!("Bearer {token}"))
-                            .set("Accept", "application/vnd.github+json"),
-                    )?;
-                    let items = resp.as_array().ok_or_else(|| {
+                for source in [PrCommentEndpoint::Conversation, PrCommentEndpoint::Review] {
+                    let url = self.comment_page_url(number, source);
+                    let resp = self.get(self.comment_request(&url, token))?;
+                    let mut items = resp.as_array().cloned().ok_or_else(|| {
                         format!("unexpected GitHub comments response shape: {resp}")
                     })?;
-                    out.extend(parse_github_comments(items));
+                    let first_page_len = items.len();
+                    items.extend(self.remaining_comment_pages(&url, token, first_page_len)?);
+                    out.extend(parse_github_comments(&items));
                 }
                 // Oldest first across both sources, matching this method's
                 // documented ordering. Both endpoints emit ISO-8601 UTC, which
@@ -3251,15 +3280,15 @@ impl ForgeClient {
                 Ok(out)
             }
             ForgeKind::GitLab => {
-                let url = format!(
-                    "{}/projects/{}/merge_requests/{number}/notes?per_page={PER_PAGE}",
-                    self.api_base, self.repo_path
-                );
-                let resp = self.get(http_agent().get(&url).set("PRIVATE-TOKEN", token))?;
-                let items = resp
+                let url = self.comment_page_url(number, PrCommentEndpoint::Conversation);
+                let resp = self.get(self.comment_request(&url, token))?;
+                let mut items = resp
                     .as_array()
+                    .cloned()
                     .ok_or_else(|| format!("unexpected GitLab notes response shape: {resp}"))?;
-                Ok(parse_gitlab_notes(items))
+                let first_page_len = items.len();
+                items.extend(self.remaining_comment_pages(&url, token, first_page_len)?);
+                Ok(parse_gitlab_notes(&items))
             }
         }
     }
@@ -3289,6 +3318,70 @@ impl ForgeClient {
         )
     }
 
+    /// The first-page URL of one comment endpoint (`per_page` set, no `page`).
+    /// GitLab has a single notes endpoint, so `source` is ignored there.
+    fn comment_page_url(&self, number: i64, source: PrCommentEndpoint) -> String {
+        match (self.kind, source) {
+            (ForgeKind::GitHub, PrCommentEndpoint::Conversation) => format!(
+                "{}/repos/{}/issues/{number}/comments?per_page={PER_PAGE}",
+                self.api_base, self.repo_path
+            ),
+            (ForgeKind::GitHub, PrCommentEndpoint::Review) => format!(
+                "{}/repos/{}/pulls/{number}/comments?per_page={PER_PAGE}",
+                self.api_base, self.repo_path
+            ),
+            (ForgeKind::GitLab, _) => format!(
+                "{}/projects/{}/merge_requests/{number}/notes?per_page={PER_PAGE}",
+                self.api_base, self.repo_path
+            ),
+        }
+    }
+
+    /// An authenticated `GET` for `url` on this forge.
+    fn comment_request(&self, url: &str, token: &str) -> ureq::Request {
+        match self.kind {
+            ForgeKind::GitHub => http_agent()
+                .get(url)
+                .set("Authorization", &format!("Bearer {token}"))
+                .set("Accept", "application/vnd.github+json"),
+            ForgeKind::GitLab => http_agent().get(url).set("PRIVATE-TOKEN", token),
+        }
+    }
+
+    /// Pages 2 onward of a comment endpoint whose first page (at `first_url`)
+    /// came back full. Stops at the first short or empty page, or after
+    /// [`MAX_CI_PAGES`] pages.
+    fn remaining_comment_pages(
+        &self,
+        first_url: &str,
+        token: &str,
+        first_page_len: usize,
+    ) -> Result<Vec<serde_json::Value>, ForgeError> {
+        let mut items = Vec::new();
+        if first_page_len < PER_PAGE as usize {
+            return Ok(items);
+        }
+        for page in 2..=MAX_CI_PAGES {
+            let url = format!("{first_url}&page={page}");
+            let ConditionalGet::Modified { value, .. } =
+                self.get_conditional(self.comment_request(&url, token), None)?
+            else {
+                break;
+            };
+            let page_items = value.as_array().cloned().unwrap_or_default();
+            let got = page_items.len();
+            items.extend(page_items);
+            if got < PER_PAGE as usize {
+                break;
+            }
+        }
+        Ok(items)
+    }
+
+    /// `etag` guards only the first page. On GitHub's conversation endpoint
+    /// (oldest first) a new comment on a PR with 100 or more lands on a later
+    /// page, so a `304` there proves nothing; the caller passes no `etag` for
+    /// such a PR to read every page.
     fn list_pr_comments_conditional_once(
         &self,
         number: i64,
@@ -3296,44 +3389,18 @@ impl ForgeClient {
         etag: Option<&str>,
     ) -> Result<CommentsPoll, ForgeError> {
         let token = self.require_token().map_err(ForgeError::other)?;
-        let req = match (self.kind, source) {
-            (ForgeKind::GitHub, PrCommentEndpoint::Conversation) => {
-                let url = format!(
-                    "{}/repos/{}/issues/{number}/comments?per_page={PER_PAGE}",
-                    self.api_base, self.repo_path
-                );
-                http_agent()
-                    .get(&url)
-                    .set("Authorization", &format!("Bearer {token}"))
-                    .set("Accept", "application/vnd.github+json")
-            }
-            (ForgeKind::GitHub, PrCommentEndpoint::Review) => {
-                let url = format!(
-                    "{}/repos/{}/pulls/{number}/comments?per_page={PER_PAGE}",
-                    self.api_base, self.repo_path
-                );
-                http_agent()
-                    .get(&url)
-                    .set("Authorization", &format!("Bearer {token}"))
-                    .set("Accept", "application/vnd.github+json")
-            }
-            (ForgeKind::GitLab, _) => {
-                let url = format!(
-                    "{}/projects/{}/merge_requests/{number}/notes?per_page={PER_PAGE}",
-                    self.api_base, self.repo_path
-                );
-                http_agent().get(&url).set("PRIVATE-TOKEN", token)
-            }
-        };
-        match self.get_conditional(req, etag)? {
+        let url = self.comment_page_url(number, source);
+        match self.get_conditional(self.comment_request(&url, token), etag)? {
             ConditionalGet::NotModified => Ok(CommentsPoll::NotModified),
             ConditionalGet::Modified { value, etag } => {
-                let items = value.as_array().ok_or_else(|| {
+                let mut items = value.as_array().cloned().ok_or_else(|| {
                     ForgeError::other(format!("unexpected comments response shape: {value}"))
                 })?;
+                let first_page_len = items.len();
+                items.extend(self.remaining_comment_pages(&url, token, first_page_len)?);
                 let comments = match self.kind {
-                    ForgeKind::GitHub => parse_github_comments(items),
-                    ForgeKind::GitLab => parse_gitlab_notes(items),
+                    ForgeKind::GitHub => parse_github_comments(&items),
+                    ForgeKind::GitLab => parse_gitlab_notes(&items),
                 };
                 Ok(CommentsPoll::Modified { comments, etag })
             }
@@ -3593,6 +3660,10 @@ impl ForgeClient {
                         {
                             cache.clear();
                         }
+                        FORGE_ETAG_DIRTY
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .insert(key.clone());
                         cache.insert(key, (etag, value.clone()));
                     }
                     None => {
@@ -3944,16 +4015,71 @@ fn parse_retry_after(value: &str) -> Option<Duration> {
     value.trim().parse::<u64>().ok().map(Duration::from_secs)
 }
 
+/// Cap on [`FAILED_PIPELINE_CACHE`]; emptied when it fills, since an entry is
+/// only saved calls and a miss simply re-reads the jobs and traces.
+const FAILED_PIPELINE_CACHE_MAX_ENTRIES: usize = 256;
+
+/// A failed GitLab pipeline's [`PrFailure`] (failed jobs and their traces),
+/// keyed by [`ForgeClient::rate_limit_key`], project, pipeline id and the
+/// pipeline's `updated_at`. Lets the CI poll of a failing MR skip re-reading
+/// jobs and traces that cannot have changed. In memory only.
+static FAILED_PIPELINE_CACHE: std::sync::LazyLock<Mutex<HashMap<String, PrFailure>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+
 /// Cap on [`FORGE_ETAG_CACHE`]; the cache is emptied when it fills, since an
-/// entry is only a saved call and any miss simply refetches.
-const FORGE_ETAG_CACHE_MAX_ENTRIES: usize = 2048;
+/// entry is only a saved call and any miss simply refetches. The saved copy
+/// is pruned to the same size.
+pub(crate) const FORGE_ETAG_CACHE_MAX_ENTRIES: usize = 2048;
 
 /// `(ETag, body)` of the last `200` for a conditional forge read
 /// ([`ForgeClient::get_cached`]), keyed by [`ForgeClient::rate_limit_key`] plus
-/// the request URL. Lives in memory only: losing it on restart costs one
-/// unconditional fetch per URL.
+/// the request URL. The daemon saves changed entries to SQLite
+/// ([`take_changed_etag_entries`]) and loads them back at startup
+/// ([`seed_etag_cache`]), so a restart does not start cold.
 static FORGE_ETAG_CACHE: std::sync::LazyLock<Mutex<HashMap<String, (String, serde_json::Value)>>> =
     std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Keys of [`FORGE_ETAG_CACHE`] entries written since the last
+/// [`take_changed_etag_entries`].
+static FORGE_ETAG_DIRTY: std::sync::LazyLock<Mutex<std::collections::HashSet<String>>> =
+    std::sync::LazyLock::new(|| Mutex::new(std::collections::HashSet::new()));
+
+/// One saved [`FORGE_ETAG_CACHE`] entry: key, ETag and response body.
+pub(crate) type EtagEntry = (String, String, serde_json::Value);
+
+/// The cache entries written since the last call, for the daemon to save.
+/// Entries evicted since (the cache empties when full) are skipped.
+pub(crate) fn take_changed_etag_entries() -> Vec<EtagEntry> {
+    let keys: Vec<String> = FORGE_ETAG_DIRTY
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .drain()
+        .collect();
+    let cache = FORGE_ETAG_CACHE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    keys.into_iter()
+        .filter_map(|key| {
+            cache
+                .get(&key)
+                .map(|(etag, body)| (key, etag.clone(), body.clone()))
+        })
+        .collect()
+}
+
+/// Load saved entries into the cache (at startup), up to its cap. An entry
+/// already in memory is newer and is kept.
+pub(crate) fn seed_etag_cache(entries: Vec<EtagEntry>) {
+    let mut cache = FORGE_ETAG_CACHE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    for (key, etag, body) in entries {
+        if cache.len() >= FORGE_ETAG_CACHE_MAX_ENTRIES {
+            break;
+        }
+        cache.entry(key).or_insert((etag, body));
+    }
+}
 
 /// The most recent `X-RateLimit-*` reading for a GitHub token: what the board
 /// shows as "N of M calls left, resets at ...".
@@ -9606,6 +9732,135 @@ mod tests {
             }),
             "both failed jobs -- not just the first -- must be captured, each with its own trace"
         );
+        mock.finish();
+    }
+
+    /// A cached read marks its entry changed; a restored entry lets the very
+    /// first read after a restart send `If-None-Match` and replay on a 304.
+    #[test]
+    fn a_restored_etag_entry_answers_the_first_read_after_a_restart() {
+        let mock = MockForge::start(move |server| {
+            let first = server.recv();
+            first
+                .respond(
+                    tiny_http::Response::from_string(r#"{"state":"open","merged":false}"#)
+                        .with_status_code(200)
+                        .with_header(
+                            tiny_http::Header::from_bytes(&b"ETag"[..], &b"\"r1\""[..]).unwrap(),
+                        ),
+                )
+                .unwrap();
+            let second = server.recv();
+            assert_eq!(
+                req_header(&second, "If-None-Match").as_deref(),
+                Some("\"r1\"")
+            );
+            second
+                .respond(tiny_http::Response::from_string("").with_status_code(304))
+                .unwrap();
+        });
+        let client = mock.client(ForgeKind::GitHub, "acme/restore");
+        client.get_pull_request_live(5).unwrap();
+        let saved: Vec<EtagEntry> = take_changed_etag_entries()
+            .into_iter()
+            .filter(|(key, _, _)| key.ends_with("/repos/acme/restore/pulls/5"))
+            .collect();
+        assert_eq!(saved.len(), 1, "the 200 marked its entry changed");
+        // Simulate a restart: the in-memory cache is gone, the saved copy is
+        // loaded back.
+        FORGE_ETAG_CACHE
+            .lock()
+            .unwrap()
+            .retain(|key, _| !key.ends_with("/repos/acme/restore/pulls/5"));
+        seed_etag_cache(saved);
+        assert_eq!(client.get_pull_request_live(5).unwrap().state, "open");
+        mock.finish();
+    }
+
+    /// A full first page of comments pulls in the following pages, so the
+    /// 101st comment is read.
+    #[test]
+    fn comment_polls_read_every_page_after_a_full_first_page() {
+        let notes = |from: i64, count: i64| {
+            let items: Vec<serde_json::Value> = (from..from + count)
+                .map(|id| {
+                    serde_json::json!({
+                        "id": id, "system": false, "body": format!("note {id}"),
+                        "author": {"username": "rev"}, "created_at": "2026-10-18T00:00:00Z",
+                    })
+                })
+                .collect();
+            serde_json::Value::Array(items).to_string()
+        };
+        let (first, second) = (notes(1, 100), notes(101, 1));
+        let mock = MockForge::start(move |server| {
+            let req = server.recv();
+            assert_eq!(
+                req.url(),
+                "/projects/group%2Fpaged/merge_requests/4/notes?per_page=100"
+            );
+            req.respond(tiny_http::Response::from_string(first).with_status_code(200))
+                .unwrap();
+            let req = server.recv();
+            assert_eq!(
+                req.url(),
+                "/projects/group%2Fpaged/merge_requests/4/notes?per_page=100&page=2"
+            );
+            req.respond(tiny_http::Response::from_string(second).with_status_code(200))
+                .unwrap();
+        });
+        let client = mock.client(ForgeKind::GitLab, "group%2Fpaged");
+        let CommentsPoll::Modified { comments, .. } = client
+            .list_pr_comments_conditional(4, PrCommentEndpoint::Conversation, None)
+            .unwrap()
+        else {
+            panic!("expected a fresh body");
+        };
+        assert_eq!(comments.len(), 101);
+        assert_eq!(comments[100].external_id, "101");
+        mock.finish();
+    }
+
+    /// A failed pipeline's jobs and traces are read once: a second poll of the
+    /// same pipeline (same `updated_at`) reads only the MR. A request for the
+    /// jobs again would hit the finished mock (500) and lose the traces.
+    #[test]
+    fn a_failed_gitlab_pipelines_jobs_and_traces_are_read_once() {
+        const MR: &str = r#"{"merge_status": "can_be_merged", "pipeline": {"id": 56, "status": "failed", "updated_at": "2026-10-18T00:00:00Z", "web_url": "https://gitlab.example/pipelines/56"}}"#;
+        let mock = MockForge::start(move |server| {
+            let req = server.recv();
+            assert_eq!(req.url(), "/projects/group%2Fcached/merge_requests/9");
+            req.respond(tiny_http::Response::from_string(MR).with_status_code(200))
+                .unwrap();
+            let req = server.recv();
+            assert!(
+                req.url()
+                    .starts_with("/projects/group%2Fcached/pipelines/56/jobs")
+            );
+            req.respond(
+                tiny_http::Response::from_string(
+                    r#"[{"id": 79, "name": "test", "web_url": "https://gitlab.example/jobs/79"}]"#,
+                )
+                .with_status_code(200),
+            )
+            .unwrap();
+            let req = server.recv();
+            assert_eq!(req.url(), "/projects/group%2Fcached/jobs/79/trace");
+            req.respond(tiny_http::Response::from_string("FAIL\n").with_status_code(200))
+                .unwrap();
+            let req = server.recv();
+            assert_eq!(req.url(), "/projects/group%2Fcached/merge_requests/9");
+            req.respond(tiny_http::Response::from_string(MR).with_status_code(200))
+                .unwrap();
+        });
+        let client = mock.client(ForgeKind::GitLab, "group%2Fcached");
+        let first = client.check_pr_ci_status(9).unwrap();
+        let second = client.check_pr_ci_status(9).unwrap();
+        let PrCiState::Failing(failure) = &second else {
+            panic!("expected failing, got {second:?}");
+        };
+        assert_eq!(failure.checks[0].log_text.as_deref(), Some("FAIL\n"));
+        assert_eq!(first, second);
         mock.finish();
     }
 

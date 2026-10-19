@@ -9951,23 +9951,28 @@ fn check_merges_and_record(store: &crate::store_lock::StoreHandle, id: &str) -> 
 
 /// Each project's current base tip for `id`, or `None` when the review
 /// cannot be read. Unresolvable projects are left out, matching
-/// [`detect_base_shift`], which skips them too.
+/// [`detect_base_shift`], which skips them too. A bare-name base (a local
+/// branch) also contributes its `@{upstream}` tip, so a forge-side merge is
+/// noticed even while the local branch cannot advance because it is checked
+/// out ([`fetch_base_branch`]).
 fn current_base_tips(store: &crate::store_lock::StoreHandle, id: &str) -> Option<BaseTips> {
     let guardian = store
         .with_read_snapshot(|conn| Store::get_guardian_conn(conn, id))
         .ok()?;
-    Some(
-        guardian
-            .projects
-            .iter()
-            .filter_map(|proj| {
-                let root = Workspace::for_guardian(store, id, Path::new(proj));
-                resolve_base(&root, &guardian.base_branch)
-                    .ok()
-                    .map(|sha| (proj.clone(), sha))
-            })
-            .collect(),
-    )
+    let mut tips = BaseTips::new();
+    for proj in &guardian.projects {
+        let root = Workspace::for_guardian(store, id, Path::new(proj));
+        if let Ok(sha) = resolve_base(&root, &guardian.base_branch) {
+            tips.insert(proj.clone(), sha);
+        }
+        if !guardian.base_branch.contains('/') {
+            let upstream = format!("{}@{{upstream}}", guardian.base_branch);
+            if let Ok(sha) = root.git(&["rev-parse", "--verify", "--quiet", &upstream]) {
+                tips.insert(format!("{proj} (upstream)"), sha.trim().to_string());
+            }
+        }
+    }
+    Some(tips)
 }
 
 /// Whether a base-shift rebuild of `id` may run this pass.
@@ -15673,9 +15678,12 @@ fn guardian_ids_for_target(
 ///   remote-tracking ref `refs/remotes/<remote>/<branch>`.
 /// - A bare name (e.g. `"main"`) with a real `@{upstream}` configured
 ///   fetches that upstream's branch, overwriting the local
-///   `refs/heads/<base_branch>` directly — the same shape (and the same
-///   already-accepted "refuses if that branch is checked out" risk) as
-///   [`crate::vcs::GitVcs::fetch_branch`].
+///   `refs/heads/<base_branch>` directly — the same shape as
+///   [`crate::vcs::GitVcs::fetch_branch`]. Git refuses that while the branch
+///   is checked out somewhere; the local branch is then left alone (moving a
+///   checked-out branch would leave its working tree behind) and only its
+///   remote-tracking ref is refreshed, which [`current_base_tips`] watches so
+///   a forge-side merge is still noticed.
 /// - Anything else is a purely local branch with no remote to fetch from,
 ///   and is left untouched.
 fn fetch_base_branch(
@@ -15697,12 +15705,57 @@ fn fetch_base_branch(
         let upstream = upstream.trim();
         if let Some((remote, branch)) = upstream.split_once('/') {
             let refspec = format!("+refs/heads/{branch}:refs/heads/{base}");
-            return ws
-                .git(&["fetch", "--no-write-fetch-head", remote, &refspec])
-                .map(|_| ());
+            return match ws.git(&["fetch", "--no-write-fetch-head", remote, &refspec]) {
+                Ok(_) => Ok(()),
+                Err(e) if e.contains("refusing to fetch into branch") => {
+                    warn_checked_out_base_once(store, target);
+                    let tracking = format!("+refs/heads/{branch}:refs/remotes/{remote}/{branch}");
+                    ws.git(&["fetch", "--no-write-fetch-head", remote, &tracking])
+                        .map(|_| ())
+                }
+                Err(e) => Err(e),
+            };
         }
     }
     Ok(())
+}
+
+/// Base-fetch targets (`"{root}|{base_branch}"`) already warned about by
+/// [`warn_checked_out_base_once`].
+static CHECKED_OUT_BASE_WARNED: LazyLock<Mutex<HashSet<String>>> =
+    LazyLock::new(|| Mutex::new(HashSet::new()));
+
+/// Say once per base branch that it is checked out and so will not advance
+/// to its upstream: reviews on it rebuild only when the branch is moved by
+/// hand, and only its upstream is watched for merges.
+fn warn_checked_out_base_once(store: &crate::store_lock::StoreHandle, target: &BaseFetchTarget) {
+    let key = format!("{}|{}", target.root.display(), target.base_branch);
+    if !CHECKED_OUT_BASE_WARNED
+        .lock()
+        .expect("poisoned")
+        .insert(key)
+    {
+        return;
+    }
+    let message = format!(
+        "base branch {} is checked out in {}, so it is not advanced to its upstream; \
+         reviews on it rebuild only when it is moved by hand",
+        target.base_branch,
+        target.root.display()
+    );
+    crate::rlog!(WARNING, "ralphus [guardian] {message}");
+    let guard = store.lock();
+    crate::cartographer::Note::new("guardian")
+        .scope("guardian")
+        .level(crate::logging::LogLevel::WARNING)
+        .emit(
+            &guard,
+            message,
+            serde_json::json!({
+                "base_branch": target.base_branch,
+                "git_root": target.root,
+            }),
+        );
 }
 
 /// Base-branch fetch targets ([`poll_base_branch_freshness_once`]) currently
@@ -18422,6 +18475,66 @@ mod tests {
         // Free again: reaches `check_pr_merges`, which finds no such review.
         assert!(!check_merges_claimed(&store, id));
         assert!(InFlightClaim::acquire(&MERGE_CHECKING, id).is_some());
+    }
+
+    /// A bare-name base that is checked out can't be advanced: the fetch
+    /// leaves the local branch alone, refreshes its remote-tracking ref
+    /// instead of failing, and the merge-check base tips see the upstream move.
+    #[test]
+    fn a_checked_out_local_base_refreshes_its_upstream_instead_of_failing() {
+        let base = tmp_dir("checked-out-base");
+        let bare = base.join("upstream.git");
+        std::fs::create_dir_all(&bare).unwrap();
+        g(&bare, &["init", "--bare", "--initial-branch", "main"]);
+        let seed = base.join("seed");
+        std::fs::create_dir_all(&seed).unwrap();
+        g(&seed, &["init", "--initial-branch", "main"]);
+        std::fs::write(seed.join("a.txt"), "a\n").unwrap();
+        g(&seed, &["add", "."]);
+        g(&seed, &["commit", "--message", "a"]);
+        g(&seed, &["remote", "add", "origin", bare.to_str().unwrap()]);
+        g(&seed, &["push", "-q", "origin", "main"]);
+        let repo = base.join("repo");
+        g(
+            &base,
+            &[
+                "clone",
+                "-q",
+                bare.to_str().unwrap(),
+                repo.to_str().unwrap(),
+            ],
+        );
+        let store = Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
+        let id = store
+            .lock()
+            .create_guardian("r", "main", repo.to_str().unwrap())
+            .unwrap();
+        let before = current_base_tips(&store, &id).unwrap();
+        assert!(
+            before.keys().any(|k| k.ends_with("(upstream)")),
+            "a bare-name base contributes its upstream tip: {before:?}"
+        );
+        let local_before = g_out(&repo, &["rev-parse", "main"]);
+
+        std::fs::write(seed.join("b.txt"), "b\n").unwrap();
+        g(&seed, &["add", "."]);
+        g(&seed, &["commit", "--message", "b"]);
+        g(&seed, &["push", "-q", "origin", "main"]);
+        let pushed = g_out(&seed, &["rev-parse", "HEAD"]);
+
+        let target = BaseFetchTarget {
+            root: repo.clone(),
+            machine: None,
+            base_branch: "main".to_string(),
+        };
+        fetch_base_branch(&store, &target).expect("falls back instead of failing");
+        assert_eq!(g_out(&repo, &["rev-parse", "main"]), local_before);
+        assert_eq!(g_out(&repo, &["rev-parse", "origin/main"]), pushed);
+        let after = current_base_tips(&store, &id).unwrap();
+        assert_ne!(before, after, "the upstream move changes the watched tips");
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// The base-shift rebuild gate: reuses an answer for the same base tips,

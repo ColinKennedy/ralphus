@@ -114,3 +114,9 @@ tag = "review-base-update-required-conflict"
 [[test]]
 id = "ralphus-daemon::guardian_merge explicit_never_and_always_modes_keep_their_behavior"
 tag = "review-base-update-modes"
+
+# Base-branch freshness fetch of a checked-out local base: falls back to the
+# remote-tracking ref, and the merge-check base tips read its upstream.
+[[test]]
+id = "ralphus-daemon guardian_merge::tests::a_checked_out_local_base_refreshes_its_upstream_instead_of_failing"
+tag = "base-fetch-checked-out-local"
