@@ -442,11 +442,13 @@ pub fn ramp(cfg: &Config, profile: &str, log: &dyn Fn(&str)) -> Result<RampResul
         let stats = run.stats(cfg.step);
         let alive = env.daemon.alive();
         log(&format!(
-            "  [{profile}] users={users:>5} ok_rps={:>8.1} err={:>6.2}% p50={:>7.1}ms p99={:>8.1}ms daemon_cpu={:>5.0}% rss={:>6.0}MB",
+            "  [{profile}] users={users:>5} ok_rps={:>8.1} err={:>6.2}% p50={:>7.1}ms p99={:>8.1}ms max={:>8.0}ms stall={:>5.1}s daemon_cpu={:>5.0}% rss={:>6.0}MB",
             stats.ok_rps,
             stats.error_rate * 100.0,
             stats.latency_ok.p50_ms,
             stats.latency_ok.p99_ms,
+            stats.latency_ok.max_ms,
+            stats.longest_silence_ms / 1000.0,
             resources.daemon_avg_cpu_pct,
             resources.daemon_peak_rss_mb
         ));
@@ -789,6 +791,23 @@ pub fn fault(
     if !killers.is_empty() {
         verdict = "fail";
         reasons.extend(killers);
+    }
+    if let Some(b) = baseline {
+        let limit = (b.victim_during.longest_silence_ms * 3.0).max(2000.0);
+        if during.longest_silence_ms > limit {
+            // Five seconds with nothing completing is the whole server
+            // frozen, not merely slow.
+            if during.longest_silence_ms >= 5000.0 {
+                verdict = "fail";
+            } else if verdict == "pass" {
+                verdict = "degraded";
+            }
+            reasons.push(format!(
+                "server stalled: no victim request completed for {:.1}s (baseline longest gap {:.1}s)",
+                during.longest_silence_ms / 1000.0,
+                b.victim_during.longest_silence_ms / 1000.0
+            ));
+        }
     }
     let findings = verdict != "pass" || !logs.is_clean();
     let kept = finish_env(cfg, env, findings);

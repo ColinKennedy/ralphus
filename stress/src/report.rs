@@ -345,9 +345,9 @@ pub fn markdown(r: &Report) -> String {
         let _ = writeln!(s, "Mix (weights): {}\n", ops.join(", "));
         let _ = writeln!(
             s,
-            "| Users | ok req/s | Errors | p50 | p90 | p99 | max | Daemon CPU avg/peak | Daemon RSS | Top error |"
+            "| Users | ok req/s | Errors | p50 | p90 | p99 | max | Longest stall | Daemon CPU avg/peak | Daemon RSS | Top error |"
         );
-        let _ = writeln!(s, "|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|");
+        let _ = writeln!(s, "|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|");
         for st in &ramp.steps {
             let top = st
                 .stats
@@ -359,7 +359,7 @@ pub fn markdown(r: &Report) -> String {
             let l = &st.stats.latency_ok;
             let _ = writeln!(
                 s,
-                "| {} | {:.0} | {} | {:.1} | {:.1} | {:.1} | {:.0} | {:.0}% / {:.0}% | {:.0} MB | {} |",
+                "| {} | {:.0} | {} | {:.1} | {:.1} | {:.1} | {:.0} | {:.1} s | {:.0}% / {:.0}% | {:.0} MB | {} |",
                 st.users,
                 st.stats.ok_rps,
                 pct(st.stats.error_rate),
@@ -367,6 +367,7 @@ pub fn markdown(r: &Report) -> String {
                 l.p90_ms,
                 l.p99_ms,
                 l.max_ms,
+                st.stats.longest_silence_ms / 1000.0,
                 st.resources.daemon_avg_cpu_pct,
                 st.resources.daemon_peak_cpu_pct,
                 st.resources.daemon_peak_rss_mb,
@@ -487,9 +488,9 @@ pub fn markdown(r: &Report) -> String {
         );
         let _ = writeln!(
             s,
-            "| Fault | Verdict | Victim ok req/s | Victim errors | Victim p99 | After: errors | Injector outcomes | Why |"
+            "| Fault | Verdict | Victim ok req/s | Victim errors | Victim p99 | Longest stall | After: errors | Injector outcomes | Why |"
         );
-        let _ = writeln!(s, "|---|---|---:|---:|---:|---:|---|---|");
+        let _ = writeln!(s, "|---|---|---:|---:|---:|---:|---:|---|---|");
         for f in &r.faults {
             let outcomes: Vec<String> = f
                 .injector
@@ -499,12 +500,13 @@ pub fn markdown(r: &Report) -> String {
                 .collect();
             let _ = writeln!(
                 s,
-                "| {} | **{}** | {:.0} | {} | {:.1} ms | {} | {} | {} |",
+                "| {} | **{}** | {:.0} | {} | {:.1} ms | {:.1} s | {} | {} | {} |",
                 f.fault,
                 f.verdict,
                 f.victim_during.ok_rps,
                 pct(f.victim_during.error_rate),
                 f.victim_during.latency_ok.p99_ms,
+                f.victim_during.longest_silence_ms / 1000.0,
                 pct(f.victim_after.error_rate),
                 outcomes.join(", "),
                 f.reasons.join("; ")

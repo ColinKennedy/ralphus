@@ -81,6 +81,24 @@ pub struct WindowStats {
     pub error_examples: BTreeMap<String, String>,
     pub per_op: BTreeMap<String, OpStats>,
     pub mb_received: f64,
+    /// Longest stretch of the window in which no request completed
+    /// successfully -- a stalled server shows up here even when every
+    /// request eventually succeeds inside the client timeout.
+    pub longest_silence_ms: f64,
+}
+
+/// Longest gap between successful completions, counting the window's start
+/// and end as boundaries.
+fn longest_silence_us(mut finishes: Vec<u64>, window_us: u64) -> u64 {
+    finishes.retain(|f| *f <= window_us);
+    finishes.sort_unstable();
+    let mut prev = 0u64;
+    let mut longest = 0u64;
+    for f in finishes {
+        longest = longest.max(f - prev);
+        prev = f;
+    }
+    longest.max(window_us.saturating_sub(prev))
 }
 
 pub fn percentile(sorted_us: &[u64], pct: f64) -> f64 {
@@ -131,6 +149,7 @@ pub fn summarize(
     let mut finished_in_window = 0u64;
     let mut ok_in_window = 0u64;
     let mut bytes = 0u64;
+    let mut ok_finishes = Vec::with_capacity(samples.len());
     for s in samples {
         stats.requests += 1;
         bytes += s.bytes;
@@ -144,6 +163,7 @@ pub fn summarize(
             stats.ok += 1;
             ok_lat.push(s.latency_us);
             per_op_lat.entry(s.op).or_default().push(s.latency_us);
+            ok_finishes.push(s.start_us + s.latency_us);
             if in_window {
                 ok_in_window += 1;
             }
@@ -166,6 +186,7 @@ pub fn summarize(
     }
     stats.latency_ok = latency(ok_lat);
     stats.mb_received = bytes as f64 / (1024.0 * 1024.0);
+    stats.longest_silence_ms = longest_silence_us(ok_finishes, window_us) as f64 / 1000.0;
     stats
 }
 
@@ -181,6 +202,15 @@ mod tests {
             outcome,
             bytes: 10,
         }
+    }
+
+    #[test]
+    fn longest_silence_counts_window_edges() {
+        assert_eq!(longest_silence_us(vec![], 1000), 1000);
+        assert_eq!(longest_silence_us(vec![100, 200, 900], 1000), 700);
+        assert_eq!(longest_silence_us(vec![600, 650], 1000), 600);
+        // Completions after the window are ignored.
+        assert_eq!(longest_silence_us(vec![100, 5000], 1000), 900);
     }
 
     #[test]
