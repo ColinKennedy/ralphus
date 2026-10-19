@@ -24572,7 +24572,10 @@ token_env = "RALPHUS_TEST_FORGE_TOKEN"
     fn an_unresolvable_forge_client_is_unknown_but_not_waiting() {
         let store: crate::store_lock::StoreHandle =
             Arc::new(crate::store_lock::StoreMutex::new(store()));
-        let (gid, _pr_id) = make_pr(&store.lock());
+        let gid = {
+            let guard = store.lock();
+            make_pr(&guard).0
+        };
         check_pr_merges(&store, &gid);
         assert!(merge_state_unknown(&gid));
         assert!(!merge_state_waiting_on_forge(&gid));
