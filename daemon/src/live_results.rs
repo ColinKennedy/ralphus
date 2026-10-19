@@ -149,6 +149,8 @@ pub struct RecordedCall {
     pub cwd: Option<String>,
     /// `None` when no result half was recorded.
     pub succeeded: Option<bool>,
+    /// The shell tool that ran it, lower-cased (`bash`, `powershell`, ...).
+    pub shell: String,
 }
 
 /// One accepted reproduction step.
@@ -156,6 +158,9 @@ pub struct RecordedCall {
 pub struct RecipeStep {
     /// The recommended command, as matched.
     pub command: String,
+    /// The shell tool the call ran in (empty on rows stored before it was kept).
+    #[serde(default)]
+    pub shell: String,
     /// The complete recorded tool call it was found in (empty on rows stored
     /// before it was kept).
     #[serde(default)]
@@ -239,6 +244,7 @@ pub fn extract_shell_calls(transcript: &str) -> Vec<RecordedCall> {
                 command,
                 cwd,
                 succeeded: None,
+                shell: tool,
             },
         );
     }
@@ -294,6 +300,7 @@ pub fn match_recipe(
         .into_iter()
         .map(|(i, _, command)| RecipeStep {
             command,
+            shell: calls[i].shell.clone(),
             recorded_command: calls[i].command.trim().to_string(),
             cwd: calls[i]
                 .cwd
@@ -723,57 +730,108 @@ fn when(ms: Option<i64>) -> String {
         )
 }
 
-fn yes_no(v: Option<bool>) -> &'static str {
-    match v {
-        Some(true) => "yes",
-        Some(false) => "no",
-        None => "unknown",
-    }
-}
-
 fn one_line(text: &str) -> String {
     clip(text).split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-fn render_run(out: &mut String, item: &SectionRun) {
+/// `(icon, word)` for a recorded verdict.
+fn verdict_badge(verdict: Option<&str>) -> (&'static str, &'static str) {
+    match verdict {
+        Some("passed") => ("✅", "Passed"),
+        Some("failed") => ("❌", "Failed"),
+        _ => ("⚠️", "Inconclusive"),
+    }
+}
+
+/// `cwd` relative to the run's checkout: empty for the checkout itself, the
+/// relative path inside it, or `cwd` unchanged when it is elsewhere.
+fn location(cwd: &str, checkout: Option<&str>) -> String {
+    let norm = |p: &str| p.replace('\\', "/").trim_end_matches('/').to_string();
+    let path = norm(cwd);
+    let Some(root) = checkout.map(norm).filter(|r| !r.is_empty()) else {
+        return cwd.to_string();
+    };
+    if path.eq_ignore_ascii_case(&root) {
+        return String::new();
+    }
+    match path.get(..=root.len()) {
+        Some(head) if head.eq_ignore_ascii_case(&format!("{root}/")) => {
+            path[root.len() + 1..].to_string()
+        }
+        _ => cwd.to_string(),
+    }
+}
+
+/// The agent's report as Markdown when it can be shown as-is, otherwise
+/// fenced: an unbalanced fence, an HTML comment or a `<details>` tag would
+/// break out of the collapsed block it sits in.
+fn report_markdown(report: &str) -> String {
+    let text = clip(report);
+    let fences = text
+        .lines()
+        .filter(|l| {
+            let l = l.trim_start();
+            l.starts_with("```") || l.starts_with("~~~")
+        })
+        .count();
+    let lower = text.to_ascii_lowercase();
+    let unsafe_html = ["<details", "</details", "<!--", "-->"]
+        .iter()
+        .any(|t| lower.contains(t));
+    if fences % 2 == 1 || unsafe_html {
+        fenced(&text)
+    } else {
+        text.trim().to_string()
+    }
+}
+
+/// The `**Reproduce**` heading and code block for a run's accepted recipe,
+/// with a `# in <dir>` line wherever the directory changes.
+fn render_reproduction(out: &mut String, steps: &[RecipeStep], checkout: Option<&str>) {
+    let dirs: Vec<String> = steps
+        .iter()
+        .map(|s| location(&clip(&s.cwd), checkout))
+        .collect();
+    let one_dir = dirs.windows(2).all(|w| w[0] == w[1]);
+    let place = match dirs.first() {
+        Some(dir) if one_dir && !dir.is_empty() => format!("in `{dir}`"),
+        _ => "from the repo root".to_string(),
+    };
+    let shells: std::collections::BTreeSet<&str> = steps.iter().map(|s| s.shell.as_str()).collect();
+    let (shell_name, language) = match shells.into_iter().collect::<Vec<_>>().as_slice() {
+        ["powershell"] => (", PowerShell", "powershell"),
+        ["bash"] => (", Bash", "sh"),
+        _ => ("", "text"),
+    };
+    let mut lines: Vec<String> = Vec::new();
+    let mut current_dir: Option<&str> = None;
+    for (step, dir) in steps.iter().zip(&dirs) {
+        if !one_dir && current_dir != Some(dir.as_str()) {
+            lines.push(if dir.is_empty() {
+                "# in the repo root".to_string()
+            } else {
+                format!("# in {dir}")
+            });
+            current_dir = Some(dir.as_str());
+        }
+        lines.push(step.command.clone());
+    }
+    let block = fenced(&clip(&lines.join("\n"))).replacen("text\n", &format!("{language}\n"), 1);
+    let _ = writeln!(out, "**Reproduce** ({place}{shell_name}):\n\n{block}\n");
+}
+
+/// The collapsed "Run details": the fix outcome, any commits and where they
+/// went, and each recorded shell call the recipe came from.
+fn render_run_details(out: &mut String, item: &SectionRun) {
     let run = &item.run;
     let ev = &item.evidence;
-    let verdict = ev.verdict.as_deref().unwrap_or("inconclusive");
     let destination = item
         .destination_branch
         .as_deref()
         .or(ev.integration_branch_id.as_deref())
         .map(|b| format!("`{b}`"));
-    let _ = writeln!(out, "#### {}\n", one_line(&run.label));
-    let _ = write!(out, "- Verdict: **{verdict}**");
-    match ev.verdict_summary.as_deref() {
-        Some(summary) => {
-            let _ = writeln!(out, " - {}", one_line(summary));
-        }
-        None => {
-            let _ = writeln!(out, " (the agent reported no summary)");
-        }
-    }
-    let _ = writeln!(out, "- {}\n", fix_line(item, destination.as_deref()));
     let _ = writeln!(out, "<details><summary>Run details</summary>\n");
-    let _ = writeln!(out, "- Live run: `{}`", run.run_id);
-    let _ = writeln!(
-        out,
-        "- Run: {} at {}; runner state `{}`",
-        if run.trigger == "auto" {
-            "automatic"
-        } else {
-            "manual"
-        },
-        when(run.started_at_ms.or(Some(run.queued_at_ms))),
-        run.state
-    );
-    let _ = writeln!(
-        out,
-        "- Fix attempted: {}; fix confirmed: {}",
-        yes_no(ev.fix_attempted),
-        yes_no(ev.fix_confirmed)
-    );
+    let _ = writeln!(out, "- {}", fix_line(item, destination.as_deref()));
     if !run.commits.is_empty() {
         let shas: Vec<String> = run
             .commits
@@ -797,55 +855,86 @@ fn render_run(out: &mut String, item: &SectionRun) {
             destination.as_deref().unwrap_or("not recorded")
         );
     }
-    if let Some(error) = run.error.as_deref() {
-        let _ = writeln!(out, "- Runner error: {}", one_line(error));
+    if ev.recipe.is_empty() {
+        let _ = writeln!(out, "- No recorded shell call matched the agent's recipe.");
     }
-    let _ = writeln!(out, "\nObserved outcome:\n");
-    match run.report.as_deref().filter(|r| !r.trim().is_empty()) {
-        Some(report) => {
-            let _ = writeln!(out, "{}\n", fenced(&clip(report)));
+    // Several steps can come from one call; show each call once.
+    let mut shown = std::collections::HashSet::new();
+    let calls: Vec<&RecipeStep> = ev
+        .recipe
+        .iter()
+        .filter(|s| !s.recorded_command.is_empty() && shown.insert(s.order))
+        .collect();
+    for step in &calls {
+        let label = if calls.len() == 1 {
+            String::new()
+        } else {
+            format!(" {}", step.order)
+        };
+        let block = fenced(&clip(&step.recorded_command))
+            .lines()
+            .map(|line| format!("  {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let _ = writeln!(
+            out,
+            "- Recorded shell call{label} ({}):\n\n{block}\n",
+            step.result
+        );
+    }
+    let _ = writeln!(out, "\n</details>\n");
+}
+
+fn render_run(out: &mut String, item: &SectionRun) {
+    let run = &item.run;
+    let ev = &item.evidence;
+    let (icon, verdict) = verdict_badge(ev.verdict.as_deref());
+    let _ = writeln!(out, "### {icon} {}", one_line(&run.label));
+    let _ = writeln!(out, "<!-- ralphus live run: {} -->\n", run.run_id);
+    let trigger = if run.trigger == "auto" {
+        "automatic"
+    } else {
+        "manual"
+    };
+    let _ = write!(
+        out,
+        "**{verdict}** · {trigger} run on the review's tip · {}",
+        when(run.started_at_ms.or(Some(run.queued_at_ms)))
+    );
+    if run.state != "finished" {
+        let _ = write!(out, " · runner state `{}`", run.state);
+    }
+    let _ = writeln!(out, "\n");
+    match ev.verdict_summary.as_deref() {
+        Some(summary) => {
+            let _ = writeln!(out, "{}\n", one_line(summary));
         }
         None => {
-            let _ = writeln!(out, "No report was recorded.\n");
+            let _ = writeln!(out, "The agent reported no summary.\n");
         }
     }
-    let _ = writeln!(out, "Reproduction:\n");
+    if let Some(error) = run.error.as_deref() {
+        let _ = writeln!(out, "**Runner error:** {}\n", one_line(error));
+    }
     if ev.recipe.is_empty() {
         let _ = writeln!(
             out,
             "No reproduction commands matching recorded shell calls are available for this run.\n"
         );
     } else {
-        for step in &ev.recipe {
-            let _ = writeln!(
-                out,
-                "{}. in `{}`: {} (recorded call {})",
-                step.order,
-                clip(&step.cwd),
-                fenced(&clip(&step.command)),
-                step.result
-            );
+        render_reproduction(out, &ev.recipe, run.cwd.as_deref());
+    }
+    let _ = writeln!(out, "<details><summary>What the agent observed</summary>\n");
+    match run.report.as_deref().filter(|r| !r.trim().is_empty()) {
+        Some(report) => {
+            let _ = writeln!(out, "{}\n", report_markdown(report));
         }
-        let _ = writeln!(out);
-        if ev.recipe.iter().any(|s| !s.recorded_command.is_empty()) {
-            let _ = writeln!(
-                out,
-                "<details><summary>Recorded invocations</summary>\n\nThe complete shell calls the commands above were found in; each result is for the whole call.\n"
-            );
-            for step in ev.recipe.iter().filter(|s| !s.recorded_command.is_empty()) {
-                let _ = writeln!(
-                    out,
-                    "Call {} in `{}` ({}):\n\n{}\n",
-                    step.order,
-                    clip(&step.cwd),
-                    step.result,
-                    fenced(&clip(&step.recorded_command))
-                );
-            }
-            let _ = writeln!(out, "</details>\n");
+        None => {
+            let _ = writeln!(out, "No report was recorded.\n");
         }
     }
-    let _ = writeln!(out, "<details><summary>Exact prompt sent</summary>\n");
+    let _ = writeln!(out, "</details>\n");
+    let _ = writeln!(out, "<details><summary>Steps it was given</summary>\n");
     match ev.sent_prompt.as_deref() {
         Some(prompt) => {
             let _ = writeln!(out, "{}\n", fenced(&clip(prompt)));
@@ -854,18 +943,40 @@ fn render_run(out: &mut String, item: &SectionRun) {
             let _ = writeln!(out, "Not recorded.\n");
         }
     }
-    let _ = writeln!(out, "</details>\n");
     if let Some(system) = ev.sent_system_prompt.as_deref() {
-        let _ = writeln!(
-            out,
-            "<details><summary>System prompt sent</summary>\n\n{}\n\n</details>\n",
-            fenced(&clip(system))
-        );
+        let _ = writeln!(out, "System prompt:\n\n{}\n", fenced(&clip(system)));
     }
     let _ = writeln!(out, "</details>\n");
+    render_run_details(out, item);
 }
 
-/// The one-sentence fix outcome shown beside the verdict.
+/// One line per earlier run of an action, collapsed under its newest run.
+fn render_earlier_runs(out: &mut String, items: &[&SectionRun]) {
+    if items.is_empty() {
+        return;
+    }
+    let _ = writeln!(
+        out,
+        "<details><summary>Earlier runs of this live test</summary>\n"
+    );
+    for item in items {
+        let (icon, verdict) = verdict_badge(item.evidence.verdict.as_deref());
+        let summary = item
+            .evidence
+            .verdict_summary
+            .as_deref()
+            .map_or_else(|| "The agent reported no summary.".to_string(), one_line);
+        let _ = writeln!(
+            out,
+            "- {icon} **{verdict}** · {} · {summary} <!-- ralphus live run: {} -->",
+            when(item.run.started_at_ms.or(Some(item.run.queued_at_ms))),
+            item.run.run_id
+        );
+    }
+    let _ = writeln!(out, "\n</details>\n");
+}
+
+/// The one-sentence fix outcome shown in the run details.
 fn fix_line(item: &SectionRun, destination: Option<&str>) -> String {
     let run = &item.run;
     let ev = &item.evidence;
@@ -882,10 +993,10 @@ fn fix_line(item: &SectionRun, destination: Option<&str>) -> String {
     }
     "Fix: not required".to_string()
 }
-
 /// The managed section for a set of runs, markers included, or `None` when
-/// there is nothing to show. Runs are grouped by action; each action shows its
-/// newest [`MAX_RUNS_PER_ACTION`] runs, newest first.
+/// there is nothing to show. Each action gets a heading with its newest run in
+/// full; up to [`MAX_RUNS_PER_ACTION`]` - 1` earlier runs follow it collapsed,
+/// newest first.
 #[must_use]
 pub fn render_section(runs: &[SectionRun]) -> Option<String> {
     let mut actions: std::collections::BTreeMap<i64, Vec<&SectionRun>> =
@@ -901,8 +1012,10 @@ pub fn render_section(runs: &[SectionRun]) -> Option<String> {
         items.sort_by(|a, b| {
             (b.run.queued_at_ms, &b.run.run_id).cmp(&(a.run.queued_at_ms, &a.run.run_id))
         });
-        for item in items.iter().take(MAX_RUNS_PER_ACTION) {
-            render_run(&mut out, item);
+        items.truncate(MAX_RUNS_PER_ACTION);
+        if let Some((newest, earlier)) = items.split_first() {
+            render_run(&mut out, newest);
+            render_earlier_runs(&mut out, earlier);
         }
     }
     out.push_str(SECTION_END);
@@ -1241,6 +1354,7 @@ mod tests {
                 fix_confirmed: Some(false),
                 recipe: vec![RecipeStep {
                     command: "cargo run".into(),
+                    shell: String::new(),
                     recorded_command: "cd w && cargo run | head".into(),
                     cwd: "/w".into(),
                     order: 2,
@@ -1352,6 +1466,7 @@ mod tests {
             command: c.into(),
             cwd: Some("/w".into()),
             succeeded: Some(true),
+            shell: "bash".into(),
         };
         let commands = |proposed: &[&str], recorded: &[&str]| -> Vec<String> {
             let proposed: Vec<String> = proposed.iter().map(|p| (*p).to_string()).collect();
@@ -1380,6 +1495,7 @@ mod tests {
             command: c.into(),
             cwd: Some("/w".into()),
             succeeded: Some(true),
+            shell: "bash".into(),
         };
         let run = |proposed: &str, recorded: &str| -> Vec<RecipeStep> {
             match_recipe(&[proposed.to_string()], &[call(recorded)], "/d")
@@ -1406,6 +1522,7 @@ mod tests {
             command: c.into(),
             cwd: Some("/w".into()),
             succeeded: Some(true),
+            shell: "bash".into(),
         };
         let run = |proposed: &str, recorded: &str| -> Vec<RecipeStep> {
             match_recipe(&[proposed.to_string()], &[call(recorded)], "/d")
@@ -1439,6 +1556,7 @@ mod tests {
             command: c.into(),
             cwd: Some("/w".into()),
             succeeded: Some(true),
+            shell: "bash".into(),
         };
         let run = |proposed: &[&str], recorded: &str| -> Vec<RecipeStep> {
             let p: Vec<String> = proposed.iter().map(|s| (*s).to_string()).collect();
@@ -1500,9 +1618,10 @@ mod tests {
     #[test]
     fn the_section_shows_the_recipe_and_collapses_the_recorded_call() {
         let section = render_section(&[section_run("r1", 0, 10)]).unwrap();
-        assert!(section.contains("cargo run"));
-        assert!(section.contains("<summary>Recorded invocations</summary>"));
-        assert!(section.contains("cd w && cargo run | head"));
+        assert!(section.contains("**Reproduce** (from the repo root):\n\n```text\ncargo run\n```"));
+        let details = section.find("<summary>Run details</summary>").unwrap();
+        let call = section.find("cd w && cargo run | head").unwrap();
+        assert!(details < call);
     }
 
     #[test]
@@ -1518,7 +1637,9 @@ mod tests {
         let second = splice_section(&after, &newer);
         assert!(second.starts_with(user));
         assert!(second.ends_with("Trailing user text."));
-        assert!(second.contains("`r2`") && !second.contains("`r1`"));
+        assert!(
+            second.contains("ralphus live run: r2 ") && !second.contains("ralphus live run: r1 ")
+        );
         // Byte-stable on a re-render with the same data.
         assert_eq!(splice_section(&second, &newer), second);
     }
@@ -1530,11 +1651,17 @@ mod tests {
             .chain([section_run("other", 1, 5)])
             .collect();
         let section = render_section(&runs).unwrap();
-        let pos = |id: &str| section.find(&format!("`{id}`"));
+        let pos = |id: &str| section.find(&format!("ralphus live run: {id} "));
         assert!(pos("run4").unwrap() < pos("run3").unwrap());
         assert!(pos("run3").unwrap() < pos("run2").unwrap());
         assert!(pos("run1").is_none() && pos("run0").is_none());
         assert!(pos("other").is_some());
+        // One heading per action: the newest run in full, earlier ones collapsed.
+        assert_eq!(section.matches("### ").count(), 2);
+        let earlier = section
+            .find("<summary>Earlier runs of this live test</summary>")
+            .unwrap();
+        assert!(pos("run4").unwrap() < earlier && earlier < pos("run3").unwrap());
         assert!(render_section(&[]).is_none());
     }
 
@@ -1544,47 +1671,122 @@ mod tests {
         item.evidence = RunEvidence::default();
         item.run.report = Some("ran ANTHROPIC_API_KEY=NOTAREALKEY run".into());
         let section = render_section(&[item]).unwrap();
-        assert!(section.contains("**inconclusive**"));
-        assert!(section.contains("push result not recorded") || section.contains("not recorded"));
+        assert!(section.contains("### ⚠️ ") && section.contains("**Inconclusive**"));
+        assert!(section.contains("The agent reported no summary."));
+        assert!(section.contains("Destination branch: `feature-top` (push result not recorded)"));
         assert!(section.contains("No reproduction commands"));
+        assert!(section.contains("- No recorded shell call matched the agent's recipe."));
         assert!(!section.contains("NOTAREALKEY"));
     }
 
     #[test]
     fn the_exact_prompt_and_destination_are_rendered() {
         let section = render_section(&[section_run("r1", 0, 1)]).unwrap();
-        assert!(section.contains("Live action: x\n\nstart it"));
+        let steps = section
+            .find("<details><summary>Steps it was given</summary>\n\n```text\nLive action: x\n\nstart it\n```\n\nSystem prompt:\n\n```text\nsystem\n```")
+            .unwrap();
+        let details = section.find("<summary>Run details</summary>").unwrap();
+        assert!(steps < details);
         assert!(section.contains("Destination branch: `feature-top` (pushed)"));
-        assert!(section.contains("2. in `/w`"));
     }
 
     #[test]
-    fn the_verdict_and_fix_line_precede_the_collapsed_details() {
+    fn each_action_is_a_heading_with_its_verdict_then_the_collapsed_details() {
         let section = render_section(&[section_run("lr9-1", 0, 1)]).unwrap();
-        let heading = section.find("#### Board shows reviews\n").unwrap();
-        let verdict = section
-            .find("- Verdict: **passed** - greeting shown")
-            .unwrap();
-        let details = section
-            .find("<details><summary>Run details</summary>")
-            .unwrap();
-        assert!(heading < verdict && verdict < details);
-        // The heading is free of the internal id; the id sits inside the details.
-        assert!(!section[heading..verdict].contains("lr9-1"));
-        assert!(section.find("lr9-1").unwrap() > details);
+        let at = |s: &str| section.find(s).unwrap();
+        // The internal id is only an HTML comment, never visible text.
+        assert!(section.contains(
+            "### ✅ Board shows reviews\n<!-- ralphus live run: lr9-1 -->\n\n**Passed** · automatic run on the review's tip · "
+        ));
+        assert_eq!(section.matches("lr9-1").count(), 1);
+        assert!(at("**Passed**") < at("greeting shown"));
+        assert!(at("greeting shown") < at("**Reproduce**"));
+        assert!(at("**Reproduce**") < at("<summary>What the agent observed</summary>"));
+        assert!(
+            at("<summary>What the agent observed</summary>")
+                < at("<summary>Steps it was given</summary>")
+        );
+        assert!(at("<summary>Steps it was given</summary>") < at("<summary>Run details</summary>"));
+        // The fix outcome is a sentence, not internal state names.
+        assert!(section.contains("- Fix: attempted but not confirmed\n"));
         assert!(!section.contains("Integration:") && !section.contains("Commits: none"));
-        // The system prompt is its own disclosure nested in the run details.
-        let system = section
-            .find("<summary>System prompt sent</summary>")
-            .unwrap();
-        assert!(details < system);
         assert_eq!(
             section.matches("<details>").count(),
             section.matches("</details>").count()
         );
-        let last_close = section.rfind("</details>").unwrap();
-        let system_close = section[system..].find("</details>").unwrap() + system;
-        assert!(system_close < last_close);
+        // The report is shown as Markdown, not as a code block.
+        assert!(section.contains("<summary>What the agent observed</summary>\n\nIt worked.\n"));
+    }
+
+    #[test]
+    fn a_powershell_recipe_says_so_and_keeps_every_fence_on_its_own_line() {
+        let recorded = "moon run app:build 2>&1 | Select-Object -Last 20; app hello; app --help";
+        let transcript = [
+            tool_line(
+                "1",
+                "PowerShell",
+                &serde_json::json!({ "command": recorded }).to_string(),
+                None,
+            ),
+            tool_line("1", "PowerShell", "", Some(false)),
+        ]
+        .join("\n");
+        let recipe: Vec<String> = ["moon run app:build", "app hello", "app --help"]
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
+        let mut item = section_run("r1", 0, 10);
+        item.run.cwd = Some("C:\\repo\\.git\\.ralphus\\g\\g1\\review-postmerge".into());
+        item.evidence.recipe = match_recipe(
+            &recipe,
+            &extract_shell_calls(&transcript),
+            item.run.cwd.as_deref().unwrap(),
+        );
+        let section = render_section(&[item]).unwrap();
+        assert!(section.contains(
+            "**Reproduce** (from the repo root, PowerShell):\n\n```powershell\nmoon run app:build\napp hello\napp --help\n```\n"
+        ));
+        // The one call all three steps came from is listed once.
+        assert_eq!(
+            section
+                .matches("- Recorded shell call (succeeded):")
+                .count(),
+            1
+        );
+        // GitHub only opens a fence at the start of a line (after a list
+        // item's indentation); a mid-line fence turns the rest into code.
+        for line in section.lines() {
+            if let Some(at) = line.find("```") {
+                assert!(line[..at].trim().is_empty(), "mid-line fence: {line:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn commands_from_several_directories_say_where_each_runs() {
+        let mut item = section_run("r1", 0, 10);
+        let step = |command: &str, cwd: &str, order: usize| RecipeStep {
+            command: command.into(),
+            shell: "bash".into(),
+            recorded_command: command.into(),
+            cwd: cwd.into(),
+            order,
+            result: "succeeded".into(),
+        };
+        item.evidence.recipe = vec![step("make", "/w", 1), step("npm test", "/w/web", 2)];
+        let section = render_section(&[item]).unwrap();
+        assert!(section.contains(
+            "**Reproduce** (from the repo root, Bash):\n\n```sh\n# in the repo root\nmake\n# in web\nnpm test\n```\n"
+        ));
+        assert!(section.contains("- Recorded shell call 1 (succeeded):"));
+        assert!(section.contains("- Recorded shell call 2 (succeeded):"));
+    }
+
+    #[test]
+    fn a_report_that_would_break_its_block_is_fenced() {
+        assert_eq!(report_markdown("- **Build:** ok"), "- **Build:** ok");
+        assert!(report_markdown("half a fence\n```\nnever closed").starts_with("```"));
+        assert!(report_markdown("ends early </details> oops").starts_with("```"));
     }
 
     #[test]

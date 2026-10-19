@@ -5451,13 +5451,18 @@ forge right before updating (GitHub `PATCH …/pulls/{n}` `body`, GitLab `PUT
 row's own forge and repo, fork-aware), replaces or appends the section and
 leaves all other text untouched; the local PR row's description is stored only
 after the forge accepts the update. Re-rendering unchanged data is byte-stable.
-Each entry shows the action label and run id, trigger and time, the verdict
-(`passed`, `failed` or `inconclusive`, separate from the runner `state`), the
-exact prompt sent (plus the system prompt), the observed outcome, whether a fix
-was attempted/confirmed, the commits, the integration state with the
-destination branch and push result, and a reproduction recipe. At most the
-latest 3 runs per action are shown, newest first; secrets are redacted and
-unknown details are stated as unknown. An action attributed to several branches
+Each action is a `### <verdict icon> <label>` heading (the run id follows as
+an HTML comment) over its newest run: the verdict (`Passed`, `Failed` or
+`Inconclusive`, separate from the runner `state`, which is shown only when it is
+not `finished`), trigger and time, the agent's summary, and a **Reproduce**
+code block of the accepted recipe, labelled with the shell it ran in and run
+from the repo root (or a `# in <dir>` line per directory). Below it, collapsed:
+what the agent observed (its report as Markdown, fenced when it would break the
+block), the steps it was given (the exact prompt and system prompt, verbatim
+and fenced), and run details (the fix outcome as one sentence, any commits and
+the destination branch with the push result, and each recorded shell call
+once). Up to 2 earlier runs of the action follow as a collapsed one-line list,
+newest first; secrets are redacted and unknown details are stated as unknown. An action attributed to several branches
 (`guardian_live_action_branches`, resolved from its source cells when the
 actions are written) appears on each branch's PR but runs once.
 
