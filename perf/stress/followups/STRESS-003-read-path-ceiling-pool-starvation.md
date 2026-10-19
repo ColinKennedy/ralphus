@@ -83,6 +83,42 @@ Release build; 56-CPU Xeon E5-2697 v3; Windows 10; about 200 held squads;
    and size `POOL_SIZE` to match `READ_WORKERS`.
 4. Record pool-acquire wait time in the request log and in `/api/daemon`.
 
+## UX risk: medium
+
+- **Stale board after a cache miss.** If a change does not invalidate the
+  snapshot, the board shows old state. For example, a user clicks Cancel
+  and the squad still shows as running. Writes that bypass a SQL commit are
+  the hazard:
+  - non-SQL state in `daemon/src/store_memory.rs` (run liveness, stall
+    debounce, worktree leases);
+  - anything computed from the current time ("no runner" warnings,
+    rate-limit `delayed_until_ms`, stall flags).
+
+  To avoid it:
+  - Bump the generation on every commit *and* every `StoreMemory` change
+    that shows up in the board.
+  - Keep time-derived values out of the cached body, or compute them at
+    send time. The board already ticks running times on the client
+    (`librarian/assets/board/15-tasks.js:1355`).
+- **Mutations don't need extra handling.** The board's `post`/`del` already
+  drop cached ETags and the in-flight `/api/tasks` request
+  (`librarian/assets/board/20-util.js:823-845`). As long as the generation
+  is bumped *before* the mutation's response is sent, the follow-up refresh
+  sees the new state.
+- **Key the cache on the full query string.** `/api/tasks` takes
+  `status`/`name`/`sort`. It does not vary by user today
+  (`daemon/src/server.rs:1095`). If per-user filtering is ever added
+  (hidden squads, "visit as"), the user becomes part of the key.
+- **The query rewrite can silently change fields.** Moving from
+  per-squad to batched queries risks a field going missing or changing on
+  the board. Add a golden/parity test: the old `build_squad_view` output
+  must equal the new batched output on fixtures that cover reviews,
+  proofs, triage, waypoints, profiles and copy links.
+- **A larger pool shouldn't be noticeable.** Raising `POOL_SIZE` to 12 means
+  more open readers, which can keep the WAL from checkpointing; that ties
+  into STRESS-005. Memory per connection is about 64 MiB of cache plus
+  256 MiB of mmap (shared).
+
 ## Verify
 
 Re-run `bash scripts/stress.sh --scenarios ramp,volume`. The read_heavy peak

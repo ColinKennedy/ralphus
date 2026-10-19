@@ -44,6 +44,35 @@
   different server layer (see STRESS-002).
 - **STRESS-003's snapshot cache would collapse a herd into a single build.**
 
+## UX risk: medium
+
+The trade-off is visible, fast failures instead of slow success. Under
+overload users see "busy" instead of a 10–20 s spinner, and recovery is
+immediate.
+
+- **Board reads cope already.** A non-OK GET keeps the last render and
+  retries on the next refresh (`librarian/assets/board/20-util.js:781`). But
+  every open tab retries on every SSE event with **no backoff**, so a
+  saturated daemon gets a retry storm from N tabs. To avoid it:
+  - add jittered exponential backoff on `503`, honoring `Retry-After`;
+  - show a "daemon busy, retrying" banner instead of silently keeping stale
+    data.
+- **Writes are the real hazard.** If the write queue is bounded, or queued
+  writes are dropped once old, a user's Cancel, Submit or Merge fails
+  visibly. Worse, a queued write that a client is still waiting on can be
+  dropped: the CLI and MCP have timeouts longer than 10 s, and large
+  submits take a while. To avoid it:
+  - **Apply the bound and the age-based drop to GETs only.** Writes keep
+    queueing, or get a much larger bound.
+  - If writes ever get a bound, it must be checked **before** the write
+    runs, never after, so a client never sees a 503 for something that
+    happened. The client should show "daemon busy, not applied — retry".
+- **The deadline must not undercut legitimate slow reads.** Big-history
+  boards take seconds today (STRESS-004). Pick the deadline from the
+  client's timeout, not from the ideal latency, until 003 and 004 land.
+- **Health endpoints.** Exempt `/api/daemon` (or give it its own lane) so
+  liveness checks and the board's banner can tell "busy" from "down".
+
 ## Verify
 
 Run `ralphus-stress run … --scenarios faults --faults abandon_response,thundering_herd`.

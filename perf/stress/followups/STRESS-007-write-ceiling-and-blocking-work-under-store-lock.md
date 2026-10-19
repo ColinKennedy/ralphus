@@ -56,6 +56,21 @@
   - narrow what needs the global writer lock;
   - or split writes by squad.
 
+## UX risk: low
+
+- **Config changes may lag.** If profile, worktree and daemon config are
+  cached, an edit to `.ralphus.toml` or an agent profile might not apply to
+  the next submit. Invalidate on file modification time (cheap `stat`
+  calls) rather than a TTL, so edits apply immediately.
+- **The config can be read before the lock.** Resolving config before
+  taking the lock can see config that changes before the insert. That is
+  harmless, since the same race exists today between the user editing a
+  file and submitting.
+- **Batching adds a little latency and needs isolation.** Each click waits
+  for its batch window. Keep the window at a few ms or less, so it does not
+  show. One invalid write in a batch must fail only itself: use per-item
+  savepoints, not one transaction that rolls back everyone's work.
+
 ## Verify
 
 The `write_heavy` peak ok req/s should rise. Re-run with

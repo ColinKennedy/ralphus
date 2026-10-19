@@ -43,6 +43,20 @@ At minimum, a failure here should send a mailbox message with remediation
 guidance (AGENTS.md, RAL-502), so the submitter learns the squad needs a
 retry.
 
+## UX risk: low–medium
+
+- **Surprise resurrection.** A squad the board showed as failed after a
+  restart comes back and proceeds on its own. Send a mailbox notice
+  ("squad X resumed after daemon restart"). Leave squads that were already
+  marked `failed` before the upgrade alone, so old history does not
+  suddenly start running.
+- **Duplicate work if a phase isn't idempotent.** Re-running a phase that
+  partly completed could claim a second worktree or branch, which shows up
+  as duplicate branches in reviews. Each phase must check what already
+  exists before acting. Worktree claims already carry a `creating/<short>`
+  marker (`daemon/AGENTS.md`, lazy worktree materialization), and that is
+  the model to follow.
+
 ## Harness follow-up
 
 The crash check currently counts an acknowledged squad as "present" even

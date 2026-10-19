@@ -20,3 +20,15 @@ Everything else in the corpus was answered with a sensible `400`, `401` or
 JSON/TOML/UTF-8, traversal, SQL-injection-shaped ids, deep JSON nesting, and
 negative or non-numeric `Content-Length`. Pipelining and
 `Expect: 100-continue` work.
+
+## UX risk: low
+
+- **Header and URL limits (`431`/`414`)** could refuse long deep links or
+  filter URLs. Keep the limits generous (for example 64 KiB of headers and
+  16 KiB of URL), well above anything the board builds.
+- **Rejecting zero-cell tasks** could break existing task files, examples
+  or tests that rely on it. Before changing `core/src/validate.rs`, search
+  `examples/`, docs and tests for it, and ask whether it is intended (per
+  AGENTS.md, ask before adding schema validation).
+- **Answering garbage or non-ASCII request lines with `400`** instead of a
+  silent close changes nothing a real browser or CLI sends.

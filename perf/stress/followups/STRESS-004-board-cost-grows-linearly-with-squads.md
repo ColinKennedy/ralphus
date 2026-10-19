@@ -40,6 +40,40 @@ During this scenario the watchdog logged
 - Together with STRESS-003's snapshot cache, this should make board cost
   independent of history size.
 
+## UX risk: high
+
+Of all these fixes, this one changes the board's behaviour the most. The
+board assumes `GET /api/tasks` holds **every** squad, so with a window:
+
+- **Search, filters, sorting, counts and "select all" / bulk actions**
+  would silently cover only the loaded page. A search would miss an old
+  squad, and a count would be wrong without any sign.
+- **Hovercards and derived UI** deliberately render only from data already
+  loaded ("Lazy by default" in `librarian/AGENTS.md`;
+  `librarian/assets/board/22-hovercards.js`). They would go blank for
+  squads outside the window.
+- **Deep links** from notifications, mailbox entries, entity URIs or review
+  links to an old squad would land on "not found".
+- **The Tasks table** (`/api/task-index`, `librarian/assets/board/15-tasks.js`)
+  and the cache in `10-tab-registry.js` that maps squad ids to labels
+  assume the full list, so names would show as raw ids.
+
+How to avoid it:
+
+- **Default window:** every non-terminal squad plus the most recent N
+  finished ones, with "Load more" or infinite scroll.
+- **Server-side search and filters.** `/api/tasks` already accepts
+  `status`/`name`/`sort`; extend it with an offset/cursor and full-history
+  search. The board's search box must query the server once a window is
+  active.
+- **Show "showing N of M"** wherever a count or bulk action appears, so
+  partial data is never mistaken for all data.
+- **Fetch one squad on demand** (`GET /api/squads/{id}`) for deep links and
+  for hovercards on squads outside the window. That needs an explicit,
+  documented exception to the "lazy" rule.
+- **Build the UI first, then switch the default window on.** Ship the UI
+  changes behind the larger default (or "all") first.
+
 ## Verify
 
 Run `ralphus-stress run … --scenarios volume --volume 1000:25,10000:250`.

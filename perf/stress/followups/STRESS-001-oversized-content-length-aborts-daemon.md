@@ -70,6 +70,17 @@ No `Authorization` header is needed.
      This also covers chunked bodies, which have no declared length.
 3. Make the same change in `librarian/src/server.rs:614`.
 
+## UX risk: low
+
+- **Large task files.** A legitimately huge task file (giant prompts, pasted
+  logs) would get `413` instead of being accepted.
+  - Set a generous cap (16–64 MiB). Today the largest real submits are far
+    smaller; the stress run's 64 MiB padded submit was accepted.
+  - Make the New Squad modal show the `413` as a readable error ("task file
+    too large: N MiB, limit M MiB"), not a generic failure toast.
+- **The librarian.** Use the same cap there, so the daemon and the
+  librarian never disagree about what is too big.
+
 ## Regression test
 
 Add it to `daemon/tests/http_concurrency.rs`, or to

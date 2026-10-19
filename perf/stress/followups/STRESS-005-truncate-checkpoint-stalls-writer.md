@@ -60,6 +60,16 @@ The watchdog also fired:
 - **Fixing STRESS-003/004 also shrinks the window.** Shorter board read
   transactions mean shorter waits.
 
+## UX risk: approximately none
+
+- **No visible change** other than writes no longer stalling for about
+  5.5 s.
+- **The WAL file grows** larger between quiet periods. That uses more disk,
+  makes reads very slightly slower when the WAL is huge, and lengthens WAL
+  recovery after a crash. Cap it with `journal_size_limit` and run the
+  blocking checkpoint only when no readers are active (for example on a
+  quiet tick).
+
 ## Regression test
 
 The setup is a file-backed store with a long-running reader on the pool and

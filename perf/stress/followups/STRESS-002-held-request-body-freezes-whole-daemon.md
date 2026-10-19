@@ -55,6 +55,28 @@ answered** until that client sends the rest or closes.
   unauthenticated client should never get to make the daemon wait.
 - **Combine with STRESS-001's body-size cap.**
 
+## UX risk: medium if done naively
+
+- **Live updates silently stop.** This is the main hazard. A socket-level
+  read or idle timeout would also apply to long-lived responses:
+  - the board's SSE stream (`GET /api/events`, `librarian/assets/board/70-sse.js`);
+  - long-poll consumers such as `mailbox follow`.
+
+  The board would stop updating or reconnect in a loop, and the only cue is
+  data that goes stale. Apply the deadline **only to reading the request**
+  (headers and body), never to writing the response or to a stream. SSE and
+  long-poll routes have no request body, so a request-read deadline never
+  touches them.
+- **Slow links get 408s.** Submits over a VPN or other remote link, and
+  large task files, could time out.
+  - Scale the deadline with `Content-Length`, for example a floor of a few
+    seconds plus per-MiB time.
+  - Have the board show `408` as "upload timed out, retry" rather than a
+    generic error.
+- **Auth before body is visible only to clients sending a bad token.** They
+  get `401` immediately instead of after the upload, which is an
+  improvement.
+
 ## Regression test
 
 Add it to `daemon/tests/http_concurrency.rs`:
