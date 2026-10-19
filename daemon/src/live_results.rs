@@ -42,6 +42,8 @@ const BASE_BACKOFF_MS: i64 = 30_000;
 const MAX_BACKOFF_MS: i64 = 30 * 60_000;
 /// Longest prompt/report text rendered into a description.
 const MAX_TEXT_CHARS: usize = 6_000;
+/// Longest runner error shown in the PR body; the full text stays on the run record.
+const MAX_ERROR_CHARS: usize = 100;
 
 // ---- the verdict ------------------------------------------------------------
 
@@ -730,6 +732,18 @@ fn when(ms: Option<i64>) -> String {
         )
 }
 
+/// `text` redacted, collapsed to one line, and cut to `max_chars` chars with a
+/// trailing `...` only when something was cut.
+fn elide_right(text: &str, max_chars: usize) -> String {
+    let redacted = ralphus_core::redact::redact_secrets(text);
+    let flat = redacted.split_whitespace().collect::<Vec<_>>().join(" ");
+    if flat.chars().count() <= max_chars {
+        return flat;
+    }
+    let kept: String = flat.chars().take(max_chars).collect();
+    format!("{kept}...")
+}
+
 fn one_line(text: &str) -> String {
     clip(text).split_whitespace().collect::<Vec<_>>().join(" ")
 }
@@ -914,7 +928,11 @@ fn render_run(out: &mut String, item: &SectionRun) {
         }
     }
     if let Some(error) = run.error.as_deref() {
-        let _ = writeln!(out, "**Runner error:** {}\n", one_line(error));
+        let _ = writeln!(
+            out,
+            "**Runner error:** {}\n",
+            elide_right(error, MAX_ERROR_CHARS)
+        );
     }
     if ev.recipe.is_empty() {
         let _ = writeln!(
@@ -1316,6 +1334,30 @@ pub fn record_run_evidence(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn elide_right_cuts_long_multiline_text_to_one_line() {
+        let long = "runner produced no result file: boom\nlast pane output:\n".to_string()
+            + &"tool call {json}\n".repeat(400);
+        let out = elide_right(&long, MAX_ERROR_CHARS);
+        assert!(!out.contains('\n'));
+        assert!(out.ends_with("..."));
+        assert_eq!(out.chars().count(), MAX_ERROR_CHARS + 3);
+        assert!(out.starts_with("runner produced no result file: boom last pane output:"));
+    }
+
+    #[test]
+    fn elide_right_leaves_short_text_alone() {
+        let exact = "x".repeat(MAX_ERROR_CHARS);
+        assert_eq!(elide_right(&exact, MAX_ERROR_CHARS), exact);
+        assert_eq!(elide_right("a\n  b", MAX_ERROR_CHARS), "a b");
+    }
+
+    #[test]
+    fn elide_right_cuts_on_char_boundaries() {
+        let out = elide_right(&"é".repeat(150), MAX_ERROR_CHARS);
+        assert_eq!(out, format!("{}...", "é".repeat(MAX_ERROR_CHARS)));
+    }
 
     fn run_row(run_id: &str, action_idx: i64, queued: i64) -> LiveRunRow {
         LiveRunRow {
