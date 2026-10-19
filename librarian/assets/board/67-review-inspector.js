@@ -1241,6 +1241,19 @@
        * @property {string|null} comments_check_error
        */
       /**
+       * One kind of forge API call (e.g. `GET pulls/{n}`) and how often this
+       * daemon made it in the current quota window.
+       * @typedef {object} ForgeCallShape
+       * @property {string} shape
+       * @property {number} counted
+       * @property {number} free
+       */
+      /**
+       * @typedef {object} ForgeCalls
+       * @property {number} window_end_ms
+       * @property {ForgeCallShape[]} by_shape
+       */
+      /**
        * @typedef {object} ForgeStatus
        * @property {number} now_ms
        * @property {boolean} client_resolved
@@ -1249,7 +1262,8 @@
        * @property {boolean} quota_tracked
        * @property {ForgeQuota|null} quota
        * @property {{active: boolean, resume_at_ms: number|null, remaining_ms: number|null}} backoff
-       * @property {{ci_standing: {interval_ms: number, next_due_at_ms: number|null}, fast_watch_active: boolean, forge_cache: {enabled: boolean, interval_ms: number}, next_attempt_at_ms: number|null}} checks
+       * @property {{ci_standing: {interval_ms: number, next_due_at_ms: number|null, slowed_for_quota?: boolean}, fast_watch_active: boolean, forge_cache: {enabled: boolean, interval_ms: number, comments_min_interval_ms: number, comments_max_interval_ms: number}, next_attempt_at_ms: number|null}} checks
+       * @property {ForgeCalls|null} calls
        * @property {ForgeStatusPr[]} pull_requests
        */
       // RALPHUS-FORGE-RATE-LIMIT:BEGIN
@@ -1330,9 +1344,11 @@
         const nextText = next === null
           ? "next CI check: not scheduled yet (this daemon has not polled the review since it started)"
           : (next > now ? `next CI check in ${fmtRelativeAge(next - now)} (${when(next)})` : "next CI check: due now");
+        const slowed = Boolean(c.ci_standing.slowed_for_quota);
         rows.push(row(
-          nextText,
-          `The earliest the daemon will next ask the forge for CI status on this review. CI is polled at most every ${fmtRelativeAge(c.ci_standing.interval_ms)}${b.active ? ", pushed back to the end of the pause above" : ""}.`,
+          slowed ? `${nextText} · slowed: quota running low` : nextText,
+          `The earliest the daemon will next ask the forge for CI status on this review. CI is polled at most every ${fmtRelativeAge(c.ci_standing.interval_ms)}${b.active ? ", pushed back to the end of the pause above" : ""}.${slowed ? " The quota is running out faster than it refills, so this check is slowed down; it is never slowed past 5 minutes." : ""}`,
+          slowed ? "var(--delayed)" : "",
         ));
         if (c.fast_watch_active) {
           rows.push(row(
@@ -1340,13 +1356,30 @@
             "A short-interval CI watch is running for this branch (every 5-60s) because it was just pushed or opened. It stops when CI reaches a final result.",
           ));
         }
+        const fc = c.forge_cache;
         rows.push(row(
-          c.forge_cache.enabled
-            ? `PR comments and branch drift refresh every ${fmtRelativeAge(c.forge_cache.interval_ms)}`
+          fc.enabled
+            ? `branch drift refreshes every ${fmtRelativeAge(fc.interval_ms)} · PR comments every ${fmtRelativeAge(fc.comments_min_interval_ms)} after activity, slowing to every ${fmtRelativeAge(fc.comments_max_interval_ms)} when quiet`
             : "PR comments and branch drift refresh is off",
-          "How often the background poller re-reads this review's PR comments and checks whether the PR's base moved. Set by [pr_cache] in the daemon config.",
+          "How often the background poller checks whether the PR's base moved, and re-reads its comments. Comments arrive in bursts, so a PR is checked often right after new comments or a push, and less and less often while nothing changes. The drift interval is set by [pr_cache] in the daemon config.",
           "var(--muted)",
         ));
+        if (st.calls && st.calls.by_shape.length) {
+          const shapes = st.calls.by_shape;
+          const counted = shapes.reduce((n, s) => n + s.counted, 0);
+          const free = shapes.reduce((n, s) => n + s.free, 0);
+          rows.push(row(
+            `this daemon's API calls this window: ${counted} counted · ${free} free`,
+            "Calls this daemon made against this token's quota since the window last reset. 'Free' calls were answered 'not modified', which the forge does not count. Other tools using the same token spend from the quota too and are not included here.",
+          ));
+          for (const s of shapes.slice(0, 5)) {
+            rows.push(row(
+              `${s.shape}: ${s.counted}${s.free ? ` (+${s.free} free)` : ""}`,
+              "One kind of API call, with how many times this daemon made it this window. The kinds that use the most quota are listed first.",
+              "var(--muted)",
+            ));
+          }
+        }
         for (const p of st.pull_requests) {
           const label = p.pr_number === null ? "PR" : `#${p.pr_number}`;
           const errs = [

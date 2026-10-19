@@ -350,6 +350,8 @@ fn run_watch(store: &crate::store_lock::StoreHandle, guardian_id: &str, branch_i
     let Some(number) = pr.pr_number else {
         return;
     };
+    // A watch starts right after a push, which tends to bring review comments.
+    crate::pr::reset_comment_poll(&pr.id);
 
     let root = PathBuf::from(&guardian.git_root);
     let forge_cfg = crate::config::resolve_forge(&root);
@@ -930,6 +932,21 @@ fn enqueue_auto_fix_exhausted_notice(
 /// expectations (`.agent/forge-design-principles.md`).
 pub(crate) const STANDING_POLL_INTERVAL: Duration = Duration::from_secs(2 * 60);
 
+/// The standing poll's interval while the forge quota is running out faster
+/// than it refills ([`crate::forge::quota_under_pressure`]). The most it is
+/// ever slowed, so a PR's CI status is never more than this stale.
+const STANDING_POLL_INTERVAL_UNDER_PRESSURE: Duration = Duration::from_secs(5 * 60);
+
+/// The standing poll's current interval: [`STANDING_POLL_INTERVAL`], or
+/// [`STANDING_POLL_INTERVAL_UNDER_PRESSURE`] while the quota is running low.
+pub(crate) fn standing_poll_interval() -> Duration {
+    if crate::forge::quota_under_pressure() {
+        STANDING_POLL_INTERVAL_UNDER_PRESSURE
+    } else {
+        STANDING_POLL_INTERVAL
+    }
+}
+
 /// Last standing-poll time per guardian id (RAL-395) -- mirrors
 /// `guardian_merge::IDLE_MAINT_LAST`'s shape, but keyed and intervaled
 /// independently since this throttles a forge call, not a maintenance pass.
@@ -942,7 +959,7 @@ static STANDING_POLL_LAST: LazyLock<Mutex<HashMap<String, Instant>>> =
 pub(crate) fn standing_poll_next_due_in(guardian_id: &str) -> Option<Duration> {
     let last = STANDING_POLL_LAST.lock().expect("poisoned");
     let prev = last.get(guardian_id)?;
-    Some(STANDING_POLL_INTERVAL.saturating_sub(prev.elapsed()))
+    Some(standing_poll_interval().saturating_sub(prev.elapsed()))
 }
 
 /// Whether a fast-start CI watch is currently in flight for this branch.
@@ -970,11 +987,12 @@ pub fn poll_open_pr_ci_status(
     guardian_id: &str,
 ) {
     {
+        let interval = standing_poll_interval();
         let mut last = STANDING_POLL_LAST.lock().expect("poisoned");
         let now = Instant::now();
         if last
             .get(guardian_id)
-            .is_some_and(|prev| now.duration_since(*prev) < STANDING_POLL_INTERVAL)
+            .is_some_and(|prev| now.duration_since(*prev) < interval)
         {
             return;
         }

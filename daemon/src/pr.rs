@@ -4651,8 +4651,60 @@ fn set_merge_state_unknown(id: &str, unknown: bool) {
 
 /// Whether the last merge check for `id` left some open PR's forge state
 /// unanswered.
-fn merge_state_unknown(id: &str) -> bool {
+pub(crate) fn merge_state_unknown(id: &str) -> bool {
     merge_state_unknown_reviews().lock().contains(id)
+}
+
+/// Reviews whose latest [`check_pr_merges`] left some PR unanswered for a
+/// reason that may clear on its own -- a rate limit or a failed request --
+/// as opposed to one no retry fixes (no forge client for the PR's recorded
+/// repo, or a number that belongs to another repository).
+fn merge_state_waiting_reviews() -> &'static parking_lot::Mutex<std::collections::HashSet<String>> {
+    static WAITING: std::sync::OnceLock<parking_lot::Mutex<std::collections::HashSet<String>>> =
+        std::sync::OnceLock::new();
+    WAITING.get_or_init(Default::default)
+}
+
+fn set_merge_state_waiting(id: &str, waiting: bool) {
+    let mut reviews = merge_state_waiting_reviews().lock();
+    if waiting {
+        reviews.insert(id.to_string());
+    } else {
+        reviews.remove(id);
+    }
+}
+
+/// Whether the last merge check for `id` is waiting on the forge: some PR
+/// went unanswered for a reason a later retry may clear. A base-shift rebuild
+/// holds off while this is true (`guardian_merge::ensure_merge_check_for_base`).
+pub(crate) fn merge_state_waiting_on_forge(id: &str) -> bool {
+    merge_state_waiting_reviews().lock().contains(id)
+}
+
+/// The tail of [`fetch_pr_merge_state`]'s error when a PR/MR number resolved
+/// to a PR filed from another branch: the recorded repository is wrong, which
+/// no retry fixes.
+const WRONG_REPO_FOR_NUMBER: &str = "is not the one that allocated this number";
+
+/// PR ids whose recorded `merged` state a forge read has confirmed: the
+/// number resolved to this PR's own branch ([`fetch_pr_merge_state`] rejects
+/// any other) and the forge reported it merged. A merged PR/MR cannot be
+/// reopened, so [`check_pr_merges`] stops asking about these. Held in memory
+/// only, so each is confirmed once more after a daemon restart.
+fn confirmed_merged_prs() -> &'static parking_lot::Mutex<std::collections::HashSet<String>> {
+    static CONFIRMED: std::sync::OnceLock<parking_lot::Mutex<std::collections::HashSet<String>>> =
+        std::sync::OnceLock::new();
+    CONFIRMED.get_or_init(Default::default)
+}
+
+/// Whether [`check_pr_merges`] still needs to ask the forge about `pr`: every
+/// open row, and a `merged` row not yet confirmed by [`confirmed_merged_prs`].
+fn needs_merge_check(pr: &PullRequestView) -> bool {
+    match pr.state.as_str() {
+        "open" => true,
+        "merged" => !confirmed_merged_prs().lock().contains(&pr.id),
+        _ => false,
+    }
 }
 
 /// Poll every PR/MR linked to `id` for a live "merged" state and settle the
@@ -4698,24 +4750,26 @@ pub fn check_pr_merges(store: &crate::store_lock::StoreHandle, id: &str) -> bool
         .unwrap_or_default();
     if prs.is_empty() {
         set_merge_state_unknown(id, false);
+        set_merge_state_waiting(id, false);
         return false;
     }
     // Resolve each open or recorded-merged PR's forge client up front (cheap,
     // local config/DB reads); the actual forge call is the only genuinely
     // slow part here, and is fired off concurrently below since one PR's
     // merge state has no bearing on any other's. A recorded `merged` is
-    // re-checked like an `open` row rather than trusted: it may have been
-    // written from another project's PR that shared the number, and a
-    // review settles as merged on it.
+    // re-checked like an `open` row until a forge read confirms it: it may
+    // have been written from another project's PR that shared the number,
+    // and a review settles as merged on it.
     struct MergeCheckJob<'a> {
         pr: &'a PullRequestView,
         client: crate::forge::ForgeClient,
     }
     let mut jobs = Vec::new();
     let mut unknown = false;
+    let mut waiting = false;
     for pr in prs
         .iter()
-        .filter(|pull_request| matches!(pull_request.state.as_str(), "open" | "merged"))
+        .filter(|pull_request| needs_merge_check(pull_request))
     {
         let project_root = pr
             .branch_id
@@ -4747,7 +4801,10 @@ pub fn check_pr_merges(store: &crate::store_lock::StoreHandle, id: &str) -> bool
             // asked again until its backoff window ends: re-asking only
             // extends the limit. The outage notice was raised when the limit
             // was first seen ([`crate::forge_health::report_failure`]).
-            Some(client) if is_backed_off(client) => unknown = true,
+            Some(client) if is_backed_off(client) => {
+                unknown = true;
+                waiting = true;
+            }
             // The number is only meaningful in the repository that allocated
             // it, so a client for any other repository (a stale recorded
             // `repo`, a removed fork) would answer for an unrelated PR/MR.
@@ -4809,6 +4866,7 @@ pub fn check_pr_merges(store: &crate::store_lock::StoreHandle, id: &str) -> bool
     for (job, result) in jobs.iter().zip(fetched) {
         if let Some(Err(error)) = &result {
             unknown = true;
+            waiting |= !error.contains(WRONG_REPO_FOR_NUMBER);
             let status = crate::forge_health::status_from_message(error);
             if crate::forge_health::classify(status, error)
                 == Some(crate::forge_health::Problem::RateLimited)
@@ -4819,6 +4877,7 @@ pub fn check_pr_merges(store: &crate::store_lock::StoreHandle, id: &str) -> bool
         reverted |= apply_pr_merge_state(store, id, job.pr, result, &mut freshly_merged);
     }
     set_merge_state_unknown(id, unknown);
+    set_merge_state_waiting(id, waiting);
     // RAL-338: react to a freshly-observed cross-repository root merge
     // before settling merge states, so a newly-promoted successor's row
     // already exists when `settle_pr_merge_states` re-reads this guardian's
@@ -5313,10 +5372,7 @@ fn apply_pr_merge_check(
 ) -> bool {
     let mut freshly_merged: Vec<PullRequestView> = Vec::new();
     let mut reverted = false;
-    for pr in prs
-        .iter()
-        .filter(|p| matches!(p.state.as_str(), "open" | "merged"))
-    {
+    for pr in prs.iter().filter(|p| needs_merge_check(p)) {
         let fetched = fetch_pr_merge_state(pr, client);
         reverted |= apply_pr_merge_state(store, id, pr, fetched, &mut freshly_merged);
     }
@@ -5342,7 +5398,7 @@ fn fetch_pr_merge_state(
             if source != pr.branch_alias {
                 return Err(format!(
                     "{} #{number} in {} was filed from branch {source}, not {}; the recorded \
-                     repo {} is not the one that allocated this number",
+                     repo {} {WRONG_REPO_FOR_NUMBER}",
                     client.kind().as_str(),
                     client.repo_label(),
                     pr.branch_alias,
@@ -5414,6 +5470,33 @@ fn can_skip_pr_fetch(
     }
 }
 
+/// How often [`fetch_remote_pr_tip`] really fetches a PR branch when no
+/// fresh forge-reported head ([`FORGE_HEAD_FRESH_FOR`]) is available: a
+/// commit pushed straight to the PR reaches the review within this long.
+const PR_FETCH_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// Whether [`fetch_remote_pr_tip`] can skip fetching because the branch was
+/// really fetched within [`PR_FETCH_MIN_INTERVAL`]. Never while a fresh forge
+/// read is available (that read decides, via [`can_skip_pr_fetch`]), and
+/// never when the sync ref is missing or differs from what this daemon last
+/// pushed. Missing information always means "fetch".
+fn pr_fetch_floor_holds(
+    forge_head: Option<(std::time::Duration, &str)>,
+    local_sync_sha: Option<&str>,
+    last_pushed_sha: Option<&str>,
+    since_last_fetch: Option<std::time::Duration>,
+) -> bool {
+    let fresh_forge_read = forge_head.is_some_and(|(age, _)| age < FORGE_HEAD_FRESH_FOR);
+    match (local_sync_sha, since_last_fetch) {
+        (Some(local), Some(since)) => {
+            !fresh_forge_read
+                && last_pushed_sha.is_none_or(|pushed| pushed == local)
+                && since < PR_FETCH_MIN_INTERVAL
+        }
+        _ => false,
+    }
+}
+
 /// The store-writing half of a single PR's merge-state check: apply an
 /// already-fetched forge state ([`fetch_pr_merge_state`]) to the PR row and
 /// `freshly_merged`. Kept serial (unlike the fetch) since it mutates shared
@@ -5435,6 +5518,9 @@ fn apply_pr_merge_state(
     };
     if result.is_ok() {
         crate::forge_health::note_success(&pr.forge, &pr.repo);
+    }
+    if matches!(&result, Ok(state) if state == "merged") {
+        confirmed_merged_prs().lock().insert(pr.id.clone());
     }
     match result {
         Ok(state) if state == pr.state => {}
@@ -6914,6 +7000,84 @@ fn start_backoff(client: &crate::forge::ForgeClient, retry_after: Option<std::ti
         .insert(key, resume_at);
 }
 
+/// Fastest comment-poll interval: right after a PR's comments changed or its
+/// branch was pushed, since comments tend to arrive in bursts.
+pub(crate) const COMMENT_POLL_MIN_INTERVAL: std::time::Duration =
+    std::time::Duration::from_secs(60);
+
+/// Slowest comment-poll interval: a PR with no comment activity for a long
+/// time is still polled once a day.
+pub(crate) const COMMENT_POLL_MAX_INTERVAL: std::time::Duration =
+    std::time::Duration::from_secs(24 * 60 * 60);
+
+/// When a PR's comments are next polled, and the interval that got it there.
+struct CommentPollSchedule {
+    interval: std::time::Duration,
+    next_due: std::time::Instant,
+}
+
+/// Per PR id: its comment-poll backoff. A PR with no entry is due now.
+fn comment_poll_schedules() -> &'static parking_lot::Mutex<HashMap<String, CommentPollSchedule>> {
+    static SCHEDULES: std::sync::OnceLock<
+        parking_lot::Mutex<HashMap<String, CommentPollSchedule>>,
+    > = std::sync::OnceLock::new();
+    SCHEDULES.get_or_init(Default::default)
+}
+
+/// Whether `pr_id`'s comments are due for a poll.
+fn comment_poll_due(pr_id: &str) -> bool {
+    comment_poll_schedules()
+        .lock()
+        .get(pr_id)
+        .is_none_or(|s| std::time::Instant::now() >= s.next_due)
+}
+
+/// Schedule `pr_id`'s next comment poll after one just ran: back to
+/// [`COMMENT_POLL_MIN_INTERVAL`] when the comments changed, doubled (capped at
+/// [`COMMENT_POLL_MAX_INTERVAL`]) when they did not, and unchanged when the
+/// poll failed (`None`).
+fn record_comment_poll(pr_id: &str, changed: Option<bool>) {
+    let now = std::time::Instant::now();
+    let mut schedules = comment_poll_schedules().lock();
+    let schedule = schedules
+        .entry(pr_id.to_string())
+        .or_insert(CommentPollSchedule {
+            interval: COMMENT_POLL_MIN_INTERVAL,
+            next_due: now,
+        });
+    match changed {
+        Some(true) => schedule.interval = COMMENT_POLL_MIN_INTERVAL,
+        Some(false) => {
+            schedule.interval = (schedule.interval * 2).min(COMMENT_POLL_MAX_INTERVAL);
+        }
+        None => {}
+    }
+    schedule.next_due = now + schedule.interval;
+}
+
+/// Poll `pr_id`'s comments at the fastest rate again, starting
+/// [`COMMENT_POLL_MIN_INTERVAL`] from now: its branch was just pushed, which
+/// tends to bring review comments.
+pub(crate) fn reset_comment_poll(pr_id: &str) {
+    comment_poll_schedules().lock().insert(
+        pr_id.to_string(),
+        CommentPollSchedule {
+            interval: COMMENT_POLL_MIN_INTERVAL,
+            next_due: std::time::Instant::now() + COMMENT_POLL_MIN_INTERVAL,
+        },
+    );
+}
+
+/// What one [`poll_pr_comments`] call learned.
+struct CommentPollResult {
+    etag_conversation: Option<String>,
+    etag_review: Option<String>,
+    /// Set when a call actually failed.
+    error: Option<String>,
+    /// Whether any endpoint returned a fresh (non-304) body.
+    changed: bool,
+}
+
 /// Poll one PR's comment endpoint(s) -- both of GitHub's conversation/review
 /// endpoints, or GitLab's single notes endpoint -- via
 /// [`crate::forge::ForgeClient::list_pr_comments_conditional`], replacing
@@ -6929,21 +7093,24 @@ fn poll_pr_comments(
     number: i64,
     etag_conversation: Option<String>,
     etag_review: Option<String>,
-) -> (Option<String>, Option<String>, Option<String>) {
+) -> CommentPollResult {
     if is_backed_off(client) {
-        return (
+        return CommentPollResult {
             etag_conversation,
             etag_review,
-            Some("forge rate-limited; backing off".to_string()),
-        );
+            error: Some("forge rate-limited; backing off".to_string()),
+            changed: false,
+        };
     }
     let mut error = None;
-    let poll_one =
+    let mut changed = false;
+    let mut poll_one =
         |endpoint: crate::forge::PrCommentEndpoint, prior_etag: Option<String>| match client
             .list_pr_comments_conditional(number, endpoint, prior_etag.as_deref())
         {
             Ok(crate::forge::CommentsPoll::NotModified) => (prior_etag, None),
             Ok(crate::forge::CommentsPoll::Modified { comments, etag }) => {
+                changed = true;
                 let table_endpoint = match endpoint {
                     crate::forge::PrCommentEndpoint::Conversation => "conversation",
                     crate::forge::PrCommentEndpoint::Review => "review",
@@ -6978,7 +7145,12 @@ fn poll_pr_comments(
     } else {
         etag_review
     };
-    (new_conv, new_review, error)
+    CommentPollResult {
+        etag_conversation: new_conv,
+        etag_review: new_review,
+        error,
+        changed,
+    }
 }
 
 /// Refresh cached forge state for every currently-open, forge-numbered PR
@@ -7019,7 +7191,16 @@ fn poll_pr_comments(
 /// guardians would mean restructuring this whole poll loop from per-guardian
 /// to per-root across every guardian in the daemon, which isn't worth the
 /// risk for what is already an N-to-1 reduction per guardian's own stack.
-fn refresh_pr_forge_cache_for_guardian(store: &crate::store_lock::StoreHandle, id: &str) {
+///
+/// Comments are only polled for PRs whose backoff says they are due
+/// ([`comment_poll_due`]). With `include_drift` false the drift pass (and its
+/// git fetch) is skipped, for the between-cycle ticks that exist only to give
+/// comment polling its faster cadence.
+fn refresh_pr_forge_cache_for_guardian(
+    store: &crate::store_lock::StoreHandle,
+    id: &str,
+    include_drift: bool,
+) {
     let Ok(guardian) =
         store.with_read_snapshot(|conn| crate::store::Store::get_guardian_conn(conn, id))
     else {
@@ -7059,7 +7240,7 @@ fn refresh_pr_forge_cache_for_guardian(store: &crate::store_lock::StoreHandle, i
         .into_iter()
         .filter(|p| p.state == "open" && p.pr_number.is_some())
         .collect();
-    if prs.is_empty() {
+    if prs.is_empty() || (!include_drift && !prs.iter().any(|pr| comment_poll_due(&pr.id))) {
         return;
     }
     let root = PathBuf::from(&guardian.git_root);
@@ -7091,7 +7272,9 @@ fn refresh_pr_forge_cache_for_guardian(store: &crate::store_lock::StoreHandle, i
     // drift, so the poller still never makes foreground work wait.
     type DriftReading =
         std::result::Result<(bool, bool, bool, Option<String>, Option<String>), String>;
-    let drift_by_pr: Vec<Option<DriftReading>> = {
+    let drift_by_pr: Vec<Option<DriftReading>> = if !include_drift {
+        prs.iter().map(|_| None).collect()
+    } else {
         let locks: Vec<Arc<Mutex<()>>> =
             prs.iter().map(|p| sync_fetch_lock(&root, &p.id)).collect();
         let guards: Vec<Option<std::sync::MutexGuard<'_, ()>>> =
@@ -7165,6 +7348,36 @@ fn refresh_pr_forge_cache_for_guardian(store: &crate::store_lock::StoreHandle, i
     let mut cycle_error: Option<String> = None;
     for (pr, drift) in prs.iter().zip(drift_by_pr) {
         let number = pr.pr_number.expect("filtered to pr_number.is_some() above");
+        if !comment_poll_due(&pr.id) {
+            // Not due for comments: write only this pass's drift, if any,
+            // leaving the comments half and its timestamp untouched.
+            if drift.is_none() {
+                continue;
+            }
+            if let Some(Err(fetch_failure)) = &drift {
+                cycle_ok = false;
+                if cycle_error.is_none() {
+                    cycle_error = Some(format!(
+                        "git fetch of the PR branches failed: {fetch_failure}"
+                    ));
+                }
+            }
+            let drift_half: HalfOutcome<DriftObservation<'_>> = drift.as_ref().map(|r| match r {
+                Ok((in_sync, pr_ahead, worktree_ahead, remote_sha, local_sha)) => {
+                    Ok(DriftObservation {
+                        in_sync: *in_sync,
+                        pr_ahead: *pr_ahead,
+                        worktree_ahead: *worktree_ahead,
+                        remote_sha: remote_sha.as_deref(),
+                        local_sha: local_sha.as_deref(),
+                    })
+                }
+                Err(e) => Err(e.clone()),
+            });
+            let result = store.lock().upsert_pr_forge_cache(&pr.id, drift_half, None);
+            warn_on_store_write(store, "upsert_pr_forge_cache", &pr.id, false, result);
+            continue;
+        }
 
         // Fetched before either write path below so the post-write
         // comparison reflects an actual state transition, not this pass's
@@ -7186,7 +7399,7 @@ fn refresh_pr_forge_cache_for_guardian(store: &crate::store_lock::StoreHandle, i
                         .lock()
                         .pr_forge_cache_etags(&pr.id)
                         .unwrap_or((None, None));
-                    let (new_conversation_etag, new_review_etag, comment_error) = poll_pr_comments(
+                    let polled = poll_pr_comments(
                         store,
                         client,
                         &pr.id,
@@ -7194,22 +7407,26 @@ fn refresh_pr_forge_cache_for_guardian(store: &crate::store_lock::StoreHandle, i
                         etag_conversation,
                         etag_review,
                     );
+                    record_comment_poll(&pr.id, polled.error.is_none().then_some(polled.changed));
                     (
-                        comment_error.is_none(),
-                        comment_error,
-                        new_conversation_etag,
-                        new_review_etag,
+                        polled.error.is_none(),
+                        polled.error,
+                        polled.etag_conversation,
+                        polled.etag_review,
                     )
                 }
                 // No resolvable forge client (missing token, unregistered
                 // remote, ...) -- degrade the comments half to "unknown" but
                 // still persist whatever drift this pass computed.
-                None => (
-                    false,
-                    Some("no forge client could be resolved for this PR's repo".to_string()),
-                    None,
-                    None,
-                ),
+                None => {
+                    record_comment_poll(&pr.id, None);
+                    (
+                        false,
+                        Some("no forge client could be resolved for this PR's repo".to_string()),
+                        None,
+                        None,
+                    )
+                }
             };
 
         let drift_half: HalfOutcome<DriftObservation<'_>> = drift.as_ref().map(|r| match r {
@@ -7359,7 +7576,7 @@ fn run_pr_forge_poll_cycle(store: &crate::store_lock::StoreHandle, cache_enabled
             }
         }
         if cache_enabled {
-            refresh_pr_forge_cache_for_guardian(store, &id);
+            refresh_pr_forge_cache_for_guardian(store, &id, true);
         }
     }
     if cache_enabled {
@@ -7376,6 +7593,24 @@ fn run_pr_forge_poll_cycle(store: &crate::store_lock::StoreHandle, cache_enabled
             Ok(_) => {}
             Err(e) => crate::rlog!(WARNING, "ralphus [pr] forge cache prune failed: {e}"),
         }
+    }
+}
+
+/// Between full [`run_pr_forge_poll_cycle`]s: poll the comments of every open
+/// PR whose backoff says it is due, with no drift pass and no git fetch.
+fn run_pr_comment_poll_tick(store: &crate::store_lock::StoreHandle) {
+    let ids = match store.lock().guardian_ids_with_open_pull_requests() {
+        Ok(ids) => ids,
+        Err(e) => {
+            crate::rlog!(
+                ERROR,
+                "ralphus [pr] comment poll: listing guardians failed: {e}"
+            );
+            return;
+        }
+    };
+    for id in ids {
+        refresh_pr_forge_cache_for_guardian(store, &id, false);
     }
 }
 
@@ -7399,12 +7634,32 @@ pub fn spawn_pr_base_drift_poller(store: crate::store_lock::StoreHandle) {
         },
         std::sync::Arc::clone(&store),
         std::sync::Arc::new(move || {
+            let mut last_full_cycle: Option<std::time::Instant> = None;
             loop {
                 let cache_cfg = crate::config::load_pr_cache_config();
-                std::thread::sleep(cache_cfg.poll_interval());
+                let interval = cache_cfg.poll_interval();
+                // Woken at least every `COMMENT_POLL_MIN_INTERVAL` so a PR
+                // with recent comment activity is polled that often; the full
+                // drift + base-drift cycle still runs once per `interval`.
+                std::thread::sleep(interval.min(COMMENT_POLL_MIN_INTERVAL));
                 if crate::config::scheduler_in_downtime() {
                     continue;
                 }
+                if last_full_cycle.is_some_and(|at| at.elapsed() < interval) {
+                    if cache_cfg.enabled() {
+                        let pass = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            run_pr_comment_poll_tick(&store);
+                        }));
+                        if pass.is_err() {
+                            crate::rlog!(
+                                ERROR,
+                                "ralphus [pr] comment poll tick panicked; the poller continues"
+                            );
+                        }
+                    }
+                    continue;
+                }
+                last_full_cycle = Some(std::time::Instant::now());
                 // `[pr_cache].enabled = false` turns off the RAL-366 cache
                 // refresh only. RAL-279's base-drift reconciliation shares this
                 // thread but is unrelated functionality with real consequences --
@@ -11026,11 +11281,11 @@ fn fetch_remote_pr_tip(
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let dest_ref = sync_fetch_ref(pr_id);
     // A `git fetch` is a git process, a transport process (ssh or a remote
-    // helper) and a network connection. When the forge's REST view -- read
-    // moments ago by this same maintenance pass's merge check -- says the
-    // branch head is exactly what the sync ref already holds, the fetch
-    // would write the same commit, so skip it (bounded by
-    // `PR_FETCH_MAX_SKIP`).
+    // helper) and a network connection. When a recent merge check's forge
+    // read says the branch head is exactly what the sync ref already holds,
+    // the fetch would write the same commit, so skip it (bounded by
+    // `PR_FETCH_MAX_SKIP`). Without such a read, the branch is fetched at
+    // most once per `PR_FETCH_MIN_INTERVAL`.
     let now = std::time::Instant::now();
     let forge_head = forge_heads()
         .lock()
@@ -11040,12 +11295,18 @@ fn fetch_remote_pr_tip(
         .lock()
         .get(pr_id)
         .map(|at| now.duration_since(*at));
-    if forge_head.is_some() && since_last_fetch.is_some() {
+    if since_last_fetch.is_some() {
         let local = git(&root, &["rev-parse", "--verify", "--quiet", &dest_ref])
             .ok()
             .map(|s| s.trim().to_string());
+        let forge_head = forge_head.as_ref().map(|(age, head)| (*age, head.as_str()));
         if can_skip_pr_fetch(
-            forge_head.as_ref().map(|(age, head)| (*age, head.as_str())),
+            forge_head,
+            local.as_deref(),
+            pr.last_pushed_sha.as_deref(),
+            since_last_fetch,
+        ) || pr_fetch_floor_holds(
+            forge_head,
             local.as_deref(),
             pr.last_pushed_sha.as_deref(),
             since_last_fetch,
@@ -11514,6 +11775,7 @@ pub fn sync_remote_pr_commits(
             .map_err(|e| format!("could not pull remote commits for PR {}: {e}", pr.id))?
         {
             pulled += 1;
+            reset_comment_poll(&pr.id);
         }
     }
     Ok(pulled)
@@ -12137,6 +12399,94 @@ mod tests {
         assert!(!can_skip_pr_fetch(None, Some("abc"), Some("abc"), recent));
         assert!(!can_skip_pr_fetch(fresh, None, Some("abc"), recent));
         assert!(!can_skip_pr_fetch(fresh, Some("abc"), Some("abc"), None));
+    }
+
+    #[test]
+    fn pr_fetch_floor_holds_only_without_a_fresh_forge_read() {
+        use std::time::Duration;
+        let recent = Some(Duration::from_secs(10));
+        let stale = Some((Duration::from_secs(30), "abc"));
+        // No fresh forge read and a real fetch 10s ago: skip.
+        assert!(pr_fetch_floor_holds(None, Some("abc"), Some("abc"), recent));
+        assert!(pr_fetch_floor_holds(stale, Some("abc"), None, recent));
+        // A fresh forge read decides instead, even when it shows a change.
+        assert!(!pr_fetch_floor_holds(
+            Some((Duration::from_secs(2), "new")),
+            Some("abc"),
+            Some("abc"),
+            recent
+        ));
+        // Floor elapsed: fetch.
+        assert!(!pr_fetch_floor_holds(
+            None,
+            Some("abc"),
+            Some("abc"),
+            Some(Duration::from_secs(21))
+        ));
+        // We pushed something the sync ref doesn't hold yet: fetch.
+        assert!(!pr_fetch_floor_holds(
+            None,
+            Some("abc"),
+            Some("new"),
+            recent
+        ));
+        // Missing information always fetches.
+        assert!(!pr_fetch_floor_holds(None, None, Some("abc"), recent));
+        assert!(!pr_fetch_floor_holds(None, Some("abc"), Some("abc"), None));
+    }
+
+    #[test]
+    fn comment_polls_back_off_to_a_day_and_reset_on_activity() {
+        use std::time::Instant;
+        let pr = "pr-comment-backoff-test";
+        comment_poll_schedules().lock().remove(pr);
+        assert!(comment_poll_due(pr), "a PR never polled is due now");
+        let interval = || comment_poll_schedules().lock().get(pr).unwrap().interval;
+
+        record_comment_poll(pr, Some(false));
+        assert_eq!(interval(), COMMENT_POLL_MIN_INTERVAL * 2);
+        assert!(!comment_poll_due(pr));
+        record_comment_poll(pr, Some(false));
+        assert_eq!(interval(), COMMENT_POLL_MIN_INTERVAL * 4);
+        for _ in 0..20 {
+            record_comment_poll(pr, Some(false));
+        }
+        assert_eq!(interval(), COMMENT_POLL_MAX_INTERVAL, "capped at a day");
+
+        // A failed poll keeps the interval.
+        record_comment_poll(pr, None);
+        assert_eq!(interval(), COMMENT_POLL_MAX_INTERVAL);
+
+        // New comments drop straight back to the fastest rate.
+        record_comment_poll(pr, Some(true));
+        assert_eq!(interval(), COMMENT_POLL_MIN_INTERVAL);
+
+        // A push resets to the fastest rate, due one interval from now.
+        for _ in 0..5 {
+            record_comment_poll(pr, Some(false));
+        }
+        reset_comment_poll(pr);
+        assert_eq!(interval(), COMMENT_POLL_MIN_INTERVAL);
+        let next = comment_poll_schedules().lock().get(pr).unwrap().next_due;
+        assert!(next > Instant::now());
+        comment_poll_schedules().lock().remove(pr);
+    }
+
+    #[test]
+    fn a_confirmed_merged_pr_is_not_checked_again() {
+        let mut pr = test_pr("ral-1-review", "main");
+        pr.id = "pr-confirm-merged-test".to_string();
+        pr.state = "merged".to_string();
+        assert!(
+            needs_merge_check(&pr),
+            "an unconfirmed merged row is re-checked"
+        );
+        confirmed_merged_prs().lock().insert(pr.id.clone());
+        assert!(!needs_merge_check(&pr));
+        pr.state = "open".to_string();
+        assert!(needs_merge_check(&pr), "open rows are always checked");
+        pr.state = "closed".to_string();
+        assert!(!needs_merge_check(&pr));
     }
 
     fn tmp_dir(tag: &str) -> PathBuf {
@@ -24215,6 +24565,22 @@ token_env = "RALPHUS_TEST_FORGE_TOKEN"
         (gid, pr_id)
     }
 
+    /// A PR with no forge client for its recorded repo leaves the merge state
+    /// unknown, but not waiting on the forge: no retry can answer it, so a
+    /// base-shift rebuild must not hold off for it.
+    #[test]
+    fn an_unresolvable_forge_client_is_unknown_but_not_waiting() {
+        let store: crate::store_lock::StoreHandle =
+            Arc::new(crate::store_lock::StoreMutex::new(store()));
+        let gid = {
+            let guard = store.lock();
+            make_pr(&guard).0
+        };
+        check_pr_merges(&store, &gid);
+        assert!(merge_state_unknown(&gid));
+        assert!(!merge_state_waiting_on_forge(&gid));
+    }
+
     #[test]
     fn record_pr_ci_check_persists_success_and_failure_without_touching_other_halves() {
         let s = store();
@@ -24504,7 +24870,7 @@ token_env = "RALPHUS_TEST_FORGE_TOKEN"
         let (_root, store, pr_id, sha) = cache_poll_fixture("cache-drift");
         let guardian_id = store.lock().get_pull_request(&pr_id).unwrap().guardian_id;
 
-        refresh_pr_forge_cache_for_guardian(&store, &guardian_id);
+        refresh_pr_forge_cache_for_guardian(&store, &guardian_id, true);
 
         let cache = store
             .lock()
@@ -24550,7 +24916,7 @@ token_env = "RALPHUS_TEST_FORGE_TOKEN"
         let held = sync_fetch_lock(&root, &pr_id);
         let _guard = held.lock().unwrap();
 
-        refresh_pr_forge_cache_for_guardian(&store, &guardian_id);
+        refresh_pr_forge_cache_for_guardian(&store, &guardian_id, true);
 
         let cache = store.lock().get_pr_forge_cache(&pr_id).unwrap().unwrap();
         assert_eq!(

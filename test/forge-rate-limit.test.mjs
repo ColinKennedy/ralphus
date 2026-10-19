@@ -47,6 +47,12 @@ const { forgeRateLimitRowsHtml } = new Function(
 )(esc, fmtRelativeAge);
 
 const NOW = 1_700_000_000_000;
+const FORGE_CACHE = {
+  enabled: true,
+  interval_ms: 300_000,
+  comments_min_interval_ms: 60_000,
+  comments_max_interval_ms: 86_400_000,
+};
 
 /** A healthy GitHub reply; tests override pieces. */
 function status(overrides = {}) {
@@ -61,13 +67,53 @@ function status(overrides = {}) {
     checks: {
       ci_standing: { interval_ms: 120_000, next_due_at_ms: NOW + 30_000 },
       fast_watch_active: false,
-      forge_cache: { enabled: true, interval_ms: 300_000 },
+      forge_cache: FORGE_CACHE,
       next_attempt_at_ms: NOW + 30_000,
     },
+    calls: null,
     pull_requests: [],
     ...overrides,
   };
 }
+
+test("lists this daemon's calls this window, biggest first, with free calls noted", () => {
+  const out = forgeRateLimitRowsHtml(
+    status({
+      calls: {
+        window_end_ms: NOW + 600_000,
+        by_shape: [
+          { shape: "GET pulls/{n}", counted: 40, free: 300 },
+          { shape: "GET issues/{n}/comments", counted: 2, free: 0 },
+        ],
+      },
+    }),
+    NOW,
+  );
+  assert.match(out, /this daemon's API calls this window: 42 counted · 300 free/);
+  assert.match(out, /GET pulls\/\{n\}: 40 \(\+300 free\)/);
+  assert.match(out, /GET issues\/\{n\}\/comments: 2</);
+  const none = forgeRateLimitRowsHtml(status(), NOW);
+  assert.doesNotMatch(none, /API calls this window/);
+});
+
+test("a CI check slowed for a low quota says so in the delayed colour", () => {
+  const out = forgeRateLimitRowsHtml(
+    status({
+      checks: {
+        ...status().checks,
+        ci_standing: { interval_ms: 300_000, next_due_at_ms: NOW + 30_000, slowed_for_quota: true },
+      },
+    }),
+    NOW,
+  );
+  assert.match(out, /style="color:var\(--delayed\)"[^>]*>next CI check in 30s \(.*\) · slowed: quota running low/);
+  assert.doesNotMatch(forgeRateLimitRowsHtml(status(), NOW), /slowed: quota running low/);
+});
+
+test("describes the comment backoff alongside the drift interval", () => {
+  const out = forgeRateLimitRowsHtml(status(), NOW);
+  assert.match(out, /branch drift refreshes every 300s · PR comments every 60s after activity, slowing to every 86400s when quiet/);
+});
 
 test("shows remaining calls, the limit and the reset", () => {
   const out = forgeRateLimitRowsHtml(status(), NOW);
@@ -95,7 +141,7 @@ test("an active backoff shows the pause, its resume, and the pushed-back next ch
       checks: {
         ci_standing: { interval_ms: 120_000, next_due_at_ms: NOW + 30_000 },
         fast_watch_active: false,
-        forge_cache: { enabled: true, interval_ms: 300_000 },
+        forge_cache: FORGE_CACHE,
         next_attempt_at_ms: NOW + 900_000,
       },
     }),
