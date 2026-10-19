@@ -74,6 +74,10 @@ pub struct Request {
 
     // If Some, a message must be sent after responding
     notify_when_responded: Option<Sender<()>>,
+
+    // ralphus patch: the connection's "client has gone" flag, see
+    // `Request::peer_closed`
+    peer_gone: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 }
 
 struct NotifyOnDrop<R> {
@@ -238,6 +242,7 @@ where
         body_length: content_length,
         must_send_continue: expects_continue,
         notify_when_responded: None,
+        peer_gone: None,
     })
 }
 
@@ -472,6 +477,27 @@ impl Request {
     pub(crate) fn with_notify_sender(mut self, sender: Sender<()>) -> Self {
         self.notify_when_responded = Some(sender);
         self
+    }
+
+    pub(crate) fn with_peer_gone(
+        mut self,
+        flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> Self {
+        self.peer_gone = Some(flag);
+        self
+    }
+
+    /// Whether the client is known to have closed or reset its connection
+    /// (ralphus patch, see `RALPHUS_PATCHES.md`).
+    ///
+    /// Learned as a side effect of reading the connection's next request,
+    /// which starts as soon as this request's body has been read (at once
+    /// for a body of at most 1 KiB). `false` means "not known to be gone",
+    /// never "known to be there".
+    pub fn peer_closed(&self) -> bool {
+        self.peer_gone
+            .as_ref()
+            .is_some_and(|f| f.load(std::sync::atomic::Ordering::Acquire))
     }
 }
 

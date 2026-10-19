@@ -84,8 +84,8 @@ How to avoid it:
 
 - A window is every unfinished squad plus the `N` newest finished ones.
 - `before` pages older finished squads only.
-- `q` is a case-insensitive id/label substring match over all of history,
-  with `%`/`_` matched literally.
+- `q` is a case-insensitive substring match on the squad's id, label or
+  any task name, over all of history, with `%`/`_` matched literally.
 - The response gains a `window` object: `total`, `loaded`, `has_more`,
   `next_before`.
 - Without `?window` the response is byte-for-byte unchanged, because the CLI's
@@ -103,18 +103,30 @@ How to avoid it:
   the matches into the list.
 - **Deep links and "go to squad" selections** for a squad outside the window
   are fetched by id (`GET /api/squads/{id}`) and pinned (`pinMissingSquads`).
+- **The go-to (Ctrl-K) search and the add-dependency and waypoint pickers**
+  search the daemon the same way (`searchSquadsMatching` in `70-sse.js`,
+  `/api/task-index?window=200&q=…`). They merge the matches into their own
+  candidates without pinning them into the board. The go-to search now also
+  lists every task of a squad whose id or name matches. The waypoint picker
+  loads the windowed task index instead of the full unwindowed `/api/tasks`.
+- **The prefs "hidden names" list** reads the windowed task index. It fetches
+  any hidden squad outside the window by id (`GET /api/squads/{id}`), four at
+  a time and at most 40 per poll. Each squad is fetched once per page load,
+  and a 404 is remembered.
 - An older daemon without windowing ignores the parameter and gets the old
   behaviour; the board sees no `window` object and shows no footer.
 - Tests: `test/board-window.test.mjs` and `test/tasks-poll.test.mjs`.
 
-**Not covered yet:**
+**Considered and not needed.** These were ways to make board cost
+independent of history size, and the window already does that. The board
+measures flat: 275 KB in about 2 ms at 1,000, 5,000 and 10,000 squads.
 
-- The go-to (Ctrl-K) search, the prefs "hidden names" list, and the
-  add-dependency and waypoint pickers still read only the loaded squads.
-- Each listed squad is still hydrated with about 12 statements. A window
-  bounds *how many*, so cost no longer grows with history. A per-squad
-  summary table would cut the per-squad cost itself.
-- Old terminal squads are not archived.
+- **A per-squad summary table.** Each listed squad is still hydrated with
+  about 12 statements, but there are at most 200 finished squads plus the
+  active ones. Reconsider if the number of *active* squads grows into the
+  thousands.
+- **Archiving old terminal squads.** It would only shrink the database; the
+  board no longer reads them.
 
 ## Verify
 

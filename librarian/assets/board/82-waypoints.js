@@ -1093,7 +1093,7 @@ Its roster -- the work that must land for it to be carried out -- is counted sep
               <div class="wp-picker">
                 <div class="wp-picker-tabs" id="cw-picker-tabs"></div>
                 <div class="wp-picker-search">
-                  <input type="text" id="cw-picker-q" value="${esc(d.pickerQuery)}" placeholder="filter by name or id…" oninput="onCreateWaypointPickerQuery(this.value)" data-tip="Narrow the list below by name or id.">
+                  <input type="text" id="cw-picker-q" value="${esc(d.pickerQuery)}" placeholder="filter by name or id…" oninput="onCreateWaypointPickerQuery(this.value)" data-tip="Narrow the list below by name or id.\nOlder finished squads the board has not loaded are searched by id or name too, after a short pause in typing.">
                 </div>
                 <div class="wp-picker-list" id="cw-picker-list"></div>
               </div>
@@ -1165,6 +1165,35 @@ Its roster -- the work that must land for it to be carried out -- is counted sep
       function onCreateWaypointPickerQuery(value) {
         if (waypointFormDraft) waypointFormDraft.pickerQuery = value.toLowerCase();
         renderCreateWaypointPicker();
+        void searchCreateWaypointSquads(value);
+      }
+
+      /**
+       * While older history is unloaded, asks the daemon for squads whose id or name matches the picker's search and
+       * adds them to the squad candidates, re-rendering if the search has not changed meanwhile (STRESS-004).
+       * @param {string} value
+       * @returns {Promise<void>}
+       */
+      async function searchCreateWaypointSquads(value) {
+        const found = await searchSquadsMatching("waypoint-picker", value);
+        if (!found || !waypointFormDraft || waypointFormDraft.pickerQuery !== value.toLowerCase()) return;
+        createWaypointSquads = unionById(createWaypointSquads, createWaypointSquadCandidates(found));
+        renderCreateWaypointPicker();
+      }
+
+      /**
+       * The affected picker's squad entries for a squad list, leaving out hidden squads: a hidden entity is one the
+       * user deliberately removed from view, so offering it here would quietly reintroduce it.
+       * @param {SquadView[]} list
+       * @returns {{id: string, name: string}[]}
+       */
+      function createWaypointSquadCandidates(list) {
+        return list
+          .filter((sq) => !hiddenSquadIds.has(sq.id))
+          .map((sq) => ({
+            id: sq.id,
+            name: sq.label || (sq.tasks && sq.tasks[0] ? sq.tasks[0].name : "") || sq.id,
+          }));
       }
 
       /**
@@ -1197,21 +1226,18 @@ Its roster -- the work that must land for it to be carried out -- is counted sep
        * those tabs had last left behind — in practice an empty review list, because nothing had visited that tab.
        * Fetching here also means the lists are only pulled when someone actually opens the picker.
        *
-       * Hidden squads and reviews are dropped: a hidden entity is one the user deliberately removed from view, so
-       * offering it here would quietly reintroduce it.
+       * Squads come from the compact, windowed index (every unfinished squad plus the newest finished ones); a search
+       * in the picker finds older ones (STRESS-004). Hidden squads and reviews are dropped: a hidden entity is one the
+       * user deliberately removed from view, so offering it here would quietly reintroduce it.
        * @returns {Promise<void>}
        */
       async function loadCreateWaypointCandidates() {
-        const [taskIndex, reviewIndex] = await Promise.all([
-          fetch("/api/tasks").then((r) => (r.ok ? r.json() : { squads: [] })).catch(() => ({ squads: [] })),
+        const [squadIndex, reviewIndex] = await Promise.all([
+          fetch(boardWindowUrl("/api/task-index")).then((r) => (r.ok ? r.json() : { squads: [] })).catch(() => ({ squads: [] })),
           fetch("/api/guardian-index").then((r) => (r.ok ? r.json() : [])).catch(() => []),
         ]);
-        createWaypointSquads = (taskIndex.squads || [])
-          .filter((/** @type {SquadView} */ sq) => !hiddenSquadIds.has(sq.id))
-          .map((/** @type {SquadView} */ sq) => ({
-            id: sq.id,
-            name: sq.label || (sq.tasks && sq.tasks[0] ? sq.tasks[0].name : "") || sq.id,
-          }));
+        noteBoardWindow(squadIndex.window, "index");
+        createWaypointSquads = createWaypointSquadCandidates(squadIndex.squads || []);
         createWaypointReviews = (reviewIndex || [])
           .filter((/** @type {{id: string}} */ g) => !hiddenGuardianIds.has(g.id))
           .map((/** @type {{id: string, name?: string}} */ g) => ({ id: g.id, name: g.name || g.id }));

@@ -184,6 +184,29 @@ fn search_reaches_finished_squads_outside_the_window_by_label_or_id() {
 }
 
 #[test]
+fn search_also_matches_task_names() {
+    let (base, _, _) = seeded();
+    let body = serde_json::json!({
+        "toml": "[[task]]\nname=\"Frobnicate-Widgets\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\n",
+        "hold": true,
+        "label": "plain",
+    })
+    .to_string();
+    let (status, v) = call(&base, "POST", "/api/squads", &body);
+    assert_eq!(status, 201, "{v}");
+    let id = v["squad_id"].as_str().unwrap().to_string();
+    finish(&base, &id);
+    for path in ["/api/tasks", "/api/task-index"] {
+        let (_, v) = call(&base, "GET", &format!("{path}?window=1&q=frobnicate"), "");
+        assert_eq!(
+            ids(&v),
+            vec![id.clone()],
+            "{path}: case-insensitive task-name match"
+        );
+    }
+}
+
+#[test]
 fn a_finished_squad_retried_back_to_life_rejoins_the_first_page() {
     let (base, _, finished) = seeded();
     let oldest = &finished[0];

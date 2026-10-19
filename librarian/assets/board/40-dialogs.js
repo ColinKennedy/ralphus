@@ -93,6 +93,8 @@
       let _addDepSourceIds = [];
       /** @type {string|null} */
       let _addDepTargetId = null;
+      /** @type {SquadView[]} squads outside the loaded window that the daemon's full-history search found while this dialog was open (STRESS-004). */
+      let _addDepFound = [];
       /**
        * Opens the Add Dependency dialog for one squad, or every multi-selected squad if `id` is part of the selection.
        * @param {MouseEvent} e
@@ -116,13 +118,14 @@
         if (!sourceIds || !sourceIds.length) return;
         _addDepSourceIds = sourceIds;
         _addDepTargetId = null;
+        _addDepFound = [];
         renderAddDependencyDialog();
       }
       /**
        * Closes the Add Dependency dialog and clears its draft state.
        * @returns {void}
        */
-      function closeAddDependencyDialog() { closeModal(); _addDepSourceIds = []; _addDepTargetId = null; }
+      function closeAddDependencyDialog() { closeModal(); _addDepSourceIds = []; _addDepTargetId = null; _addDepFound = []; }
       // Elides the "For: ..." squad list to a fixed 80-char max width (RAL-119):
       // shows as many full names as fit, then "... and N others"; falls back
       // to a mid-name ellipsis when even the first name alone is too long.
@@ -164,7 +167,7 @@
             <h2>Add Dependency</h2>
             <div class="k" style="margin-bottom:8px" data-tip="${esc(forTip)}">For: <b>${esc(sourceDisplay)}</b></div>
             <div class="edit-form">
-              <label data-tip="Type part of a squad ID or its name. Matching squads appear below with a status chip — pick the exact squad if multiple share a name.">search by squad ID or name<input id="add-dep-search" placeholder="e.g. squad-000000000004 or my-task" autofocus oninput="renderAddDependencyCandidates(this.value)"></label>
+              <label data-tip="Type part of a squad ID or its name. Matching squads appear below with a status chip — pick the exact squad if multiple share a name.\nOlder finished squads the board has not loaded are searched too, after a short pause in typing.">search by squad ID or name<input id="add-dep-search" placeholder="e.g. squad-000000000004 or my-task" autofocus oninput="onAddDependencySearch(this.value)"></label>
             </div>
             <div id="add-dep-list" style="max-height:280px;overflow:auto;margin-top:8px;border:1px solid var(--border);border-radius:8px"></div>
             <div id="add-dep-err" class="verr"></div>
@@ -184,8 +187,8 @@
        */
       function renderAddDependencyCandidates(query) {
         const q = (query || "").trim().toLowerCase();
-        const candidates = squads.filter((r) => !_addDepSourceIds.includes(r.id)
-          && (!q || r.id.toLowerCase().includes(q) || (r.label || "").toLowerCase().includes(q)))
+        const candidates = mergeWindowedSquads(squads, _addDepFound).filter((r) => !_addDepSourceIds.includes(r.id)
+          && (!q || squadMatchesSearch(r, q)))
           .sort((a, b) => b.created_at_ms - a.created_at_ms)
           .slice(0, 50);
         const el = document.getElementById("add-dep-list");
@@ -196,6 +199,22 @@
                data-tip="Squad ${esc(r.id)} (${esc(squadDisplayState(r))}).\nClick to select it as the dependency target.">
             ${sdot(squadDisplayState(r))}<span class="rid">${esc(r.label || r.id)}</span> ${pill(squadDisplayState(r))} <span class="meta">${esc(r.id)}</span>
           </div>`).join("");
+      }
+      /**
+       * The Add Dependency search box's input handler: filters the loaded
+       * squads at once and, while older history is unloaded, asks the daemon
+       * for matching squads outside the window, re-rendering with them if
+       * the box still holds the same text (STRESS-004).
+       * @param {string} value
+       * @returns {Promise<void>}
+       */
+      async function onAddDependencySearch(value) {
+        renderAddDependencyCandidates(value);
+        const found = await searchSquadsMatching("add-dependency", value);
+        const inp = /** @type {HTMLInputElement|null} */ (document.getElementById("add-dep-search"));
+        if (!found || !inp || inp.value !== value) return;
+        _addDepFound = unionById(_addDepFound, found);
+        renderAddDependencyCandidates(value);
       }
       /**
        * Selects a candidate squad as the Add Dependency target and enables the confirm button.

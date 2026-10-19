@@ -4,9 +4,22 @@
   limit once reads are fixed. The lock holds add tail latency for everyone.
 - **Found by:** `ralphus-stress` ramp `write_heavy`; the long-lock-hold table
 - **Found at:** `035ef1e70` (staging, 2026-10-18)
-- **Status:** config work fixed on `stress-fixes-low` (PR #778): the write
-  peak went from 78 to 165 ok/s. Writes are still single-worker (~130–165
-  ok/s); write batching is not done.
+- **Status:** fixed.
+  - `stress-fixes-low` (PR #778) took config reads and `.ralphus.toml`
+    discovery off the lock: the write peak went from 78 to 165 ok/s.
+  - `stress-fixes-followups` cut the rest of the per-submit lock churn:
+    - one store lock for all of submit's registry checks instead of about
+      eight;
+    - no preset-registry load for a file that extends no preset;
+    - one commit per materialization progress update;
+    - validation answered on the read pool.
+
+    The write peak is 192 ok/s, and the 1%-error point stays at 2048 users.
+  - Cross-request write batching, one of the long-term directions, was
+    rejected as unsafe in this design; see "Why write batching was
+    rejected". It is a decision, not an open item. Revisit it only if the
+    write path is restructured so a batch can hold the store for its whole
+    duration.
 
 ## Numbers
 
@@ -57,6 +70,23 @@
   - batch writes, so one worker commits several requests per transaction;
   - narrow what needs the global writer lock;
   - or split writes by squad.
+
+**Why write batching was rejected.** A write handler takes the store lock
+several times per request, and background threads write through the same
+connection between those takes. There are two ways to give the batch one
+transaction:
+
+- **Keep it open across the handlers.** It would then absorb the background
+  threads' writes, and a failed request's savepoint rollback would undo them
+  too.
+- **Hold the lock for the whole batch.** The handlers' own lock calls would
+  then re-enter it, which `crate::store_lock` forbids (a re-entrant take
+  parks forever).
+
+Writes are serialized by design ("mutations stay totally ordered",
+`WRITE_WORKERS`), and the measured cost is CPU on that one writer, not
+fsync: `synchronous=NORMAL` already skips it. The ceiling that remains is
+that design choice, now at about 190 ok/s.
 
 ## UX risk: low
 

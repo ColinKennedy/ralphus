@@ -527,34 +527,58 @@
         forgetEtag();
         await tick();
       }
-      /** Pending debounce for {@link searchUnloadedSquads}. @type {ReturnType<typeof setTimeout>|null} */
-      let unloadedSearchTimer = null;
+      /**
+       * Pending debounced searches of {@link searchSquadsMatching}, one per
+       * search box.
+       * @type {Map<string, {timer: ReturnType<typeof setTimeout>, resolve: (found: SquadView[]|null) => void}>}
+       */
+      const squadSearchPending = new Map();
+      /**
+       * Searches every squad ever submitted, by id or label, for a search box
+       * whose own list holds only the loaded window (STRESS-004). Debounced
+       * 300 ms per `key`, so typing does not fire a request per keystroke; a
+       * call superseded by a newer one for the same key resolves `null`, as
+       * does one with nothing to search (see {@link boardWindowSearchText}) or
+       * a failed request. Nothing is pinned into the board: the caller merges
+       * the matches into its own candidates, after checking that its box
+       * still holds the same text.
+       * @param {string} key - which search box is asking.
+       * @param {string} text
+       * @param {string} [path] - `/api/task-index` (the default) or `/api/tasks`.
+       * @returns {Promise<SquadView[]|null>}
+       */
+      function searchSquadsMatching(key, text, path = "/api/task-index") {
+        const prev = squadSearchPending.get(key);
+        if (prev) { clearTimeout(prev.timer); squadSearchPending.delete(key); prev.resolve(null); }
+        const q = boardWindowSearchText(text);
+        if (!q) return Promise.resolve(null);
+        return new Promise((resolve) => {
+          const timer = setTimeout(async () => {
+            squadSearchPending.delete(key);
+            try {
+              const res = await fetch(boardSearchUrl(path, q));
+              resolve(res.ok ? /** @type {SquadView[]} */ ((await res.json()).squads || []) : null);
+            } catch (e) { resolve(null); /* transient -- the search runs again on the next keystroke */ }
+          }, 300);
+          squadSearchPending.set(key, { timer, resolve });
+        });
+      }
       /**
        * When older history is not loaded, a search typed into the Squads or
        * Tasks filter box also asks the daemon, so a finished squad outside the
        * window can still be found by id or name (STRESS-004). Matches are
        * pinned into the list; the box's own filtering then shows them.
-       * Debounced, so typing does not fire a request per keystroke.
        * @param {string} text
-       * @returns {void}
+       * @returns {Promise<void>}
        */
-      function searchUnloadedSquads(text) {
-        if (unloadedSearchTimer) clearTimeout(unloadedSearchTimer);
-        const q = text.trim();
-        if (q.length < 2 || !(boardWindow.hasMore.full || boardWindow.hasMore.index)) return;
-        unloadedSearchTimer = setTimeout(async () => {
-          unloadedSearchTimer = null;
-          try {
-            const res = await fetch(`${boardWindowUrl("/api/tasks")}&q=${encodeURIComponent(q)}`);
-            if (!res.ok) return;
-            const d = await res.json();
-            let added = false;
-            for (const s of /** @type {SquadView[]} */ (d.squads || [])) {
-              if (!findSquad(s.id)) { boardWindow.pinned.set(s.id, s); added = true; }
-            }
-            if (added) { forgetEtag(); await tick(); }
-          } catch (e) { /* transient -- the search runs again on the next keystroke */ }
-        }, 300);
+      async function searchUnloadedSquads(text) {
+        const found = await searchSquadsMatching("board-filter", text, "/api/tasks");
+        if (!found) return;
+        let added = false;
+        for (const s of found) {
+          if (!findSquad(s.id)) { boardWindow.pinned.set(s.id, s); added = true; }
+        }
+        if (added) { forgetEtag(); await tick(); }
       }
       // RALPHUS-UPDATE-COUNTER:BEGIN
       /**

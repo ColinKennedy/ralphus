@@ -3838,7 +3838,7 @@ resolution and `status` rely on that.
 |---|---|
 | `window=N` | Return every squad that has not finished, plus the `N` newest finished squads (`done`, `failed` or `cancelled`). `N` is capped at 1000. |
 | `before=<cursor>` | A previous response's `window.next_before`. Returns the next `N` older finished squads only; unfinished squads come only with the first page. |
-| `q=<text>` | Keep only squads whose id or label contains `text`, case-insensitively, across all history. `%` and `_` match themselves. |
+| `q=<text>` | Keep only squads whose id, label or any task name contains `text`, case-insensitively, across all history. `%` and `_` match themselves. |
 
 `status`, `name` and `sort` still apply on top. A windowed response adds a
 `window` object:

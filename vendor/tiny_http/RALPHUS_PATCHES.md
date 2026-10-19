@@ -73,13 +73,39 @@ Writes are never affected, so streamed responses (the daemon's
 `/api/events`) keep working. Clients that pool connections cope with
 idle closes: ureq checks `server_closed()` before reusing one.
 
-## 5. Connection threads not double-booked (`src/util/task_pool.rs`)
+## 5. Knowing when the client has gone (`src/client.rs`, `src/request.rs`)
+
+| | |
+|---|---|
+| **Found by** | `ralphus-stress`, STRESS-006 (`abandon_response`) |
+| **Problem** | A server that queues requests had no way to tell that a client sent one and hung up. Every queued request ran, and live clients waited behind work no one would read. |
+| **Change** | A per-connection flag. It is set when reading the connection's next request reaches end of stream, or fails with a reset, abort or broken pipe. Every `Request` read from that connection shares it, and `Request::peer_closed()` reports it. |
+
+That next read starts as soon as the current request's body has been read,
+which happens at once for a body of at most 1 KiB, so the flag is usually
+current by the time a queued request reaches a worker. `false` means "not
+known to be gone", never "known to be there".
+
+A connection that will carry no further request (`Connection: close`,
+HTTP/1.0) is read anyway, until the client closes it or the read timeout
+fires, so its last request learns it too. Before that read, the connection
+drops its handle on the response writer, so the write side still closes
+as soon as the last response is written; a client that reads until the
+server closes is not kept waiting.
+
+## 6. Connection threads not double-booked (`src/util/task_pool.rs`)
 
 | | |
 |---|---|
 | **Found by** | The RAL-414 board cold-load CI job, stalling ~30 s on a Linux runner |
 | **Problem** | `TaskPool::spawn` queued a new connection whenever `waiting_tasks > 0`. A thread that has been notified stays counted there until it wakes, so two connections accepted back to back could both be queued for one idle thread. The second then waited, unread, until a keep-alive connection closed and freed a thread: never without a read timeout, 30 s with patch 4. A browser opening several connections at once hit it on a busy 2-CPU machine. |
 | **Change** | Spawn a new thread unless there are more idle threads than queued tasks (`waiting_tasks > queue.len()`). |
+
+Regression tests: `librarian/tests/connection_pool.rs` reproduces the hang
+deterministically on one CPU (`taskset -c 0`), and
+`a_burst_of_keep_alive_connections_is_served_without_waiting` in
+`daemon/tests/http_hardening.rs` hits it on two (`taskset -c 0,1`); with
+many idle cores the race window is usually too short to hit.
 
 ## 3. Silenced upstream warnings (`src/lib.rs`)
 

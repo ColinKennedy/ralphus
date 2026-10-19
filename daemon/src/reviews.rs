@@ -1242,127 +1242,136 @@ pub fn derive_reviews_with_full_prefetch(
     if let Some(progress) = progress {
         progress("Deriving review plan");
     }
-    let store = &store.lock();
-    let mut link_groups: BTreeMap<String, Vec<&Membership>> = BTreeMap::new();
-    let mut proj_groups: BTreeMap<String, Vec<&Membership>> = BTreeMap::new();
-    for m in &memberships {
-        if let Some(key) = &m.link_key {
-            link_groups.entry(key.clone()).or_default().push(m);
-        } else {
-            proj_groups
-                .entry(m.project.to_string_lossy().into_owned())
-                .or_default()
-                .push(m);
-        }
-    }
+    // STRESS-008: and one transaction, so a daemon stopped part-way leaves
+    // either every guardian of this squad or none. A restarted daemon then
+    // takes "the squad has guardians" to mean this finished, and runs the
+    // squad's setup again from here only when it has none.
+    let guard = store.lock();
+    guard.transaction_or(
+        |store| {
+            let mut link_groups: BTreeMap<String, Vec<&Membership>> = BTreeMap::new();
+            let mut proj_groups: BTreeMap<String, Vec<&Membership>> = BTreeMap::new();
+            for m in &memberships {
+                if let Some(key) = &m.link_key {
+                    link_groups.entry(key.clone()).or_default().push(m);
+                } else {
+                    proj_groups
+                        .entry(m.project.to_string_lossy().into_owned())
+                        .or_default()
+                        .push(m);
+                }
+            }
 
-    let mut created = Vec::new();
+            let mut created = Vec::new();
 
-    // Project groups: one fresh guardian each. Several in one submit get a numeric
-    // suffix so their names stay distinct (review-001, review-002, …).
-    let multi = proj_groups.len() > 1;
-    for (k, (project, members)) in proj_groups.iter().enumerate() {
-        let mut members = members.clone();
-        members.sort_by_key(|m| m.order);
-        let upstream = members
-            .first()
-            .map_or_else(|| "main".to_string(), |m| m.upstream.clone());
-        let suggested = members
-            .iter()
-            .find(|m| !m.name.is_empty())
-            .map_or_else(|| "review".to_string(), |m| m.name.clone());
-        let name = if multi {
-            format!("{suggested}-{:03}", k + 1)
-        } else {
-            suggested
-        };
-        let registered_project = single_registered_project(&members);
-        let gid = store
-            .create_guardian_keyed(
-                &name,
-                &upstream,
-                project,
-                Some(squad_id),
-                None,
-                registered_project,
-            )
-            .map_err(|e| ReviewError::new(e.to_string()))?;
-        apply_resolver(store, &gid, &members)?;
-        apply_project_review_defaults(store, &gid, project)?;
-        apply_preparation(store, &gid, &members)?;
-        // Single-project: no need to tag branches with a project (they share git_root).
-        add_new_branches(store, &gid, &[], &members, false)?;
-        apply_action_hints(
-            store,
-            &gid,
-            &group_key_for_project(project),
-            &authored_actions,
-        )?;
-        record_review_guardian(store, squad_id, &gid, &members, &implicit_cells_by_branch)?;
-        created.push(gid);
-    }
+            // Project groups: one fresh guardian each. Several in one submit get a numeric
+            // suffix so their names stay distinct (review-001, review-002, …).
+            let multi = proj_groups.len() > 1;
+            for (k, (project, members)) in proj_groups.iter().enumerate() {
+                let mut members = members.clone();
+                members.sort_by_key(|m| m.order);
+                let upstream = members
+                    .first()
+                    .map_or_else(|| "main".to_string(), |m| m.upstream.clone());
+                let suggested = members
+                    .iter()
+                    .find(|m| !m.name.is_empty())
+                    .map_or_else(|| "review".to_string(), |m| m.name.clone());
+                let name = if multi {
+                    format!("{suggested}-{:03}", k + 1)
+                } else {
+                    suggested
+                };
+                let registered_project = single_registered_project(&members);
+                let gid = store
+                    .create_guardian_keyed(
+                        &name,
+                        &upstream,
+                        project,
+                        Some(squad_id),
+                        None,
+                        registered_project,
+                    )
+                    .map_err(|e| ReviewError::new(e.to_string()))?;
+                apply_resolver(store, &gid, &members)?;
+                apply_project_review_defaults(store, &gid, project)?;
+                apply_preparation(store, &gid, &members)?;
+                // Single-project: no need to tag branches with a project (they share git_root).
+                add_new_branches(store, &gid, &[], &members, false)?;
+                apply_action_hints(
+                    store,
+                    &gid,
+                    &group_key_for_project(project),
+                    &authored_actions,
+                )?;
+                record_review_guardian(store, squad_id, &gid, &members, &implicit_cells_by_branch)?;
+                created.push(gid);
+            }
 
-    // Link groups: `ralphus:new-review/<key>` is a submission-LOCAL placeholder
-    // for a review id that does not exist yet. Each key group ALWAYS mints a fresh
-    // guardian for this submission — tasks sharing the same <key> within this one
-    // submission collapse into that new guardian, while different keys make
-    // different new guardians. A later submission that reuses the same <key> string
-    // gets its own brand-new guardian; the placeholder never attaches to a guardian
-    // from a previous submission (RAL-* placeholder semantics). The `review_key` is
-    // still recorded on the guardian purely as provenance (which placeholder minted
-    // it), never as a cross-submission link. Branches are tagged with their project
-    // root so the merge engine processes each repo independently (RAL-29).
-    for (key, members) in &link_groups {
-        let mut members = members.clone();
-        members.sort_by_key(|m| m.order);
-        // Use the first member's project as the primary git_root.
-        let project = members
-            .first()
-            .map(|m| m.project.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        let upstream = members
-            .first()
-            .map_or_else(|| "main".to_string(), |m| m.upstream.clone());
-        let name = members
-            .iter()
-            .find(|m| !m.name.is_empty())
-            .map_or_else(|| key.clone(), |m| m.name.clone());
-        // Preserve every distinct project in the linked review so each
-        // project's defaults can be applied to the shared guardian.
-        let distinct_projects: Vec<String> = {
-            let mut seen = std::collections::HashSet::new();
-            members
-                .iter()
-                .map(|m| m.project.to_string_lossy().into_owned())
-                .filter(|p| seen.insert(p.clone()))
-                .collect()
-        };
-        let registered_project = single_registered_project(&members);
-        let gid = store
-            .create_guardian_keyed(
-                &name,
-                &upstream,
-                &project,
-                Some(squad_id),
-                Some(key),
-                registered_project,
-            )
-            .map_err(|e| ReviewError::new(e.to_string()))?;
-        // Apply skip_worktrees for every distinct project in the group.
-        for proj in &distinct_projects {
-            apply_project_review_defaults(store, &gid, proj)?;
-        }
-        apply_resolver(store, &gid, &members)?;
-        apply_preparation(store, &gid, &members)?;
-        // Freshly minted guardian: no branches attached yet. Tag each branch with
-        // its project root (multi-project link group).
-        add_new_branches(store, &gid, &[], &members, true)?;
-        apply_action_hints(store, &gid, &group_key_for_link(key), &authored_actions)?;
-        record_review_guardian(store, squad_id, &gid, &members, &implicit_cells_by_branch)?;
-        created.push(gid);
-    }
+            // Link groups: `ralphus:new-review/<key>` is a submission-LOCAL placeholder
+            // for a review id that does not exist yet. Each key group ALWAYS mints a fresh
+            // guardian for this submission — tasks sharing the same <key> within this one
+            // submission collapse into that new guardian, while different keys make
+            // different new guardians. A later submission that reuses the same <key> string
+            // gets its own brand-new guardian; the placeholder never attaches to a guardian
+            // from a previous submission (RAL-* placeholder semantics). The `review_key` is
+            // still recorded on the guardian purely as provenance (which placeholder minted
+            // it), never as a cross-submission link. Branches are tagged with their project
+            // root so the merge engine processes each repo independently (RAL-29).
+            for (key, members) in &link_groups {
+                let mut members = members.clone();
+                members.sort_by_key(|m| m.order);
+                // Use the first member's project as the primary git_root.
+                let project = members
+                    .first()
+                    .map(|m| m.project.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                let upstream = members
+                    .first()
+                    .map_or_else(|| "main".to_string(), |m| m.upstream.clone());
+                let name = members
+                    .iter()
+                    .find(|m| !m.name.is_empty())
+                    .map_or_else(|| key.clone(), |m| m.name.clone());
+                // Preserve every distinct project in the linked review so each
+                // project's defaults can be applied to the shared guardian.
+                let distinct_projects: Vec<String> = {
+                    let mut seen = std::collections::HashSet::new();
+                    members
+                        .iter()
+                        .map(|m| m.project.to_string_lossy().into_owned())
+                        .filter(|p| seen.insert(p.clone()))
+                        .collect()
+                };
+                let registered_project = single_registered_project(&members);
+                let gid = store
+                    .create_guardian_keyed(
+                        &name,
+                        &upstream,
+                        &project,
+                        Some(squad_id),
+                        Some(key),
+                        registered_project,
+                    )
+                    .map_err(|e| ReviewError::new(e.to_string()))?;
+                // Apply skip_worktrees for every distinct project in the group.
+                for proj in &distinct_projects {
+                    apply_project_review_defaults(store, &gid, proj)?;
+                }
+                apply_resolver(store, &gid, &members)?;
+                apply_preparation(store, &gid, &members)?;
+                // Freshly minted guardian: no branches attached yet. Tag each branch with
+                // its project root (multi-project link group).
+                add_new_branches(store, &gid, &[], &members, true)?;
+                apply_action_hints(store, &gid, &group_key_for_link(key), &authored_actions)?;
+                record_review_guardian(store, squad_id, &gid, &members, &implicit_cells_by_branch)?;
+                created.push(gid);
+            }
 
-    Ok(created)
+            Ok(created)
+        },
+        |e| ReviewError::new(e.to_string()),
+    )
 }
 
 /// Return the one registered project shared by every member. Mixed-project

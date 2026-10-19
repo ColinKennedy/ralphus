@@ -424,6 +424,8 @@
       let squads = [];
       let gotoSearchQuery = "";
       let gotoSearchSelected = 0;
+      /** @type {SquadView[]} squads outside the loaded window that the daemon's full-history search found for the go-to overlay's current query (STRESS-004). */
+      let gotoSearchFound = [];
       /** Whether the go-to search overlay's own "show hidden" checkbox (RAL-365) is on -- independent of the Squads-tab sidebar's `filters.showHidden`. Reset to `false` every time the overlay opens. */
       let gotoSearchShowHidden = false;
       /**

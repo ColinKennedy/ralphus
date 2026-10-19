@@ -4,10 +4,16 @@
   for work the daemon then abandons and that needs a manual retry.
 - **Found by:** `ralphus-stress` scenario `crash_restart`
 - **Found at:** `035ef1e70` (staging, 2026-10-18)
-- **Status:** mitigated on `stress-fixes-medium` (PR #780). An orphaned
-  squad is still marked failed after a crash, but it now gets an urgent
-  mailbox message with `ralphus squad retry <id>` as the remediation.
-  Resuming materialization automatically is not done.
+- **Status:** fixed on `stress-fixes-followups`; the crash check passes.
+  - A submission is stored with its squad, in the same transaction that
+    creates the squad in `materializing`.
+  - On restart, `resume_materializations` rebuilds the task file the way
+    `submit` did and runs the setup again.
+  - Review derivation creates a squad's guardians in one transaction, and
+    waypoint creation records itself as done, so a resumed setup never
+    repeats either.
+  - Only a squad created before submissions were stored is still failed,
+    with the `ralphus squad retry <id>` message.
 
 ## Evidence
 

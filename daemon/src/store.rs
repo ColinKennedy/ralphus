@@ -871,6 +871,19 @@ pub struct WindowMeta {
     pub next_before: Option<String>,
 }
 
+/// What a squad's background setup (`server::run_submit_followup`) needs to
+/// run again after a restart (STRESS-008), stored with the squad while it
+/// is `materializing`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SquadSubmission {
+    /// The task file exactly as submitted.
+    pub toml: String,
+    /// Submitted held: the squad ends up `queued` rather than `pending`.
+    pub hold: bool,
+    /// The user the submission was made as, for auto-watch.
+    pub acting_user: Option<String>,
+}
+
 /// Escape `%`, `_` and `\` for a `LIKE ... ESCAPE '\'` pattern.
 fn escape_like(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
@@ -1820,6 +1833,23 @@ impl Store {
         let tx = self.conn.unchecked_transaction()?;
         let out = f(self)?;
         tx.commit()?;
+        Ok(out)
+    }
+
+    /// [`Store::transaction`] for a caller with its own error type: `f`'s
+    /// error rolls back and is returned as is, and a failure to begin or
+    /// commit is turned into `E` by `sql_error`. Same constraints on `f`.
+    pub fn transaction_or<T, E>(
+        &self,
+        f: impl FnOnce(&Self) -> std::result::Result<T, E>,
+        sql_error: impl Fn(StoreError) -> E,
+    ) -> std::result::Result<T, E> {
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .map_err(|e| sql_error(e.into()))?;
+        let out = f(self)?;
+        tx.commit().map_err(|e| sql_error(e.into()))?;
         Ok(out)
     }
 
@@ -4409,6 +4439,16 @@ impl Store {
             "ALTER TABLE squads ADD COLUMN materialization_step INTEGER",
             "ALTER TABLE squads ADD COLUMN materialization_total INTEGER",
             "ALTER TABLE squads ADD COLUMN materialization_phase TEXT",
+            // STRESS-008: what a squad's background materialization needs to
+            // run again if the daemon stops before it finishes -- the
+            // submitted TOML, its `hold` flag and the acting user -- plus
+            // whether its declared waypoints were already created (that step
+            // mints new ids, so it must not run twice). Written with the squad
+            // and cleared once it leaves `materializing`.
+            "ALTER TABLE squads ADD COLUMN submission_toml TEXT",
+            "ALTER TABLE squads ADD COLUMN submission_hold INTEGER",
+            "ALTER TABLE squads ADD COLUMN submission_user TEXT",
+            "ALTER TABLE squads ADD COLUMN submission_waypoints_done INTEGER NOT NULL DEFAULT 0",
             // RAL-516: per-profile override of whether this agent can emit
             // thinking/reasoning output for the Live View "Show Thinking"
             // control. NULL = inherit the backend's own declared capability
@@ -4955,6 +4995,34 @@ impl Store {
         label: Option<&str>,
         hold: bool,
     ) -> Result<()> {
+        self.insert_squad_rows(squad_id, file, label, hold, None)
+    }
+
+    /// [`Self::insert_squad`] for a submission whose setup continues in the
+    /// background (`server::run_submit_followup`): the squad lands in
+    /// `materializing` instead of `pending`/`queued`, and `submission` is
+    /// stored with it so a restarted daemon can run that setup again
+    /// (STRESS-008). Both happen in the same transaction as the squad's rows,
+    /// so no crash can leave a squad that looks runnable but was never set up.
+    pub fn insert_materializing_squad(
+        &mut self,
+        file: &TaskFile,
+        label: Option<&str>,
+        submission: &SquadSubmission,
+    ) -> Result<String> {
+        let squad_id = self.next_squad_id()?;
+        self.insert_squad_rows(&squad_id, file, label, submission.hold, Some(submission))?;
+        Ok(squad_id)
+    }
+
+    fn insert_squad_rows(
+        &mut self,
+        squad_id: &str,
+        file: &TaskFile,
+        label: Option<&str>,
+        hold: bool,
+        submission: Option<&SquadSubmission>,
+    ) -> Result<()> {
         let now = now_ms();
         let state = if hold {
             SquadState::Queued
@@ -5238,7 +5306,25 @@ impl Store {
             }
         }
 
+        if let Some(submission) = submission {
+            tx.execute(
+                "UPDATE squads SET state=?, submission_toml=?, submission_hold=?, submission_user=?
+                 WHERE id=?",
+                params![
+                    SquadState::Materializing.as_str(),
+                    submission.toml,
+                    submission.hold,
+                    submission.acting_user,
+                    squad_id
+                ],
+            )?;
+        }
         tx.commit()?;
+        let state = if submission.is_some() {
+            SquadState::Materializing
+        } else {
+            state
+        };
         crate::rlog!(
             INFO,
             "ralphus [submit] squad {squad_id} inserted state={} tasks={}",
@@ -5369,13 +5455,19 @@ impl Store {
         let now = now_ms();
         let entering_running = i64::from(state == SquadState::Running);
         let entering_terminal = i64::from(state.is_terminal());
+        // The stored submission (STRESS-008) is needed only while the squad
+        // is still being set up.
+        let staying_materializing = i64::from(state == SquadState::Materializing);
         let n = self.conn.execute(
             "UPDATE squads SET state=?, updated_at_ms=?,
                  started_at_ms = CASE WHEN ?=1 THEN COALESCE(started_at_ms, ?) ELSE started_at_ms END,
                  finished_at_ms = CASE WHEN ?=1 THEN ? ELSE finished_at_ms END,
                  materialization_step = NULL,
                  materialization_total = NULL,
-                 materialization_phase = NULL
+                 materialization_phase = NULL,
+                 submission_toml = CASE WHEN ?=1 THEN submission_toml ELSE NULL END,
+                 submission_hold = CASE WHEN ?=1 THEN submission_hold ELSE NULL END,
+                 submission_user = CASE WHEN ?=1 THEN submission_user ELSE NULL END
              WHERE id=?",
             params![
                 state.as_str(),
@@ -5384,6 +5476,9 @@ impl Store {
                 now,
                 entering_terminal,
                 now,
+                staying_materializing,
+                staying_materializing,
+                staying_materializing,
                 id
             ],
         )?;
@@ -6332,9 +6427,12 @@ impl Store {
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .map(|s| format!("%{}%", escape_like(s)));
-        // `?1` is the search pattern when there is one.
+        // `?1` is the search pattern when there is one: the squad's id,
+        // label, or any of its task names.
         let search = if pattern.is_some() {
-            " AND (id LIKE ?1 ESCAPE '\\' OR COALESCE(label, '') LIKE ?1 ESCAPE '\\')"
+            " AND (id LIKE ?1 ESCAPE '\\' OR COALESCE(label, '') LIKE ?1 ESCAPE '\\' \
+             OR EXISTS (SELECT 1 FROM tasks t WHERE t.squad_id = squads.id \
+             AND t.name LIKE ?1 ESCAPE '\\'))"
         } else {
             ""
         };
@@ -10833,19 +10931,18 @@ impl Store {
         }
 
         // RAL-<pending>: a squad left `materializing` after an unclean
-        // shutdown has no background follow-up left to finish it either --
-        // unlike `running`, there is no partial-progress state worth
-        // resuming (worktree resolution/review derivation either committed
-        // fully or not at all per cell, and re-running it isn't wired to
-        // anything the scheduler can pick up on its own). Land it in
-        // `failed` with a clear, actionable reason instead of leaving it
-        // invisible forever (`Store::list_ready` never selects
+        // shutdown has no background follow-up left to finish it either.
+        // One stored with its submission (STRESS-008) is set up again by
+        // `server::resume_materializations`, so it is left alone here. One
+        // without -- created before submissions were stored -- cannot be:
+        // land it in `failed` with a clear, actionable reason instead of
+        // leaving it invisible forever (`Store::list_ready` never selects
         // `materializing`, so with no recovery it would simply never be
         // looked at again). A human resubmits or runs `ralphus squad retry`.
         let materializing_ids: Vec<String> = {
-            let mut stmt = self
-                .conn
-                .prepare("SELECT id FROM squads WHERE state='materializing'")?;
+            let mut stmt = self.conn.prepare(
+                "SELECT id FROM squads WHERE state='materializing' AND submission_toml IS NULL",
+            )?;
             stmt.query_map([], |r| r.get::<_, String>(0))?
                 .collect::<std::result::Result<Vec<_>, _>>()?
         };
@@ -10901,6 +10998,53 @@ impl Store {
         self.close_stale_active_intervals()?;
 
         Ok(ids)
+    }
+
+    /// Squads still `materializing` whose submission was stored with them
+    /// (STRESS-008): at startup, their setup was interrupted and can run
+    /// again. Oldest first.
+    pub fn resumable_materializations(&self) -> Result<Vec<(String, SquadSubmission)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, submission_toml, COALESCE(submission_hold, 0), submission_user
+             FROM squads WHERE state='materializing' AND submission_toml IS NOT NULL
+             ORDER BY created_at_ms ASC, id ASC",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                SquadSubmission {
+                    toml: r.get(1)?,
+                    hold: r.get::<_, i64>(2)? != 0,
+                    acting_user: r.get(3)?,
+                },
+            ))
+        })?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    /// Whether this squad's declared waypoints were already created by its
+    /// setup (STRESS-008): that step mints new waypoint ids, so a resumed
+    /// setup must not run it twice.
+    pub fn submission_waypoints_done(&self, squad_id: &str) -> Result<bool> {
+        let done: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT submission_waypoints_done FROM squads WHERE id=?",
+                params![squad_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(done.unwrap_or(0) != 0)
+    }
+
+    /// Record that this squad's declared waypoints exist. Call in the same
+    /// transaction that creates them.
+    pub fn mark_submission_waypoints_done(&self, squad_id: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE squads SET submission_waypoints_done=1 WHERE id=?",
+            params![squad_id],
+        )?;
+        Ok(())
     }
 
     /// Startup repair: closes every active-duration interval still open on a
@@ -14388,9 +14532,50 @@ mod tests {
         );
     }
 
-    /// STRESS-008: a squad caught mid-materialization by a crash is failed on
-    /// startup -- and, since the client was already told `201`, someone is
-    /// told what to do about it.
+    /// STRESS-008: a squad created for background setup is stored with its
+    /// submission, survives startup recovery for resume, and drops the
+    /// stored submission once it leaves `materializing`.
+    #[test]
+    fn a_materializing_squad_keeps_its_submission_until_it_is_set_up() {
+        let mut store = Store::open_in_memory().unwrap();
+        let submission = SquadSubmission {
+            toml: SAMPLE.to_string(),
+            hold: true,
+            acting_user: Some("ada".to_string()),
+        };
+        let id = store
+            .insert_materializing_squad(&parse(SAMPLE), Some("lbl"), &submission)
+            .unwrap();
+        assert_eq!(store.squad_state(&id).unwrap(), SquadState::Materializing);
+
+        store.recover_orphaned_squads().unwrap();
+        assert_eq!(store.squad_state(&id).unwrap(), SquadState::Materializing);
+        assert_eq!(
+            store.resumable_materializations().unwrap(),
+            vec![(id.clone(), submission)]
+        );
+
+        assert!(!store.submission_waypoints_done(&id).unwrap());
+        store.mark_submission_waypoints_done(&id).unwrap();
+        assert!(store.submission_waypoints_done(&id).unwrap());
+
+        store.set_squad_state(&id, SquadState::Queued).unwrap();
+        assert!(store.resumable_materializations().unwrap().is_empty());
+        let toml: Option<String> = store
+            .conn
+            .query_row(
+                "SELECT submission_toml FROM squads WHERE id=?",
+                params![id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(toml, None);
+    }
+
+    /// STRESS-008: a squad caught mid-materialization by a crash with no
+    /// stored submission (created before submissions were stored) is failed
+    /// on startup -- and, since the client was already told `201`, someone
+    /// is told what to do about it.
     #[test]
     fn a_squad_orphaned_mid_materialization_is_failed_with_an_actionable_message() {
         let store = Store::open_in_memory().unwrap();

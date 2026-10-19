@@ -154,6 +154,30 @@ fn chunked_body_over_the_limit_is_413() {
     assert_eq!(daemon_answers(addr, None), Some(200));
 }
 
+/// STRESS-006: the server keeps reading a `Connection: close` connection to
+/// notice its client leaving, but that must not hold the connection open: a
+/// client that reads its response until the server closes still sees the
+/// close as soon as the response is done.
+#[test]
+fn a_connection_close_response_still_ends_with_the_server_closing() {
+    let addr = spawn_server_with_timeout(None, Some(Duration::from_secs(30)));
+    let mut s = TcpStream::connect(addr).expect("connect");
+    s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    s.write_all(b"GET /api/daemon HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+        .unwrap();
+    let started = std::time::Instant::now();
+    let mut response = Vec::new();
+    s.read_to_end(&mut response)
+        .expect("the server closes the connection after the response");
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "the close came only after {:?}",
+        started.elapsed()
+    );
+    let text = String::from_utf8_lossy(&response);
+    assert!(text.starts_with("HTTP/1.1 200"), "{text}");
+}
+
 /// A large but legitimate body is still read and handled (the limit is not
 /// so tight that real task files trip it).
 #[test]

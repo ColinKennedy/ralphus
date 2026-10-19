@@ -256,8 +256,18 @@
         return !!el && /input|textarea/i.test(el.tagName || "");
       }
       /**
-       * Returns every task whose name contains the current search query.
-       * Empty query means "show everything."
+       * The squads the go-to overlay searches: the loaded index plus whatever
+       * the daemon's full-history search found for the current query
+       * (STRESS-004).
+       * @returns {SquadView[]}
+       */
+      function gotoSearchSquads() {
+        return mergeWindowedSquads(taskIndex, gotoSearchFound);
+      }
+      /**
+       * Returns every task whose name contains the current search query, and
+       * every task of a squad whose id or name contains it. Empty query means
+       * "show everything."
        * @param {string} query
        * @returns {GotoSearchResult[]}
        */
@@ -265,7 +275,8 @@
         const needle = String(query || "").trim().toLowerCase();
         /** @type {GotoSearchResult[]} */
         const out = [];
-        taskIndex.forEach((squad) => {
+        gotoSearchSquads().forEach((squad) => {
+          const squadMatches = !needle || squadMatchesSearch(squad, needle);
           // RAL-331/RAL-365: a hidden squad's tasks, and any individually
           // hidden task, are excluded from go-to search by default too --
           // same "hidden unless specifically surfaced" rule as the sidebar,
@@ -274,7 +285,7 @@
           const squadHidden = hiddenSquadIds.has(squad.id) && squad.id !== revealedSquadId;
           if (squadHidden && !gotoSearchShowHidden) return;
           squad.tasks.forEach((task, taskIdx) => {
-            if (needle && !task.name.toLowerCase().includes(needle)) return;
+            if (!squadMatches && !task.name.toLowerCase().includes(needle)) return;
             if (!squadHidden && hiddenTaskKeys.has(`${squad.id}:${taskIdx}`) && !gotoSearchShowHidden) return;
             out.push({
               squadId: squad.id,
@@ -305,12 +316,13 @@
         // this actually opens rather than ridden along on every board poll.
         await loadTaskIndex();
         gotoSearchQuery = "";
+        gotoSearchFound = [];
         gotoSearchSelected = 0;
         gotoSearchShowHidden = false;
         byId("modal-root").innerHTML = `
           <div class="modal-bg" onclick="if(event.target===this)closeModal()"><div class="modal goto-search-modal">
             <h2>Go To Task</h2>
-            <input type="text" id="goto-search-input" class="goto-search-input" placeholder="search tasks across every squad…" oninput="gotoSearchInput(this.value)" onkeydown="gotoSearchInputKeydown(event)" data-tip="Filter every task by substring match on task name.\nWho/when: use this when you know part of a task's name and want the owning squad shown beside it.\nArrow keys move the selection · Enter opens it." />
+            <input type="text" id="goto-search-input" class="goto-search-input" placeholder="search tasks across every squad…" oninput="gotoSearchInput(this.value)" onkeydown="gotoSearchInputKeydown(event)" data-tip="Filter every task by substring match on task name, or on its squad's id or name.\nOlder finished squads the board has not loaded are searched by squad id or name too, after a short pause in typing.\nWho/when: use this when you know part of a task's name and want the owning squad shown beside it.\nArrow keys move the selection · Enter opens it." />
             <label style="display:flex;align-items:center;gap:6px;margin:8px 0 0" data-tip="Include tasks you've explicitly hidden and tasks belonging to a squad you've hidden.\nIndependent of the Squads tab's own 'show hidden' toggle -- resets every time this window opens.">
               <input type="checkbox" id="goto-search-show-hidden" onchange="gotoSearchToggleShowHidden(this.checked)"> show hidden
             </label>
@@ -338,10 +350,11 @@
         if (!list || !summary) return;
         const results = gotoSearchResults(gotoSearchQuery);
         clampGotoSearchSelection(results.length);
-        summary.textContent = `${results.length} matching task${results.length === 1 ? "" : "s"} across ${taskIndex.length} squad${taskIndex.length === 1 ? "" : "s"}.`;
+        const squadCount = gotoSearchSquads().length;
+        summary.textContent = `${results.length} matching task${results.length === 1 ? "" : "s"} across ${squadCount} squad${squadCount === 1 ? "" : "s"}.`;
         list.innerHTML = results.length
           ? results.map((result, index) => `<button type="button" id="goto-search-row-${index}" class="goto-search-row${index === gotoSearchSelected ? " selected" : ""}" onclick="selectGotoSearchResult(${index})" ondblclick="gotoSelectedTaskSearchResult()" data-tip="Open ${esc(result.label)} on the Squads tab.\nWho/when: use this when several squads contain similarly named work and you need the exact owner shown.">${esc(result.label)}</button>`).join("")
-          : `<div class="empty" style="margin:0;padding:20px" data-tip="No current task names contain this substring.\nWho/when: clear or broaden the query to search across every squad again.">No matching tasks.</div>`;
+          : `<div class="empty" style="margin:0;padding:20px" data-tip="No task name, squad name or squad id contains this substring.\nWho/when: clear or broaden the query to search across every squad again.">No matching tasks.</div>`;
         scrollGotoSearchSelectionIntoView();
       }
       /**
@@ -352,6 +365,20 @@
       function gotoSearchInput(value) {
         gotoSearchQuery = value;
         gotoSearchSelected = 0;
+        renderGotoSearchResults();
+        void searchGotoUnloaded(value);
+      }
+      /**
+       * While older history is unloaded, asks the daemon for squads whose id
+       * or name matches the go-to query, and re-renders with them if the
+       * query has not changed meanwhile (STRESS-004).
+       * @param {string} value
+       * @returns {Promise<void>}
+       */
+      async function searchGotoUnloaded(value) {
+        const found = await searchSquadsMatching("goto", value);
+        if (!found || gotoSearchQuery !== value) return;
+        gotoSearchFound = found;
         renderGotoSearchResults();
       }
       /**
