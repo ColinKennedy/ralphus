@@ -22,6 +22,23 @@ bash scripts/stress-history.sh --ago "3 days,6 weeks"
 bash scripts/stress-history.sh --rev v1.2.0 --rev 1a2b3c4 -- --quick
 ```
 
+In CI, use the **Stress test** workflow
+(`.github/workflows/stress.yml`). Trigger it from the Actions tab with
+"Run workflow" on any branch. It takes these inputs:
+
+| Input | Values |
+|---|---|
+| mode | `quick` or `full` |
+| scenarios | which scenarios to run |
+| history_revs | optional commits/tags to run retroactively |
+| extra_args | extra arguments for `ralphus-stress run` |
+| runner OS | Linux or Windows |
+
+It uploads `perf/stress/` as an artifact and puts the headline and fault
+tables in the job summary. Results are not committed automatically:
+download the artifact and commit the `results/*.json` you want tracked in
+`HISTORY.md`. Compare numbers only within one runner type.
+
 Or drive the binary directly:
 
 ```bash
