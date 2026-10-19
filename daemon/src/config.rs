@@ -3093,6 +3093,68 @@ fn warn_config_fallback(key: &str, value: &str, fallback: &str) {
     }
 }
 
+/// One config file's contents, as last read, with the file attributes that
+/// say whether the copy is still current.
+struct CachedConfigFile {
+    modified: Option<std::time::SystemTime>,
+    len: u64,
+    text: std::sync::Arc<str>,
+}
+
+fn config_file_cache()
+-> &'static std::sync::Mutex<std::collections::HashMap<PathBuf, CachedConfigFile>> {
+    static CACHE: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<PathBuf, CachedConfigFile>>,
+    > = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Read a config file's text, reusing the last read while the file's
+/// modification time and length are unchanged.
+///
+/// Config is loaded fresh on nearly every request and several times per
+/// submit (profiles, model defaults, worktree and daemon settings); each
+/// load re-opened and re-read the same few files, which on Windows -- where
+/// opening a file goes through on-access scanning -- made those reads the
+/// largest part of a submit (STRESS-007, `perf/stress/followups/`). Checking
+/// one `stat` per use keeps an edit visible on the very next load, exactly
+/// as before: only the open and read are skipped. A missing or non-file path
+/// is the caller's `NotFound`, as from `std::fs::read_to_string`.
+pub(crate) fn read_config_file_cached(path: &Path) -> std::io::Result<std::sync::Arc<str>> {
+    let meta = std::fs::metadata(path)?;
+    if !meta.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("{} is not a file", path.display()),
+        ));
+    }
+    let modified = meta.modified().ok();
+    let len = meta.len();
+    {
+        let cache = config_file_cache()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(hit) = cache.get(path) {
+            if hit.modified == modified && hit.len == len {
+                return Ok(std::sync::Arc::clone(&hit.text));
+            }
+        }
+    }
+    let text: std::sync::Arc<str> = std::fs::read_to_string(path)?.into();
+    config_file_cache()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(
+            path.to_path_buf(),
+            CachedConfigFile {
+                modified,
+                len,
+                text: std::sync::Arc::clone(&text),
+            },
+        );
+    Ok(text)
+}
+
 /// Read one config file's text. An absent file is the normal "not
 /// configured" case and returns `None` silently; any other read failure is
 /// logged with the path and also returns `None`, so the caller falls back to
@@ -3104,7 +3166,7 @@ fn warn_config_fallback(key: &str, value: &str, fallback: &str) {
 fn read_config_text(path: impl AsRef<Path>) -> Option<String> {
     let path = path.as_ref();
     let display = path.display().to_string();
-    match std::fs::read_to_string(path) {
+    match read_config_file_cached(path).map(|text| text.to_string()) {
         Ok(text) => {
             let digest = hash_text(&text);
             if config_log_changed(&format!("file:{display}"), digest) {
@@ -3159,29 +3221,43 @@ pub fn global_config_path() -> Option<PathBuf> {
     )
 }
 
-/// Discover the per-project config by walking up from `start` until a
-/// `.ralphus.toml` is found or the filesystem root is reached.
-#[must_use]
-pub fn find_project_config(start: &Path) -> Option<PathBuf> {
-    let mut dir = Some(start);
-    while let Some(d) = dir {
-        let candidate = d.join(".ralphus.toml");
-        if candidate.is_file() {
-            return Some(candidate);
-        }
-        dir = d.parent();
-    }
-    None
+/// How long a [`project_configs_on_path`] result is reused for the same
+/// starting directory.
+///
+/// Discovery stats a `.ralphus.toml` in every ancestor directory, and on
+/// Windows a stat of a file that does not exist cost ~230 us -- ~2.3 ms per
+/// lookup from a typical project path, paid several times per submit and on
+/// most other requests (STRESS-007, `perf/stress/followups/`). Within this
+/// window a found file is still re-checked to exist (one stat), and edits to
+/// an existing file are always seen at once (`read_config_file_cached`
+/// checks its modification time); only a `.ralphus.toml` *newly created* in
+/// an ancestor can take up to this long to be noticed. Code that creates one
+/// and must see it at once calls [`forget_discovered_project_configs`].
+/// (Validating against each ancestor directory's modification time instead
+/// costs as many stats as the walk itself.)
+const PROJECT_CONFIG_DISCOVERY_TTL: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// A previous discovery from one starting directory: every `.ralphus.toml`
+/// found, root-first.
+struct DiscoveredConfigs {
+    at: std::time::Instant,
+    configs: Vec<PathBuf>,
 }
 
-/// Find all `.ralphus.toml` files from the filesystem root down to `start`,
-/// returning them in order (root-first). This enables parent-plus-subfolder
-/// layering: a root `.ralphus.toml` sets base configuration, intermediate
-/// `.ralphus.toml` files narrow or extend it, and a leaf subdirectory
-/// `.ralphus.toml` makes final overrides. All existing files on the path
-/// from root to `start` are collected, then reversed to root-first order.
-#[must_use]
-pub fn find_all_project_configs(start: &Path) -> Vec<PathBuf> {
+fn discovery_cache()
+-> &'static std::sync::Mutex<std::collections::HashMap<PathBuf, DiscoveredConfigs>> {
+    static CACHE: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<PathBuf, DiscoveredConfigs>>,
+    > = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Upper bound on remembered starting directories; the cache is simply
+/// cleared when it is reached (distinct project paths are few in practice).
+const DISCOVERY_CACHE_MAX_ENTRIES: usize = 4096;
+
+/// Walk up from `start`, returning every `.ralphus.toml` found, root-first.
+fn walk_project_configs(start: &Path) -> Vec<PathBuf> {
     let mut configs = Vec::new();
     let mut dir = Some(start);
     while let Some(d) = dir {
@@ -3193,6 +3269,65 @@ pub fn find_all_project_configs(start: &Path) -> Vec<PathBuf> {
     }
     configs.reverse();
     configs
+}
+
+/// [`walk_project_configs`], reusing a result for `start` that is younger
+/// than `ttl` and whose files all still exist.
+fn project_configs_on_path(start: &Path, ttl: std::time::Duration) -> Vec<PathBuf> {
+    {
+        let cache = discovery_cache()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(hit) = cache.get(start) {
+            if hit.at.elapsed() < ttl && hit.configs.iter().all(|p| p.is_file()) {
+                return hit.configs.clone();
+            }
+        }
+    }
+    let configs = walk_project_configs(start);
+    let mut cache = discovery_cache()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if cache.len() >= DISCOVERY_CACHE_MAX_ENTRIES {
+        cache.clear();
+    }
+    cache.insert(
+        start.to_path_buf(),
+        DiscoveredConfigs {
+            at: std::time::Instant::now(),
+            configs: configs.clone(),
+        },
+    );
+    configs
+}
+
+/// Drop every remembered [`project_configs_on_path`] result, so the next
+/// lookup walks the filesystem again and sees a `.ralphus.toml` created
+/// since.
+pub fn forget_discovered_project_configs() {
+    discovery_cache()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clear();
+}
+
+/// Discover the per-project config: the nearest `.ralphus.toml` at or above
+/// `start`, if any. See [`PROJECT_CONFIG_DISCOVERY_TTL`] for how a lookup is
+/// reused.
+#[must_use]
+pub fn find_project_config(start: &Path) -> Option<PathBuf> {
+    project_configs_on_path(start, PROJECT_CONFIG_DISCOVERY_TTL).pop()
+}
+
+/// Find all `.ralphus.toml` files from the filesystem root down to `start`,
+/// returning them in order (root-first). This enables parent-plus-subfolder
+/// layering: a root `.ralphus.toml` sets base configuration, intermediate
+/// `.ralphus.toml` files narrow or extend it, and a leaf subdirectory
+/// `.ralphus.toml` makes final overrides. See
+/// [`PROJECT_CONFIG_DISCOVERY_TTL`] for how a lookup is reused.
+#[must_use]
+pub fn find_all_project_configs(start: &Path) -> Vec<PathBuf> {
+    project_configs_on_path(start, PROJECT_CONFIG_DISCOVERY_TTL)
 }
 
 /// Parse a `DaemonConfig` from the given TOML text.
@@ -4694,6 +4829,75 @@ initialization_timeout_sec = 30
         let own = from_toml_str(include_str!("../../.ralphus.toml"));
         assert!(!own.auto_run());
         assert!(own.checks.is_empty());
+    }
+
+    /// STRESS-007: the config file cache must never serve stale text -- an
+    /// edit is visible on the very next read.
+    #[test]
+    fn read_config_file_cached_sees_edits_immediately() {
+        let dir = std::env::temp_dir().join(format!("ralphus-cfg-cache-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::write(&path, "[daemon]\n").unwrap();
+        assert_eq!(&*read_config_file_cached(&path).unwrap(), "[daemon]\n");
+        assert_eq!(&*read_config_file_cached(&path).unwrap(), "[daemon]\n");
+        std::fs::write(&path, "[daemon]\nmax_concurrent = 3\n").unwrap();
+        assert_eq!(
+            &*read_config_file_cached(&path).unwrap(),
+            "[daemon]\nmax_concurrent = 3\n"
+        );
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(
+            read_config_file_cached(&path).unwrap_err().kind(),
+            std::io::ErrorKind::NotFound
+        );
+        assert_eq!(
+            read_config_file_cached(&dir).unwrap_err().kind(),
+            std::io::ErrorKind::NotFound,
+            "a directory is not a config file"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// STRESS-007: a remembered discovery still notices a deleted
+    /// `.ralphus.toml` immediately, and a newly created one once the reuse
+    /// window has passed (with a zero window: at once).
+    #[test]
+    fn project_config_discovery_reuse_window() {
+        use std::time::Duration;
+        let base = std::env::temp_dir().join(format!("ralphus-cfg-disc-{}", std::process::id()));
+        let nested = base.join("a").join("b");
+        std::fs::create_dir_all(&nested).unwrap();
+        let config = base.join(".ralphus.toml");
+        std::fs::write(&config, "[review]\n").unwrap();
+        let long = Duration::from_secs(3600);
+
+        assert_eq!(project_configs_on_path(&nested, long), vec![config.clone()]);
+        // Deleted: noticed despite the long window.
+        std::fs::remove_file(&config).unwrap();
+        assert!(project_configs_on_path(&nested, long).is_empty());
+        // Created again: a long window keeps the remembered "none"...
+        std::fs::write(&config, "[review]\n").unwrap();
+        assert!(project_configs_on_path(&nested, long).is_empty());
+        // ...until it is forgotten...
+        forget_discovered_project_configs();
+        assert_eq!(project_configs_on_path(&nested, long), vec![config.clone()]);
+        // ...and an expired window walks again and finds it too.
+        std::fs::remove_file(&config).unwrap();
+        assert!(project_configs_on_path(&nested, long).is_empty());
+        std::fs::write(&config, "[review]\n").unwrap();
+        assert_eq!(
+            project_configs_on_path(&nested, Duration::ZERO),
+            vec![config.clone()]
+        );
+        // A nearer file is listed last (nearest wins in `find_project_config`).
+        let nearer = nested.join(".ralphus.toml");
+        std::fs::write(&nearer, "[review]\n").unwrap();
+        assert_eq!(
+            project_configs_on_path(&nested, Duration::ZERO),
+            vec![config.clone(), nearer.clone()]
+        );
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]

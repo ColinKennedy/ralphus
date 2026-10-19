@@ -1,0 +1,109 @@
+# On-demand daemon stress test (ralphus-stress, perf/stress/README.md).
+#
+# Run it from the Actions tab ("Stress test" -> "Run workflow") on any
+# branch. It builds the daemon and the harness in release mode, runs the
+# suite against the checked-out commit (and, optionally, retroactively
+# against older commits), uploads perf/stress/ as an artifact and writes the
+# headline tables to the job summary. Results are not committed: download
+# the artifact and commit perf/stress/results/*.json if you want them in
+# HISTORY.md.
+#
+# Numbers are only comparable between runs on the same runner type; the
+# result files record the machine they ran on.
+name: Stress test
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "quick (~5 min smoke) or full (~30 min per commit)"
+        type: choice
+        options: [quick, full]
+        default: quick
+      scenarios:
+        description: "Comma-separated: ramp,volume,faults,crash"
+        type: string
+        default: "ramp,volume,faults,crash"
+      history_revs:
+        description: "Optional space-separated commits/tags to also run retroactively (e.g. 'v0.4.0 1a2b3c4')"
+        type: string
+        default: ""
+      extra_args:
+        description: "Extra ralphus-stress run arguments (e.g. '--max-users 1024 --faults slowloris')"
+        type: string
+        default: ""
+      os:
+        description: "Runner"
+        type: choice
+        options: [ubuntu-latest, windows-latest]
+        default: ubuntu-latest
+
+permissions:
+  contents: read
+
+jobs:
+  stress:
+    runs-on: ${{ inputs.os }}
+    timeout-minutes: 360
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: true
+      - name: Install Rust toolchain
+        run: rustup toolchain install stable --profile minimal
+      - uses: Swatinem/rust-cache@v2
+      - name: Run the stress suite on this commit
+        env:
+          MODE: ${{ inputs.mode }}
+          SCENARIOS: ${{ inputs.scenarios }}
+          EXTRA_ARGS: ${{ inputs.extra_args }}
+        run: |
+          # The fault scenarios hold ~1000-2000 sockets at once; the default
+          # 1024 open-file limit would fail the generator's own connects and
+          # read as daemon errors.
+          if [ "$(uname -s)" = "Linux" ]; then ulimit -n "$(ulimit -Hn)"; fi
+          args=(--scenarios "$SCENARIOS")
+          [ "$MODE" = "quick" ] && args+=(--quick)
+          # shellcheck disable=SC2206
+          [ -n "$EXTRA_ARGS" ] && args+=($EXTRA_ARGS)
+          bash scripts/stress.sh "${args[@]}"
+      - name: Run the stress suite retroactively
+        if: ${{ inputs.history_revs != '' }}
+        env:
+          MODE: ${{ inputs.mode }}
+          SCENARIOS: ${{ inputs.scenarios }}
+          REVS: ${{ inputs.history_revs }}
+          EXTRA_ARGS: ${{ inputs.extra_args }}
+        run: |
+          if [ "$(uname -s)" = "Linux" ]; then ulimit -n "$(ulimit -Hn)"; fi
+          revs=()
+          for r in $REVS; do revs+=(--rev "$r"); done
+          pass=(--scenarios "$SCENARIOS")
+          [ "$MODE" = "quick" ] && pass+=(--quick)
+          # shellcheck disable=SC2206
+          [ -n "$EXTRA_ARGS" ] && pass+=($EXTRA_ARGS)
+          RALPHUS_STRESS_WORK="$RUNNER_TEMP/stress-history" \
+            bash scripts/stress-history.sh "${revs[@]}" -- "${pass[@]}"
+      - name: Summarize
+        if: always()
+        run: |
+          {
+            echo "## Stress results"
+            for md in $(ls -t perf/stress/results/*.md 2>/dev/null); do
+              echo
+              # Headline table and fault table of each run produced here.
+              sed -n '1,/^## Ramp:/p' "$md" | sed '$d'
+              sed -n '/^## Fault injection/,/^### /p' "$md" | sed '$d'
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: stress-results-${{ inputs.os }}-${{ github.sha }}
+          path: perf/stress/
+          if-no-files-found: warn

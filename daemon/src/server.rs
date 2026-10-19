@@ -21142,6 +21142,45 @@ enum HttpLoopEnd {
     AcceptError(std::io::Error),
 }
 
+/// Largest request body the daemon will read (STRESS-001). Far above any
+/// real task file, review feedback or settings payload; a larger body is
+/// answered `413` without being read. The librarian enforces the same limit
+/// (`librarian/src/server.rs`).
+pub const MAX_REQUEST_BODY_BYTES: usize = 32 * 1024 * 1024;
+
+/// Answer `413` for a body over [`MAX_REQUEST_BODY_BYTES`] and close the
+/// connection. `size` is the declared or received length, for the message.
+fn reject_oversized_body(request: tiny_http::Request, method: &str, url: &str, size: usize) {
+    let path = url.split('?').next().unwrap_or(url);
+    if let Some(suppressed) = failure_log_permit(&format!("body-too-large {path}")) {
+        // ralphus[ignore-rlog-pair]: the accept loop must never wait on the store lock, so this size rejection stays text-only
+        crate::rlog!(
+            WARNING,
+            "ralphus [http] {method} {path} rejected 413: request body of {size} bytes exceeds the {MAX_REQUEST_BODY_BYTES}-byte limit{}",
+            suppressed_suffix(suppressed)
+        );
+    }
+    let body = error(
+        413,
+        "payload_too_large",
+        &format!(
+            "request body is {size} bytes; the daemon accepts at most {MAX_REQUEST_BODY_BYTES} bytes"
+        ),
+        vec![],
+    )
+    .body;
+    let response = tiny_http::Response::from_string(body)
+        .with_status_code(413)
+        .with_header(
+            tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..])
+                .expect("valid header"),
+        )
+        .with_header(
+            tiny_http::Header::from_bytes(&b"Connection"[..], &b"close"[..]).expect("valid header"),
+        );
+    let _ = request.respond(response);
+}
+
 fn run_http_loop(server: tiny_http::Server, daemon: &Arc<Daemon>) -> HttpLoopEnd {
     let read_pool = ReadPool::new(daemon, READ_WORKERS);
     let write_pool = ReadPool::new(daemon, WRITE_WORKERS);
@@ -21261,8 +21300,23 @@ fn run_http_loop(server: tiny_http::Server, daemon: &Arc<Daemon>) -> HttpLoopEnd
         let if_none_match = header_value(&request, "If-None-Match");
         let remote_addr = request.remote_addr().map(ToString::to_string);
 
+        // STRESS-001: refuse an oversized body before reading any of it -- by
+        // its declared length when there is one, and by what actually
+        // arrives otherwise (chunked, or a length that lied low).
+        if let Some(declared) = request
+            .body_length()
+            .filter(|n| *n > MAX_REQUEST_BODY_BYTES)
+        {
+            reject_oversized_body(request, &method, &url, declared);
+            continue;
+        }
         let mut body = String::new();
-        if let Err(e) = request.as_reader().read_to_string(&mut body) {
+        let mut limited = <&mut dyn std::io::Read as std::io::Read>::take(
+            request.as_reader(),
+            MAX_REQUEST_BODY_BYTES as u64 + 1,
+        );
+        let read = std::io::Read::read_to_string(&mut limited, &mut body);
+        if let Err(e) = read {
             // ralphus[ignore-rlog-pair]: the accept loop must never wait on the store lock; the handler's own rejection of the truncated body is recorded downstream
             crate::rlog!(
                 WARNING,
@@ -21270,6 +21324,11 @@ fn run_http_loop(server: tiny_http::Server, daemon: &Arc<Daemon>) -> HttpLoopEnd
                 url.split('?').next().unwrap_or(&url),
                 body.len()
             );
+        }
+        if body.len() > MAX_REQUEST_BODY_BYTES {
+            let received = body.len();
+            reject_oversized_body(request, &method, &url, received);
+            continue;
         }
 
         let pending = PendingRequest {

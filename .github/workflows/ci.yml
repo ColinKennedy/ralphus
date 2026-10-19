@@ -158,6 +158,11 @@ jobs:
       - name: Test (shell-syntax feature)
         if: matrix.suite == 'full' && needs.defer-gate.outputs.deferred != 'true'
         run: cargo "+${{ matrix.toolchain }}" nextest run -p ralphus-shell-syntax --features parser
+      # vendor/tiny_http is excluded from the workspace, so nothing above
+      # runs its own unit tests (see vendor/tiny_http/RALPHUS_PATCHES.md).
+      - name: Test (vendored tiny_http)
+        if: matrix.suite == 'full' && needs.defer-gate.outputs.deferred != 'true'
+        run: cargo "+${{ matrix.toolchain }}" test --manifest-path vendor/tiny_http/Cargo.toml --lib
       - name: Doctests
         if: ${{ !cancelled() && matrix.suite == 'full' && needs.defer-gate.outputs.deferred != 'true' }}
         run: cargo "+${{ matrix.toolchain }}" test --doc --workspace

@@ -38,6 +38,20 @@ const WAL_SIZE_LIMIT_BYTES: i64 = 64 * 1024 * 1024;
 #[cfg(not(test))]
 const WAL_CHECKPOINT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
 
+/// Busy timeout of the WAL checkpoint thread's own connection.
+///
+/// Deliberately far below the store's `store_pool::BUSY_TIMEOUT`: a
+/// `TRUNCATE` pass holds SQLite's writer lock while it waits for readers to
+/// leave the old WAL snapshot, so whatever it waits here, every store write
+/// waits too. With the store's 5 s timeout, a board read in flight turned one
+/// truncate into a ~5.5 s stall of every writer (STRESS-005,
+/// `perf/stress/followups/`). Giving up after this long and retrying on the
+/// next pass costs only a WAL that stays over its size limit a little
+/// longer. `PASSIVE` passes never invoke the busy handler, so this does not
+/// change them.
+pub(crate) const CHECKPOINT_BUSY_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_millis(100);
+
 /// A checkpoint pass at or above this long is logged, with its mode, so the
 /// cost a checkpoint still imposes stays visible instead of surfacing only as
 /// an unexplained slow write somewhere else.
@@ -1574,7 +1588,7 @@ fn spawn_wal_checkpoint_thread(path: std::path::PathBuf) {
                 return;
             }
         };
-        if let Err(e) = conn.busy_timeout(crate::store_pool::BUSY_TIMEOUT) {
+        if let Err(e) = conn.busy_timeout(CHECKPOINT_BUSY_TIMEOUT) {
             // ralphus[ignore-rlog-pair]: same bare-connection boundary as above -- no Store to emit a structured row through
             crate::rlog!(
                 WARNING,
@@ -20793,6 +20807,77 @@ command = "e"
             truncate_busy > 0,
             "a pending TRUNCATE with a pinned reader holds the writer lock -- \
              this is the stall the routine PASSIVE pass exists to avoid"
+        );
+
+        reader.execute_batch("COMMIT").unwrap();
+        drop(reader);
+        drop(writer);
+        drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// STRESS-005: a `TRUNCATE` that cannot finish because a reader pins the
+    /// WAL must give up within [`CHECKPOINT_BUSY_TIMEOUT`], so a writer using
+    /// the store's own (5 s) busy timeout is held up briefly -- not for the
+    /// whole busy timeout, which is what turned trivial writes into ~5.5 s
+    /// store-lock holds under board load.
+    #[test]
+    fn a_blocked_truncate_checkpoint_stalls_writers_only_briefly() {
+        use std::time::{Duration, Instant};
+
+        let dir = std::env::temp_dir().join(format!(
+            "ralphus-wal-checkpoint-brief-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let db_path = dir.join("tasks.db");
+        let store = Store::open(&db_path).expect("open store");
+        store
+            .conn
+            .execute_batch("CREATE TABLE ckpt_probe (x INTEGER)")
+            .expect("create probe table");
+
+        let writer = Connection::open(&db_path).expect("open writer");
+        writer
+            .busy_timeout(crate::store_pool::BUSY_TIMEOUT)
+            .unwrap();
+        writer
+            .execute("INSERT INTO ckpt_probe VALUES (0)", [])
+            .unwrap();
+        let reader = Connection::open(&db_path).expect("open reader");
+        reader.execute_batch("BEGIN").unwrap();
+        let _: i64 = reader
+            .query_row("SELECT count(*) FROM ckpt_probe", [], |r| r.get(0))
+            .unwrap();
+        writer
+            .execute("INSERT INTO ckpt_probe VALUES (1)", [])
+            .unwrap();
+
+        let path = db_path.clone();
+        let checkpointer = std::thread::spawn(move || {
+            let conn = Connection::open(&path).expect("open checkpointer");
+            conn.busy_timeout(CHECKPOINT_BUSY_TIMEOUT).unwrap();
+            let started = Instant::now();
+            let _ = wal_checkpoint_pass(&conn, WalCheckpointMode::Truncate);
+            started.elapsed()
+        });
+        // Let the checkpoint take the writer lock before writing.
+        std::thread::sleep(Duration::from_millis(20));
+        let started = Instant::now();
+        writer
+            .execute("INSERT INTO ckpt_probe VALUES (2)", [])
+            .expect("the write succeeds once the checkpoint gives up");
+        let write_wait = started.elapsed();
+        let checkpoint_took = checkpointer.join().expect("checkpointer thread");
+
+        assert!(
+            checkpoint_took < Duration::from_secs(1),
+            "a blocked TRUNCATE gives up within its short busy timeout, took {checkpoint_took:?}"
+        );
+        assert!(
+            write_wait < Duration::from_secs(1),
+            "a writer waits for a blocked TRUNCATE only briefly, waited {write_wait:?}"
         );
 
         reader.execute_batch("COMMIT").unwrap();
