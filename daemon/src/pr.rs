@@ -4655,6 +4655,37 @@ pub(crate) fn merge_state_unknown(id: &str) -> bool {
     merge_state_unknown_reviews().lock().contains(id)
 }
 
+/// Reviews whose latest [`check_pr_merges`] left some PR unanswered for a
+/// reason that may clear on its own -- a rate limit or a failed request --
+/// as opposed to one no retry fixes (no forge client for the PR's recorded
+/// repo, or a number that belongs to another repository).
+fn merge_state_waiting_reviews() -> &'static parking_lot::Mutex<std::collections::HashSet<String>> {
+    static WAITING: std::sync::OnceLock<parking_lot::Mutex<std::collections::HashSet<String>>> =
+        std::sync::OnceLock::new();
+    WAITING.get_or_init(Default::default)
+}
+
+fn set_merge_state_waiting(id: &str, waiting: bool) {
+    let mut reviews = merge_state_waiting_reviews().lock();
+    if waiting {
+        reviews.insert(id.to_string());
+    } else {
+        reviews.remove(id);
+    }
+}
+
+/// Whether the last merge check for `id` is waiting on the forge: some PR
+/// went unanswered for a reason a later retry may clear. A base-shift rebuild
+/// holds off while this is true (`guardian_merge::ensure_merge_check_for_base`).
+pub(crate) fn merge_state_waiting_on_forge(id: &str) -> bool {
+    merge_state_waiting_reviews().lock().contains(id)
+}
+
+/// The tail of [`fetch_pr_merge_state`]'s error when a PR/MR number resolved
+/// to a PR filed from another branch: the recorded repository is wrong, which
+/// no retry fixes.
+const WRONG_REPO_FOR_NUMBER: &str = "is not the one that allocated this number";
+
 /// PR ids whose recorded `merged` state a forge read has confirmed: the
 /// number resolved to this PR's own branch ([`fetch_pr_merge_state`] rejects
 /// any other) and the forge reported it merged. A merged PR/MR cannot be
@@ -4719,6 +4750,7 @@ pub fn check_pr_merges(store: &crate::store_lock::StoreHandle, id: &str) -> bool
         .unwrap_or_default();
     if prs.is_empty() {
         set_merge_state_unknown(id, false);
+        set_merge_state_waiting(id, false);
         return false;
     }
     // Resolve each open or recorded-merged PR's forge client up front (cheap,
@@ -4734,6 +4766,7 @@ pub fn check_pr_merges(store: &crate::store_lock::StoreHandle, id: &str) -> bool
     }
     let mut jobs = Vec::new();
     let mut unknown = false;
+    let mut waiting = false;
     for pr in prs
         .iter()
         .filter(|pull_request| needs_merge_check(pull_request))
@@ -4768,7 +4801,10 @@ pub fn check_pr_merges(store: &crate::store_lock::StoreHandle, id: &str) -> bool
             // asked again until its backoff window ends: re-asking only
             // extends the limit. The outage notice was raised when the limit
             // was first seen ([`crate::forge_health::report_failure`]).
-            Some(client) if is_backed_off(client) => unknown = true,
+            Some(client) if is_backed_off(client) => {
+                unknown = true;
+                waiting = true;
+            }
             // The number is only meaningful in the repository that allocated
             // it, so a client for any other repository (a stale recorded
             // `repo`, a removed fork) would answer for an unrelated PR/MR.
@@ -4830,6 +4866,7 @@ pub fn check_pr_merges(store: &crate::store_lock::StoreHandle, id: &str) -> bool
     for (job, result) in jobs.iter().zip(fetched) {
         if let Some(Err(error)) = &result {
             unknown = true;
+            waiting |= !error.contains(WRONG_REPO_FOR_NUMBER);
             let status = crate::forge_health::status_from_message(error);
             if crate::forge_health::classify(status, error)
                 == Some(crate::forge_health::Problem::RateLimited)
@@ -4840,6 +4877,7 @@ pub fn check_pr_merges(store: &crate::store_lock::StoreHandle, id: &str) -> bool
         reverted |= apply_pr_merge_state(store, id, job.pr, result, &mut freshly_merged);
     }
     set_merge_state_unknown(id, unknown);
+    set_merge_state_waiting(id, waiting);
     // RAL-338: react to a freshly-observed cross-repository root merge
     // before settling merge states, so a newly-promoted successor's row
     // already exists when `settle_pr_merge_states` re-reads this guardian's
@@ -5360,7 +5398,7 @@ fn fetch_pr_merge_state(
             if source != pr.branch_alias {
                 return Err(format!(
                     "{} #{number} in {} was filed from branch {source}, not {}; the recorded \
-                     repo {} is not the one that allocated this number",
+                     repo {} {WRONG_REPO_FOR_NUMBER}",
                     client.kind().as_str(),
                     client.repo_label(),
                     pr.branch_alias,
@@ -24525,6 +24563,19 @@ token_env = "RALPHUS_TEST_FORGE_TOKEN"
             )
             .unwrap();
         (gid, pr_id)
+    }
+
+    /// A PR with no forge client for its recorded repo leaves the merge state
+    /// unknown, but not waiting on the forge: no retry can answer it, so a
+    /// base-shift rebuild must not hold off for it.
+    #[test]
+    fn an_unresolvable_forge_client_is_unknown_but_not_waiting() {
+        let store: crate::store_lock::StoreHandle =
+            Arc::new(crate::store_lock::StoreMutex::new(store()));
+        let (gid, _pr_id) = make_pr(&store.lock());
+        check_pr_merges(&store, &gid);
+        assert!(merge_state_unknown(&gid));
+        assert!(!merge_state_waiting_on_forge(&gid));
     }
 
     #[test]

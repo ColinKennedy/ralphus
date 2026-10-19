@@ -9928,14 +9928,17 @@ fn check_merges_claimed(store: &crate::store_lock::StoreHandle, id: &str) -> boo
 }
 
 /// Runs the merge check for `id` (the caller holds its [`MERGE_CHECKING`]
-/// claim) and, when the forge answered for every PR, records the base tips it
-/// answered against in [`MERGE_CHECK_ANSWERED_AT`]. The tips are read before
-/// the check, so a base that moves mid-check is never recorded as answered.
+/// claim) and, unless it is still waiting on the forge
+/// ([`crate::pr::merge_state_waiting_on_forge`]), records the base tips it
+/// answered against in [`MERGE_CHECK_ANSWERED_AT`]. A PR no retry can answer
+/// (no forge client for its recorded repo) does not hold the rebuild back:
+/// there is nothing to wait for. The tips are read before the check, so a
+/// base that moves mid-check is never recorded as answered.
 fn check_merges_and_record(store: &crate::store_lock::StoreHandle, id: &str) -> bool {
     let bases = current_base_tips(store, id);
     let changed = crate::pr::check_pr_merges(store, id);
     if let Some(bases) = bases {
-        if !crate::pr::merge_state_unknown(id) {
+        if !crate::pr::merge_state_waiting_on_forge(id) {
             MERGE_CHECK_UNANSWERED.lock().expect("poisoned").remove(id);
             MERGE_CHECK_ANSWERED_AT
                 .lock()
