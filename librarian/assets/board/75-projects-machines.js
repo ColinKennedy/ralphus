@@ -787,6 +787,38 @@ Work submitted against it will fail — fix the machine or deregister the provid
         } catch (_) { /* transient -- the next live refresh retries */ }
       }
       /**
+       * Hidden squads outside the board's window, fetched by id to name them
+       * on the Preferences tab (STRESS-004): squad id -> its view, or `null`
+       * once the daemon answered 404 (deleted). Kept for the page's lifetime,
+       * so each one is fetched once rather than on every poll.
+       * @type {Map<string, SquadView|null>}
+       */
+      const hiddenSquadLookups = new Map();
+      /** At most this many hidden squads are looked up per poll; the next poll continues. */
+      const HIDDEN_SQUAD_LOOKUPS_PER_POLL = 40;
+      /**
+       * Fetches `GET /api/squads/{id}` for each id not looked up yet, a few at
+       * a time, into {@link hiddenSquadLookups}. A failed request other than a
+       * 404 is retried on the next poll.
+       * @param {string[]} ids
+       * @returns {Promise<void>}
+       */
+      async function lookUpHiddenSquads(ids) {
+        const todo = [...new Set(ids)].filter((id) => !hiddenSquadLookups.has(id)).slice(0, HIDDEN_SQUAD_LOOKUPS_PER_POLL);
+        let next = 0;
+        const worker = async () => {
+          while (next < todo.length) {
+            const id = todo[next++];
+            try {
+              const r = await fetch(`/api/squads/${encodeURIComponent(id)}`);
+              if (r.ok) hiddenSquadLookups.set(id, await r.json());
+              else if (r.status === 404) hiddenSquadLookups.set(id, null);
+            } catch (_) { /* transient -- the next poll retries */ }
+          }
+        };
+        await Promise.all(Array.from({ length: Math.min(4, todo.length) }, worker));
+      }
+      /**
        * Polls `GET /api/hidden` for the current (or, under RAL-332's "Edit
        * Profile", visited) user's hidden squads/reviews (RAL-328/RAL-329),
        * plus `GET /api/task-index`/`GET /api/guardian-index` to resolve
@@ -804,8 +836,9 @@ Work submitted against it will fail — fix the machine or deregister the provid
             // only fields read below are id/label/name, all of which the
             // compact indexes carry. The full board view is ~9x larger
             // (6.2MB vs 684KB against a real squad history) and every byte
-            // past those fields is discarded here.
-            fetch("/api/task-index"),
+            // past those fields is discarded here. Windowed (STRESS-004): a
+            // hidden squad outside the window is looked up by id below.
+            fetch(boardWindowUrl("/api/task-index")),
             fetch("/api/guardian-index"),
           ]);
           byId("conn").className = "dot on";
@@ -820,10 +853,14 @@ Work submitted against it will fail — fix the machine or deregister the provid
           }
           if (tasksResp.ok) {
             const t = await tasksResp.json();
-            hiddenSquadNames = new Map((t.squads || []).map((/** @type {SquadView} */ s) => [s.id, s.label || s.id]));
+            /** @type {SquadView[]} */
+            const indexed = t.squads || [];
+            const known = new Set(indexed.map((s) => s.id));
+            await lookUpHiddenSquads(hiddenItems.map((h) => h.squad_id || "").filter((id) => id && !known.has(id)));
+            const named = [...indexed, .../** @type {SquadView[]} */ ([...hiddenSquadLookups.values()].filter(Boolean))];
+            hiddenSquadNames = new Map(named.map((s) => [s.id, s.label || s.id]));
             hiddenTaskNames = new Map(
-              (t.squads || []).flatMap((/** @type {SquadView} */ s) =>
-                (s.tasks || []).map((/** @type {TaskView} */ task, idx) => [`${s.id}:${idx}`, task.name])),
+              named.flatMap((s) => (s.tasks || []).map((/** @type {TaskView} */ task, idx) => [`${s.id}:${idx}`, task.name])),
             );
           }
           if (guardiansResp.ok) {

@@ -66,3 +66,31 @@ test("the footer appears only while older history is not loaded, and says how mu
   w.boardWindow.hasMore.full = false;
   assert.equal(w.boardWindowFooter(900, "full"), "");
 });
+
+test("a search box asks the daemon only for 2+ characters while older history is unloaded", () => {
+  const w = makeWindow();
+  assert.equal(w.boardWindowSearchText("old squad"), "", "everything loaded: nothing to search");
+  w.boardWindow.hasMore.index = true;
+  assert.equal(w.boardWindowSearchText(" x "), "");
+  assert.equal(w.boardWindowSearchText("  old squad "), "old squad");
+  assert.equal(
+    w.boardSearchUrl("/api/task-index", "a&b"),
+    `/api/task-index?window=${w.BOARD_WINDOW}&q=a%26b`,
+  );
+});
+
+test("a squad matches a search on its id or its label, like the daemon's q", () => {
+  const w = makeWindow();
+  assert.equal(w.squadMatchesSearch(sq(42, { label: "Nightly Build" }), "nightly"), true);
+  assert.equal(w.squadMatchesSearch(sq(42, { label: null }), "000042"), true);
+  assert.equal(w.squadMatchesSearch(sq(42, { label: "Nightly" }), "deploy"), false);
+});
+
+test("union by id keeps the existing entries and their order, and appends new ones", () => {
+  const w = makeWindow();
+  const merged = w.unionById(
+    [{ id: "b", name: "old" }, { id: "a", name: "a" }],
+    [{ id: "b", name: "new" }, { id: "c", name: "c" }, { id: "c", name: "dup" }],
+  );
+  assert.deepEqual(merged, [{ id: "b", name: "old" }, { id: "a", name: "a" }, { id: "c", name: "c" }]);
+});

@@ -213,6 +213,50 @@
        */
       const windowedSquads = (first, shape) => mergeWindowedSquads(first, boardWindow.older[shape], [...boardWindow.pinned.values()]);
       /**
+       * The text a search box should send to the daemon's full-history
+       * search, or "" when it should not search: under 2 characters, or
+       * nothing older is unloaded (every squad is already on the board).
+       * @param {string} text
+       * @returns {string}
+       */
+      const boardWindowSearchText = (text) => {
+        const q = String(text || "").trim();
+        return q.length >= 2 && (boardWindow.hasMore.full || boardWindow.hasMore.index) ? q : "";
+      };
+      /**
+       * A windowed list URL that searches all of history: the daemon matches
+       * `q` case-insensitively against squad ids and labels.
+       * @param {string} path - `/api/tasks` or `/api/task-index`.
+       * @param {string} q
+       * @returns {string}
+       */
+      const boardSearchUrl = (path, q) => `${boardWindowUrl(path)}&q=${encodeURIComponent(q)}`;
+      /**
+       * Whether a squad's id or label contains `needle` (already lowercased),
+       * the same match the daemon's `q` makes.
+       * @param {{id: string, label?: string|null}} squad
+       * @param {string} needle
+       * @returns {boolean}
+       */
+      const squadMatchesSearch = (squad, needle) =>
+        squad.id.toLowerCase().includes(needle) || (squad.label || "").toLowerCase().includes(needle);
+      /**
+       * `list` followed by every entry of `extra` whose id it does not hold
+       * yet; order is kept and the existing entry wins.
+       * @template {{id: string}} T
+       * @param {T[]} list
+       * @param {T[]} extra
+       * @returns {T[]}
+       */
+      const unionById = (list, extra) => {
+        const seen = new Set(list.map((x) => x.id));
+        const out = [...list];
+        for (const x of extra) {
+          if (!seen.has(x.id)) { seen.add(x.id); out.push(x); }
+        }
+        return out;
+      };
+      /**
        * The "showing N of M" footer under a squad list, or "" when everything
        * is loaded.
        * @param {number} shown - squads currently in the list.

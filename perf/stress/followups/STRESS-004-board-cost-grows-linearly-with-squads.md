@@ -103,14 +103,24 @@ How to avoid it:
   the matches into the list.
 - **Deep links and "go to squad" selections** for a squad outside the window
   are fetched by id (`GET /api/squads/{id}`) and pinned (`pinMissingSquads`).
+- **The go-to (Ctrl-K) search and the add-dependency and waypoint pickers**
+  search the daemon the same way (`searchSquadsMatching` in `70-sse.js`,
+  `/api/task-index?window=200&q=…`). They merge the matches into their own
+  candidates without pinning them into the board. The go-to search now also
+  lists every task of a squad whose id or name matches. The waypoint picker
+  loads the windowed task index instead of the full unwindowed `/api/tasks`.
+- **The prefs "hidden names" list** reads the windowed task index. It fetches
+  any hidden squad outside the window by id (`GET /api/squads/{id}`), four at
+  a time and at most 40 per poll. Each squad is fetched once per page load,
+  and a 404 is remembered.
 - An older daemon without windowing ignores the parameter and gets the old
   behaviour; the board sees no `window` object and shows no footer.
 - Tests: `test/board-window.test.mjs` and `test/tasks-poll.test.mjs`.
 
 **Not covered yet:**
 
-- The go-to (Ctrl-K) search, the prefs "hidden names" list, and the
-  add-dependency and waypoint pickers still read only the loaded squads.
+- The daemon's `q` matches squad ids and labels, not task names. A go-to
+  search by task name still finds only the tasks of loaded squads.
 - Each listed squad is still hydrated with about 12 statements. A window
   bounds *how many*, so cost no longer grows with history. A per-squad
   summary table would cut the per-squad cost itself.
