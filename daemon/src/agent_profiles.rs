@@ -95,7 +95,7 @@ enum RawEnvValue {
 }
 
 fn parse_profile_file(path: &Path) -> Result<BTreeMap<String, AgentProfile>, String> {
-    let text = std::fs::read_to_string(path)
+    let text = crate::config::read_config_file_cached(path)
         .map_err(|e| format!("could not read {}: {e}", path.display()))?;
     let parsed: AgentProfilesFile =
         toml::from_str(&text).map_err(|e| format!("could not parse {}: {e}", path.display()))?;

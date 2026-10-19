@@ -1692,6 +1692,13 @@ impl Store {
     /// # Errors
     /// Propagates any SQLite failure.
     pub fn enroll_new_squad_in_open_waypoints(&self, squad_id: &str) -> StoreResult<Vec<String>> {
+        // Every submit runs this under the store lock, and almost always no
+        // waypoint is open: check that first, before resolving the squad's
+        // scope (STRESS-007, `perf/stress/followups/`).
+        let open_waypoints = self.list_open_waypoint_ids()?;
+        if open_waypoints.is_empty() {
+            return Ok(Vec::new());
+        }
         let squad_scopes = self.squad_scope_by_project(squad_id)?;
         if squad_scopes.is_empty() {
             return Ok(Vec::new());
@@ -1702,7 +1709,7 @@ impl Store {
         // it again would add a second, unanswered entry for the same work.
         let own_reviews = self.guardians_for_squad(squad_id)?;
         let mut enrolled = Vec::new();
-        for waypoint_id in self.list_open_waypoint_ids()? {
+        for waypoint_id in open_waypoints {
             let waypoint_scopes = self.waypoint_scope_by_project(&waypoint_id)?;
             let overlaps = waypoint_scopes.iter().any(|(project, ws)| {
                 squad_scopes
