@@ -1514,6 +1514,7 @@ impl Store {
         conn.busy_timeout(crate::store_pool::BUSY_TIMEOUT)?;
         crate::store_pool::apply_shared_pragmas(&conn)?;
         crate::store_pool::apply_writer_pragmas(&conn)?;
+        crate::response_cache::install_commit_hook(&conn);
         // Built from the writer connection's own path so pooled reads see
         // the same on-disk (WAL-mode) database -- see `crate::store_pool`.
         let read_pool = crate::store_pool::ReadConnPool::open(
@@ -1716,6 +1717,7 @@ impl Store {
         conn.busy_timeout(crate::store_pool::BUSY_TIMEOUT)?;
         crate::store_pool::apply_shared_pragmas(&conn)?;
         crate::store_pool::apply_writer_pragmas(&conn)?;
+        crate::response_cache::install_commit_hook(&conn);
         let read_pool = crate::store_pool::ReadConnPool::open(&location);
         let store = Self {
             conn,
@@ -6369,7 +6371,7 @@ impl Store {
         submitter: Option<String>,
         materialization_phase: Option<SquadMaterializationPhase>,
     ) -> Result<SquadView> {
-        let mut tstmt = conn.prepare(
+        let mut tstmt = conn.prepare_cached(
             "SELECT idx, name, project, agent, model, state, depends_on, env_overrides, proof_env_overrides, soloed, started_at_ms, finished_at_ms, env_out_of_date, error
              FROM tasks WHERE squad_id=? ORDER BY idx",
         )?;
@@ -6565,7 +6567,7 @@ impl Store {
         conn: &Connection,
         squad_id: &str,
     ) -> Result<(Option<CellCopyLink>, Vec<CellCopyLink>)> {
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT from_squad_id, from_task_idx, from_cell_idx, to_squad_id, from_branch
              FROM cell_copies WHERE to_squad_id=?1 OR from_squad_id=?1
              ORDER BY created_at_ms, to_squad_id",
@@ -6628,7 +6630,7 @@ impl Store {
         // branch-name arm on the same primary key and then
         // `idx_guardian_branches_branch`. `UNION` also supplies the
         // de-duplication the outer `DISTINCT` used to do.
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT g.id, g.name, g.status, g.origin FROM guardians g
              WHERE g.id IN (
                  SELECT s.review_guardian_id FROM cells s
@@ -6671,7 +6673,7 @@ impl Store {
         db_profiles: &HashMap<String, crate::agent_profile_store::AgentProfileView>,
     ) -> Result<HashMap<i64, Vec<CellView>>> {
         let triage_pending = Self::triage_pending_cells(conn, squad_id)?;
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT task_idx, idx, sid, name, cwd, agent, model, state, tokens_in, tokens_out, cost_usd, error, prompt, command, effective_system_prompt, depends_on, review_branch, agent_session_id, maximum_budget_usd, env_overrides, proof_env_overrides, started_at_ms, finished_at_ms, env_out_of_date, machine, maximum_context, auto_compact_threshold, cache_creation_tokens, cache_read_tokens, cost_is_estimated, maximum_tool_output_tokens, compaction_input_tokens, compaction_count, delayed_until_ms, completed_active_duration_ms, CASE WHEN state='running' THEN active_started_at_ms END, turns, waypoint_halted_at_ms, runner_stalled_at_ms, effort, temperature, init_commands, init_source, init_timeout_sec, init_state, init_duration_ms, init_exit_status, init_output, init_finished_at_ms, shell
              FROM cells WHERE squad_id=? ORDER BY task_idx, idx",
         )?;
@@ -6822,7 +6824,7 @@ impl Store {
     ) -> Result<HashMap<(i64, i64), Vec<SquadReviewRef>>> {
         let mut map: HashMap<(i64, i64), Vec<SquadReviewRef>> = HashMap::new();
 
-        let mut direct_stmt = conn.prepare(
+        let mut direct_stmt = conn.prepare_cached(
             "SELECT DISTINCT s.task_idx, s.idx, g.id, g.name, g.status, s.review_branch, g.origin
              FROM cells s
              JOIN guardians g ON g.id = s.review_guardian_id
@@ -6847,7 +6849,7 @@ impl Store {
             map.entry((task_idx, idx)).or_default().push(rref);
         }
 
-        let mut fallback_stmt = conn.prepare(
+        let mut fallback_stmt = conn.prepare_cached(
             "SELECT DISTINCT s.task_idx, s.idx, g.id, g.name, g.status, gb.branch, g.origin
              FROM cells s
              JOIN guardian_branches gb ON gb.branch = s.review_branch
@@ -6921,7 +6923,7 @@ impl Store {
         squad_id: &str,
         db_profiles: &HashMap<String, crate::agent_profile_store::AgentProfileView>,
     ) -> Result<HashMap<(i64, String, i64), Vec<ProofView>>> {
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT task_idx, scope, cell_idx, vid, kind, state, delayed_until_ms, delayed_reason, output, spec, effective_system_prompt, model, agent, agent_session_id, tokens_in, tokens_out, cost_usd, env_overrides, env_out_of_date, cache_creation_tokens, cache_read_tokens, cost_is_estimated, maximum_tool_output_tokens, compaction_input_tokens, compaction_count, completed_active_duration_ms, CASE WHEN state='running' THEN active_started_at_ms END, turns, shell FROM proofs
              WHERE squad_id=? ORDER BY task_idx, scope, cell_idx, idx",
         )?;
@@ -10710,6 +10712,26 @@ impl Store {
                     id
                 ],
             )?;
+            // STRESS-008: the submitter was told `201` and the squad never
+            // became runnable. Its watchers are only enrolled by the
+            // follow-up that never ran, so say so on the shared mailbox, with
+            // the one command that fixes it.
+            let _ = self.enqueue_error_mailbox_message(
+                crate::mailbox::MailboxPriority::Urgent,
+                &format!(
+                    "squad {id} was still being set up when the daemon stopped, so it never \
+                     became runnable and is now marked failed"
+                ),
+                &crate::mailbox::Remediation::SuggestedCommand {
+                    command: format!("ralphus squad retry {id}"),
+                    purpose: "reset the squad to pending so it runs".to_string(),
+                },
+                Some(id),
+                None,
+                None,
+                Some(&format!("squad:{id}")),
+                None,
+            );
         }
 
         self.close_stale_active_intervals()?;
@@ -14199,6 +14221,44 @@ mod tests {
                 .unwrap()
                 .len(),
             5
+        );
+    }
+
+    /// STRESS-008: a squad caught mid-materialization by a crash is failed on
+    /// startup -- and, since the client was already told `201`, someone is
+    /// told what to do about it.
+    #[test]
+    fn a_squad_orphaned_mid_materialization_is_failed_with_an_actionable_message() {
+        let store = Store::open_in_memory().unwrap();
+        let client_id = store.register_mailbox_client().unwrap();
+        store
+            .conn
+            .execute(
+                "INSERT INTO squads (id, state, created_at_ms, updated_at_ms)
+                 VALUES ('squad-000000000042', 'materializing', 0, 0)",
+                [],
+            )
+            .unwrap();
+
+        store.recover_orphaned_squads().unwrap();
+
+        assert_eq!(
+            store.squad_state("squad-000000000042").unwrap(),
+            SquadState::Failed
+        );
+        let unread = store
+            .mailbox_messages_for_client(&client_id, true, None)
+            .unwrap();
+        let message = unread
+            .iter()
+            .find(|m| m.entity_uri.as_deref() == Some("squad:squad-000000000042"))
+            .expect("a mailbox message about the orphaned squad");
+        assert!(
+            message
+                .message
+                .contains("run `ralphus squad retry squad-000000000042`"),
+            "{}",
+            message.message
         );
     }
 

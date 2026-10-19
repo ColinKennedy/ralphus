@@ -99,6 +99,25 @@ test("pollTasksTab: sends no If-None-Match on the first poll, then echoes the ta
   await second;
 });
 
+test("pollTasksTab: a 503 keeps what is on screen and says the daemon is busy, not freshly updated", async () => {
+  const pt = makePollTasksTab();
+  const first = pt.pollTasksTab();
+  resolveJson(pt.pendingFetches[0], { daemon: { running: 1, max_concurrent: 2 }, squads: [{ id: "squad-1" }] });
+  resolveJson(pt.pendingFetches[1], {});
+  await first;
+  assert.equal(pt.calls.renderTasksTab, 1);
+
+  // STRESS-006: the daemon sheds load with 503 + Retry-After.
+  const second = pt.pollTasksTab();
+  await awaitFetches(pt, 4);
+  resolveJson(pt.pendingFetches[2], null, { status: 503 });
+  resolveJson(pt.pendingFetches[3], null, { status: 503 });
+  await second;
+  assert.equal(pt.calls.renderTasksTab, 1, "a shed read must not re-render (or blank) the table");
+  assert.equal(pt.state().squads.length, 1, "the last good data stays");
+  assert.match(pt.els.updated.textContent, /^daemon busy — retrying in \d+s$/);
+});
+
 test("pollTasksTab: a 304 on both reads skips the re-render but still stamps #updated", async () => {
   const pt = makePollTasksTab();
   const first = pt.pollTasksTab();

@@ -76,6 +76,7 @@ pub mod remediation;
 pub mod remote_failure;
 pub mod remote_runner;
 pub mod resources;
+pub(crate) mod response_cache;
 pub mod review_branch;
 pub mod review_notes;
 pub mod reviews;

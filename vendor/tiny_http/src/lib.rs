@@ -145,6 +145,10 @@ pub struct Server {
 
     // result of TcpListener::local_addr()
     listening_addr: ListenAddr,
+
+    // ralphus patch: read timeout applied to each accepted connection, see
+    // `Server::set_read_timeout` and RALPHUS_PATCHES.md
+    read_timeout: Arc<std::sync::Mutex<Option<Duration>>>,
 }
 
 enum Message {
@@ -290,6 +294,8 @@ impl Server {
 
         let inside_close_trigger = close_trigger.clone();
         let inside_messages = messages.clone();
+        let read_timeout: Arc<std::sync::Mutex<Option<Duration>>> = Arc::default();
+        let inside_read_timeout = read_timeout.clone();
         thread::spawn(move || {
             // a tasks pool is used to dispatch the connections into threads
             let tasks_pool = util::TaskPool::new();
@@ -299,6 +305,13 @@ impl Server {
                 let new_client = match server.accept() {
                     Ok((sock, _)) => {
                         use util::RefinedTcpStream;
+                        // ralphus patch: bound every read on this socket.
+                        let timeout = *inside_read_timeout
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        if timeout.is_some() {
+                            sock.set_read_timeout(timeout).ok();
+                        }
                         let (read_closable, write_closable) = match ssl {
                             None => RefinedTcpStream::new(sock),
                             #[cfg(any(feature = "ssl-openssl", feature = "ssl-rustls"))]
@@ -316,7 +329,11 @@ impl Server {
                             Some(ref _ssl) => unreachable!(),
                         };
 
-                        Ok(ClientConnection::new(write_closable, read_closable))
+                        Ok(ClientConnection::new(
+                            write_closable,
+                            read_closable,
+                            timeout,
+                        ))
                     }
                     Err(e) => Err(e),
                 };
@@ -358,7 +375,27 @@ impl Server {
             messages,
             close: close_trigger,
             listening_addr: local_addr,
+            read_timeout,
         })
+    }
+
+    /// Bounds how long reading a request may take (ralphus patch, see
+    /// `RALPHUS_PATCHES.md`). Applies to connections accepted after the call.
+    ///
+    /// Every read on the socket fails with a timeout once it has waited this
+    /// long, and reading a request's line and headers must finish within this
+    /// long of its first byte. A connection that times out before sending any
+    /// byte of a new request (an idle keep-alive connection) is closed
+    /// without a response; one that times out part-way through is answered
+    /// `408` and closed. A body is read by the application, whose reads fail
+    /// with `TimedOut` (or `WouldBlock` on Unix) after this long without
+    /// data. Writing responses is unaffected, so long-lived streamed
+    /// responses keep working. `None` (the default) means no limit.
+    pub fn set_read_timeout(&self, timeout: Option<Duration>) {
+        *self
+            .read_timeout
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = timeout;
     }
 
     /// Returns an iterator for all the incoming requests.

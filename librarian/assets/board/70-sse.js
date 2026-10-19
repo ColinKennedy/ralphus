@@ -511,6 +511,9 @@
        * @returns {Promise<void>}
        */
       async function tick() {
+        // STRESS-006: while the daemon is shedding load, the reconciliation
+        // tick skips a round; pushed events catch up once the backoff ends.
+        if (daemonBusyWaitMs() > 0) return;
         // These four are independent of each other and of the per-tab refresh
         // below -- none reads another's result -- so they run concurrently
         // rather than as a sequential chain that sums four round-trips.
@@ -686,6 +689,13 @@
        */
       async function runSseRefresh() {
         sseRefreshTimer = null;
+        // STRESS-006: the daemon asked us to back off (a `503`). The pending
+        // events stay folded into the sets; refresh once the wait is over.
+        const busyWait = daemonBusyWaitMs();
+        if (busyWait > 0) {
+          sseRefreshTimer = setTimeout(runSseRefresh, busyWait);
+          return;
+        }
         const kinds = sseRefreshKinds; sseRefreshKinds = new Set();
         const guardianIds = sseRefreshGuardianIds; sseRefreshGuardianIds = new Set();
         const hasSquadChange = sseRefreshHasSquadChange; sseRefreshHasSquadChange = false;

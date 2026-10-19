@@ -356,6 +356,9 @@ pub fn guard_hold_snapshot() -> GuardHoldSnapshot {
 
 impl Drop for StoreGuard<'_> {
     fn drop(&mut self) {
+        // Any commit made under this guard is visible now; see
+        // `response_cache::install_commit_hook`.
+        crate::response_cache::note_writer_released();
         let held_ms = self.acquired_at.elapsed().as_millis();
         // Recorded for every hold, not just the long ones: the maximum is only
         // meaningful if nothing is excluded from it.
@@ -430,6 +433,16 @@ thread_local! {
     /// each request runs start-to-finish on a single accept-loop or
     /// `ReadPool` worker thread (see `server.rs::answer_request`).
     static REQUEST_LOCK_WAIT_US: Cell<u64> = const { Cell::new(0) };
+}
+
+/// Add time spent waiting for a pooled read connection to this thread's
+/// per-request lock-wait figure (STRESS-003). The store lock and the read
+/// pool are the two ways a handler waits for the store; counting only the
+/// lock left pool starvation hidden inside `handler` time, where every
+/// request log line read `lock_wait 0ms` while reads queued for seconds.
+/// Not recorded in the store-lock histogram, which is the lock's alone.
+pub(crate) fn add_request_pool_wait(waited: Duration) {
+    REQUEST_LOCK_WAIT_US.with(|acc| acc.set(acc.get().saturating_add(micros(waited))));
 }
 
 /// Zero this thread's per-request lock-wait accumulator. Call before running

@@ -120,7 +120,16 @@ pub struct Daemon {
     /// in [`Daemon::new`] so in-process tests that submit review-less TOML keep
     /// working; `serve()` turns it on via [`Daemon::with_review_intent_policy`].
     review_intent_policy: bool,
+    /// STRESS-003: shared builds of the board's heaviest reads -- see
+    /// [`Daemon::cached_reply`].
+    responses: crate::response_cache::ResponseCache,
 }
+
+/// How long one build of a board response may be shared (STRESS-003). The
+/// data generation already retires it on the next commit; this bounds only
+/// the in-memory values it also carries (the running count, the downtime
+/// flag), and is short enough that no one sees them lag.
+const BOARD_RESPONSE_MAX_AGE: Duration = Duration::from_secs(1);
 
 /// How to run a unit of background follow-up work spawned from a request
 /// handler (today: only `submit`'s materialization step, RAL-<pending>).
@@ -227,6 +236,31 @@ impl Daemon {
             health_sweep: crate::health_sweep::HealthSweepState::new(),
             watchdog: crate::watchdog::WatchdogState::new(),
             review_intent_policy: false,
+            responses: crate::response_cache::ResponseCache::default(),
+        }
+    }
+
+    /// `build`'s reply, shared with every other request for `key` while the
+    /// store's data is unchanged (STRESS-003, see `crate::response_cache`).
+    /// Bypassed while `RALPHUS_BOARD_TIMING` is on, whose `Server-Timing`
+    /// header only means something for a real build.
+    fn cached_reply(&self, key: &str, build: impl FnOnce() -> Reply) -> Reply {
+        if perf_timing::timing_enabled() {
+            return build();
+        }
+        let cached = self
+            .responses
+            .get_or_build(key, BOARD_RESPONSE_MAX_AGE, || {
+                let reply = build();
+                crate::response_cache::Cached {
+                    status: reply.status,
+                    body: reply.body,
+                }
+            });
+        Reply {
+            status: cached.status,
+            body: cached.body.clone(),
+            server_timing: None,
         }
     }
 
@@ -2584,81 +2618,87 @@ fn strip_prompt_text(squads: &mut [crate::store::SquadView]) {
 /// Drives the Squads tab and (via `fetchTasksShared()`) the header task
 /// counter; this is the board's heaviest, least-bounded payload -- every
 /// squad ever submitted, every time -- so it carries the same RAL-414 stage
-/// timing as [`task_index`] (opt in with `RALPHUS_BOARD_TIMING`).
+/// timing as [`task_index`] (opt in with `RALPHUS_BOARD_TIMING`). One build
+/// per query is shared between requests -- see [`Daemon::cached_reply`].
 fn board(daemon: &Daemon, query: &str) -> Reply {
-    let mut timer = perf_timing::PhaseTimer::start();
-    let (squads, merging) = match daemon.read_board_snapshot() {
-        Ok(v) => v,
-        Err(e) => return store_error(&e),
-    };
-    timer.phase(perf_timing::PHASE_LOCK_WAIT);
-    // Ground truth is the shared concurrency semaphore, not a DB row count:
-    // a permit is held for a cell/proof/review-merge's entire time in
-    // flight, which outlasts the windows where any single row actually reads
-    // `running` (see `Semaphore::in_use`) — counting DB rows undercounts.
-    let running = daemon.sem.in_use();
-    let running_reviews: Vec<RunningReviewItem> = merging
-        .into_iter()
-        .map(|(id, name)| RunningReviewItem { id, name })
-        .collect();
-    let status = query_filter(query, "status");
-    let name = query_filter(query, "name");
-    let sort = query_filter(query, "sort");
-    let mut squads =
-        filter_and_sort_squads(squads, status.as_deref(), name.as_deref(), sort.as_deref());
-    strip_prompt_text(&mut squads);
-    timer.phase(perf_timing::PHASE_VIEW);
-    let mut reply = json(
-        200,
-        &Board {
+    daemon.cached_reply(&format!("tasks?{query}"), || {
+        let mut timer = perf_timing::PhaseTimer::start();
+        let (squads, merging) = match daemon.read_board_snapshot() {
+            Ok(v) => v,
+            Err(e) => return store_error(&e),
+        };
+        timer.phase(perf_timing::PHASE_LOCK_WAIT);
+        // Ground truth is the shared concurrency semaphore, not a DB row count:
+        // a permit is held for a cell/proof/review-merge's entire time in
+        // flight, which outlasts the windows where any single row actually reads
+        // `running` (see `Semaphore::in_use`) — counting DB rows undercounts.
+        let running = daemon.sem.in_use();
+        let running_reviews: Vec<RunningReviewItem> = merging
+            .into_iter()
+            .map(|(id, name)| RunningReviewItem { id, name })
+            .collect();
+        let status = query_filter(query, "status");
+        let name = query_filter(query, "name");
+        let sort = query_filter(query, "sort");
+        let mut squads =
+            filter_and_sort_squads(squads, status.as_deref(), name.as_deref(), sort.as_deref());
+        strip_prompt_text(&mut squads);
+        timer.phase(perf_timing::PHASE_VIEW);
+        let mut reply = json(
+            200,
+            &Board {
+                daemon: DaemonStatus {
+                    running,
+                    max_concurrent: daemon.max_concurrent,
+                    running_reviews,
+                    downtime_active: crate::config::scheduler_in_downtime(),
+                },
+                squads,
+            },
+        );
+        timer.phase(perf_timing::PHASE_SERIALIZE);
+        reply.server_timing = timer.finish("board", reply.body.len());
+        reply
+    })
+}
+
+/// Compact cross-squad task data for the Tasks tab, with stage timings (RAL-
+/// 414: via `crate::perf_timing`, opt in with `RALPHUS_BOARD_TIMING`) that
+/// separate store-lock contention, view construction, and serialization.
+/// One build is shared between requests -- see [`Daemon::cached_reply`].
+fn task_index(daemon: &Daemon) -> Reply {
+    daemon.cached_reply("task-index", || {
+        // Same read as `board` above, served from the same pooled snapshot --
+        // this endpoint reads exactly the two things `board_snapshot_conn`
+        // returns, so there is no reason for it to take the writer lock either.
+        // The Tasks tab polls it, and `updateCounter` polls it from every other
+        // tab, so it is nearly as hot as `/api/tasks` itself.
+        let mut timer = perf_timing::PhaseTimer::start();
+        let (squads, merging) = match daemon.read_board_snapshot() {
+            Ok(v) => v,
+            Err(e) => return store_error(&e),
+        };
+        timer.phase(perf_timing::PHASE_LOCK_WAIT);
+        let running = daemon.sem.in_use();
+        let running_reviews = merging
+            .into_iter()
+            .map(|(id, name)| RunningReviewItem { id, name })
+            .collect();
+        let response = TaskIndexBoard {
             daemon: DaemonStatus {
                 running,
                 max_concurrent: daemon.max_concurrent,
                 running_reviews,
                 downtime_active: crate::config::scheduler_in_downtime(),
             },
-            squads,
-        },
-    );
-    timer.phase(perf_timing::PHASE_SERIALIZE);
-    reply.server_timing = timer.finish("board", reply.body.len());
-    reply
-}
-
-/// Compact cross-squad task data for the Tasks tab, with stage timings (RAL-
-/// 414: via `crate::perf_timing`, opt in with `RALPHUS_BOARD_TIMING`) that
-/// separate store-lock contention, view construction, and serialization.
-fn task_index(daemon: &Daemon) -> Reply {
-    // Same read as `board` above, served from the same pooled snapshot --
-    // this endpoint reads exactly the two things `board_snapshot_conn`
-    // returns, so there is no reason for it to take the writer lock either.
-    // The Tasks tab polls it, and `updateCounter` polls it from every other
-    // tab, so it is nearly as hot as `/api/tasks` itself.
-    let mut timer = perf_timing::PhaseTimer::start();
-    let (squads, merging) = match daemon.read_board_snapshot() {
-        Ok(v) => v,
-        Err(e) => return store_error(&e),
-    };
-    timer.phase(perf_timing::PHASE_LOCK_WAIT);
-    let running = daemon.sem.in_use();
-    let running_reviews = merging
-        .into_iter()
-        .map(|(id, name)| RunningReviewItem { id, name })
-        .collect();
-    let response = TaskIndexBoard {
-        daemon: DaemonStatus {
-            running,
-            max_concurrent: daemon.max_concurrent,
-            running_reviews,
-            downtime_active: crate::config::scheduler_in_downtime(),
-        },
-        squads: squads.into_iter().map(Into::into).collect(),
-    };
-    timer.phase(perf_timing::PHASE_VIEW);
-    let mut reply = json(200, &response);
-    timer.phase(perf_timing::PHASE_SERIALIZE);
-    reply.server_timing = timer.finish("task-index", reply.body.len());
-    reply
+            squads: squads.into_iter().map(Into::into).collect(),
+        };
+        timer.phase(perf_timing::PHASE_VIEW);
+        let mut reply = json(200, &response);
+        timer.phase(perf_timing::PHASE_SERIALIZE);
+        reply.server_timing = timer.finish("task-index", reply.body.len());
+        reply
+    })
 }
 
 /// Per-task resource usage for every running cell with a live subprocess
@@ -14253,10 +14293,13 @@ fn queue(daemon: &Daemon) -> Reply {
     // read-only connection instead of the writer lock. The read transaction
     // inside `with_read_snapshot` is what keeps the multi-statement view
     // internally consistent; excluding the writer was never what did that.
-    match daemon.with_read_snapshot(Store::queue_conn) {
-        Ok(items) => json(200, &QueueResponse { items }),
-        Err(e) => store_error(&e),
-    }
+    // One build is shared between requests -- see `Daemon::cached_reply`.
+    daemon.cached_reply("queue", || {
+        match daemon.with_read_snapshot(Store::queue_conn) {
+            Ok(items) => json(200, &QueueResponse { items }),
+            Err(e) => store_error(&e),
+        }
+    })
 }
 
 /// Persist a new queue order (server-side DAG-stabilized), returning the
@@ -20072,7 +20115,10 @@ pub fn serve<A: ToSocketAddrs>(
     // failing here on the bind, corrupting state without ever serving a
     // request. Binding first makes that race fail closed instead.
     let server = match tiny_http::Server::http(addr) {
-        Ok(server) => server,
+        Ok(server) => {
+            server.set_read_timeout(Some(REQUEST_READ_TIMEOUT));
+            server
+        }
         Err(e) => {
             crate::daemon_health::startup_failed("port_bind", &e.to_string());
             crate::cartographer::Note::new("daemon")
@@ -20360,7 +20406,7 @@ pub fn serve<A: ToSocketAddrs>(
     let bound_addr = server.server_addr().to_ip();
     let mut server = server;
     loop {
-        match run_http_loop(server, &daemon) {
+        match run_http_loop(server, &daemon, HttpLimits::default()) {
             HttpLoopEnd::Shutdown => break,
             HttpLoopEnd::AcceptError(e) => {
                 crate::rlog!(
@@ -20425,6 +20471,7 @@ fn rebind_http_listener(addr: std::net::SocketAddr) -> std::io::Result<tiny_http
     for attempt in 1..=ATTEMPTS {
         match tiny_http::Server::http(addr) {
             Ok(server) => {
+                server.set_read_timeout(Some(REQUEST_READ_TIMEOUT));
                 crate::rlog!(
                     INFO,
                     "ralphus [http] listener rebound on {addr} (attempt {attempt})"
@@ -20450,8 +20497,19 @@ fn rebind_http_listener(addr: std::net::SocketAddr) -> std::io::Result<tiny_http
 /// Does NOT start the scheduler — exposed so tests can bind an ephemeral port
 /// and drive the API without squads executing underneath them.
 pub fn serve_with(server: tiny_http::Server, store: Store, max_concurrent: i64) {
+    serve_with_limits(server, store, max_concurrent, HttpLimits::default());
+}
+
+/// [`serve_with`] with the read path's load-shedding limits (STRESS-006)
+/// set explicitly, so tests can exercise them without real overload.
+pub fn serve_with_limits(
+    server: tiny_http::Server,
+    store: Store,
+    max_concurrent: i64,
+    limits: HttpLimits,
+) {
     let daemon = Arc::new(Daemon::new(store, max_concurrent));
-    run_http_loop(server, &daemon);
+    run_http_loop(server, &daemon, limits);
 }
 
 /// Like [`serve_with`], but requires `token` on every route (RAL-219) —
@@ -20464,7 +20522,7 @@ pub fn serve_with_token(
     token: String,
 ) {
     let daemon = Arc::new(Daemon::new(store, max_concurrent).with_token(token));
-    run_http_loop(server, &daemon);
+    run_http_loop(server, &daemon, HttpLimits::default());
 }
 
 /// The SSE push endpoint (RAL-167). Handled specially in `run_http_loop`
@@ -20653,16 +20711,98 @@ struct PendingRequest {
 /// constantly.
 struct ReadPool {
     tx: std::sync::mpsc::Sender<PendingRequest>,
+    /// Requests queued and not yet picked up by a worker.
+    queued: Arc<std::sync::atomic::AtomicUsize>,
+    /// At most this many may wait (STRESS-006); `None` for no bound.
+    limit: Option<usize>,
+}
+
+/// How many `GET`s may wait for a read worker before more are answered
+/// `503` (STRESS-006, `perf/stress/followups/`). The queue was unbounded:
+/// a herd of 2000 board loads, or clients that sent a board load and hung
+/// up, queued minutes of work no one would read -- the daemon then could
+/// not answer even its health check, and stayed that way after the burst.
+/// At a few hundred ms per board build, this many is already seconds of
+/// waiting; a fast `503` with `Retry-After` serves the client better.
+const READ_QUEUE_LIMIT: usize = 256;
+
+/// A `GET` that waited this long for a worker is answered `503` instead of
+/// being run (STRESS-006): every client the daemon serves has given up by
+/// then (the CLI, MCP and stress clients time out at 10 s; the board backs
+/// off and refreshes), so building its response is work for no one. Writes
+/// are never dropped -- a client must never be told a mutation was refused
+/// after it may already have happened.
+const READ_STALE_AFTER: Duration = Duration::from_secs(10);
+
+/// Why [`ReadPool::try_dispatch`] did not queue a request.
+enum DispatchRefused {
+    /// The pool's queue is at its limit.
+    Full(Box<PendingRequest>),
+    /// Every worker thread has died; answer inline.
+    Closed(Box<PendingRequest>),
+}
+
+/// Answer `503` with `Retry-After` for a read the daemon is shedding.
+fn respond_busy(pending: PendingRequest, why: &str) {
+    let PendingRequest {
+        request,
+        method,
+        url,
+        cors,
+        ..
+    } = pending;
+    let path = url.split('?').next().unwrap_or(&url);
+    if let Some(suppressed) = failure_log_permit(&format!("busy {path}")) {
+        // ralphus[ignore-rlog-pair]: load shedding must never wait on the store lock; this is a transport-level refusal with no state change
+        crate::rlog!(
+            WARNING,
+            "ralphus [http] {method} {path} answered 503: {why}{}",
+            suppressed_suffix(suppressed)
+        );
+    }
+    let mut response = tiny_http::Response::from_string(
+        error(
+            503,
+            "busy",
+            &format!("the daemon is busy ({why}); retry shortly"),
+            vec![],
+        )
+        .body,
+    )
+    .with_status_code(503)
+    .with_header(
+        tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..])
+            .expect("valid header"),
+    )
+    .with_header(
+        tiny_http::Header::from_bytes(&b"Retry-After"[..], &b"1"[..]).expect("valid header"),
+    );
+    if let ralphus_core::cors::CorsDecision::Allowed(origin) = &cors {
+        for h in cors_response_headers(origin) {
+            response = response.with_header(h);
+        }
+    }
+    let _ = request.respond(response);
 }
 
 impl ReadPool {
     /// Spawn `workers` threads draining a shared queue of read requests.
-    fn new(daemon: &Arc<Daemon>, workers: usize) -> Self {
+    /// With `limit`, at most that many requests may wait (see
+    /// [`ReadPool::try_dispatch`]); with `stale_after`, a request that
+    /// waited longer is answered `503` instead of being run.
+    fn new(
+        daemon: &Arc<Daemon>,
+        workers: usize,
+        limit: Option<usize>,
+        stale_after: Option<Duration>,
+    ) -> Self {
         let (tx, rx) = std::sync::mpsc::channel::<PendingRequest>();
         let rx = Arc::new(Mutex::new(rx));
+        let queued = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         for _ in 0..workers {
             let rx = Arc::clone(&rx);
             let daemon = Arc::clone(daemon);
+            let queued = Arc::clone(&queued);
             std::thread::spawn(move || {
                 let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     loop {
@@ -20671,7 +20811,15 @@ impl ReadPool {
                         // and the rest are free the instant it takes a job.
                         let job = rx.lock().expect("read pool mutex poisoned").recv();
                         match job {
-                            Ok(pending) => answer_request(&daemon, pending),
+                            Ok(pending) => {
+                                queued.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                                match stale_after {
+                                    Some(limit) if pending.accepted_at.elapsed() > limit => {
+                                        respond_busy(pending, "the request waited too long");
+                                    }
+                                    _ => answer_request(&daemon, pending),
+                                }
+                            }
                             Err(_) => break,
                         }
                     }
@@ -20691,13 +20839,80 @@ impl ReadPool {
                 }
             });
         }
-        Self { tx }
+        Self { tx, queued, limit }
     }
 
     /// Queue `pending` for a worker, or hand it back if every worker thread
     /// has died (the channel is closed) so the caller can answer it inline.
+    /// Ignores the pool's limit.
     fn dispatch(&self, pending: PendingRequest) -> Option<PendingRequest> {
-        self.tx.send(pending).err().map(|e| e.0)
+        self.queued
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.tx.send(pending).err().map(|e| {
+            self.queued
+                .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            e.0
+        })
+    }
+
+    /// [`ReadPool::dispatch`], refusing when the queue is at the pool's limit.
+    fn try_dispatch(&self, pending: PendingRequest) -> Result<(), DispatchRefused> {
+        if let Some(limit) = self.limit {
+            if self.queued.load(std::sync::atomic::Ordering::Relaxed) >= limit {
+                return Err(DispatchRefused::Full(Box::new(pending)));
+            }
+        }
+        match self.dispatch(pending) {
+            None => Ok(()),
+            Some(returned) => Err(DispatchRefused::Closed(Box::new(returned))),
+        }
+    }
+}
+
+/// The worker pools behind the accept loop.
+struct Pools {
+    /// `GET`s: bounded and shedding stale requests (STRESS-006).
+    read: ReadPool,
+    /// Every other method: one worker, so mutations stay totally ordered.
+    write: ReadPool,
+    /// `GET /api/daemon` alone, so health and liveness checks are answered
+    /// even while the read queue is full of board loads -- "busy" stays
+    /// distinguishable from "down".
+    health: ReadPool,
+}
+
+/// The read-path load-shedding limits (STRESS-006). [`Default`] is what
+/// the daemon runs with; [`serve_with_limits`] exists so tests can shrink
+/// them.
+#[derive(Debug, Clone, Copy)]
+pub struct HttpLimits {
+    /// At most this many `GET`s wait for a read worker; more are `503`.
+    pub read_queue_limit: usize,
+    /// A `GET` that waited longer than this for a worker is `503`.
+    pub read_stale_after: Duration,
+}
+
+impl Default for HttpLimits {
+    fn default() -> Self {
+        Self {
+            read_queue_limit: READ_QUEUE_LIMIT,
+            read_stale_after: READ_STALE_AFTER,
+        }
+    }
+}
+
+impl Pools {
+    fn start(daemon: &Arc<Daemon>, limits: HttpLimits) -> Self {
+        Self {
+            read: ReadPool::new(
+                daemon,
+                READ_WORKERS,
+                Some(limits.read_queue_limit),
+                Some(limits.read_stale_after),
+            ),
+            write: ReadPool::new(daemon, WRITE_WORKERS, None, None),
+            health: ReadPool::new(daemon, 1, None, None),
+        }
     }
 }
 
@@ -21148,29 +21363,119 @@ enum HttpLoopEnd {
 /// (`librarian/src/server.rs`).
 pub const MAX_REQUEST_BODY_BYTES: usize = 32 * 1024 * 1024;
 
-/// Answer `413` for a body over [`MAX_REQUEST_BODY_BYTES`] and close the
-/// connection. `size` is the declared or received length, for the message.
-fn reject_oversized_body(request: tiny_http::Request, method: &str, url: &str, size: usize) {
-    let path = url.split('?').next().unwrap_or(url);
-    if let Some(suppressed) = failure_log_permit(&format!("body-too-large {path}")) {
-        // ralphus[ignore-rlog-pair]: the accept loop must never wait on the store lock, so this size rejection stays text-only
+/// Read timeout applied to every connection the daemon accepts
+/// (STRESS-002). A read that waits this long without data fails, so a
+/// client that stops sending part-way through a request -- or a keep-alive
+/// connection left idle -- can no longer hold a thread forever. Reading a
+/// request's line and headers must also finish within this long of its first
+/// byte (`vendor/tiny_http`'s `Server::set_read_timeout`). Responses,
+/// including the `/api/events` stream, are not affected.
+pub const REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// tiny_http reads a body of at most this many bytes together with the
+/// request's headers, before the request reaches `recv()`; reading it here
+/// never waits on the client. A larger (or chunked) body is read from the
+/// socket as it arrives.
+const EAGER_BODY_BYTES: usize = 1024;
+
+/// How long reading one request body may take in total: the read timeout
+/// plus a second per MiB declared, capped at two minutes. Checked between
+/// reads, each of which is itself bounded by [`REQUEST_READ_TIMEOUT`].
+fn body_read_deadline(declared: Option<usize>) -> Duration {
+    let mib = declared.unwrap_or(0) / (1024 * 1024);
+    (REQUEST_READ_TIMEOUT + Duration::from_secs(mib as u64)).min(Duration::from_secs(120))
+}
+
+/// Why a request body could not be taken.
+#[derive(Debug)]
+enum BodyError {
+    /// More than [`MAX_REQUEST_BODY_BYTES`] arrived (this many bytes so far).
+    TooLarge(usize),
+    /// The client stopped sending before the body was complete.
+    TimedOut,
+}
+
+/// Read a whole request body, enforcing [`MAX_REQUEST_BODY_BYTES`] and
+/// `deadline`. Any other read failure keeps what arrived (logged), and a
+/// body that is not UTF-8 is handled as empty, as the handlers have always
+/// seen it.
+fn read_request_body(
+    request: &mut tiny_http::Request,
+    method: &str,
+    url: &str,
+    deadline: Duration,
+) -> Result<String, BodyError> {
+    let started = Instant::now();
+    let reader = request.as_reader();
+    let mut bytes = Vec::new();
+    let mut chunk = vec![0u8; 64 * 1024];
+    loop {
+        if started.elapsed() > deadline {
+            return Err(BodyError::TimedOut);
+        }
+        match std::io::Read::read(reader, &mut chunk) {
+            Ok(0) => break,
+            Ok(n) => {
+                bytes.extend_from_slice(&chunk[..n]);
+                if bytes.len() > MAX_REQUEST_BODY_BYTES {
+                    return Err(BodyError::TooLarge(bytes.len()));
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                ) =>
+            {
+                return Err(BodyError::TimedOut);
+            }
+            Err(e) => {
+                // ralphus[ignore-rlog-pair]: the accept loop must never wait on the store lock; the handler's own rejection of the truncated body is recorded downstream
+                crate::rlog!(
+                    WARNING,
+                    "ralphus [http] {method} {} request body could not be read in full ({e}); handling what was read ({} bytes)",
+                    url.split('?').next().unwrap_or(url),
+                    bytes.len()
+                );
+                break;
+            }
+        }
+    }
+    Ok(String::from_utf8(bytes).unwrap_or_else(|e| {
+        // ralphus[ignore-rlog-pair]: the accept loop must never wait on the store lock; the handler rejects the empty body downstream
         crate::rlog!(
             WARNING,
-            "ralphus [http] {method} {path} rejected 413: request body of {size} bytes exceeds the {MAX_REQUEST_BODY_BYTES}-byte limit{}",
+            "ralphus [http] {method} {} request body is not UTF-8 ({} bytes); handling it as empty",
+            url.split('?').next().unwrap_or(url),
+            e.as_bytes().len()
+        );
+        String::new()
+    }))
+}
+
+/// Answer a request that is refused before reaching a handler, and close
+/// the connection: the body may be unread.
+fn reject_request(
+    request: tiny_http::Request,
+    method: &str,
+    url: &str,
+    status: u16,
+    code: &str,
+    message: &str,
+) {
+    let path = url.split('?').next().unwrap_or(url);
+    if let Some(suppressed) = failure_log_permit(&format!("reject-{status} {path}")) {
+        // ralphus[ignore-rlog-pair]: the accept loop must never wait on the store lock, so this rejection stays text-only
+        crate::rlog!(
+            WARNING,
+            "ralphus [http] {method} {path} rejected {status}: {message}{}",
             suppressed_suffix(suppressed)
         );
     }
-    let body = error(
-        413,
-        "payload_too_large",
-        &format!(
-            "request body is {size} bytes; the daemon accepts at most {MAX_REQUEST_BODY_BYTES} bytes"
-        ),
-        vec![],
-    )
-    .body;
+    let body = error(status, code, message, vec![]).body;
     let response = tiny_http::Response::from_string(body)
-        .with_status_code(413)
+        .with_status_code(status)
         .with_header(
             tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..])
                 .expect("valid header"),
@@ -21181,11 +21486,116 @@ fn reject_oversized_body(request: tiny_http::Request, method: &str, url: &str, s
     let _ = request.respond(response);
 }
 
-fn run_http_loop(server: tiny_http::Server, daemon: &Arc<Daemon>) -> HttpLoopEnd {
-    let read_pool = ReadPool::new(daemon, READ_WORKERS);
-    let write_pool = ReadPool::new(daemon, WRITE_WORKERS);
+/// Answer `413` for a body over [`MAX_REQUEST_BODY_BYTES`] and close the
+/// connection. `size` is the declared or received length, for the message.
+fn reject_oversized_body(request: tiny_http::Request, method: &str, url: &str, size: usize) {
+    reject_request(
+        request,
+        method,
+        url,
+        413,
+        "payload_too_large",
+        &format!(
+            "request body is {size} bytes; the daemon accepts at most {MAX_REQUEST_BODY_BYTES} bytes"
+        ),
+    );
+}
+
+/// The parts of a request read from its line and headers, carried to
+/// wherever its body is read.
+struct RequestHead {
+    method: String,
+    url: String,
+    traceparent: Option<String>,
+    auth_header: Option<String>,
+    user_header: Option<String>,
+    remote_addr: Option<String>,
+    if_none_match: Option<String>,
+    cors: ralphus_core::cors::CorsDecision,
+}
+
+impl RequestHead {
+    fn into_pending(self, request: tiny_http::Request, body: String) -> PendingRequest {
+        PendingRequest {
+            request,
+            method: self.method,
+            url: self.url,
+            body,
+            traceparent: self.traceparent,
+            auth_header: self.auth_header,
+            user_header: self.user_header,
+            remote_addr: self.remote_addr,
+            if_none_match: self.if_none_match,
+            cors: self.cors,
+            accepted_at: Instant::now(),
+        }
+    }
+}
+
+/// Read `request`'s body and turn it into a [`PendingRequest`], or answer
+/// it with `413`/`408` and return `None`.
+fn take_body(
+    mut request: tiny_http::Request,
+    head: RequestHead,
+    deadline: Duration,
+) -> Option<PendingRequest> {
+    match read_request_body(&mut request, &head.method, &head.url, deadline) {
+        Ok(body) => Some(head.into_pending(request, body)),
+        Err(BodyError::TooLarge(n)) => {
+            reject_oversized_body(request, &head.method, &head.url, n);
+            None
+        }
+        Err(BodyError::TimedOut) => {
+            reject_request(
+                request,
+                &head.method,
+                &head.url,
+                408,
+                "request_timeout",
+                "the request body was not received in time",
+            );
+            None
+        }
+    }
+}
+
+/// Hand a fully read request to the worker that answers it: `GET`s to the
+/// read pool (or the health lane for `/api/daemon`), everything else to the
+/// single write worker, so mutations stay totally ordered. A `GET` arriving
+/// while the read queue is full is answered `503` at once (STRESS-006).
+/// `POST /api/daemon/shutdown` is answered inline -- see `run_http_loop`.
+fn dispatch_pending(daemon: &Arc<Daemon>, pools: &Pools, pending: PendingRequest) {
+    let path = pending.url.split('?').next().unwrap_or(&pending.url);
+    if pending.method == "GET" {
+        let pool = if path == "/api/daemon" {
+            &pools.health
+        } else {
+            &pools.read
+        };
+        match pool.try_dispatch(pending) {
+            Ok(()) => {}
+            Err(DispatchRefused::Full(pending)) => {
+                respond_busy(*pending, "too many requests are already waiting");
+            }
+            // Every worker thread is gone (they all panicked); answering it
+            // inline then is better than dropping the connection on the floor.
+            Err(DispatchRefused::Closed(returned)) => answer_request(daemon, *returned),
+        }
+    } else if pending.method == "POST" && path == "/api/daemon/shutdown" {
+        answer_request(daemon, pending);
+    } else if let Some(returned) = pools.write.dispatch(pending) {
+        answer_request(daemon, returned);
+    }
+}
+
+fn run_http_loop(
+    server: tiny_http::Server,
+    daemon: &Arc<Daemon>,
+    limits: HttpLimits,
+) -> HttpLoopEnd {
+    let pools = Arc::new(Pools::start(daemon, limits));
     loop {
-        let mut request = match server.recv() {
+        let request = match server.recv() {
             Ok(r) => r,
             Err(e) => return HttpLoopEnd::AcceptError(e),
         };
@@ -21302,48 +21712,70 @@ fn run_http_loop(server: tiny_http::Server, daemon: &Arc<Daemon>) -> HttpLoopEnd
 
         // STRESS-001: refuse an oversized body before reading any of it -- by
         // its declared length when there is one, and by what actually
-        // arrives otherwise (chunked, or a length that lied low).
-        if let Some(declared) = request
-            .body_length()
-            .filter(|n| *n > MAX_REQUEST_BODY_BYTES)
-        {
+        // arrives otherwise (chunked, or a length that lied low; see
+        // `read_request_body`).
+        let declared = request.body_length();
+        if let Some(declared) = declared.filter(|n| *n > MAX_REQUEST_BODY_BYTES) {
             reject_oversized_body(request, &method, &url, declared);
             continue;
         }
-        let mut body = String::new();
-        let mut limited = <&mut dyn std::io::Read as std::io::Read>::take(
-            request.as_reader(),
-            MAX_REQUEST_BODY_BYTES as u64 + 1,
-        );
-        let read = std::io::Read::read_to_string(&mut limited, &mut body);
-        if let Err(e) = read {
-            // ralphus[ignore-rlog-pair]: the accept loop must never wait on the store lock; the handler's own rejection of the truncated body is recorded downstream
-            crate::rlog!(
-                WARNING,
-                "ralphus [http] {method} {} request body could not be read in full ({e}); handling what was read ({} bytes)",
-                url.split('?').next().unwrap_or(&url),
-                body.len()
-            );
-        }
-        if body.len() > MAX_REQUEST_BODY_BYTES {
-            let received = body.len();
-            reject_oversized_body(request, &method, &url, received);
-            continue;
-        }
-
-        let pending = PendingRequest {
-            request,
+        let head = RequestHead {
             method,
             url,
-            body,
             traceparent,
             auth_header,
             user_header,
             remote_addr,
             if_none_match,
             cors,
-            accepted_at: Instant::now(),
         };
+        // STRESS-002: this loop is the only thread taking requests, so it
+        // must never wait on a client. A body tiny_http has not already
+        // buffered with the headers (larger than `EAGER_BODY_BYTES`, or
+        // chunked) arrives at the client's pace -- one client that declared
+        // a body and stopped sending froze every request. Such a body is
+        // read on its own thread, under a deadline, and only an
+        // authenticated caller gets that far.
+        let lazy_body = match declared {
+            Some(n) => n > EAGER_BODY_BYTES,
+            None => header_value(&request, "Transfer-Encoding").is_some(),
+        };
+        if lazy_body {
+            if !daemon.authorized(head.auth_header.as_deref()) {
+                reject_request(
+                    request,
+                    &head.method,
+                    &head.url,
+                    401,
+                    "unauthorized",
+                    "missing or invalid bearer token",
+                );
+                continue;
+            }
+            let (daemon, pools) = (Arc::clone(daemon), Arc::clone(&pools));
+            let spawned = std::thread::Builder::new()
+                .name("http-body".to_string())
+                .spawn(move || {
+                    if let Some(pending) = take_body(request, head, body_read_deadline(declared)) {
+                        dispatch_pending(&daemon, &pools, pending);
+                    }
+                });
+            if let Err(e) = spawned {
+                // The request moved into the closure and is dropped with it,
+                // which answers it 500.
+                // ralphus[ignore-rlog-pair]: the accept loop must never wait on the store lock; nothing reached a handler
+                crate::rlog!(
+                    WARNING,
+                    "ralphus [http] could not start a thread to read a request body: {e}"
+                );
+            }
+            continue;
+        }
+        // Already in memory: reading it cannot wait on the client.
+        let Some(pending) = take_body(request, head, body_read_deadline(declared)) else {
+            continue;
+        };
+
         // Read-only requests go to `read_pool` (real concurrency, see
         // `ReadPool`'s doc comment); mutating requests go to `write_pool`
         // (exactly one worker, so they stay totally ordered exactly like
@@ -21357,20 +21789,7 @@ fn run_http_loop(server: tiny_http::Server, daemon: &Arc<Daemon>) -> HttpLoopEnd
         // time that poll runs -- true when the accept loop itself just ran
         // the handler, not guaranteed if a `write_pool` worker is still
         // mid-flight on a separate thread.
-        if pending.method == "GET" {
-            // `dispatch` only hands the request back if every worker thread
-            // is gone (they all panicked); answering it inline then is
-            // better than dropping the connection on the floor.
-            if let Some(returned) = read_pool.dispatch(pending) {
-                answer_request(daemon, returned);
-            }
-        } else if pending.method == "POST"
-            && pending.url.split('?').next().unwrap_or(&pending.url) == "/api/daemon/shutdown"
-        {
-            answer_request(daemon, pending);
-        } else if let Some(returned) = write_pool.dispatch(pending) {
-            answer_request(daemon, returned);
-        }
+        dispatch_pending(daemon, &pools, pending);
         // Requested by `POST /api/daemon/shutdown` (`shutdown()` above).
         // Breaking here — rather than calling `server.unblock()` — is
         // sufficient: this request has already been answered and we simply

@@ -67,7 +67,12 @@
        * poller's success path, once that poller's own data has landed.
        * @returns {void}
        */
-      const markUpdated = () => { byId("updated").textContent = "updated " + new Date().toLocaleTimeString(); };
+      const markUpdated = () => {
+        // While the daemon is shedding load, the data on screen is not fresh:
+        // keep the "busy" notice up rather than stamping a new time.
+        if (daemonBusyWaitMs() > 0) return;
+        byId("updated").textContent = "updated " + new Date().toLocaleTimeString();
+      };
       /**
        * Marks the board as unable to reach the daemon: clears the connection dot
        * and replaces the freshness stamp, so a stale time is never left standing
@@ -75,6 +80,52 @@
        * @returns {void}
        */
       const markUnreachable = () => { byId("conn").className = "dot off"; byId("updated").textContent = "daemon unreachable"; };
+      // RALPHUS-DAEMON-BUSY:BEGIN
+      /**
+       * STRESS-006: when its read queue is full, or a read waited past the
+       * point any client would still be listening, the daemon answers `503`
+       * with `Retry-After` instead of queueing more work. Without backing off,
+       * every open tab would retry on every pushed event and keep it saturated.
+       * Returns how long to hold off before the next refresh: `Retry-After`
+       * (at least 1 s), doubled per consecutive `503` up to 30 s, plus up to
+       * 25% jitter so tabs do not retry in lockstep.
+       * @param {number} streak - consecutive `503`s, including this one (>= 1).
+       * @param {number} retryAfterSeconds - the response's `Retry-After`, or 0.
+       * @param {number} jitter01 - a random number in [0, 1).
+       * @returns {number} milliseconds to wait.
+       */
+      const daemonBusyDelayMs = (streak, retryAfterSeconds, jitter01) => {
+        const doublings = Math.min(Math.max(streak - 1, 0), 5);
+        const base = Math.min(Math.max(retryAfterSeconds, 1) * 1000 * 2 ** doublings, 30000);
+        return Math.round(base * (1 + 0.25 * jitter01));
+      };
+      /** Epoch ms before which refreshes hold off (0: the daemon is not busy). */
+      let daemonBusyUntil = 0;
+      /** Consecutive `503` answers, for `daemonBusyDelayMs`'s backoff. */
+      let daemonBusyStreak = 0;
+      /**
+       * How long refreshes should still hold off, in ms (0 when not busy).
+       * @returns {number}
+       */
+      const daemonBusyWaitMs = () => Math.max(0, daemonBusyUntil - Date.now());
+      /**
+       * Records a `503` from the daemon: backs off, and says so in place of the
+       * freshness stamp so stale data is never presented as current.
+       * @param {Response} res
+       * @returns {void}
+       */
+      const noteDaemonBusy = (res) => {
+        daemonBusyStreak += 1;
+        const delay = daemonBusyDelayMs(daemonBusyStreak, Number(res.headers.get("Retry-After")) || 0, Math.random());
+        daemonBusyUntil = Date.now() + delay;
+        byId("updated").textContent = `daemon busy — retrying in ${Math.ceil(delay / 1000)}s`;
+      };
+      /**
+       * Records that the daemon answered normally again, ending any backoff.
+       * @returns {void}
+       */
+      const noteDaemonAnswered = () => { daemonBusyStreak = 0; daemonBusyUntil = 0; };
+      // RALPHUS-DAEMON-BUSY:END
 
       // ---- ralphus URI scheme (RAL-188) ----
       // One self-describing way to address any squad/task/cell/proof or
@@ -777,6 +828,10 @@ The daemon will mark it failed automatically if nothing happens; restart the cel
         const known = etagByPath[path];
         if (known) headers["If-None-Match"] = known;
         const res = await fetch(path, { headers, cache: "no-store" });
+        // STRESS-006: the daemon is shedding load. Keep what is on screen
+        // (`changed: false`) and back off -- see `noteDaemonBusy`.
+        if (res.status === 503) { noteDaemonBusy(res); return { changed: false, data: null }; }
+        noteDaemonAnswered();
         if (res.status === 304) return { changed: false, data: null };
         if (!res.ok) return { changed: true, data: null };
         const tag = res.headers.get("ETag");

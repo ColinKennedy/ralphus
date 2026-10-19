@@ -266,7 +266,7 @@ fn validate_profile_fields(
 /// # Errors
 /// Propagates any SQLite failure.
 pub fn list_agent_profiles_conn(conn: &rusqlite::Connection) -> StoreResult<Vec<AgentProfileView>> {
-    let mut stmt = conn.prepare(
+    let mut stmt = conn.prepare_cached(
         "SELECT name, backend, executable, model, env_json, thinking_capable, created_at_ms, updated_at_ms
          FROM agent_profiles ORDER BY name",
     )?;

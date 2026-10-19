@@ -44,7 +44,9 @@ ralphus-shell-syntax = { path = "../shell-syntax" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 toml = { workspace = true }
-rusqlite = { workspace = true }
+# `hooks`: the writer's commit hook drives `response_cache`'s data
+# generation (STRESS-003). No extra dependencies.
+rusqlite = { workspace = true, features = ["hooks"] }
 parking_lot = { workspace = true }
 tiny_http = { workspace = true }
 ureq = { workspace = true, features = ["tls"] }
