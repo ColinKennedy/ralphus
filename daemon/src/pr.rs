@@ -1859,6 +1859,56 @@ impl Store {
         Ok(())
     }
 
+    /// Save forge conditional-request cache entries
+    /// ([`crate::forge::take_changed_etag_entries`]) and prune the table to
+    /// the in-memory cache's cap, newest kept.
+    pub(crate) fn save_forge_etags(&self, entries: &[crate::forge::EtagEntry]) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT OR REPLACE INTO forge_etag_cache(cache_key, etag, body, stored_at_ms)
+                 VALUES(?,?,?,?)",
+            )?;
+            let now = now_ms();
+            for (key, etag, body) in entries {
+                stmt.execute(params![key, etag, body.to_string(), now])?;
+            }
+        }
+        tx.execute(
+            "DELETE FROM forge_etag_cache WHERE cache_key NOT IN (
+                 SELECT cache_key FROM forge_etag_cache
+                 ORDER BY stored_at_ms DESC LIMIT ?)",
+            params![i64::try_from(crate::forge::FORGE_ETAG_CACHE_MAX_ENTRIES).unwrap_or(i64::MAX)],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Every saved forge conditional-request cache entry, newest first. A row
+    /// whose body no longer parses is skipped.
+    pub(crate) fn load_forge_etags(&self) -> Result<Vec<crate::forge::EtagEntry>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT cache_key, etag, body FROM forge_etag_cache ORDER BY stored_at_ms DESC",
+        )?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|(key, etag, body)| {
+                serde_json::from_str(&body)
+                    .ok()
+                    .map(|body| (key, etag, body))
+            })
+            .collect())
+    }
+
     /// The forge ids of the comments stored for one PR endpoint
     /// ([`Self::replace_pr_forge_comments`]), sorted.
     pub(crate) fn pr_forge_comment_ids(&self, pr_id: &str, endpoint: &str) -> Result<Vec<String>> {
@@ -7664,6 +7714,7 @@ pub fn spawn_pr_base_drift_poller(store: crate::store_lock::StoreHandle) {
         },
         std::sync::Arc::clone(&store),
         std::sync::Arc::new(move || {
+            restore_forge_etags(&store);
             let mut last_full_cycle: Option<std::time::Instant> = None;
             loop {
                 let cache_cfg = crate::config::load_pr_cache_config();
@@ -7710,9 +7761,43 @@ pub fn spawn_pr_base_drift_poller(store: crate::store_lock::StoreHandle) {
                         "ralphus [pr] forge poll cycle panicked; the poller continues with the next cycle"
                     );
                 }
+                persist_forge_etags(&store);
             }
         }),
     );
+}
+
+/// Load the forge client's saved conditional-request cache, so the first
+/// polls after a restart can still get free `304`s.
+fn restore_forge_etags(store: &crate::store_lock::StoreHandle) {
+    let loaded = store.lock().load_forge_etags();
+    match loaded {
+        Ok(entries) => {
+            let count = entries.len();
+            crate::forge::seed_etag_cache(entries);
+            // ralphus[ignore-rlog-pair]: startup cache warm-up detail, no workflow outcome to record
+            crate::rlog!(
+                DEBUG,
+                "ralphus [pr] restored {count} forge conditional-request cache entries"
+            );
+        }
+        // ralphus[ignore-rlog-pair]: a lost cache only costs unconditional fetches; no workflow outcome to record
+        Err(e) => crate::rlog!(
+            WARNING,
+            "ralphus [pr] could not restore the forge conditional-request cache: {e}"
+        ),
+    }
+}
+
+/// Save the forge client's conditional-request cache entries changed since
+/// the last call ([`restore_forge_etags`] reads them back).
+fn persist_forge_etags(store: &crate::store_lock::StoreHandle) {
+    let entries = crate::forge::take_changed_etag_entries();
+    if entries.is_empty() {
+        return;
+    }
+    let result = store.lock().save_forge_etags(&entries);
+    warn_on_store_write(store, "save_forge_etags", "-", false, result);
 }
 
 // ---------------------------------------------------------------------------
@@ -24593,6 +24678,37 @@ token_env = "RALPHUS_TEST_FORGE_TOKEN"
             )
             .unwrap();
         (gid, pr_id)
+    }
+
+    /// Saved forge ETag entries load back newest first, a re-save replaces a
+    /// key in place, and the table never holds more than the cache's cap.
+    #[test]
+    fn forge_etags_round_trip_and_stay_within_the_cap() {
+        let s = store();
+        let entry = |key: &str, etag: &str| {
+            (
+                key.to_string(),
+                etag.to_string(),
+                serde_json::json!({"key": key}),
+            )
+        };
+        s.save_forge_etags(&[entry("a", "\"1\""), entry("b", "\"1\"")])
+            .unwrap();
+        s.save_forge_etags(&[entry("a", "\"2\"")]).unwrap();
+        let loaded = s.load_forge_etags().unwrap();
+        assert_eq!(loaded.len(), 2);
+        let a = loaded.iter().find(|(k, _, _)| k == "a").unwrap();
+        assert_eq!(a.1, "\"2\"");
+        assert_eq!(a.2, serde_json::json!({"key": "a"}));
+
+        let many: Vec<_> = (0..crate::forge::FORGE_ETAG_CACHE_MAX_ENTRIES + 5)
+            .map(|i| entry(&format!("k{i}"), "\"e\""))
+            .collect();
+        s.save_forge_etags(&many).unwrap();
+        assert_eq!(
+            s.load_forge_etags().unwrap().len(),
+            crate::forge::FORGE_ETAG_CACHE_MAX_ENTRIES
+        );
     }
 
     /// A PR holding a full page of comments is re-read in full (no ETag, since

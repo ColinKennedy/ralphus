@@ -2584,6 +2584,16 @@ impl Store {
                 feedback_applied_at_ms INTEGER,
                 feedback_outcome       TEXT
             );
+            -- The forge client's conditional-request cache
+            -- (`forge::FORGE_ETAG_CACHE`): per token hash + URL, the last
+            -- ETag and response body, so a restarted daemon can still get
+            -- free `304`s. Only a saved call: losing a row costs one fetch.
+            CREATE TABLE IF NOT EXISTS forge_etag_cache (
+                cache_key    TEXT PRIMARY KEY,
+                etag         TEXT NOT NULL,
+                body         TEXT NOT NULL,
+                stored_at_ms INTEGER NOT NULL
+            );
             -- RAL-366: the set of PR comments/notes last fetched by the
             -- background poller -- id/author/timestamp only, deliberately
             -- never the body text, so no reviewer-written feedback lands at

@@ -3660,6 +3660,10 @@ impl ForgeClient {
                         {
                             cache.clear();
                         }
+                        FORGE_ETAG_DIRTY
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .insert(key.clone());
                         cache.insert(key, (etag, value.clone()));
                     }
                     None => {
@@ -4023,15 +4027,59 @@ static FAILED_PIPELINE_CACHE: std::sync::LazyLock<Mutex<HashMap<String, PrFailur
     std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// Cap on [`FORGE_ETAG_CACHE`]; the cache is emptied when it fills, since an
-/// entry is only a saved call and any miss simply refetches.
-const FORGE_ETAG_CACHE_MAX_ENTRIES: usize = 2048;
+/// entry is only a saved call and any miss simply refetches. The saved copy
+/// is pruned to the same size.
+pub(crate) const FORGE_ETAG_CACHE_MAX_ENTRIES: usize = 2048;
 
 /// `(ETag, body)` of the last `200` for a conditional forge read
 /// ([`ForgeClient::get_cached`]), keyed by [`ForgeClient::rate_limit_key`] plus
-/// the request URL. Lives in memory only: losing it on restart costs one
-/// unconditional fetch per URL.
+/// the request URL. The daemon saves changed entries to SQLite
+/// ([`take_changed_etag_entries`]) and loads them back at startup
+/// ([`seed_etag_cache`]), so a restart does not start cold.
 static FORGE_ETAG_CACHE: std::sync::LazyLock<Mutex<HashMap<String, (String, serde_json::Value)>>> =
     std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Keys of [`FORGE_ETAG_CACHE`] entries written since the last
+/// [`take_changed_etag_entries`].
+static FORGE_ETAG_DIRTY: std::sync::LazyLock<Mutex<std::collections::HashSet<String>>> =
+    std::sync::LazyLock::new(|| Mutex::new(std::collections::HashSet::new()));
+
+/// One saved [`FORGE_ETAG_CACHE`] entry: key, ETag and response body.
+pub(crate) type EtagEntry = (String, String, serde_json::Value);
+
+/// The cache entries written since the last call, for the daemon to save.
+/// Entries evicted since (the cache empties when full) are skipped.
+pub(crate) fn take_changed_etag_entries() -> Vec<EtagEntry> {
+    let keys: Vec<String> = FORGE_ETAG_DIRTY
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .drain()
+        .collect();
+    let cache = FORGE_ETAG_CACHE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    keys.into_iter()
+        .filter_map(|key| {
+            cache
+                .get(&key)
+                .map(|(etag, body)| (key, etag.clone(), body.clone()))
+        })
+        .collect()
+}
+
+/// Load saved entries into the cache (at startup), up to its cap. An entry
+/// already in memory is newer and is kept.
+pub(crate) fn seed_etag_cache(entries: Vec<EtagEntry>) {
+    let mut cache = FORGE_ETAG_CACHE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    for (key, etag, body) in entries {
+        if cache.len() >= FORGE_ETAG_CACHE_MAX_ENTRIES {
+            break;
+        }
+        cache.entry(key).or_insert((etag, body));
+    }
+}
 
 /// The most recent `X-RateLimit-*` reading for a GitHub token: what the board
 /// shows as "N of M calls left, resets at ...".
@@ -9684,6 +9732,48 @@ mod tests {
             }),
             "both failed jobs -- not just the first -- must be captured, each with its own trace"
         );
+        mock.finish();
+    }
+
+    /// A cached read marks its entry changed; a restored entry lets the very
+    /// first read after a restart send `If-None-Match` and replay on a 304.
+    #[test]
+    fn a_restored_etag_entry_answers_the_first_read_after_a_restart() {
+        let mock = MockForge::start(move |server| {
+            let first = server.recv();
+            first
+                .respond(
+                    tiny_http::Response::from_string(r#"{"state":"open","merged":false}"#)
+                        .with_status_code(200)
+                        .with_header(
+                            tiny_http::Header::from_bytes(&b"ETag"[..], &b"\"r1\""[..]).unwrap(),
+                        ),
+                )
+                .unwrap();
+            let second = server.recv();
+            assert_eq!(
+                req_header(&second, "If-None-Match").as_deref(),
+                Some("\"r1\"")
+            );
+            second
+                .respond(tiny_http::Response::from_string("").with_status_code(304))
+                .unwrap();
+        });
+        let client = mock.client(ForgeKind::GitHub, "acme/restore");
+        client.get_pull_request_live(5).unwrap();
+        let saved: Vec<EtagEntry> = take_changed_etag_entries()
+            .into_iter()
+            .filter(|(key, _, _)| key.ends_with("/repos/acme/restore/pulls/5"))
+            .collect();
+        assert_eq!(saved.len(), 1, "the 200 marked its entry changed");
+        // Simulate a restart: the in-memory cache is gone, the saved copy is
+        // loaded back.
+        FORGE_ETAG_CACHE
+            .lock()
+            .unwrap()
+            .retain(|key, _| !key.ends_with("/repos/acme/restore/pulls/5"));
+        seed_etag_cache(saved);
+        assert_eq!(client.get_pull_request_live(5).unwrap().state, "open");
         mock.finish();
     }
 
