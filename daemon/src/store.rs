@@ -6332,9 +6332,12 @@ impl Store {
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .map(|s| format!("%{}%", escape_like(s)));
-        // `?1` is the search pattern when there is one.
+        // `?1` is the search pattern when there is one: the squad's id,
+        // label, or any of its task names.
         let search = if pattern.is_some() {
-            " AND (id LIKE ?1 ESCAPE '\\' OR COALESCE(label, '') LIKE ?1 ESCAPE '\\')"
+            " AND (id LIKE ?1 ESCAPE '\\' OR COALESCE(label, '') LIKE ?1 ESCAPE '\\' \
+             OR EXISTS (SELECT 1 FROM tasks t WHERE t.squad_id = squads.id \
+             AND t.name LIKE ?1 ESCAPE '\\'))"
         } else {
             ""
         };

@@ -232,8 +232,9 @@
        */
       const boardSearchUrl = (path, q) => `${boardWindowUrl(path)}&q=${encodeURIComponent(q)}`;
       /**
-       * Whether a squad's id or label contains `needle` (already lowercased),
-       * the same match the daemon's `q` makes.
+       * Whether a squad's id or label contains `needle` (already lowercased):
+       * the squad-level half of the daemon's `q`, which also matches task
+       * names.
        * @param {{id: string, label?: string|null}} squad
        * @param {string} needle
        * @returns {boolean}
