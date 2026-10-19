@@ -20072,7 +20072,10 @@ pub fn serve<A: ToSocketAddrs>(
     // failing here on the bind, corrupting state without ever serving a
     // request. Binding first makes that race fail closed instead.
     let server = match tiny_http::Server::http(addr) {
-        Ok(server) => server,
+        Ok(server) => {
+            server.set_read_timeout(Some(REQUEST_READ_TIMEOUT));
+            server
+        }
         Err(e) => {
             crate::daemon_health::startup_failed("port_bind", &e.to_string());
             crate::cartographer::Note::new("daemon")
@@ -20425,6 +20428,7 @@ fn rebind_http_listener(addr: std::net::SocketAddr) -> std::io::Result<tiny_http
     for attempt in 1..=ATTEMPTS {
         match tiny_http::Server::http(addr) {
             Ok(server) => {
+                server.set_read_timeout(Some(REQUEST_READ_TIMEOUT));
                 crate::rlog!(
                     INFO,
                     "ralphus [http] listener rebound on {addr} (attempt {attempt})"
@@ -21148,29 +21152,119 @@ enum HttpLoopEnd {
 /// (`librarian/src/server.rs`).
 pub const MAX_REQUEST_BODY_BYTES: usize = 32 * 1024 * 1024;
 
-/// Answer `413` for a body over [`MAX_REQUEST_BODY_BYTES`] and close the
-/// connection. `size` is the declared or received length, for the message.
-fn reject_oversized_body(request: tiny_http::Request, method: &str, url: &str, size: usize) {
-    let path = url.split('?').next().unwrap_or(url);
-    if let Some(suppressed) = failure_log_permit(&format!("body-too-large {path}")) {
-        // ralphus[ignore-rlog-pair]: the accept loop must never wait on the store lock, so this size rejection stays text-only
+/// Read timeout applied to every connection the daemon accepts
+/// (STRESS-002). A read that waits this long without data fails, so a
+/// client that stops sending part-way through a request -- or a keep-alive
+/// connection left idle -- can no longer hold a thread forever. Reading a
+/// request's line and headers must also finish within this long of its first
+/// byte (`vendor/tiny_http`'s `Server::set_read_timeout`). Responses,
+/// including the `/api/events` stream, are not affected.
+pub const REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// tiny_http reads a body of at most this many bytes together with the
+/// request's headers, before the request reaches `recv()`; reading it here
+/// never waits on the client. A larger (or chunked) body is read from the
+/// socket as it arrives.
+const EAGER_BODY_BYTES: usize = 1024;
+
+/// How long reading one request body may take in total: the read timeout
+/// plus a second per MiB declared, capped at two minutes. Checked between
+/// reads, each of which is itself bounded by [`REQUEST_READ_TIMEOUT`].
+fn body_read_deadline(declared: Option<usize>) -> Duration {
+    let mib = declared.unwrap_or(0) / (1024 * 1024);
+    (REQUEST_READ_TIMEOUT + Duration::from_secs(mib as u64)).min(Duration::from_secs(120))
+}
+
+/// Why a request body could not be taken.
+#[derive(Debug)]
+enum BodyError {
+    /// More than [`MAX_REQUEST_BODY_BYTES`] arrived (this many bytes so far).
+    TooLarge(usize),
+    /// The client stopped sending before the body was complete.
+    TimedOut,
+}
+
+/// Read a whole request body, enforcing [`MAX_REQUEST_BODY_BYTES`] and
+/// `deadline`. Any other read failure keeps what arrived (logged), and a
+/// body that is not UTF-8 is handled as empty, as the handlers have always
+/// seen it.
+fn read_request_body(
+    request: &mut tiny_http::Request,
+    method: &str,
+    url: &str,
+    deadline: Duration,
+) -> Result<String, BodyError> {
+    let started = Instant::now();
+    let reader = request.as_reader();
+    let mut bytes = Vec::new();
+    let mut chunk = vec![0u8; 64 * 1024];
+    loop {
+        if started.elapsed() > deadline {
+            return Err(BodyError::TimedOut);
+        }
+        match std::io::Read::read(reader, &mut chunk) {
+            Ok(0) => break,
+            Ok(n) => {
+                bytes.extend_from_slice(&chunk[..n]);
+                if bytes.len() > MAX_REQUEST_BODY_BYTES {
+                    return Err(BodyError::TooLarge(bytes.len()));
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                ) =>
+            {
+                return Err(BodyError::TimedOut);
+            }
+            Err(e) => {
+                // ralphus[ignore-rlog-pair]: the accept loop must never wait on the store lock; the handler's own rejection of the truncated body is recorded downstream
+                crate::rlog!(
+                    WARNING,
+                    "ralphus [http] {method} {} request body could not be read in full ({e}); handling what was read ({} bytes)",
+                    url.split('?').next().unwrap_or(url),
+                    bytes.len()
+                );
+                break;
+            }
+        }
+    }
+    Ok(String::from_utf8(bytes).unwrap_or_else(|e| {
+        // ralphus[ignore-rlog-pair]: the accept loop must never wait on the store lock; the handler rejects the empty body downstream
         crate::rlog!(
             WARNING,
-            "ralphus [http] {method} {path} rejected 413: request body of {size} bytes exceeds the {MAX_REQUEST_BODY_BYTES}-byte limit{}",
+            "ralphus [http] {method} {} request body is not UTF-8 ({} bytes); handling it as empty",
+            url.split('?').next().unwrap_or(url),
+            e.as_bytes().len()
+        );
+        String::new()
+    }))
+}
+
+/// Answer a request that is refused before reaching a handler, and close
+/// the connection: the body may be unread.
+fn reject_request(
+    request: tiny_http::Request,
+    method: &str,
+    url: &str,
+    status: u16,
+    code: &str,
+    message: &str,
+) {
+    let path = url.split('?').next().unwrap_or(url);
+    if let Some(suppressed) = failure_log_permit(&format!("reject-{status} {path}")) {
+        // ralphus[ignore-rlog-pair]: the accept loop must never wait on the store lock, so this rejection stays text-only
+        crate::rlog!(
+            WARNING,
+            "ralphus [http] {method} {path} rejected {status}: {message}{}",
             suppressed_suffix(suppressed)
         );
     }
-    let body = error(
-        413,
-        "payload_too_large",
-        &format!(
-            "request body is {size} bytes; the daemon accepts at most {MAX_REQUEST_BODY_BYTES} bytes"
-        ),
-        vec![],
-    )
-    .body;
+    let body = error(status, code, message, vec![]).body;
     let response = tiny_http::Response::from_string(body)
-        .with_status_code(413)
+        .with_status_code(status)
         .with_header(
             tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..])
                 .expect("valid header"),
@@ -21181,11 +21275,110 @@ fn reject_oversized_body(request: tiny_http::Request, method: &str, url: &str, s
     let _ = request.respond(response);
 }
 
+/// Answer `413` for a body over [`MAX_REQUEST_BODY_BYTES`] and close the
+/// connection. `size` is the declared or received length, for the message.
+fn reject_oversized_body(request: tiny_http::Request, method: &str, url: &str, size: usize) {
+    reject_request(
+        request,
+        method,
+        url,
+        413,
+        "payload_too_large",
+        &format!(
+            "request body is {size} bytes; the daemon accepts at most {MAX_REQUEST_BODY_BYTES} bytes"
+        ),
+    );
+}
+
+/// The parts of a request read from its line and headers, carried to
+/// wherever its body is read.
+struct RequestHead {
+    method: String,
+    url: String,
+    traceparent: Option<String>,
+    auth_header: Option<String>,
+    user_header: Option<String>,
+    remote_addr: Option<String>,
+    if_none_match: Option<String>,
+    cors: ralphus_core::cors::CorsDecision,
+}
+
+impl RequestHead {
+    fn into_pending(self, request: tiny_http::Request, body: String) -> PendingRequest {
+        PendingRequest {
+            request,
+            method: self.method,
+            url: self.url,
+            body,
+            traceparent: self.traceparent,
+            auth_header: self.auth_header,
+            user_header: self.user_header,
+            remote_addr: self.remote_addr,
+            if_none_match: self.if_none_match,
+            cors: self.cors,
+            accepted_at: Instant::now(),
+        }
+    }
+}
+
+/// Read `request`'s body and turn it into a [`PendingRequest`], or answer
+/// it with `413`/`408` and return `None`.
+fn take_body(
+    mut request: tiny_http::Request,
+    head: RequestHead,
+    deadline: Duration,
+) -> Option<PendingRequest> {
+    match read_request_body(&mut request, &head.method, &head.url, deadline) {
+        Ok(body) => Some(head.into_pending(request, body)),
+        Err(BodyError::TooLarge(n)) => {
+            reject_oversized_body(request, &head.method, &head.url, n);
+            None
+        }
+        Err(BodyError::TimedOut) => {
+            reject_request(
+                request,
+                &head.method,
+                &head.url,
+                408,
+                "request_timeout",
+                "the request body was not received in time",
+            );
+            None
+        }
+    }
+}
+
+/// Hand a fully read request to the worker that answers it: `GET`s to the
+/// read pool, everything else to the single write worker, so mutations stay
+/// totally ordered. `POST /api/daemon/shutdown` is answered inline -- see
+/// `run_http_loop`.
+fn dispatch_pending(
+    daemon: &Arc<Daemon>,
+    read_pool: &ReadPool,
+    write_pool: &ReadPool,
+    pending: PendingRequest,
+) {
+    if pending.method == "GET" {
+        // `dispatch` only hands the request back if every worker thread is
+        // gone (they all panicked); answering it inline then is better than
+        // dropping the connection on the floor.
+        if let Some(returned) = read_pool.dispatch(pending) {
+            answer_request(daemon, returned);
+        }
+    } else if pending.method == "POST"
+        && pending.url.split('?').next().unwrap_or(&pending.url) == "/api/daemon/shutdown"
+    {
+        answer_request(daemon, pending);
+    } else if let Some(returned) = write_pool.dispatch(pending) {
+        answer_request(daemon, returned);
+    }
+}
+
 fn run_http_loop(server: tiny_http::Server, daemon: &Arc<Daemon>) -> HttpLoopEnd {
-    let read_pool = ReadPool::new(daemon, READ_WORKERS);
-    let write_pool = ReadPool::new(daemon, WRITE_WORKERS);
+    let read_pool = Arc::new(ReadPool::new(daemon, READ_WORKERS));
+    let write_pool = Arc::new(ReadPool::new(daemon, WRITE_WORKERS));
     loop {
-        let mut request = match server.recv() {
+        let request = match server.recv() {
             Ok(r) => r,
             Err(e) => return HttpLoopEnd::AcceptError(e),
         };
@@ -21302,48 +21495,74 @@ fn run_http_loop(server: tiny_http::Server, daemon: &Arc<Daemon>) -> HttpLoopEnd
 
         // STRESS-001: refuse an oversized body before reading any of it -- by
         // its declared length when there is one, and by what actually
-        // arrives otherwise (chunked, or a length that lied low).
-        if let Some(declared) = request
-            .body_length()
-            .filter(|n| *n > MAX_REQUEST_BODY_BYTES)
-        {
+        // arrives otherwise (chunked, or a length that lied low; see
+        // `read_request_body`).
+        let declared = request.body_length();
+        if let Some(declared) = declared.filter(|n| *n > MAX_REQUEST_BODY_BYTES) {
             reject_oversized_body(request, &method, &url, declared);
             continue;
         }
-        let mut body = String::new();
-        let mut limited = <&mut dyn std::io::Read as std::io::Read>::take(
-            request.as_reader(),
-            MAX_REQUEST_BODY_BYTES as u64 + 1,
-        );
-        let read = std::io::Read::read_to_string(&mut limited, &mut body);
-        if let Err(e) = read {
-            // ralphus[ignore-rlog-pair]: the accept loop must never wait on the store lock; the handler's own rejection of the truncated body is recorded downstream
-            crate::rlog!(
-                WARNING,
-                "ralphus [http] {method} {} request body could not be read in full ({e}); handling what was read ({} bytes)",
-                url.split('?').next().unwrap_or(&url),
-                body.len()
-            );
-        }
-        if body.len() > MAX_REQUEST_BODY_BYTES {
-            let received = body.len();
-            reject_oversized_body(request, &method, &url, received);
-            continue;
-        }
-
-        let pending = PendingRequest {
-            request,
+        let head = RequestHead {
             method,
             url,
-            body,
             traceparent,
             auth_header,
             user_header,
             remote_addr,
             if_none_match,
             cors,
-            accepted_at: Instant::now(),
         };
+        // STRESS-002: this loop is the only thread taking requests, so it
+        // must never wait on a client. A body tiny_http has not already
+        // buffered with the headers (larger than `EAGER_BODY_BYTES`, or
+        // chunked) arrives at the client's pace -- one client that declared
+        // a body and stopped sending froze every request. Such a body is
+        // read on its own thread, under a deadline, and only an
+        // authenticated caller gets that far.
+        let lazy_body = match declared {
+            Some(n) => n > EAGER_BODY_BYTES,
+            None => header_value(&request, "Transfer-Encoding").is_some(),
+        };
+        if lazy_body {
+            if !daemon.authorized(head.auth_header.as_deref()) {
+                reject_request(
+                    request,
+                    &head.method,
+                    &head.url,
+                    401,
+                    "unauthorized",
+                    "missing or invalid bearer token",
+                );
+                continue;
+            }
+            let (daemon, read_pool, write_pool) = (
+                Arc::clone(daemon),
+                Arc::clone(&read_pool),
+                Arc::clone(&write_pool),
+            );
+            let spawned = std::thread::Builder::new()
+                .name("http-body".to_string())
+                .spawn(move || {
+                    if let Some(pending) = take_body(request, head, body_read_deadline(declared)) {
+                        dispatch_pending(&daemon, &read_pool, &write_pool, pending);
+                    }
+                });
+            if let Err(e) = spawned {
+                // The request moved into the closure and is dropped with it,
+                // which answers it 500.
+                // ralphus[ignore-rlog-pair]: the accept loop must never wait on the store lock; nothing reached a handler
+                crate::rlog!(
+                    WARNING,
+                    "ralphus [http] could not start a thread to read a request body: {e}"
+                );
+            }
+            continue;
+        }
+        // Already in memory: reading it cannot wait on the client.
+        let Some(pending) = take_body(request, head, body_read_deadline(declared)) else {
+            continue;
+        };
+
         // Read-only requests go to `read_pool` (real concurrency, see
         // `ReadPool`'s doc comment); mutating requests go to `write_pool`
         // (exactly one worker, so they stay totally ordered exactly like
@@ -21357,20 +21576,7 @@ fn run_http_loop(server: tiny_http::Server, daemon: &Arc<Daemon>) -> HttpLoopEnd
         // time that poll runs -- true when the accept loop itself just ran
         // the handler, not guaranteed if a `write_pool` worker is still
         // mid-flight on a separate thread.
-        if pending.method == "GET" {
-            // `dispatch` only hands the request back if every worker thread
-            // is gone (they all panicked); answering it inline then is
-            // better than dropping the connection on the floor.
-            if let Some(returned) = read_pool.dispatch(pending) {
-                answer_request(daemon, returned);
-            }
-        } else if pending.method == "POST"
-            && pending.url.split('?').next().unwrap_or(&pending.url) == "/api/daemon/shutdown"
-        {
-            answer_request(daemon, pending);
-        } else if let Some(returned) = write_pool.dispatch(pending) {
-            answer_request(daemon, returned);
-        }
+        dispatch_pending(daemon, &read_pool, &write_pool, pending);
         // Requested by `POST /api/daemon/shutdown` (`shutdown()` above).
         // Breaking here — rather than calling `server.unblock()` — is
         // sufficient: this request has already been answered and we simply

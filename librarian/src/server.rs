@@ -483,6 +483,7 @@ pub fn serve(port: u16, daemon_url: &str) -> std::io::Result<()> {
     let bind_host = crate::resolve_bind_host(std::env::var(crate::BIND_ADDR_ENV).ok().as_deref());
     let mut server = tiny_http::Server::http((bind_host.as_str(), port))
         .map_err(|e| std::io::Error::other(e.to_string()))?;
+    server.set_read_timeout(Some(REQUEST_READ_TIMEOUT));
     // tiny_http 0.12 treats any accept() error as fatal: its accept thread
     // reports the error via the `log` crate (no logger is installed here, so
     // the message vanishes) and exits, after which [`serve_with`]'s loop ends.
@@ -511,6 +512,7 @@ fn rebind_listener(bind_host: &str, port: u16) -> std::io::Result<tiny_http::Ser
     for attempt in 1..=ATTEMPTS {
         match tiny_http::Server::http((bind_host, port)) {
             Ok(server) => {
+                server.set_read_timeout(Some(REQUEST_READ_TIMEOUT));
                 eprintln!(
                     "ralphus-librarian: listener rebound on {bind_host}:{port} (attempt {attempt})"
                 );
@@ -557,6 +559,13 @@ pub fn serve_with(server: tiny_http::Server, daemon_url: &str) {
 /// Handle one accepted request end to end: CORS gating, `OPTIONS` preflight,
 /// the SSE stream, or an ordinary proxied call -- exactly the branches
 /// [`serve_with`] used to run inline, now run on that request's own thread.
+/// Read timeout for every connection the librarian accepts (STRESS-002),
+/// the same as the daemon's `REQUEST_READ_TIMEOUT`: a read that waits this
+/// long without data fails, so a stalled client releases its thread, and an
+/// idle keep-alive connection is closed. Responses (the SSE stream included)
+/// are unaffected.
+pub const REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Largest request body the librarian will read and forward (STRESS-001),
 /// the same limit the daemon enforces (`MAX_REQUEST_BODY_BYTES` in
 /// `daemon/src/server.rs`). A larger body is answered `413` unread.
@@ -662,6 +671,23 @@ fn handle_request(mut request: tiny_http::Request, daemon_url: &str) {
         eprintln!(
             "ralphus-librarian [proxy] could not read request body {method} {path} error={e}"
         );
+        if matches!(
+            e.kind(),
+            std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+        ) {
+            // Forwarding a truncated body would act on part of a request.
+            drop(limited);
+            let response = tiny_http::Response::from_string(
+                r#"{"error":{"code":"request_timeout","message":"the request body was not received in time"}}"#,
+            )
+            .with_status_code(408)
+            .with_header(
+                tiny_http::Header::from_bytes(&b"Connection"[..], &b"close"[..])
+                    .expect("valid header"),
+            );
+            let _ = request.respond(response);
+            return;
+        }
     }
     if body.len() > MAX_REQUEST_BODY_BYTES {
         let received = body.len();

@@ -55,6 +55,24 @@ it.
 In every case the connection is closed afterwards. The limits are far above
 anything the board, CLI or MCP server sends.
 
+## 4. Per-connection read timeout (`src/lib.rs`, `src/client.rs`, `src/connection.rs`)
+
+| | |
+|---|---|
+| **Found by** | `ralphus-stress`, STRESS-002 |
+| **Problem** | No socket read timeout existed. A client that sent headers, or part of a body, and then stopped could hold its connection thread (and, through ralphus's accept loop, every request) forever. |
+| **Change** | New `Server::set_read_timeout(Option<Duration>)`, `None` by default. See the table below. |
+
+| Situation once a timeout is set | Behaviour |
+|---|---|
+| Any socket read waits that long | It fails with a timeout (`TimedOut`, or `WouldBlock` on Unix). |
+| Request line and headers still unread that long after the request's first byte | Answered `408`, then closed. This catches headers trickled slowly enough that no single read times out. |
+| Idle keep-alive connection: nothing received before the first byte of a new request | Closed without a response. |
+
+Writes are never affected, so streamed responses (the daemon's
+`/api/events`) keep working. Clients that pool connections cope with
+idle closes: ureq checks `server_closed()` before reusing one.
+
 ## 3. Silenced upstream warnings (`src/lib.rs`)
 
 Upstream compiles with two unused imports and one unused trait. Cargo does

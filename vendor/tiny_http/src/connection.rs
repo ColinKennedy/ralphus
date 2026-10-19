@@ -102,6 +102,19 @@ impl Connection {
             Self::Unix(s) => s.try_clone().map(Self::from),
         }
     }
+
+    /// Sets the socket's read timeout (ralphus patch, see
+    /// `RALPHUS_PATCHES.md`). Applies to every clone of the socket.
+    pub(crate) fn set_read_timeout(
+        &self,
+        timeout: Option<std::time::Duration>,
+    ) -> std::io::Result<()> {
+        match self {
+            Self::Tcp(s) => s.set_read_timeout(timeout),
+            #[cfg(unix)]
+            Self::Unix(s) => s.set_read_timeout(timeout),
+        }
+    }
 }
 impl From<TcpStream> for Connection {
     fn from(s: TcpStream) -> Self {

@@ -20,7 +20,14 @@ use ralphus_daemon::store::Store;
 const TOKEN: &str = "hardening-test-token";
 
 fn spawn_server(token: Option<&str>) -> SocketAddr {
+    spawn_server_with_timeout(token, None)
+}
+
+/// A listener with the vendored tiny_http's per-connection read timeout set
+/// (production uses `REQUEST_READ_TIMEOUT`; tests use a short one).
+fn spawn_server_with_timeout(token: Option<&str>, read_timeout: Option<Duration>) -> SocketAddr {
     let server = tiny_http::Server::http("127.0.0.1:0").expect("bind ephemeral port");
+    server.set_read_timeout(read_timeout);
     let addr = server.server_addr().to_ip().expect("ip addr");
     let store = Store::open_in_memory().expect("store");
     let token = token.map(str::to_string);
@@ -203,6 +210,172 @@ fn realistic_large_headers_are_accepted() {
         "v".repeat(8 * 1024)
     );
     assert_eq!(exchange(addr, req.as_bytes()).0, Some(200));
+}
+
+/// STRESS-002: one client that declared a body and stopped sending froze
+/// every request, because the body was read on the only thread taking
+/// requests. Now it waits on its own thread. No read timeout here: the
+/// decoupling alone must keep the daemon answering.
+#[test]
+fn a_held_request_body_does_not_freeze_other_requests() {
+    let addr = spawn_server(Some(TOKEN));
+    let mut holder = TcpStream::connect(addr).expect("connect");
+    holder
+        .write_all(
+            format!(
+                "POST /api/squads HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer {TOKEN}\r\nContent-Type: application/json\r\nContent-Length: 1048576\r\n\r\n"
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+    holder.write_all(&[b' '; 64]).unwrap();
+    thread::sleep(Duration::from_millis(300));
+    let started = std::time::Instant::now();
+    assert_eq!(daemon_answers(addr, Some(TOKEN)), Some(200));
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "the health check waited {:?} behind a held body",
+        started.elapsed()
+    );
+    // Writes too: they go to the write worker, which the held body is not on.
+    let body = r#"{"toml":"x"}"#;
+    let req = format!(
+        "POST /api/squads/validate HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer {TOKEN}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    assert!(exchange(addr, req.as_bytes()).0.is_some_and(|s| s < 500));
+    drop(holder);
+}
+
+/// STRESS-002: with the read timeout set, a held body is answered `408`
+/// instead of holding its thread (and socket) forever.
+#[test]
+fn a_held_request_body_times_out_with_408() {
+    let addr = spawn_server_with_timeout(None, Some(Duration::from_secs(1)));
+    let mut s = TcpStream::connect(addr).expect("connect");
+    s.set_read_timeout(Some(Duration::from_secs(20))).unwrap();
+    s.write_all(
+        b"POST /api/squads HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nContent-Length: 1048576\r\n\r\n",
+    )
+    .unwrap();
+    s.write_all(&[b' '; 64]).unwrap();
+    let started = std::time::Instant::now();
+    assert_eq!(read_status(&mut s), Some(408));
+    assert!(started.elapsed() < Duration::from_secs(10));
+}
+
+/// STRESS-002: a large body from a caller without the token is refused from
+/// its headers -- the daemon never waits for it.
+#[test]
+fn an_unauthenticated_large_body_is_401_without_being_read() {
+    let addr = spawn_server(Some(TOKEN));
+    let req = b"POST /api/squads HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nContent-Length: 1048576\r\n\r\n";
+    let started = std::time::Instant::now();
+    assert_eq!(exchange(addr, req).0, Some(401));
+    assert!(started.elapsed() < Duration::from_secs(3));
+}
+
+/// STRESS-002: an idle keep-alive connection is closed after the read
+/// timeout, without a response (it never started a request).
+#[test]
+fn an_idle_connection_is_closed_silently_after_the_read_timeout() {
+    let addr = spawn_server_with_timeout(None, Some(Duration::from_secs(1)));
+    let mut s = TcpStream::connect(addr).expect("connect");
+    s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    let mut buf = [0u8; 64];
+    let n = s.read(&mut buf).unwrap_or(0);
+    assert_eq!(n, 0, "expected a silent close, got {:?}", &buf[..n]);
+}
+
+/// STRESS-002/009: headers trickled slowly enough that no single read times
+/// out still have to finish within the read timeout of the first byte.
+#[test]
+fn trickled_headers_are_answered_408() {
+    let addr = spawn_server_with_timeout(None, Some(Duration::from_secs(1)));
+    let mut s = TcpStream::connect(addr).expect("connect");
+    s.set_read_timeout(Some(Duration::from_millis(100)))
+        .unwrap();
+    s.write_all(b"GET /api/daemon HTTP/1.1\r\n").unwrap();
+    let started = std::time::Instant::now();
+    let mut got = Vec::new();
+    while started.elapsed() < Duration::from_secs(10) {
+        let _ = s.write_all(b"X");
+        let mut buf = [0u8; 256];
+        match s.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                got.extend_from_slice(&buf[..n]);
+                break;
+            }
+            Err(_) => thread::sleep(Duration::from_millis(200)),
+        }
+    }
+    let line = String::from_utf8_lossy(&got);
+    assert!(line.starts_with("HTTP/1.1 408"), "got {line:?}");
+}
+
+/// STRESS-002 UX guard: the read timeout must never cut the board's live
+/// update stream. `/api/events` writes for as long as the client stays; it
+/// must still deliver an event well after the read timeout has passed.
+#[test]
+fn the_event_stream_outlives_the_read_timeout() {
+    let addr = spawn_server_with_timeout(Some(TOKEN), Some(Duration::from_secs(1)));
+    let base = format!("http://{addr}");
+    let ticket: serde_json::Value = serde_json::from_str(
+        &ureq::post(&format!("{base}/api/events/ticket"))
+            .set("Authorization", &format!("Bearer {TOKEN}"))
+            .call()
+            .expect("mint ticket")
+            .into_string()
+            .expect("ticket body"),
+    )
+    .expect("ticket json");
+    let ticket = ticket["ticket"]
+        .as_str()
+        .expect("ticket string")
+        .to_string();
+
+    let mut sse = TcpStream::connect(addr).expect("connect");
+    sse.write_all(
+        format!("GET /api/events?ticket={ticket} HTTP/1.1\r\nHost: x\r\n\r\n").as_bytes(),
+    )
+    .unwrap();
+    sse.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    let mut head = [0u8; 512];
+    let n = sse.read(&mut head).expect("stream headers");
+    assert!(String::from_utf8_lossy(&head[..n]).starts_with("HTTP/1.1 200"));
+
+    // Three read timeouts with nothing sent by the client.
+    thread::sleep(Duration::from_secs(3));
+
+    // A submit writes Cartographer rows, each of which is pushed as an event.
+    let user = ureq::post(&format!("{base}/api/users"))
+        .set("Authorization", &format!("Bearer {TOKEN}"))
+        .send_string(r#"{"name":"sse-user"}"#);
+    assert!(user.is_ok());
+    let submit = ureq::post(&format!("{base}/api/squads"))
+        .set("Authorization", &format!("Bearer {TOKEN}"))
+        .set("X-Ralphus-User", "sse-user")
+        .send_string(
+            &serde_json::json!({
+                "toml": "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\n",
+                "hold": true
+            })
+            .to_string(),
+        );
+    assert!(submit.is_ok(), "submit failed: {submit:?}");
+
+    let mut got = String::new();
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while std::time::Instant::now() < deadline && !got.contains("event:") {
+        let mut buf = [0u8; 1024];
+        match sse.read(&mut buf) {
+            Ok(0) => panic!("the event stream was closed: {got:?}"),
+            Ok(n) => got.push_str(&String::from_utf8_lossy(&buf[..n])),
+            Err(e) => panic!("no event within 10s ({e}): {got:?}"),
+        }
+    }
+    assert!(got.contains("event:"), "{got:?}");
 }
 
 /// STRESS-009: a non-ASCII request line is answered `400` instead of the

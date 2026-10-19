@@ -6,6 +6,7 @@ use std::io::{BufReader, BufWriter, ErrorKind, Read};
 
 use std::net::SocketAddr;
 use std::str::FromStr;
+use std::time::{Duration, Instant};
 
 use crate::common::{HTTPVersion, Method};
 use crate::util::RefinedTcpStream;
@@ -34,6 +35,10 @@ pub struct ClientConnection {
 
     // true if the connection goes through SSL
     secure: bool,
+
+    // ralphus patch: the socket's read timeout (`Server::set_read_timeout`),
+    // reused as the deadline for reading one request's line and headers
+    read_timeout: Option<Duration>,
 }
 
 /// Longest request line (method, target, version) accepted (ralphus patch,
@@ -67,6 +72,15 @@ enum LineError {
     Io(IoError),
     TooLong,
     NotAscii,
+    /// the read timed out before the first byte of a new request: an idle
+    /// keep-alive connection, closed without a response
+    Idle,
+}
+
+/// Whether a read error is the socket's read timeout firing (`TimedOut` on
+/// Windows, `WouldBlock` for `SO_RCVTIMEO` on Unix).
+fn is_timeout(e: &IoError) -> bool {
+    matches!(e.kind(), ErrorKind::TimedOut | ErrorKind::WouldBlock)
 }
 
 impl ClientConnection {
@@ -74,6 +88,7 @@ impl ClientConnection {
     pub fn new(
         write_socket: RefinedTcpStream,
         mut read_socket: RefinedTcpStream,
+        read_timeout: Option<Duration>,
     ) -> ClientConnection {
         let remote_addr = read_socket.peer_addr();
         let secure = read_socket.secure();
@@ -88,6 +103,7 @@ impl ClientConnection {
             next_header_source: first_header,
             no_more_requests: false,
             secure,
+            read_timeout,
         }
     }
 
@@ -102,7 +118,17 @@ impl ClientConnection {
     ///  at the first byte of the new line. Stops with `LineError::TooLong`
     ///  once the line exceeds `max` bytes (ralphus patch: upstream buffered
     ///  without bound).
-    fn read_next_line(&mut self, max: usize) -> Result<AsciiString, LineError> {
+    ///
+    /// ralphus patch: `deadline` is when reading this request's line and
+    ///  headers must be done; it is set when the request's first byte
+    ///  arrives (if a read timeout is configured) and checked after every
+    ///  byte, so a client trickling headers cannot hold the connection
+    ///  forever. A timeout before that first byte is `LineError::Idle`.
+    fn read_next_line(
+        &mut self,
+        max: usize,
+        deadline: &mut Option<Instant>,
+    ) -> Result<AsciiString, LineError> {
         let mut buf = Vec::new();
         let mut prev_byte_was_cr = false;
 
@@ -110,7 +136,14 @@ impl ClientConnection {
             let byte = self.next_header_source.by_ref().bytes().next();
 
             let byte = match byte {
-                Some(b) => b.map_err(LineError::Io)?,
+                Some(Ok(b)) => b,
+                Some(Err(e)) if is_timeout(&e) => {
+                    if deadline.is_none() {
+                        return Err(LineError::Idle);
+                    }
+                    return Err(LineError::Io(IoError::new(ErrorKind::TimedOut, e)));
+                }
+                Some(Err(e)) => return Err(LineError::Io(e)),
                 None => {
                     return Err(LineError::Io(IoError::new(
                         ErrorKind::ConnectionAborted,
@@ -118,6 +151,16 @@ impl ClientConnection {
                     )))
                 }
             };
+            match *deadline {
+                None => *deadline = self.read_timeout.map(|t| Instant::now() + t),
+                Some(d) if Instant::now() > d => {
+                    return Err(LineError::Io(IoError::new(
+                        ErrorKind::TimedOut,
+                        "request headers not received in time",
+                    )))
+                }
+                Some(_) => {}
+            }
 
             if byte == b'\n' && prev_byte_was_cr {
                 buf.pop(); // removing the '\r'
@@ -138,14 +181,21 @@ impl ClientConnection {
     /// Reads a request from the stream.
     /// Blocks until the header has been read.
     fn read(&mut self) -> Result<Request, ReadError> {
+        let mut deadline = None;
         let (method, path, version, headers) = {
             // reading the request line
             let (method, path, version) = {
-                let line = self.read_next_line(MAX_REQUEST_LINE).map_err(|e| match e {
-                    LineError::Io(e) => ReadError::ReadIoError(e),
-                    LineError::TooLong => ReadError::UriTooLong,
-                    LineError::NotAscii => ReadError::WrongRequestLine,
-                })?;
+                let line = self
+                    .read_next_line(MAX_REQUEST_LINE, &mut deadline)
+                    .map_err(|e| match e {
+                        LineError::Io(e) => ReadError::ReadIoError(e),
+                        LineError::TooLong => ReadError::UriTooLong,
+                        LineError::NotAscii => ReadError::WrongRequestLine,
+                        LineError::Idle => ReadError::ReadIoError(IoError::new(
+                            ErrorKind::ConnectionAborted,
+                            "idle connection timed out",
+                        )),
+                    })?;
 
                 parse_request_line(
                     line.as_str().trim(), // TODO: remove this conversion
@@ -157,11 +207,18 @@ impl ClientConnection {
                 let mut headers = Vec::new();
                 let mut header_bytes = 0usize;
                 loop {
-                    let line = self.read_next_line(MAX_HEADER_LINE).map_err(|e| match e {
-                        LineError::Io(e) => ReadError::ReadIoError(e),
-                        LineError::TooLong => ReadError::HeadersTooLarge(version.clone()),
-                        LineError::NotAscii => ReadError::WrongHeader(version.clone()),
-                    })?;
+                    let line = self
+                        .read_next_line(MAX_HEADER_LINE, &mut deadline)
+                        .map_err(|e| match e {
+                            LineError::Io(e) => ReadError::ReadIoError(e),
+                            LineError::TooLong => ReadError::HeadersTooLarge(version.clone()),
+                            LineError::NotAscii => ReadError::WrongHeader(version.clone()),
+                            // the deadline is always set once the request
+                            // line has arrived
+                            LineError::Idle => {
+                                ReadError::ReadIoError(IoError::new(ErrorKind::TimedOut, "timeout"))
+                            }
+                        })?;
 
                     if line.is_empty() {
                         break;
@@ -250,7 +307,7 @@ impl Iterator for ClientConnection {
                                  // se we have to close
                 }
 
-                Err(ReadError::ReadIoError(ref err)) if err.kind() == ErrorKind::TimedOut => {
+                Err(ReadError::ReadIoError(ref err)) if is_timeout(err) => {
                     // request timeout
                     let writer = self.sink.next().unwrap();
                     let response = Response::new_empty(StatusCode(408));
