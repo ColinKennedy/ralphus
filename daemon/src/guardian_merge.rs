@@ -18868,11 +18868,17 @@ mod tests {
             return; // Already done in this process
         }
         let temp_dir = std::env::temp_dir();
-        let pid = std::process::id();
+        let pid = std::process::id().to_string();
         if let Ok(entries) = std::fs::read_dir(&temp_dir) {
             for entry in entries.flatten() {
                 if let Ok(name) = entry.file_name().into_string() {
-                    if name.starts_with("wt-rec-") && name.contains(&format!("-{pid}")) {
+                    // Names are `wt-rec-{tag}-{pid}-{n}` (see `tmp_dir`).
+                    // Compare the pid segment exactly: a substring match
+                    // would also delete the live directories of a
+                    // concurrent test process whose pid merely starts with
+                    // ours (nextest runs each test in its own process).
+                    let pid_segment = name.rsplit('-').nth(1);
+                    if name.starts_with("wt-rec-") && pid_segment == Some(pid.as_str()) {
                         let _ = std::fs::remove_dir_all(entry.path());
                     }
                 }
