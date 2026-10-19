@@ -4,7 +4,9 @@
   limit once reads are fixed. The lock holds add tail latency for everyone.
 - **Found by:** `ralphus-stress` ramp `write_heavy`; the long-lock-hold table
 - **Found at:** `035ef1e70` (staging, 2026-10-18)
-- **Status:** open
+- **Status:** config work fixed on `stress-fixes-low` (PR #778): the write
+  peak went from 78 to 165 ok/s. Writes are still single-worker (~130–165
+  ok/s); write batching is not done.
 
 ## Numbers
 

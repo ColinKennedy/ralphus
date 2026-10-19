@@ -5,7 +5,7 @@
 - **Found by:** `ralphus-stress` scenarios `volume` and `abandon_response`;
   the long-lock-hold table
 - **Found at:** `035ef1e70` (staging, 2026-10-18)
-- **Status:** open
+- **Status:** fixed on `stress-fixes-low` (PR #778).
 
 ## Evidence
 

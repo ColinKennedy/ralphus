@@ -5,7 +5,8 @@
 - **Found by:** `ralphus-stress`, fault `truncated_body_hold`, confirmed
   with a standalone experiment
 - **Found at:** `035ef1e70` (staging, 2026-10-18), release build, Windows 10
-- **Status:** open
+- **Status:** fixed on `stress-fixes-medium` (PR #780): `truncated_body_hold`,
+  `truncated_body_close`, `slowloris` and `idle_connections` pass.
 
 ## What happens
 

@@ -4,7 +4,10 @@
   for work the daemon then abandons and that needs a manual retry.
 - **Found by:** `ralphus-stress` scenario `crash_restart`
 - **Found at:** `035ef1e70` (staging, 2026-10-18)
-- **Status:** open
+- **Status:** mitigated on `stress-fixes-medium` (PR #780). An orphaned
+  squad is still marked failed after a crash, but it now gets an urgent
+  mailbox message with `ralphus squad retry <id>` as the remediation.
+  Resuming materialization automatically is not done.
 
 ## Evidence
 
