@@ -79,8 +79,8 @@ pub struct Api {
     pub id_key: String,
     /// `kind` value for a label-only edit (`squad` or `run`).
     pub edit_kind: String,
-    /// The task file's table name for a cell (see [`CELL_KEYS`]).
-    pub cell_key: String,
+    /// How this daemon spells a task file.
+    pub dialect: Dialect,
     /// Registered user names; empty when the daemon has no user registry.
     pub users: Vec<String>,
     pub available: Vec<Op>,
@@ -239,18 +239,54 @@ impl Rng {
     }
 }
 
-/// The task-file table names a cell, newest first: `[[task.cell]]` since the
-/// RAL-239 rename, `[[task.session]]` before it.
-pub const CELL_KEYS: [&str; 2] = ["cell", "session"];
+/// How one daemon version spells a task file.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Dialect {
+    /// The cell table: `[[task.cell]]` since the RAL-239 rename,
+    /// `[[task.session]]` before it.
+    pub cell_key: &'static str,
+    /// Whether to state top-level `no_review = true`. Current daemons reject
+    /// a submission that does not say whether it wants a review; older ones
+    /// reject the key as unknown.
+    pub no_review: bool,
+}
+
+impl Dialect {
+    /// The spellings to try, newest first.
+    pub const ALL: [Dialect; 3] = [
+        Dialect {
+            cell_key: "cell",
+            no_review: true,
+        },
+        Dialect {
+            cell_key: "cell",
+            no_review: false,
+        },
+        Dialect {
+            cell_key: "session",
+            no_review: false,
+        },
+    ];
+
+    /// The top-level keys that must precede every `[[task]]` table.
+    pub fn preamble(self) -> &'static str {
+        if self.no_review {
+            "no_review = true\n"
+        } else {
+            ""
+        }
+    }
+}
 
 /// A one-task, one-cell squad. A `prompt` cell is the shape every daemon
 /// version accepts without extra fields (a `command` cell needs
 /// `remediation_attempts` on current ones); it is submitted held, so it never
-/// runs. `cell_key` is the daemon's name for the cell table (see
-/// [`CELL_KEYS`]).
-pub fn submit_toml(n: u64, cwd: &str, cell_key: &str) -> String {
+/// runs.
+pub fn submit_toml(n: u64, cwd: &str, dialect: Dialect) -> String {
+    let cell_key = dialect.cell_key;
     format!(
-        "[[task]]\nname = \"stress-{n}\"\n[[task.{cell_key}]]\ncwd = \"{cwd}\"\nprompt = \"stress {n}\"\n"
+        "{}[[task]]\nname = \"stress-{n}\"\n[[task.{cell_key}]]\ncwd = \"{cwd}\"\nprompt = \"stress {n}\"\n",
+        dialect.preamble()
     )
 }
 
@@ -258,10 +294,10 @@ pub fn json_str(s: &str) -> String {
     serde_json::Value::String(s.to_string()).to_string()
 }
 
-pub fn submit_body(n: u64, cwd: &str, cell_key: &str) -> String {
+pub fn submit_body(n: u64, cwd: &str, dialect: Dialect) -> String {
     format!(
         "{{\"toml\":{},\"hold\":true,\"label\":\"stress-{n}\"}}",
-        json_str(&submit_toml(n, cwd, cell_key))
+        json_str(&submit_toml(n, cwd, dialect))
     )
 }
 
@@ -318,7 +354,7 @@ impl Api {
     pub fn submit(&self, agent: &ureq::Agent, user: Option<&str>, rng: &mut Rng) -> Reply {
         let n = self.counter.fetch_add(1, Ordering::Relaxed);
         let cwd = self.random_cwd(rng);
-        let body = submit_body(n, &cwd, &self.cell_key);
+        let body = submit_body(n, &cwd, self.dialect);
         let path = format!("/api/{}", self.noun);
         let mut reply = self.call(agent, user, "POST", &path, Some(&body), true);
         if reply.outcome.is_ok() {
@@ -360,7 +396,7 @@ impl Api {
                 let n = self.counter.fetch_add(1, Ordering::Relaxed);
                 let body = format!(
                     "{{\"toml\":{}}}",
-                    json_str(&submit_toml(n, &self.random_cwd(rng), &self.cell_key))
+                    json_str(&submit_toml(n, &self.random_cwd(rng), self.dialect))
                 );
                 self.call(
                     agent,
@@ -422,6 +458,7 @@ impl Api {
 pub struct Capabilities {
     pub noun: String,
     pub cell_key: String,
+    pub no_review: bool,
     pub auth: bool,
     pub users: bool,
     pub available_ops: Vec<Op>,
@@ -432,7 +469,8 @@ impl Api {
     pub fn capabilities(&self) -> Capabilities {
         Capabilities {
             noun: self.noun.clone(),
-            cell_key: self.cell_key.clone(),
+            cell_key: self.dialect.cell_key.to_string(),
+            no_review: self.dialect.no_review,
             auth: self.token.is_some(),
             users: !self.users.is_empty(),
             available_ops: self.available.clone(),
@@ -493,13 +531,13 @@ pub fn probe(
     let first_user = users.first().cloned();
     let user = first_user.as_deref();
 
-    // Submit noun, and the task file's name for a cell. A 404/405 means the
-    // route does not exist; a 400 means the route exists but rejected this
-    // spelling of the task file, so try the older one before giving up.
+    // Submit noun, and the task file's dialect. A 404/405 means the route
+    // does not exist; a 400 means the route exists but rejected this
+    // spelling of the task file, so try the older ones before giving up.
     let mut found = None;
     let mut last_rejection = String::new();
     'nouns: for noun in ["squads", "runs"] {
-        for cell_key in CELL_KEYS {
+        for dialect in Dialect::ALL {
             let r = raw_call(
                 &ag,
                 base,
@@ -507,7 +545,7 @@ pub fn probe(
                 user,
                 "POST",
                 &format!("/api/{noun}"),
-                Some(&submit_body(0, cwd, cell_key)),
+                Some(&submit_body(0, cwd, dialect)),
                 true,
             );
             if r.outcome.is_ok() {
@@ -517,7 +555,7 @@ pub fn probe(
                     .find(|k| extract_id(&body, k).is_some())
                     .ok_or_else(|| format!("submit to /api/{noun} returned no id: {body}"))?;
                 let id = extract_id(&body, key).unwrap_or_default();
-                found = Some((noun.to_string(), key.to_string(), id, cell_key.to_string()));
+                found = Some((noun.to_string(), key.to_string(), id, dialect));
                 break 'nouns;
             }
             match r.outcome {
@@ -532,7 +570,7 @@ pub fn probe(
             }
         }
     }
-    let (noun, id_key, first_id, cell_key) = found.ok_or_else(|| {
+    let (noun, id_key, first_id, dialect) = found.ok_or_else(|| {
         format!("neither POST /api/squads nor /api/runs accepted a submit; last rejection: {last_rejection}")
     })?;
 
@@ -546,7 +584,7 @@ pub fn probe(
         } else {
             "squad".into()
         },
-        cell_key,
+        dialect,
         users,
         available: Vec::new(),
         unavailable: Vec::new(),
@@ -582,10 +620,24 @@ mod tests {
 
     #[test]
     fn submit_body_is_valid_json_with_hold() {
-        let body = submit_body(3, "C:/x y/\"q\"", "cell");
+        let body = submit_body(3, "C:/x y/\"q\"", Dialect::ALL[0]);
         let v: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(v["hold"], true);
         assert!(v["toml"].as_str().unwrap().contains("stress-3"));
+    }
+
+    #[test]
+    fn every_dialect_parses_as_toml_and_states_review_intent_up_front() {
+        for dialect in Dialect::ALL {
+            let toml_text = submit_toml(1, "C:/r", dialect);
+            let v: toml::Value = toml::from_str(&toml_text).unwrap();
+            assert_eq!(
+                v.get("no_review").and_then(toml::Value::as_bool),
+                dialect.no_review.then_some(true),
+                "{toml_text}"
+            );
+            assert!(v["task"][0].get(dialect.cell_key).is_some(), "{toml_text}");
+        }
     }
 
     #[test]
