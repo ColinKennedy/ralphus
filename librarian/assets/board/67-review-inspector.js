@@ -1062,7 +1062,7 @@
             ${sections}`;
         } else if (n.type === "live_action") {
           preview = n.verdict_summary || n.prompt;
-          details = `<div class="kv-row" data-tip="The verdict of this action's latest finished live run."><span class="k">verdict</span><span class="v">${esc(n.verdict || "not run yet")}</span></div>
+          details = `<div class="kv-row" data-tip="The verdict of this action's latest finished live run."><span class="k">verdict</span><span class="v">${esc(n.verdict || "not run yet")}${n.verdict_unbacked ? ` <span style="color:var(--ignored)" data-tip="The agent reported a pass or a confirmed fix, but no command it proposed matches a shell call ralphus recorded.\nIt may have tested another way (GUI, browser, MCP tools); the verdict itself is unchanged.\nTreat it as unverified until you reproduce it.">(not backed by a recorded command)</span>` : ""}</span></div>
             <div class="k" data-tip="What the live run was asked to do.">prompt</div><div class="mono" style="${block}">${esc(n.prompt)}</div>
             ${n.report ? `<div class="k" data-tip="The agent's report from the latest finished run.">report</div><div class="mono" style="${block}">${esc(n.report)}</div>` : ""}`;
         } else {

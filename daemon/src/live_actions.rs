@@ -94,7 +94,7 @@ settings (`MODE=production npm test`, not `npm test`); input-changing forms \
 (`source .venv/bin/activate`, `set -e`, `nvm use 20`) may be left out, but if you \
 include one, write it exactly as run. \
 Example: recorded `cd app && npm test 2>&1 | tee test.log | rg \\\"failed|error\\\"`, recipe \
-`npm test`. ralphus keeps only commands it recorded you running.";
+`npm test`. Commands ralphus did not record you running are shown to reviewers as not run, so prefer clean, reproducible commands.";
 
 /// The read-only variant: the run's edits are never carried back.
 pub const LIVE_ACTION_READ_ONLY_SYSTEM_PROMPT: &str = "\
@@ -131,7 +131,7 @@ settings (`MODE=production npm test`, not `npm test`); input-changing forms \
 (`source .venv/bin/activate`, `set -e`, `nvm use 20`) may be left out, but if you \
 include one, write it exactly as run. \
 Example: recorded `Push-Location app; dotnet test > results.txt; Pop-Location`, recipe \
-`dotnet test`. ralphus keeps only commands it recorded you running.";
+`dotnet test`. Commands ralphus did not record you running are shown to reviewers as not run, so prefer clean, reproducible commands.";
 
 /// The marker a cell's agent writes a live handoff under.
 pub const LIVE_ACTION_MARKER: &str = "RALPHUS_LIVE_ACTION:";

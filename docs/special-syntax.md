@@ -509,7 +509,7 @@ tool guidance, but without the waypoint section (`waypoint_context` false). The 
 - **`RALPHUS_LIVE_RESULT: {json}`** — the last line of a live run agent's reply: its
   proposed `verdict` (`passed`/`failed`/`inconclusive`), `summary`, `fix_attempted`,
   `fix_confirmed` and `recipe` (commands). Parsed by `live_results::parse_result_line`;
-  recipe commands are kept only when they match a recorded shell tool call. Written into
+  every recipe command is kept and annotated as run exactly, run as a variant, or not run by comparing it with the recorded shell tool calls; a pass or confirmed fix with no matched command is shown as not backed by a recorded command. Written into
   PR/MR descriptions' `## Live-Test Results` section (see `daemon-api.md`).
 - **`RALPHUS_LIVE_ACTION: <how to test this live>`** (or
   `RALPHUS_LIVE_ACTION: (nothing to test live)`) — a **live handoff**: how a
