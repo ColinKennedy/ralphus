@@ -1,0 +1,62 @@
+# STRESS-007: writes cap at about 70 req/s on one core; submit reads config files under the store lock
+
+- **Severity:** medium. The ceiling is acceptable today but is the next
+  limit once reads are fixed. The lock holds add tail latency for everyone.
+- **Found by:** `ralphus-stress` ramp `write_heavy`; the long-lock-hold table
+- **Found at:** `035ef1e70` (staging, 2026-10-18)
+- **Status:** open
+
+## Numbers
+
+`write_heavy` mix: submit 50, env set 25, label edit 20, validate 5.
+
+| Users | ok req/s | p50 | p99 | Daemon CPU |
+|---:|---:|---:|---:|---:|
+| 1 | 66 | 16 ms | 34 ms | 96% |
+| 16 | 71 | 216 ms | 449 ms | 100% |
+| 128 | 69 | 1.8 s | 2.2 s | 105% |
+| 512 | 69 | 6.8 s | 7.7 s | 103% |
+| 1024 | 73 | 4.9 s | 9.9 s | 115%; **58% errors** (timeouts) |
+
+- **Throughput is flat from 1 user up.** Every non-GET goes through one
+  write worker (`WRITE_WORKERS = 1`, `daemon/src/server.rs:20524`), and the
+  daemon sits at about 100% of a single core. Queue time is the whole
+  latency: `POST /api/squads` handler p50 is 20 ms, but queued p99 is 14.4 s.
+- **Long store-lock holds in submit** were seen on every fault run's seeding:
+
+  | Site | Max hold |
+  |---|---:|
+  | `server.rs:7034` (`insert_squad`) | 1.2–1.6 s |
+  | `server.rs:6911` | 511 ms |
+  | `server.rs:6940` | 509 ms |
+  | `server.rs:7510` | 598 ms |
+  | `server.rs:9725` | 982 ms |
+  | `server.rs:9198` | 663 ms |
+
+## Root cause, from reading the code
+
+| Site | Work done under the store guard |
+|---|---|
+| `server.rs:6911` | `validate_task_file_profiles` → `resolve_agent_for_path_with` → `load_profiles_for_path_with` (`agent_profiles.rs:403`). It reads `.ralphus.toml` and config files from disk, although the code comment says "DB lookups only". |
+| `server.rs:6940` | `apply_profile_model_defaults` → `resolve_agent_for_path_db`, with the same config-file reads. |
+| `server.rs:7034` | `insert_squad` (`store.rs:4877-5187`). Inside the open transaction, each task runs `load_worktree_config` and `load_daemon_config()` (`store.rs:4969`, `4975`), which means file reads and TOML parsing. |
+| `server.rs:7510` | `enroll_new_squad_in_open_waypoints` (`waypoints.rs:1694`). It computes the squad's subproject and project scope *before* checking whether any waypoint is open. |
+| `scheduler_in_downtime()` | Reloads config from disk on every request (`config.rs:1776-1777` → `3244-3262`). |
+
+`server.rs:9198` and `9725` were not examined in this pass.
+
+## Fix direction
+
+- Resolve profile, worktree and daemon config before taking the lock, or
+  cache them keyed on file mtime.
+- Return early from waypoint enrollment when no waypoint is open.
+- Cache the downtime config.
+- Longer term:
+  - batch writes, so one worker commits several requests per transaction;
+  - narrow what needs the global writer lock;
+  - or split writes by squad.
+
+## Verify
+
+The `write_heavy` peak ok req/s should rise. Re-run with
+`--scenarios ramp --profiles write_heavy`.

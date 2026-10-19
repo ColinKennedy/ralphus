@@ -119,15 +119,21 @@ of ports would read as "the daemon refused connections".
 A fault's verdict is one of three:
 
 - **fail**: the daemon died; or it stopped answering `/api/daemon`; or the
-  3 s recovery window still had more than 1% errors.
+  3 s recovery window still had more than 1% errors; or no victim request
+  completed for 5 s or more (the whole server stalled).
 - **degraded**: during the fault, the victim had one of these:
   - more than 1% errors;
   - a p99 above 5× the baseline (and at least 500 ms over it);
   - throughput below half the baseline;
   - any op with more than 5% errors.
 
-  A daemon panic, a 5xx answer to a malformed payload, or a complete request
-  that went unanswered for 10 s also count.
+  A daemon panic, a 5xx answer to a malformed payload, a complete request
+  that went unanswered for 10 s, or a stall longer than max(2 s, 3× the
+  baseline's longest gap) also count.
+- When a malformed payload kills the daemon, the harness pins the crash on
+  that payload, records the exit status and stderr tail, restarts the
+  daemon, and finishes the rest of the corpus. That run's verdict is
+  **fail**.
 - **pass**: none of the above.
 
 ### Crash and restart
@@ -136,7 +142,9 @@ The daemon is hard-killed (TerminateProcess/SIGKILL) a third of the way
 into a 16-user submit-only load. It is then restarted on the same database.
 The run records how long the restart took to answer. Every submit the
 clients saw acknowledged (201) must still be readable afterwards. One that
-is missing is data loss and fails the check.
+is missing is data loss and fails the check. One that comes back in state
+`failed` (crash recovery fails squads caught mid-materialization) marks the
+check as degraded.
 
 ## Reading results
 
@@ -156,6 +164,21 @@ Definitions:
 - **Peak with ≤1% errors**: the best step whose error rate stayed at or
   under 1%. This is the "hard max" number to track.
 - **First users >1% errors**: the concurrency where the error budget broke.
+- **Max users with p99 ≤ 1 s**: the highest concurrency (before the first
+  step that broke it) with p99 at or under 1 s and ≤1% errors. Read this
+  together with the 1% point: requests only start to *fail* once they reach
+  the 10 s client timeout, so the 1% point is often far past where the
+  daemon stopped being usable.
+- **Longest stall**: the longest stretch of a window in which no request
+  completed successfully. A stall that is shorter than the client timeout
+  shows up here even when no request fails.
+
+Each result also includes server-side timing scraped from the daemon's own
+output:
+
+- per-route `handler`/`queued`/`lock_wait` percentiles from its request
+  log. All writes are logged, but GETs only when they are `SLOW` (≥ 1 s);
+- long store-lock holds, grouped by the `file:line` that took the lock.
 
 Findings come from several sources:
 

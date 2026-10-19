@@ -360,6 +360,11 @@ pub struct RampSummary {
     pub users_at_peak_under_1pct: usize,
     /// Highest user count whose step stayed at or under 1% errors.
     pub max_users_under_1pct: usize,
+    /// Highest user count (before the first step that broke it) whose step
+    /// kept p99 at or under 1 s with at most 1% errors -- capacity at a
+    /// usable latency, since errors only appear once requests hit the
+    /// client timeout.
+    pub max_users_p99_under_1s: usize,
     /// First user count whose step exceeded 1% errors (None: never did).
     pub first_users_over_1pct: Option<usize>,
     pub error_rate_at_first_over: Option<f64>,
@@ -386,7 +391,15 @@ pub fn summarize_ramp(steps: &[Step], stop_reason: String) -> RampSummary {
         stop_reason,
         ..RampSummary::default()
     };
+    let mut slo_broken = false;
     for st in steps {
+        if !slo_broken {
+            if st.stats.error_rate <= 0.01 && st.stats.latency_ok.p99_ms <= 1000.0 {
+                s.max_users_p99_under_1s = st.users;
+            } else {
+                slo_broken = true;
+            }
+        }
         s.max_users_tested = s.max_users_tested.max(st.users);
         if st.stats.ok_rps > s.peak_ok_rps {
             s.peak_ok_rps = st.stats.ok_rps;
@@ -841,6 +854,9 @@ pub struct CrashResult {
     pub victim: WindowStats,
     pub acked_submits: usize,
     pub verified_present: usize,
+    /// Acknowledged squads that exist after the restart but in `failed`
+    /// (crash recovery fails squads caught mid-materialization).
+    pub failed_after_restart: Vec<String>,
     pub lost: Vec<String>,
     pub verify_errors: usize,
     pub health_after: Health,
@@ -879,6 +895,7 @@ pub fn crash(cfg: &Config) -> Result<CrashResult, String> {
     let mut lost = Vec::new();
     let mut present = 0;
     let mut verify_errors = 0;
+    let mut failed_after_restart = Vec::new();
     if restart_error.is_none() {
         let ag = api::agent(cfg.timeout);
         let user = env.api.users.first().map(String::as_str);
@@ -889,10 +906,15 @@ pub fn crash(cfg: &Config) -> Result<CrashResult, String> {
                 "GET",
                 &format!("/api/{}/{id}", env.api.noun),
                 None,
-                false,
+                true,
             );
             match r.outcome {
-                crate::stats::Outcome::Ok(_) => present += 1,
+                crate::stats::Outcome::Ok(_) => {
+                    present += 1;
+                    if squad_state(r.body.as_deref()).as_deref() == Some("failed") {
+                        failed_after_restart.push(id.clone());
+                    }
+                }
                 crate::stats::Outcome::Http(404) => lost.push(id.clone()),
                 _ => verify_errors += 1,
             }
@@ -927,9 +949,19 @@ pub fn crash(cfg: &Config) -> Result<CrashResult, String> {
         verdict = "degraded";
         reasons.push(format!("{} panic site(s) logged", logs.panics.len()));
     }
+    if !failed_after_restart.is_empty() {
+        if verdict == "pass" {
+            verdict = "degraded";
+        }
+        reasons.push(format!(
+            "{} acknowledged submits came back failed after the restart",
+            failed_after_restart.len()
+        ));
+    }
     let findings = verdict != "pass" || !logs.is_clean();
     let kept = finish_env(cfg, env, findings);
     lost.truncate(50);
+    failed_after_restart.truncate(50);
     Ok(CrashResult {
         victim_users: cfg.victim_users,
         killed_after_s: kill_at.as_secs_f64(),
@@ -938,6 +970,7 @@ pub fn crash(cfg: &Config) -> Result<CrashResult, String> {
         victim: stats,
         acked_submits: acked,
         verified_present: present,
+        failed_after_restart,
         lost,
         verify_errors,
         health_after,
@@ -946,6 +979,15 @@ pub fn crash(cfg: &Config) -> Result<CrashResult, String> {
         reasons,
         sandbox_kept: kept,
     })
+}
+
+/// The `state` of a squad-detail response, wherever this daemon version puts
+/// it (top level, or under `squad`/`run`).
+fn squad_state(body: Option<&str>) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(body?).ok()?;
+    [&v["state"], &v["squad"]["state"], &v["run"]["state"]]
+        .into_iter()
+        .find_map(|s| s.as_str().map(str::to_string))
 }
 
 /// Probe-only pass, so the report records what the daemon supports even if
@@ -990,6 +1032,7 @@ mod tests {
         assert_eq!(s.users_at_peak, 8);
         assert_eq!(s.users_at_peak_under_1pct, 4);
         assert_eq!(s.max_users_under_1pct, 4);
+        assert_eq!(s.max_users_p99_under_1s, 4);
         assert_eq!(s.first_users_over_1pct, Some(8));
         assert_eq!(s.max_users_tested, 16);
     }
