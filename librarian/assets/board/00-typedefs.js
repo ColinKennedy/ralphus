@@ -56,7 +56,7 @@
        * @typedef {BranchNoteBase & AppraisalView & {type: "appraisal"}} AppraisalNote - RAL-670: an appraisal, titled with the label of its proof step (its `id`, else `proof N`).
        */
       /**
-       * @typedef {BranchNoteBase & {type: "live_action", prompt: string, verdict: string|null, verdict_summary: string|null, report: string|null}} LiveActionNote - RAL-670: a live action attributed to the branch, with its latest finished run's outcome (all null before one finishes).
+       * @typedef {BranchNoteBase & {type: "live_action", prompt: string, verdict: string|null, verdict_summary: string|null, verdict_unbacked: boolean, report: string|null}} LiveActionNote - RAL-670: a live action attributed to the branch, with its latest finished run's outcome (all null before one finishes). `verdict_unbacked` is true when a passed verdict or confirmed fix has no recorded command behind it.
        */
       /**
        * @typedef {BranchNoteBase & {type: "ghost", owner_uri: string, content: string}} GhostNote - RAL-670: the branch's latest ghost handoff.

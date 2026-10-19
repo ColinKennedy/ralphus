@@ -7,10 +7,10 @@
 //!
 //! The pieces:
 //! * the structured result a live agent proposes ([`parse_result_line`]) and
-//!   the recipe commands ralphus accepts from it ([`match_recipe`]): a command
-//!   survives only if it matches a command inside a recorded `RALPHUS_TOOL:`
-//!   shell call (ignoring navigation, redirection and output filters), so
-//!   there is no second model judgment;
+//!   the recipe commands it proposes, each annotated by [`match_recipe`] as run
+//!   exactly, run as a variant, or not run, by comparing it with the commands
+//!   inside the recorded `RALPHUS_TOOL:` shell calls (ignoring navigation,
+//!   redirection and output filters), so there is no second model judgment;
 //! * the renderer ([`render_section`]) and the marker splice
 //!   ([`splice_section`]), both byte-stable;
 //! * the evidence a run keeps (`guardian_live_run_evidence`) and the stable
@@ -155,23 +155,80 @@ pub struct RecordedCall {
     pub shell: String,
 }
 
-/// One accepted reproduction step.
+/// How a proposed recipe command relates to the run's recorded shell calls.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StepMatch {
+    /// The recorded call is the proposed command, as written.
+    #[default]
+    Exact,
+    /// The proposed command is one command inside a larger recorded call
+    /// (`cd app && npm test 2>&1 | tee x`).
+    Variant,
+    /// No recorded call contains it.
+    NotRun,
+}
+
+impl StepMatch {
+    /// Whether a recorded call backs this step.
+    #[must_use]
+    pub fn ran(self) -> bool {
+        self != Self::NotRun
+    }
+}
+
+/// One proposed reproduction step and whether the agent was recorded running it.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct RecipeStep {
-    /// The recommended command, as matched.
+    /// The recommended command, as matched (as proposed when not run).
     pub command: String,
-    /// The shell tool the call ran in (empty on rows stored before it was kept).
+    /// The shell tool the call ran in (empty on rows stored before it was kept,
+    /// and on a step that was not run).
     #[serde(default)]
     pub shell: String,
     /// The complete recorded tool call it was found in (empty on rows stored
-    /// before it was kept).
+    /// before it was kept, and on a step that was not run).
     #[serde(default)]
     pub recorded_command: String,
     pub cwd: String,
-    /// 1-based position among the run's recorded shell calls.
+    /// 1-based position among the run's recorded shell calls; 0 when not run.
     pub order: usize,
-    /// `succeeded`, `failed` or `no result recorded`.
+    /// `succeeded`, `failed` or `no result recorded`; empty when not run.
     pub result: String,
+    /// Rows stored before steps were annotated hold only matched steps.
+    #[serde(default)]
+    pub status: StepMatch,
+}
+
+/// The recipe as stored: the steps plus a marker that they were annotated.
+/// Rows written before annotation are a bare array of matched steps, where an
+/// empty list cannot tell "nothing proposed" from "nothing matched".
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(untagged)]
+enum StoredRecipe {
+    Annotated {
+        annotated: bool,
+        steps: Vec<RecipeStep>,
+    },
+    Legacy(Vec<RecipeStep>),
+}
+
+/// The recipe's steps and whether it was annotated (so unmatched commands are
+/// present and an empty list truly means no recipe was proposed).
+fn decode_recipe(raw: &str) -> (Vec<RecipeStep>, bool) {
+    match serde_json::from_str::<StoredRecipe>(raw) {
+        Ok(StoredRecipe::Annotated { annotated, steps }) => (steps, annotated),
+        Ok(StoredRecipe::Legacy(steps)) => (steps, false),
+        Err(_) => (Vec::new(), false),
+    }
+}
+
+fn encode_recipe(steps: &[RecipeStep]) -> String {
+    serde_json::to_string(&StoredRecipe::Annotated {
+        annotated: true,
+        steps: steps.to_vec(),
+    })
+    .unwrap_or_default()
 }
 
 const SHELL_TOOLS: &[&str] = &[
@@ -260,13 +317,15 @@ pub fn extract_shell_calls(transcript: &str) -> Vec<RecordedCall> {
         .collect()
 }
 
-/// Keep only the proposed recipe commands that match a command in a recorded
-/// shell call (see [`command_units`]), each recorded command at most once,
-/// ordered as they were run. A step carries the proposed command and, as
-/// evidence, the whole recorded invocation with its cwd (or `default_cwd`) and
-/// result. An unmatched command is dropped without affecting the others. The
-/// commands of one proposed entry must match in the order they were written and
-/// ran; one written out of order is dropped.
+/// Annotate every proposed recipe command against the recorded shell calls
+/// (see [`command_units`]), each recorded command used at most once. A command
+/// that equals a recorded call (trimmed) is [`StepMatch::Exact`]; one found
+/// inside a different recorded call is [`StepMatch::Variant`]; one found
+/// nowhere is [`StepMatch::NotRun`] and carries no recorded call, result or
+/// order. Matched steps come first, ordered as they were run, with the whole
+/// recorded invocation, its cwd (or `default_cwd`) and result; unmatched steps
+/// follow in the order proposed. The commands of one proposed entry must match
+/// in the order they were written and ran; one written out of order is not run.
 #[must_use]
 pub fn match_recipe(
     proposed: &[String],
@@ -276,6 +335,7 @@ pub fn match_recipe(
     let recorded: Vec<Vec<Unit>> = calls.iter().map(|c| command_units(&c.command)).collect();
     let mut used: Vec<Vec<bool>> = recorded.iter().map(|u| vec![false; u.len()]).collect();
     let mut matched: Vec<(usize, usize, String)> = Vec::new();
+    let mut unmatched: Vec<String> = Vec::new();
     for entry in proposed {
         // The commands of one entry run in the order written, so each must
         // match a recorded command later than the one before it.
@@ -294,29 +354,49 @@ pub fn match_recipe(
                 used[i][j] = true;
                 after = Some((i, j));
                 matched.push((i, j, unit.shown_for(&recorded[i][j])));
+            } else {
+                unmatched.push(unit.text());
             }
         }
     }
     matched.sort_by_key(|(i, j, _)| (*i, *j));
-    matched
+    let mut steps: Vec<RecipeStep> = matched
         .into_iter()
-        .map(|(i, _, command)| RecipeStep {
-            command,
-            shell: calls[i].shell.clone(),
-            recorded_command: calls[i].command.trim().to_string(),
-            cwd: calls[i]
-                .cwd
-                .clone()
-                .unwrap_or_else(|| default_cwd.to_string()),
-            order: i + 1,
-            result: match calls[i].succeeded {
-                Some(true) => "succeeded",
-                Some(false) => "failed",
-                None => "no result recorded",
+        .map(|(i, _, command)| {
+            let recorded_command = calls[i].command.trim().to_string();
+            RecipeStep {
+                status: if recorded_command == command.trim() {
+                    StepMatch::Exact
+                } else {
+                    StepMatch::Variant
+                },
+                command,
+                shell: calls[i].shell.clone(),
+                recorded_command,
+                cwd: calls[i]
+                    .cwd
+                    .clone()
+                    .unwrap_or_else(|| default_cwd.to_string()),
+                order: i + 1,
+                result: match calls[i].succeeded {
+                    Some(true) => "succeeded",
+                    Some(false) => "failed",
+                    None => "no result recorded",
+                }
+                .to_string(),
             }
-            .to_string(),
         })
-        .collect()
+        .collect();
+    steps.extend(unmatched.into_iter().map(|command| RecipeStep {
+        command,
+        shell: String::new(),
+        recorded_command: String::new(),
+        cwd: default_cwd.to_string(),
+        order: 0,
+        result: String::new(),
+        status: StepMatch::NotRun,
+    }));
+    steps
 }
 
 /// All shell calls recorded for one live run's agent session.
@@ -348,6 +428,9 @@ pub struct RunEvidence {
     pub fix_attempted: Option<bool>,
     pub fix_confirmed: Option<bool>,
     pub recipe: Vec<RecipeStep>,
+    /// Whether `recipe` holds every proposed command, so an empty list means
+    /// none was proposed. False on rows stored before steps were annotated.
+    pub recipe_annotated: bool,
     pub branch_ids: Vec<String>,
     pub integration_branch_id: Option<String>,
     pub integration_pushed: Option<bool>,
@@ -481,7 +564,7 @@ impl Store {
                 parsed.and_then(|p| p.summary.clone()),
                 opt_bool(parsed.and_then(|p| p.fix_attempted)),
                 opt_bool(parsed.and_then(|p| p.fix_confirmed)),
-                serde_json::to_string(recipe).unwrap_or_default(),
+                encode_recipe(recipe),
                 run_id
             ],
         )?;
@@ -523,7 +606,9 @@ impl Store {
                  FROM guardian_live_run_evidence WHERE run_id=?",
                 rusqlite::params![run_id],
                 |r| {
-                    let recipe: Option<String> = r.get(6)?;
+                    let (recipe, recipe_annotated) = r
+                        .get::<_, Option<String>>(6)?
+                        .map_or((Vec::new(), false), |s| decode_recipe(&s));
                     let branches: Option<String> = r.get(7)?;
                     let flag = |i| r.get::<_, Option<i64>>(i).map(|v| v.map(|n| n != 0));
                     Ok(RunEvidence {
@@ -533,9 +618,8 @@ impl Store {
                         verdict_summary: r.get(3)?,
                         fix_attempted: flag(4)?,
                         fix_confirmed: flag(5)?,
-                        recipe: recipe
-                            .and_then(|s| serde_json::from_str(&s).ok())
-                            .unwrap_or_default(),
+                        recipe,
+                        recipe_annotated,
                         branch_ids: branches
                             .and_then(|s| serde_json::from_str(&s).ok())
                             .unwrap_or_default(),
@@ -799,6 +883,78 @@ fn report_markdown(report: &str) -> String {
     }
 }
 
+/// Whether the agent's "passed" verdict or confirmed fix has no recorded shell
+/// command behind it: the recipe was annotated and not one proposed command
+/// matched. Rows stored before annotation are never flagged. The claim itself
+/// is left as the agent made it; this only qualifies it.
+#[must_use]
+pub fn recipe_unbacked(ev: &RunEvidence) -> bool {
+    ev.recipe_annotated && !ev.recipe.iter().any(|s| s.status.ran())
+}
+
+/// A "passed" verdict or confirmed fix that [`recipe_unbacked`] qualifies.
+#[must_use]
+pub fn verdict_unbacked(ev: &RunEvidence) -> bool {
+    recipe_unbacked(ev)
+        && (ev.verdict.as_deref() == Some("passed") || ev.fix_confirmed == Some(true))
+}
+
+const UNBACKED: &str = "not backed by a recorded command";
+
+/// The reproduction block of a run: the coverage line, the commands the agent
+/// was recorded running, and, separately, the ones it was not.
+fn render_recipe(out: &mut String, ev: &RunEvidence, checkout: Option<&str>) {
+    let ran: Vec<RecipeStep> = ev
+        .recipe
+        .iter()
+        .filter(|s| s.status.ran())
+        .cloned()
+        .collect();
+    let not_run: Vec<&RecipeStep> = ev.recipe.iter().filter(|s| !s.status.ran()).collect();
+    if ev.recipe.is_empty() {
+        let text = if ev.recipe_annotated {
+            "The agent proposed no reproduction commands.\n"
+        } else {
+            "No reproduction commands matching recorded shell calls are available for this run.\n"
+        };
+        let _ = writeln!(out, "{text}");
+        return;
+    }
+    let exact = ran.iter().filter(|s| s.status == StepMatch::Exact).count();
+    let _ = write!(
+        out,
+        "{} of {} proposed command{} {} run by the agent",
+        ran.len(),
+        ev.recipe.len(),
+        if ev.recipe.len() == 1 { "" } else { "s" },
+        if ran.len() == 1 { "was" } else { "were" },
+    );
+    if !ran.is_empty() {
+        let _ = write!(
+            out,
+            " ({exact} exactly, {} as a variant)",
+            ran.len() - exact
+        );
+    }
+    let _ = writeln!(out, ".\n");
+    if ran.is_empty() {
+        let _ = writeln!(
+            out,
+            "No reproduction commands matching recorded shell calls are available for this run.\n"
+        );
+    } else {
+        render_reproduction(out, &ran, checkout);
+    }
+    if !not_run.is_empty() {
+        let list: Vec<&str> = not_run.iter().map(|s| s.command.as_str()).collect();
+        let block = fenced(&clip(&list.join("\n")));
+        let _ = writeln!(
+            out,
+            "**Suggested, not run by the agent** (no recorded shell call ran these; do not read them as tested):\n\n{block}\n"
+        );
+    }
+}
+
 /// The `**Reproduce**` heading and code block for a run's accepted recipe,
 /// with a `# in <dir>` line wherever the directory changes.
 fn render_reproduction(out: &mut String, steps: &[RecipeStep], checkout: Option<&str>) {
@@ -869,7 +1025,7 @@ fn render_run_details(out: &mut String, item: &SectionRun) {
             destination.as_deref().unwrap_or("not recorded")
         );
     }
-    if ev.recipe.is_empty() {
+    if !ev.recipe.iter().any(|s| s.status.ran()) {
         let _ = writeln!(out, "- No recorded shell call matched the agent's recipe.");
     }
     // Several steps can come from one call; show each call once.
@@ -910,9 +1066,14 @@ fn render_run(out: &mut String, item: &SectionRun) {
     } else {
         "manual"
     };
+    let unbacked = if recipe_unbacked(ev) && ev.verdict.as_deref() == Some("passed") {
+        format!(" ({UNBACKED})")
+    } else {
+        String::new()
+    };
     let _ = write!(
         out,
-        "**{verdict}** · {trigger} run on the review's tip · {}",
+        "**{verdict}**{unbacked} · {trigger} run on the review's tip · {}",
         when(run.started_at_ms.or(Some(run.queued_at_ms)))
     );
     if run.state != "finished" {
@@ -934,14 +1095,7 @@ fn render_run(out: &mut String, item: &SectionRun) {
             elide_right(error, MAX_ERROR_CHARS)
         );
     }
-    if ev.recipe.is_empty() {
-        let _ = writeln!(
-            out,
-            "No reproduction commands matching recorded shell calls are available for this run.\n"
-        );
-    } else {
-        render_reproduction(out, &ev.recipe, run.cwd.as_deref());
-    }
+    render_recipe(out, ev, run.cwd.as_deref());
     let _ = writeln!(out, "<details><summary>What the agent observed</summary>\n");
     match run.report.as_deref().filter(|r| !r.trim().is_empty()) {
         Some(report) => {
@@ -1000,10 +1154,15 @@ fn fix_line(item: &SectionRun, destination: Option<&str>) -> String {
     let ev = &item.evidence;
     let onto = destination.map_or_else(|| "the top branch".to_string(), str::to_string);
     if ev.fix_confirmed == Some(true) {
-        return match run.integration.as_str() {
+        let line = match run.integration.as_str() {
             "integrated" => format!("Fix: confirmed and carried onto {onto}"),
             "pending" | "integrating" => format!("Fix: confirmed; being carried onto {onto}"),
             _ => "Fix: confirmed but could not be carried".to_string(),
+        };
+        return if recipe_unbacked(ev) {
+            format!("{line} ({UNBACKED})")
+        } else {
+            line
         };
     }
     if ev.fix_attempted == Some(true) || !run.commits.is_empty() {
@@ -1315,10 +1474,10 @@ pub fn record_run_evidence(
 ) {
     let parsed = parse_result_line(&outcome.raw_reply);
     let verdict = final_verdict(outcome.end, parsed.as_ref());
-    let recipe = match (&parsed, run.cwd.as_deref()) {
-        (Some(p), Some(cwd)) if !p.recipe.is_empty() => {
+    let recipe = match &parsed {
+        Some(p) if !p.recipe.is_empty() => {
             let calls = recorded_calls_for_run(guardian_id, &outcome.cell_id);
-            match_recipe(&p.recipe, &calls, cwd)
+            match_recipe(&p.recipe, &calls, run.cwd.as_deref().unwrap_or_default())
         }
         _ => Vec::new(),
     };
@@ -1401,7 +1560,9 @@ mod tests {
                     cwd: "/w".into(),
                     order: 2,
                     result: "succeeded".into(),
+                    status: StepMatch::Variant,
                 }],
+                recipe_annotated: true,
                 integration_branch_id: Some("branch-1".into()),
                 integration_pushed: Some(true),
                 ..RunEvidence::default()
@@ -1453,7 +1614,7 @@ mod tests {
     }
 
     #[test]
-    fn the_recipe_keeps_only_commands_that_were_actually_run() {
+    fn the_recipe_annotates_every_command_with_whether_it_was_run() {
         let transcript = [
             tool_line("1", "Read", r#"{"file_path":"x"}"#, None),
             tool_line(
@@ -1489,15 +1650,17 @@ mod tests {
                     s.command.as_str(),
                     s.cwd.as_str(),
                     s.result.as_str(),
+                    s.status,
                 )
             })
             .collect();
         assert_eq!(
             summary,
             vec![
-                (1, "cargo build", "/w/sub", "succeeded"),
-                (2, "curl localhost", "/w", "failed"),
-                (3, "ls", "/w", "no result recorded"),
+                (1, "cargo build", "/w/sub", "succeeded", StepMatch::Exact),
+                (2, "curl localhost", "/w", "failed", StepMatch::Exact),
+                (3, "ls", "/w", "no result recorded", StepMatch::Exact),
+                (0, "rm -rf /", "/w", "", StepMatch::NotRun),
             ]
         );
     }
@@ -1515,6 +1678,7 @@ mod tests {
             let recorded: Vec<RecordedCall> = recorded.iter().map(|r| call(r)).collect();
             match_recipe(&proposed, &recorded, "/d")
                 .into_iter()
+                .filter(|s| s.status.ran())
                 .map(|s| s.command)
                 .collect()
         };
@@ -1541,6 +1705,9 @@ mod tests {
         };
         let run = |proposed: &str, recorded: &str| -> Vec<RecipeStep> {
             match_recipe(&[proposed.to_string()], &[call(recorded)], "/d")
+                .into_iter()
+                .filter(|s| s.status.ran())
+                .collect()
         };
         let steps = run("foo", "sudo bash -c 'foo'");
         assert_eq!(steps.len(), 1);
@@ -1568,6 +1735,9 @@ mod tests {
         };
         let run = |proposed: &str, recorded: &str| -> Vec<RecipeStep> {
             match_recipe(&[proposed.to_string()], &[call(recorded)], "/d")
+                .into_iter()
+                .filter(|s| s.status.ran())
+                .collect()
         };
         let steps = run("foo --bar", "timeout 100 foo --bar | head");
         assert_eq!(steps.len(), 1);
@@ -1603,6 +1773,9 @@ mod tests {
         let run = |proposed: &[&str], recorded: &str| -> Vec<RecipeStep> {
             let p: Vec<String> = proposed.iter().map(|s| (*s).to_string()).collect();
             match_recipe(&p, &[call(recorded)], "/d")
+                .into_iter()
+                .filter(|s| s.status.ran())
+                .collect()
         };
         for (proposed, recorded) in [
             (
@@ -1633,17 +1806,25 @@ mod tests {
         ] {
             let steps = run(&[proposed], recorded);
             assert!(!steps.is_empty(), "{recorded}");
-            assert!(
-                steps
-                    .iter()
-                    .all(|s| s.recorded_command == recorded && s.cwd == "/w" && s.order == 1)
-            );
+            assert!(steps.iter().all(|s| s.recorded_command == recorded
+                && s.cwd == "/w"
+                && s.order == 1
+                && s.status != StepMatch::NotRun));
         }
         let steps = run(&["npm test"], "npm test && npm run deploy");
         assert_eq!(steps.len(), 1);
         assert_eq!(steps[0].command, "npm test");
         let steps = run(&["npm test && npm run lint"], "npm test");
         assert_eq!(steps.len(), 1);
+        assert_eq!(steps[0].status, StepMatch::Exact);
+        let all = match_recipe(
+            &["npm test && npm run lint".into()],
+            &[call("npm test")],
+            "/d",
+        );
+        assert_eq!(all.len(), 2);
+        assert_eq!(all[1].command, "npm run lint");
+        assert_eq!(all[1].status, StepMatch::NotRun);
         assert!(run(&["rm -rf /"], "ls").is_empty());
         assert!(run(&["npm test"], "MODE=production npm test").is_empty());
         assert_eq!(
@@ -1664,6 +1845,119 @@ mod tests {
         let details = section.find("<summary>Run details</summary>").unwrap();
         let call = section.find("cd w && cargo run | head").unwrap();
         assert!(details < call);
+    }
+
+    fn step_with(command: &str, status: StepMatch) -> RecipeStep {
+        RecipeStep {
+            command: command.into(),
+            shell: String::new(),
+            recorded_command: if status.ran() {
+                command.into()
+            } else {
+                String::new()
+            },
+            cwd: "/w".into(),
+            order: usize::from(status.ran()),
+            result: if status.ran() {
+                "succeeded".into()
+            } else {
+                String::new()
+            },
+            status,
+        }
+    }
+
+    fn evidence_with(steps: Vec<RecipeStep>, annotated: bool) -> RunEvidence {
+        RunEvidence {
+            verdict: Some("passed".into()),
+            verdict_summary: Some("works".into()),
+            fix_attempted: Some(true),
+            fix_confirmed: Some(true),
+            recipe: steps,
+            recipe_annotated: annotated,
+            ..RunEvidence::default()
+        }
+    }
+
+    fn render_with(ev: RunEvidence) -> String {
+        let mut run = section_run("r1", 0, 10);
+        run.evidence = ev;
+        render_section(&[run]).unwrap()
+    }
+
+    #[test]
+    fn the_section_shows_coverage_and_lists_unrun_commands_apart() {
+        let section = render_with(evidence_with(
+            vec![
+                step_with("cargo build", StepMatch::Exact),
+                step_with("cargo test", StepMatch::NotRun),
+            ],
+            true,
+        ));
+        assert!(section.contains("1 of 2 proposed commands was run by the agent"));
+        let ran = section.find("**Reproduce**").unwrap();
+        let heading = section.find("**Suggested, not run by the agent**").unwrap();
+        assert!(ran < heading);
+        assert!(section[heading..].contains("cargo test"));
+        assert!(!section[ran..heading].contains("cargo test"));
+    }
+
+    #[test]
+    fn an_empty_recipe_says_whether_none_was_proposed_or_none_ran() {
+        let none = render_with(evidence_with(Vec::new(), true));
+        assert!(none.contains("The agent proposed no reproduction commands."));
+        let unrun = render_with(evidence_with(
+            vec![step_with("cargo test", StepMatch::NotRun)],
+            true,
+        ));
+        assert!(unrun.contains("0 of 1 proposed command were run"));
+        assert!(unrun.contains("No reproduction commands matching recorded shell calls"));
+        assert!(unrun.contains("**Suggested, not run by the agent**"));
+    }
+
+    #[test]
+    fn a_legacy_recipe_decodes_as_matched_and_is_never_flagged() {
+        let legacy = r#"[{"command":"ls","shell":"","recorded_command":"ls","cwd":"/w","order":1,"result":"succeeded"}]"#;
+        let (steps, annotated) = decode_recipe(legacy);
+        assert!(!annotated);
+        assert_eq!(steps.len(), 1);
+        assert_eq!(steps[0].status, StepMatch::Exact);
+        assert!(!verdict_unbacked(&evidence_with(Vec::new(), false)));
+        assert!(!verdict_unbacked(&evidence_with(steps, false)));
+        let (steps, annotated) =
+            decode_recipe(&encode_recipe(&[step_with("ls", StepMatch::NotRun)]));
+        assert!(annotated);
+        assert_eq!(steps[0].status, StepMatch::NotRun);
+    }
+
+    #[test]
+    fn a_verdict_without_a_matched_command_is_qualified_but_not_rewritten() {
+        let ev = evidence_with(vec![step_with("cargo test", StepMatch::NotRun)], true);
+        assert!(verdict_unbacked(&ev));
+        let section = render_with(ev);
+        assert!(section.contains("**Passed** (not backed by a recorded command)"));
+        assert!(
+            section
+                .contains("not backed by a recorded command")
+                .then_some(())
+                .is_some()
+        );
+        let none = evidence_with(Vec::new(), true);
+        assert!(verdict_unbacked(&none));
+        assert_eq!(none.verdict.as_deref(), Some("passed"));
+        let failed = RunEvidence {
+            verdict: Some("failed".into()),
+            fix_confirmed: Some(false),
+            ..evidence_with(Vec::new(), true)
+        };
+        assert!(!verdict_unbacked(&failed));
+    }
+
+    #[test]
+    fn a_matched_command_backs_the_verdict() {
+        let ev = evidence_with(vec![step_with("cargo build", StepMatch::Variant)], true);
+        assert!(!verdict_unbacked(&ev));
+        assert!(!render_with(ev).contains("not backed by a recorded command"));
     }
 
     #[test]
@@ -1814,6 +2108,7 @@ mod tests {
             cwd: cwd.into(),
             order,
             result: "succeeded".into(),
+            status: StepMatch::Exact,
         };
         item.evidence.recipe = vec![step("make", "/w", 1), step("npm test", "/w/web", 2)];
         let section = render_section(&[item]).unwrap();

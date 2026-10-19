@@ -2678,7 +2678,11 @@ the board's inspector Notes tab. Three types, each with a `type`, a stable
 - `live_action` — a review live action attributed to this branch (an action
   spanning several branches appears on each). Carries `prompt`, and the
   `verdict`, `verdict_summary` and `report` of its latest finished run (all
-  `null` before one finishes); `at_ms` is that run's finish time, else the
+  `null` before one finishes), plus `verdict_unbacked`: true when that run
+  reported `passed` or a confirmed fix but none of its recipe commands matches a
+  recorded shell call (or it proposed none), so the claim has no recorded command
+  behind it (always false for runs stored before recipes were annotated). The
+  verdict itself is never changed; `at_ms` is that run's finish time, else the
   action's creation time.
 - `ghost` — the single most recently updated ghost among the branch's cells'
   ghosts and the branch's review-worktree ghost (a ghost accumulates its own
@@ -2693,7 +2697,7 @@ Board-only (no CLI command).
       "at_ms": 1700000002000, "owner_uri": "cell:squad-1:0:0", "content": "…" },
     { "type": "live_action", "id": "live-action:guardian-1:0", "title": "Open the board",
       "at_ms": 1700000001000, "prompt": "…", "verdict": "pass",
-      "verdict_summary": "…", "report": "…" },
+      "verdict_summary": "…", "verdict_unbacked": false, "report": "…" },
     { "type": "appraisal", "id": "proof:squad-1:0:cell:0:0#2", "title": "judge",
       "at_ms": 1700000000000, "score": 8, "pass_score": 7, "passed": true,
       "summary": "…", "sections": [{ "title": "Findings", "body": "…" }] }
@@ -5455,8 +5459,12 @@ Each action is a `### <verdict icon> <label>` heading (the run id follows as
 an HTML comment) over its newest run: the verdict (`Passed`, `Failed` or
 `Inconclusive`, separate from the runner `state`, which is shown only when it is
 not `finished`), trigger and time, the agent's summary, and a **Reproduce**
-code block of the accepted recipe, labelled with the shell it ran in and run
-from the repo root (or a `# in <dir>` line per directory). Below it, collapsed:
+coverage line ("2 of 3 proposed commands were run by the agent"), a **Reproduce**
+code block of the commands it was recorded running, labelled with the shell and run
+from the repo root (or a `# in <dir>` line per directory), and, as a separate
+**Suggested, not run by the agent** block, the proposed commands no recorded call ran.
+A `Passed` verdict or confirmed fix with no recorded command behind it is
+qualified "(not backed by a recorded command)" without being changed. Below it, collapsed:
 what the agent observed (its report as Markdown, fenced when it would break the
 block), the steps it was given (the exact prompt and system prompt, verbatim
 and fenced), and run details (the fix outcome as one sentence, any commits and
@@ -5472,9 +5480,12 @@ A live agent ends its reply with `RALPHUS_LIVE_RESULT: {"verdict": "...",
 the run's recorded `RALPHUS_TOOL:` shell calls (split on `&&`, `||`, `;`, `&`
 and line breaks; `cd`-style navigation, redirection and output-only pipeline
 stages such as `head`, `grep`, `Select-Object`, `findstr` are ignored;
-environment settings are not); matched commands are kept, unmatched ones
-dropped, each with the recorded call's cwd, order and result and the complete
-recorded invocation (rendered collapsed);
+environment settings are not); every proposed command is kept with a status: `exact` (the
+recorded call is that command), `variant` (it is one command inside a different
+recorded call) or `not_run`. Matched steps come first in recorded order, each with the recorded call's cwd, order and result and the complete
+recorded invocation (rendered collapsed); unmatched steps follow in proposed order
+with no call, order or result. The recipe is stored as `{"annotated":true,"steps":[…]}`;
+older rows are a bare array of matched steps and are never flagged as unbacked;
 a missing or unparseable result, or a run that did not finish, is
 `inconclusive`. Refreshes are durable (`pr_live_result_refresh`): requested on
 run finish, integration end, and PR create/adopt/replace/promote; a failed

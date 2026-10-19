@@ -105,14 +105,15 @@ impl Store {
                     let evidence = self.live_run_evidence(&r.run_id).ok()?;
                     Some((r, evidence))
                 });
-            let (verdict, verdict_summary, report, run_at) = match &latest {
+            let (verdict, verdict_summary, report, run_at, unbacked) = match &latest {
                 Some((run, evidence)) => (
                     evidence.verdict.clone(),
                     evidence.verdict_summary.clone(),
                     run.report.clone(),
                     run.finished_at_ms,
+                    crate::live_results::verdict_unbacked(evidence),
                 ),
-                None => (None, None, None, None),
+                None => (None, None, None, None, false),
             };
             notes.push(json!({
                 "type": "live_action",
@@ -122,6 +123,7 @@ impl Store {
                 "prompt": action.prompt,
                 "verdict": verdict,
                 "verdict_summary": verdict_summary,
+                "verdict_unbacked": unbacked,
                 "report": report,
             }));
         }
