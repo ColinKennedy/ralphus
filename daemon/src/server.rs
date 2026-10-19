@@ -7122,9 +7122,13 @@ fn prepare_submitted_file(
     toml_text: &str,
     file: &mut ralphus_core::schema::TaskFile,
 ) -> Result<Vec<String>, Reply> {
+    // One guard for every check: they are local DB/registry lookups, and
+    // taking the lock once rather than per check means one wait behind other
+    // writers instead of eight (STRESS-007).
     // allow-lock-io: preflight validators below are local DB/registry lookups only.
+    let guard = store.lock();
     let profile_errors =
-        crate::agent_profiles::validate_task_file_profiles(&store.lock(), toml_text, file);
+        crate::agent_profiles::validate_task_file_profiles(&guard, toml_text, file);
     if !profile_errors.is_empty() {
         return Err(error(
             400,
@@ -7140,7 +7144,7 @@ fn prepare_submitted_file(
     // Runs before `apply_profile_model_defaults` so a winning candidate with
     // no `model` of its own still gets that same profile-default backfill.
     let candidate_list_errors = crate::agent_profiles::resolve_agent_candidate_lists(
-        &store.lock(),
+        &guard,
         file,
         &crate::runner::SubprocessRunner::from_env(),
     );
@@ -7152,18 +7156,14 @@ fn prepare_submitted_file(
             candidate_list_errors,
         ));
     }
-    // allow-lock-io: local DB/registry lookup only.
-    crate::agent_profiles::apply_profile_model_defaults(&store.lock(), file);
+    crate::agent_profiles::apply_profile_model_defaults(&guard, file);
 
     // RAL-…: an `extends` entry must name a registered preset --
     // `core::validate` only checked its shape, since `core` has no store
     // access. Runs before `apply_presets` stamps field defaults into any of
     // this file's tasks'/cells'/proof steps' own unset fields, so every
     // stamp below is guaranteed to resolve a real preset.
-    let preset_errors = {
-        let guard = store.lock();
-        crate::presets::validate_task_file_presets(&guard, toml_text, file)
-    };
+    let preset_errors = crate::presets::validate_task_file_presets(&guard, toml_text, file);
     if !preset_errors.is_empty() {
         return Err(error(
             400,
@@ -7172,10 +7172,7 @@ fn prepare_submitted_file(
             preset_errors,
         ));
     }
-    let preset_warnings = {
-        let guard = store.lock();
-        crate::presets::apply_presets(&guard, file)
-    };
+    let preset_warnings = crate::presets::apply_presets(&guard, file);
     let post_preset_errors = crate::presets::check_required_fields_after_presets(file);
     if !post_preset_errors.is_empty() {
         return Err(error(
@@ -7189,9 +7186,8 @@ fn prepare_submitted_file(
     // RAL-318: an inline `triage_type` must name a registered Triage type --
     // `core::validate` only checked its structure (non-empty, requires
     // `triage = true`), since `core` has no store access.
-    // allow-lock-io: local DB/registry lookup only.
     let triage_type_errors =
-        crate::triage::validate_task_file_triage_types(&store.lock(), toml_text, file);
+        crate::triage::validate_task_file_triage_types(&guard, toml_text, file);
     if !triage_type_errors.is_empty() {
         return Err(error(
             400,
@@ -7205,16 +7201,14 @@ fn prepare_submitted_file(
     // project in its `project` field; `validate_toml` above already required
     // that field to be set (core has no DB access), so this preflight only
     // needs the registry lookup itself (RAL-100).
-    // allow-lock-io: local DB/registry lookup only.
-    if let Err(msg) = validate_projects_registered(&store.lock(), file) {
+    if let Err(msg) = validate_projects_registered(&guard, file) {
         return Err(error(400, "project_validation_failed", &msg, vec![]));
     }
 
     // Every `machine` value must name a registered provider at a supported
     // contract version (RAL-185). Core validated the syntax offline; only the
     // daemon can see the registry.
-    // allow-lock-io: local DB/registry lookup only.
-    if let Err(msg) = validate_machines_registered(&store.lock(), file) {
+    if let Err(msg) = validate_machines_registered(&guard, file) {
         return Err(error(400, "machine_validation_failed", &msg, vec![]));
     }
     // Phase 3a: every cell/proof under one task must share a machine.
@@ -7222,8 +7216,7 @@ fn prepare_submitted_file(
         return Err(error(400, "machine_validation_failed", &msg, vec![]));
     }
     // Phase 3b: a remote-fed review must declare what cannot be discovered.
-    // allow-lock-io: local DB/registry lookup only.
-    if let Err(msg) = validate_remote_reviews_are_declarative(&store.lock(), file) {
+    if let Err(msg) = validate_remote_reviews_are_declarative(&guard, file) {
         return Err(error(400, "machine_validation_failed", &msg, vec![]));
     }
     Ok(preset_warnings)
@@ -7274,7 +7267,7 @@ fn seed_materializing_cells(
             // independent of whether it opted into Triage.
             if !cell.subprojects.is_empty() {
                 let _ = store.set_cell_subprojects(
-                    &squad_id,
+                    squad_id,
                     task_idx as i64,
                     idx as i64,
                     &cell.subprojects,
@@ -7301,7 +7294,7 @@ fn seed_materializing_cells(
                     .clone()
                     .or_else(|| cell.command.clone())
                     .unwrap_or_default();
-                let _ = store.mark_cell_triage_pending(&squad_id, task_idx, idx);
+                let _ = store.mark_cell_triage_pending(squad_id, task_idx, idx);
                 pending_classifications.push(crate::arbiter::PendingClassification {
                     task_idx,
                     idx,
@@ -7309,7 +7302,7 @@ fn seed_materializing_cells(
                     context,
                 });
             } else {
-                let _ = store.set_cell_triage_types(&squad_id, task_idx, idx, &inline_types);
+                let _ = store.set_cell_triage_types(squad_id, task_idx, idx, &inline_types);
             }
             // RAL-346: seed this cell's subproject resolution from its own
             // manually-declared `CellDef.subprojects` when non-empty -- a
@@ -7477,20 +7470,30 @@ fn report_materialization_phase(
     label: &str,
 ) {
     let guard = store_handle.lock();
-    let _ =
-        guard.set_squad_materialization_phase(squad_id, step, MATERIALIZATION_TOTAL_PHASES, label);
-    crate::cartographer::Note::new("submit")
-        .scope("materialize")
-        .squad(squad_id)
-        .emit(
-            &guard,
-            format!("{step}/{MATERIALIZATION_TOTAL_PHASES} {label}"),
-            serde_json::json!({
-                "step": step,
-                "total": MATERIALIZATION_TOTAL_PHASES,
-                "label": label,
-            }),
+    // One commit for the phase and its Cartographer row: every submit
+    // reports several phases, all competing with the write worker for the
+    // store (STRESS-007).
+    let _ = guard.transaction(|store| {
+        let _ = store.set_squad_materialization_phase(
+            squad_id,
+            step,
+            MATERIALIZATION_TOTAL_PHASES,
+            label,
         );
+        crate::cartographer::Note::new("submit")
+            .scope("materialize")
+            .squad(squad_id)
+            .emit(
+                store,
+                format!("{step}/{MATERIALIZATION_TOTAL_PHASES} {label}"),
+                serde_json::json!({
+                    "step": step,
+                    "total": MATERIALIZATION_TOTAL_PHASES,
+                    "label": label,
+                }),
+            );
+        Ok(())
+    });
 }
 
 /// Land a squad whose background materialization failed in `failed`, with

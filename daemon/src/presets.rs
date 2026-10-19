@@ -368,6 +368,9 @@ pub fn validate_task_file_presets(
     file: &TaskFile,
 ) -> Vec<ValidationError> {
     let mut errors = Vec::new();
+    if !task_file_extends_presets(file) {
+        return errors;
+    }
     let registered = effective_presets(store).unwrap_or_default();
     let known_names: Vec<&str> = registered.iter().map(|p| p.name.as_str()).collect();
     let mut search_from_line = 0usize;
@@ -608,6 +611,21 @@ pub fn merge_presets(db: Vec<PresetView>, roots: &[PathBuf]) -> Vec<PresetView> 
 ///
 /// # Errors
 /// Propagates any SQLite failure.
+/// Whether any task, cell or proof step in `file` names a preset in its
+/// `extends`. Most submissions name none, and then there is nothing to
+/// validate or apply, so the preset registry (database rows plus every
+/// configured preset directory) is not loaded at all (STRESS-007).
+#[must_use]
+pub fn task_file_extends_presets(file: &TaskFile) -> bool {
+    file.task.iter().any(|task| {
+        !task.extends.is_empty()
+            || task.proof.iter().any(|p| !p.extends.is_empty())
+            || task.cell.iter().any(|cell| {
+                !cell.extends.is_empty() || cell.proof.iter().any(|p| !p.extends.is_empty())
+            })
+    })
+}
+
 pub fn effective_presets(store: &Store) -> StoreResult<Vec<PresetView>> {
     Ok(merge_presets(
         store.list_presets()?,
@@ -898,6 +916,9 @@ fn apply_to_proof(
 ///
 /// Returns the warnings the stamp produced (see [`apply_presets_from`]).
 pub fn apply_presets(store: &Store, file: &mut TaskFile) -> Vec<String> {
+    if !task_file_extends_presets(file) {
+        return Vec::new();
+    }
     let registered = effective_presets(store).unwrap_or_default();
     apply_presets_from(&registered, file)
 }
@@ -1024,6 +1045,25 @@ mod tests {
 
     fn store() -> Store {
         Store::open_in_memory().expect("in-memory store")
+    }
+
+    #[test]
+    fn only_a_file_that_extends_a_preset_needs_the_registry() {
+        let plain = "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\n";
+        assert!(!task_file_extends_presets(&file_from_toml(plain)));
+        for extends in [
+            "[[task]]\nname=\"t\"\nextends=[\"a\"]\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\n",
+            "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nextends=[\"a\"]\n",
+            "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\n\
+             [[task.cell.proof]]\ncommand=\"true\"\nextends=[\"a\"]\n",
+            "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\n\
+             [[task.proof]]\ncommand=\"true\"\nextends=[\"a\"]\n",
+        ] {
+            assert!(
+                task_file_extends_presets(&file_from_toml(extends)),
+                "{extends}"
+            );
+        }
     }
 
     fn file_from_toml(raw: &str) -> TaskFile {
