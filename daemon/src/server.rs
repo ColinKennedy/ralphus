@@ -7047,110 +7047,10 @@ pub(crate) fn submit(daemon: &Daemon, body: &str, query: &str, user_header: Opti
         Ok(resolved) => file.submitter = resolved,
         Err(reply) => return reply,
     }
-    // allow-lock-io: preflight validators below are local DB/registry lookups only.
-    let profile_errors =
-        crate::agent_profiles::validate_task_file_profiles(&daemon.lock(), &req.toml, &file);
-    if !profile_errors.is_empty() {
-        return error(
-            400,
-            "validation_failed",
-            "the submitted TOML is invalid",
-            profile_errors,
-        );
-    }
-    // RAL-4xx: an `agent` candidate list is resolved to its first available
-    // entry exactly once, here, before persistence -- every candidate name
-    // was already confirmed to exist by the profile check just above, so a
-    // failure here only means "none of them are available on this machine."
-    // Runs before `apply_profile_model_defaults` so a winning candidate with
-    // no `model` of its own still gets that same profile-default backfill.
-    let candidate_list_errors = crate::agent_profiles::resolve_agent_candidate_lists(
-        &daemon.lock(),
-        &mut file,
-        &crate::runner::SubprocessRunner::from_env(),
-    );
-    if !candidate_list_errors.is_empty() {
-        return error(
-            400,
-            "validation_failed",
-            "the submitted TOML is invalid",
-            candidate_list_errors,
-        );
-    }
-    // allow-lock-io: local DB/registry lookup only.
-    crate::agent_profiles::apply_profile_model_defaults(&daemon.lock(), &mut file);
-
-    // RAL-…: an `extends` entry must name a registered preset --
-    // `core::validate` only checked its shape, since `core` has no store
-    // access. Runs before `apply_presets` stamps field defaults into any of
-    // this file's tasks'/cells'/proof steps' own unset fields, so every
-    // stamp below is guaranteed to resolve a real preset.
-    let preset_errors = {
-        let guard = daemon.lock();
-        crate::presets::validate_task_file_presets(&guard, &req.toml, &file)
+    let preset_warnings = match prepare_submitted_file(&daemon.store, &req.toml, &mut file) {
+        Ok(warnings) => warnings,
+        Err(reply) => return reply,
     };
-    if !preset_errors.is_empty() {
-        return error(
-            400,
-            "validation_failed",
-            "the submitted TOML is invalid",
-            preset_errors,
-        );
-    }
-    let preset_warnings = {
-        let guard = daemon.lock();
-        crate::presets::apply_presets(&guard, &mut file)
-    };
-    let post_preset_errors = crate::presets::check_required_fields_after_presets(&file);
-    if !post_preset_errors.is_empty() {
-        return error(
-            400,
-            "validation_failed",
-            "the submitted TOML is invalid",
-            post_preset_errors,
-        );
-    }
-
-    // RAL-318: an inline `triage_type` must name a registered Triage type --
-    // `core::validate` only checked its structure (non-empty, requires
-    // `triage = true`), since `core` has no store access.
-    // allow-lock-io: local DB/registry lookup only.
-    let triage_type_errors =
-        crate::triage::validate_task_file_triage_types(&daemon.lock(), &req.toml, &file);
-    if !triage_type_errors.is_empty() {
-        return error(
-            400,
-            "validation_failed",
-            "the submitted TOML is invalid",
-            triage_type_errors,
-        );
-    }
-
-    // A task with a placeholder cwd (`ralphus:new-worktree/<branch>`) names a
-    // project in its `project` field; `validate_toml` above already required
-    // that field to be set (core has no DB access), so this preflight only
-    // needs the registry lookup itself (RAL-100).
-    // allow-lock-io: local DB/registry lookup only.
-    if let Err(msg) = validate_projects_registered(&daemon.lock(), &file) {
-        return error(400, "project_validation_failed", &msg, vec![]);
-    }
-
-    // Every `machine` value must name a registered provider at a supported
-    // contract version (RAL-185). Core validated the syntax offline; only the
-    // daemon can see the registry.
-    // allow-lock-io: local DB/registry lookup only.
-    if let Err(msg) = validate_machines_registered(&daemon.lock(), &file) {
-        return error(400, "machine_validation_failed", &msg, vec![]);
-    }
-    // Phase 3a: every cell/proof under one task must share a machine.
-    if let Err(msg) = validate_machine_affinity(&file) {
-        return error(400, "machine_validation_failed", &msg, vec![]);
-    }
-    // Phase 3b: a remote-fed review must declare what cannot be discovered.
-    // allow-lock-io: local DB/registry lookup only.
-    if let Err(msg) = validate_remote_reviews_are_declarative(&daemon.lock(), &file) {
-        return error(400, "machine_validation_failed", &msg, vec![]);
-    }
     if let Some(label) = req.label.as_deref() {
         if let Some(reply) = reject_label_with_comma(label) {
             return reply;
@@ -7172,20 +7072,181 @@ pub(crate) fn submit(daemon: &Daemon, body: &str, query: &str, user_header: Opti
     // already established for Triage -- see [`BackgroundWork`]'s doc comment
     // for the production-vs-test split that keeps this from making the
     // ~150 existing `route()`-based submit tests flaky.
+    //
+    // `materializing`, not the hold-derived `pending`/`queued`: this squad's
+    // worktrees don't exist and its reviews haven't been derived yet, so it
+    // must not be schedulable (`Store::list_ready` only selects `pending`).
+    // The submission is stored with it, so a restarted daemon can finish
+    // setting it up (STRESS-008, `resume_materializations`).
+    let submission = crate::store::SquadSubmission {
+        toml: req.toml.clone(),
+        hold: req.hold,
+        acting_user: resolve_acting_user(query),
+    };
     let mut store = daemon.lock();
-    let squad_id = match store.insert_squad(&file, req.label.as_deref(), req.hold) {
+    let squad_id = match store.insert_materializing_squad(&file, req.label.as_deref(), &submission)
+    {
         Ok(id) => id,
         Err(e) => return store_error(&e),
     };
-    // Not the hold-derived `pending`/`queued` state `insert_squad` just
-    // wrote -- this squad's worktrees don't exist and its reviews haven't
-    // been derived yet, so it must not be schedulable. `Store::list_ready`
-    // only selects `state='pending'`, so `materializing` is already excluded
-    // with no scheduler change needed; `run_submit_followup` flips this
-    // forward to `pending`/`queued` on success, or `failed` on error.
-    if let Err(e) = store.set_squad_state(&squad_id, SquadState::Materializing) {
-        return store_error(&e);
+    let seeds = seed_materializing_cells(&store, &squad_id, &file);
+    drop(store);
+    spawn_materialization(
+        daemon.background(),
+        daemon.store_handle(),
+        squad_id.clone(),
+        file,
+        submission,
+        seeds,
+    );
+
+    json(
+        201,
+        &SubmitResponse {
+            squad_id,
+            state: SquadState::Materializing.as_str(),
+            warnings: preset_warnings,
+        },
+    )
+}
+
+/// Bring a parsed task file to the form a squad is created from, checking it
+/// against the daemon's registries on the way: agent profiles (including
+/// resolving candidate lists and backfilling profile default models),
+/// presets, Triage types, projects, machines and machine affinity. Returns
+/// the preset warnings, or the `400` reply naming what is wrong. Shared by
+/// `submit` and by resuming an interrupted setup (STRESS-008), so both build
+/// exactly the same squad from the same TOML.
+fn prepare_submitted_file(
+    store: &crate::store_lock::StoreMutex,
+    toml_text: &str,
+    file: &mut ralphus_core::schema::TaskFile,
+) -> Result<Vec<String>, Reply> {
+    // allow-lock-io: preflight validators below are local DB/registry lookups only.
+    let profile_errors =
+        crate::agent_profiles::validate_task_file_profiles(&store.lock(), toml_text, file);
+    if !profile_errors.is_empty() {
+        return Err(error(
+            400,
+            "validation_failed",
+            "the submitted TOML is invalid",
+            profile_errors,
+        ));
     }
+    // RAL-4xx: an `agent` candidate list is resolved to its first available
+    // entry exactly once, here, before persistence -- every candidate name
+    // was already confirmed to exist by the profile check just above, so a
+    // failure here only means "none of them are available on this machine."
+    // Runs before `apply_profile_model_defaults` so a winning candidate with
+    // no `model` of its own still gets that same profile-default backfill.
+    let candidate_list_errors = crate::agent_profiles::resolve_agent_candidate_lists(
+        &store.lock(),
+        file,
+        &crate::runner::SubprocessRunner::from_env(),
+    );
+    if !candidate_list_errors.is_empty() {
+        return Err(error(
+            400,
+            "validation_failed",
+            "the submitted TOML is invalid",
+            candidate_list_errors,
+        ));
+    }
+    // allow-lock-io: local DB/registry lookup only.
+    crate::agent_profiles::apply_profile_model_defaults(&store.lock(), file);
+
+    // RAL-…: an `extends` entry must name a registered preset --
+    // `core::validate` only checked its shape, since `core` has no store
+    // access. Runs before `apply_presets` stamps field defaults into any of
+    // this file's tasks'/cells'/proof steps' own unset fields, so every
+    // stamp below is guaranteed to resolve a real preset.
+    let preset_errors = {
+        let guard = store.lock();
+        crate::presets::validate_task_file_presets(&guard, toml_text, file)
+    };
+    if !preset_errors.is_empty() {
+        return Err(error(
+            400,
+            "validation_failed",
+            "the submitted TOML is invalid",
+            preset_errors,
+        ));
+    }
+    let preset_warnings = {
+        let guard = store.lock();
+        crate::presets::apply_presets(&guard, file)
+    };
+    let post_preset_errors = crate::presets::check_required_fields_after_presets(file);
+    if !post_preset_errors.is_empty() {
+        return Err(error(
+            400,
+            "validation_failed",
+            "the submitted TOML is invalid",
+            post_preset_errors,
+        ));
+    }
+
+    // RAL-318: an inline `triage_type` must name a registered Triage type --
+    // `core::validate` only checked its structure (non-empty, requires
+    // `triage = true`), since `core` has no store access.
+    // allow-lock-io: local DB/registry lookup only.
+    let triage_type_errors =
+        crate::triage::validate_task_file_triage_types(&store.lock(), toml_text, file);
+    if !triage_type_errors.is_empty() {
+        return Err(error(
+            400,
+            "validation_failed",
+            "the submitted TOML is invalid",
+            triage_type_errors,
+        ));
+    }
+
+    // A task with a placeholder cwd (`ralphus:new-worktree/<branch>`) names a
+    // project in its `project` field; `validate_toml` above already required
+    // that field to be set (core has no DB access), so this preflight only
+    // needs the registry lookup itself (RAL-100).
+    // allow-lock-io: local DB/registry lookup only.
+    if let Err(msg) = validate_projects_registered(&store.lock(), file) {
+        return Err(error(400, "project_validation_failed", &msg, vec![]));
+    }
+
+    // Every `machine` value must name a registered provider at a supported
+    // contract version (RAL-185). Core validated the syntax offline; only the
+    // daemon can see the registry.
+    // allow-lock-io: local DB/registry lookup only.
+    if let Err(msg) = validate_machines_registered(&store.lock(), file) {
+        return Err(error(400, "machine_validation_failed", &msg, vec![]));
+    }
+    // Phase 3a: every cell/proof under one task must share a machine.
+    if let Err(msg) = validate_machine_affinity(file) {
+        return Err(error(400, "machine_validation_failed", &msg, vec![]));
+    }
+    // Phase 3b: a remote-fed review must declare what cannot be discovered.
+    // allow-lock-io: local DB/registry lookup only.
+    if let Err(msg) = validate_remote_reviews_are_declarative(&store.lock(), file) {
+        return Err(error(400, "machine_validation_failed", &msg, vec![]));
+    }
+    Ok(preset_warnings)
+}
+
+/// What [`seed_materializing_cells`] leaves for the background setup to do:
+/// the Triage classifications and subproject resolutions that need a model
+/// call, and whether any cell opted into Triage.
+struct MaterializationSeeds {
+    pending_classifications: Vec<crate::arbiter::PendingClassification>,
+    pending_subprojects: Vec<crate::arbiter::PendingSubprojectResolution>,
+    has_triage: bool,
+}
+
+/// Record each cell's declared subprojects and Triage types on a squad that
+/// was just created in `materializing`, and collect the Triage work that
+/// waits for its background setup. Plain store writes, so running it again
+/// for the same squad (a resumed setup, STRESS-008) rewrites the same values.
+fn seed_materializing_cells(
+    store: &crate::store::Store,
+    squad_id: &str,
+    file: &ralphus_core::schema::TaskFile,
+) -> MaterializationSeeds {
     // RAL-318: resolve every Triage-opted-in cell's type before it reaches
     // the pool. A cell with its own inline `triage_type` (already validated
     // as registered above) resolves for free, right here -- just a store
@@ -7277,41 +7338,120 @@ pub(crate) fn submit(daemon: &Daemon, body: &str, query: &str, user_header: Opti
             // cell rather than only Triage ones.
         }
     }
-    drop(store);
+    MaterializationSeeds {
+        pending_classifications,
+        pending_subprojects,
+        has_triage,
+    }
+}
 
-    let store_handle = daemon.store_handle();
-    let followup_squad_id = squad_id.clone();
-    let hold = req.hold;
-    let acting_user = resolve_acting_user(query);
-    daemon.background().spawn(move || {
+/// Run a `materializing` squad's background setup ([`run_submit_followup`])
+/// on `background`, failing the squad if it panics.
+fn spawn_materialization(
+    background: &BackgroundWork,
+    store_handle: StoreHandle,
+    squad_id: String,
+    file: ralphus_core::schema::TaskFile,
+    submission: crate::store::SquadSubmission,
+    seeds: MaterializationSeeds,
+) {
+    background.spawn(move || {
         let guard_handle = store_handle.clone();
-        let guard_squad_id = followup_squad_id.clone();
+        let guard_squad_id = squad_id.clone();
         run_submit_followup_guarded(
             &guard_handle,
             &guard_squad_id,
             std::panic::AssertUnwindSafe(move || {
                 run_submit_followup(
                     &store_handle,
-                    followup_squad_id,
+                    squad_id,
                     file,
-                    hold,
-                    pending_classifications,
-                    pending_subprojects,
-                    has_triage,
-                    acting_user,
+                    submission.hold,
+                    seeds.pending_classifications,
+                    seeds.pending_subprojects,
+                    seeds.has_triage,
+                    submission.acting_user,
                 );
             }),
         );
     });
+}
 
-    json(
-        201,
-        &SubmitResponse {
-            squad_id,
-            state: SquadState::Materializing.as_str(),
-            warnings: preset_warnings,
-        },
-    )
+/// Finish setting up every squad a previous daemon left `materializing`
+/// (STRESS-008). Each was stored with its submission, so the effective task
+/// file is rebuilt from it exactly as `submit` built it, and its background
+/// setup runs again: steps that already finished are idempotent or skipped
+/// (see [`run_submit_followup`]). A submission that no longer prepares
+/// cleanly -- a preset or agent profile removed meanwhile -- fails the squad
+/// with that reason. Call once at startup, after `recover_orphaned_squads`
+/// and before the scheduler runs. Returns the squad ids it resumed.
+pub(crate) fn resume_materializations(daemon: &Daemon) -> Vec<String> {
+    let resumable = match daemon.lock().resumable_materializations() {
+        Ok(rows) => rows,
+        Err(e) => {
+            // ralphus[ignore-rlog-pair]: the store could not be read, so there is no working store to record this on
+            crate::rlog!(
+                ERROR,
+                "ralphus [recovery] could not list interrupted squad setups: {e}"
+            );
+            return Vec::new();
+        }
+    };
+    let store_handle = daemon.store_handle();
+    let mut resumed = Vec::new();
+    for (squad_id, submission) in resumable {
+        let prepared = toml::from_str::<ralphus_core::schema::TaskFile>(&submission.toml)
+            .map_err(|e| format!("could not parse the stored task file: {e}"))
+            .and_then(|mut file| {
+                file.submitter = daemon
+                    .lock()
+                    .get_squad(&squad_id)
+                    .ok()
+                    .and_then(|s| s.submitter);
+                prepare_submitted_file(&daemon.store, &submission.toml, &mut file)
+                    .map(|_| file)
+                    .map_err(|reply| {
+                        format!(
+                            "the stored task file no longer passes submission checks: {}",
+                            reply.body
+                        )
+                    })
+            });
+        let file = match prepared {
+            Ok(file) => file,
+            Err(message) => {
+                fail_materialization(&store_handle, &squad_id, &message);
+                continue;
+            }
+        };
+        crate::rlog!(
+            WARNING,
+            "ralphus [recovery] squad {squad_id}: resuming setup interrupted by a restart"
+        );
+        let seeds = {
+            let guard = store_handle.lock();
+            crate::cartographer::Note::new("recovery")
+                .level(crate::logging::LogLevel::WARNING)
+                .squad(&squad_id)
+                .scope("materialize")
+                .emit(
+                    &guard,
+                    "squad setup interrupted by a restart: resuming",
+                    serde_json::json!({}),
+                );
+            seed_materializing_cells(&guard, &squad_id, &file)
+        };
+        spawn_materialization(
+            daemon.background(),
+            store_handle.clone(),
+            squad_id.clone(),
+            file,
+            submission,
+            seeds,
+        );
+        resumed.push(squad_id);
+    }
+    resumed
 }
 
 /// Fixed count of [`run_submit_followup`]'s named materialization phases
@@ -7570,19 +7710,32 @@ fn run_submit_followup(
     //
     // The failure path below takes its own guard: there is nothing to keep
     // atomic between the derivation and reporting that it failed.
-    let derived = crate::reviews::derive_reviews_with_full_prefetch(
-        store_handle,
-        &squad_id,
-        &file,
-        &prefetched_upstreams,
-        &prefetched_worktrees,
-        Some(&report_phase as &dyn Fn(&str)),
-    );
-    if let Err(e) = derived {
-        fail_materialization(store_handle, &squad_id, &e.message);
-        return;
+    //
+    // STRESS-008: derivation creates every guardian of a squad in one
+    // transaction, so a squad that already has guardians is a resumed setup
+    // whose derivation finished before the restart; running it again would
+    // create a second set.
+    let already_derived = store_handle
+        .lock()
+        .guardians_for_squad(&squad_id)
+        .is_ok_and(|ids| !ids.is_empty());
+    if already_derived {
+        checkpoint("review derivation already finished before a restart");
+    } else {
+        let derived = crate::reviews::derive_reviews_with_full_prefetch(
+            store_handle,
+            &squad_id,
+            &file,
+            &prefetched_upstreams,
+            &prefetched_worktrees,
+            Some(&report_phase as &dyn Fn(&str)),
+        );
+        if let Err(e) = derived {
+            fail_materialization(store_handle, &squad_id, &e.message);
+            return;
+        }
+        checkpoint("review derivation finished");
     }
-    checkpoint("review derivation finished");
 
     // RAL-400 Phase 8: create every `[[waypoint]]` this submission declared,
     // now that review derivation above has run and every same-file
@@ -7590,9 +7743,20 @@ fn run_submit_followup(
     // whole squad -- a declared waypoint is a coordination contract the
     // submitter asked for, so silently dropping it would be worse than
     // surfacing the error the same way a review-derivation failure does.
+    //
+    // STRESS-008: created in one transaction that also records them as
+    // created, so a resumed setup neither repeats nor half-repeats them.
     if !file.waypoint.is_empty() {
         let guard = store_handle.lock();
-        if let Err(e) = guard.create_submission_waypoints(&squad_id, &file.waypoint) {
+        let created = if guard.submission_waypoints_done(&squad_id).unwrap_or(false) {
+            Ok(())
+        } else {
+            guard.transaction(|store| {
+                store.create_submission_waypoints(&squad_id, &file.waypoint)?;
+                store.mark_submission_waypoints_done(&squad_id)
+            })
+        };
+        if let Err(e) = created {
             let message = e.to_string();
             let _ = guard.set_squad_error(&squad_id, Some(&message));
             let _ = guard.set_squad_state(&squad_id, SquadState::Failed);
@@ -20328,6 +20492,25 @@ pub fn serve<A: ToSocketAddrs>(
     // invoke the Arbiter -- but before any background worker or the scheduler
     // thread below starts scheduling work.
     crate::reviews::repair_triage_pool_keys(&daemon.store_handle());
+    // STRESS-008: squads whose setup the previous daemon did not finish run
+    // it again (on background threads; each stays `materializing`, so the
+    // scheduler below cannot claim it until it is done).
+    let resumed = resume_materializations(&daemon);
+    if !resumed.is_empty() {
+        crate::rlog!(
+            WARNING,
+            "ralphus [recovery] {} interrupted squad setup(s) resumed: {}",
+            resumed.len(),
+            resumed.join(", ")
+        );
+        crate::cartographer::Note::new("recovery")
+            .level(crate::logging::LogLevel::WARNING)
+            .emit(
+                &daemon.lock(),
+                "interrupted squad setups resumed",
+                serde_json::json!({ "squad_ids": resumed }),
+            );
+    }
 
     // Scheduler runs on its own thread, sharing the store via Arc<Mutex> and the
     // cancellation registry so a `cancel` request can reach its workers. The
@@ -22190,6 +22373,115 @@ mod tests {
         let error = v["error"].as_str().unwrap_or_default();
         assert!(
             error.contains("panicked") && error.contains("worktree claim exploded"),
+            "{error}"
+        );
+    }
+
+    /// A squad with one review on a registered project, submitted to a
+    /// daemon whose background setup waits for `drain()`.
+    fn deferred_review_submission(name: &str) -> (Daemon, String) {
+        let d = daemon().with_background_work(BackgroundWork::deferred());
+        let repo = tmp_git_repo(name);
+        let project = register_body("proj", &repo.to_string_lossy(), "");
+        assert_eq!(route(&d, "POST", "/api/projects", &project).status, 201);
+        let toml = "[[task]]\nname=\"t\"\nproject=\"proj\"\n\
+                    [[task.cell]]\nid=\"work\"\ncwd=\"<<ralphus:new-worktree/feat?upstream=main>>\"\n\
+                    prompt=\"p\"\nreview=\"<<ralphus:new-review/r>>\"\n\
+                    [[review]]\nid=\"ralphus:new-review/r\"\n";
+        let r = route(&d, "POST", "/api/squads", &submit_body(toml));
+        assert_eq!(r.status, 201, "{}", r.body);
+        let v: serde_json::Value = serde_json::from_str(&r.body).unwrap();
+        (d, v["squad_id"].as_str().unwrap().to_string())
+    }
+
+    #[test]
+    fn a_restart_mid_setup_resumes_the_squad_instead_of_failing_it() {
+        // STRESS-008: the daemon stops after acknowledging the submit but
+        // before its background setup ran (the deferred work is never
+        // drained), then starts again.
+        let (d, id) = deferred_review_submission("resume-mid-setup");
+        assert_eq!(
+            d.lock().squad_state(&id).unwrap(),
+            SquadState::Materializing
+        );
+
+        d.lock().recover_orphaned_squads().unwrap();
+        assert_eq!(
+            d.lock().squad_state(&id).unwrap(),
+            SquadState::Materializing,
+            "a squad stored with its submission is resumed, not failed"
+        );
+        assert_eq!(resume_materializations(&d), vec![id.clone()]);
+        // The original, interrupted setup never runs; only the resumed one.
+        d.background().drain();
+
+        assert_eq!(d.lock().squad_state(&id).unwrap(), SquadState::Pending);
+        assert_eq!(d.lock().guardians_for_squad(&id).unwrap().len(), 1);
+        assert!(
+            d.lock().resumable_materializations().unwrap().is_empty(),
+            "the stored submission is cleared once the squad is set up"
+        );
+    }
+
+    #[test]
+    fn a_resumed_setup_does_not_create_the_squads_reviews_twice() {
+        // The restart came after review derivation committed: the resumed
+        // setup must reuse its guardian rather than mint another.
+        let (d, id) = deferred_review_submission("resume-after-derive");
+        d.background().drain();
+        assert_eq!(d.lock().guardians_for_squad(&id).unwrap().len(), 1);
+
+        let submission = crate::store::SquadSubmission {
+            toml: "[[task]]\nname=\"t\"\nproject=\"proj\"\n\
+                   [[task.cell]]\nid=\"work\"\ncwd=\"<<ralphus:new-worktree/feat?upstream=main>>\"\n\
+                   prompt=\"p\"\nreview=\"<<ralphus:new-review/r>>\"\n\
+                   [[review]]\nid=\"ralphus:new-review/r\"\n"
+                .to_string(),
+            hold: false,
+            acting_user: None,
+        };
+        let mut file: ralphus_core::schema::TaskFile = toml::from_str(&submission.toml).unwrap();
+        prepare_submitted_file(&d.store, &submission.toml, &mut file).unwrap();
+        d.lock()
+            .set_squad_state(&id, SquadState::Materializing)
+            .unwrap();
+        let seeds = seed_materializing_cells(&d.lock(), &id, &file);
+        spawn_materialization(
+            d.background(),
+            d.store_handle(),
+            id.clone(),
+            file,
+            submission,
+            seeds,
+        );
+        d.background().drain();
+
+        assert_eq!(d.lock().squad_state(&id).unwrap(), SquadState::Pending);
+        assert_eq!(d.lock().guardians_for_squad(&id).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_stored_submission_that_no_longer_prepares_fails_the_squad_with_the_reason() {
+        let d = daemon().with_background_work(BackgroundWork::deferred());
+        let file: ralphus_core::schema::TaskFile = toml::from_str(GOOD).unwrap();
+        let id = d
+            .lock()
+            .insert_materializing_squad(
+                &file,
+                None,
+                &crate::store::SquadSubmission {
+                    toml: "this is not toml".to_string(),
+                    hold: false,
+                    acting_user: None,
+                },
+            )
+            .unwrap();
+
+        assert!(resume_materializations(&d).is_empty());
+        assert_eq!(d.lock().squad_state(&id).unwrap(), SquadState::Failed);
+        let error = d.lock().get_squad(&id).unwrap().error.unwrap_or_default();
+        assert!(
+            error.contains("could not parse the stored task file"),
             "{error}"
         );
     }
