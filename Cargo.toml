@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["core", "daemon", "librarian", "auth", "keygen", "bench-types", "bench-macros", "bench-harness", "ssh-provider", "runner", "cli", "mcp", "shell-syntax", "shell-syntax/grammars"]
+members = ["core", "daemon", "librarian", "auth", "keygen", "bench-types", "bench-macros", "bench-harness", "ssh-provider", "runner", "cli", "mcp", "shell-syntax", "shell-syntax/grammars", "stress"]
 
 [workspace.package]
 version = "0.1.0"

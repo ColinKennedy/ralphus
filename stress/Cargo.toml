@@ -1,0 +1,21 @@
+[package]
+name = "ralphus-stress"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "HTTP stress/fault-injection harness for ralphus-daemon: finds the request-rate ceiling and the 1%-error point, records results per tag/commit."
+
+[[bin]]
+name = "ralphus-stress"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+ureq = { workspace = true }
+chrono = { workspace = true }
+sysinfo = { workspace = true }

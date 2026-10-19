@@ -1094,6 +1094,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "ralphus-stress"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "serde",
+ "serde_json",
+ "sysinfo",
+ "ureq",
+]
+
+[[package]]
 name = "rand"
 version = "0.9.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
