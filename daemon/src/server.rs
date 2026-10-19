@@ -452,6 +452,26 @@ impl Daemon {
         }
     }
 
+    /// [`Daemon::read_board_snapshot`] for a windowed listing (STRESS-004);
+    /// with `None`, exactly the unwindowed snapshot.
+    pub(crate) fn read_board_snapshot_window(
+        &self,
+        window: Option<&crate::store::SquadWindow>,
+    ) -> crate::store::Result<(
+        crate::store::BoardSnapshot,
+        Option<crate::store::WindowMeta>,
+    )> {
+        let Some(window) = window else {
+            return self.read_board_snapshot().map(|s| (s, None));
+        };
+        let snapshot = match self.read_pool.acquire() {
+            Some(conn) => Store::board_snapshot_window_conn(&conn, window),
+            // allow-lock-io: fallback only when the read pool has no free connection.
+            None => Store::board_snapshot_window_conn(&self.lock().conn, window),
+        };
+        snapshot.map(|(s, meta)| (s, Some(meta)))
+    }
+
     /// [`Store::resolve_worktree_credential`] routed through the RAL-393
     /// Stage 3 read pool -- see that method's doc comment for why this must
     /// never wait on `StoreMutex`: doing so would self-deadlock against
@@ -898,6 +918,10 @@ struct DaemonStatus {
 struct Board {
     daemon: DaemonStatus,
     squads: Vec<crate::store::SquadView>,
+    /// Present only for a windowed request (`?window=N`, STRESS-004): what
+    /// the listing covers -- see [`board_window`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    window: Option<crate::store::WindowMeta>,
 }
 
 /// The compact board representation used exclusively by the flat Tasks tab.
@@ -906,6 +930,30 @@ struct Board {
 struct TaskIndexBoard {
     daemon: DaemonStatus,
     squads: Vec<TaskIndexSquad>,
+    /// As for [`Board::window`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    window: Option<crate::store::WindowMeta>,
+}
+
+/// Most finished squads one windowed page may ask for.
+const MAX_BOARD_WINDOW: i64 = 1000;
+
+/// A windowed board request (STRESS-004): `window=N` asks for every
+/// unfinished squad plus the `N` newest finished ones (capped at
+/// [`MAX_BOARD_WINDOW`]); `before=<cursor>` (a previous response's
+/// `window.next_before`) asks for the next page of older finished squads;
+/// `q=<text>` keeps only squads whose id or label contains it. Without
+/// `window` the listing is every squad, as it always was -- the CLI's
+/// selector resolution and `status` rely on that.
+fn board_window(query: &str) -> Option<crate::store::SquadWindow> {
+    let finished: i64 = query_param(query, "window")?.parse().ok()?;
+    Some(crate::store::SquadWindow {
+        finished: finished.clamp(1, MAX_BOARD_WINDOW),
+        before: query_param(query, "before")
+            .map(url_decode)
+            .and_then(|c| crate::store::SquadWindow::parse_cursor(&c)),
+        search: query_param(query, "q").map(url_decode),
+    })
 }
 
 #[derive(Serialize)]
@@ -1146,7 +1194,7 @@ fn route_for_user(
         ("POST", ["api", "events", "ticket"]) => mint_events_ticket(daemon),
         ("GET", ["api", "tasks"]) => board(daemon, query),
         // ralphus[ignore-endpoint-cli]: board 'Tasks' tab flat listing; the CLI reads per-squad views and `GET /api/tasks` instead
-        ("GET", ["api", "task-index"]) => task_index(daemon),
+        ("GET", ["api", "task-index"]) => task_index(daemon, query),
         // RAL-332: reads stay open to every caller -- `GET /api/projects` and
         // `.../branches` back the Simple task form's project/branch pickers
         // for every user, not just admins. Only the mutating registration
@@ -2623,7 +2671,8 @@ fn strip_prompt_text(squads: &mut [crate::store::SquadView]) {
 fn board(daemon: &Daemon, query: &str) -> Reply {
     daemon.cached_reply(&format!("tasks?{query}"), || {
         let mut timer = perf_timing::PhaseTimer::start();
-        let (squads, merging) = match daemon.read_board_snapshot() {
+        let window = board_window(query);
+        let ((squads, merging), window) = match daemon.read_board_snapshot_window(window.as_ref()) {
             Ok(v) => v,
             Err(e) => return store_error(&e),
         };
@@ -2654,6 +2703,7 @@ fn board(daemon: &Daemon, query: &str) -> Reply {
                     downtime_active: crate::config::scheduler_in_downtime(),
                 },
                 squads,
+                window,
             },
         );
         timer.phase(perf_timing::PHASE_SERIALIZE);
@@ -2666,15 +2716,18 @@ fn board(daemon: &Daemon, query: &str) -> Reply {
 /// 414: via `crate::perf_timing`, opt in with `RALPHUS_BOARD_TIMING`) that
 /// separate store-lock contention, view construction, and serialization.
 /// One build is shared between requests -- see [`Daemon::cached_reply`].
-fn task_index(daemon: &Daemon) -> Reply {
-    daemon.cached_reply("task-index", || {
+/// Takes the same `window`/`before`/`q` parameters as `/api/tasks`
+/// ([`board_window`]).
+fn task_index(daemon: &Daemon, query: &str) -> Reply {
+    daemon.cached_reply(&format!("task-index?{query}"), || {
         // Same read as `board` above, served from the same pooled snapshot --
         // this endpoint reads exactly the two things `board_snapshot_conn`
         // returns, so there is no reason for it to take the writer lock either.
         // The Tasks tab polls it, and `updateCounter` polls it from every other
         // tab, so it is nearly as hot as `/api/tasks` itself.
         let mut timer = perf_timing::PhaseTimer::start();
-        let (squads, merging) = match daemon.read_board_snapshot() {
+        let window = board_window(query);
+        let ((squads, merging), window) = match daemon.read_board_snapshot_window(window.as_ref()) {
             Ok(v) => v,
             Err(e) => return store_error(&e),
         };
@@ -2692,6 +2745,7 @@ fn task_index(daemon: &Daemon) -> Reply {
                 downtime_active: crate::config::scheduler_in_downtime(),
             },
             squads: squads.into_iter().map(Into::into).collect(),
+            window,
         };
         timer.phase(perf_timing::PHASE_VIEW);
         let mut reply = json(200, &response);

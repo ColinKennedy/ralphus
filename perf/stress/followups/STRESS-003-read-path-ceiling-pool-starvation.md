@@ -5,7 +5,8 @@
   `browsing_users`
 - **Found at:** `035ef1e70` (staging, 2026-10-18); `cbd049ec5` shows the
   same numbers
-- **Status:** open
+- **Status:** fixed on `stress-fixes-medium` (PR #780): the read peak went
+  from ~20 to ~10,500 ok/s.
 
 ## Numbers
 

@@ -278,6 +278,14 @@ impl Dialect {
     }
 }
 
+/// The board list the web board itself requests: every active squad plus
+/// the 200 newest finished ones (STRESS-004). Daemons that predate the
+/// window ignore the parameter and return every squad, which is exactly
+/// what the board of their era asked for, so results stay comparable.
+pub const BOARD_PATH: &str = "/api/tasks?window=200";
+/// The compact Tasks-tab list, windowed the same way as [`BOARD_PATH`].
+pub const TASK_INDEX_PATH: &str = "/api/task-index?window=200";
+
 /// A one-task, one-cell squad. A `prompt` cell is the shape every daemon
 /// version accepts without extra fields (a `command` cell needs
 /// `remediation_attempts` on current ones); it is submitted held, so it never
@@ -386,10 +394,10 @@ impl Api {
         let noun = &self.noun;
         match op {
             Op::Health => self.call(agent, user, "GET", "/api/daemon", None, false),
-            Op::Board => self.call(agent, user, "GET", "/api/tasks", None, false),
+            Op::Board => self.call(agent, user, "GET", BOARD_PATH, None, false),
             Op::Queue => self.call(agent, user, "GET", "/api/queue", None, false),
             Op::Projects => self.call(agent, user, "GET", "/api/projects", None, false),
-            Op::TaskIndex => self.call(agent, user, "GET", "/api/task-index", None, false),
+            Op::TaskIndex => self.call(agent, user, "GET", TASK_INDEX_PATH, None, false),
             Op::Guardians => self.call(agent, user, "GET", "/api/guardians", None, false),
             Op::Submit => self.submit(agent, user, rng),
             Op::Validate => {
@@ -409,7 +417,7 @@ impl Api {
             }
             Op::SquadGet | Op::EnvSet | Op::LabelEdit => {
                 let Some(id) = self.random_id(rng) else {
-                    return self.call(agent, user, "GET", "/api/tasks", None, false);
+                    return self.call(agent, user, "GET", BOARD_PATH, None, false);
                 };
                 let n = self.counter.fetch_add(1, Ordering::Relaxed);
                 match op {

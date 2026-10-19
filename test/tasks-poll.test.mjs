@@ -38,7 +38,7 @@ test("updateCounter: concurrent calls share one in-flight /api/task-index reques
   const promiseA = poll.updateCounter();
   const promiseB = poll.updateCounter();
   assert.equal(poll.pendingFetches.length, 1, "the second call must not fire its own duplicate fetch");
-  assert.equal(poll.pendingFetches[0].url, "/api/task-index", "the counter reads the compact index, not the full board");
+  assert.equal(poll.pendingFetches[0].url, "/api/task-index?window=200", "the counter reads the compact, windowed index, not the full board");
 
   resolveJson(poll.pendingFetches[0], { daemon: { running: 1, max_concurrent: 2 }, squads: [{ id: "s-1" }] });
   await Promise.all([promiseA, promiseB]);
@@ -73,7 +73,7 @@ test("pollTasks and updateCounter read different endpoints, so neither is starve
   const tasksPromise = poll.pollTasks();
   assert.deepEqual(
     poll.pendingFetches.map((f) => f.url).sort(),
-    ["/api/task-index", "/api/tasks"],
+    ["/api/task-index?window=200", "/api/tasks?window=200"],
     "each function fetches its own endpoint",
   );
 

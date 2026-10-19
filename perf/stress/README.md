@@ -91,6 +91,12 @@ once one step exceeds 50%, or when the daemon dies.
 | `mixed_80_20` | 80% of the read mix, 20% of the write mix |
 | `browsing_users` | the mixed profile with a 1 s think time per user; steps of 100 → 4000 users. Models "how many people can have the board open and clicking". |
 
+"Board" and "task index" request what the web board requests:
+`/api/tasks?window=200` and `/api/task-index?window=200` (STRESS-004).
+Daemons that predate windowing ignore the parameter and return every squad,
+which is what their board asked for, so numbers stay comparable across
+versions.
+
 Every write except validate goes through the daemon's single write worker
 (`WRITE_WORKERS` in `daemon/src/server.rs`). Reads go to the 12-thread read
 pool.
@@ -102,7 +108,7 @@ A single daemon is grown through (squads, projects) levels:
 the run records:
 
 - submit throughput while seeding;
-- board (`GET /api/tasks`) size and single-request latency;
+- board (`GET /api/tasks?window=200`) size and single-request latency;
 - a read-heavy window and a mixed window at `--volume-users` (32) VUs.
 
 Projects are registered against real `git init` repositories, as the daemon
@@ -214,5 +220,8 @@ Triaged follow-up work for findings lives in [`followups/`](followups/).
   drops ops an older daemon does not support. Each result records which ops
   ran, so cross-version comparisons stay honest.
 - **A new fault:** add a `Fault` variant in `stress/src/faults.rs`.
+- **The task-file schema changes:** add a spelling to `api::Dialect::ALL`,
+  newest first. The probe submits each in turn and keeps the first one the
+  daemon accepts, so older commits stay measurable.
 - **Schema changes:** bump `report::SCHEMA_VERSION`. `HISTORY.md` is built
   from the raw JSON and tolerates missing fields.

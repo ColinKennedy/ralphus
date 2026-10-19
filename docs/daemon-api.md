@@ -3830,6 +3830,33 @@ keeps the default newest-first order).
 
 `max_concurrent` is the configured global concurrency cap (`0` means no limit).
 
+**Windowed listing (STRESS-004).** The parameters below are opt-in. Without
+`window`, the response is every squad, as before; `ralphus` selector
+resolution and `status` rely on that.
+
+| Parameter | Meaning |
+|---|---|
+| `window=N` | Return every squad that has not finished, plus the `N` newest finished squads (`done`, `failed` or `cancelled`). `N` is capped at 1000. |
+| `before=<cursor>` | A previous response's `window.next_before`. Returns the next `N` older finished squads only; unfinished squads come only with the first page. |
+| `q=<text>` | Keep only squads whose id or label contains `text`, case-insensitively, across all history. `%` and `_` match themselves. |
+
+`status`, `name` and `sort` still apply on top. A windowed response adds a
+`window` object:
+
+```json
+"window": { "total": 10007, "loaded": 214, "has_more": true, "next_before": "1783120106867:squad-000000009801" }
+```
+
+| Field | Meaning |
+|---|---|
+| `total` | Squads matching `q` (all squads without it). |
+| `loaded` | Squads in this response. |
+| `has_more` | Whether older finished squads remain. |
+| `next_before` | Cursor for the next page, or `null` when `has_more` is false. |
+
+The board uses `window=200` and pages older history in on request.
+`GET /api/task-index` takes the same parameters.
+
 ```json
 {
   "daemon": { "running": 1, "max_concurrent": 20, "running_reviews": [], "downtime_active": false },
@@ -3920,8 +3947,9 @@ Compact cross-squad data for the flat Tasks tab. It has the same `daemon` and
 `squads` nesting needed by that table, but omits authored prompts, commands,
 system prompts, proof specifications, captured proof output, and configuration
 fields the table never renders. This keeps a historical board from repeatedly
-transferring multi-megabyte text blobs on tab entry. It is read-only and has no
-query parameters.
+transferring multi-megabyte text blobs on tab entry. It is read-only. It takes
+the same opt-in `window` / `before` / `q` parameters as `GET /api/tasks`, with
+the same `window` object in the response.
 
 `started_at_ms` (RAL-210) is epoch-ms local-machine time of the moment this
 cell most recently transitioned to `running`; omitted from the JSON

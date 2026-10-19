@@ -126,6 +126,105 @@
        */
       const noteDaemonAnswered = () => { daemonBusyStreak = 0; daemonBusyUntil = 0; };
       // RALPHUS-DAEMON-BUSY:END
+      // RALPHUS-BOARD-WINDOW:BEGIN
+      /**
+       * STRESS-004: the board loads every squad that is still active plus this
+       * many of the newest finished ones, instead of every squad ever
+       * submitted -- whose cost (payload, daemon build time, and every
+       * client-side filter pass) grew without bound with history. Older
+       * finished squads arrive a page at a time through "Load older".
+       */
+      const BOARD_WINDOW = 200;
+      /**
+       * @typedef {object} BoardWindowMeta
+       * @property {number} total - squads matching the request (all squads, without a search).
+       * @property {number} loaded - squads in that response.
+       * @property {boolean} has_more - whether older finished squads remain.
+       * @property {string|null} next_before - cursor for the next page.
+       */
+      /**
+       * @typedef {object} BoardWindowState
+       * @property {BoardWindowMeta|null} meta - coverage of the last first-page response.
+       * @property {{full: SquadView[], index: SquadView[]}} older - pages loaded with "Load older", per response shape (`/api/tasks` is "full", `/api/task-index` is "index").
+       * @property {{full: string|null, index: string|null}} cursor - where each shape's next page starts.
+       * @property {{full: boolean, index: boolean}} hasMore - whether each shape has older pages left.
+       * @property {Map<string, SquadView>} pinned - squads outside the window fetched by id (a deep link, the current selection, a search hit).
+       * @property {Set<string>} pinTried - ids already looked up, so a missing squad is not refetched every poll.
+       */
+      /** @type {BoardWindowState} */
+      const boardWindow = {
+        meta: null,
+        older: { full: [], index: [] },
+        cursor: { full: null, index: null },
+        hasMore: { full: false, index: false },
+        pinned: new Map(),
+        pinTried: new Set(),
+      };
+      /**
+       * A windowed list URL.
+       * @param {string} path - `/api/tasks` or `/api/task-index`.
+       * @param {string|null} [before] - a page cursor (`window.next_before`).
+       * @returns {string}
+       */
+      const boardWindowUrl = (path, before) => `${path}?window=${BOARD_WINDOW}${before ? `&before=${encodeURIComponent(before)}` : ""}`;
+      /**
+       * Records a first-page response's coverage. Each shape's cursor follows
+       * the first page until that shape has loaded an older page itself; after
+       * that, "Load older" owns it.
+       * @param {BoardWindowMeta|undefined|null} meta
+       * @param {"full"|"index"} shape
+       * @returns {void}
+       */
+      const noteBoardWindow = (meta, shape) => {
+        if (!meta) return;
+        boardWindow.meta = meta;
+        if (!boardWindow.older[shape].length) {
+          boardWindow.cursor[shape] = meta.next_before;
+          boardWindow.hasMore[shape] = meta.has_more;
+        }
+      };
+      /**
+       * Joins the first page with older pages and pinned squads: deduplicated
+       * by id with the first page winning (it is the freshest -- a squad that
+       * left an older page by being retried comes back in it), newest first.
+       * Squad ids are fixed-width and increase with submission, so they order
+       * by age in both response shapes.
+       * @param {SquadView[]} first
+       * @param {...SquadView[]} extras
+       * @returns {SquadView[]}
+       */
+      const mergeWindowedSquads = (first, ...extras) => {
+        const seen = new Set(first.map((s) => s.id));
+        const out = [...first];
+        for (const list of extras) {
+          for (const s of list) {
+            if (!seen.has(s.id)) { seen.add(s.id); out.push(s); }
+          }
+        }
+        out.sort((a, b) => (a.id < b.id ? 1 : a.id > b.id ? -1 : 0));
+        return out;
+      };
+      /**
+       * The squad list the board shows for one response shape: its first page
+       * plus everything loaded beyond it.
+       * @param {SquadView[]} first
+       * @param {"full"|"index"} shape
+       * @returns {SquadView[]}
+       */
+      const windowedSquads = (first, shape) => mergeWindowedSquads(first, boardWindow.older[shape], [...boardWindow.pinned.values()]);
+      /**
+       * The "showing N of M" footer under a squad list, or "" when everything
+       * is loaded.
+       * @param {number} shown - squads currently in the list.
+       * @param {"full"|"index"} shape
+       * @returns {string}
+       */
+      const boardWindowFooter = (shown, shape) => {
+        const meta = boardWindow.meta;
+        if (!meta || !boardWindow.hasMore[shape]) return "";
+        return `<div class="window-more"><span data-tip="The board loads every active squad plus the ${BOARD_WINDOW} newest finished ones, so it stays fast however much history builds up.\nOlder finished squads are still there: load them a page at a time, or type in the search box to find one by id or name across all history.">Showing ${shown} of ${meta.total} squads</span><button class="btn" data-click="loadOlderSquads" data-tip="Load the next ${BOARD_WINDOW} older finished squads into this list.\nWho/when: looking for a squad that finished a while ago.\nThe extra squads stay loaded until the page is reloaded.">Load older</button></div>`;
+      };
+      // RALPHUS-BOARD-WINDOW:END
 
       // ---- ralphus URI scheme (RAL-188) ----
       // One self-describing way to address any squad/task/cell/proof or

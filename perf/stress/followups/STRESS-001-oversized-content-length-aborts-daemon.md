@@ -4,7 +4,8 @@
 - **Found by:** `ralphus-stress`, fault `malformed_requests`, payload
   `huge_content_length_then_close`
 - **Found at:** `035ef1e70` (staging, 2026-10-18), release build, Windows 10
-- **Status:** open
+- **Status:** fixed on `stress-fixes-low` (PR #778): `malformed_requests`
+  and `oversized_body` pass.
 
 ## What happens
 

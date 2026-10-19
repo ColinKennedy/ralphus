@@ -217,7 +217,7 @@
           const gen = ++tasksFetchGeneration;
           tasksFetchInFlight = (async () => {
             try {
-              return await (await fetch("/api/tasks")).json();
+              return await (await fetch(boardWindowUrl("/api/tasks"))).json();
             } finally {
               // Only clear the slot if it's still this request's -- a
               // slow request that `invalidateTasksFetch` (RAL-406) already
@@ -259,7 +259,7 @@
           const gen = ++taskIndexFetchGeneration;
           taskIndexFetchInFlight = (async () => {
             try {
-              return await (await fetch("/api/task-index")).json();
+              return await (await fetch(boardWindowUrl("/api/task-index"))).json();
             } finally {
               if (taskIndexFetchGeneration === gen) taskIndexFetchInFlight = null;
             }
@@ -462,8 +462,99 @@
         try {
           // Shares `updateCounter`'s in-flight request rather than issuing a
           // second one: on every tab where that runs, this costs nothing.
-          setTaskIndex((await fetchTaskIndexShared()).squads);
+          const d = await fetchTaskIndexShared();
+          noteBoardWindow(d.window, "index");
+          setTaskIndex(windowedSquads(d.squads || [], "index"));
         } catch (e) { /* transient -- the opener falls back to whatever is cached */ }
+      }
+      /**
+       * STRESS-004: fetches, by id, the squads the board needs but its window
+       * does not hold -- a deep link's, or the current selection's (set by a
+       * "go to squad" link from another view) -- and pins them into the list.
+       * Each id is looked up once; a label in a hand-written URI is never
+       * looked up here.
+       * @returns {Promise<boolean>} whether anything new was pinned.
+       */
+      async function pinMissingSquads() {
+        const wanted = [pendingHash && pendingHash.squadId, selectedSquadId];
+        let added = false;
+        for (const id of wanted) {
+          if (!id || !id.startsWith("squad-") || findSquad(id) || boardWindow.pinTried.has(id)) continue;
+          boardWindow.pinTried.add(id);
+          try {
+            const res = await fetch(`/api/squads/${encodeURIComponent(id)}`);
+            if (res.ok) { boardWindow.pinned.set(id, await res.json()); added = true; }
+          } catch (e) { /* transient -- the next poll looks again */ boardWindow.pinTried.delete(id); }
+        }
+        return added;
+      }
+      /**
+       * `pollTasks`, then -- if a deep link or the selection names a squad
+       * outside the loaded window -- fetches it and polls once more so it
+       * shows up (STRESS-004).
+       * @returns {Promise<void>}
+       */
+      async function pollTasksPinned() {
+        await pollTasks();
+        if (await pinMissingSquads()) await pollTasks();
+      }
+      /**
+       * The Tasks tab's twin of {@link pollTasksPinned}.
+       * @returns {Promise<void>}
+       */
+      async function pollTasksTabPinned() {
+        await pollTasksTab();
+        if (await pinMissingSquads()) { forgetEtag(); await pollTasksTab(); }
+      }
+      /**
+       * Loads the next page of older finished squads into the current tab's
+       * list (STRESS-004).
+       * @returns {Promise<void>}
+       */
+      async function loadOlderSquads() {
+        /** @type {"full"|"index"} */
+        const shape = tab === "tasks" ? "index" : "full";
+        const before = boardWindow.cursor[shape];
+        if (!before) return;
+        try {
+          const res = await fetch(boardWindowUrl(shape === "index" ? "/api/task-index" : "/api/tasks", before));
+          if (!res.ok) { notify("error", "could not load older squads"); return; }
+          const d = await res.json();
+          boardWindow.older[shape].push(...(d.squads || []));
+          boardWindow.cursor[shape] = d.window ? d.window.next_before : null;
+          boardWindow.hasMore[shape] = !!(d.window && d.window.has_more);
+        } catch (e) { notify("error", "daemon unreachable"); return; }
+        forgetEtag();
+        await tick();
+      }
+      /** Pending debounce for {@link searchUnloadedSquads}. @type {ReturnType<typeof setTimeout>|null} */
+      let unloadedSearchTimer = null;
+      /**
+       * When older history is not loaded, a search typed into the Squads or
+       * Tasks filter box also asks the daemon, so a finished squad outside the
+       * window can still be found by id or name (STRESS-004). Matches are
+       * pinned into the list; the box's own filtering then shows them.
+       * Debounced, so typing does not fire a request per keystroke.
+       * @param {string} text
+       * @returns {void}
+       */
+      function searchUnloadedSquads(text) {
+        if (unloadedSearchTimer) clearTimeout(unloadedSearchTimer);
+        const q = text.trim();
+        if (q.length < 2 || !(boardWindow.hasMore.full || boardWindow.hasMore.index)) return;
+        unloadedSearchTimer = setTimeout(async () => {
+          unloadedSearchTimer = null;
+          try {
+            const res = await fetch(`${boardWindowUrl("/api/tasks")}&q=${encodeURIComponent(q)}`);
+            if (!res.ok) return;
+            const d = await res.json();
+            let added = false;
+            for (const s of /** @type {SquadView[]} */ (d.squads || [])) {
+              if (!findSquad(s.id)) { boardWindow.pinned.set(s.id, s); added = true; }
+            }
+            if (added) { forgetEtag(); await tick(); }
+          } catch (e) { /* transient -- the search runs again on the next keystroke */ }
+        }, 300);
       }
       // RALPHUS-UPDATE-COUNTER:BEGIN
       /**
@@ -490,7 +581,8 @@
           const d = await fetchTaskIndexShared();
           if (seq !== tasksPollSeq) return; // superseded -- a newer poll's data wins
           /** @type {any} */ (window)._daemonStatus = d.daemon;
-          squads = d.squads || [];
+          noteBoardWindow(d.window, "index");
+          squads = windowedSquads(d.squads || [], "index");
           byId("running").textContent = formatConcurrencyStatus(d.daemon.running ?? 0, d.daemon.max_concurrent ?? 0);
         } catch (_) {
           if (seq !== tasksPollSeq) return;
@@ -557,9 +649,9 @@
         else if (tab === "worktree-retirement") tabPoll = pollWorktreeRetirements();
         else if (tab === "health") tabPoll = pollHealth();
         else if (tab === "prefs") tabPoll = pollPrefs();
-        else if (tab === "tasks") tabPoll = refreshRegisteredProjectNames().then(() => pollTasksTab());
+        else if (tab === "tasks") tabPoll = refreshRegisteredProjectNames().then(() => pollTasksTabPinned());
         else if (tab === "waypoints") tabPoll = pollWaypoints();
-        else tabPoll = refreshRegisteredProjectNames().then(() => pollTasks());
+        else tabPoll = refreshRegisteredProjectNames().then(() => pollTasksPinned());
         await Promise.all([globalPolls, tabPoll]);
         await refreshBanner();
       }
@@ -611,7 +703,7 @@
           // `tick()`, so refresh the registered-project list here too --
           // keeps the project-filter dropdown current between full ticks.
           await refreshRegisteredProjectNames();
-          await pollTasksTab();
+          await pollTasksTabPinned();
           await refreshBanner();
           return;
         }
@@ -630,7 +722,7 @@
           // dropdown binds to the live registered-project list, refreshed on
           // SSE-driven polls too (no full tick involved).
           await refreshRegisteredProjectNames();
-          await pollTasks();
+          await pollTasksPinned();
           await refreshBanner();
           return;
         }
@@ -909,7 +1001,8 @@
           /** @type {any} */ (window)._daemonStatus = d.daemon;
           byId("running").textContent = formatConcurrencyStatus(d.daemon.running ?? 0, d.daemon.max_concurrent ?? 0);
           byId("updated").textContent = "updated " + new Date().toLocaleTimeString();
-          squads = d.squads || [];
+          noteBoardWindow(d.window, "full");
+          squads = windowedSquads(d.squads || [], "full");
           // Before any render: the fresh rows carry null prompt fields, so
           // without this the details pane paints empty and only fills in
           // once the fetch below lands -- a visible blank-and-repaint on

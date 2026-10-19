@@ -6,7 +6,9 @@
   `thundering_herd`; the post-ramp health checks
 - **Found at:** `035ef1e70` (staging, 2026-10-18); `cbd049ec5` behaves the
   same
-- **Status:** open
+- **Status:** mostly fixed on `stress-fixes-medium` (PR #780):
+  `thundering_herd` sheds load with fast 503s. Still open: `abandon_response`
+  (clients hanging up mid-response) stalls victims for ~3–4 s.
 
 ## Evidence
 
