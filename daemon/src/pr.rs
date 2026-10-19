@@ -4861,12 +4861,13 @@ pub fn check_pr_merges(store: &crate::store_lock::StoreHandle, id: &str) -> bool
             .collect()
     });
 
-    let mut freshly_merged = Vec::new();
-    let mut reverted = false;
-    for (job, result) in jobs.iter().zip(fetched) {
-        if let Some(Err(error)) = &result {
+    let mut unread_open = false;
+    for (job, result) in jobs.iter().zip(&fetched) {
+        if let Some(Err(error)) = result {
             unknown = true;
-            waiting |= !error.contains(WRONG_REPO_FOR_NUMBER);
+            let transient = !error.contains(WRONG_REPO_FOR_NUMBER);
+            waiting |= transient;
+            unread_open |= transient && job.pr.state != "merged";
             let status = crate::forge_health::status_from_message(error);
             if crate::forge_health::classify(status, error)
                 == Some(crate::forge_health::Problem::RateLimited)
@@ -4874,10 +4875,31 @@ pub fn check_pr_merges(store: &crate::store_lock::StoreHandle, id: &str) -> bool
                 start_backoff(&job.client, None);
             }
         }
-        reverted |= apply_pr_merge_state(store, id, job.pr, result, &mut freshly_merged);
     }
     set_merge_state_unknown(id, unknown);
     set_merge_state_waiting(id, waiting);
+    // An open PR's state could not be read for a reason that clears on its
+    // own (a timeout, a server error, a rate limit): it may already have
+    // merged. Applying the other PRs' answers would settle the review, or
+    // promote a fork root, from a partial picture -- and a merge recorded now
+    // would not count as freshly merged on the next pass. Nothing is applied;
+    // the next pass reads every PR again. A PR no retry can answer (no forge
+    // client for its repository, a number from another repository), or one
+    // already recorded merged whose confirming read failed, does not hold the
+    // others up.
+    if unread_open {
+        for (job, result) in jobs.iter().zip(&fetched) {
+            if let Some(Err(error)) = result {
+                log_pr_merge_check_failure(store, id, job.pr, error);
+            }
+        }
+        return false;
+    }
+    let mut freshly_merged = Vec::new();
+    let mut reverted = false;
+    for (job, result) in jobs.iter().zip(fetched) {
+        reverted |= apply_pr_merge_state(store, id, job.pr, result, &mut freshly_merged);
+    }
     // RAL-338: react to a freshly-observed cross-repository root merge
     // before settling merge states, so a newly-promoted successor's row
     // already exists when `settle_pr_merge_states` re-reads this guardian's
@@ -5736,7 +5758,7 @@ fn log_pr_merge_check_failure(
 ) {
     crate::rlog!(
         WARNING,
-        "ralphus [pr] review {id} pr {} merge check failed, assuming not merged: {error}",
+        "ralphus [pr] review {id} pr {} merge check failed, merge state unknown until a later check: {error}",
         pr.id
     );
     crate::forge_health::report_failure(
@@ -5754,7 +5776,7 @@ fn log_pr_merge_check_failure(
     let _ = guard.cartographer_log(crate::cartographer::CartographerEntry {
         level: crate::logging::LogLevel::WARNING,
         source: "pr",
-        message: "linked pr merge check failed; assuming not merged",
+        message: "linked pr merge check failed; merge state unknown until a later check",
         scope: Some("guardian"),
         squad_id: None,
         guardian_id: Some(id),
@@ -19564,6 +19586,80 @@ token_env = "RALPHUS_TEST_FORGE_TOKEN"
         // open) -- the review must stay `in_review`, not jump to `merged`.
         let updated_guardian = store.lock().get_guardian(&gid).unwrap();
         assert_eq!(updated_guardian.status.as_str(), "in_review");
+
+        mock.finish();
+        let _ = std::fs::remove_dir_all(root_dir);
+    }
+
+    #[test]
+    fn a_pass_with_an_unreadable_pr_applies_nothing_and_the_next_pass_catches_up() {
+        let mock = MockForge::start(move |server| {
+            // Pass 1: the root reads merged, but the successor's read fails
+            // with a server error (the shape of a forge timeout).
+            for _ in 0..2 {
+                let req = server.recv();
+                let response = if req.url() == "/repos/acme/widget/pulls/10" {
+                    tiny_http::Response::from_string(r#"{"state":"closed","merged":true}"#)
+                        .with_status_code(200)
+                } else {
+                    assert_eq!(req.url(), "/repos/alice/widget/pulls/20");
+                    tiny_http::Response::from_string("bad gateway").with_status_code(502)
+                };
+                req.respond(response).unwrap();
+            }
+            // Pass 2: both answer, and the root's merge promotes the successor.
+            answer_merge_probes(
+                server,
+                &[
+                    (
+                        "/repos/acme/widget/pulls/10",
+                        r#"{"state":"closed","merged":true}"#,
+                    ),
+                    (
+                        "/repos/alice/widget/pulls/20",
+                        r#"{"state":"open","merged":false}"#,
+                    ),
+                ],
+            );
+            let req = server.recv();
+            assert_eq!(req.method(), &tiny_http::Method::Post);
+            assert_eq!(req.url(), "/repos/acme/widget/pulls");
+            req.respond(
+                tiny_http::Response::from_string(r#"{"number":30,"html_url":"http://x/30"}"#)
+                    .with_status_code(201),
+            )
+            .unwrap();
+            let req = server.recv();
+            assert_eq!(req.url(), "/repos/alice/widget/pulls/20");
+            req.respond(tiny_http::Response::from_string("{}").with_status_code(200))
+                .unwrap();
+            let req = server.recv();
+            assert_eq!(req.url(), "/repos/alice/widget/issues/20/comments");
+            req.respond(tiny_http::Response::from_string("{}").with_status_code(201))
+                .unwrap();
+        });
+        let (store, gid, root_dir) = fork_promotion_fixture(mock.addr());
+
+        check_pr_merges(&store, &gid);
+        let rows = store.lock().list_pull_requests_for_guardian(&gid).unwrap();
+        assert_eq!(rows.len(), 2, "nothing was promoted from a partial picture");
+        let root_row = rows.iter().find(|p| p.pr_number == Some(10)).unwrap();
+        assert_eq!(
+            root_row.state, "open",
+            "the root's merge is not applied yet"
+        );
+        assert!(merge_state_unknown(&gid));
+        assert!(merge_state_waiting_on_forge(&gid));
+
+        check_pr_merges(&store, &gid);
+        let rows = store.lock().list_pull_requests_for_guardian(&gid).unwrap();
+        let root_row = rows.iter().find(|p| p.pr_number == Some(10)).unwrap();
+        assert_eq!(root_row.state, "merged");
+        assert!(
+            rows.iter().any(|p| p.pr_number == Some(30)),
+            "the merge still counted as fresh, so the successor was promoted"
+        );
+        assert!(!merge_state_unknown(&gid));
 
         mock.finish();
         let _ = std::fs::remove_dir_all(root_dir);
