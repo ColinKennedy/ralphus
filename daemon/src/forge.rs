@@ -1683,6 +1683,25 @@ impl ForgeClient {
                         ..Default::default()
                     }));
                 };
+                // A finished pipeline's failed jobs and their traces never
+                // change; a job retry re-runs inside the same pipeline but
+                // moves its `updated_at`, so that is part of the key.
+                let cache_key = pipeline["updated_at"].as_str().map(|updated| {
+                    format!(
+                        "{}|{}|{pipeline_id}|{updated}",
+                        self.rate_limit_key(),
+                        self.repo_path
+                    )
+                });
+                if let Some(cached) = cache_key.as_ref().and_then(|key| {
+                    FAILED_PIPELINE_CACHE
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .get(key)
+                        .cloned()
+                }) {
+                    return Ok(PrCiState::Failing(cached));
+                }
                 let jobs = self.gitlab_failed_jobs(pipeline_id, token);
                 if jobs.is_empty() {
                     return Ok(PrCiState::Failing(PrFailure {
@@ -1713,10 +1732,24 @@ impl ForgeClient {
                         }
                     })
                     .collect();
-                Ok(PrCiState::Failing(PrFailure {
+                let failure = PrFailure {
                     generation: Some(pipeline_id.to_string()),
                     ..build_pr_failure(checks, "job")
-                }))
+                };
+                // Cached only when every trace was read, so a transient trace
+                // failure is retried on the next poll.
+                let complete = failure.checks.iter().all(|c| c.log_text.is_some());
+                if let (Some(key), true) = (cache_key, complete) {
+                    let mut cache = FAILED_PIPELINE_CACHE
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    if cache.len() >= FAILED_PIPELINE_CACHE_MAX_ENTRIES && !cache.contains_key(&key)
+                    {
+                        cache.clear();
+                    }
+                    cache.insert(key, failure.clone());
+                }
+                Ok(PrCiState::Failing(failure))
             }
             // A cancelled or skipped pipeline has no failure to fix: keep
             // waiting for a re-run rather than dispatching an auto-fix.
@@ -3943,6 +3976,17 @@ fn string_all_rejected(detail: String, _retry_after: Option<Duration>) -> String
 fn parse_retry_after(value: &str) -> Option<Duration> {
     value.trim().parse::<u64>().ok().map(Duration::from_secs)
 }
+
+/// Cap on [`FAILED_PIPELINE_CACHE`]; emptied when it fills, since an entry is
+/// only saved calls and a miss simply re-reads the jobs and traces.
+const FAILED_PIPELINE_CACHE_MAX_ENTRIES: usize = 256;
+
+/// A failed GitLab pipeline's [`PrFailure`] (failed jobs and their traces),
+/// keyed by [`ForgeClient::rate_limit_key`], project, pipeline id and the
+/// pipeline's `updated_at`. Lets the CI poll of a failing MR skip re-reading
+/// jobs and traces that cannot have changed. In memory only.
+static FAILED_PIPELINE_CACHE: std::sync::LazyLock<Mutex<HashMap<String, PrFailure>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// Cap on [`FORGE_ETAG_CACHE`]; the cache is emptied when it fills, since an
 /// entry is only a saved call and any miss simply refetches.
@@ -9606,6 +9650,49 @@ mod tests {
             }),
             "both failed jobs -- not just the first -- must be captured, each with its own trace"
         );
+        mock.finish();
+    }
+
+    /// A failed pipeline's jobs and traces are read once: a second poll of the
+    /// same pipeline (same `updated_at`) reads only the MR. A request for the
+    /// jobs again would hit the finished mock (500) and lose the traces.
+    #[test]
+    fn a_failed_gitlab_pipelines_jobs_and_traces_are_read_once() {
+        const MR: &str = r#"{"merge_status": "can_be_merged", "pipeline": {"id": 56, "status": "failed", "updated_at": "2026-10-18T00:00:00Z", "web_url": "https://gitlab.example/pipelines/56"}}"#;
+        let mock = MockForge::start(move |server| {
+            let req = server.recv();
+            assert_eq!(req.url(), "/projects/group%2Fcached/merge_requests/9");
+            req.respond(tiny_http::Response::from_string(MR).with_status_code(200))
+                .unwrap();
+            let req = server.recv();
+            assert!(
+                req.url()
+                    .starts_with("/projects/group%2Fcached/pipelines/56/jobs")
+            );
+            req.respond(
+                tiny_http::Response::from_string(
+                    r#"[{"id": 79, "name": "test", "web_url": "https://gitlab.example/jobs/79"}]"#,
+                )
+                .with_status_code(200),
+            )
+            .unwrap();
+            let req = server.recv();
+            assert_eq!(req.url(), "/projects/group%2Fcached/jobs/79/trace");
+            req.respond(tiny_http::Response::from_string("FAIL\n").with_status_code(200))
+                .unwrap();
+            let req = server.recv();
+            assert_eq!(req.url(), "/projects/group%2Fcached/merge_requests/9");
+            req.respond(tiny_http::Response::from_string(MR).with_status_code(200))
+                .unwrap();
+        });
+        let client = mock.client(ForgeKind::GitLab, "group%2Fcached");
+        let first = client.check_pr_ci_status(9).unwrap();
+        let second = client.check_pr_ci_status(9).unwrap();
+        let PrCiState::Failing(failure) = &second else {
+            panic!("expected failing, got {second:?}");
+        };
+        assert_eq!(failure.checks[0].log_text.as_deref(), Some("FAIL\n"));
+        assert_eq!(first, second);
         mock.finish();
     }
 
