@@ -33,8 +33,12 @@ class _Handler(BaseHTTPRequestHandler):
     server: _FixtureHTTPServer
 
     def do_GET(self) -> None:
-        if self.path in self.server.routes:
-            body = json.dumps(self.server.routes[self.path]).encode("utf-8")
+        # Routes are matched on the path alone: like the daemon, the stub
+        # ignores query parameters it has no use for (e.g. the board's
+        # `?window=` on `/api/tasks`).
+        path = self.path.split("?", 1)[0]
+        if path in self.server.routes:
+            body = json.dumps(self.server.routes[path]).encode("utf-8")
             self._send(200, body, "application/json")
             return
         self._send(404, b"{}", "application/json")

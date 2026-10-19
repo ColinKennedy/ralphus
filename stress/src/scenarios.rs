@@ -227,6 +227,68 @@ pub fn seed_squads(api: &Arc<Api>, target: usize) -> Result<f64, String> {
     Ok(made as f64 / t0.elapsed().as_secs_f64().max(1e-6))
 }
 
+/// How many of the newest seeded squads [`finish_older_squads`] leaves
+/// unfinished: a long-lived instance's history is mostly finished squads.
+pub const VOLUME_ACTIVE_SQUADS: usize = 50;
+
+/// Mark every seeded squad but the newest `keep_active` done, and drop the
+/// finished ones from the random-op pool so edits keep targeting live
+/// squads. Returns how many were finished; a daemon without
+/// `set-status` finishes none and says why.
+pub fn finish_older_squads(api: &Arc<Api>, keep_active: usize) -> (usize, Option<String>) {
+    let older: Vec<String> = match api.ids.read() {
+        Ok(ids) if ids.len() > keep_active => ids[..ids.len() - keep_active].to_vec(),
+        _ => return (0, None),
+    };
+    let next = Arc::new(AtomicUsize::new(0));
+    let older = Arc::new(older);
+    let finished = Arc::new(Mutex::new(Vec::<String>::new()));
+    let first_error = Arc::new(Mutex::new(None::<String>));
+    let mut hs = Vec::new();
+    for w in 0..16 {
+        let (api, next, older, finished, first_error) = (
+            Arc::clone(api),
+            Arc::clone(&next),
+            Arc::clone(&older),
+            Arc::clone(&finished),
+            Arc::clone(&first_error),
+        );
+        hs.push(thread::spawn(move || {
+            let ag = api::agent(api.timeout);
+            let user = api.user_for(w);
+            let body = format!("{{\"kind\":\"{}\",\"state\":\"done\"}}", api.edit_kind);
+            loop {
+                let i = next.fetch_add(1, Ordering::Relaxed);
+                let Some(id) = older.get(i) else { return };
+                let path = format!("/api/{}/{id}/set-status", api.noun);
+                let r = api.call(&ag, user, "POST", &path, Some(&body), false);
+                if r.outcome.is_ok() {
+                    if let Ok(mut f) = finished.lock() {
+                        f.push(id.clone());
+                    }
+                } else if let Ok(mut e) = first_error.lock() {
+                    if e.is_none() {
+                        *e = Some(r.error.unwrap_or_else(|| r.outcome.class()));
+                    }
+                    // Without the endpoint every call fails the same way.
+                    next.store(older.len(), Ordering::Relaxed);
+                    return;
+                }
+            }
+        }));
+    }
+    for h in hs {
+        let _ = h.join();
+    }
+    let finished = finished.lock().map(|f| f.clone()).unwrap_or_default();
+    let done: std::collections::HashSet<&String> = finished.iter().collect();
+    if let Ok(mut ids) = api.ids.write() {
+        ids.retain(|id| !done.contains(id));
+    }
+    let error = first_error.lock().ok().and_then(|e| e.clone());
+    (finished.len(), error)
+}
+
 /// Daemon health after a scenario: whether `/api/daemon` answers, how fast,
 /// and a trimmed copy of what it said (lock-wait/guard-hold/watchdog stats).
 #[derive(Serialize, Clone, Debug, Default)]
@@ -522,6 +584,9 @@ pub fn ramp(cfg: &Config, profile: &str, log: &dyn Fn(&str)) -> Result<RampResul
 #[derive(Serialize, Clone, Debug)]
 pub struct VolumeLevel {
     pub squads: usize,
+    /// How many of `squads` were marked done (see [`finish_older_squads`]).
+    #[serde(default)]
+    pub finished_squads: usize,
     pub projects: usize,
     pub seed_squads_per_s: f64,
     pub seed_projects_s: f64,
@@ -558,6 +623,9 @@ pub fn volume(cfg: &Config, log: &dyn Fn(&str)) -> Result<VolumeResult, String> 
     );
     let mut levels = Vec::new();
     let mut error = None;
+    let mut notes = Vec::new();
+    // Squads finished so far; they leave `api.ids`, so seeding targets the rest.
+    let mut finished_total = 0;
     for &(squads, projects) in &cfg.volume_levels {
         let seed_projects_s = match add_projects(&mut env, projects) {
             Ok(s) => s,
@@ -566,13 +634,20 @@ pub fn volume(cfg: &Config, log: &dyn Fn(&str)) -> Result<VolumeResult, String> 
                 break;
             }
         };
-        let seed_rate = match seed_squads(&env.api, squads) {
+        let seed_rate = match seed_squads(&env.api, squads.saturating_sub(finished_total)) {
             Ok(r) => r,
             Err(e) => {
                 error = Some(e);
                 break;
             }
         };
+        let (finished, finish_error) = finish_older_squads(&env.api, VOLUME_ACTIVE_SQUADS);
+        finished_total += finished;
+        if let Some(e) = finish_error {
+            notes.push(format!(
+                "squads={squads}: could not finish older squads ({e}); every squad stays active"
+            ));
+        }
         // Single-request board cost at this volume.
         let ag = api::agent(cfg.timeout);
         let user = env.api.users.first().map(String::as_str);
@@ -597,9 +672,9 @@ pub fn volume(cfg: &Config, log: &dyn Fn(&str)) -> Result<VolumeResult, String> 
         let read = load::run(&env.api, &read_mix, &spec(()), &stop).stats(cfg.step);
         let mixed = load::run(&env.api, &mixed_mix, &spec(()), &stop).stats(cfg.step);
         let resources = sampler.finish();
-        let actual_squads = env.api.ids.read().map(|v| v.len()).unwrap_or(squads);
+        let actual_squads = env.api.ids.read().map(|v| v.len()).unwrap_or(squads) + finished_total;
         log(&format!(
-            "  [volume] squads={actual_squads:>6} projects={projects:>4} board={:>7.1}KB single={:>7.1}ms | read ok_rps={:>7.1} err={:.2}% p99={:.1}ms | mixed ok_rps={:>7.1} err={:.2}% p99={:.1}ms",
+            "  [volume] squads={actual_squads:>6} (finished {finished_total:>6}) projects={projects:>4} board={:>7.1}KB single={:>7.1}ms | read ok_rps={:>7.1} err={:.2}% p99={:.1}ms | mixed ok_rps={:>7.1} err={:.2}% p99={:.1}ms",
             bytes as f64 / 1024.0,
             times[2] as f64 / 1000.0,
             read.ok_rps,
@@ -611,6 +686,7 @@ pub fn volume(cfg: &Config, log: &dyn Fn(&str)) -> Result<VolumeResult, String> 
         ));
         levels.push(VolumeLevel {
             squads: actual_squads,
+            finished_squads: finished_total,
             projects,
             seed_squads_per_s: seed_rate,
             seed_projects_s,
@@ -627,7 +703,7 @@ pub fn volume(cfg: &Config, log: &dyn Fn(&str)) -> Result<VolumeResult, String> 
     }
     let health_after = health(&mut env);
     let logs = env.cursor.scan();
-    let notes = env.notes.clone();
+    notes.extend(env.notes.iter().cloned());
     let findings = !logs.is_clean() || !health_after.answered || error.is_some();
     let kept = finish_env(cfg, env, findings);
     Ok(VolumeResult {
