@@ -4193,6 +4193,7 @@ impl Fixture {
             ),
         )
         .unwrap();
+        ralphus_daemon::config::forget_discovered_project_configs();
         let info = fx.root.join(".git").join("info");
         std::fs::create_dir_all(&info).unwrap();
         let exclude = info.join("exclude");

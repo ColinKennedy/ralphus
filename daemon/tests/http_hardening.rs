@@ -113,11 +113,18 @@ fn body_over_the_limit_is_413_without_being_read() {
 }
 
 /// A chunked body has no declared length; the limit applies to what arrives.
+///
+/// The status is read on its own thread while the body is still being sent:
+/// the daemon answers and closes with the rest of the body unread, and on
+/// Windows that close resets the connection, discarding a response the
+/// client has not read yet.
 #[test]
 fn chunked_body_over_the_limit_is_413() {
     let addr = spawn_server(None);
     let mut s = TcpStream::connect(addr).expect("connect");
     s.set_read_timeout(Some(Duration::from_secs(60))).unwrap();
+    let mut reader = s.try_clone().expect("clone socket");
+    let status = thread::spawn(move || read_status(&mut reader));
     s.write_all(
         b"POST /api/squads/validate HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\n\r\n",
     )
@@ -135,7 +142,7 @@ fn chunked_body_over_the_limit_is_413() {
         sent += chunk.len();
     }
     let _ = s.write_all(b"0\r\n\r\n");
-    assert_eq!(read_status(&mut s), Some(413));
+    assert_eq!(status.join().expect("reader thread"), Some(413));
     drop(s);
     assert_eq!(daemon_answers(addr, None), Some(200));
 }

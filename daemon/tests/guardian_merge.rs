@@ -35,8 +35,11 @@ use ralphus_daemon::store::{NodeState, Store};
 use ralphus_daemon::store_lock::StoreMutex;
 use ralphus_daemon::workspace::Workspace;
 
+/// Write `name` under `root`. A `.ralphus.toml` written after setup has
+/// already looked for one must be seen by the very next lookup.
 fn write(root: &Path, name: &str, content: &str) {
     std::fs::write(root.join(name), content).expect("write file");
+    ralphus_daemon::config::forget_discovered_project_configs();
 }
 
 fn temp_repo() -> PathBuf {

@@ -3231,7 +3231,10 @@ pub fn global_config_path() -> Option<PathBuf> {
 /// window a found file is still re-checked to exist (one stat), and edits to
 /// an existing file are always seen at once (`read_config_file_cached`
 /// checks its modification time); only a `.ralphus.toml` *newly created* in
-/// an ancestor can take up to this long to be noticed.
+/// an ancestor can take up to this long to be noticed. Code that creates one
+/// and must see it at once calls [`forget_discovered_project_configs`].
+/// (Validating against each ancestor directory's modification time instead
+/// costs as many stats as the walk itself.)
 const PROJECT_CONFIG_DISCOVERY_TTL: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// A previous discovery from one starting directory: every `.ralphus.toml`
@@ -3296,6 +3299,16 @@ fn project_configs_on_path(start: &Path, ttl: std::time::Duration) -> Vec<PathBu
         },
     );
     configs
+}
+
+/// Drop every remembered [`project_configs_on_path`] result, so the next
+/// lookup walks the filesystem again and sees a `.ralphus.toml` created
+/// since.
+pub fn forget_discovered_project_configs() {
+    discovery_cache()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clear();
 }
 
 /// Discover the per-project config: the nearest `.ralphus.toml` at or above
@@ -4866,7 +4879,13 @@ initialization_timeout_sec = 30
         // Created again: a long window keeps the remembered "none"...
         std::fs::write(&config, "[review]\n").unwrap();
         assert!(project_configs_on_path(&nested, long).is_empty());
-        // ...and an expired window walks again and finds it.
+        // ...until it is forgotten...
+        forget_discovered_project_configs();
+        assert_eq!(project_configs_on_path(&nested, long), vec![config.clone()]);
+        // ...and an expired window walks again and finds it too.
+        std::fs::remove_file(&config).unwrap();
+        assert!(project_configs_on_path(&nested, long).is_empty());
+        std::fs::write(&config, "[review]\n").unwrap();
         assert_eq!(
             project_configs_on_path(&nested, Duration::ZERO),
             vec![config.clone()]
