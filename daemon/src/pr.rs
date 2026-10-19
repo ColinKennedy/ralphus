@@ -2931,6 +2931,7 @@ fn synthesize_pr_text(
     template: Option<&str>,
     trace_context: Option<&str>,
     prophecies: &[crate::prophecy::ProphecyView],
+    checks: &[crate::pr_test_evidence::CheckRun],
 ) -> (String, String, Vec<crate::prophecy::ProphecyView>) {
     let root = PathBuf::from(&guardian.git_root);
     let fallback_title = guardian
@@ -3045,9 +3046,12 @@ fn synthesize_pr_text(
                 .to_string(),
         )
     };
+    // The checks the branch's own agent ran, so the testing section reports
+    // them instead of a guess from the diff.
+    let checks_note = crate::pr_test_evidence::prompt_section(checks);
     let prompt = format!(
         "Suggest a pull request title and description for one branch in a \
-         stacked review. Use ONLY the commits and diff in the unique range \
+         stacked review. Describe ONLY the commits and diff in the unique range \
          below. Do not describe predecessor branches, downstream branches, \
          the wider review, or unrelated files visible in the workspace.\n\n\
          UNIQUE COMMITS (oldest first):\n\n{commits}\n\n\
@@ -3065,7 +3069,7 @@ fn synthesize_pr_text(
          appear in the PR, with no quoting or escaping of any of it>\n\n\
          The description should explain what changed and why, focused on developer \
          intent rather than file-level detail. Keep it under {MAX_PR_DESCRIPTION_CHARS} \
-         characters.{template_note}{prophecy_note}"
+         characters.{template_note}{prophecy_note}{checks_note}"
     );
     let spec = pr_writer_spec(guardian, position, resolved, prompt, trace_context);
     // ralphus[ignore-rlog-pair]: this low-level helper has no Store; its Store-owning caller records the structured workflow outcome
@@ -3112,6 +3116,7 @@ fn synthesize_pr_text(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn resolve_title_description(
     runner: &dyn Runner,
     guardian: &GuardianView,
@@ -3120,6 +3125,7 @@ fn resolve_title_description(
     client: &crate::forge::ForgeClient,
     trace_context: Option<&str>,
     prophecies: &[crate::prophecy::ProphecyView],
+    checks: &[crate::pr_test_evidence::CheckRun],
 ) -> (String, String, Vec<crate::prophecy::ProphecyView>) {
     if let (Some(t), Some(d)) = (&req.title, &req.description) {
         // Both title and description were given explicitly, so the
@@ -3140,6 +3146,7 @@ fn resolve_title_description(
         template.as_deref(),
         trace_context,
         prophecies,
+        checks,
     );
     (
         req.title.clone().unwrap_or(synth_title),
@@ -8755,6 +8762,14 @@ fn submit_stacked_branch_pr(
     {
         Some(existing) => adopt(existing),
         None => {
+            // The session is looked up under the store lock; its transcript
+            // files are read after the lock is released.
+            let check_session =
+                crate::pr_test_evidence::branch_session_name(&store.lock(), guardian, position);
+            let checks = check_session
+                .as_deref()
+                .map(crate::pr_test_evidence::session_check_runs)
+                .unwrap_or_default();
             let (title, description, reviewer_relevant_prophecies) = resolve_title_description(
                 runner,
                 guardian,
@@ -8763,6 +8778,7 @@ fn submit_stacked_branch_pr(
                 &route.client,
                 trace_context,
                 &unpublished_prophecies,
+                &checks,
             );
             let description =
                 attribute_description(runner, guardian, position, trace_context, &description);
@@ -12699,7 +12715,7 @@ mod tests {
         );
 
         let (title, description, relevant) =
-            synthesize_pr_text(&runner, &guardian, 0, None, None, &prophecies);
+            synthesize_pr_text(&runner, &guardian, 0, None, None, &prophecies, &[]);
 
         assert_eq!(title, "Add x");
         assert_eq!(description, "Adds x.");
@@ -23936,6 +23952,11 @@ token_env = "RALPHUS_TEST_FORGE_TOKEN"
             Some("## Summary\n\n<!-- fill this in -->"),
             None,
             &[],
+            &[crate::pr_test_evidence::CheckRun {
+                command: "moon run b:test".into(),
+                succeeded: Some(true),
+                output_tail: "3 passed".into(),
+            }],
         );
         assert!(relevant.is_empty(), "no prophecies were given to judge");
 
@@ -23964,6 +23985,13 @@ token_env = "RALPHUS_TEST_FORGE_TOKEN"
         assert!(!prompt.contains("add predecessor behavior"), "{prompt}");
         assert!(!prompt.contains("add downstream behavior"), "{prompt}");
         assert!(prompt.contains("<!-- fill this in -->"), "{prompt}");
+        // The branch agent's own checks reach the writer for the testing section.
+        assert!(
+            prompt.contains("CHECKS RUN WHILE BUILDING THIS BRANCH")
+                && prompt.contains("moon run b:test")
+                && prompt.contains("3 passed"),
+            "{prompt}"
+        );
 
         let _ = std::fs::remove_dir_all(root);
     }
@@ -24024,7 +24052,7 @@ token_env = "RALPHUS_TEST_FORGE_TOKEN"
         let guardian = store.get_guardian(&gid).unwrap();
         let runner = CapturingFailureRunner(Mutex::new(None));
 
-        let (_, description, _) = synthesize_pr_text(&runner, &guardian, 0, None, None, &[]);
+        let (_, description, _) = synthesize_pr_text(&runner, &guardian, 0, None, None, &[], &[]);
 
         assert!(description.contains("add x"), "{description}");
         assert!(

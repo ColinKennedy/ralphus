@@ -2924,7 +2924,11 @@ pre-RAL-378 branch that still has one. `title`/`description` default to
 an LLM-synthesized suggestion from the branch's commits, conforming to the
 target repo's PR template when one is found
 (`.github/PULL_REQUEST_TEMPLATE.md` or
-`.gitlab/merge_request_templates/Default.md`).
+`.gitlab/merge_request_templates/Default.md`). The writer is also given the
+checks the branch's source cell ran (its recorded shell calls other than file
+reads, searches and edits, each with its last result and the end of its
+output; `daemon/src/pr_test_evidence.rs`) and writes the testing section from
+them.
 
 `use_worktree_branch_name` (RAL-307, optional boolean, applies to both a
 stacked and a whole-stack request) is ignored when `branch_alias` is also set
