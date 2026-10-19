@@ -1,24 +1,26 @@
-name: Review-input races (nightly)
+name: Review-input races (push to race-suite)
 
 # The review-input race suite (daemon/tests/review_input_races.rs) is ~150
 # real-git scenarios and takes ~30 minutes on a hosted Windows runner, so it
 # does not run on pull requests: `.config/nextest.toml` keeps it out of every
 # default `cargo nextest run`, and this workflow is the only place CI runs it.
-# It runs on a nightly schedule, and on demand from the Actions tab
-# ("Run workflow", pick a branch) when a change touches review / PR / guardian
-# code and wants the suite before merging.
+# It runs when you push to the `race-suite` branch:
+#     git push <remote> HEAD:race-suite --force
+# A `push` trigger uses the workflow file from the pushed commit, so it works
+# even though this file is not on the default branch (a `schedule` trigger and
+# the Actions tab's "Run workflow" only see the default branch's copy).
 #
 # Two jobs:
 #   * `races`: every deterministic scenario, on Ubuntu and Windows.
 #   * `race-soak`: the randomly seeded, time-boxed soak. It picks a fresh seed
-#     each night and prints `RACE SOAK SEED: <n>` up front. A failure is
+#     each run and prints `RACE SOAK SEED: <n>` up front. A failure is
 #     replayed locally with `RALPHUS_RACE_SEED=<n> RALPHUS_RACE_NIGHTLY=1
 #     cargo nextest run -P review-races -p ralphus-daemon --features race-suite --run-ignored only
 #     -E 'test(soak_randomly_seeded_time_boxed)'`.
 
 on:
-  schedule:
-    - cron: "17 3 * * *"
+  push:
+    branches: [race-suite]
   workflow_dispatch:
     inputs:
       seconds:
@@ -84,7 +86,9 @@ jobs:
         env:
           RALPHUS_RACE_NIGHTLY: "1"
           RALPHUS_RACE_SOAK_SECONDS: ${{ inputs.seconds || '3000' }}
-          RALPHUS_RACE_SEED: ${{ inputs.seed }}
+          # A push has no inputs: set the `RACE_SEED` repository variable to
+          # replay a seed on push runs; leave it unset for a fresh seed each push.
+          RALPHUS_RACE_SEED: ${{ inputs.seed || vars.RACE_SEED }}
         run: >
           cargo nextest run -P review-races -p ralphus-daemon --features race-suite
           --run-ignored only --no-capture
