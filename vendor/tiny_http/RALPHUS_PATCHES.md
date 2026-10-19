@@ -6,9 +6,23 @@ This is tiny_http 0.12.0 as published on crates.io (MIT OR Apache-2.0; see
 upstream is listed here; keep this list in sync with the code, and drop a
 patch if upstream ships an equivalent fix.
 
+## Pristine base
+
+| | |
+|---|---|
+| **Version** | `tiny_http` 0.12.0 |
+| **crates.io checksum (sha256)** | `389915df6413a2e74fb181895f933386023c71110878cd0825588928e64cdc82` |
+
+To see exactly what ralphus changed, download the 0.12.0 `.crate` (or take
+it from `~/.cargo/registry/cache/`), confirm its sha256 matches the value
+above, unpack it, and diff it against this directory. This copy is
+deliberately not a git submodule: upstream has not released in years, so
+there is little to merge, and the patches below are maintained here.
+
 The regression tests that guard these patches live in the ralphus workspace
-(`daemon/tests/http_hardening.rs`), because this crate is excluded from the
-workspace and its own tests do not run in CI. The unit tests added to
+(`daemon/tests/http_hardening.rs`). This crate is excluded from the
+workspace, so CI runs its own unit tests through a separate step
+("Test (vendored tiny_http)"). The unit tests added to
 `src/util/equal_reader.rs` document the behaviour; run them with
 `cargo test --manifest-path vendor/tiny_http/Cargo.toml --lib` if you change
 it.
