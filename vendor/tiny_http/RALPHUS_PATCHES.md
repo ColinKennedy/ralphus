@@ -73,6 +73,14 @@ Writes are never affected, so streamed responses (the daemon's
 `/api/events`) keep working. Clients that pool connections cope with
 idle closes: ureq checks `server_closed()` before reusing one.
 
+## 5. Connection threads not double-booked (`src/util/task_pool.rs`)
+
+| | |
+|---|---|
+| **Found by** | The RAL-414 board cold-load CI job, stalling ~30 s on a Linux runner |
+| **Problem** | `TaskPool::spawn` queued a new connection whenever `waiting_tasks > 0`. A thread that has been notified stays counted there until it wakes, so two connections accepted back to back could both be queued for one idle thread. The second then waited, unread, until a keep-alive connection closed and freed a thread: never without a read timeout, 30 s with patch 4. A browser opening several connections at once hit it on a busy 2-CPU machine. |
+| **Change** | Spawn a new thread unless there are more idle threads than queued tasks (`waiting_tasks > queue.len()`). |
+
 ## 3. Silenced upstream warnings (`src/lib.rs`)
 
 Upstream compiles with two unused imports and one unused trait. Cargo does

@@ -66,10 +66,17 @@ impl TaskPool {
 
     /// Executes a function in a thread.
     /// If no thread is available, spawns a new one.
+    ///
+    /// ralphus patch: an idle thread only counts as available if no queued
+    /// task is already waiting for it. A notified thread stays in
+    /// `waiting_tasks` until it wakes and takes the lock, so upstream's
+    /// `waiting_tasks == 0` check queued a second connection behind the one
+    /// idle thread; that connection then waited until some keep-alive
+    /// connection closed and freed its thread.
     pub fn spawn(&self, code: Box<dyn FnMut() + Send>) {
         let mut queue = self.sharing.todo.lock().unwrap();
 
-        if self.sharing.waiting_tasks.load(Ordering::Acquire) == 0 {
+        if self.sharing.waiting_tasks.load(Ordering::Acquire) <= queue.len() {
             self.add_thread(Some(code));
         } else {
             queue.push_back(code);

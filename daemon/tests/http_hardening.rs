@@ -387,3 +387,27 @@ fn non_ascii_request_line_is_400() {
     assert_eq!(exchange(addr, req.as_bytes()).0, Some(400));
     assert_eq!(daemon_answers(addr, None), Some(200));
 }
+
+/// A burst of connections must each get a thread of their own. tiny_http's
+/// `TaskPool` used to queue a new connection whenever any thread was idle,
+/// even one already claimed by a connection queued a moment earlier; the
+/// later one then went unread until some keep-alive connection closed (in
+/// production, the 30 s idle read timeout). Every connection here stays open
+/// after its answer, so a starved one is never served.
+#[test]
+fn a_burst_of_keep_alive_connections_is_served_without_waiting() {
+    let addr = spawn_server(None);
+    let mut conns: Vec<TcpStream> = (0..32)
+        .map(|_| TcpStream::connect(addr).expect("connect"))
+        .collect();
+    for (i, s) in conns.iter_mut().enumerate() {
+        s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        s.write_all(b"GET /api/daemon HTTP/1.1\r\nHost: x\r\n\r\n")
+            .expect("write");
+        assert_eq!(
+            read_status(s),
+            Some(200),
+            "connection {i} of the burst was not answered within 5s"
+        );
+    }
+}
