@@ -6,9 +6,13 @@
   `thundering_herd`; the post-ramp health checks
 - **Found at:** `035ef1e70` (staging, 2026-10-18); `cbd049ec5` behaves the
   same
-- **Status:** mostly fixed on `stress-fixes-medium` (PR #780):
-  `thundering_herd` sheds load with fast 503s. Still open: `abandon_response`
-  (clients hanging up mid-response) stalls victims for ~3–4 s.
+- **Status:** fixed. `stress-fixes-medium` (PR #780) bounded the read
+  queue, so `thundering_herd` sheds load with fast 503s.
+  `stress-fixes-followups` skips queued requests whose client has hung up,
+  including `Connection: close` ones (tiny_http patch 5). It also gives
+  writes their own queue bound, with the refusal made before the write runs.
+  `abandon_response` went from 17–25% victim errors at a 5–9 s p99 to 1.7%
+  at 679 ms. The few errors left in both faults are fast 503s.
 
 ## Evidence
 
