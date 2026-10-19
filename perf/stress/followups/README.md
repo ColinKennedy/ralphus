@@ -6,6 +6,34 @@ confirmed vs inferred), a fix direction, and how to verify the fix with the
 harness. First found on `035ef1e70` (staging, 2026-10-18); see
 [`../HISTORY.md`](../HISTORY.md) for whether older commits share them.
 
+## Baseline (before any fix)
+
+Each commit was run sequentially with the full suite on one machine: a
+56-CPU Xeon E5-2697 v3 on Windows 10, release builds.
+
+| Build | Read peak | Write peak | Mixed peak | Mixed users at p99 ≤ 1 s | Board GET at ~1k squads |
+|---|---:|---:|---:|---:|---:|
+| `0a1df37e6` (2026-08-15) | 45/s | 152/s | 39/s | 16 | 341 ms |
+| `9190c3fd5` (2026-09-18) | 28/s | 43/s | 24/s | 4 | 514 ms |
+| `8f4575796` (2026-10-11) | 19/s | 98/s | 24/s | 4 | 655 ms |
+| `cbd049ec5` (2026-10-17) | 19/s | 85/s | 22/s | 4 | 675 ms |
+| `035ef1e70` (2026-10-18) | 19/s | 78/s | 20/s | 2 | 715 ms |
+
+Between August and October:
+
+- read and write throughput roughly halved;
+- the board's cost at 1,000 squads doubled;
+- the number of users the daemon serves with p99 under 1 s fell from 16 to
+  2–4.
+
+The read path collapsed between August and mid-September. The write path
+fell by October 18.
+
+Caveat: the 2026-10-11, 2026-09-18 and 2026-08-15 runs overlapped
+development work on the same machine (`-j 8` builds and some test runs).
+That may have taken a few percent off those three rows. The trend is far
+larger than that noise.
+
 | Id | Severity | Summary |
 |---|---|---|
 | [STRESS-001](STRESS-001-oversized-content-length-aborts-daemon.md) | critical | One request with a huge `Content-Length` aborts the daemon — unauthenticated (tiny_http `EqualReader::drop` allocation; no body cap; librarian too) |
