@@ -322,7 +322,7 @@ impl Store {
         conn: &Connection,
         squad_id: &str,
     ) -> StoreResult<std::collections::HashSet<(i64, i64)>> {
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT task_idx, idx FROM triage_pending_cells WHERE squad_id=? AND created_at_ms>?",
         )?;
         let rows = stmt
@@ -366,7 +366,7 @@ impl Store {
         conn: &Connection,
         squad_id: &str,
     ) -> StoreResult<std::collections::HashMap<(i64, i64), Vec<String>>> {
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT task_idx, idx, triage_type FROM triage_cell_types WHERE squad_id=? ORDER BY task_idx, idx, triage_type",
         )?;
         let rows = stmt
@@ -620,7 +620,7 @@ impl Store {
         conn: &Connection,
         squad_id: &str,
     ) -> StoreResult<CellSubprojectsMap> {
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT task_idx, idx, subproject, inferred FROM cell_subprojects
              WHERE squad_id=? ORDER BY task_idx, idx, subproject",
         )?;

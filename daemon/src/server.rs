@@ -120,7 +120,16 @@ pub struct Daemon {
     /// in [`Daemon::new`] so in-process tests that submit review-less TOML keep
     /// working; `serve()` turns it on via [`Daemon::with_review_intent_policy`].
     review_intent_policy: bool,
+    /// STRESS-003: shared builds of the board's heaviest reads -- see
+    /// [`Daemon::cached_reply`].
+    responses: crate::response_cache::ResponseCache,
 }
+
+/// How long one build of a board response may be shared (STRESS-003). The
+/// data generation already retires it on the next commit; this bounds only
+/// the in-memory values it also carries (the running count, the downtime
+/// flag), and is short enough that no one sees them lag.
+const BOARD_RESPONSE_MAX_AGE: Duration = Duration::from_secs(1);
 
 /// How to run a unit of background follow-up work spawned from a request
 /// handler (today: only `submit`'s materialization step, RAL-<pending>).
@@ -227,6 +236,31 @@ impl Daemon {
             health_sweep: crate::health_sweep::HealthSweepState::new(),
             watchdog: crate::watchdog::WatchdogState::new(),
             review_intent_policy: false,
+            responses: crate::response_cache::ResponseCache::default(),
+        }
+    }
+
+    /// `build`'s reply, shared with every other request for `key` while the
+    /// store's data is unchanged (STRESS-003, see `crate::response_cache`).
+    /// Bypassed while `RALPHUS_BOARD_TIMING` is on, whose `Server-Timing`
+    /// header only means something for a real build.
+    fn cached_reply(&self, key: &str, build: impl FnOnce() -> Reply) -> Reply {
+        if perf_timing::timing_enabled() {
+            return build();
+        }
+        let cached = self
+            .responses
+            .get_or_build(key, BOARD_RESPONSE_MAX_AGE, || {
+                let reply = build();
+                crate::response_cache::Cached {
+                    status: reply.status,
+                    body: reply.body,
+                }
+            });
+        Reply {
+            status: cached.status,
+            body: cached.body.clone(),
+            server_timing: None,
         }
     }
 
@@ -1110,9 +1144,11 @@ fn route_for_user(
         // like every other route.
         // ralphus[ignore-endpoint-cli]: SSE ticket minted for the board's live event stream only (RAL-222); the CLI has no SSE consumer
         ("POST", ["api", "events", "ticket"]) => mint_events_ticket(daemon),
-        ("GET", ["api", "tasks"]) => board(daemon, query),
+        ("GET", ["api", "tasks"]) => {
+            daemon.cached_reply(&format!("tasks?{query}"), || board(daemon, query))
+        }
         // ralphus[ignore-endpoint-cli]: board 'Tasks' tab flat listing; the CLI reads per-squad views and `GET /api/tasks` instead
-        ("GET", ["api", "task-index"]) => task_index(daemon),
+        ("GET", ["api", "task-index"]) => daemon.cached_reply("task-index", || task_index(daemon)),
         // RAL-332: reads stay open to every caller -- `GET /api/projects` and
         // `.../branches` back the Simple task form's project/branch pickers
         // for every user, not just admins. Only the mutating registration
@@ -1655,7 +1691,7 @@ fn route_for_user(
         // ralphus[ignore-endpoint-cli]: board 'Simple' form generator cancel (RAL-374)
         ("POST", ["api", "generate", id, "cancel"]) => generate_cancel(daemon, id),
         ("POST", ["api", "clear"]) => clear_all(daemon, body),
-        ("GET", ["api", "queue"]) => queue(daemon),
+        ("GET", ["api", "queue"]) => daemon.cached_reply("queue", || queue(daemon)),
         ("POST", ["api", "queue", "reorder"]) => queue_reorder(daemon, body),
         ("POST", ["api", "queue", "set-position"]) => queue_set_position(daemon, body),
         ("GET", ["api", "graph"]) => global_graph(daemon, query),

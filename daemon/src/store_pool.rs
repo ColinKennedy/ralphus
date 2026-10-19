@@ -41,8 +41,10 @@ pub(crate) const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 /// default guarantees the hot read paths keep going back to the OS for pages
 /// they just read.
 ///
-/// Costed per connection, so the real figure is this times 1 writer + 4
-/// pooled readers. That is the intended trade: 320 MiB of virtual cache
+/// Costed per connection, so the real figure is this times 1 writer +
+/// `POOL_SIZE` pooled readers -- an upper bound, since a connection's cache
+/// only holds pages it has actually read. That is the intended trade: up to
+/// 576 MiB of cache
 /// against a daemon whose read amplification (RC-4: the board re-hydrates
 /// everything on every SSE event) is the thing being paid for.
 const CACHE_SIZE_KIB: i64 = -65_536;
@@ -66,6 +68,11 @@ const MMAP_SIZE_BYTES: i64 = 268_435_456;
 /// new value as a result row, which the `execute` path underneath
 /// `pragma_update` rejects.
 pub(crate) fn apply_shared_pragmas(conn: &Connection) -> rusqlite::Result<()> {
+    // Building one squad's board view runs about a dozen distinct statements
+    // through `prepare_cached` (STRESS-003); rusqlite's default cache holds
+    // 16, too few for those plus the rest of a request's statements, and a
+    // miss recompiles the SQL.
+    conn.set_prepared_statement_cache_capacity(64);
     conn.execute_batch(&format!(
         "PRAGMA cache_size = {CACHE_SIZE_KIB};
          PRAGMA mmap_size = {MMAP_SIZE_BYTES};
@@ -97,7 +104,14 @@ pub(crate) fn apply_writer_pragmas(conn: &Connection) -> rusqlite::Result<()> {
 /// How many pooled read-only connections to open per `Store`. Small and
 /// fixed -- this is meant to absorb HTTP `GET` read bursts, not to be a
 /// general-purpose connection pool sized to core count.
-const POOL_SIZE: usize = 4;
+///
+/// Eight, for twelve read workers: with four, every read worker past the
+/// fourth waited for a connection, so trivial reads (even the health check)
+/// queued behind board builds (STRESS-003, `perf/stress/followups/`). The
+/// board's builds are now shared between requests (`crate::response_cache`),
+/// so the remaining readers are mostly short; eight leaves headroom without
+/// paying `CACHE_SIZE_KIB` for a connection per worker.
+const POOL_SIZE: usize = 8;
 
 /// Where a [`crate::store::Store`]'s database lives, so [`ReadConnPool`] can
 /// open its own independent connections to the same database.
@@ -196,12 +210,14 @@ impl ReadConnPool {
         if self.total == 0 {
             return None;
         }
+        let started = std::time::Instant::now();
         let mut guard = self.free.lock();
         while guard.is_empty() {
             self.available.wait(&mut guard);
         }
         let conn = guard.pop().expect("just checked non-empty");
         drop(guard);
+        crate::store_lock::add_request_pool_wait(started.elapsed());
         Some(PooledConn {
             conn: Some(conn),
             pool: Arc::clone(self),
