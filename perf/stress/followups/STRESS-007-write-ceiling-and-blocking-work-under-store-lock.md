@@ -15,7 +15,11 @@
     - validation answered on the read pool.
 
     The write peak is 192 ok/s, and the 1%-error point stays at 2048 users.
-  - Write batching was considered and not done; see "Fix direction".
+  - Cross-request write batching, one of the long-term directions, was
+    rejected as unsafe in this design; see "Why write batching was
+    rejected". It is a decision, not an open item. Revisit it only if the
+    write path is restructured so a batch can hold the store for its whole
+    duration.
 
 ## Numbers
 
@@ -67,7 +71,7 @@
   - narrow what needs the global writer lock;
   - or split writes by squad.
 
-**Why write batching was not done.** A write handler takes the store lock
+**Why write batching was rejected.** A write handler takes the store lock
 several times per request, and background threads write through the same
 connection between those takes. There are two ways to give the batch one
 transaction:
