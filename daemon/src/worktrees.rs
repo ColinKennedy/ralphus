@@ -6662,6 +6662,31 @@ mod tests {
         );
     }
 
+    /// The database claim is durable: when the marker step fails after it, a
+    /// retry by the same squad reuses the recorded branch (even though the
+    /// snapshot now shows that branch occupied) instead of allocating another.
+    #[test]
+    fn database_claim_is_reused_after_a_marker_failure() {
+        let repo = init_repo("claim-reuse");
+        let store = Store::open_in_memory().unwrap();
+        store
+            .register_project("proj", "", &repo.to_string_lossy(), "git")
+            .unwrap();
+        let project = store.resolve_project("proj").unwrap().unwrap();
+        let first =
+            resolve_squad_branch_claim(&store, &project, "feat-reuse", "squad-1", &HashMap::new())
+                .unwrap();
+        let occupied = HashMap::from([("slot".to_string(), first.clone())]);
+        let retry =
+            resolve_squad_branch_claim(&store, &project, "feat-reuse", "squad-1", &occupied)
+                .unwrap();
+        assert_eq!(first, retry);
+        let other =
+            resolve_squad_branch_claim(&store, &project, "feat-reuse", "squad-2", &occupied)
+                .unwrap();
+        assert_ne!(first, other, "another squad never inherits the claim");
+    }
+
     /// Concurrent claimers of one slot: only the branch that wrote the marker
     /// ever sees success.
     #[test]
