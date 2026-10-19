@@ -20902,7 +20902,7 @@ impl Default for HttpLimits {
 }
 
 impl Pools {
-    fn new(daemon: &Arc<Daemon>, limits: HttpLimits) -> Self {
+    fn start(daemon: &Arc<Daemon>, limits: HttpLimits) -> Self {
         Self {
             read: ReadPool::new(
                 daemon,
@@ -21593,7 +21593,7 @@ fn run_http_loop(
     daemon: &Arc<Daemon>,
     limits: HttpLimits,
 ) -> HttpLoopEnd {
-    let pools = Arc::new(Pools::new(daemon, limits));
+    let pools = Arc::new(Pools::start(daemon, limits));
     loop {
         let request = match server.recv() {
             Ok(r) => r,
