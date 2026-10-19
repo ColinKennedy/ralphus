@@ -22451,7 +22451,10 @@ mod tests {
         d.lock()
             .set_squad_state(&id, SquadState::Materializing)
             .unwrap();
-        let seeds = seed_materializing_cells(&d.lock(), &id, &file);
+        let seeds = {
+            let guard = d.lock();
+            seed_materializing_cells(&guard, &id, &file)
+        };
         spawn_materialization(
             d.background(),
             d.store_handle(),
