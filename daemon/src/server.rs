@@ -20975,8 +20975,11 @@ const READ_STALE_AFTER: Duration = Duration::from_secs(10);
 /// How many mutations may wait for the write worker before more are
 /// answered `503` (STRESS-006). The refusal happens before the mutation
 /// runs, so the client may safely retry; nothing is ever refused after it
-/// started. At a few ms per write this is about a second of backlog.
-const WRITE_QUEUE_LIMIT: usize = 256;
+/// started. A flood backstop, not a latency bound: at ~150 writes/s this
+/// is ~13 s of backlog, past the point the CLI and MCP (10 s) stop waiting,
+/// so a burst of live clients is queued rather than refused. Clients that
+/// hang up are skipped anyway ([`drop_abandoned`]).
+const WRITE_QUEUE_LIMIT: usize = 2048;
 
 /// Why [`ReadPool::try_dispatch`] did not queue a request.
 enum DispatchRefused {
