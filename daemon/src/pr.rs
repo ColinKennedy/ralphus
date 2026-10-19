@@ -1859,6 +1859,19 @@ impl Store {
         Ok(())
     }
 
+    /// The forge ids of the comments stored for one PR endpoint
+    /// ([`Self::replace_pr_forge_comments`]), sorted.
+    pub(crate) fn pr_forge_comment_ids(&self, pr_id: &str, endpoint: &str) -> Result<Vec<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT external_id FROM guardian_pr_forge_comments
+             WHERE pr_id=? AND endpoint=? ORDER BY external_id",
+        )?;
+        let ids = stmt
+            .query_map(params![pr_id, endpoint], |row| row.get::<_, String>(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(ids)
+    }
+
     /// Drop cached forge state for every PR that is no longer open.
     ///
     /// The poller only visits open PRs, so once a PR merges or closes its row
@@ -7104,22 +7117,38 @@ fn poll_pr_comments(
     }
     let mut error = None;
     let mut changed = false;
-    let mut poll_one =
-        |endpoint: crate::forge::PrCommentEndpoint, prior_etag: Option<String>| match client
-            .list_pr_comments_conditional(number, endpoint, prior_etag.as_deref())
-        {
+    let mut poll_one = |endpoint: crate::forge::PrCommentEndpoint, prior_etag: Option<String>| {
+        let table_endpoint = match endpoint {
+            crate::forge::PrCommentEndpoint::Conversation => "conversation",
+            crate::forge::PrCommentEndpoint::Review => "review",
+        };
+        let stored_ids = store
+            .lock()
+            .pr_forge_comment_ids(pr_id, table_endpoint)
+            .unwrap_or_default();
+        // The ETag only guards the first page: once a PR holds a full page,
+        // a new comment can land past it without changing it, so read every
+        // page instead of trusting a 304.
+        let etag_to_send = if stored_ids.len() >= crate::forge::COMMENTS_PER_PAGE {
+            None
+        } else {
+            prior_etag.as_deref()
+        };
+        match client.list_pr_comments_conditional(number, endpoint, etag_to_send) {
             Ok(crate::forge::CommentsPoll::NotModified) => (prior_etag, None),
             Ok(crate::forge::CommentsPoll::Modified { comments, etag }) => {
-                changed = true;
-                let table_endpoint = match endpoint {
-                    crate::forge::PrCommentEndpoint::Conversation => "conversation",
-                    crate::forge::PrCommentEndpoint::Review => "review",
-                };
-                let result =
-                    store
-                        .lock()
-                        .replace_pr_forge_comments(pr_id, table_endpoint, &comments);
-                warn_on_store_write(store, "replace_pr_forge_comments", pr_id, false, result);
+                let mut fresh_ids: Vec<&str> =
+                    comments.iter().map(|c| c.external_id.as_str()).collect();
+                fresh_ids.sort_unstable();
+                // A full re-read of an unchanged long PR is not activity.
+                if fresh_ids != stored_ids {
+                    changed = true;
+                    let result =
+                        store
+                            .lock()
+                            .replace_pr_forge_comments(pr_id, table_endpoint, &comments);
+                    warn_on_store_write(store, "replace_pr_forge_comments", pr_id, false, result);
+                }
                 (etag.or(prior_etag), None)
             }
             Err(e) => {
@@ -7128,7 +7157,8 @@ fn poll_pr_comments(
                 }
                 (prior_etag, Some(e.to_string()))
             }
-        };
+        }
+    };
     let (new_conv, conv_err) = poll_one(
         crate::forge::PrCommentEndpoint::Conversation,
         etag_conversation,
@@ -24563,6 +24593,57 @@ token_env = "RALPHUS_TEST_FORGE_TOKEN"
             )
             .unwrap();
         (gid, pr_id)
+    }
+
+    /// A PR holding a full page of comments is re-read in full (no ETag, since
+    /// a 304 on page 1 would prove nothing), and an unchanged re-read does not
+    /// count as comment activity for the backoff.
+    #[test]
+    fn a_long_prs_unchanged_full_reread_is_not_comment_activity() {
+        let store: crate::store_lock::StoreHandle =
+            Arc::new(crate::store_lock::StoreMutex::new(store()));
+        let note = |id: i64| crate::forge::PrComment {
+            external_id: id.to_string(),
+            author: "rev".to_string(),
+            body: String::new(),
+            created_at: "2026-10-18T00:00:00Z".to_string(),
+        };
+        let pr_id = {
+            let guard = store.lock();
+            let (_gid, pr_id) = make_pr(&guard);
+            let stored: Vec<_> = (1..=100).map(note).collect();
+            guard
+                .replace_pr_forge_comments(&pr_id, "conversation", &stored)
+                .unwrap();
+            pr_id
+        };
+        let page: String = serde_json::Value::Array(
+            (1..=100)
+                .map(|id| {
+                    serde_json::json!({"id": id, "system": false, "body": "",
+                        "author": {"username": "rev"}, "created_at": "2026-10-18T00:00:00Z"})
+                })
+                .collect(),
+        )
+        .to_string();
+        let mock = crate::mock_forge::MockForge::start(move |server| {
+            let req = server.recv();
+            assert!(
+                !req.headers().iter().any(|h| h.field.equiv("If-None-Match")),
+                "a full-page PR must not trust a page-1 ETag"
+            );
+            req.respond(tiny_http::Response::from_string(page).with_status_code(200))
+                .unwrap();
+            let req = server.recv();
+            assert!(req.url().ends_with("&page=2"));
+            req.respond(tiny_http::Response::from_string("[]").with_status_code(200))
+                .unwrap();
+        });
+        let client = mock.client(crate::forge::ForgeKind::GitLab, "acme%2Fw");
+        let polled = poll_pr_comments(&store, &client, &pr_id, 1, Some("\"e1\"".to_string()), None);
+        assert!(polled.error.is_none(), "{:?}", polled.error);
+        assert!(!polled.changed, "an unchanged full re-read is not activity");
+        mock.finish();
     }
 
     /// A PR with no forge client for its recorded repo leaves the merge state

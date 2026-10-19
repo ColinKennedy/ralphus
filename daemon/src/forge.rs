@@ -198,6 +198,11 @@ pub struct PrComment {
 /// count silently under-reported.
 const PER_PAGE: u32 = 100;
 
+/// Comments per page on the comment endpoints ([`PER_PAGE`]): a PR holding
+/// at least this many can have new comments past the conditionally-checked
+/// first page.
+pub(crate) const COMMENTS_PER_PAGE: usize = PER_PAGE as usize;
+
 /// Upper bound on pages followed when listing a PR's check-runs / a pipeline's
 /// failed jobs, so a misbehaving forge cannot loop a poll forever.
 const MAX_CI_PAGES: u32 = 20;
@@ -3258,24 +3263,15 @@ impl ForgeClient {
                 // un-actioned count could never reach zero for any PR that had
                 // one.
                 let mut out = Vec::new();
-                for path in [
-                    format!("issues/{number}/comments"),
-                    format!("pulls/{number}/comments"),
-                ] {
-                    let url = format!(
-                        "{}/repos/{}/{path}?per_page={PER_PAGE}",
-                        self.api_base, self.repo_path
-                    );
-                    let resp = self.get(
-                        http_agent()
-                            .get(&url)
-                            .set("Authorization", &format!("Bearer {token}"))
-                            .set("Accept", "application/vnd.github+json"),
-                    )?;
-                    let items = resp.as_array().ok_or_else(|| {
+                for source in [PrCommentEndpoint::Conversation, PrCommentEndpoint::Review] {
+                    let url = self.comment_page_url(number, source);
+                    let resp = self.get(self.comment_request(&url, token))?;
+                    let mut items = resp.as_array().cloned().ok_or_else(|| {
                         format!("unexpected GitHub comments response shape: {resp}")
                     })?;
-                    out.extend(parse_github_comments(items));
+                    let first_page_len = items.len();
+                    items.extend(self.remaining_comment_pages(&url, token, first_page_len)?);
+                    out.extend(parse_github_comments(&items));
                 }
                 // Oldest first across both sources, matching this method's
                 // documented ordering. Both endpoints emit ISO-8601 UTC, which
@@ -3284,15 +3280,15 @@ impl ForgeClient {
                 Ok(out)
             }
             ForgeKind::GitLab => {
-                let url = format!(
-                    "{}/projects/{}/merge_requests/{number}/notes?per_page={PER_PAGE}",
-                    self.api_base, self.repo_path
-                );
-                let resp = self.get(http_agent().get(&url).set("PRIVATE-TOKEN", token))?;
-                let items = resp
+                let url = self.comment_page_url(number, PrCommentEndpoint::Conversation);
+                let resp = self.get(self.comment_request(&url, token))?;
+                let mut items = resp
                     .as_array()
+                    .cloned()
                     .ok_or_else(|| format!("unexpected GitLab notes response shape: {resp}"))?;
-                Ok(parse_gitlab_notes(items))
+                let first_page_len = items.len();
+                items.extend(self.remaining_comment_pages(&url, token, first_page_len)?);
+                Ok(parse_gitlab_notes(&items))
             }
         }
     }
@@ -3322,6 +3318,70 @@ impl ForgeClient {
         )
     }
 
+    /// The first-page URL of one comment endpoint (`per_page` set, no `page`).
+    /// GitLab has a single notes endpoint, so `source` is ignored there.
+    fn comment_page_url(&self, number: i64, source: PrCommentEndpoint) -> String {
+        match (self.kind, source) {
+            (ForgeKind::GitHub, PrCommentEndpoint::Conversation) => format!(
+                "{}/repos/{}/issues/{number}/comments?per_page={PER_PAGE}",
+                self.api_base, self.repo_path
+            ),
+            (ForgeKind::GitHub, PrCommentEndpoint::Review) => format!(
+                "{}/repos/{}/pulls/{number}/comments?per_page={PER_PAGE}",
+                self.api_base, self.repo_path
+            ),
+            (ForgeKind::GitLab, _) => format!(
+                "{}/projects/{}/merge_requests/{number}/notes?per_page={PER_PAGE}",
+                self.api_base, self.repo_path
+            ),
+        }
+    }
+
+    /// An authenticated `GET` for `url` on this forge.
+    fn comment_request(&self, url: &str, token: &str) -> ureq::Request {
+        match self.kind {
+            ForgeKind::GitHub => http_agent()
+                .get(url)
+                .set("Authorization", &format!("Bearer {token}"))
+                .set("Accept", "application/vnd.github+json"),
+            ForgeKind::GitLab => http_agent().get(url).set("PRIVATE-TOKEN", token),
+        }
+    }
+
+    /// Pages 2 onward of a comment endpoint whose first page (at `first_url`)
+    /// came back full. Stops at the first short or empty page, or after
+    /// [`MAX_CI_PAGES`] pages.
+    fn remaining_comment_pages(
+        &self,
+        first_url: &str,
+        token: &str,
+        first_page_len: usize,
+    ) -> Result<Vec<serde_json::Value>, ForgeError> {
+        let mut items = Vec::new();
+        if first_page_len < PER_PAGE as usize {
+            return Ok(items);
+        }
+        for page in 2..=MAX_CI_PAGES {
+            let url = format!("{first_url}&page={page}");
+            let ConditionalGet::Modified { value, .. } =
+                self.get_conditional(self.comment_request(&url, token), None)?
+            else {
+                break;
+            };
+            let page_items = value.as_array().cloned().unwrap_or_default();
+            let got = page_items.len();
+            items.extend(page_items);
+            if got < PER_PAGE as usize {
+                break;
+            }
+        }
+        Ok(items)
+    }
+
+    /// `etag` guards only the first page. On GitHub's conversation endpoint
+    /// (oldest first) a new comment on a PR with 100 or more lands on a later
+    /// page, so a `304` there proves nothing; the caller passes no `etag` for
+    /// such a PR to read every page.
     fn list_pr_comments_conditional_once(
         &self,
         number: i64,
@@ -3329,44 +3389,18 @@ impl ForgeClient {
         etag: Option<&str>,
     ) -> Result<CommentsPoll, ForgeError> {
         let token = self.require_token().map_err(ForgeError::other)?;
-        let req = match (self.kind, source) {
-            (ForgeKind::GitHub, PrCommentEndpoint::Conversation) => {
-                let url = format!(
-                    "{}/repos/{}/issues/{number}/comments?per_page={PER_PAGE}",
-                    self.api_base, self.repo_path
-                );
-                http_agent()
-                    .get(&url)
-                    .set("Authorization", &format!("Bearer {token}"))
-                    .set("Accept", "application/vnd.github+json")
-            }
-            (ForgeKind::GitHub, PrCommentEndpoint::Review) => {
-                let url = format!(
-                    "{}/repos/{}/pulls/{number}/comments?per_page={PER_PAGE}",
-                    self.api_base, self.repo_path
-                );
-                http_agent()
-                    .get(&url)
-                    .set("Authorization", &format!("Bearer {token}"))
-                    .set("Accept", "application/vnd.github+json")
-            }
-            (ForgeKind::GitLab, _) => {
-                let url = format!(
-                    "{}/projects/{}/merge_requests/{number}/notes?per_page={PER_PAGE}",
-                    self.api_base, self.repo_path
-                );
-                http_agent().get(&url).set("PRIVATE-TOKEN", token)
-            }
-        };
-        match self.get_conditional(req, etag)? {
+        let url = self.comment_page_url(number, source);
+        match self.get_conditional(self.comment_request(&url, token), etag)? {
             ConditionalGet::NotModified => Ok(CommentsPoll::NotModified),
             ConditionalGet::Modified { value, etag } => {
-                let items = value.as_array().ok_or_else(|| {
+                let mut items = value.as_array().cloned().ok_or_else(|| {
                     ForgeError::other(format!("unexpected comments response shape: {value}"))
                 })?;
+                let first_page_len = items.len();
+                items.extend(self.remaining_comment_pages(&url, token, first_page_len)?);
                 let comments = match self.kind {
-                    ForgeKind::GitHub => parse_github_comments(items),
-                    ForgeKind::GitLab => parse_gitlab_notes(items),
+                    ForgeKind::GitHub => parse_github_comments(&items),
+                    ForgeKind::GitLab => parse_gitlab_notes(&items),
                 };
                 Ok(CommentsPoll::Modified { comments, etag })
             }
@@ -9650,6 +9684,50 @@ mod tests {
             }),
             "both failed jobs -- not just the first -- must be captured, each with its own trace"
         );
+        mock.finish();
+    }
+
+    /// A full first page of comments pulls in the following pages, so the
+    /// 101st comment is read.
+    #[test]
+    fn comment_polls_read_every_page_after_a_full_first_page() {
+        let notes = |from: i64, count: i64| {
+            let items: Vec<serde_json::Value> = (from..from + count)
+                .map(|id| {
+                    serde_json::json!({
+                        "id": id, "system": false, "body": format!("note {id}"),
+                        "author": {"username": "rev"}, "created_at": "2026-10-18T00:00:00Z",
+                    })
+                })
+                .collect();
+            serde_json::Value::Array(items).to_string()
+        };
+        let (first, second) = (notes(1, 100), notes(101, 1));
+        let mock = MockForge::start(move |server| {
+            let req = server.recv();
+            assert_eq!(
+                req.url(),
+                "/projects/group%2Fpaged/merge_requests/4/notes?per_page=100"
+            );
+            req.respond(tiny_http::Response::from_string(first).with_status_code(200))
+                .unwrap();
+            let req = server.recv();
+            assert_eq!(
+                req.url(),
+                "/projects/group%2Fpaged/merge_requests/4/notes?per_page=100&page=2"
+            );
+            req.respond(tiny_http::Response::from_string(second).with_status_code(200))
+                .unwrap();
+        });
+        let client = mock.client(ForgeKind::GitLab, "group%2Fpaged");
+        let CommentsPoll::Modified { comments, .. } = client
+            .list_pr_comments_conditional(4, PrCommentEndpoint::Conversation, None)
+            .unwrap()
+        else {
+            panic!("expected a fresh body");
+        };
+        assert_eq!(comments.len(), 101);
+        assert_eq!(comments[100].external_id, "101");
         mock.finish();
     }
 
