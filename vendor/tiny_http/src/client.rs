@@ -26,8 +26,10 @@ pub struct ClientConnection {
     source: SequentialReaderBuilder<BufReader<RefinedTcpStream>>,
 
     // sequence of Writers to the stream, to avoid writing response #2 before
-    //  response #1
-    sink: SequentialWriterBuilder<BufWriter<RefinedTcpStream>>,
+    //  response #1 (ralphus patch: released once no request remains, so the
+    //  socket's write side closes with the last response, see
+    //  `watch_for_hang_up`)
+    sink: Option<SequentialWriterBuilder<BufWriter<RefinedTcpStream>>>,
 
     // Reader to read the next header from
     next_header_source: SequentialReader<BufReader<RefinedTcpStream>>,
@@ -105,7 +107,10 @@ impl ClientConnection {
 
         ClientConnection {
             source,
-            sink: SequentialWriterBuilder::new(BufWriter::with_capacity(1024, write_socket)),
+            sink: Some(SequentialWriterBuilder::new(BufWriter::with_capacity(
+                1024,
+                write_socket,
+            ))),
             remote_addr,
             next_header_source: first_header,
             no_more_requests: false,
@@ -118,6 +123,34 @@ impl ClientConnection {
     /// true if the connection is HTTPS
     pub fn secure(&self) -> bool {
         self.secure
+    }
+
+    /// ralphus patch: on a connection that will carry no further request
+    /// (`Connection: close`, HTTP/1.0), keep reading until the client closes
+    /// it, so a client that hangs up before its last request is answered is
+    /// noticed (`Request::peer_closed`). Waits for that request's body to be
+    /// read first (the reader is sequential), discards anything the client
+    /// still sends, and stops at the read timeout if one is set.
+    fn watch_for_hang_up(&mut self) {
+        let mut buf = [0u8; 512];
+        loop {
+            match self.next_header_source.read(&mut buf) {
+                Ok(0) => {
+                    self.peer_gone.store(true, Ordering::Release);
+                    return;
+                }
+                Ok(_) => {}
+                Err(e) if is_timeout(&e) || e.kind() == ErrorKind::Interrupted => {
+                    if e.kind() != ErrorKind::Interrupted {
+                        return;
+                    }
+                }
+                Err(_) => {
+                    self.peer_gone.store(true, Ordering::Release);
+                    return;
+                }
+            }
+        }
     }
 
     /// Reads the next line from self.next_header_source.
@@ -261,7 +294,12 @@ impl ClientConnection {
         };
 
         // building the writer for the request
-        let writer = self.sink.next().unwrap();
+        let writer = self
+            .sink
+            .as_mut()
+            .expect("sink is released only once no request remains")
+            .next()
+            .unwrap();
 
         // follow-up for next potential request
         let mut data_source = self.source.next().unwrap();
@@ -305,13 +343,23 @@ impl Iterator for ClientConnection {
         // the client sent a "connection: close" header in this previous request
         //  or is using HTTP 1.0, meaning that no new request will come
         if self.no_more_requests {
+            // No response remains to be started here; dropping this handle
+            // lets the last response's writer close the write side as soon
+            // as it is done, as it did before the watch below existed.
+            self.sink = None;
+            self.watch_for_hang_up();
             return None;
         }
 
         loop {
             let rq = match self.read() {
                 Err(ReadError::WrongRequestLine) => {
-                    let writer = self.sink.next().unwrap();
+                    let writer = self
+                        .sink
+                        .as_mut()
+                        .expect("sink is released only once no request remains")
+                        .next()
+                        .unwrap();
                     let response = Response::new_empty(StatusCode(400));
                     response
                         .raw_print(writer, HTTPVersion(1, 1), &[], false, None)
@@ -321,7 +369,12 @@ impl Iterator for ClientConnection {
                 }
 
                 Err(ReadError::WrongHeader(ver)) => {
-                    let writer = self.sink.next().unwrap();
+                    let writer = self
+                        .sink
+                        .as_mut()
+                        .expect("sink is released only once no request remains")
+                        .next()
+                        .unwrap();
                     let response = Response::new_empty(StatusCode(400));
                     response.raw_print(writer, ver, &[], false, None).ok();
                     return None; // we don't know where the next request would start,
@@ -330,7 +383,12 @@ impl Iterator for ClientConnection {
 
                 Err(ReadError::ReadIoError(ref err)) if is_timeout(err) => {
                     // request timeout
-                    let writer = self.sink.next().unwrap();
+                    let writer = self
+                        .sink
+                        .as_mut()
+                        .expect("sink is released only once no request remains")
+                        .next()
+                        .unwrap();
                     let response = Response::new_empty(StatusCode(408));
                     response
                         .raw_print(writer, HTTPVersion(1, 1), &[], false, None)
@@ -339,7 +397,12 @@ impl Iterator for ClientConnection {
                 }
 
                 Err(ReadError::UriTooLong) => {
-                    let writer = self.sink.next().unwrap();
+                    let writer = self
+                        .sink
+                        .as_mut()
+                        .expect("sink is released only once no request remains")
+                        .next()
+                        .unwrap();
                     let response = Response::new_empty(StatusCode(414));
                     response
                         .raw_print(writer, HTTPVersion(1, 1), &[], false, None)
@@ -348,14 +411,24 @@ impl Iterator for ClientConnection {
                 }
 
                 Err(ReadError::HeadersTooLarge(ver)) => {
-                    let writer = self.sink.next().unwrap();
+                    let writer = self
+                        .sink
+                        .as_mut()
+                        .expect("sink is released only once no request remains")
+                        .next()
+                        .unwrap();
                     let response = Response::new_empty(StatusCode(431));
                     response.raw_print(writer, ver, &[], false, None).ok();
                     return None; // the rest of the headers are still unread
                 }
 
                 Err(ReadError::ExpectationFailed(ver)) => {
-                    let writer = self.sink.next().unwrap();
+                    let writer = self
+                        .sink
+                        .as_mut()
+                        .expect("sink is released only once no request remains")
+                        .next()
+                        .unwrap();
                     let response = Response::new_empty(StatusCode(417));
                     response.raw_print(writer, ver, &[], true, None).ok();
                     return None; // TODO: should be recoverable, but needs handling in case of body
@@ -368,7 +441,12 @@ impl Iterator for ClientConnection {
 
             // checking HTTP version
             if *rq.http_version() > (1, 1) {
-                let writer = self.sink.next().unwrap();
+                let writer = self
+                    .sink
+                    .as_mut()
+                    .expect("sink is released only once no request remains")
+                    .next()
+                    .unwrap();
                 let response = Response::from_string(
                     "This server only supports HTTP versions 1.0 and 1.1".to_owned(),
                 )

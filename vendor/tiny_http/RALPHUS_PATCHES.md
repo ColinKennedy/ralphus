@@ -84,8 +84,14 @@ idle closes: ureq checks `server_closed()` before reusing one.
 That next read starts as soon as the current request's body has been read,
 which happens at once for a body of at most 1 KiB, so the flag is usually
 current by the time a queued request reaches a worker. `false` means "not
-known to be gone", never "known to be there". A request on a
-`Connection: close` connection never learns it.
+known to be gone", never "known to be there".
+
+A connection that will carry no further request (`Connection: close`,
+HTTP/1.0) is read anyway, until the client closes it or the read timeout
+fires, so its last request learns it too. Before that read, the connection
+drops its handle on the response writer, so the write side still closes
+as soon as the last response is written; a client that reads until the
+server closes is not kept waiting.
 
 ## 6. Connection threads not double-booked (`src/util/task_pool.rs`)
 

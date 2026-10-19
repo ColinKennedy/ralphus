@@ -125,7 +125,18 @@ fn validating_a_task_file_does_not_queue_behind_writes() {
 
 #[test]
 fn a_queued_write_whose_client_hung_up_is_skipped() {
-    let db = temp_db("abandoned");
+    abandoned_write_is_skipped("abandoned", "");
+}
+
+#[test]
+fn a_queued_connection_close_write_whose_client_hung_up_is_skipped() {
+    // One-shot clients send `Connection: close`; the server must still
+    // notice them leaving although no further request will be read.
+    abandoned_write_is_skipped("abandoned-close", "Connection: close\r\n");
+}
+
+fn abandoned_write_is_skipped(name: &str, extra_headers: &str) {
+    let db = temp_db(name);
     let base = spawn_server_on(Store::open(&db).expect("store"), HttpLimits::default());
     let addr = base.trim_start_matches("http://").to_string();
     users(&base); // the schema exists before the test takes the write lock
@@ -144,7 +155,7 @@ fn a_queued_write_whose_client_hung_up_is_skipped() {
     let mut s = TcpStream::connect(&addr).unwrap();
     write!(
         s,
-        "POST /api/users HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+        "POST /api/users HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\n{extra_headers}Content-Length: {}\r\n\r\n{body}",
         body.len()
     )
     .unwrap();
