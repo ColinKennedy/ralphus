@@ -20754,7 +20754,8 @@ struct PendingRequest {
 /// out to git. The Reviews tab polls several of them per refresh, so a click
 /// landing mid-poll queues behind all of them.
 ///
-/// Only `GET` is dispatched here. Every mutating method stays on the accept
+/// The read pool gets `GET`s and read-only `POST`s ([`is_read_only_post`]);
+/// mutations get their own one-worker pool ([`WRITE_WORKERS`]). Every mutating method stays on the accept
 /// loop, which keeps the invariant the mutating handlers were written under:
 /// **no two state-changing requests ever run at the same time**, so a handler
 /// that reads then writes across separate `Store` lock acquisitions still
@@ -20788,6 +20789,12 @@ const READ_QUEUE_LIMIT: usize = 256;
 /// after it may already have happened.
 const READ_STALE_AFTER: Duration = Duration::from_secs(10);
 
+/// How many mutations may wait for the write worker before more are
+/// answered `503` (STRESS-006). The refusal happens before the mutation
+/// runs, so the client may safely retry; nothing is ever refused after it
+/// started. At a few ms per write this is about a second of backlog.
+const WRITE_QUEUE_LIMIT: usize = 256;
+
 /// Why [`ReadPool::try_dispatch`] did not queue a request.
 enum DispatchRefused {
     /// The pool's queue is at its limit.
@@ -20796,7 +20803,8 @@ enum DispatchRefused {
     Closed(Box<PendingRequest>),
 }
 
-/// Answer `503` with `Retry-After` for a read the daemon is shedding.
+/// Answer `503` with `Retry-After` for a request the daemon is shedding
+/// without having run it.
 fn respond_busy(pending: PendingRequest, why: &str) {
     let PendingRequest {
         request,
@@ -20839,6 +20847,44 @@ fn respond_busy(pending: PendingRequest, why: &str) {
     let _ = request.respond(response);
 }
 
+/// Skip a queued request whose client has already closed its connection
+/// (STRESS-006): no one is left to read the answer, and for a mutation not
+/// running it is the only outcome consistent with the client never having
+/// seen an acknowledgement. Clients that send a request and hang up -- a
+/// timed-out CLI call, a closed tab, a flood -- otherwise make every worker
+/// run their work first while live clients wait behind it.
+fn drop_abandoned(pending: PendingRequest) {
+    let PendingRequest {
+        request,
+        method,
+        url,
+        ..
+    } = pending;
+    let path = url.split('?').next().unwrap_or(&url);
+    if let Some(suppressed) = failure_log_permit(&format!("abandoned {path}")) {
+        // ralphus[ignore-rlog-pair]: skipping a request whose client is gone is a transport-level event with no state change, and must not wait on the store lock
+        crate::rlog!(
+            INFO,
+            "ralphus [http] {method} {path} skipped: the client closed the connection before it ran{}",
+            suppressed_suffix(suppressed)
+        );
+    }
+    // Answered (not dropped silently) only so a client that half-closed its
+    // side and is still reading learns the request did not run.
+    let _ = request.respond(
+        tiny_http::Response::from_string(
+            error(
+                503,
+                "client_gone",
+                "the connection was closed before the request ran; it was not run",
+                vec![],
+            )
+            .body,
+        )
+        .with_status_code(503),
+    );
+}
+
 impl ReadPool {
     /// Spawn `workers` threads draining a shared queue of read requests.
     /// With `limit`, at most that many requests may wait (see
@@ -20867,6 +20913,10 @@ impl ReadPool {
                         match job {
                             Ok(pending) => {
                                 queued.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                                if pending.request.peer_closed() {
+                                    drop_abandoned(pending);
+                                    continue;
+                                }
                                 match stale_after {
                                     Some(limit) if pending.accepted_at.elapsed() > limit => {
                                         respond_busy(pending, "the request waited too long");
@@ -20944,6 +20994,9 @@ pub struct HttpLimits {
     pub read_queue_limit: usize,
     /// A `GET` that waited longer than this for a worker is `503`.
     pub read_stale_after: Duration,
+    /// At most this many mutations wait for the write worker; more are
+    /// `503` before they run.
+    pub write_queue_limit: usize,
 }
 
 impl Default for HttpLimits {
@@ -20951,6 +21004,7 @@ impl Default for HttpLimits {
         Self {
             read_queue_limit: READ_QUEUE_LIMIT,
             read_stale_after: READ_STALE_AFTER,
+            write_queue_limit: WRITE_QUEUE_LIMIT,
         }
     }
 }
@@ -20964,7 +21018,7 @@ impl Pools {
                 Some(limits.read_queue_limit),
                 Some(limits.read_stale_after),
             ),
-            write: ReadPool::new(daemon, WRITE_WORKERS, None, None),
+            write: ReadPool::new(daemon, WRITE_WORKERS, Some(limits.write_queue_limit), None),
             health: ReadPool::new(daemon, 1, None, None),
         }
     }
@@ -21613,32 +21667,40 @@ fn take_body(
     }
 }
 
-/// Hand a fully read request to the worker that answers it: `GET`s to the
-/// read pool (or the health lane for `/api/daemon`), everything else to the
-/// single write worker, so mutations stay totally ordered. A `GET` arriving
-/// while the read queue is full is answered `503` at once (STRESS-006).
-/// `POST /api/daemon/shutdown` is answered inline -- see `run_http_loop`.
+/// Whether a non-`GET` request only reads, so it may run on the read pool
+/// instead of queueing behind every mutation (STRESS-007). Validating a
+/// task file parses and checks it; nothing is stored.
+fn is_read_only_post(method: &str, path: &str) -> bool {
+    method == "POST" && (path == "/api/squads/validate" || path == "/api/runs/validate")
+}
+
+/// Hand a fully read request to the worker that answers it: `GET`s (and
+/// read-only `POST`s, see [`is_read_only_post`]) to the read pool, or the
+/// health lane for `/api/daemon`; everything else to the single write
+/// worker, so mutations stay totally ordered. A request arriving while its
+/// queue is full is answered `503` at once, before anything runs
+/// (STRESS-006), so a refused write never happened. `POST
+/// /api/daemon/shutdown` is answered inline -- see `run_http_loop`.
 fn dispatch_pending(daemon: &Arc<Daemon>, pools: &Pools, pending: PendingRequest) {
     let path = pending.url.split('?').next().unwrap_or(&pending.url);
-    if pending.method == "GET" {
-        let pool = if path == "/api/daemon" {
-            &pools.health
-        } else {
-            &pools.read
-        };
-        match pool.try_dispatch(pending) {
-            Ok(()) => {}
-            Err(DispatchRefused::Full(pending)) => {
-                respond_busy(*pending, "too many requests are already waiting");
-            }
-            // Every worker thread is gone (they all panicked); answering it
-            // inline then is better than dropping the connection on the floor.
-            Err(DispatchRefused::Closed(returned)) => answer_request(daemon, *returned),
-        }
+    let pool = if pending.method == "GET" && path == "/api/daemon" {
+        &pools.health
+    } else if pending.method == "GET" || is_read_only_post(&pending.method, path) {
+        &pools.read
     } else if pending.method == "POST" && path == "/api/daemon/shutdown" {
         answer_request(daemon, pending);
-    } else if let Some(returned) = pools.write.dispatch(pending) {
-        answer_request(daemon, returned);
+        return;
+    } else {
+        &pools.write
+    };
+    match pool.try_dispatch(pending) {
+        Ok(()) => {}
+        Err(DispatchRefused::Full(pending)) => {
+            respond_busy(*pending, "too many requests are already waiting");
+        }
+        // Every worker thread is gone (they all panicked); answering it
+        // inline then is better than dropping the connection on the floor.
+        Err(DispatchRefused::Closed(returned)) => answer_request(daemon, *returned),
     }
 }
 

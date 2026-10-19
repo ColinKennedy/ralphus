@@ -6,6 +6,8 @@ use std::io::{BufReader, BufWriter, ErrorKind, Read};
 
 use std::net::SocketAddr;
 use std::str::FromStr;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::common::{HTTPVersion, Method};
@@ -39,6 +41,11 @@ pub struct ClientConnection {
     // ralphus patch: the socket's read timeout (`Server::set_read_timeout`),
     // reused as the deadline for reading one request's line and headers
     read_timeout: Option<Duration>,
+
+    // ralphus patch: set once a read on this connection finds that the
+    // client has closed or reset it; shared with every `Request` read from
+    // it (`Request::peer_closed`)
+    peer_gone: Arc<AtomicBool>,
 }
 
 /// Longest request line (method, target, version) accepted (ralphus patch,
@@ -104,6 +111,7 @@ impl ClientConnection {
             no_more_requests: false,
             secure,
             read_timeout,
+            peer_gone: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -143,12 +151,24 @@ impl ClientConnection {
                     }
                     return Err(LineError::Io(IoError::new(ErrorKind::TimedOut, e)));
                 }
-                Some(Err(e)) => return Err(LineError::Io(e)),
+                Some(Err(e)) => {
+                    if matches!(
+                        e.kind(),
+                        ErrorKind::ConnectionReset
+                            | ErrorKind::ConnectionAborted
+                            | ErrorKind::BrokenPipe
+                    ) {
+                        self.peer_gone.store(true, Ordering::Release);
+                    }
+                    return Err(LineError::Io(e));
+                }
                 None => {
+                    // end of stream: the client closed its side
+                    self.peer_gone.store(true, Ordering::Release);
                     return Err(LineError::Io(IoError::new(
                         ErrorKind::ConnectionAborted,
                         "Unexpected EOF",
-                    )))
+                    )));
                 }
             };
             match *deadline {
@@ -258,6 +278,7 @@ impl ClientConnection {
             data_source,
             writer,
         )
+        .map(|rq| rq.with_peer_gone(Arc::clone(&self.peer_gone)))
         .map_err(|e| {
             use crate::request;
             match e {

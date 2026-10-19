@@ -73,7 +73,21 @@ Writes are never affected, so streamed responses (the daemon's
 `/api/events`) keep working. Clients that pool connections cope with
 idle closes: ureq checks `server_closed()` before reusing one.
 
-## 5. Connection threads not double-booked (`src/util/task_pool.rs`)
+## 5. Knowing when the client has gone (`src/client.rs`, `src/request.rs`)
+
+| | |
+|---|---|
+| **Found by** | `ralphus-stress`, STRESS-006 (`abandon_response`) |
+| **Problem** | A server that queues requests had no way to tell that a client sent one and hung up. Every queued request ran, and live clients waited behind work no one would read. |
+| **Change** | A per-connection flag. It is set when reading the connection's next request reaches end of stream, or fails with a reset, abort or broken pipe. Every `Request` read from that connection shares it, and `Request::peer_closed()` reports it. |
+
+That next read starts as soon as the current request's body has been read,
+which happens at once for a body of at most 1 KiB, so the flag is usually
+current by the time a queued request reaches a worker. `false` means "not
+known to be gone", never "known to be there". A request on a
+`Connection: close` connection never learns it.
+
+## 6. Connection threads not double-booked (`src/util/task_pool.rs`)
 
 | | |
 |---|---|
