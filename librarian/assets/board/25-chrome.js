@@ -828,7 +828,7 @@
        * @param {string} v
        * @returns {void}
        */
-      function onFilter(v) { filters.q = v.toLowerCase(); renderSquads(); syncHash(); }
+      function onFilter(v) { filters.q = v.toLowerCase(); renderSquads(); syncHash(); searchUnloadedSquads(v); }
       // RALPHUS-SQUAD-AGENT-FILTER:BEGIN
       // RAL-486 follow-up: the Squads sidebar's Agent dropdown -- the same
       // shared multi-select Status dropdown (RAL-475) the Tasks toolbar and
@@ -1316,7 +1316,9 @@
         renderSquadAgentFilter();
         const el = byId("squads");
         const list = visibleSquads();
-        if (!list.length) { el.innerHTML = `<div class="empty">No squads.</div>`; return; }
+        // STRESS-004: under the list, how much of history is loaded.
+        const footer = boardWindowFooter(squads.length, "full");
+        if (!list.length) { el.innerHTML = `<div class="empty">No squads.</div>${footer}`; return; }
         el.innerHTML = list.map((r) => `
           <div class="squad-item ${(r.id === selectedSquadId || multiSel.has(r.id)) ? "selected" : ""}" data-click="onSquadClick" data-ctx="openSquadMenu" data-squad-id="${esc(r.id)}">
             <div class="squad-row">
@@ -1327,7 +1329,7 @@
                 <button class="btn squadbtn" data-click="openSquadMenu" data-squad-id="${esc(r.id)}" data-tip="Squad actions — rename, hide, retry, restart, cancel, delete, or view logs for this squad.">⋯</button>
               </span>
             </div>
-          </div>`).join("");
+          </div>`).join("") + footer;
       }
       /**
        * Selects a squad and shows its details pane — an explicit navigation, so the

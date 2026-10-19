@@ -425,6 +425,9 @@
 
       .detail-pane { padding: 16px 18px; }
       .empty { color: var(--muted); text-align: center; margin-top: 40px; }
+      /* STRESS-004: "Showing N of M squads -- Load older" under a windowed list. */
+      .window-more { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 8px 10px; color: var(--muted); font-size: 12px; border-top: 1px solid var(--border); }
+      .tt-summary .window-more { display: inline-flex; padding: 0 0 0 12px; border-top: none; }
       .materializing-graph { color: var(--materializing); cursor: help; }
       .materializing-phase { color: var(--muted); font-size: 12px; margin-top: 6px; }
       .dhead { display: flex; align-items: center; gap: 8px; margin-bottom: 4px; }

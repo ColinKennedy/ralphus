@@ -63,6 +63,9 @@ export function makeFilterScroll({
     syncHash: () => { calls.syncHash++; calls.order.push("syncHash"); },
     renderTtStatusFilters: () => { calls.renderTtStatusFilters++; calls.order.push("renderTtStatusFilters"); },
     ttRenderVisibleRows: () => { calls.ttRenderVisibleRows++; calls.order.push("ttRenderVisibleRows"); },
+    // STRESS-004: the name filter also searches unloaded history on the
+    // daemon -- a network side effect outside what these tests cover.
+    searchUnloadedSquads: () => {},
     byId: (id) => elements[id],
     TT_ROW_H: rowH,
     STATES: ["queued", "running", "done", "failed", "ignored"],
@@ -73,7 +76,7 @@ export function makeFilterScroll({
   // eslint-disable-next-line no-new-func -- evaluating the real shipped source is the point; see the header.
   const factory = new Function(
     "deps",
-    `const { renderTasksTab, syncHash, renderTtStatusFilters, ttRenderVisibleRows, byId, TT_ROW_H, STATES } = deps;
+    `const { renderTasksTab, syncHash, renderTtStatusFilters, ttRenderVisibleRows, searchUnloadedSquads, byId, TT_ROW_H, STATES } = deps;
      var taskTabFilters = deps.taskTabFilters;
      var taskTabSel = deps.taskTabSel;
      var ttDisplayItems = deps.ttDisplayItems;

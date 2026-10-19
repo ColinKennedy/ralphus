@@ -835,6 +835,54 @@ pub struct EventView {
     pub at_ms: i64,
 }
 
+/// Which squads a windowed board listing returns -- see
+/// [`Store::list_squads_window_conn`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SquadWindow {
+    /// How many finished squads to include, newest first (at least 1).
+    pub finished: i64,
+    /// A "load more" page: only finished squads older than this
+    /// `(created_at_ms, id)`; unfinished squads come only with the first page.
+    pub before: Option<(i64, String)>,
+    /// Only squads whose id or label contains this, case-insensitively.
+    pub search: Option<String>,
+}
+
+impl SquadWindow {
+    /// Parse a `next_before` cursor (`"<created_at_ms>:<id>"`).
+    #[must_use]
+    pub fn parse_cursor(cursor: &str) -> Option<(i64, String)> {
+        let (ms, id) = cursor.split_once(':')?;
+        Some((ms.parse().ok()?, id.to_string()))
+    }
+}
+
+/// What a windowed board listing covers, so the board can say "showing N of
+/// M" and offer more.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WindowMeta {
+    /// Squads matching the search (all squads when there is none).
+    pub total: i64,
+    /// Squads in this response.
+    pub loaded: usize,
+    /// Whether older finished squads remain beyond this page.
+    pub has_more: bool,
+    /// Cursor for the next page (`before=`), when `has_more`.
+    pub next_before: Option<String>,
+}
+
+/// Escape `%`, `_` and `\` for a `LIKE ... ESCAPE '\'` pattern.
+fn escape_like(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        if matches!(c, '%' | '_' | '\\') {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}
+
 /// A squad (submission) as shown in the board.
 #[derive(Debug, Clone, Serialize)]
 pub struct SquadView {
@@ -6223,6 +6271,19 @@ impl Store {
         Ok((squads, merging))
     }
 
+    /// [`Self::board_snapshot_conn`] for a windowed listing (STRESS-004):
+    /// the same single read transaction, over
+    /// [`Self::list_squads_window_conn`].
+    pub(crate) fn board_snapshot_window_conn(
+        conn: &Connection,
+        window: &SquadWindow,
+    ) -> Result<(BoardSnapshot, WindowMeta)> {
+        let tx = conn.unchecked_transaction()?;
+        let (squads, meta) = Self::list_squads_window_conn(&tx, window)?;
+        let merging = Self::merging_guardians_conn(&tx)?;
+        Ok(((squads, merging), meta))
+    }
+
     /// [`Self::list_squads`] against any connection, so a pooled read-only
     /// connection (`crate::store_pool`) can serve it without taking the
     /// writer lock. A caller needing one consistent snapshot across several
@@ -6249,11 +6310,114 @@ impl Store {
         conn: &Connection,
         limit: Option<i64>,
     ) -> Result<Vec<SquadView>> {
+        Self::squads_where(conn, "1", &[], limit)
+    }
+
+    /// The board's windowed listing (STRESS-004, `perf/stress/followups/`):
+    /// every squad that has not finished, plus the `window.finished` newest
+    /// finished ones -- or, with `window.before`, the next page of older
+    /// finished squads only. The unwindowed listing hydrates every squad ever
+    /// submitted, so its cost grew with history (11 MB / 7 s at 10,000
+    /// squads); this one is bounded by what is live plus one page.
+    ///
+    /// Squads come back newest first, like [`Self::list_squads_conn`].
+    pub(crate) fn list_squads_window_conn(
+        conn: &Connection,
+        window: &SquadWindow,
+    ) -> Result<(Vec<SquadView>, WindowMeta)> {
+        const FINISHED: &str = "state IN ('done', 'failed', 'cancelled')";
+        let pattern = window
+            .search
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| format!("%{}%", escape_like(s)));
+        // `?1` is the search pattern when there is one.
+        let search = if pattern.is_some() {
+            " AND (id LIKE ?1 ESCAPE '\\' OR COALESCE(label, '') LIKE ?1 ESCAPE '\\')"
+        } else {
+            ""
+        };
+        let pattern_param: Vec<&dyn rusqlite::ToSql> = match &pattern {
+            Some(p) => vec![p],
+            None => vec![],
+        };
+
+        let mut squads = Vec::new();
+        if window.before.is_none() {
+            squads = Self::squads_where(
+                conn,
+                &format!("NOT {FINISHED}{search}"),
+                &pattern_param,
+                None,
+            )?;
+        }
+
+        let page = window.finished.max(1);
+        let mut finished = match &window.before {
+            None => Self::squads_where(
+                conn,
+                &format!("{FINISHED}{search}"),
+                &pattern_param,
+                Some(page + 1),
+            )?,
+            Some((created, id)) => {
+                let n = pattern_param.len();
+                let clause = format!(
+                    "{FINISHED}{search} AND (created_at_ms < ?{a} OR (created_at_ms = ?{a} AND id < ?{b}))",
+                    a = n + 1,
+                    b = n + 2
+                );
+                let mut params = pattern_param.clone();
+                params.push(created);
+                params.push(id);
+                Self::squads_where(conn, &clause, &params, Some(page + 1))?
+            }
+        };
+        let has_more = i64::try_from(finished.len()).unwrap_or(i64::MAX) > page;
+        finished.truncate(usize::try_from(page).unwrap_or(usize::MAX));
+        let next_before = if has_more {
+            finished
+                .last()
+                .map(|s| format!("{}:{}", s.created_at_ms, s.id))
+        } else {
+            None
+        };
+        squads.extend(finished);
+        squads.sort_by(|a, b| {
+            b.created_at_ms
+                .cmp(&a.created_at_ms)
+                .then_with(|| b.id.cmp(&a.id))
+        });
+
+        let total: i64 = conn.query_row(
+            &format!("SELECT COUNT(*) FROM squads WHERE 1{search}"),
+            rusqlite::params_from_iter(pattern_param.iter()),
+            |r| r.get(0),
+        )?;
+        let meta = WindowMeta {
+            total,
+            loaded: squads.len(),
+            has_more,
+            next_before,
+        };
+        Ok((squads, meta))
+    }
+
+    /// Squads matching `clause` (an SQL condition over `squads`, with
+    /// `params` bound to its numbered placeholders), newest first, hydrated
+    /// into full views; at most `limit` when positive.
+    fn squads_where(
+        conn: &Connection,
+        clause: &str,
+        params: &[&dyn rusqlite::ToSql],
+        limit: Option<i64>,
+    ) -> Result<Vec<SquadView>> {
         // Tie-break on id so squads created within the same millisecond still order
         // deterministically. Squad ids are monotonic, zero-padded, fixed-width, so
         // lexicographic `id DESC` == newest-first.
-        let sql = String::from(
-            "SELECT id, label, state, created_at_ms, started_at_ms, finished_at_ms, env_overrides, error, submitter, materialization_step, materialization_total, materialization_phase FROM squads ORDER BY created_at_ms DESC, id DESC",
+        let sql = format!(
+            "SELECT id, label, state, created_at_ms, started_at_ms, finished_at_ms, env_overrides, error, submitter, materialization_step, materialization_total, materialization_phase FROM squads WHERE {clause} ORDER BY created_at_ms DESC, id DESC",
         );
         // A non-positive limit would mean "no rows", which no caller wants and a
         // typo could easily produce; treat it as unlimited.
@@ -6263,7 +6427,7 @@ impl Store {
         };
         let mut stmt = conn.prepare(&sql)?;
         let rows = stmt
-            .query_map([], |r| {
+            .query_map(rusqlite::params_from_iter(params.iter()), |r| {
                 Ok((
                     r.get::<_, String>(0)?,
                     r.get::<_, Option<String>>(1)?,

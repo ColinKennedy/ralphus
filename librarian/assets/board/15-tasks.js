@@ -44,14 +44,15 @@
         let anythingChanged = false;
         try {
           const [index, prIndex] = await Promise.all([
-            conditionalGet("/api/task-index"),
+            conditionalGet(boardWindowUrl("/api/task-index")),
             conditionalGet("/api/pull-requests/index"),
           ]);
           if (index.changed) {
             anythingChanged = true;
             if (index.data) {
               /** @type {any} */ (window)._daemonStatus = index.data.daemon;
-              squads = index.data.squads || [];
+              noteBoardWindow(index.data.window, "index");
+              squads = windowedSquads(index.data.squads || [], "index");
               byId("running").textContent = formatConcurrencyStatus(index.data.daemon.running ?? 0, index.data.daemon.max_concurrent ?? 0);
             }
           }
@@ -165,7 +166,9 @@
       function renderTtSummary(allRows, filtered, needsMeKeys) {
         const squadCount = new Set(filtered.map((r) => r.squadId)).size;
         const running = filtered.filter((r) => r.state === "running").length;
-        byId("tt-summary").textContent = `${filtered.length} task${filtered.length === 1 ? "" : "s"} across ${squadCount} squad${squadCount === 1 ? "" : "s"} · ${running} running · ${needsMeKeys.size} waiting on you`;
+        // STRESS-004: when older history is not loaded, say so beside the
+        // counts, so they are never read as totals over every squad.
+        byId("tt-summary").innerHTML = `<span>${filtered.length} task${filtered.length === 1 ? "" : "s"} across ${squadCount} squad${squadCount === 1 ? "" : "s"} · ${running} running · ${needsMeKeys.size} waiting on you</span>${boardWindowFooter(squads.length, "index")}`;
         byId("tt-needs-me-count").textContent = needsMeKeys.size ? String(needsMeKeys.size) : "";
       }
       // RALPHUS-TT-COLUMN-TIPS:BEGIN
@@ -749,7 +752,7 @@
        * @param {string} v
        * @returns {void}
        */
-      function ttSetNameFilter(v) { taskTabFilters.q = v.toLowerCase(); renderTasksTab(); ttScrollSelectionIntoView(); syncHash(); }
+      function ttSetNameFilter(v) { taskTabFilters.q = v.toLowerCase(); renderTasksTab(); ttScrollSelectionIntoView(); syncHash(); searchUnloadedSquads(v); }
       /**
        * Toggles the "show hidden" (include tasks of hidden squads) filter. Re-centers the retained selection (RAL-383).
        * @param {boolean} on

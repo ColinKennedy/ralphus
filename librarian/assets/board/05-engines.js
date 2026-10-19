@@ -73,6 +73,7 @@
         renameSquad: (e, ds) => renameSquad(ds.squadId || ""),
         squadMenuActivate: (e, ds) => squadMenuAct(ds.squadId || "", "activate"),
         retrySquad: (e, ds) => retrySquad(ds.squadId || ""),
+        loadOlderSquads: () => { guardedAction("load-older-squads", loadOlderSquads); },
         restartSquad: (e, ds) => restartSquad(ds.squadId || ""),
         cancelSquad: (e, ds) => cancelSquad(ds.squadId || ""),
         openAddDependencyDialogFor: (e, ds) => openAddDependencyDialogFor(e, ds.squadId || ""),

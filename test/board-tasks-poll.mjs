@@ -42,6 +42,8 @@ function sliceRegion([BEGIN, END]) {
 }
 
 const REGIONS = {
+  // STRESS-004: the polls fetch windowed lists and merge older pages in.
+  boardWindow: ["// RALPHUS-BOARD-WINDOW:BEGIN", "// RALPHUS-BOARD-WINDOW:END"],
   tasksSeqDecl: ["// RALPHUS-TASKS-POLL-SEQ:BEGIN", "// RALPHUS-TASKS-POLL-SEQ:END"],
   updateCounter: ["// RALPHUS-UPDATE-COUNTER:BEGIN", "// RALPHUS-UPDATE-COUNTER:END"],
   pollTasks: ["// RALPHUS-POLL-TASKS:BEGIN", "// RALPHUS-POLL-TASKS:END"],
@@ -116,6 +118,7 @@ export function makeTasksPoll({ pendingHash = null, selectedSquadId = "s-existin
      var persistSquadSelectionState = () => {};
      var findSquad = (id) => squads.find((r) => r.id === id);
      ${sliceRegion(REGIONS.selStorage)}
+     ${sliceRegion(REGIONS.boardWindow)}
      ${sliceRegion(REGIONS.tasksSeqDecl)}
      ${sliceRegion(REGIONS.updateCounter)}
      ${sliceRegion(REGIONS.pollHelpers)}

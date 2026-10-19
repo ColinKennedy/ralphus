@@ -580,7 +580,9 @@ pub fn volume(cfg: &Config, log: &dyn Fn(&str)) -> Result<VolumeResult, String> 
         let mut bytes = 0;
         for _ in 0..5 {
             let t0 = Instant::now();
-            let r = env.api.call(&ag, user, "GET", "/api/tasks", None, false);
+            let r = env
+                .api
+                .call(&ag, user, "GET", crate::api::BOARD_PATH, None, false);
             times.push(t0.elapsed().as_micros() as u64);
             bytes = r.bytes;
         }

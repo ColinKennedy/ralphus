@@ -295,7 +295,7 @@ pub fn inject(
             r.attempts += 1;
             let n = r.attempts;
             let bytes = if n % 2 == 0 {
-                t.get("/api/tasks")
+                t.get(crate::api::BOARD_PATH)
             } else {
                 let body = crate::api::submit_body(900_000_000 + n, "C:/abandon", t.dialect);
                 t.post(&format!("/api/{}", t.noun), body.as_bytes())
@@ -566,7 +566,7 @@ fn herd(t: &Target, n: usize) -> InjectorReport {
             .spawn(move || {
                 barrier.wait();
                 let t0 = Instant::now();
-                let label = exchange(&t, &t.get("/api/tasks"), Duration::from_secs(30));
+                let label = exchange(&t, &t.get(crate::api::BOARD_PATH), Duration::from_secs(30));
                 if let Ok(mut v) = results.lock() {
                     v.push((label, t0.elapsed()));
                 }

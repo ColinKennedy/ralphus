@@ -4,7 +4,8 @@
   accumulate.
 - **Found by:** `ralphus-stress` scenario `volume`
 - **Found at:** `035ef1e70` (staging, 2026-10-18)
-- **Status:** open
+- **Status:** partly fixed on `stress-fixes-high`. The board lists a window;
+  the per-squad hydration cost and archiving remain (see "What's done").
 
 ## Numbers
 
@@ -73,6 +74,46 @@ How to avoid it:
   documented exception to the "lazy" rule.
 - **Build the UI first, then switch the default window on.** Ship the UI
   changes behind the larger default (or "all") first.
+
+## What's done
+
+**Daemon.** `GET /api/tasks` and `GET /api/task-index` accept
+`?window=N` (capped at 1000), `&before=<cursor>` and `&q=<text>`
+(`server.rs::board_window`, `store.rs::list_squads_window_conn`).
+
+- A window is every unfinished squad plus the `N` newest finished ones.
+- `before` pages older finished squads only.
+- `q` is a case-insensitive id/label substring match over all of history,
+  with `%`/`_` matched literally.
+- The response gains a `window` object: `total`, `loaded`, `has_more`,
+  `next_before`.
+- Without `?window` the response is byte-for-byte unchanged, because the CLI's
+  selector resolution needs the full list.
+- Tests: `daemon/tests/board_window.rs`.
+
+**Board.** It asks for `?window=200` (`BOARD_WINDOW` in `20-util.js`, the
+`RALPHUS-BOARD-WINDOW` region). The UX mitigations above are in place:
+
+- **"Showing N of M squads · Load older"** footer under the Squads list and
+  the Tasks table, shown only while older history is unloaded. "Load older"
+  pages through the cursor.
+- **The filter boxes also search the daemon** (`searchUnloadedSquads`,
+  debounced 300 ms, at least 2 characters) while history is unloaded, and pin
+  the matches into the list.
+- **Deep links and "go to squad" selections** for a squad outside the window
+  are fetched by id (`GET /api/squads/{id}`) and pinned (`pinMissingSquads`).
+- An older daemon without windowing ignores the parameter and gets the old
+  behaviour; the board sees no `window` object and shows no footer.
+- Tests: `test/board-window.test.mjs` and `test/tasks-poll.test.mjs`.
+
+**Not covered yet:**
+
+- The go-to (Ctrl-K) search, the prefs "hidden names" list, and the
+  add-dependency and waypoint pickers still read only the loaded squads.
+- Each listed squad is still hydrated with about 12 statements. A window
+  bounds *how many*, so cost no longer grows with history. A per-squad
+  summary table would cut the per-squad cost itself.
+- Old terminal squads are not archived.
 
 ## Verify
 
