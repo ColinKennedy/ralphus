@@ -36,9 +36,10 @@ function constSourceOf(name) {
   if (!m) throw new Error(`board-freshness: could not find the ${name} definition in the board source.`);
   return m[0];
 }
-const FRESHNESS_HELPERS_SRC = `${constSourceOf("markUpdated")}\n${constSourceOf("markUnreachable")}`;
-
 const REGIONS = {
+  // STRESS-006: `markUpdated` holds off while the daemon is shedding load
+  // and `conditionalGet` records a `503`, so both need the real busy state.
+  daemonBusy: ["// RALPHUS-DAEMON-BUSY:BEGIN", "// RALPHUS-DAEMON-BUSY:END"],
   tasksSeqDecl: ["// RALPHUS-TASKS-POLL-SEQ:BEGIN", "// RALPHUS-TASKS-POLL-SEQ:END"],
   updateCounter: ["// RALPHUS-UPDATE-COUNTER:BEGIN", "// RALPHUS-UPDATE-COUNTER:END"],
   pollTasksTab: ["// RALPHUS-POLL-TASKS-TAB:BEGIN", "// RALPHUS-POLL-TASKS-TAB:END"],
@@ -47,6 +48,8 @@ const REGIONS = {
   // 304-means-skip-the-render decision is exactly what these tests cover.
   conditionalGet: ["// RALPHUS-CONDITIONAL-GET:BEGIN", "// RALPHUS-CONDITIONAL-GET:END"],
 };
+
+const FRESHNESS_HELPERS_SRC = `${sliceRegion(REGIONS.daemonBusy)}\n${constSourceOf("markUpdated")}\n${constSourceOf("markUnreachable")}`;
 
 /** The raw board script (all chunks concatenated), for source-text assertions (e.g. showTab). */
 export const boardSource = html;
