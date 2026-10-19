@@ -662,11 +662,14 @@ fn handle_request(mut request: tiny_http::Request, daemon_url: &str) {
         return;
     }
     let mut body = String::new();
-    let mut limited = <&mut dyn std::io::Read as std::io::Read>::take(
-        request.as_reader(),
-        MAX_REQUEST_BODY_BYTES as u64 + 1,
-    );
-    if let Err(e) = std::io::Read::read_to_string(&mut limited, &mut body) {
+    let read = {
+        let mut limited = <&mut dyn std::io::Read as std::io::Read>::take(
+            request.as_reader(),
+            MAX_REQUEST_BODY_BYTES as u64 + 1,
+        );
+        std::io::Read::read_to_string(&mut limited, &mut body)
+    };
+    if let Err(e) = read {
         let path = url.split('?').next().unwrap_or(&url);
         eprintln!(
             "ralphus-librarian [proxy] could not read request body {method} {path} error={e}"
@@ -676,7 +679,6 @@ fn handle_request(mut request: tiny_http::Request, daemon_url: &str) {
             std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
         ) {
             // Forwarding a truncated body would act on part of a request.
-            drop(limited);
             let response = tiny_http::Response::from_string(
                 r#"{"error":{"code":"request_timeout","message":"the request body was not received in time"}}"#,
             )

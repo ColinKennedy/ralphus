@@ -1144,11 +1144,9 @@ fn route_for_user(
         // like every other route.
         // ralphus[ignore-endpoint-cli]: SSE ticket minted for the board's live event stream only (RAL-222); the CLI has no SSE consumer
         ("POST", ["api", "events", "ticket"]) => mint_events_ticket(daemon),
-        ("GET", ["api", "tasks"]) => {
-            daemon.cached_reply(&format!("tasks?{query}"), || board(daemon, query))
-        }
+        ("GET", ["api", "tasks"]) => board(daemon, query),
         // ralphus[ignore-endpoint-cli]: board 'Tasks' tab flat listing; the CLI reads per-squad views and `GET /api/tasks` instead
-        ("GET", ["api", "task-index"]) => daemon.cached_reply("task-index", || task_index(daemon)),
+        ("GET", ["api", "task-index"]) => task_index(daemon),
         // RAL-332: reads stay open to every caller -- `GET /api/projects` and
         // `.../branches` back the Simple task form's project/branch pickers
         // for every user, not just admins. Only the mutating registration
@@ -1691,7 +1689,7 @@ fn route_for_user(
         // ralphus[ignore-endpoint-cli]: board 'Simple' form generator cancel (RAL-374)
         ("POST", ["api", "generate", id, "cancel"]) => generate_cancel(daemon, id),
         ("POST", ["api", "clear"]) => clear_all(daemon, body),
-        ("GET", ["api", "queue"]) => daemon.cached_reply("queue", || queue(daemon)),
+        ("GET", ["api", "queue"]) => queue(daemon),
         ("POST", ["api", "queue", "reorder"]) => queue_reorder(daemon, body),
         ("POST", ["api", "queue", "set-position"]) => queue_set_position(daemon, body),
         ("GET", ["api", "graph"]) => global_graph(daemon, query),
@@ -2620,81 +2618,87 @@ fn strip_prompt_text(squads: &mut [crate::store::SquadView]) {
 /// Drives the Squads tab and (via `fetchTasksShared()`) the header task
 /// counter; this is the board's heaviest, least-bounded payload -- every
 /// squad ever submitted, every time -- so it carries the same RAL-414 stage
-/// timing as [`task_index`] (opt in with `RALPHUS_BOARD_TIMING`).
+/// timing as [`task_index`] (opt in with `RALPHUS_BOARD_TIMING`). One build
+/// per query is shared between requests -- see [`Daemon::cached_reply`].
 fn board(daemon: &Daemon, query: &str) -> Reply {
-    let mut timer = perf_timing::PhaseTimer::start();
-    let (squads, merging) = match daemon.read_board_snapshot() {
-        Ok(v) => v,
-        Err(e) => return store_error(&e),
-    };
-    timer.phase(perf_timing::PHASE_LOCK_WAIT);
-    // Ground truth is the shared concurrency semaphore, not a DB row count:
-    // a permit is held for a cell/proof/review-merge's entire time in
-    // flight, which outlasts the windows where any single row actually reads
-    // `running` (see `Semaphore::in_use`) — counting DB rows undercounts.
-    let running = daemon.sem.in_use();
-    let running_reviews: Vec<RunningReviewItem> = merging
-        .into_iter()
-        .map(|(id, name)| RunningReviewItem { id, name })
-        .collect();
-    let status = query_filter(query, "status");
-    let name = query_filter(query, "name");
-    let sort = query_filter(query, "sort");
-    let mut squads =
-        filter_and_sort_squads(squads, status.as_deref(), name.as_deref(), sort.as_deref());
-    strip_prompt_text(&mut squads);
-    timer.phase(perf_timing::PHASE_VIEW);
-    let mut reply = json(
-        200,
-        &Board {
+    daemon.cached_reply(&format!("tasks?{query}"), || {
+        let mut timer = perf_timing::PhaseTimer::start();
+        let (squads, merging) = match daemon.read_board_snapshot() {
+            Ok(v) => v,
+            Err(e) => return store_error(&e),
+        };
+        timer.phase(perf_timing::PHASE_LOCK_WAIT);
+        // Ground truth is the shared concurrency semaphore, not a DB row count:
+        // a permit is held for a cell/proof/review-merge's entire time in
+        // flight, which outlasts the windows where any single row actually reads
+        // `running` (see `Semaphore::in_use`) — counting DB rows undercounts.
+        let running = daemon.sem.in_use();
+        let running_reviews: Vec<RunningReviewItem> = merging
+            .into_iter()
+            .map(|(id, name)| RunningReviewItem { id, name })
+            .collect();
+        let status = query_filter(query, "status");
+        let name = query_filter(query, "name");
+        let sort = query_filter(query, "sort");
+        let mut squads =
+            filter_and_sort_squads(squads, status.as_deref(), name.as_deref(), sort.as_deref());
+        strip_prompt_text(&mut squads);
+        timer.phase(perf_timing::PHASE_VIEW);
+        let mut reply = json(
+            200,
+            &Board {
+                daemon: DaemonStatus {
+                    running,
+                    max_concurrent: daemon.max_concurrent,
+                    running_reviews,
+                    downtime_active: crate::config::scheduler_in_downtime(),
+                },
+                squads,
+            },
+        );
+        timer.phase(perf_timing::PHASE_SERIALIZE);
+        reply.server_timing = timer.finish("board", reply.body.len());
+        reply
+    })
+}
+
+/// Compact cross-squad task data for the Tasks tab, with stage timings (RAL-
+/// 414: via `crate::perf_timing`, opt in with `RALPHUS_BOARD_TIMING`) that
+/// separate store-lock contention, view construction, and serialization.
+/// One build is shared between requests -- see [`Daemon::cached_reply`].
+fn task_index(daemon: &Daemon) -> Reply {
+    daemon.cached_reply("task-index", || {
+        // Same read as `board` above, served from the same pooled snapshot --
+        // this endpoint reads exactly the two things `board_snapshot_conn`
+        // returns, so there is no reason for it to take the writer lock either.
+        // The Tasks tab polls it, and `updateCounter` polls it from every other
+        // tab, so it is nearly as hot as `/api/tasks` itself.
+        let mut timer = perf_timing::PhaseTimer::start();
+        let (squads, merging) = match daemon.read_board_snapshot() {
+            Ok(v) => v,
+            Err(e) => return store_error(&e),
+        };
+        timer.phase(perf_timing::PHASE_LOCK_WAIT);
+        let running = daemon.sem.in_use();
+        let running_reviews = merging
+            .into_iter()
+            .map(|(id, name)| RunningReviewItem { id, name })
+            .collect();
+        let response = TaskIndexBoard {
             daemon: DaemonStatus {
                 running,
                 max_concurrent: daemon.max_concurrent,
                 running_reviews,
                 downtime_active: crate::config::scheduler_in_downtime(),
             },
-            squads,
-        },
-    );
-    timer.phase(perf_timing::PHASE_SERIALIZE);
-    reply.server_timing = timer.finish("board", reply.body.len());
-    reply
-}
-
-/// Compact cross-squad task data for the Tasks tab, with stage timings (RAL-
-/// 414: via `crate::perf_timing`, opt in with `RALPHUS_BOARD_TIMING`) that
-/// separate store-lock contention, view construction, and serialization.
-fn task_index(daemon: &Daemon) -> Reply {
-    // Same read as `board` above, served from the same pooled snapshot --
-    // this endpoint reads exactly the two things `board_snapshot_conn`
-    // returns, so there is no reason for it to take the writer lock either.
-    // The Tasks tab polls it, and `updateCounter` polls it from every other
-    // tab, so it is nearly as hot as `/api/tasks` itself.
-    let mut timer = perf_timing::PhaseTimer::start();
-    let (squads, merging) = match daemon.read_board_snapshot() {
-        Ok(v) => v,
-        Err(e) => return store_error(&e),
-    };
-    timer.phase(perf_timing::PHASE_LOCK_WAIT);
-    let running = daemon.sem.in_use();
-    let running_reviews = merging
-        .into_iter()
-        .map(|(id, name)| RunningReviewItem { id, name })
-        .collect();
-    let response = TaskIndexBoard {
-        daemon: DaemonStatus {
-            running,
-            max_concurrent: daemon.max_concurrent,
-            running_reviews,
-            downtime_active: crate::config::scheduler_in_downtime(),
-        },
-        squads: squads.into_iter().map(Into::into).collect(),
-    };
-    timer.phase(perf_timing::PHASE_VIEW);
-    let mut reply = json(200, &response);
-    timer.phase(perf_timing::PHASE_SERIALIZE);
-    reply.server_timing = timer.finish("task-index", reply.body.len());
-    reply
+            squads: squads.into_iter().map(Into::into).collect(),
+        };
+        timer.phase(perf_timing::PHASE_VIEW);
+        let mut reply = json(200, &response);
+        timer.phase(perf_timing::PHASE_SERIALIZE);
+        reply.server_timing = timer.finish("task-index", reply.body.len());
+        reply
+    })
 }
 
 /// Per-task resource usage for every running cell with a live subprocess
@@ -14289,10 +14293,13 @@ fn queue(daemon: &Daemon) -> Reply {
     // read-only connection instead of the writer lock. The read transaction
     // inside `with_read_snapshot` is what keeps the multi-statement view
     // internally consistent; excluding the writer was never what did that.
-    match daemon.with_read_snapshot(Store::queue_conn) {
-        Ok(items) => json(200, &QueueResponse { items }),
-        Err(e) => store_error(&e),
-    }
+    // One build is shared between requests -- see `Daemon::cached_reply`.
+    daemon.cached_reply("queue", || {
+        match daemon.with_read_snapshot(Store::queue_conn) {
+            Ok(items) => json(200, &QueueResponse { items }),
+            Err(e) => store_error(&e),
+        }
+    })
 }
 
 /// Persist a new queue order (server-side DAG-stabilized), returning the
@@ -20730,9 +20737,9 @@ const READ_STALE_AFTER: Duration = Duration::from_secs(10);
 /// Why [`ReadPool::try_dispatch`] did not queue a request.
 enum DispatchRefused {
     /// The pool's queue is at its limit.
-    Full(PendingRequest),
+    Full(Box<PendingRequest>),
     /// Every worker thread has died; answer inline.
-    Closed(PendingRequest),
+    Closed(Box<PendingRequest>),
 }
 
 /// Answer `503` with `Retry-After` for a read the daemon is shedding.
@@ -20852,12 +20859,12 @@ impl ReadPool {
     fn try_dispatch(&self, pending: PendingRequest) -> Result<(), DispatchRefused> {
         if let Some(limit) = self.limit {
             if self.queued.load(std::sync::atomic::Ordering::Relaxed) >= limit {
-                return Err(DispatchRefused::Full(pending));
+                return Err(DispatchRefused::Full(Box::new(pending)));
             }
         }
         match self.dispatch(pending) {
             None => Ok(()),
-            Some(returned) => Err(DispatchRefused::Closed(returned)),
+            Some(returned) => Err(DispatchRefused::Closed(Box::new(returned))),
         }
     }
 }
@@ -21568,11 +21575,11 @@ fn dispatch_pending(daemon: &Arc<Daemon>, pools: &Pools, pending: PendingRequest
         match pool.try_dispatch(pending) {
             Ok(()) => {}
             Err(DispatchRefused::Full(pending)) => {
-                respond_busy(pending, "too many requests are already waiting");
+                respond_busy(*pending, "too many requests are already waiting");
             }
             // Every worker thread is gone (they all panicked); answering it
             // inline then is better than dropping the connection on the floor.
-            Err(DispatchRefused::Closed(returned)) => answer_request(daemon, returned),
+            Err(DispatchRefused::Closed(returned)) => answer_request(daemon, *returned),
         }
     } else if pending.method == "POST" && path == "/api/daemon/shutdown" {
         answer_request(daemon, pending);
