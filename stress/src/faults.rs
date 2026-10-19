@@ -26,6 +26,9 @@ pub struct Target {
     pub token: Option<String>,
     pub user: Option<String>,
     pub noun: String,
+    /// The task file's table name for a cell (`cell`, or `session` on
+    /// daemons that predate the rename).
+    pub cell_key: String,
 }
 
 impl Target {
@@ -295,7 +298,7 @@ pub fn inject(
             let bytes = if n % 2 == 0 {
                 t.get("/api/tasks")
             } else {
-                let body = crate::api::submit_body(900_000_000 + n, "C:/abandon");
+                let body = crate::api::submit_body(900_000_000 + n, "C:/abandon", &t.cell_key);
                 t.post(&format!("/api/{}", t.noun), body.as_bytes())
             };
             match t.connect() {
@@ -622,6 +625,7 @@ fn oversized(t: &Target, window: Duration, stop: &Arc<AtomicBool>) -> InjectorRe
         toml.push_str(&crate::api::submit_toml(
             800_000_000 + i as u64,
             "C:/oversized",
+            &t.cell_key,
         ));
         let body = format!(
             "{{\"toml\":{},\"hold\":true}}",
@@ -649,6 +653,7 @@ fn oversized(t: &Target, window: Duration, stop: &Arc<AtomicBool>) -> InjectorRe
 fn corpus(t: &Target) -> Vec<(&'static str, Vec<u8>, bool)> {
     let auth = t.auth();
     let noun = &t.noun;
+    let cell = &t.cell_key;
     let submit = format!("/api/{noun}");
     let raw = |s: String| s.into_bytes();
     let mut garbage = Vec::with_capacity(1024);
@@ -664,7 +669,7 @@ fn corpus(t: &Target) -> Vec<(&'static str, Vec<u8>, bool)> {
     let big_squad: String = (0..500)
         .map(|i| {
             format!(
-                "[[task]]\nname = \"big-{i}\"\n[[task.cell]]\ncwd = \"C:/big\"\nprompt = \"p{i}\"\n"
+                "[[task]]\nname = \"big-{i}\"\n[[task.{cell}]]\ncwd = \"C:/big\"\nprompt = \"p{i}\"\n"
             )
         })
         .collect();
@@ -673,7 +678,7 @@ fn corpus(t: &Target) -> Vec<(&'static str, Vec<u8>, bool)> {
         serde_json::Value::String(big_squad)
     );
     let chunked_ok = {
-        let body = crate::api::submit_body(700_000_000, "C:/chunked");
+        let body = crate::api::submit_body(700_000_000, "C:/chunked", cell);
         format!(
             "POST {submit} HTTP/1.1\r\nHost: x\r\n{auth}Content-Type: application/json\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n{:x}\r\n{body}\r\n0\r\n\r\n",
             body.len()
@@ -702,7 +707,7 @@ fn corpus(t: &Target) -> Vec<(&'static str, Vec<u8>, bool)> {
         ("invalid_toml", t.post(&submit, br#"{"toml":"[[task]\nname=","hold":true}"#), true),
         ("empty_toml", t.post(&submit, br#"{"toml":"","hold":true}"#), true),
         ("toml_no_cells", t.post(&submit, br#"{"toml":"[[task]]\nname=\"x\"\n","hold":true}"#), true),
-        ("toml_nul_and_control_chars", t.post(&submit, "{\"toml\":\"[[task]]\\nname=\\\"a\\u0000b\\u001b[31m\\\"\\n[[task.cell]]\\ncwd=\\\"C:/x\\\"\\nprompt=\\\"p\\\"\\n\",\"hold\":true}".as_bytes()), true),
+        ("toml_nul_and_control_chars", t.post(&submit, format!("{{\"toml\":{}, \"hold\":true}}", crate::api::json_str(&format!("[[task]]\nname=\"a\u{0}b\u{1b}[31m\"\n[[task.{cell}]]\ncwd=\"C:/x\"\nprompt=\"p\"\n"))).as_bytes()), true),
         ("submit_500_tasks", t.post(&submit, big_squad_body.as_bytes()), true),
         ("chunked_valid_submit", chunked_ok.into_bytes(), true),
         ("chunked_bad_size", raw(format!("POST {submit} HTTP/1.1\r\nHost: x\r\n{auth}Transfer-Encoding: chunked\r\nConnection: close\r\n\r\nzz\r\nabc\r\n0\r\n\r\n")), true),
@@ -810,6 +815,7 @@ mod tests {
             token: Some("t".into()),
             user: Some("u".into()),
             noun: "squads".into(),
+            cell_key: "cell".into(),
         };
         let c = corpus(&t);
         let mut names: Vec<_> = c.iter().map(|(n, _, _)| *n).collect();

@@ -58,6 +58,7 @@ impl Env {
             token: self.api.token.clone(),
             user: self.api.users.first().cloned(),
             noun: self.api.noun.clone(),
+            cell_key: self.api.cell_key.clone(),
         }
     }
 }
