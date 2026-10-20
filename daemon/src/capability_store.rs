@@ -1015,12 +1015,14 @@ mod tests {
     #[test]
     fn resolved_env_is_registered_for_redaction() {
         crate::redact::with_registry_lock(|| {
+            // Built at runtime so no secret-shaped literal is committed to the repo.
+            let secret = format!("redact-probe-{}", now_ms());
             let store = Store::open_in_memory().unwrap();
             store
                 .upsert_capability_item(
                     CapabilityKind::Mcp,
                     "gh",
-                    Some(stdio(vec![set("TOKEN", "tok-redact-me-695")])),
+                    Some(stdio(vec![set("TOKEN", &secret)])),
                     None,
                     "manual",
                 )
@@ -1029,7 +1031,7 @@ mod tests {
                 .set_capability_enabled("pi", CapabilityKind::Mcp, "gh", true, false)
                 .unwrap();
             store.resolve_capabilities("pi", false).unwrap();
-            assert!(!crate::redact::redact_all("oops tok-redact-me-695").contains("tok-redact"));
+            assert!(!crate::redact::redact_all(&format!("oops {secret}")).contains(&secret));
         });
     }
 
