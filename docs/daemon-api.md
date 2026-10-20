@@ -496,6 +496,21 @@ Response `200` (sent before the daemon actually exits):
 }
 ```
 
+### `POST /api/ingest`
+Attach existing branches, and any open PRs on them, to a review (RAL-702;
+`ralphus ingest`). Body: `{path, branches[], review_id?, pr?, base?, prompt?,
+label?, dry_run?}`. `path` is the git checkout (registered project or not).
+With `dry_run: true` nothing is created and the plan is returned (`200`):
+`base` and `base_rule`, `agent`/`model` and `agent_rule`, `branches[]`
+(`branch`, `pr_number`, `pr_url`, `description_source`), `warnings`, and
+`force_push_warning`. Without it the daemon creates one task per branch (one
+prompt cell each, chained by `depends_on` in order), creates the review (or
+adds the branches to `review_id`), and returns the plan plus `squad_id` and
+`review_id` (`201`). `auto_submit_pr_stack` is enabled on a new review only
+when a branch already has a PR. Refused: `pr` when that PR's head is not the
+branch (or with more than one branch), and a branch checked out in the user's
+checkout.
+
 ### `POST /api/squads/validate`
 Validate a TOML batch without persisting anything.
 

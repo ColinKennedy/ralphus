@@ -161,6 +161,7 @@ ENDPOINT_TO_CLI: dict[str, list[str]] = {
     # ---- squads ------------------------------------------------------------
     "POST /api/squads/validate": ["validate"],
     "POST /api/squads": ["submit"],
+    "POST /api/ingest": ["ingest"],
     "POST /api/clear": ["clear"],
     "GET /api/queue": ["queue list"],
     "POST /api/queue/reorder": ["queue reorder"],

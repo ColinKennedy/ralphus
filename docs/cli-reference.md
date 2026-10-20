@@ -151,6 +151,7 @@ list of candidates.
 |---|---|
 | `validate <file>` | Validate a task TOML file offline (no daemon needed if `ralphus-daemon` is on PATH) |
 | `submit <file...\|dir\|glob\|-> [--label] [--hold] [--activate] [--wait] [--no-validate]` | Submit task TOML. See [Submit](#submit) below |
+| `ingest <branch...> [--review <selector>] [--pr <n>] [--base <branch>] [--prompt\|--prompt-file] [--label] [--yes]` | Attach existing branches (and any open PRs on them) to a review: one task with one prompt cell per branch, chained in command-line order. Prints the chosen base and agent with the rule that chose each, "will adopt PR #N" per branch, and the force-push warning (RAL-701), then asks to proceed unless `--yes`. Refuses `--pr N` when PR N's head is not the branch, and a branch checked out in your own checkout. Works in an unregistered repo. `auto_submit_pr_stack` is turned on for a new review only when a branch already has a PR |
 | `author [--goal\|--prompt-file] [--verify] [--review] [--hold] [--dry-run] ...` | Generate, validate, and submit a TOML from a plain-language goal |
 | `status [squad_id] [--concurrency]` | Show one squad, or list all squads; `--concurrency` shows scheduler load instead |
 | `resources` | Per-task CPU/RAM/GPU for running cells |
@@ -769,6 +770,7 @@ use; see `READ_ONLY_NOTE`.
     - (read-only-safe) get selector [uri] field [str, optional]  {Query one field from any entity's JSON view (jq-lite).}
     - (read-only-safe) graph squad_id [id, optional] --all --dot  {Render the task-order dependency graph. (Rust port simplifies Python's --global/--format ascii|dot choice to plain --dot/--all boolean flags.)}
     - (read-only-safe) history selector [uri] --type [str]  {Show a cell/proof step's transcript history (one-shot snapshot; Python's --live tailing and --wait-until-valid are not yet ported).}
+    - ingest branch [str...] --base [branch] --label [text] --pr [integer] --prompt [text] --prompt-file [path] --review [selector] --yes  {Attach existing branches, and any open PRs on them, to a review (RAL-702). Each branch becomes one task with one prompt cell, chained in command-line order; --review attaches to an existing review instead of creating one. Prints the chosen base and agent with the rule that chose each, the PRs it will adopt, and the force-push warning, then asks to proceed unless --yes.}
     - initialize  {One-time local setup helpers for a repository.}
         - followup --remote --state-dir [path] --stop  {Launch an isolated daemon and run the deferred-prophecy follow-up flow with a stub agent: a review merges, offers follow-up work, the offer is accepted, and the drafted squad runs to completion. Local only (--remote is refused); --stop shuts the daemon down afterwards.}
         - git --path [path]  {Enable git rerere in a repo so review rebases replay conflict resolutions.}

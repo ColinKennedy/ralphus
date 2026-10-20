@@ -1729,6 +1729,7 @@ fn route_for_user(
         }
         ("POST", ["api", "squads", "validate"]) => validate_endpoint(daemon, body),
         ("POST", ["api", "squads"]) => submit(daemon, body, query, user_header),
+        ("POST", ["api", "ingest"]) => ingest_endpoint(daemon, body),
         // RAL-297: Simple task form's opt-in "generation step" primitive.
         // ralphus[ignore-endpoint-cli]: board 'Simple' form sketch-to-task generator (RAL-374)
         ("POST", ["api", "generate"]) => generate_start(daemon, body),
@@ -7020,6 +7021,23 @@ fn generate_status(daemon: &Daemon, id: &str) -> Reply {
 fn generate_cancel(daemon: &Daemon, id: &str) -> Reply {
     daemon.cancellations_handle().cancel(id);
     json(202, &serde_json::json!({}))
+}
+
+/// `POST /api/ingest` (RAL-702): attach existing branches (and their open pull
+/// requests) to a review. See [`crate::ingest`].
+fn ingest_endpoint(daemon: &Daemon, body: &str) -> Reply {
+    let Ok(req) = serde_json::from_str::<crate::ingest::IngestRequest>(body) else {
+        return error(
+            400,
+            "bad_request",
+            "body must be {path, branches[, review_id, pr, base, prompt, label, dry_run]}",
+            vec![],
+        );
+    };
+    match crate::ingest::ingest(&daemon.store_handle(), &req) {
+        Ok(out) => json(if req.dry_run { 200 } else { 201 }, &out),
+        Err(e) => error(e.status, e.code, &e.message, vec![]),
+    }
 }
 
 pub(crate) fn submit(daemon: &Daemon, body: &str, query: &str, user_header: Option<&str>) -> Reply {
