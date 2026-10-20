@@ -771,6 +771,18 @@ impl ProviderRunner {
 }
 
 impl ProviderRunner {
+    /// `result` with the usage this handle's streamed `llm-invoke` events
+    /// reported, when the result itself carries none -- the remote twin of the
+    /// local runner's backfill, so a cancelled or timed-out remote cell still
+    /// records the tokens it spent.
+    fn with_live_usage(&self, mut result: RunnerResult) -> RunnerResult {
+        let usage = *self.live_usage.lock().expect("poisoned");
+        if let Some(usage) = usage {
+            crate::runner::backfill_live_usage(&mut result, usage);
+        }
+        result
+    }
+
     /// Invoke a handle-scoped verb (`status`/`stream`/`cancel`).
     fn invoke_handle(
         &self,
@@ -815,8 +827,12 @@ impl ProviderRunner {
             }
         };
         let mut cursor: Option<i64> = None;
+        // Registered like a local run for as long as this loop polls: a
+        // per-cell stop (status change, cancel) reaches it, and Live View
+        // reports the cell as running.
+        let live = crate::runner::LiveSessionGuard::new(&session_name);
         loop {
-            if cancel.is_some_and(CancelToken::is_cancelled) {
+            if cancel.is_some_and(CancelToken::is_cancelled) || live.stop_requested() {
                 // Best-effort: a provider that can't cancel still leaves us
                 // reporting the cell cancelled, which matches how a local
                 // kill that races the process exit behaves.
@@ -834,7 +850,7 @@ impl ProviderRunner {
                     "remote cell cancelled",
                     serde_json::json!({"handle": handle, "scheme": self.scheme}),
                 );
-                return RunnerResult::failure("cancelled");
+                return self.with_live_usage(RunnerResult::failure("cancelled"));
             }
             if let Some(budget) = budget {
                 if started.elapsed() >= budget {
@@ -861,11 +877,11 @@ impl ProviderRunner {
                             "timeout_sec": budget.as_secs(),
                         }),
                     );
-                    return RunnerResult::failure(format!(
+                    return self.with_live_usage(RunnerResult::failure(format!(
                         "timed out after {}s on machine provider {:?}",
                         budget.as_secs(),
                         self.scheme
-                    ));
+                    )));
                 }
             }
             // RAL-161/RAL-201: mirror `SubprocessRunner`'s live cost-cap kill.
@@ -2626,6 +2642,44 @@ else:
         let r = router.run_cancellable(&spec(Some("ib:A")), &cancel);
         assert_eq!(r.status, "failed");
         assert_eq!(r.error.as_deref(), Some("cancelled"), "{r:?}");
+    }
+
+    #[test]
+    fn a_per_cell_stop_reaches_a_running_remote_cell() {
+        // A status change on one cell (not a squad cancel) stops it through
+        // the live-session registry; a remote cell must be in it too, or the
+        // job keeps running on the machine.
+        let script = fake_async_provider(
+            "async-stop",
+            &[
+                ("exec", r#"{"ok":true,"protocol_version":1,"handle":"h1"}"#),
+                (
+                    "status",
+                    r#"{"ok":true,"protocol_version":1,"state":"running"}"#,
+                ),
+                ("cancel", r#"{"ok":true,"protocol_version":1}"#),
+            ],
+        );
+        let s = store();
+        register(&s, "ib", &script);
+        let (router, _local) = router(Arc::clone(&s));
+        let cell = spec(Some("ib:A"));
+        let session = crate::cell_session::session_name(&cell.squad_id, &cell.task, &cell.cell_id);
+        let watcher = {
+            let session = session.clone();
+            std::thread::spawn(move || {
+                let deadline = Instant::now() + Duration::from_secs(20);
+                while !crate::runner::direct_session_active(&session) {
+                    assert!(Instant::now() < deadline, "remote cell never registered");
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                assert!(crate::runner::direct_request_stop(&session));
+            })
+        };
+        let r = router.run_cancellable(&cell, &CancelToken::new());
+        watcher.join().unwrap();
+        assert_eq!(r.error.as_deref(), Some("cancelled"), "{r:?}");
+        assert!(!crate::runner::direct_session_active(&session));
     }
 
     #[test]

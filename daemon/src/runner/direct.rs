@@ -70,14 +70,16 @@ fn request_stop_matching(matches: impl Fn(&str) -> bool) -> usize {
         .count()
 }
 
-/// Marks a cell active for as long as it lives.
-struct ActiveGuard {
+/// Marks a cell active for as long as it lives. Also held by a remote cell's
+/// poll loop ([`crate::remote_runner`]), so status changes, cancel and Live
+/// View treat a cell running on another machine exactly like a local one.
+pub(crate) struct ActiveGuard {
     name: String,
     stop: Arc<AtomicBool>,
 }
 
 impl ActiveGuard {
-    fn new(session_name: &str) -> Self {
+    pub(crate) fn new(session_name: &str) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
         if let Ok(mut names) = active().lock() {
             names.insert(session_name.to_string(), Arc::clone(&stop));
@@ -88,7 +90,7 @@ impl ActiveGuard {
         }
     }
 
-    fn stop_requested(&self) -> bool {
+    pub(crate) fn stop_requested(&self) -> bool {
         self.stop.load(Ordering::SeqCst)
     }
 }

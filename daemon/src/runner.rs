@@ -21,8 +21,9 @@ use crate::store::{CellRow, NodeState};
 
 mod direct;
 pub(crate) use direct::{
-    CappedSink as TranscriptSink, is_active as direct_session_active,
-    live_tail as direct_live_tail, request_stop as direct_request_stop,
+    ActiveGuard as LiveSessionGuard, CappedSink as TranscriptSink,
+    is_active as direct_session_active, live_tail as direct_live_tail,
+    request_stop as direct_request_stop,
     request_stop_with_any_prefix as direct_request_stop_with_any_prefix,
 };
 
@@ -2669,7 +2670,7 @@ fn redact_event(event: &mut RunnerEvent) {
 /// numbers are authoritative and are never overwritten by a stale snapshot.
 /// [`RunnerResult::cost_exceeded`] already carries real figures, so this is a
 /// no-op for it.
-fn backfill_live_usage(result: &mut RunnerResult, live: LiveUsage) {
+pub(crate) fn backfill_live_usage(result: &mut RunnerResult, live: LiveUsage) {
     if result.tokens_in == 0
         && result.tokens_out == 0
         && result.cache_creation_tokens == 0
