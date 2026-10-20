@@ -10706,10 +10706,11 @@ fn current_review_heads(
             .project
             .clone()
             .unwrap_or_else(|| guardian.git_root.clone());
-        if let Ok(sha) = Workspace::on(Path::new(&proj), guardian.machine.as_deref())
-            .with_store(Arc::clone(store))
-            .git(&["rev-parse", "--verify", rev])
-        {
+        if let Ok(sha) = Workspace::for_guardian(store, &guardian.id, Path::new(&proj)).git(&[
+            "rev-parse",
+            "--verify",
+            rev,
+        ]) {
             out.push((b.position, b.id.clone(), sha.trim().to_string()));
         }
     }
@@ -15107,6 +15108,7 @@ pub fn run_periodic_git_maintenance(store: &crate::store_lock::StoreHandle) {
             .unwrap_or_default()
             .into_iter()
             .map(|g| GuardianRootInfo {
+                id: g.id,
                 git_root: g.git_root,
                 machine: g.machine,
                 status: g.status,
@@ -15119,6 +15121,12 @@ pub fn run_periodic_git_maintenance(store: &crate::store_lock::StoreHandle) {
             log_git_maintenance_skipped(store, &root, machine.as_deref());
             continue;
         }
+        // Any review on this (root, machine) can translate the daemon-side
+        // root onto the machine's repository.
+        let guardian_id = guardians
+            .iter()
+            .find(|g| Path::new(&g.git_root) == root && g.machine == machine)
+            .map(|g| g.id.clone());
         let store = Arc::clone(store);
         let emit_store = Arc::clone(&store);
         std::thread::spawn(move || {
@@ -15132,7 +15140,10 @@ pub fn run_periodic_git_maintenance(store: &crate::store_lock::StoreHandle) {
                 log_git_maintenance_skipped(&emit_store, &root, machine.as_deref());
                 return;
             };
-            let ws = Workspace::on(&root, machine.as_deref()).with_store(store);
+            let ws = match &guardian_id {
+                Some(id) => Workspace::for_guardian(&store, id, &root),
+                None => Workspace::on(&root, machine.as_deref()).with_store(store),
+            };
             // The store lock is taken only to record the outcome below --
             // never held across the `git gc` call itself, which can run for
             // minutes on a bloated repo and must not stall the rest of the
@@ -15187,6 +15198,7 @@ fn log_git_maintenance_skipped(
 /// narrows it for `collect_base_fetch_targets`, so the pure dedup/filter
 /// logic can be unit-tested without constructing a whole view.
 pub(crate) struct GuardianRootInfo {
+    pub id: String,
     pub git_root: String,
     pub machine: Option<String>,
     pub status: String,
@@ -15734,8 +15746,16 @@ fn guardian_ids_for_target(
 fn fetch_base_branch(
     store: &crate::store_lock::StoreHandle,
     target: &BaseFetchTarget,
+    guardian_id: Option<&str>,
 ) -> std::result::Result<(), String> {
-    let ws = Workspace::on(&target.root, target.machine.as_deref()).with_store(Arc::clone(store));
+    // A review served by this target translates its daemon-side project root
+    // onto the review's machine; without one the root is used as given.
+    let ws = match guardian_id {
+        Some(id) => Workspace::for_guardian(store, id, &target.root),
+        None => {
+            Workspace::on(&target.root, target.machine.as_deref()).with_store(Arc::clone(store))
+        }
+    };
     let base = &target.base_branch;
 
     if let Some((remote, branch)) = base.split_once('/') {
@@ -15848,7 +15868,8 @@ pub fn poll_base_branch_freshness_once(store: &crate::store_lock::StoreHandle) {
         std::thread::spawn(move || {
             let _claim = claim;
             let _remote_scope = crate::machine_strict::enter(target.machine.as_deref());
-            let result = fetch_base_branch(&store, &target);
+            let result =
+                fetch_base_branch(&store, &target, guardian_ids.first().map(String::as_str));
             let outcome = match &result {
                 Ok(()) => crate::poller_health::PollOutcome::Healthy,
                 Err(e) => {
@@ -15968,7 +15989,9 @@ pub(crate) fn resolve_base(
     root: &Workspace,
     base_branch: &str,
 ) -> std::result::Result<String, String> {
-    let qualified = qualify_ambiguous_ref(root.root(), base_branch);
+    // Qualified where it is resolved: on the review's machine for a remote
+    // review, whose refs the daemon's checkout does not have.
+    let qualified = qualify_ambiguous_ref_in(root, base_branch);
     let spec = format!("{qualified}^{{commit}}");
     Ok(root
         .git(&["rev-parse", "--verify", &spec])?
@@ -18593,7 +18616,7 @@ mod tests {
             machine: None,
             base_branch: "main".to_string(),
         };
-        fetch_base_branch(&store, &target).expect("falls back instead of failing");
+        fetch_base_branch(&store, &target, None).expect("falls back instead of failing");
         assert_eq!(g_out(&repo, &["rev-parse", "main"]), local_before);
         assert_eq!(g_out(&repo, &["rev-parse", "origin/main"]), pushed);
         let after = current_base_tips(&store, &id).unwrap();
@@ -18845,6 +18868,7 @@ mod tests {
 
     fn root_info(git_root: &str, machine: Option<&str>, status: &str) -> GuardianRootInfo {
         GuardianRootInfo {
+            id: format!("guardian-{git_root}"),
             git_root: git_root.to_string(),
             machine: machine.map(str::to_string),
             status: status.to_string(),
