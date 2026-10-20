@@ -88,6 +88,8 @@ So a pool token needs **read access to the repository and nothing else**:
   *Commit statuses* and *Checks* set to **Read-only** (plus the automatic
   *Metadata*) is the least-privileged alternative if your organization allows
   them.
+
+  ![The classic-token scope list with only the repo box (and its sub-scopes) ticked](images/github-poll-pool-token-scopes.png)
 - **Public repositories only:** **no scopes at all.** A classic token with
   every box unticked still authenticates (which is what lifts the rate limit
   from 60 to 5,000 requests/hour) and can read any public repository.
