@@ -1453,9 +1453,21 @@
        */
       function inspectorOverviewTab(g, b) {
         const place = hcStackPlace(g, b);
-        const src = b.source_squad_id
-          ? `${esc(b.source_squad_id)}${b.source_cell_idx === undefined ? "" : ` · cell ${b.source_cell_idx}`}`
-          : "—";
+        // Links read only the already-loaded `squads`; an unloaded squad stays plain text.
+        const srcId = b.source_squad_id;
+        const srcLoaded = !!srcId && squads.some((r) => r.id === srcId);
+        const srcIdHtml = srcId && srcLoaded
+          ? `<a href="#" data-click="gotoSquad" data-squad-id="${esc(srcId)}" style="color:var(--accent)" data-tip="The squad that produced this branch.\nSwitches to the Squads tab with this squad selected.">${esc(srcId)}</a>`
+          : esc(srcId || "");
+        const srcTi = b.source_task_idx;
+        const srcCell = b.source_cell_idx;
+        let srcCellHtml = "";
+        if (srcCell !== undefined && srcCell !== null) {
+          srcCellHtml = srcId && srcLoaded && typeof srcTi === "number"
+            ? ` · <a href="#" data-click="gotoSquadItem" data-squad-id="${esc(srcId)}" data-kind="cell" data-ti="${srcTi}" data-si="${srcCell}" data-vi="-1" style="color:var(--accent)" data-tip="The cell that produced this branch.\nSwitches to the Squads tab and opens this cell in the detail pane.">cell ${srcCell}</a>`
+            : ` · cell ${srcCell}`;
+        }
+        const src = srcId ? `${srcIdHtml}${srcCellHtml}` : "—";
         const prs = (pullRequests[g.id] || []).filter((p) => p.branch_id === b.id);
         // RAL-634: the branch worktree's own counts against its nearest enabled
         // upstream; RAL-550's runner-pushed source-cell counts when the branch
