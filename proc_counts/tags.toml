@@ -129,3 +129,8 @@ tag = "existing-branch-worktree-local"
 [[test]]
 id = "ralphus-daemon worktrees::tests::existing_branch_mode_fetches_remote_only_branch"
 tag = "existing-branch-worktree-remote"
+
+# Probing a catalog MCP server over stdio (RAL-695; `capability_probe::probe_mcp`).
+[[test]]
+id = "ralphus-daemon capability_probe::tests::probe_stdio_counts_tools_from_a_real_server"
+tag = "capability-probe"

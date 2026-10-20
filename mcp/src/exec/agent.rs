@@ -6,8 +6,8 @@
 use ralphus_cli::agents::KNOWN_AGENTS;
 use ralphus_cli::client::DaemonClient;
 use ralphus_cli::commands::agent::{
-    AgentBackendCommandCommand, AgentCommand, AgentProfileCommand, AgentProfileSummary,
-    load_agent_profile_summaries,
+    AgentBackendCommandCommand, AgentCapabilityCommand, AgentCommand, AgentProfileCommand,
+    AgentProfileSummary, load_agent_profile_summaries,
 };
 use serde_json::json;
 
@@ -39,6 +39,7 @@ pub fn execute(cmd: AgentCommand, client: &DaemonClient) -> ExecResult {
         }
         AgentCommand::Profile(c) => execute_profile(c, client),
         AgentCommand::BackendCommand(c) => execute_backend_command(c, client),
+        AgentCommand::Capability(c) => execute_capability(c, client),
     }
 }
 
@@ -100,5 +101,34 @@ fn execute_backend_command(cmd: AgentBackendCommandCommand, client: &DaemonClien
         AgentBackendCommandCommand::Profiles { backend } => {
             Ok(client.list_agent_profiles_for_backend(&backend)?)
         }
+    }
+}
+
+fn execute_capability(cmd: AgentCapabilityCommand, client: &DaemonClient) -> ExecResult {
+    use AgentCapabilityCommand as C;
+    match cmd {
+        C::Help | C::UsageError(_) => Err(usage("no such tool")),
+        C::List => Ok(client.list_capabilities()?),
+        C::Save {
+            kind,
+            name,
+            body,
+            replace,
+        } => Ok(client.save_capability(&kind, &name, body, replace)?),
+        C::Remove { kind, name } => Ok(client.remove_capability(&kind, &name)?),
+        C::Check { kind, name } => Ok(client.check_capability(&kind, &name)?),
+        C::Import => Ok(client.import_capabilities()?),
+        C::Profile { profile } => Ok(client.get_profile_capabilities(&profile)?),
+        C::Toggle {
+            profile,
+            kind,
+            name,
+            enabled,
+        } => Ok(client.set_profile_capability(&profile, &kind, &name, enabled)?),
+        C::Delivery {
+            profile,
+            mode,
+            args,
+        } => Ok(client.set_profile_capability_delivery(&profile, &mode, &args)?),
     }
 }

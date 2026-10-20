@@ -1325,6 +1325,68 @@ Response `200`:
 See [`docs/machine-providers.md`](machine-providers.md) for the provider
 contract (verbs, JSON envelope, versioning) and the publishing model.
 
+
+### Capabilities (RAL-695)
+The ralphus-owned catalog of **MCP servers** and **skills** an agent may use,
+and each agent profile's toggles over it. All routes are admin-only. A spawned
+agent receives *only* the items its profile has enabled (default: none) --
+personal MCP servers and skills are never read, even with personal settings
+allowed. Probes and skill checks run on the daemon host only.
+
+An item is `{ "kind": "mcp"|"skill", "name": ..., "mcp": {...}|null,
+"skill": {...}|null }`. `mcp` is `{ "command", "args", "env", "url",
+"headers" }` (`command` for a stdio server, `url` for an HTTP one); `env` and
+`headers` rows use the agent-profile Set/Link model (`{ "key", "kind":
+"set"|"link", "value" }`), and a `set` value is always returned masked and
+registered for redaction in logs, mailbox text and Cartographer rows. `skill`
+is `{ "path": "<folder on the daemon host>" }`.
+
+#### `GET /api/capabilities`
+`{ "items": [...], "allow_ralphus_mcp": bool }`. Each item also carries
+`source` (`manual`, `import:<origin>`, `builtin`), `status` (`untested`, `ok`,
+`failing` for MCP; `found`, `missing` for skills), `status_detail`,
+`tool_count` and `checked_at_ms`. The built-in `ralphus` MCP entry appears
+only when the global config has `[agents] allow_ralphus_mcp = true` (default
+`false`); `ralphus` is a reserved name for stored items.
+
+#### `POST /api/capabilities`
+Create an item (`kind`, `name`, `mcp` or `skill`). `409 already_exists` if the
+name is taken, `400` for an invalid definition. Response `{ "kind", "name" }`.
+
+#### `PATCH /api/capabilities/{kind}/{name}`
+Replace an item's definition. A masked `set` value sent back unchanged keeps
+the stored secret. `404` if absent.
+
+#### `DELETE /api/capabilities/{kind}/{name}`
+Remove the item and every profile's enablement of it. `{ "removed": true }`.
+
+#### `POST /api/capabilities/{kind}/{name}/check`
+Probe an MCP server (spawn it or connect, `initialize`, `tools/list`, stop it;
+bounded by a per-step timeout) or check that a skill folder holds a
+`SKILL.md`, and record the result. Response `{ "kind", "name", "status",
+"status_detail", "tool_count" }`.
+
+#### `POST /api/capabilities/import`
+Read the daemon user's `~/.claude.json`, `~/.codex/config.toml`,
+`~/.config/mcp/mcp.json` and skill folders into the catalog. Names already in
+the catalog are skipped. Response `{ "added": [...], "skipped": [...] }`.
+
+#### `GET /api/agent-profiles/{name}/capabilities`
+`name` is a profile or a built-in backend name. Response `{ "profile",
+"enabled": [{kind,name}], "delivery": {mode,args}, "support": { "backend",
+"supported", "delivery_configurable" } }`. `supported` is false for the native
+agents (`claude`, `anthropic`, `ollama`) and `raw`, which cannot receive MCP
+servers or skills natively; `delivery_configurable` is true for `raw`.
+
+#### `POST /api/agent-profiles/{name}/capabilities`
+`{ "kind", "name", "enabled" }` toggles one item for the profile. `404` if the
+item is not in the catalog.
+
+#### `POST /api/agent-profiles/{name}/capabilities/delivery`
+`{ "mode": "backend_default"|"extra_args"|"none", "args": [...] }` -- how the
+capabilities reach a custom command profile. With `extra_args`, `{mcp_config}`
+and `{skills_dir}` in `args` expand to the generated paths.
+
 ### `GET /api/machines/targets/health`
 Check every configured `[machine.targets.*]` entry (RAL-355 Phase 9):
 `ralphus check health --all-remotes`'s daemon-side counterpart. Always

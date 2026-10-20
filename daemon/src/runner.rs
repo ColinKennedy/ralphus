@@ -306,6 +306,14 @@ pub struct RunnerSpec {
     /// ambiguous "unset" state -- defaults to `false` (isolated) wherever this
     /// spec isn't resolved from `.ralphus.toml` (proof/internal invocations).
     pub allow_personal_settings: bool,
+    /// RAL-695: the MCP servers and skills the agent profile enabled
+    /// (`crate::capability_store`), resolved to the runner's `capabilities`
+    /// wire object. `Some` -- even when nothing is enabled -- means the
+    /// runner provisions exactly this set and loads nothing from personal
+    /// settings; `None` marks an invocation that is not a profile-driven agent
+    /// run.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub capabilities: Option<serde_json::Value>,
     /// RAL-336: the resolved `[agent_isolation] allow_personal_memory` value
     /// (`crate::config::AgentIsolationConfig::allow_personal_memory`) --
     /// same rationale as [`Self::allow_personal_settings`], but for the
@@ -790,6 +798,7 @@ impl RunnerSpec {
             thrash_max_compactions: Some(thrash_max_compactions),
             thrash_min_turn_gap: Some(thrash_min_turn_gap),
             allow_personal_settings: agent_isolation.allow_personal_settings(),
+            capabilities: None,
             allow_personal_memory: agent_isolation.allow_personal_memory(),
             waypoint_context: true,
             // RAL-497: a freshly dispatched cell always starts its own
@@ -923,6 +932,7 @@ impl RunnerSpec {
             thrash_max_compactions: Some(thrash_max_compactions),
             thrash_min_turn_gap: Some(thrash_min_turn_gap),
             allow_personal_settings: agent_isolation.allow_personal_settings(),
+            capabilities: None,
             allow_personal_memory: agent_isolation.allow_personal_memory(),
             waypoint_context: true,
             retry_attempt: 0,
@@ -1018,6 +1028,7 @@ impl RunnerSpec {
             // Same rationale: no `ModelBackend` reached, so isolation is
             // inert here.
             allow_personal_settings: false,
+            capabilities: None,
             allow_personal_memory: false,
             waypoint_context: true,
             // Same rationale: no `ModelBackend` reached, so there is no
@@ -3310,6 +3321,7 @@ mod tests {
             thrash_max_compactions: None,
             thrash_min_turn_gap: None,
             allow_personal_settings: false,
+            capabilities: None,
             allow_personal_memory: false,
             waypoint_context: true,
             retry_attempt: 0,

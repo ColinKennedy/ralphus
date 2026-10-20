@@ -182,6 +182,41 @@ pub(crate) fn resolve_agent_selection(
     crate::agent_profiles::resolve_agent_for_path_with_snapshot(agent, Path::new(cwd), Some(&db))
 }
 
+/// RAL-695: the `capabilities` object for a profile-driven agent spec: what
+/// `agent` (a stored profile name, else the resolved `backend`) has enabled.
+/// Always `Some`, so the runner never falls back to personal MCP servers or
+/// skills -- a failed lookup delivers an empty set rather than none.
+pub(crate) fn capabilities_for_agent(
+    store: &crate::store_lock::StoreHandle,
+    agent: &str,
+    backend: &str,
+) -> Option<serde_json::Value> {
+    let allow_ralphus_mcp = crate::config::resolve_agents_config().allow_ralphus_mcp();
+    let plan = {
+        let guard = store.lock();
+        let profile = if guard.get_agent_profile(agent).ok().flatten().is_some() {
+            agent
+        } else {
+            backend
+        };
+        guard.capability_plan(profile, allow_ralphus_mcp)
+    };
+    match plan {
+        Ok(plan) => Some(plan.resolve(&store.lock())),
+        Err(e) => {
+            crate::cartographer::Note::new("scheduler")
+                .level(crate::logging::LogLevel::WARNING)
+                .scope("capability")
+                .emit(
+                    &store.lock(),
+                    format!("cannot read capabilities for agent {agent:?}: {e}"),
+                    serde_json::json!({ "agent": agent, "error": e.to_string() }),
+                );
+            Some(serde_json::json!({"mcp_servers": [], "skills": []}))
+        }
+    }
+}
+
 /// Whether a resolved backend name is Claude Code (`claude-code`, `claude-cli`).
 ///
 /// `pub(crate)`, not private: also used below (RAL-288 Stage 1) to decide
@@ -4002,6 +4037,9 @@ fn run_cell_worker(
     }
     spec.agent = selection.backend.clone();
     spec.executable = selection.executable.clone();
+    if spec.prompt.is_some() {
+        spec.capabilities = capabilities_for_agent(store, &row.agent, &selection.backend);
+    }
     spec.prompt = spec
         .prompt
         .map(|p| resolve_handoffs(&p, &plan.deps[i], &summaries));
@@ -6786,6 +6824,8 @@ fn run_proofs(
                     proof_maximum_tool_output_tokens.and_then(|v| u64::try_from(v).ok()),
                 );
                 runner_spec.system_prompt = Some(proof_context);
+                runner_spec.capabilities =
+                    capabilities_for_agent(store, cell_agent, &selection.backend);
                 // RAL-575: a scored proof is taught and decided by the
                 // appraisal contract rather than PASS/FAIL.
                 runner_spec.pass_score = store

@@ -1058,6 +1058,7 @@ dependencies = [
 name = "ralphus-runner"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "git2",
  "nix",
  "opentelemetry",

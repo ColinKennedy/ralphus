@@ -138,9 +138,14 @@ impl ModelBackend for CodexBackend {
             args.push("resume".to_string());
             args.push(id.to_string());
         }
+        let codex_home = isolated_codex_home(options, workspace);
+        let provisioning = match options.capabilities {
+            Some(capabilities) => self.provision_capabilities(workspace, options, capabilities)?,
+            None => crate::capabilities::Provisioning::default(),
+        };
+        args.extend(provisioning.args.iter().cloned());
         args.push("-".to_string());
 
-        let codex_home = isolated_codex_home(options, workspace);
         let mut child = spawn(&program, compound, &args, workspace, codex_home.as_deref())
             .map_err(|e| {
                 crate::cli_agent_common::emit_child_lifecycle(
@@ -239,6 +244,27 @@ impl ModelBackend for CodexBackend {
         true
     }
 
+    fn supports_capabilities(&self) -> bool {
+        true
+    }
+
+    /// RAL-695: the enabled MCP servers become `[mcp_servers.*]` tables in the
+    /// isolated `CODEX_HOME/config.toml` (replacing any personal ones) and the
+    /// enabled skills replace `CODEX_HOME/skills`.
+    fn provision_capabilities(
+        &self,
+        workspace: &Workspace,
+        options: &RunOptions<'_>,
+        capabilities: &crate::capabilities::CapabilitySet,
+    ) -> Result<crate::capabilities::Provisioning, BackendError> {
+        let dir = crate::agent_isolation::isolated_config_dir(workspace.root(), "codex");
+        crate::capabilities::provision_with(capabilities, &dir, |dir| {
+            crate::capabilities::write_skills(&dir.join("skills"), &capabilities.skills)?;
+            write_codex_config(dir, options.allow_personal_settings, capabilities)?;
+            Ok(crate::capabilities::Provisioning::default())
+        })
+    }
+
     fn supports_thinking(&self) -> bool {
         true
     }
@@ -313,6 +339,35 @@ fn context_limit_args(options: &RunOptions<'_>) -> Vec<String> {
     args
 }
 
+/// Writes `dir/config.toml` with exactly the capability set's MCP servers.
+/// Personal settings (already copied into `dir` when allowed) are kept, minus
+/// their own `mcp_servers`; otherwise the file starts empty so a previous
+/// run's servers never linger.
+fn write_codex_config(
+    dir: &std::path::Path,
+    keep_personal_settings: bool,
+    capabilities: &crate::capabilities::CapabilitySet,
+) -> Result<(), BackendError> {
+    let path = dir.join("config.toml");
+    let mut table = if keep_personal_settings {
+        std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|text| text.parse::<toml::Table>().ok())
+            .unwrap_or_default()
+    } else {
+        toml::Table::new()
+    };
+    table.remove("mcp_servers");
+    let servers = capabilities.codex_mcp_table();
+    if !servers.is_empty() {
+        table.insert("mcp_servers".to_string(), toml::Value::Table(servers));
+    }
+    std::fs::create_dir_all(dir)
+        .map_err(|e| BackendError(format!("could not create {}: {e}", dir.display())))?;
+    std::fs::write(&path, table.to_string())
+        .map_err(|e| BackendError(format!("could not write {}: {e}", path.display())))
+}
+
 /// RAL-336: `CODEX_HOME` is Codex's single config-directory lever -- it
 /// can't cleanly separate personal settings from personal memory, so
 /// isolation engages whenever either opt-in is off (favoring
@@ -322,7 +377,13 @@ fn isolated_codex_home(
     options: &RunOptions<'_>,
     workspace: &Workspace,
 ) -> Option<std::path::PathBuf> {
-    if options.allow_personal_settings && options.allow_personal_memory {
+    // RAL-695: a capability set is the only source of MCP servers and skills,
+    // both of which live under `CODEX_HOME`, so it is isolated whenever one
+    // is present.
+    if options.allow_personal_settings
+        && options.allow_personal_memory
+        && options.capabilities.is_none()
+    {
         return None;
     }
     let real_dir = std::env::var_os("CODEX_HOME")

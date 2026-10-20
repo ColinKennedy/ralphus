@@ -208,6 +208,15 @@ impl ModelBackend for ClaudeCodeBackend {
         base_args.extend(effort_args(options));
         base_args.extend(setting_sources_args(options));
         let claude_config_dir = isolated_claude_config_dir(options, workspace);
+        let provisioning = match options.capabilities {
+            Some(capabilities) => self.provision_capabilities(workspace, options, capabilities)?,
+            None => crate::capabilities::Provisioning::default(),
+        };
+        base_args.extend(provisioning.args.iter().cloned());
+        let _provisioning_cleanup = ProvisioningCleanup {
+            provisioning: &provisioning,
+            keep: self.keep_temporary_files,
+        };
 
         let mut prompt_file_for_system: Option<std::path::PathBuf> = None;
         if let Some(sp) = options.append_system_prompt {
@@ -372,6 +381,36 @@ impl ModelBackend for ClaudeCodeBackend {
         true
     }
 
+    fn supports_capabilities(&self) -> bool {
+        true
+    }
+
+    /// RAL-695: the enabled MCP servers go in a generated JSON file passed
+    /// with `--mcp-config` plus `--strict-mcp-config`, so no other MCP source
+    /// (personal settings included) is read; enabled skills replace the
+    /// isolated config directory's `skills/`.
+    fn provision_capabilities(
+        &self,
+        workspace: &Workspace,
+        _options: &RunOptions<'_>,
+        capabilities: &crate::capabilities::CapabilitySet,
+    ) -> Result<crate::capabilities::Provisioning, BackendError> {
+        let dir = crate::agent_isolation::isolated_config_dir(workspace.root(), "claude-code");
+        crate::capabilities::provision_with(capabilities, &dir, |dir| {
+            crate::capabilities::write_skills(&dir.join("skills"), &capabilities.skills)?;
+            let path = dir.join(crate::capabilities::GENERIC_MCP_FILE);
+            crate::capabilities::write_json(&path, &capabilities.mcp_json())?;
+            Ok(crate::capabilities::Provisioning {
+                args: vec![
+                    "--mcp-config".to_string(),
+                    path.display().to_string(),
+                    "--strict-mcp-config".to_string(),
+                ],
+                temporary_files: vec![path],
+            })
+        })
+    }
+
     fn supports_closing_turn(&self) -> bool {
         true
     }
@@ -505,6 +544,21 @@ fn apply_effort_env(cmd: &mut Command, effort_pinned: bool) {
     }
 }
 
+/// Deletes the generated MCP file (which holds resolved secrets) when the
+/// run ends, however it ends.
+struct ProvisioningCleanup<'a> {
+    provisioning: &'a crate::capabilities::Provisioning,
+    keep: bool,
+}
+
+impl Drop for ProvisioningCleanup<'_> {
+    fn drop(&mut self) {
+        if !self.keep {
+            crate::capabilities::cleanup(self.provisioning);
+        }
+    }
+}
+
 /// Sets `CLAUDE_CONFIG_DIR` on `cmd` when RAL-336 isolation resolved a
 /// redirect directory -- a no-op otherwise, leaving the child's inherited
 /// `CLAUDE_CONFIG_DIR` (if any) untouched so an operator who opts fully back
@@ -530,7 +584,10 @@ fn isolated_claude_config_dir(
     options: &RunOptions<'_>,
     workspace: &Workspace,
 ) -> Option<std::path::PathBuf> {
-    if options.allow_personal_memory {
+    // RAL-695: a capability set is the only source of skills, and skills live
+    // in the config directory, so the directory is isolated even when
+    // personal memory is allowed.
+    if options.allow_personal_memory && options.capabilities.is_none() {
         return None;
     }
     let real_dir = std::env::var_os("CLAUDE_CONFIG_DIR")
@@ -540,6 +597,9 @@ fn isolated_claude_config_dir(
     crate::agent_isolation::preserve_auth_file(real_dir.as_deref(), &isolated, ".credentials.json");
     if options.allow_personal_settings {
         crate::agent_isolation::preserve_auth_file(real_dir.as_deref(), &isolated, "settings.json");
+    }
+    if options.allow_personal_memory {
+        crate::agent_isolation::preserve_auth_file(real_dir.as_deref(), &isolated, "CLAUDE.md");
     }
     Some(isolated)
 }

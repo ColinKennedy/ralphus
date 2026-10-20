@@ -30,6 +30,20 @@ pub struct HarnessBackend {
 }
 
 impl ModelBackend for HarnessBackend {
+    fn provision_capabilities(
+        &self,
+        workspace: &Workspace,
+        _options: &RunOptions<'_>,
+        capabilities: &crate::capabilities::CapabilitySet,
+    ) -> Result<crate::capabilities::Provisioning, BackendError> {
+        let dir = crate::agent_isolation::isolated_config_dir(workspace.root(), "raw");
+        crate::capabilities::provision_with(capabilities, &dir, |_| {
+            Err(BackendError(
+                "this agent backend has no default MCP server or skill delivery".to_string(),
+            ))
+        })
+    }
+
     fn run(
         &self,
         prompt: &str,
@@ -41,6 +55,21 @@ impl ModelBackend for HarnessBackend {
         if let Some(model) = options.model {
             cmd.arg("--model").arg(model);
         }
+        // RAL-695: a raw harness has no native MCP/skill mechanism, so only a
+        // profile's extra-args delivery reaches it.
+        let provisioning = match options.capabilities {
+            Some(capabilities)
+                if matches!(
+                    capabilities.delivery,
+                    crate::capabilities::DeliveryMode::ExtraArgs(_)
+                ) =>
+            {
+                self.provision_capabilities(workspace, options, capabilities)?
+            }
+            _ => crate::capabilities::Provisioning::default(),
+        };
+        let _provisioning_cleanup = crate::capabilities::CleanupGuard::new(&provisioning);
+        cmd.args(&provisioning.args);
         cmd.arg(prompt);
 
         let child = cmd

@@ -669,7 +669,7 @@
         else if (tab === "presets") tabPoll = pollPresets();
         else if (tab === "users") tabPoll = pollUsers();
         else if (tab === "secrets") tabPoll = pollSecretEnvNames();
-        else if (tab === "agents") tabPoll = Promise.all([pollAgentBackendCommands(), pollAgentProfiles(), pollAgentBackendHealth()]).then(() => undefined);
+        else if (tab === "agents") tabPoll = Promise.all([pollAgentBackendCommands(), pollAgentProfiles(), pollAgentBackendHealth()]).then(() => pollAgentCapabilities()).then(() => undefined);
         else if (tab === "worktree-retirement") tabPoll = pollWorktreeRetirements();
         else if (tab === "health") tabPoll = pollHealth();
         else if (tab === "prefs") tabPoll = pollPrefs();

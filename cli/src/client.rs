@@ -935,6 +935,87 @@ impl DaemonClient {
         self.delete(&format!("/api/agent-profiles/{name}{query}"))
     }
 
+    /// `GET /api/capabilities` (RAL-695): the MCP server / skill catalog.
+    pub fn list_capabilities(&self) -> Result<Value, DaemonError> {
+        self.get("/api/capabilities")
+    }
+
+    /// `POST /api/capabilities` (create) or `PATCH /api/capabilities/{kind}/{name}`
+    /// (replace) with the already-built `{kind, name, mcp|skill}` body.
+    pub fn save_capability(
+        &self,
+        kind: &str,
+        name: &str,
+        body: Value,
+        replace: bool,
+    ) -> Result<Value, DaemonError> {
+        if replace {
+            self.patch(
+                &format!("/api/capabilities/{kind}/{}", urlencode(name)),
+                Some(body),
+            )
+        } else {
+            self.post("/api/capabilities", Some(body))
+        }
+    }
+
+    /// `DELETE /api/capabilities/{kind}/{name}`.
+    pub fn remove_capability(&self, kind: &str, name: &str) -> Result<Value, DaemonError> {
+        self.delete(&format!("/api/capabilities/{kind}/{}", urlencode(name)))
+    }
+
+    /// `POST /api/capabilities/{kind}/{name}/check`: probe the server / check
+    /// the skill folder on the daemon host.
+    pub fn check_capability(&self, kind: &str, name: &str) -> Result<Value, DaemonError> {
+        self.post(
+            &format!("/api/capabilities/{kind}/{}/check", urlencode(name)),
+            None,
+        )
+    }
+
+    /// `POST /api/capabilities/import`: pull items from the daemon user's CLI configs.
+    pub fn import_capabilities(&self) -> Result<Value, DaemonError> {
+        self.post("/api/capabilities/import", None)
+    }
+
+    /// `GET /api/agent-profiles/{name}/capabilities`.
+    pub fn get_profile_capabilities(&self, profile: &str) -> Result<Value, DaemonError> {
+        self.get(&format!(
+            "/api/agent-profiles/{}/capabilities",
+            urlencode(profile)
+        ))
+    }
+
+    /// `POST /api/agent-profiles/{name}/capabilities`: enable/disable one item.
+    pub fn set_profile_capability(
+        &self,
+        profile: &str,
+        kind: &str,
+        name: &str,
+        enabled: bool,
+    ) -> Result<Value, DaemonError> {
+        self.post(
+            &format!("/api/agent-profiles/{}/capabilities", urlencode(profile)),
+            Some(json!({"kind": kind, "name": name, "enabled": enabled})),
+        )
+    }
+
+    /// `POST /api/agent-profiles/{name}/capabilities/delivery`.
+    pub fn set_profile_capability_delivery(
+        &self,
+        profile: &str,
+        mode: &str,
+        args: &[String],
+    ) -> Result<Value, DaemonError> {
+        self.post(
+            &format!(
+                "/api/agent-profiles/{}/capabilities/delivery",
+                urlencode(profile)
+            ),
+            Some(json!({"mode": mode, "args": args})),
+        )
+    }
+
     /// `GET /api/agent-backend-commands` (Q4): every built-in backend's
     /// current command override (an absent backend still runs its
     /// compiled-in default).

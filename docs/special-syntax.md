@@ -711,6 +711,14 @@ files or cell replies:
   own, so the daemon strips the tag there and shows the reasoning plainly
   (`server.rs::unprefix_thinking_line`).
 
+### Capability delivery placeholders (`extra_args`)
+
+A `raw` agent profile whose capability delivery mode is `extra_args` (RAL-695,
+`POST /api/agent-profiles/{name}/capabilities/delivery`) may use two
+placeholders in its `args`: `{mcp_config}` expands to the generated MCP config
+file path and `{skills_dir}` to the generated skills directory. They are
+expanded only in those delivery args, not in task files or prompts.
+
 ---
 
 ## 2. Agent-facing conventions (not parsed)
