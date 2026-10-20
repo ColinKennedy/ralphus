@@ -1016,6 +1016,24 @@ impl DaemonClient {
         )
     }
 
+    /// `POST /api/agent-profiles/{name}/capabilities/tools`: allow or deny one
+    /// tool of an MCP server for a profile.
+    pub fn set_profile_tool_policy(
+        &self,
+        profile: &str,
+        server: &str,
+        tool: &str,
+        allowed: bool,
+    ) -> Result<Value, DaemonError> {
+        self.post(
+            &format!(
+                "/api/agent-profiles/{}/capabilities/tools",
+                urlencode(profile)
+            ),
+            Some(json!({"server": server, "tool": tool, "allowed": allowed})),
+        )
+    }
+
     /// `GET /api/agent-backend-commands` (Q4): every built-in backend's
     /// current command override (an absent backend still runs its
     /// compiled-in default).

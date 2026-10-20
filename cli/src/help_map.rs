@@ -1011,6 +1011,24 @@ const AGENT_CAPABILITY_CHILDREN: &[HelpNode] = &[
         &[],
     ),
     node(
+        "allow-tool",
+        &["profile [str]", "server [str]", "tool [str]"],
+        &[],
+        "RAL-697: allow one tool of an enabled MCP server for an agent profile (the default for every tool, including ones a server adds later). Clears a deny.",
+        false,
+        false,
+        &[],
+    ),
+    node(
+        "deny-tool",
+        &["profile [str]", "server [str]", "tool [str]"],
+        &[],
+        "RAL-697: deny one tool of an MCP server for an agent profile. Claude Code and Codex enforce it; Pi and extra-args delivery refuse.",
+        false,
+        false,
+        &[],
+    ),
+    node(
         "delivery",
         &["profile [str]"],
         &[

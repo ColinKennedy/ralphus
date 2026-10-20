@@ -126,6 +126,10 @@ ENDPOINT_TO_CLI: dict[str, list[str]] = {
         "agent capability disable",
     ],
     "POST /api/agent-profiles/{name}/capabilities/delivery": ["agent capability delivery"],
+    "POST /api/agent-profiles/{name}/capabilities/tools": [
+        "agent capability allow-tool",
+        "agent capability deny-tool",
+    ],
     "GET /api/agent-backend-commands": ["agent backend-command list"],
     "POST /api/agent-backend-commands/{backend}": ["agent backend-command set"],
     "DELETE /api/agent-backend-commands/{backend}": ["agent backend-command reset"],

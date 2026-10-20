@@ -41,6 +41,9 @@ pub struct McpServerSpec {
     /// HTTP transport: the endpoint.
     pub url: Option<String>,
     pub headers: BTreeMap<String, String>,
+    /// Tool names (as the server reports them) this session must not be able
+    /// to call. Empty means every tool the server exposes is allowed.
+    pub denied_tools: Vec<String>,
 }
 
 /// One file inside a skill folder.
@@ -110,6 +113,33 @@ impl CapabilitySet {
         Ok(set)
     }
 
+    /// Whether any server has a denied tool, which a delivery that cannot
+    /// filter tools must refuse rather than ignore.
+    #[must_use]
+    pub fn has_denied_tools(&self) -> bool {
+        self.mcp_servers.iter().any(|s| !s.denied_tools.is_empty())
+    }
+
+    /// The Claude Code deny patterns (`mcp__<server>__<tool>`) for every
+    /// denied tool, comma-joined for one `--disallowedTools` value.
+    #[must_use]
+    pub fn claude_disallowed_tools(&self) -> Option<String> {
+        let patterns: Vec<String> = self
+            .mcp_servers
+            .iter()
+            .flat_map(|server| {
+                server.denied_tools.iter().map(|tool| {
+                    format!(
+                        "mcp__{}__{}",
+                        claude_tool_component(&server.name),
+                        claude_tool_component(tool)
+                    )
+                })
+            })
+            .collect();
+        (!patterns.is_empty()).then(|| patterns.join(","))
+    }
+
     /// The `{"mcpServers": {...}}` document Claude Code's `--mcp-config` and
     /// the Pi MCP adapter both read.
     #[must_use]
@@ -176,9 +206,47 @@ impl CapabilitySet {
                     );
                 }
             }
+            if !server.denied_tools.is_empty() {
+                entry.insert(
+                    "disabled_tools".to_string(),
+                    toml::Value::Array(
+                        server
+                            .denied_tools
+                            .iter()
+                            .map(|t| toml::Value::String(t.clone()))
+                            .collect(),
+                    ),
+                );
+            }
             table.insert(server.name.clone(), toml::Value::Table(entry));
         }
         table
+    }
+}
+
+/// Claude Code names an MCP tool `mcp__<server>__<tool>` after replacing every
+/// character outside `[A-Za-z0-9_-]` with `_`.
+fn claude_tool_component(name: &str) -> String {
+    name.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '_' | '-') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+/// The error a delivery without per-tool filtering returns when a tool is
+/// denied, so the denial is never silently dropped.
+pub fn refuse_tool_filters(set: &CapabilitySet, backend: &str) -> Result<(), BackendError> {
+    if set.has_denied_tools() {
+        Err(BackendError(format!(
+            "{backend} cannot filter individual MCP tools; allow every tool of each enabled server for this profile"
+        )))
+    } else {
+        Ok(())
     }
 }
 
@@ -235,6 +303,18 @@ fn parse_server(value: &Value) -> Result<McpServerSpec, String> {
         env: string_map(obj.get("env"), "env")?,
         url: obj.get("url").and_then(Value::as_str).map(str::to_string),
         headers: string_map(obj.get("headers"), "headers")?,
+        denied_tools: match obj.get("denied_tools").filter(|v| !v.is_null()) {
+            Some(Value::Array(items)) => items
+                .iter()
+                .map(|v| {
+                    v.as_str()
+                        .map(str::to_string)
+                        .ok_or_else(|| format!("MCP server {name}: denied_tools must be strings"))
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+            Some(_) => return Err(format!("MCP server {name}: denied_tools must be an array")),
+            None => Vec::new(),
+        },
         name,
     })
 }
@@ -390,6 +470,7 @@ where
         DeliveryMode::None => Ok(Provisioning::default()),
         DeliveryMode::BackendDefault => backend_default(isolated_dir),
         DeliveryMode::ExtraArgs(args) => {
+            refuse_tool_filters(set, "extra-args delivery")?;
             let mcp_path = isolated_dir.join(GENERIC_MCP_FILE);
             let skills_dir = isolated_dir.join("skills");
             write_json(&mcp_path, &set.mcp_json())?;
@@ -647,6 +728,68 @@ command = \"x\"
         let settings = std::fs::read_to_string(dir.join("settings.json")).unwrap();
         assert!(settings.contains("pi-mcp-adapter"));
         assert!(dir.join("skills/deploy/SKILL.md").exists());
+    }
+
+    fn with_denied(tools: &[&str]) -> CapabilitySet {
+        let mut set = sample();
+        set.mcp_servers[0].denied_tools = tools.iter().map(|t| (*t).to_string()).collect();
+        set
+    }
+
+    #[test]
+    fn claude_provisioning_passes_disallowed_tools_before_the_mcp_flags() {
+        let ws = unique_workspace("claude-deny");
+        let backend = crate::claude_code_backend::ClaudeCodeBackend {
+            keep_temporary_files: false,
+            program_override: None,
+        };
+        let set = with_denied(&["run_js", "page.eval"]);
+        let options = crate::backend::RunOptions {
+            capabilities: Some(&set),
+            ..Default::default()
+        };
+        let p = backend.provision_capabilities(&ws, &options, &set).unwrap();
+        let at = p
+            .args
+            .iter()
+            .position(|a| a == "--disallowedTools")
+            .unwrap();
+        assert_eq!(
+            p.args[at + 1],
+            format!(
+                "mcp__{0}__run_js,mcp__{0}__page_eval",
+                set.mcp_servers[0].name
+            )
+        );
+        assert!(at + 2 < p.args.len() && p.args[at + 2] == "--mcp-config");
+        assert!(with_denied(&[]).claude_disallowed_tools().is_none());
+    }
+
+    #[test]
+    fn codex_table_lists_disabled_tools() {
+        let set = with_denied(&["run_js"]);
+        let table = set.codex_mcp_table();
+        let entry = table[&set.mcp_servers[0].name].as_table().unwrap();
+        assert_eq!(entry["disabled_tools"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn pi_and_extra_args_refuse_denied_tools() {
+        let ws = unique_workspace("pi-deny");
+        let backend = crate::pi_backend::PiBackend {
+            keep_temporary_files: false,
+            program_override: None,
+        };
+        let set = with_denied(&["run_js"]);
+        let options = crate::backend::RunOptions::default();
+        let err = backend
+            .provision_capabilities(&ws, &options, &set)
+            .unwrap_err();
+        assert!(err.0.contains("cannot filter"));
+        let mut generic = with_denied(&["run_js"]);
+        generic.delivery = DeliveryMode::ExtraArgs(vec!["--x".to_string()]);
+        let dir = std::env::temp_dir().join("ralphus-cap-deny-generic");
+        assert!(provision_with(&generic, &dir, |_| Ok(Provisioning::default())).is_err());
     }
 
     #[test]

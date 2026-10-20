@@ -464,6 +464,7 @@ impl ModelBackend for PiBackend {
     ) -> Result<crate::capabilities::Provisioning, BackendError> {
         let dir = crate::agent_isolation::isolated_config_dir(workspace.root(), "pi");
         crate::capabilities::provision_with(capabilities, &dir, |dir| {
+            crate::capabilities::refuse_tool_filters(capabilities, "Pi")?;
             crate::capabilities::write_skills(&dir.join("skills"), &capabilities.skills)?;
             crate::capabilities::write_json(&dir.join("mcp.json"), &capabilities.mcp_json())?;
             if !capabilities.mcp_servers.is_empty() {

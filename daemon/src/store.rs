@@ -2073,6 +2073,16 @@ impl Store {
                 name    TEXT NOT NULL,
                 PRIMARY KEY (profile, kind, name)
             );
+            CREATE TABLE IF NOT EXISTS capability_tool_inventory (
+                name       TEXT PRIMARY KEY,
+                tools_json TEXT NOT NULL DEFAULT '[]'
+            );
+            CREATE TABLE IF NOT EXISTS agent_capability_tool_denied (
+                profile TEXT NOT NULL,
+                server  TEXT NOT NULL,
+                tool    TEXT NOT NULL,
+                PRIMARY KEY (profile, server, tool)
+            );
             CREATE TABLE IF NOT EXISTS agent_capability_delivery (
                 profile   TEXT PRIMARY KEY,
                 mode      TEXT NOT NULL,
