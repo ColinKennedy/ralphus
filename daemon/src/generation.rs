@@ -332,6 +332,7 @@ pub fn run_generation(
         maximum_timeout: None,
         pass_score: None,
         closing_turn_prompt: None,
+        exhibit: None,
     };
     let runner = SubprocessRunner::from_env();
     let result = runner.run_cancellable(&spec, cancel);

@@ -2691,7 +2691,7 @@ live
             let github = kind == crate::forge::ForgeKind::GitHub;
             let (store, gid, pr_id) =
                 published_fixture(if github { "github" } else { "gitlab" }, "acme/widget");
-            let dir = crate::exhibit_media::tests::TestDir::new();
+            let dir = crate::exhibit_delivery::TestDir::new();
             let key = pending_exhibit(&store, &gid, dir.path(), &[]);
             let mock = crate::mock_forge::MockForge::start(move |server| {
                 let mut urls = Vec::new();
@@ -2767,11 +2767,22 @@ live
                 .as_str()
                 .unwrap()
                 .to_string();
-            let url = if github {
-                "https://github.com/user-attachments/assets/abc"
+            let fill = store.lock().guardian_exhibit_slots(&gid).unwrap()[0]
+                .fill
+                .clone()
+                .unwrap();
+            let url = fill.url.clone().unwrap();
+            if github {
+                assert_eq!(url, "https://github.com/user-attachments/assets/abc");
             } else {
-                "/uploads/s3cr3t/shot.png"
-            };
+                // GitLab's project-relative URL, made absolute under the
+                // project's web URL.
+                assert!(
+                    url.starts_with("http")
+                        && url.ends_with("/acme/widget/uploads/s3cr3t/shot.png"),
+                    "{url}"
+                );
+            }
             assert!(text.starts_with("My notes."), "{text}");
             assert!(text.contains(&crate::exhibits::slot_start(key)), "{text}");
             assert!(text.contains(&format!("![Hello shown]({url})")), "{text}");
@@ -2781,11 +2792,6 @@ live
                 text.find(crate::exhibits::SECTION_START).unwrap()
                     < text.find(SECTION_START).unwrap()
             );
-            let fill = store.lock().guardian_exhibit_slots(&gid).unwrap()[0]
-                .fill
-                .clone()
-                .unwrap();
-            assert_eq!(fill.url.as_deref(), Some(url));
             // Uploaded: the cached copy is gone and no longer referenced.
             assert_eq!(fill.local_path, None);
             assert!(!dir.path().join("shot.png").exists());
@@ -2795,7 +2801,7 @@ live
     #[test]
     fn a_gitlab_replacement_deletes_the_old_upload_only_after_the_new_one_is_in() {
         let (store, gid, pr_id) = published_fixture("gitlab", "acme/widget");
-        let dir = crate::exhibit_media::tests::TestDir::new();
+        let dir = crate::exhibit_delivery::TestDir::new();
         pending_exhibit(&store, &gid, dir.path(), &["11"]);
         let mock = crate::mock_forge::MockForge::start(move |server| {
             let mut seen = Vec::new();

@@ -543,12 +543,18 @@ tool guidance, but without the waypoint section (`waypoint_context` false). The 
   deduplication and carried to the merged live action by handoff number, so
   dedupe can neither drop nor reassign one; each becomes an **exhibit slot**.
 - **`RALPHUS_EXHIBIT: {json}`** — one line per exhibit slot in a live run
-  agent's reply: `{"slot": "<action>.<slot>", "file": "<name in
-  $RALPHUS_EXHIBIT_DIR>", "caption": "..."}` or `{"slot": "...", "missing":
+  agent's reply: `{"slot": "<action>.<slot>", "file": "<file name in the
+  run's exhibit directory>", "caption": "..."}` or `{"slot": "...", "missing":
   "<why>"}`. Parsed by `exhibits::parse_reports`; a line naming another
   action's slot, an unknown slot, or a file outside the run's exhibit
   directory is ignored and logged. Slots a run leaves unreported get one
   follow-up turn (the same session resumed where the backend supports it).
+- **`<<RALPHUS_EXHIBIT_DIR>>`** — stands for a live run's exhibit directory in
+  the run's prompt, including an `[[exhibit.recipe]]` `command` passed into
+  it. The `ralphus-runner` on the machine running the live action creates
+  the directory there and replaces every occurrence with its path before the
+  agent starts (`ralphus_runner::exhibit_upload::DIR_PLACEHOLDER`), so it
+  works on a remote machine, where `$RALPHUS_EXHIBIT_DIR` is not set.
 - **`EXHIBIT_REQUEST: {json}`** — the PR writer's own exhibit requests, in the
   header of its reply (before `===DESCRIPTION===`), when the review's
   `infer_exhibits` setting is on: `{"owner": <live action id> | "new", "kind":

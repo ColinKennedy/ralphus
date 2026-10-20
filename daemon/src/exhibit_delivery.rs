@@ -1,30 +1,28 @@
-//! Getting exhibits from a live run into a PR/MR description: reading what a
-//! run reported into its action's slots ([`record_run_reports`]), then, when a
-//! description is published, uploading each captured file through the PR's
-//! own forge client ([`upload_pending`]).
+//! Getting exhibits from a live run into a PR/MR description.
 //!
-//! Uploads go through the forge's REST API first. On GitHub, when that fails
-//! and `gh` (2.99 or later, logged in) is available, `gh pr edit --attach`
-//! is the fallback; any text `gh` adds to the description is removed again,
-//! so the daemon stays the only writer of what the description says. When
-//! nothing can upload a file, the slot says so and the file stays on the
-//! board.
+//! The machine that ran the live run prepares and uploads its captures itself
+//! (`ralphus_runner::exhibit_upload`), so a capture reaches the forge
+//! straight from where it was made. The daemon only says which files to
+//! deliver ([`upload_files`]) and records what came back ([`record_run`]):
+//! a URL, a text excerpt, or why a slot has nothing.
+//!
+//! A capture stays on disk only for a run on the daemon's own machine whose
+//! upload could not happen yet (no forge resolved, the upload failed): it is
+//! kept in this machine's exhibit cache and [`upload_pending`] retries it
+//! when a PR/MR description is published. On GitHub, when that REST upload
+//! fails and `gh` (2.99 or later, logged in) is available, `gh pr edit
+//! --attach` is the fallback; any text `gh` adds to the description is
+//! removed again, so the daemon stays the only writer of what the
+//! description says. When nothing can upload a file, the slot says so.
 
 use std::path::{Path, PathBuf};
 
-use crate::exhibit_media::{Prepared, Transcoder};
-use crate::exhibits::{
-    ExhibitFill, ExhibitKind, ExhibitSettings, ExhibitSlot, SlotKey, SlotReport,
-};
+use ralphus_runner::exhibit_upload::{SlotOutcome, UploadFile};
 
-/// Longest text an `output` exhibit keeps.
-const MAX_TEXT_CHARS: usize = 4_000;
+use crate::exhibits::{ExhibitFill, ExhibitSlot, SlotKey, SlotReport};
 
-/// Where captured exhibits wait until they are uploaded: the per-user cache
-/// directory (`ralphus_core::cache_dir()`), never the state directory. Each
-/// file is deleted once its upload succeeds, a run's raw capture directory
-/// once its reports are recorded, and anything older than
-/// [`MAX_CACHE_AGE`] by [`prune_cache`].
+/// This machine's exhibit cache (`ralphus_runner::exhibit_upload::exhibits_root`),
+/// where a live run on the daemon's own machine saves its captures.
 #[must_use]
 pub fn exhibits_root() -> PathBuf {
     #[cfg(test)]
@@ -33,43 +31,7 @@ pub fn exhibits_root() -> PathBuf {
             return root;
         }
     }
-    ralphus_core::cache_dir().join("exhibits")
-}
-
-/// How long a captured exhibit may wait in the cache before it is pruned,
-/// uploaded or not.
-pub const MAX_CACHE_AGE: std::time::Duration = std::time::Duration::from_secs(14 * 24 * 60 * 60);
-
-/// Delete every file under `root` last modified more than `max_age` ago, and
-/// any directory left empty. Best-effort: anything that cannot be read or
-/// removed is skipped. Returns how many files were deleted.
-pub fn prune_cache(root: &Path, max_age: std::time::Duration) -> usize {
-    fn walk(dir: &Path, cutoff: std::time::SystemTime, removed: &mut usize) {
-        let Ok(entries) = std::fs::read_dir(dir) else {
-            return;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            let Ok(meta) = entry.metadata() else {
-                continue;
-            };
-            if meta.is_dir() {
-                walk(&path, cutoff, removed);
-                // Only succeeds once the directory is empty.
-                let _ = std::fs::remove_dir(&path);
-            } else if meta.modified().is_ok_and(|m| m < cutoff)
-                && std::fs::remove_file(&path).is_ok()
-            {
-                *removed += 1;
-            }
-        }
-    }
-    let Some(cutoff) = std::time::SystemTime::now().checked_sub(max_age) else {
-        return 0;
-    };
-    let mut removed = 0;
-    walk(root, cutoff, &mut removed);
-    removed
+    ralphus_runner::exhibit_upload::exhibits_root()
 }
 
 #[cfg(test)]
@@ -83,111 +45,71 @@ pub fn set_test_root(root: &Path) {
     TEST_ROOT.with(|r| *r.borrow_mut() = Some(root.to_path_buf()));
 }
 
-/// The directory a live run saves its exhibits into.
-#[must_use]
-pub fn run_dir(root: &Path, guardian_id: &str, run_id: &str) -> PathBuf {
-    root.join(safe(guardian_id)).join("runs").join(safe(run_id))
-}
-
-fn kept_dir(root: &Path, guardian_id: &str) -> PathBuf {
-    root.join(safe(guardian_id)).join("kept")
-}
-
-fn safe(value: &str) -> String {
-    value
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect()
-}
-
-/// What [`record_run_reports`] did, for the run's log row.
+/// What [`record_run`] did, for the run's log row.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
 pub struct RecordSummary {
     pub delivered: Vec<String>,
     pub missing: Vec<String>,
 }
 
-/// Record a run's reports into its action's slots. Every slot of `slots`
-/// gets a new fill -- a re-run replaces what an earlier run delivered -- and
-/// a slot the run did not report is recorded as missing.
-#[allow(clippy::too_many_arguments)]
-pub fn record_run_reports(
+/// The reported files among `reports` that belong to `slots`, to deliver.
+#[must_use]
+pub fn upload_files(slots: &[ExhibitSlot], reports: &[SlotReport]) -> Vec<UploadFile> {
+    reports
+        .iter()
+        .filter_map(|report| match report {
+            SlotReport::File { key, file, .. } => {
+                let slot = slots.iter().find(|s| s.key == *key)?;
+                Some(UploadFile {
+                    action_idx: key.action_idx,
+                    slot_idx: key.slot_idx,
+                    requested: slot.request.kind,
+                    file: file.clone(),
+                })
+            }
+            SlotReport::Missing { .. } => None,
+        })
+        .collect()
+}
+
+/// Record a run's exhibits into its action's slots: every slot of `slots`
+/// gets a new fill -- a re-run replaces what an earlier run delivered. A
+/// reported file takes what its delivery `outcomes` say; one with no outcome
+/// is missing for `undelivered` (why the delivery step did not answer), and
+/// a slot the run did not report is missing too.
+pub fn record_run(
     store: &crate::store_lock::StoreHandle,
     guardian_id: &str,
     run_id: &str,
     slots: &[ExhibitSlot],
     reports: &[SlotReport],
-    dir: &Path,
-    root: &Path,
-    settings: &ExhibitSettings,
-    ffmpeg: &dyn Transcoder,
+    outcomes: &[SlotOutcome],
+    undelivered: &str,
 ) -> RecordSummary {
     let mut summary = RecordSummary::default();
-    let kept = kept_dir(root, guardian_id);
-    let _ = std::fs::create_dir_all(&kept);
     for slot in slots {
         let label = crate::exhibits::slot_label(slot.key);
-        let report = reports.iter().find(|r| r.key() == slot.key);
         let mut fill = ExhibitFill {
             run_id: Some(run_id.to_string()),
             updated_at_ms: crate::store::now_ms(),
             ..ExhibitFill::default()
         };
-        match report {
-            None => {
-                fill.missing_reason = Some("the live run did not report it".to_string());
-            }
-            Some(SlotReport::Missing { reason, .. }) => {
-                fill.missing_reason = Some(reason.clone());
-            }
-            Some(SlotReport::File { file, caption, .. }) => {
+        match reports.iter().find(|r| r.key() == slot.key) {
+            None => fill.missing_reason = Some("the live run did not report it".to_string()),
+            Some(SlotReport::Missing { reason, .. }) => fill.missing_reason = Some(reason.clone()),
+            Some(SlotReport::File { caption, .. }) => {
                 fill.caption.clone_from(caption);
-                match crate::exhibits::resolve_reported_file(dir, file) {
-                    None => {
-                        fill.missing_reason = Some(format!(
-                            "reported file {file:?} is not in the run's exhibit directory"
-                        ));
-                    }
-                    Some(source) => {
-                        let stem = kept.join(format!(
-                            "{}-{}-{}",
-                            safe(run_id),
-                            slot.key.action_idx,
-                            slot.key.slot_idx
-                        ));
-                        let preference = preference_for(slot.request.kind, settings);
-                        match crate::exhibit_media::prepare(
-                            &source,
-                            &stem,
-                            &preference,
-                            settings.max_video_seconds,
-                            MAX_TEXT_CHARS,
-                            ffmpeg,
-                        ) {
-                            Prepared::Text { text } => {
-                                fill.delivered_kind = Some(ExhibitKind::Output);
-                                fill.text = Some(text);
-                            }
-                            Prepared::File { path, kind } => match keep(&path, &stem) {
-                                Ok(kept_path) => {
-                                    fill.delivered_kind = Some(kind);
-                                    fill.local_path = Some(kept_path.to_string_lossy().to_string());
-                                }
-                                Err(e) => {
-                                    fill.missing_reason =
-                                        Some(format!("could not keep the captured file: {e}"));
-                                }
-                            },
-                            Prepared::Undeliverable { reason } => {
-                                fill.missing_reason = Some(reason);
-                            }
-                        }
+                match outcomes.iter().find(|o| {
+                    o.action_idx == slot.key.action_idx && o.slot_idx == slot.key.slot_idx
+                }) {
+                    None => fill.missing_reason = Some(undelivered.to_string()),
+                    Some(outcome) => {
+                        fill.delivered_kind = outcome.delivered_kind;
+                        fill.url.clone_from(&outcome.url);
+                        fill.forge_upload_id.clone_from(&outcome.upload_id);
+                        fill.text.clone_from(&outcome.text);
+                        fill.missing_reason.clone_from(&outcome.missing_reason);
+                        fill.local_path.clone_from(&outcome.kept_path);
                     }
                 }
             }
@@ -199,33 +121,7 @@ pub fn record_run_reports(
         }
         let _ = store.lock().set_exhibit_fill(guardian_id, slot.key, &fill);
     }
-    // Everything worth keeping was copied to the kept directory above; the
-    // run's raw captures are not needed any more.
-    if dir.starts_with(root) && dir != root {
-        let _ = std::fs::remove_dir_all(dir);
-    }
     summary
-}
-
-/// The kinds a slot may be delivered as: an `output` slot only as text, a
-/// visual one in the review's preference order.
-fn preference_for(requested: ExhibitKind, settings: &ExhibitSettings) -> Vec<ExhibitKind> {
-    if requested == ExhibitKind::Output {
-        vec![ExhibitKind::Output]
-    } else {
-        settings.kind_preference.clone()
-    }
-}
-
-/// Copy a prepared file into the kept directory (a converted file already is).
-fn keep(path: &Path, stem: &Path) -> std::io::Result<PathBuf> {
-    if path.parent() == stem.parent() {
-        return Ok(path.to_path_buf());
-    }
-    let ext = path.extension().unwrap_or_default();
-    let dest = stem.with_extension(ext);
-    std::fs::copy(path, &dest)?;
-    Ok(dest)
 }
 
 // ---- uploading at publish time ---------------------------------------------
@@ -293,7 +189,7 @@ fn upload_one(
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_else(|| "exhibit".to_string());
-    let ctype = crate::exhibit_media::content_type(local);
+    let ctype = ralphus_runner::exhibit_media::content_type(local);
     let direct = client.upload_attachment(&name, ctype, &bytes);
     let uploaded = match direct {
         Ok(up) => Ok((up.url, up.upload_id, "api")),
@@ -475,47 +371,40 @@ fn gh_attach(
     Ok(url)
 }
 
+/// A scratch directory removed when dropped, for tests.
+#[cfg(test)]
+pub(crate) struct TestDir(PathBuf);
+
+#[cfg(test)]
+impl TestDir {
+    pub(crate) fn new() -> Self {
+        static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "ralphus-exhibits-{}-{}-{}",
+            std::process::id(),
+            crate::store::now_ms(),
+            N.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        Self(dir)
+    }
+
+    pub(crate) fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+#[cfg(test)]
+impl Drop for TestDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::exhibit_media::tests::TestDir;
-    use crate::exhibits::{ExhibitOrigin, ExhibitRequest};
-
-    struct NoFfmpeg;
-    impl Transcoder for NoFfmpeg {
-        fn available(&self) -> bool {
-            false
-        }
-        fn run(&self, _: &[String]) -> Result<(), String> {
-            Err("no ffmpeg".into())
-        }
-        fn duration_seconds(&self, _: &Path) -> Option<f64> {
-            None
-        }
-    }
-
-    #[test]
-    fn pruning_removes_only_old_files_and_empty_folders() {
-        let root = TestDir::new();
-        let old_dir = root.path().join("g").join("kept");
-        std::fs::create_dir_all(&old_dir).unwrap();
-        let old = old_dir.join("old.png");
-        let fresh = root.path().join("g").join("fresh.png");
-        std::fs::write(&old, b"x").unwrap();
-        std::fs::write(&fresh, b"x").unwrap();
-        let long_ago =
-            std::time::SystemTime::now() - std::time::Duration::from_secs(30 * 24 * 3600);
-        std::fs::File::options()
-            .write(true)
-            .open(&old)
-            .unwrap()
-            .set_modified(long_ago)
-            .unwrap();
-        assert_eq!(prune_cache(root.path(), MAX_CACHE_AGE), 1);
-        assert!(!old.exists());
-        assert!(!old_dir.exists(), "the emptied folder goes too");
-        assert!(fresh.exists());
-    }
+    use crate::exhibits::{ExhibitKind, ExhibitOrigin, ExhibitRequest};
 
     #[test]
     fn the_cache_root_is_never_the_state_directory() {
@@ -524,144 +413,150 @@ mod tests {
 
     #[test]
     fn attachment_urls_are_found_in_markdown_and_bare_lines() {
-        let text = "x ![a](https://github.com/user-attachments/assets/1) y\nhttps://github.com/user-attachments/assets/2\n<img src=\"https://github.com/user-attachments/assets/3\">";
+        let text = "x ![a](https://github.com/user-attachments/assets/1) y
+https://github.com/user-attachments/assets/2
+<img src=\"https://github.com/user-attachments/assets/3\">";
         assert_eq!(attachment_urls(text).len(), 3);
     }
 
-    #[test]
-    fn a_runs_reports_fill_its_slots_and_unreported_ones_are_missing() {
+    fn review_with_slots(kinds: &[ExhibitKind]) -> (crate::store_lock::StoreHandle, String) {
         let store = crate::store::Store::open_in_memory().unwrap();
         let gid = store.create_guardian("r", "main", "/repo").unwrap();
+        let requests: Vec<_> = kinds
+            .iter()
+            .map(|kind| {
+                (
+                    ExhibitRequest {
+                        kind: *kind,
+                        describe: kind.as_str().into(),
+                    },
+                    None,
+                )
+            })
+            .collect();
         store
-            .add_exhibit_requests(
-                &gid,
-                0,
-                ExhibitOrigin::Handoff,
-                &[
-                    (
-                        ExhibitRequest {
-                            kind: ExhibitKind::Gif,
-                            describe: "moving".into(),
-                        },
-                        None,
-                    ),
-                    (
-                        ExhibitRequest {
-                            kind: ExhibitKind::Output,
-                            describe: "cli".into(),
-                        },
-                        None,
-                    ),
-                    (
-                        ExhibitRequest {
-                            kind: ExhibitKind::Screenshot,
-                            describe: "end".into(),
-                        },
-                        None,
-                    ),
-                ],
-            )
+            .add_exhibit_requests(&gid, 0, ExhibitOrigin::Handoff, &requests)
             .unwrap();
-        let handle = std::sync::Arc::new(crate::store_lock::StoreMutex::new(store));
+        (
+            std::sync::Arc::new(crate::store_lock::StoreMutex::new(store)),
+            gid,
+        )
+    }
+
+    #[test]
+    fn only_reported_files_are_sent_for_delivery() {
+        let (handle, gid) = review_with_slots(&[ExhibitKind::Gif, ExhibitKind::Output]);
         let slots = handle.lock().guardian_exhibit_slots(&gid).unwrap();
-        let root = TestDir::new();
-        let dir = run_dir(root.path(), &gid, "run-1");
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("a.gif"), b"GIF89a").unwrap();
-        std::fs::write(dir.join("out.txt"), b"hello").unwrap();
         let reports = vec![
             SlotReport::File {
                 key: slots[0].key,
                 file: "a.gif".into(),
-                caption: Some("see it".into()),
-            },
-            SlotReport::File {
-                key: slots[1].key,
-                file: "out.txt".into(),
                 caption: None,
             },
+            SlotReport::Missing {
+                key: slots[1].key,
+                reason: "nothing to show".into(),
+            },
         ];
-        let summary = record_run_reports(
-            &handle,
-            &gid,
-            "run-1",
-            &slots,
-            &reports,
-            &dir,
-            root.path(),
-            &ExhibitSettings::default(),
-            &NoFfmpeg,
-        );
         assert_eq!(
-            summary.delivered,
-            vec!["0.0".to_string(), "0.1".to_string()]
-        );
-        assert_eq!(summary.missing, vec!["0.2".to_string()]);
-        let now = handle.lock().guardian_exhibit_slots(&gid).unwrap();
-        let gif = now[0].fill.as_ref().unwrap();
-        assert_eq!(gif.delivered_kind, Some(ExhibitKind::Gif));
-        let kept = gif.local_path.as_deref().unwrap();
-        assert!(Path::new(kept).is_file());
-        assert!(kept.contains("kept"));
-        assert_eq!(now[1].fill.as_ref().unwrap().text.as_deref(), Some("hello"));
-        assert_eq!(
-            now[2].fill.as_ref().unwrap().missing_reason.as_deref(),
-            Some("the live run did not report it")
-        );
-        assert!(
-            !dir.exists(),
-            "the run's raw capture folder is removed once recorded"
+            upload_files(&slots, &reports),
+            vec![UploadFile {
+                action_idx: 0,
+                slot_idx: 0,
+                requested: ExhibitKind::Gif,
+                file: "a.gif".into(),
+            }]
         );
     }
 
     #[test]
-    fn a_report_pointing_outside_the_run_directory_is_refused() {
-        let store = crate::store::Store::open_in_memory().unwrap();
-        let gid = store.create_guardian("r", "main", "/repo").unwrap();
-        store
+    fn a_runs_outcomes_fill_its_slots_and_unreported_ones_are_missing() {
+        let (handle, gid) = review_with_slots(&[
+            ExhibitKind::Gif,
+            ExhibitKind::Output,
+            ExhibitKind::Screenshot,
+            ExhibitKind::Video,
+        ]);
+        handle
+            .lock()
             .add_exhibit_requests(
                 &gid,
-                0,
+                1,
                 ExhibitOrigin::Handoff,
                 &[(
                     ExhibitRequest {
                         kind: ExhibitKind::Screenshot,
-                        describe: "end".into(),
+                        describe: "another action's".into(),
                     },
                     None,
                 )],
             )
             .unwrap();
-        let handle = std::sync::Arc::new(crate::store_lock::StoreMutex::new(store));
         let slots = handle.lock().guardian_exhibit_slots(&gid).unwrap();
-        let root = TestDir::new();
-        let dir = run_dir(root.path(), &gid, "run-1");
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(root.path().join("secret.png"), b"x").unwrap();
-        let reports = vec![SlotReport::File {
-            key: slots[0].key,
-            file: "../../../secret.png".into(),
-            caption: None,
-        }];
-        record_run_reports(
+        let file = |i: usize, caption: Option<&str>| SlotReport::File {
+            key: slots[i].key,
+            file: format!("{i}.bin"),
+            caption: caption.map(str::to_string),
+        };
+        let reports = vec![
+            file(0, Some("see it")),
+            file(1, None),
+            file(3, None),
+            file(4, None),
+        ];
+        let outcomes = vec![
+            SlotOutcome {
+                action_idx: 0,
+                slot_idx: 0,
+                delivered_kind: Some(ExhibitKind::Gif),
+                url: Some("https://forge/a.gif".into()),
+                upload_id: Some("7".into()),
+                ..SlotOutcome::default()
+            },
+            SlotOutcome {
+                action_idx: 0,
+                slot_idx: 1,
+                delivered_kind: Some(ExhibitKind::Output),
+                text: Some("hello".into()),
+                ..SlotOutcome::default()
+            },
+            SlotOutcome {
+                action_idx: 0,
+                slot_idx: 3,
+                delivered_kind: Some(ExhibitKind::Video),
+                kept_path: Some("/cache/k.mp4".into()),
+                upload_error: Some("no token".into()),
+                ..SlotOutcome::default()
+            },
+        ];
+        let summary = record_run(
             &handle,
             &gid,
             "run-1",
             &slots,
             &reports,
-            &dir,
-            root.path(),
-            &ExhibitSettings::default(),
-            &NoFfmpeg,
+            &outcomes,
+            "the upload step failed",
         );
+        assert_eq!(summary.delivered, vec!["0.0", "0.1", "0.3"]);
+        assert_eq!(summary.missing, vec!["0.2", "1.0"]);
         let now = handle.lock().guardian_exhibit_slots(&gid).unwrap();
-        let fill = now[0].fill.as_ref().unwrap();
-        assert!(fill.local_path.is_none());
-        assert!(
-            fill.missing_reason
-                .as_deref()
-                .unwrap()
-                .contains("not in the run's exhibit directory")
+        let gif = now[0].fill.as_ref().unwrap();
+        assert_eq!(gif.url.as_deref(), Some("https://forge/a.gif"));
+        assert_eq!(gif.forge_upload_id.as_deref(), Some("7"));
+        assert_eq!(gif.caption.as_deref(), Some("see it"));
+        assert!(gif.local_path.is_none(), "an uploaded file is not kept");
+        assert_eq!(now[1].fill.as_ref().unwrap().text.as_deref(), Some("hello"));
+        assert_eq!(
+            now[2].fill.as_ref().unwrap().missing_reason.as_deref(),
+            Some("the live run did not report it")
+        );
+        let kept = now[3].fill.as_ref().unwrap();
+        assert_eq!(kept.local_path.as_deref(), Some("/cache/k.mp4"));
+        assert!(kept.url.is_none() && kept.missing_reason.is_none());
+        assert_eq!(
+            now[4].fill.as_ref().unwrap().missing_reason.as_deref(),
+            Some("the upload step failed")
         );
     }
 }

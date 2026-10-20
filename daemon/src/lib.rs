@@ -37,7 +37,6 @@ pub mod entity_uri;
 pub mod env_view;
 pub mod events;
 pub mod exhibit_delivery;
-pub mod exhibit_media;
 pub mod exhibit_settings;
 pub mod exhibits;
 pub mod followup;

@@ -2596,6 +2596,7 @@ fn synthesize_proof_instructions(
         maximum_timeout: None,
         pass_score: None,
         closing_turn_prompt: None,
+        exhibit: None,
     };
     let result = run_agent_with_stall_recovery(store, &mut spec, runner, cancel, None);
     // RAL-193: not fatal from this helper (it returns a plain `String`, not a
@@ -3218,6 +3219,7 @@ fn resolve_conflicts_with_agent(
             maximum_timeout: None,
             pass_score: None,
             closing_turn_prompt: None,
+            exhibit: None,
         };
 
         // Clean up any stale file from a previous pass so the watcher does not
@@ -3657,6 +3659,7 @@ fn run_final_proof(
         maximum_timeout: None,
         pass_score: None,
         closing_turn_prompt: None,
+        exhibit: None,
     };
     // RAL-259: the final-proof agent is actually beginning to run — stamp the
     // branch's Live-View start time. COALESCE means a branch that already
@@ -8104,6 +8107,7 @@ fn run_commit_step(
         maximum_timeout: None,
         pass_score: None,
         closing_turn_prompt: None,
+        exhibit: None,
     };
     let result = run_agent_with_stall_recovery(
         store,
@@ -8727,6 +8731,7 @@ fn run_feedback_pass(
         maximum_timeout: None,
         pass_score: None,
         closing_turn_prompt: None,
+        exhibit: None,
     };
     // Stash any pre-existing dirty state so we only include the resolver's
     // own changes in the new commit -- run unconditionally now (RAL-<new>): a
@@ -13029,6 +13034,7 @@ fn run_review_auto_build(
         maximum_timeout: None,
         pass_score: None,
         closing_turn_prompt: None,
+        exhibit: None,
     };
     let result = run_agent_with_stall_recovery(store, &mut spec, runner, cancel, None);
     let _ = record_guardian_call_cost(store, id, None, "auto_build", &result);
@@ -16889,6 +16895,7 @@ fn generate_final_summary(
         maximum_timeout: None,
         pass_score: None,
         closing_turn_prompt: None,
+        exhibit: None,
     };
     let result = runner.run(&spec);
     let _ = record_guardian_call_cost(store, id, None, "summary", &result);
@@ -17413,6 +17420,7 @@ fn generate_manual_commands(
         maximum_timeout: None,
         pass_score: None,
         closing_turn_prompt: None,
+        exhibit: None,
     };
 
     // Side-channel file where the Python backend writes the claude session ID as
@@ -17716,6 +17724,7 @@ pub(crate) fn resolve_check_input(
         maximum_timeout: None,
         pass_score: None,
         closing_turn_prompt: None,
+        exhibit: None,
     };
 
     let result = runner.run(&spec);

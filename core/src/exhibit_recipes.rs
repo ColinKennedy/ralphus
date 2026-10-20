@@ -8,7 +8,7 @@
 //! kind = "gif"
 //! describe = "the checkout flow in tests/e2e/smoke.spec.ts"
 //! paths = ["src/**", "*.tsx"]
-//! command = "node tools/record_flow.js --out $RALPHUS_EXHIBIT_DIR"
+//! command = "node tools/record_flow.js --out <<RALPHUS_EXHIBIT_DIR>>"
 //! ```
 //!
 //! A recipe's `paths` are globs (`*` within a segment, `**` across segments)
@@ -26,6 +26,62 @@ use serde::Deserialize;
 
 /// The kinds a recipe may ask for.
 pub const RECIPE_KINDS: &[&str] = &["gif", "video", "screenshot", "output"];
+
+/// What a slot asks to show. `Gif`, `Video` and `Screenshot` are visual and
+/// are delivered in the review's preference order; `Output` is text, shown
+/// inline and never uploaded.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, Deserialize,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum ExhibitKind {
+    Gif,
+    Video,
+    Screenshot,
+    Output,
+}
+
+impl ExhibitKind {
+    /// Every kind, in declaration order.
+    pub const ALL: [ExhibitKind; 4] = [Self::Gif, Self::Video, Self::Screenshot, Self::Output];
+
+    /// The stored/config lowercase name.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Gif => "gif",
+            Self::Video => "video",
+            Self::Screenshot => "screenshot",
+            Self::Output => "output",
+        }
+    }
+
+    /// Parse a kind name, ignoring case and surrounding space.
+    #[must_use]
+    pub fn parse(name: &str) -> Option<Self> {
+        let name = name.trim();
+        Self::ALL
+            .into_iter()
+            .find(|k| k.as_str().eq_ignore_ascii_case(name))
+    }
+
+    /// Whether this kind is a picture or recording (everything but `output`).
+    #[must_use]
+    pub fn is_visual(self) -> bool {
+        self != Self::Output
+    }
+
+    /// How the kind is named in a PR/MR description.
+    #[must_use]
+    pub fn display(self) -> &'static str {
+        match self {
+            Self::Gif => "GIF",
+            Self::Video => "Video",
+            Self::Screenshot => "Screenshot",
+            Self::Output => "Output",
+        }
+    }
+}
 
 /// One recipe.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]

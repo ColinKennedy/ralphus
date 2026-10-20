@@ -2529,15 +2529,11 @@ impl ForgeClient {
     }
 
     /// Upload a file a PR/MR description can embed (an exhibit), returning
-    /// the URL to embed and, where the forge can delete uploads, its id.
-    ///
-    /// GitHub: the `user-attachments` upload a description's drag-and-drop
-    /// uses, sent with the token (`uploads.github.com/user-attachments/assets`).
-    /// It accepts PNG, GIF, WebP, SVG, MP4, WebM and MOV only, images up to
-    /// 10 MiB and video up to 100 MiB (paid plans), and returns no deletable
-    /// id. GitLab: project uploads (`POST /projects/:id/uploads`), any type up
-    /// to 100 MiB, deletable by id. Logs the outbound call (start/done/error)
-    /// via `rlog!`.
+    /// the URL to embed and, where the forge can delete uploads, its id --
+    /// through `ralphus_runner::exhibit_upload::upload_attachment`, the same
+    /// upload a live run's machine makes for its own captures (its doc names
+    /// each forge's endpoint and limits). Logs the outbound call
+    /// (start/done/error) via `rlog!`.
     pub fn upload_attachment(
         &self,
         name: &str,
@@ -2552,7 +2548,19 @@ impl ForgeClient {
             self.repo_path,
             bytes.len()
         );
-        let result = self.upload_attachment_inner(name, content_type, bytes);
+        let result = self.upload_target().and_then(|(target, token)| {
+            ralphus_runner::exhibit_upload::upload_attachment(
+                &target,
+                &token,
+                name,
+                content_type,
+                bytes,
+            )
+            .map(|up| UploadedAttachment {
+                url: up.url,
+                upload_id: up.upload_id,
+            })
+        });
         match &result {
             // ralphus[ignore-rlog-pair]: this provider boundary has no Store; its caller records the structured workflow outcome
             Ok(up) => crate::rlog!(
@@ -2573,67 +2581,39 @@ impl ForgeClient {
         result
     }
 
-    fn upload_attachment_inner(
+    /// Where this client's repository takes exhibit uploads, and the token to
+    /// send them with: what a live run's machine needs to upload its captures
+    /// itself. GitHub's numeric repository id is looked up here (cached), so
+    /// the uploader does not have to.
+    ///
+    /// # Errors
+    ///
+    /// No token is configured, or GitHub's repository lookup failed.
+    pub fn upload_target(
         &self,
-        name: &str,
-        content_type: &str,
-        bytes: &[u8],
-    ) -> Result<UploadedAttachment, String> {
-        let token = self.require_token()?;
-        match self.kind {
+    ) -> Result<(ralphus_runner::exhibit_upload::UploadTarget, String), String> {
+        use ralphus_runner::exhibit_upload::{UploadForge, UploadTarget};
+        let token = self.require_token()?.to_string();
+        let (forge, repository_id) = match self.kind {
             ForgeKind::GitHub => {
                 let repo_url = format!("{}/repos/{}", self.api_base, self.repo_path);
-                let repo = self.get_github_cached(&repo_url, token)?;
-                let repository_id = repo["id"]
+                let repo = self.get_github_cached(&repo_url, &token)?;
+                let id = repo["id"]
                     .as_i64()
                     .ok_or_else(|| format!("GitHub repo {} has no numeric id", self.repo_path))?;
-                let url = format!(
-                    "{}/user-attachments/assets?name={}&content_type={}&repository_id={repository_id}",
-                    github_uploads_base(&self.api_base),
-                    percent_encode_query(name),
-                    percent_encode_query(content_type),
-                );
-                let value = self.send_bytes(
-                    http_agent()
-                        .post(&url)
-                        .set("Authorization", &format!("Bearer {token}"))
-                        .set("Accept", "application/json"),
-                    content_type,
-                    bytes,
-                )?;
-                let url = value["url"]
-                    .as_str()
-                    .or_else(|| value["href"].as_str())
-                    .ok_or_else(|| "GitHub attachment upload returned no URL".to_string())?;
-                Ok(UploadedAttachment {
-                    url: url.to_string(),
-                    upload_id: None,
-                })
+                (UploadForge::Github, Some(id))
             }
-            ForgeKind::GitLab => {
-                let url = format!("{}/projects/{}/uploads", self.api_base, self.repo_path);
-                let boundary = format!("ralphus-{:x}", crate::store::now_ms());
-                let safe_name = name.replace(['"', '\r', '\n'], "_");
-                let mut body = format!(
-                    "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"{safe_name}\"\r\nContent-Type: {content_type}\r\n\r\n"
-                )
-                .into_bytes();
-                body.extend_from_slice(bytes);
-                body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
-                let value = self.send_bytes(
-                    http_agent().post(&url).set("PRIVATE-TOKEN", token),
-                    &format!("multipart/form-data; boundary={boundary}"),
-                    &body,
-                )?;
-                let url = value["url"]
-                    .as_str()
-                    .ok_or_else(|| "GitLab upload returned no URL".to_string())?;
-                Ok(UploadedAttachment {
-                    url: url.to_string(),
-                    upload_id: value["id"].as_i64().map(|id| id.to_string()),
-                })
-            }
-        }
+            ForgeKind::GitLab => (UploadForge::Gitlab, None),
+        };
+        Ok((
+            UploadTarget {
+                forge,
+                api_base: self.api_base.clone(),
+                repo_path: self.repo_path.clone(),
+                repository_id,
+            },
+            token,
+        ))
     }
 
     /// Delete an upload by the id [`Self::upload_attachment`] returned. Only
@@ -3678,29 +3658,6 @@ pub struct UploadedAttachment {
     pub upload_id: Option<String>,
 }
 
-/// Where GitHub takes attachment uploads for `api_base`: `uploads.github.com`
-/// for github.com, otherwise `api_base` itself (a test forge).
-fn github_uploads_base(api_base: &str) -> String {
-    if api_base.trim_end_matches('/') == "https://api.github.com" {
-        "https://uploads.github.com".to_string()
-    } else {
-        api_base.trim_end_matches('/').to_string()
-    }
-}
-
-/// Percent-encode a query-string value.
-fn percent_encode_query(value: &str) -> String {
-    let mut out = String::new();
-    for b in value.bytes() {
-        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
-            out.push(char::from(b));
-        } else {
-            out.push_str(&format!("%{b:02X}"));
-        }
-    }
-    out
-}
-
 /// Parse a GitHub comments-array response (shared by both
 /// `/issues/{n}/comments` and `/pulls/{n}/comments` -- their item shape is
 /// identical) into normalised [`PrComment`]s.
@@ -3761,23 +3718,6 @@ impl ForgeClient {
         let result = req
             .set("Content-Type", "application/json")
             .send_string(&payload.to_string());
-        if let Ok(resp) = &result {
-            self.record_quota_headers(resp);
-        }
-        self.count_response(&method, &url, &result);
-        parse_body(result.map_err(|e| self.describe_evicting(e))?)
-    }
-
-    /// `POST` raw bytes with `content_type`, parsing the JSON response body;
-    /// [`Self::send`] for a non-JSON payload (a file upload).
-    fn send_bytes(
-        &self,
-        req: ureq::Request,
-        content_type: &str,
-        bytes: &[u8],
-    ) -> Result<serde_json::Value, String> {
-        let (method, url) = (req.method().to_string(), req.url().to_string());
-        let result = req.set("Content-Type", content_type).send_bytes(bytes);
         if let Ok(resp) = &result {
             self.record_quota_headers(resp);
         }
