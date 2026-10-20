@@ -4827,15 +4827,27 @@ fn claim_combined_review_ref(
 /// starts) forces that rebuild to fall back to its from-scratch path and
 /// re-derive every remaining branch purely from its own feature-branch tip.
 pub fn purge_worktrees(store: &crate::store_lock::StoreHandle, git_root: &str, id: &str) {
-    let _remote_scope = crate::machine_strict::enter_for_guardian(store, id);
-    let num = id.replace("guardian-", "");
     let root = Workspace::for_guardian(store, id, Path::new(git_root));
+    purge_worktrees_in(store, &root, git_root, id);
+}
+
+/// [`purge_worktrees`] in a workspace the caller already resolved -- for a
+/// review being deleted, whose machine can no longer be looked up once its
+/// row is gone.
+pub fn purge_worktrees_in(
+    store: &crate::store_lock::StoreHandle,
+    root: &Workspace,
+    git_root: &str,
+    id: &str,
+) {
+    let _remote_scope = crate::machine_strict::enter(root.machine());
+    let num = id.replace("guardian-", "");
     let wt_base = root.at(worktree_dir(git_root, id));
     let claimed = claimed_review_branches(store, id, Some(git_root));
-    let mut summary = cleanup_review_worktrees(&root, &wt_base, id, &num, &claimed);
+    let mut summary = cleanup_review_worktrees(root, &wt_base, id, &num, &claimed);
     // Also drop any carry-forward protection refs so a deleted guardian leaves
     // nothing pinning otherwise-unreachable commits.
-    summary.failures.extend(purge_carry_refs(&root, id));
+    summary.failures.extend(purge_carry_refs(root, id));
     let guard = store.lock();
     let payload = serde_json::json!({
         "git_root": git_root,

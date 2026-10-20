@@ -19001,6 +19001,7 @@ fn guardian_squash(daemon: &Daemon, id: &str, body: &str) -> Reply {
 /// `daemon.background()`'s `Immediate` mode in tests, so existing synchronous
 /// assertions about cleanup still see it happen before `route()` returns.
 fn delete_guardian_and_defer_cleanup(daemon: &Daemon, id: &str) -> Result<(), StoreError> {
+    let store_handle = daemon.store_handle();
     let store = daemon.lock();
     // Snapshot everything needed for cleanup before the row is gone
     // (multi-project guardians span >1 root).
@@ -19009,9 +19010,25 @@ fn delete_guardian_and_defer_cleanup(daemon: &Daemon, id: &str) -> Result<(), St
     // while the row -- and the fork routing it is resolved from -- still
     // exists.
     let dual_root_branch = store.guardian_dual_root_stack_branch(id).ok().flatten();
-    store.delete_guardian(id)?;
     drop(store);
-    let store_handle = daemon.store_handle();
+    // Each project's workspace, resolved while the review still records its
+    // machine: once the row is gone, cleanup could only fall back to the
+    // daemon's host and would leave a remote review's worktrees behind.
+    let workspaces: Vec<(String, crate::workspace::Workspace)> = snapshot
+        .as_ref()
+        .map(|g| {
+            g.projects
+                .iter()
+                .map(|root| {
+                    (
+                        root.clone(),
+                        crate::workspace::Workspace::for_guardian(&store_handle, id, root.as_str()),
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    daemon.lock().delete_guardian(id)?;
     let id = id.to_string();
     daemon.background().spawn(move || {
         if let Some(g) = snapshot {
@@ -19027,8 +19044,8 @@ fn delete_guardian_and_defer_cleanup(daemon: &Daemon, id: &str) -> Result<(), St
                     "review deleted",
                 );
             }
-            for root in &g.projects {
-                crate::guardian_merge::purge_worktrees(&store_handle, root, &id);
+            for (root, ws) in &workspaces {
+                crate::guardian_merge::purge_worktrees_in(&store_handle, ws, root, &id);
             }
         }
         // RAL-154: same scoping as `kill_guardian_cell_sessions` — a
