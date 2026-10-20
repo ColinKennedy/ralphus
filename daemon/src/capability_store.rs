@@ -312,9 +312,10 @@ impl CapabilityPlan {
     /// Every resolved env/header value is registered for redaction here, so a
     /// failure message or transcript line that echoes one is scrubbed. Skill
     /// folders are read from the daemon host and travel as bytes so a remote
-    /// machine can provision from the spec alone.
+    /// machine can provision from the spec alone. A skill that cannot be read
+    /// is skipped and recorded through `store`.
     #[must_use]
-    pub fn resolve(&self) -> Value {
+    pub fn resolve(&self, store: &Store) -> Value {
         let mut mcp_servers = Vec::new();
         let mut skills = Vec::new();
         let mut secrets = Vec::new();
@@ -340,13 +341,10 @@ impl CapabilityPlan {
                     let Some(config) = &item.skill else { continue };
                     match read_skill_files(Path::new(&config.path)) {
                         Ok(files) => skills.push(json!({"name": name, "files": files})),
-                        Err(reason) => {
-                            crate::rlog!(
-                                WARNING,
-                                "ralphus [capabilities] skill {name:?} skipped for {:?}: {reason}",
-                                self.profile
-                            );
-                        }
+                        Err(reason) => store.log_capability_event(
+                            "skill skipped",
+                            json!({"skill": name, "profile": self.profile, "reason": reason}),
+                        ),
                     }
                 }
             }
@@ -756,7 +754,9 @@ impl Store {
         profile: &str,
         allow_ralphus_mcp: bool,
     ) -> StoreResult<Value> {
-        Ok(self.capability_plan(profile, allow_ralphus_mcp)?.resolve())
+        Ok(self
+            .capability_plan(profile, allow_ralphus_mcp)?
+            .resolve(self))
     }
 
     fn log_capability_event(&self, message: &'static str, payload: Value) {

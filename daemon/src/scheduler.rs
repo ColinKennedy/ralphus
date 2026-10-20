@@ -202,12 +202,16 @@ pub(crate) fn capabilities_for_agent(
         guard.capability_plan(profile, allow_ralphus_mcp)
     };
     match plan {
-        Ok(plan) => Some(plan.resolve()),
+        Ok(plan) => Some(plan.resolve(&store.lock())),
         Err(e) => {
-            crate::rlog!(
-                WARNING,
-                "ralphus [scheduler] cannot read capabilities for agent {agent:?}: {e}"
-            );
+            crate::cartographer::Note::new("scheduler")
+                .level(crate::logging::LogLevel::WARNING)
+                .scope("capability")
+                .emit(
+                    &store.lock(),
+                    format!("cannot read capabilities for agent {agent:?}: {e}"),
+                    serde_json::json!({ "agent": agent, "error": e.to_string() }),
+                );
             Some(serde_json::json!({"mcp_servers": [], "skills": []}))
         }
     }
