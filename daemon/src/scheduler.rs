@@ -5184,6 +5184,117 @@ fn check_task_no_commits_guard(
     false
 }
 
+/// `machine` with the daemon's own host (unset, blank or `local`) as `None`.
+fn remote_machine(machine: Option<&str>) -> Option<&str> {
+    machine
+        .map(str::trim)
+        .filter(|m| !m.is_empty() && !m.eq_ignore_ascii_case(ralphus_core::schema::LOCAL_MACHINE))
+}
+
+/// Push each remote cell's committed branch from its machine to
+/// [`crate::vcs::published_cell_ref`] on `origin` when a review that stacks it
+/// runs somewhere else -- another machine or the daemon's host -- and so can
+/// only get it through the shared remote. Ralphus pushes only what the cell
+/// already committed. A review on the cell's own machine reads the branch in
+/// place, so nothing is pushed for it.
+///
+/// `origin` is the remote a provider's clone of the project's registered
+/// clone URL creates. Returns `false` (with the task error set) when a needed
+/// push fails, so the task fails here rather than its review failing later
+/// with a missing branch.
+fn publish_remote_task_branches(
+    store: &crate::store_lock::StoreHandle,
+    squad_id: &str,
+    task_idx: i64,
+    task_name: &str,
+    cells: &[crate::store::CellRow],
+) -> bool {
+    let mut published = std::collections::HashSet::new();
+    for cell in cells.iter().filter(|c| c.task_idx == task_idx) {
+        let (Some(machine), Some(cwd)) =
+            (remote_machine(cell.machine.as_deref()), cell.cwd.as_deref())
+        else {
+            continue;
+        };
+        if !published.insert((machine.to_string(), cwd.to_string())) {
+            continue;
+        }
+        let ws = crate::workspace::Workspace::on(cwd, Some(machine)).with_store(Arc::clone(store));
+        let Ok(branch) = ws
+            .git(&["rev-parse", "--abbrev-ref", "HEAD"])
+            .map(|b| b.trim().to_string())
+        else {
+            continue;
+        };
+        if branch.is_empty() || branch == "HEAD" {
+            continue;
+        }
+        let consumers = store
+            .with_read_snapshot(|conn| {
+                crate::store::Store::review_machines_for_branch_conn(conn, &branch)
+            })
+            .unwrap_or_default();
+        if !consumers
+            .iter()
+            .any(|m| remote_machine(m.as_deref()) != Some(machine))
+        {
+            continue;
+        }
+        let target = crate::vcs::published_cell_ref(&branch);
+        let refspec = format!("+HEAD:{target}");
+        match ws.git(&["push", "origin", &refspec]) {
+            Ok(_) => {
+                crate::cartographer::Note::new("scheduler")
+                    .scope("task")
+                    .squad(squad_id)
+                    .emit(
+                        &store.lock(),
+                        format!("published remote branch {branch} from {machine}"),
+                        serde_json::json!({
+                            "task": task_name,
+                            "branch": branch,
+                            "machine": machine,
+                            "ref": target,
+                        }),
+                    );
+            }
+            Err(e) => {
+                let error = format!(
+                    "task failed: could not publish branch {branch} from machine {machine} to \
+                     {target} on origin, which a review on another machine needs: {e}"
+                );
+                crate::rlog!(
+                    WARNING,
+                    "ralphus [scheduler] {squad_id}/{task_name} {error}"
+                );
+                let guard = store.lock();
+                crate::cartographer::Note::new("scheduler")
+                    .level(crate::logging::LogLevel::WARNING)
+                    .scope("task")
+                    .squad(squad_id)
+                    .emit(
+                        &guard,
+                        "remote branch publish failed",
+                        serde_json::json!({
+                            "task": task_name,
+                            "branch": branch,
+                            "machine": machine,
+                            "error": e,
+                        }),
+                    );
+                store_ok(
+                    &guard,
+                    squad_id,
+                    "set_task_error",
+                    guard.set_task_error(squad_id, task_idx, Some(&error)),
+                );
+                return false;
+            }
+        }
+    }
+    true
+}
+
 /// Finalize a single task once all its cells are terminal: run its
 /// task-level proof steps (skipped if any cell already failed) in the
 /// task's first cell's working directory and resolved backend, then flip the
@@ -5417,7 +5528,9 @@ fn run_task_finalizer(
             .find(|s| s.task_idx == task_idx)
             .map(|s| s.task_name.clone())
             .unwrap_or_default();
-        if !check_task_no_commits_guard(store, squad_id, task_idx, &task_name, cells) {
+        if !check_task_no_commits_guard(store, squad_id, task_idx, &task_name, cells)
+            || !publish_remote_task_branches(store, squad_id, task_idx, &task_name, cells)
+        {
             failed = true;
             progress
                 .lock()

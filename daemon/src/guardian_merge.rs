@@ -14026,21 +14026,19 @@ fn artifact_exists_command(relative: &str) -> String {
 /// Fetch a branch produced on another machine into this repository, so the
 /// review can stack it (RAL-185 Phase 3b).
 ///
-/// Per **D2** the daemon never *publishes* — deciding what to commit is
-/// judgment, and a generic `add -A && commit && push` would sweep up build
-/// artifacts and contradict the per-cell control task files already
-/// exercise. The task's own cell is responsible for pushing. Fetching a
-/// branch whose name and remote are both already known is the opposite: fully
-/// deterministic, so it belongs here.
+/// The cell commits; ralphus never decides what to commit. When the task
+/// finishes, ralphus pushes those commits from the producing machine to
+/// [`crate::vcs::published_cell_ref`] on the shared remote if a review on a
+/// different machine needs them (the scheduler's task finalizer). This fetches
+/// that ref, whose name and remote are both already known.
 ///
 /// A no-op for a locally-produced branch, which is every pre-RAL-185 branch.
 ///
-/// **This is the check that catches a task that never pushed.** Without it the
-/// review would either fail deep inside `worktree add` with an opaque "invalid
-/// reference" message, or — worse, when a *previous* squad did push — quietly
-/// stack that older revision and present a plausible but stale review. The
-/// error names the branch, its machine, and the fact that publishing is the
-/// task's own job.
+/// **This is the check that catches a branch that was never published.**
+/// Without it the review would either fail deep inside `worktree add` with an
+/// opaque "invalid reference" message, or — worse, when a *previous* squad did
+/// publish — quietly stack that older revision and present a plausible but
+/// stale review. The error names the branch and its machine.
 ///
 /// Note the limit, honestly: this proves the branch *exists* on the remote,
 /// not that it is the newest thing the task machine has. Detecting "pushed,
@@ -14087,10 +14085,10 @@ fn fetch_branch_for_remote_cell(
     let not_published = |e: &str| {
         format!(
             "branch \"{}\" was produced on machine \"{machine}\" but could not be fetched from \
-             \"{remote}\": {e}. The task that owns this branch is responsible for pushing it \
-             before it completes — ralphus never commits or pushes on a cell's behalf. Check \
-             that cell's output, confirm it pushed, then restart this review.",
-            branch.branch
+             \"{remote}\" ({}): {e}. Ralphus publishes it there when its task finishes; check \
+             that task's error for a failed publish, then restart this review.",
+            branch.branch,
+            crate::vcs::published_cell_ref(&branch.branch)
         )
     };
     let review_machine = review
@@ -14105,7 +14103,10 @@ fn fetch_branch_for_remote_cell(
         let ws = Workspace::for_guardian(store, guardian_id, root);
         let head_ref = format!("refs/heads/{}", branch.branch);
         if review_machine != machine {
-            let refspec = format!("+{head_ref}:{head_ref}");
+            let refspec = format!(
+                "+{}:{head_ref}",
+                crate::vcs::published_cell_ref(&branch.branch)
+            );
             ws.git(&["fetch", "--no-write-fetch-head", &remote, &refspec])
                 .map_err(|e| not_published(&e))?;
         }
@@ -22416,6 +22417,51 @@ mod tests {
     }
 
     #[test]
+    fn a_published_remote_branch_is_fetched_from_its_hidden_ref() {
+        // The task finalizer publishes a remote cell's branch outside
+        // `refs/heads/` so it never clutters the forge's branch list; the
+        // review must read it from there.
+        let (base, repo, fwt) = make_repo("fetch-published");
+        let origin = base.join("origin.git");
+        g(&base, &["init", "--bare", origin.to_str().unwrap()]);
+        g(
+            &repo,
+            &["remote", "add", "origin", origin.to_str().unwrap()],
+        );
+        g(
+            &fwt,
+            &[
+                "push",
+                "origin",
+                &format!("HEAD:{}", crate::vcs::published_cell_ref("feature/remote")),
+            ],
+        );
+        let store = Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
+        let id = {
+            let guard = store.lock();
+            let id = guard
+                .create_guardian("r", "main", repo.to_str().unwrap())
+                .unwrap();
+            guard.add_guardian_branch(&id, "feature/remote").unwrap();
+            id
+        };
+        let mut b = store.lock().get_guardian(&id).unwrap().branches[0].clone();
+        b.source_cell_machine = Some("incredibuild:A".to_string());
+
+        fetch_branch_for_remote_cell(&store, &id, &b).expect("published branch must fetch");
+
+        assert_eq!(
+            git(&repo, &["rev-parse", "refs/heads/feature/remote"])
+                .unwrap()
+                .trim(),
+            git(&fwt, &["rev-parse", "HEAD"]).unwrap().trim(),
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
     fn a_remote_branch_that_was_never_pushed_fails_with_an_actionable_message() {
         // The quietly-wrong case Q6 exists for: the task ran on another machine
         // and never pushed, so its commits are nowhere this repo can see them.
@@ -22445,8 +22491,12 @@ mod tests {
             "must name the machine: {err}"
         );
         assert!(
-            err.contains("responsible for pushing"),
-            "must say whose job publishing is: {err}"
+            err.contains("refs/ralphus/cells/feature/a"),
+            "must name the published ref it looked for: {err}"
+        );
+        assert!(
+            err.contains("publish"),
+            "must point at the task's publish step: {err}"
         );
 
         let _ = std::fs::remove_dir_all(&base);
