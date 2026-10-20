@@ -4,7 +4,7 @@ An **exhibit** is a GIF, video, screenshot or text output of a change working,
 put into the PR/MR description automatically. Exhibits come from a review's
 **live actions** -- the agent-run live tests that already start the real
 program -- so they work for any project ralphus can run: a web app, a CLI,
-Houdini, Maya, anything with output a person would look at.
+a Qt desktop app, anything with output a person would look at.
 
 ## How it works
 
@@ -27,7 +27,7 @@ Houdini, Maya, anything with output a person would look at.
 
    ```markdown
    <!-- ralphus:exhibit:start action=0 slot=0 -->
-   - [ ] **GIF** — dragging the density slider from 0 to 1 thins the points _(live action: Scatter slider)_
+   - [ ] **GIF** — dragging the zoom slider from 0 to 1 magnifies the chart _(live action: Zoom slider)_
    <!-- ralphus:exhibit:end action=0 slot=0 -->
    ```
 
@@ -44,11 +44,11 @@ Houdini, Maya, anything with output a person would look at.
 
    ```toml
    [[exhibit.recipe]]
-   name = "hda-flipbook"
+   name = "flow-recording"
    kind = "gif"                      # gif | video | screenshot | output
-   describe = "flipbook frames 1-48 of tests/scenes/smoke.hip"
-   paths = ["otls/**", "*.hda"]      # relative to this .ralphus.toml's folder
-   command = "hython tools/ralphus_flipbook.py --out $RALPHUS_EXHIBIT_DIR"
+   describe = "the checkout flow in tests/e2e/smoke.spec.ts"
+   paths = ["src/**", "*.tsx"]      # relative to this .ralphus.toml's folder
+   command = "node tools/record_flow.js --out $RALPHUS_EXHIBIT_DIR"
    ```
 
    When a PR is written, each changed file is checked against the recipes in
@@ -78,8 +78,8 @@ Houdini, Maya, anything with output a person would look at.
 
 ## Capturing
 
-Agents use whatever the project already has (Playwright, a `hython`
-flipbook, a `mayapy` playblast, ...). Where nothing better exists, ralphus
+Agents use whatever the project already has (Playwright, a screen-capture
+script, a Qt test recording, ...). Where nothing better exists, ralphus
 ships a portable fallback that needs only the OS's own tools:
 
 ```bash

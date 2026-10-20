@@ -24661,13 +24661,13 @@ token_env = "RALPHUS_TEST_FORGE_TOKEN"
         gwrite(
             &root,
             ".ralphus.toml",
-            "[[exhibit.recipe]]\nname = \"flipbook\"\nkind = \"gif\"\ndescribe = \"the scatter flipbook\"\npaths = [\"houdini/**\"]\ncommand = \"hython flip.py\"\n",
+            "[[exhibit.recipe]]\nname = \"recording\"\nkind = \"gif\"\ndescribe = \"the chart recording\"\npaths = [\"website/**\"]\ncommand = \"node record.js\"\n",
         );
         g(&root, &["add", "."]);
         g(&root, &["commit", "--message", "base"]);
         for (branch, file) in [
             ("review/a", "docs/a.md"),
-            ("review/b", "houdini/otls/scatter.hda"),
+            ("review/b", "website/src/Chart.tsx"),
         ] {
             g(&root, &["checkout", "-b", branch]);
             std::fs::create_dir_all(root.join(file).parent().unwrap()).unwrap();
@@ -24706,11 +24706,11 @@ token_env = "RALPHUS_TEST_FORGE_TOKEN"
         );
         assert_eq!(
             branch_changed_paths(&root, &guardian, 1),
-            vec!["houdini/otls/scatter.hda".to_string()]
+            vec!["website/src/Chart.tsx".to_string()]
         );
         let handle: crate::store_lock::StoreHandle =
             std::sync::Arc::new(crate::store_lock::StoreMutex::new(store));
-        // Branch a changes nothing under houdini/: no request.
+        // Branch a changes nothing under website/: no request.
         apply_exhibit_recipes(&handle, &guardian, &root, 0, &ids[0]);
         // Branch b does: one pending request, waiting for a live action.
         apply_exhibit_recipes(&handle, &guardian, &root, 1, &ids[1]);
@@ -24727,7 +24727,7 @@ token_env = "RALPHUS_TEST_FORGE_TOKEN"
             pending,
             vec![(
                 ids[1].clone(),
-                "the scatter flipbook (capture with: hython flip.py)".to_string(),
+                "the chart recording (capture with: node record.js)".to_string(),
                 "recipe".to_string()
             )]
         );

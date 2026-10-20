@@ -4,11 +4,11 @@
 //!
 //! ```toml
 //! [[exhibit.recipe]]
-//! name = "hda-flipbook"
+//! name = "flow-recording"
 //! kind = "gif"
-//! describe = "flipbook frames 1-48 of tests/scenes/smoke.hip"
-//! paths = ["otls/**", "*.hda"]
-//! command = "hython tools/ralphus_flipbook.py --out $RALPHUS_EXHIBIT_DIR"
+//! describe = "the checkout flow in tests/e2e/smoke.spec.ts"
+//! paths = ["src/**", "*.tsx"]
+//! command = "node tools/record_flow.js --out $RALPHUS_EXHIBIT_DIR"
 //! ```
 //!
 //! A recipe's `paths` are globs (`*` within a segment, `**` across segments)
@@ -230,10 +230,10 @@ describe = "the review inspector"
 paths = ["librarian/**"]
 
 [[exhibit.recipe]]
-name = "flipbook"
+name = "recording"
 kind = "gif"
-describe = "root flipbook"
-paths = ["**/*.hda"]
+describe = "root recording"
+paths = ["**/*.tsx"]
 "#;
 
     #[test]
@@ -279,14 +279,14 @@ paths = ["**/*.hda"]
     fn a_subfolder_refines_a_recipe_only_for_its_own_files() {
         let t = Tree::new();
         t.write(".ralphus.toml", ROOT);
-        // houdini/ overrides "flipbook" with its own scene and paths
+        // website/ overrides "recording" with its own scene and paths
         // relative to itself.
         t.write(
-            "houdini/.ralphus.toml",
-            "[[exhibit.recipe]]\nname = \"flipbook\"\nkind = \"gif\"\ndescribe = \"houdini flipbook\"\npaths = [\"otls/**\"]\ncommand = \"hython tools/flip.py\"\n",
+            "website/.ralphus.toml",
+            "[[exhibit.recipe]]\nname = \"recording\"\nkind = \"gif\"\ndescribe = \"website recording\"\npaths = [\"src/**\"]\ncommand = \"node tools/record.js\"\n",
         );
         let (got, warnings) =
-            recipes_for_changes(&t.0, &["houdini/otls/scatter.hda", "maya/rig.hda"]);
+            recipes_for_changes(&t.0, &["website/src/Chart.tsx", "qtapp/main_window.tsx"]);
         assert!(warnings.is_empty(), "{warnings:?}");
         let mut names: Vec<(String, String)> = got
             .iter()
@@ -296,18 +296,18 @@ paths = ["**/*.hda"]
         assert_eq!(
             names,
             vec![
-                ("flipbook".to_string(), "houdini flipbook".to_string()),
-                ("flipbook".to_string(), "root flipbook".to_string()),
+                ("recording".to_string(), "root recording".to_string()),
+                ("recording".to_string(), "website recording".to_string()),
             ],
-            "houdini's file wins inside houdini/, the root one still covers maya/"
+            "website's file wins inside website/, the root one still covers qtapp/"
         );
-        let houdini = got
+        let website = got
             .iter()
-            .find(|m| m.recipe.describe == "houdini flipbook")
+            .find(|m| m.recipe.describe == "website recording")
             .unwrap();
         assert_eq!(
-            houdini.recipe.command.as_deref(),
-            Some("hython tools/flip.py")
+            website.recipe.command.as_deref(),
+            Some("node tools/record.js")
         );
     }
 
@@ -316,12 +316,12 @@ paths = ["**/*.hda"]
         let t = Tree::new();
         t.write(".ralphus.toml", ROOT);
         t.write(
-            "houdini/.ralphus.toml",
-            "[[exhibit.recipe]]\nname = \"flipbook\"\nkind = \"gif\"\ndescribe = \"houdini flipbook\"\npaths = [\"otls/**\"]\n",
+            "website/.ralphus.toml",
+            "[[exhibit.recipe]]\nname = \"recording\"\nkind = \"gif\"\ndescribe = \"website recording\"\npaths = [\"src/**\"]\n",
         );
-        // houdini/scenes/x.hda matches the root glob, but houdini/ decides
-        // "flipbook" for its own files and its glob does not match.
-        let (got, _) = recipes_for_changes(&t.0, &["houdini/scenes/x.hda"]);
+        // website/scenes/x.tsx matches the root glob, but website/ decides
+        // "recording" for its own files and its glob does not match.
+        let (got, _) = recipes_for_changes(&t.0, &["website/scenes/x.tsx"]);
         assert!(got.is_empty(), "{got:?}");
     }
 

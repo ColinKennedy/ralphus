@@ -1455,22 +1455,22 @@ mod tests {
     }
 
     fn block(s: &ExhibitSlot) -> (SlotKey, String) {
-        (s.key, render_slot(s, "Scatter slider", ForgeKind::GitHub))
+        (s.key, render_slot(s, "Zoom slider", ForgeKind::GitHub))
     }
 
     #[test]
     fn split_handoff_lifts_exhibit_lines_out_of_the_steps() {
-        let text = "Scatter density slider\nOpen test.hip and cook scatter1.\n  EXHIBIT: gif | drag density 0 to 1\nEXHIBIT: Screenshot | viewport at 0.5\nCheck the point count drops.";
+        let text = "Zoom slider\nOpen the chart page.\n  EXHIBIT: gif | drag zoom 0 to 1\nEXHIBIT: Screenshot | chart at 50%\nCheck the chart magnifies.";
         let split = split_handoff(text);
         assert_eq!(
             split.text,
-            "Scatter density slider\nOpen test.hip and cook scatter1.\nCheck the point count drops."
+            "Zoom slider\nOpen the chart page.\nCheck the chart magnifies."
         );
         assert_eq!(
             split.requests,
             vec![
-                req(ExhibitKind::Gif, "drag density 0 to 1"),
-                req(ExhibitKind::Screenshot, "viewport at 0.5"),
+                req(ExhibitKind::Gif, "drag zoom 0 to 1"),
+                req(ExhibitKind::Screenshot, "chart at 50%"),
             ]
         );
         assert!(split.rejected.is_empty());
@@ -1531,11 +1531,11 @@ mod tests {
 
     #[test]
     fn an_unfilled_slot_renders_as_an_open_todo() {
-        let s = slot(7, 1, ExhibitKind::Gif, "drag density 0→1");
-        let text = render_slot(&s, "Scatter slider", ForgeKind::GitHub);
+        let s = slot(7, 1, ExhibitKind::Gif, "drag zoom 0→1");
+        let text = render_slot(&s, "Zoom slider", ForgeKind::GitHub);
         assert_eq!(
             text,
-            "<!-- ralphus:exhibit:start action=7 slot=1 -->\n- [ ] **GIF** — drag density 0→1 _(live action: Scatter slider)_\n<!-- ralphus:exhibit:end action=7 slot=1 -->"
+            "<!-- ralphus:exhibit:start action=7 slot=1 -->\n- [ ] **GIF** — drag zoom 0→1 _(live action: Zoom slider)_\n<!-- ralphus:exhibit:end action=7 slot=1 -->"
         );
     }
 

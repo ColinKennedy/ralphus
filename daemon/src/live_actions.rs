@@ -173,7 +173,7 @@ output, not the setup. <kind> is one of gif (motion or interaction), video, \
 screenshot (a still result) or output (text from a terminal or log). Ask only \
 for what is visible and matters to the change; a change with nothing to see \
 asks for nothing, or for output. Example: \
-'EXHIBIT: gif | dragging the density slider from 0 to 1 thins the scattered points'.";
+'EXHIBIT: gif | dragging the zoom slider from 0 to 1 magnifies the chart'.";
 
 /// Most capabilities named per kind in the handoff question; the rest are
 /// counted.
@@ -1930,16 +1930,16 @@ prompt = "second"
 
     #[test]
     fn exhibit_requests_follow_their_handoff_numbers_through_dedupe() {
-        let mut a = handoff("c1", "open the scatter tool");
+        let mut a = handoff("c1", "open the zoom tool");
         a.exhibits = vec![crate::exhibits::ExhibitRequest {
             kind: crate::exhibits::ExhibitKind::Gif,
-            describe: "drag density".into(),
+            describe: "drag zoom".into(),
         }];
-        let mut b = handoff("c2", "open the scatter tool again");
+        let mut b = handoff("c2", "open the zoom tool again");
         b.exhibits = vec![
             crate::exhibits::ExhibitRequest {
                 kind: crate::exhibits::ExhibitKind::Gif,
-                describe: "Drag density".into(),
+                describe: "Drag zoom".into(),
             },
             crate::exhibits::ExhibitRequest {
                 kind: crate::exhibits::ExhibitKind::Screenshot,
@@ -1954,7 +1954,7 @@ prompt = "second"
         // The agent merged 1 and 2 and dropped every EXHIBIT word from its
         // prompts; the requests still land on the right actions.
         let reply = r#"{"live_actions": [
-            {"label": "Scatter", "prompt": "open the scatter tool", "sources": [2, 1]},
+            {"label": "Zoom", "prompt": "open the zoom tool", "sources": [2, 1]},
             {"label": "CLI", "prompt": "run the CLI", "sources": [3]}
         ]}"#;
         let actions = parse_dedupe_answer(reply, &[a, b, c]).unwrap();
@@ -1965,7 +1965,7 @@ prompt = "second"
                 .map(|r| r.describe.as_str())
                 .collect::<Vec<_>>()
         };
-        assert_eq!(describe(0), vec!["Drag density", "final view"]);
+        assert_eq!(describe(0), vec!["Drag zoom", "final view"]);
         assert_eq!(describe(1), vec!["help text"]);
     }
 
