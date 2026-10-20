@@ -31,6 +31,10 @@ provider's business.
 > turns any remaining daemon-host fallback into a visible failure while
 > developing ralphus.
 
+> **Provider services:** a provider can also be a long-running service that
+> hands ralphus *allocations* rather than a program run per call -- see
+> [`machine-provider-service.md`](machine-provider-service.md) (contract v2).
+
 > **Platform support:** Linux and Windows daemon hosts are fully supported.
 > macOS as a daemon host is **experimental** (RAL-398) — see "Platform
 > support" in `docs/dependencies.md`.
