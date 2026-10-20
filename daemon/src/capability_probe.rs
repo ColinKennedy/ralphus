@@ -29,6 +29,9 @@ pub const PROBE_STEP_TIMEOUT: Duration = Duration::from_secs(20);
 
 const PROTOCOL_VERSION: &str = "2024-11-05";
 const STDERR_TAIL_BYTES: usize = 600;
+/// How long to wait for the stderr pipe to reach EOF after the server exits,
+/// so a server that writes its error and quits still has it in the detail.
+const STDERR_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// The result of probing one MCP server.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -184,6 +187,7 @@ fn probe_stdio(command: &str, args: &[String], env: &BTreeMap<String, String>) -
         }
     });
     let tail = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+    let (stderr_done_tx, stderr_done_rx) = mpsc::channel::<()>();
     if let Some(mut stderr) = stderr {
         let tail = std::sync::Arc::clone(&tail);
         std::thread::spawn(move || {
@@ -200,7 +204,10 @@ fn probe_stdio(command: &str, args: &[String], env: &BTreeMap<String, String>) -
                     }
                 }
             }
+            let _ = stderr_done_tx.send(());
         });
+    } else {
+        drop(stderr_done_tx);
     }
 
     let exchange =
@@ -262,6 +269,9 @@ fn probe_stdio(command: &str, args: &[String], env: &BTreeMap<String, String>) -
     drop(stdin);
     let _ = child.kill();
     let _ = child.wait();
+    // The reader thread finishes once the pipe closes; wait for it so a
+    // server's last words are in the tail before it is read below.
+    let _ = stderr_done_rx.recv_timeout(STDERR_DRAIN_TIMEOUT);
 
     match result {
         Ok(names) => ProbeOutcome::listed(names),

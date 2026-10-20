@@ -202,7 +202,10 @@ pub(crate) fn capabilities_for_agent(
         guard.capability_plan(profile, allow_ralphus_mcp)
     };
     match plan {
-        Ok(plan) => Some(plan.resolve(&store.lock())),
+        Ok(plan) => {
+            let guard = store.lock();
+            Some(plan.resolve(&guard))
+        }
         Err(e) => {
             crate::cartographer::Note::new("scheduler")
                 .level(crate::logging::LogLevel::WARNING)
