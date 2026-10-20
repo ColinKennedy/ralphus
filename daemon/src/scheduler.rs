@@ -301,6 +301,25 @@ enum SessionShare {
 /// surprised a user running Codex under two different models on dependent
 /// cells (see [`sharing_blocked_reason`]'s doc comment for that report). A
 /// cell that hasn't opted in never even reaches the dependency scan below.
+/// Why a dependency's agent session cannot be shared with a cell on another
+/// machine: the session lives where it ran. `None` when both run on the same
+/// machine (or both on the daemon host).
+fn machine_sharing_blocked_reason(
+    dep_cell: &str,
+    dep_machine: Option<&str>,
+    cell_machine: Option<&str>,
+) -> Option<String> {
+    let (dep, cell) = (remote_machine(dep_machine), remote_machine(cell_machine));
+    (dep != cell).then(|| {
+        format!(
+            "dependency {dep_cell} ran on {} and this cell runs on {}; an agent session cannot \
+             be resumed across machines",
+            dep.unwrap_or("the daemon host"),
+            cell.unwrap_or("the daemon host"),
+        )
+    })
+}
+
 fn resolve_shared_session_id(
     store: &crate::store_lock::StoreHandle,
     squad_id: &str,
@@ -335,6 +354,14 @@ fn resolve_shared_session_id(
     let mut blocked_reason: Option<String> = None;
     for (d, session_id) in dep_sessions {
         let dep = &cells[d];
+        if let Some(reason) = machine_sharing_blocked_reason(
+            &dep.cell_id,
+            dep.machine.as_deref(),
+            row.machine.as_deref(),
+        ) {
+            blocked_reason = Some(reason);
+            continue;
+        }
         let dep_backend =
             resolve_agent_selection(store, &dep.agent, dep.cwd.as_deref().unwrap_or("."))
                 .map(|s| s.backend)
@@ -12902,6 +12929,17 @@ prompt = "anything"
         };
         execute_squad(&store, &runner, &id);
         assert_eq!(session_share_recorded(&seen, "consumer"), None);
+    }
+
+    #[test]
+    fn a_session_is_not_shared_across_machines() {
+        assert!(machine_sharing_blocked_reason("dep", None, Some("local")).is_none());
+        assert!(machine_sharing_blocked_reason("dep", Some("ib:A"), Some(" ib:A ")).is_none());
+        let reason = machine_sharing_blocked_reason("dep", Some("ib:A"), None)
+            .expect("remote dependency, local cell");
+        assert!(reason.contains("ib:A"), "{reason}");
+        assert!(reason.contains("daemon host"), "{reason}");
+        assert!(machine_sharing_blocked_reason("dep", Some("ib:A"), Some("ib:B")).is_some());
     }
 
     #[test]
