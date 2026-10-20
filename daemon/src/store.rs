@@ -6506,6 +6506,16 @@ impl Store {
         Self::list_squads_conn_limited(conn, None)
     }
 
+    /// Every squad in `state`, newest first, hydrated like
+    /// [`Self::list_squads_conn`] -- for a caller that only cares about, say,
+    /// the running squads and should not pay to hydrate the whole history.
+    pub(crate) fn list_squads_in_state_conn(
+        conn: &Connection,
+        state: &str,
+    ) -> Result<Vec<SquadView>> {
+        Self::squads_where(conn, "state = ?1", &[&state], None)
+    }
+
     /// [`Self::list_squads_conn`] with an optional cap on how many squads are
     /// hydrated (WS-D.3).
     ///
@@ -18791,6 +18801,25 @@ command = "cargo test"
         let squads = store.list_squads().unwrap();
         assert_eq!(squads.len(), 2);
         assert_eq!(squads[0].id, b); // newest first
+    }
+
+    #[test]
+    fn list_squads_in_state_returns_only_that_state() {
+        let mut store = Store::open_in_memory().unwrap();
+        let pending = store
+            .insert_squad(&parse(SAMPLE), Some("a"), false)
+            .unwrap();
+        let running = store
+            .insert_squad(&parse(SAMPLE), Some("b"), false)
+            .unwrap();
+        store
+            .set_squad_state(&running, SquadState::Running)
+            .unwrap();
+        let squads = Store::list_squads_in_state_conn(&store.conn, "running").unwrap();
+        let ids: Vec<&str> = squads.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(ids, [running.as_str()]);
+        assert!(!ids.contains(&pending.as_str()));
+        assert!(!squads[0].tasks.is_empty(), "squads are hydrated");
     }
 
     #[test]
