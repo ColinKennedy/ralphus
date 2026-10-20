@@ -1012,7 +1012,9 @@ After testing, capture what a code reviewer must see, one file per item below, \
 saved in {}{}. Capture the final visible result, not the setup. \
 For an app, capture just its window with the title bar, not the whole screen; on a \
 display with no window manager (a bare Xvfb) start one first (`openbox &`, `xfwm4 &` \
-or `twm &`, whichever is installed) so the window has a title bar. \
+or `twm &`, whichever is installed) so the window has a title bar. On X11, \
+`import -frame -window <id>` keeps the title bar (plain `-window` drops it), and a \
+whole-screen shot of a bare display is cropped to its window automatically. \
 For a visual item deliver the first kind of {order} that shows it; keep any video \
 under {} seconds and any GIF short (a few seconds, small window). For an output \
 item save the relevant text as a .txt file. If the steps you ran did not show an \
