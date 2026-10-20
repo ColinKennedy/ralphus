@@ -618,6 +618,22 @@ pub fn parse_worktree_placeholder_upstream(cwd: &str) -> Option<&str> {
     Some(value)
 }
 
+/// Whether a `ralphus:new-worktree/<branch>?upstream=<base>&existing=1`
+/// placeholder asks for the branch that already exists to be checked out at its
+/// current tip, instead of a fresh branch forked from `?upstream=`. In that
+/// mode `?upstream=` names the review base only: the branch is never renamed,
+/// rebased or re-pointed at it.
+#[must_use]
+pub fn parse_worktree_placeholder_existing(cwd: &str) -> bool {
+    let Some(rest) = cwd.strip_prefix(WORKTREE_PLACEHOLDER_PREFIX) else {
+        return false;
+    };
+    let Some((_, query)) = rest.split_once('?') else {
+        return false;
+    };
+    query.split('&').any(|parameter| parameter == "existing=1")
+}
+
 /// A worktree placeholder embedded as text in a review preparation/action
 /// field. It identifies the declared branch and can optionally transform that
 /// branch for a deterministic output path; it never materializes a worktree.
@@ -3528,6 +3544,21 @@ mod tests {
             ),
             Some("origin/feature/x")
         );
+    }
+
+    #[test]
+    fn worktree_placeholder_existing_flag_parses() {
+        let p = "ralphus:new-worktree/feat?upstream=main&existing=1";
+        assert!(parse_worktree_placeholder_existing(p));
+        assert_eq!(parse_worktree_placeholder(p), Some("feat"));
+        assert_eq!(parse_worktree_placeholder_upstream(p), Some("main"));
+        assert!(!parse_worktree_placeholder_existing(
+            "ralphus:new-worktree/feat?upstream=main"
+        ));
+        assert!(!parse_worktree_placeholder_existing(
+            "ralphus:new-worktree/feat?upstream=main&existing=0"
+        ));
+        assert!(!parse_worktree_placeholder_existing("/plain/path"));
     }
 
     #[test]

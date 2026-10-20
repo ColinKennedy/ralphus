@@ -44,8 +44,28 @@ use crate::store_lock::StoreHandle;
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum BranchMaterialization {
     ExistingLocal,
-    NewFromRemote { remote_ref: String },
-    NewFromHead { warning: Option<String> },
+    NewFromRemote {
+        remote_ref: String,
+    },
+    NewFromHead {
+        warning: Option<String>,
+    },
+    /// Existing-branch mode: no local branch of that name yet, so it is
+    /// fetched from a remote under the same short name.
+    TrackRemoteBranch,
+}
+
+/// How a worktree request treats the branch it names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WorktreeMode {
+    /// The branch is ralphus's own: created from `?upstream=`, allocated a
+    /// `-2`/`-3` name when taken, tracked and resynced against `?upstream=`.
+    Fresh,
+    /// The branch already holds someone's work (`&existing=1`): checked out at
+    /// its current tip under its own name, never renamed, re-pointed or
+    /// rebased. The "upstream" is the review base, used only to freeze the
+    /// commit baseline.
+    Existing,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -285,6 +305,17 @@ fn read_creation_marker(path: &Path) -> Option<(String, Option<String>)> {
     Some((branch.to_string(), upstream))
 }
 
+/// The [`WorktreeMode`] a slot's creation marker was written with.
+fn read_creation_marker_mode(path: &Path) -> WorktreeMode {
+    let existing = std::fs::read_to_string(path)
+        .is_ok_and(|text| text.lines().any(|line| line.trim() == "existing=1"));
+    if existing {
+        WorktreeMode::Existing
+    } else {
+        WorktreeMode::Fresh
+    }
+}
+
 /// Every in-progress (or interrupted) creation under `root`: slot short name
 /// to the branch that marker names. A slot listed here is occupied even
 /// though `git worktree list` may not show it yet, or ever, if its creation
@@ -329,6 +360,18 @@ fn write_creation_marker(
     branch: &str,
     upstream: &str,
 ) -> Result<bool, String> {
+    write_creation_marker_for(root, short, branch, upstream, WorktreeMode::Fresh)
+}
+
+/// [`write_creation_marker`] that also records `mode`, so a restarted daemon
+/// finishes an interrupted existing-branch creation the same way.
+fn write_creation_marker_for(
+    root: &Path,
+    short: &str,
+    branch: &str,
+    upstream: &str,
+    mode: WorktreeMode,
+) -> Result<bool, String> {
     use std::io::Write as _;
     use std::sync::atomic::{AtomicU64, Ordering};
     static STAGING_SEQ: AtomicU64 = AtomicU64::new(0);
@@ -342,8 +385,13 @@ fn write_creation_marker(
         std::process::id(),
         STAGING_SEQ.fetch_add(1, Ordering::Relaxed)
     ));
+    let existing_line = if mode == WorktreeMode::Existing {
+        "existing=1\n"
+    } else {
+        ""
+    };
     let contents = format!(
-        "{branch}\nupstream={upstream}\npid={}\n",
+        "{branch}\nupstream={upstream}\n{existing_line}pid={}\n",
         std::process::id()
     );
     let staged = std::fs::File::create_new(&staging).and_then(|mut file| {
@@ -1020,6 +1068,177 @@ fn branch_materialization(root: &Path, branch: &str) -> Result<BranchMaterializa
     Ok(BranchMaterialization::NewFromHead { warning })
 }
 
+/// How existing-branch mode materializes `branch`: the local branch itself
+/// when there is one, otherwise a same-named local branch fetched from a
+/// remote. Never a new branch forked from anywhere else, and never the
+/// `<remote>/<branch>`-named local branch [`branch_materialization`] makes.
+fn existing_branch_materialization(
+    root: &Path,
+    branch: &str,
+) -> Result<BranchMaterialization, String> {
+    validate_branch_name(root, branch)?;
+    if git(
+        root,
+        &["rev-parse", "--verify", &format!("refs/heads/{branch}")],
+    )
+    .is_ok()
+    {
+        return Ok(BranchMaterialization::ExistingLocal);
+    }
+    Ok(BranchMaterialization::TrackRemoteBranch)
+}
+
+/// Existing-branch mode refuses to share a branch with a checkout it does not
+/// own. `on_disk` is [`existing_and_reserved_worktree_branches`]: a worktree
+/// outside `w/` (the user's own checkout included) is keyed by its full path,
+/// a ralphus slot by its short name. Git itself would refuse the second
+/// checkout; the alternative of allocating `<branch>-2` would silently work on
+/// a different branch, so this fails with the way out instead.
+fn refuse_branch_checked_out_elsewhere(
+    branch: &str,
+    on_disk: &HashMap<String, String>,
+) -> Result<(), String> {
+    let is_path = |key: &str| key.contains('/') || key.contains('\\') || key.contains(':');
+    match on_disk
+        .iter()
+        .find(|(key, value)| is_path(key) && value.eq_ignore_ascii_case(branch))
+    {
+        Some((path, _)) => Err(format!(
+            "branch \"{branch}\" is checked out in {path}, so ralphus cannot check it out a \
+             second time. Switch that checkout off \"{branch}\" (e.g. `git switch <other-branch>` \
+             there) and retry; ralphus never works on a renamed copy such as \"{branch}-2\""
+        )),
+        None => Ok(()),
+    }
+}
+
+/// Fail early, with remediation, when existing-branch mode cannot have `branch`
+/// because another checkout holds it. For callers that decide before anything
+/// is submitted or materialized.
+pub fn check_existing_branch_available(root: &Path, branch: &str) -> Result<(), String> {
+    validate_branch_name(root, branch)?;
+    refuse_branch_checked_out_elsewhere(branch, &existing_and_reserved_worktree_branches(root))
+}
+
+/// Fetch `branch` from the first remote that has it into
+/// `refs/remotes/<remote>/<branch>`, preferring `origin`. Returns the remote.
+fn fetch_remote_branch(root: &Path, branch: &str) -> Result<String, String> {
+    let listed = git(root, &["remote"])?;
+    let mut remotes: Vec<&str> = listed
+        .lines()
+        .map(str::trim)
+        .filter(|r| !r.is_empty())
+        .collect();
+    remotes.sort_by_key(|r| *r != "origin");
+    if remotes.is_empty() {
+        return Err(format!(
+            "branch \"{branch}\" does not exist locally and {} has no remote to fetch it from; \
+             create the branch or add a remote and retry",
+            root.display()
+        ));
+    }
+    let mut failures = Vec::new();
+    for remote in &remotes {
+        let refspec = format!("+refs/heads/{branch}:refs/remotes/{remote}/{branch}");
+        match git(root, &["fetch", "--no-write-fetch-head", remote, &refspec]) {
+            Ok(_) => return Ok((*remote).to_string()),
+            Err(e) => failures.push(format!("{remote}: {e}")),
+        }
+    }
+    Err(format!(
+        "branch \"{branch}\" exists neither locally nor on any remote ({}); check the branch name \
+         and that the remote is reachable, then retry",
+        failures.join("; ")
+    ))
+}
+
+/// Existing-branch mode's counterpart of [`execute_worktree_plan`]. Leaves the
+/// branch exactly where it is: no `set_explicit_upstream` (which would overwrite
+/// the user's `branch.<b>.remote/merge`) and no `resync_remote_tracking_branch`
+/// (which would rebase it). `base` is the review base, used only to freeze the
+/// commit baseline at its merge-base with the branch, so commits the branch
+/// already has count as present rather than as work the cell failed to do.
+fn execute_existing_branch_plan(
+    root: &Path,
+    branch: &str,
+    base: &str,
+    plan: &WorktreePlan,
+) -> Result<PathBuf, String> {
+    sync_commit_metadata_hook_best_effort(&crate::workspace::Workspace::local(root), root);
+    if plan.already_exists {
+        return Ok(plan.wt.clone());
+    }
+    if let Some(parent) = plan.wt.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("could not create worktree parent directory: {e}"))?;
+    }
+    let wt_str = plan.wt.to_string_lossy().to_string();
+    match &plan.materialization {
+        BranchMaterialization::ExistingLocal => {
+            preflight_worktree_budget(root, &plan.wt, branch, path_budget_limit())?;
+            git(root, &["worktree", "add", &wt_str, branch])?;
+        }
+        BranchMaterialization::TrackRemoteBranch => {
+            let remote = fetch_remote_branch(root, branch)?;
+            let remote_ref = format!("refs/remotes/{remote}/{branch}");
+            preflight_worktree_budget(root, &plan.wt, &remote_ref, path_budget_limit())?;
+            git(
+                root,
+                &[
+                    "worktree",
+                    "add",
+                    "--no-track",
+                    "-b",
+                    branch,
+                    &wt_str,
+                    &remote_ref,
+                ],
+            )?;
+            // The branch is new, so there is no config of the user's to keep.
+            let _guard = WORKTREE_CONFIG_LOCK.lock();
+            git_config_write_retrying(
+                &plan.wt,
+                &["config", &format!("branch.{branch}.remote"), &remote],
+            )?;
+            git_config_write_retrying(
+                &plan.wt,
+                &[
+                    "config",
+                    &format!("branch.{branch}.merge"),
+                    &format!("refs/heads/{branch}"),
+                ],
+            )?;
+        }
+        other => {
+            return Err(format!(
+                "internal error: existing-branch mode planned {other:?} for \"{branch}\""
+            ));
+        }
+    }
+    freeze_baseline_at_merge_base(&plan.wt, branch, base);
+    Ok(plan.wt.clone())
+}
+
+/// Freeze the commit baseline at the merge-base of the checked-out branch and
+/// `base`. A no-op when `base` is empty; an unresolvable `base` is logged and
+/// leaves the baseline unset (the live `@{upstream}` fallback applies).
+fn freeze_baseline_at_merge_base(wt: &Path, branch: &str, base: &str) {
+    if base.is_empty() {
+        return;
+    }
+    let qualified = qualify_ambiguous_ref(wt, base);
+    let frozen = git(wt, &["merge-base", "HEAD", &qualified])
+        .and_then(|sha| crate::reviews::set_worktree_commit_baseline(wt, sha.trim()));
+    if let Err(e) = frozen {
+        // ralphus[ignore-rlog-pair]: worktree helper has no Store; caller records review workflow outcomes
+        crate::rlog!(
+            WARNING,
+            "ralphus: could not freeze commit baseline for branch '{branch}' against base '{base}' at {}: {e}",
+            wt.display()
+        );
+    }
+}
+
 /// Set `branch`'s (checked out in worktree `wt`) upstream to the explicit
 /// `?upstream=` value from a `ralphus:new-worktree/<branch>?upstream=<upstream>`
 /// placeholder ([`ensure_worktree`]'s `upstream` parameter is now mandatory --
@@ -1588,8 +1807,12 @@ fn plan_worktree(
     root: &Path,
     branch: &str,
     existing: &HashMap<String, String>,
+    mode: WorktreeMode,
 ) -> Result<WorktreePlan, String> {
-    let materialization = branch_materialization(root, branch)?;
+    let materialization = match mode {
+        WorktreeMode::Fresh => branch_materialization(root, branch)?,
+        WorktreeMode::Existing => existing_branch_materialization(root, branch)?,
+    };
     let wt = resolve_task_worktree_dir_with_existing(root, branch, existing);
     let already_exists = wt.join(".git").exists();
     Ok(WorktreePlan {
@@ -1627,6 +1850,11 @@ fn execute_worktree_plan(
     }
     let wt_str = plan.wt.to_string_lossy().to_string();
     match &plan.materialization {
+        BranchMaterialization::TrackRemoteBranch => {
+            return Err(format!(
+                "internal error: a fresh worktree for \"{branch}\" was planned as existing-branch"
+            ));
+        }
         BranchMaterialization::ExistingLocal => {
             preflight_worktree_budget(root, &plan.wt, branch, path_budget_limit())?;
             git(root, &["worktree", "add", &wt_str, branch])?;
@@ -1710,6 +1938,36 @@ pub(crate) fn ensure_worktree_tracked(
     branch: &str,
     upstream: &str,
 ) -> Result<Materialized, String> {
+    ensure_worktree_tracked_as(root, branch, upstream, WorktreeMode::Fresh)
+}
+
+/// Materialize a worktree for a branch that already exists (existing-branch
+/// mode), for any git repository -- registered with ralphus or not, since it
+/// needs only `root` and the branch name.
+///
+/// The worktree checks out `branch` at its current tip: the local branch when
+/// there is one, otherwise a same-named local branch fetched from a remote and
+/// tracking it. Fails, naming the way out, when another checkout already holds
+/// the branch. It never renames the branch, never rewrites its
+/// `branch.<b>.remote/merge` config and never rebases it.
+///
+/// `base` is the review base (RAL-703 resolves it): the commit baseline is
+/// frozen at its merge-base with the branch. `None` leaves the baseline unset.
+pub fn ensure_existing_branch_worktree(
+    root: &Path,
+    branch: &str,
+    base: Option<&str>,
+) -> Result<PathBuf, String> {
+    ensure_worktree_tracked_as(root, branch, base.unwrap_or(""), WorktreeMode::Existing)
+        .map(|m| m.path)
+}
+
+fn ensure_worktree_tracked_as(
+    root: &Path,
+    branch: &str,
+    upstream: &str,
+    mode: WorktreeMode,
+) -> Result<Materialized, String> {
     let key = (root.to_path_buf(), branch.to_ascii_lowercase());
     let (lock, cv) = &*WORKTREE_CREATIONS;
     let mut waited = false;
@@ -1733,7 +1991,7 @@ pub(crate) fn ensure_worktree_tracked(
         }
         map.insert(key.clone(), CreationState::Creating);
     }
-    let result = materialize_exclusively(root, branch, upstream);
+    let result = materialize_exclusively(root, branch, upstream, mode);
     lock.lock()
         .insert(key, CreationState::Finished(result.clone()));
     cv.notify_all();
@@ -1762,6 +2020,7 @@ fn materialize_exclusively(
     root: &Path,
     branch: &str,
     upstream: &str,
+    mode: WorktreeMode,
 ) -> Result<Materialized, String> {
     let mut repaired = None;
     let (plan, marker_short, repair_owned) = with_repository_plan_lock(
@@ -1770,7 +2029,10 @@ fn materialize_exclusively(
         format!("materialize branch {branch}"),
         || {
             let existing = existing_and_reserved_worktree_branches(root);
-            let mut plan = plan_worktree(root, branch, &existing)?;
+            if mode == WorktreeMode::Existing {
+                refuse_branch_checked_out_elsewhere(branch, &existing)?;
+            }
+            let mut plan = plan_worktree(root, branch, &existing, mode)?;
             let short = plan
                 .wt
                 .file_name()
@@ -1800,7 +2062,7 @@ fn materialize_exclusively(
             if plan.already_exists {
                 Ok((plan, None, false))
             } else {
-                if !write_creation_marker(root, &short, branch, upstream)? {
+                if !write_creation_marker_for(root, &short, branch, upstream, mode)? {
                     return Err(format!(
                         "worktree slot {} was claimed by another creation while this one was starting; refusing to touch it",
                         plan.wt.display()
@@ -1829,7 +2091,10 @@ fn materialize_exclusively(
         }
     }
     let init_spec = crate::worktree_init::take(root, branch);
-    let path = execute_worktree_plan(root, branch, upstream, &plan)?;
+    let path = match mode {
+        WorktreeMode::Fresh => execute_worktree_plan(root, branch, upstream, &plan)?,
+        WorktreeMode::Existing => execute_existing_branch_plan(root, branch, upstream, &plan)?,
+    };
     // RAL-615: initialization runs after the worktree is fully set up and
     // before the creation marker is cleared, so an init interrupted by a
     // daemon restart leaves the marker behind and the next attempt recreates
@@ -1986,10 +2251,25 @@ impl ProjectStartupAdapter for GitProjectStartupAdapter {
                 .borrow_mut()
                 .insert(root_key.clone(), snapshot);
         }
-        let branch = {
-            let all = ctx.on_disk_worktrees.borrow();
-            let on_disk = all.get(&root_key).expect("populated just above");
-            resolve_squad_branch(store, project, branch, ctx.squad_id, on_disk)
+        let mode = if ralphus_core::schema::parse_worktree_placeholder_existing(placeholder) {
+            WorktreeMode::Existing
+        } else {
+            WorktreeMode::Fresh
+        };
+        // Existing-branch mode names the branch exactly: no per-squad
+        // `-2`/`-3` allocation, and an occupied branch is refused at
+        // materialization instead.
+        let branch = match mode {
+            WorktreeMode::Existing => {
+                let all = ctx.on_disk_worktrees.borrow();
+                let on_disk = all.get(&root_key).expect("populated just above");
+                refuse_branch_checked_out_elsewhere(branch, on_disk).map(|()| branch.to_string())
+            }
+            WorktreeMode::Fresh => {
+                let all = ctx.on_disk_worktrees.borrow();
+                let on_disk = all.get(&root_key).expect("populated just above");
+                resolve_squad_branch(store, project, branch, ctx.squad_id, on_disk)
+            }
         }
         .map_err(|e| {
             format!(
@@ -1999,6 +2279,13 @@ impl ProjectStartupAdapter for GitProjectStartupAdapter {
         })?;
         let branch = branch.as_str();
         let resolved = match ctx.machine {
+            Some(machine) if mode == WorktreeMode::Existing && !machine.trim().is_empty() => {
+                return Err(format!(
+                    "cell '{}': \"{placeholder}\" cannot run on machine \"{machine}\": \
+                     existing-branch worktrees are local-only; remove `machine` from the cell",
+                    ctx.cell_id
+                ));
+            }
             Some(machine) if !machine.trim().is_empty() => provision_remote_with_targets(
                 store,
                 machine,
@@ -2032,10 +2319,11 @@ impl ProjectStartupAdapter for GitProjectStartupAdapter {
                         &upstream,
                     )?,
                 };
-                let materialized = ensure_worktree_tracked(
+                let materialized = ensure_worktree_tracked_as(
                     Path::new(&project.path),
                     branch,
                     &upstream,
+                    mode,
                 )
                 .map(|m| m.path)
                 .map_err(|e| {
@@ -2979,7 +3267,7 @@ fn claim_worktree_slot(
     snapshot: &mut HashMap<String, String>,
 ) -> Result<WorktreePlan, String> {
     for _ in 0..16 {
-        let plan = plan_worktree(root, branch, snapshot)?;
+        let plan = plan_worktree(root, branch, snapshot, WorktreeMode::Fresh)?;
         if plan.already_exists {
             return Ok(plan);
         }
@@ -3009,7 +3297,10 @@ fn claim_worktree_slot(
 pub(crate) struct PendingWorktree {
     pub(crate) root: PathBuf,
     pub(crate) branch: String,
+    /// The tracking upstream, or in existing-branch mode the review base
+    /// (possibly empty).
     pub(crate) upstream: String,
+    pub(crate) mode: WorktreeMode,
     pub(crate) wt: PathBuf,
 }
 
@@ -3031,11 +3322,18 @@ pub(crate) fn pending_worktree_at(cwd: &Path) -> Option<PendingWorktree> {
         return None;
     }
     let root = git_dir.parent()?.to_path_buf();
-    let (branch, upstream) = read_creation_marker(&creation_marker_path(&root, short))?;
+    let marker = creation_marker_path(&root, short);
+    let (branch, upstream) = read_creation_marker(&marker)?;
+    let mode = read_creation_marker_mode(&marker);
+    let upstream = match mode {
+        WorktreeMode::Fresh => upstream?,
+        WorktreeMode::Existing => upstream.unwrap_or_default(),
+    };
     Some(PendingWorktree {
         root,
         branch,
-        upstream: upstream?,
+        upstream,
+        mode,
         wt: cwd.to_path_buf(),
     })
 }
@@ -3043,7 +3341,12 @@ pub(crate) fn pending_worktree_at(cwd: &Path) -> Option<PendingWorktree> {
 /// Create the worktree behind `pending` (single-flight, see
 /// [`ensure_worktree_tracked`]).
 pub(crate) fn materialize_pending(pending: &PendingWorktree) -> Result<Materialized, String> {
-    ensure_worktree_tracked(&pending.root, &pending.branch, &pending.upstream)
+    ensure_worktree_tracked_as(
+        &pending.root,
+        &pending.branch,
+        &pending.upstream,
+        pending.mode,
+    )
 }
 
 /// Per-worktree "already routed to the submitter's fork" flags, so the
@@ -3307,6 +3610,13 @@ pub(crate) fn plan_local_worktree_jobs(
         let Ok(Some(branch)) = classify_placeholder(placeholder) else {
             continue;
         };
+        if ralphus_core::schema::parse_worktree_placeholder_existing(placeholder) {
+            skip(
+                cell,
+                "existing-branch worktrees are created live, never claimed ahead",
+            );
+            continue;
+        }
         // Keyed on the unwrapped text: that is what the live resolution's
         // cache is keyed on for a wrapped cwd, so the claimed path is found
         // there instead of being created again.
@@ -7424,6 +7734,93 @@ mod tests {
                 .count(),
             2,
             "retry re-runs in the surviving worktree"
+        );
+    }
+
+    /// Existing-branch mode: the local branch's unpushed tip is the worktree's
+    /// HEAD, its tracking config is untouched, and nothing is rebased.
+    #[test]
+    fn existing_branch_mode_checks_out_local_tip_without_touching_config() {
+        let (repo, _) = init_repo_with_remote_branch("existing-local", "origin/foo");
+        git(&repo, &["branch", "wip", "origin/foo"]).unwrap();
+        git(&repo, &["config", "branch.wip.remote", "origin"]).unwrap();
+        git(&repo, &["config", "branch.wip.merge", "refs/heads/foo"]).unwrap();
+        git(&repo, &["switch", "wip"]).unwrap();
+        std::fs::write(
+            repo.join("unpushed.txt"),
+            "u
+",
+        )
+        .unwrap();
+        git(&repo, &["add", "-A"]).unwrap();
+        git(&repo, &["commit", "-m", "unpushed"]).unwrap();
+        let tip = git(&repo, &["rev-parse", "wip"]).unwrap();
+        // Held by the user's checkout: refused with remediation, no `-2`.
+        let err = ensure_existing_branch_worktree(&repo, "wip", Some("origin/main")).unwrap_err();
+        assert!(err.contains("Switch that checkout off"), "{err}");
+        assert!(check_existing_branch_available(&repo, "wip").is_err());
+        assert!(git(&repo, &["rev-parse", "--verify", "wip-2"]).is_err());
+        git(&repo, &["switch", "main"]).unwrap();
+        check_existing_branch_available(&repo, "wip").unwrap();
+
+        let wt = ensure_existing_branch_worktree(&repo, "wip", Some("origin/main")).unwrap();
+        assert_eq!(git(&wt, &["rev-parse", "HEAD"]).unwrap(), tip);
+        assert_eq!(head_branch(&wt.to_string_lossy()), "wip");
+        assert_eq!(
+            git(&repo, &["config", "branch.wip.merge"]).unwrap().trim(),
+            "refs/heads/foo"
+        );
+        assert_eq!(
+            git(&repo, &["config", "branch.wip.remote"]).unwrap().trim(),
+            "origin"
+        );
+    }
+
+    /// A branch that exists only on the remote becomes a same-named local
+    /// branch at the remote tip, tracking it.
+    #[test]
+    fn existing_branch_mode_fetches_remote_only_branch() {
+        let (repo, remote_sha) = init_repo_with_remote_branch("existing-remote", "origin/foo");
+        assert!(git(&repo, &["rev-parse", "--verify", "refs/heads/foo"]).is_err());
+        let wt = ensure_existing_branch_worktree(&repo, "foo", Some("origin/main")).unwrap();
+        assert_eq!(git(&wt, &["rev-parse", "HEAD"]).unwrap().trim(), remote_sha);
+        assert_eq!(head_branch(&wt.to_string_lossy()), "foo");
+        assert_eq!(
+            git(&repo, &["config", "branch.foo.remote"]).unwrap().trim(),
+            "origin"
+        );
+        assert!(git(&repo, &["rev-parse", "--verify", "refs/heads/origin/foo"]).is_err());
+    }
+
+    /// A branch that exists nowhere fails loudly instead of forking a new one.
+    #[test]
+    fn existing_branch_mode_fails_for_unknown_branch() {
+        let repo = init_repo("existing-unknown");
+        let err = ensure_existing_branch_worktree(&repo, "nope", None).unwrap_err();
+        assert!(err.contains("nope"), "{err}");
+        assert!(git(&repo, &["rev-parse", "--verify", "refs/heads/nope"]).is_err());
+    }
+
+    /// The mode survives in the creation marker, so a restart finishes an
+    /// interrupted existing-branch creation the same way.
+    #[test]
+    fn creation_marker_records_existing_mode() {
+        let repo = init_repo("marker-existing-mode");
+        assert!(
+            write_creation_marker_for(&repo, "slot", "feat", "main", WorktreeMode::Existing)
+                .unwrap()
+        );
+        let path = creation_marker_path(&repo, "slot");
+        assert_eq!(read_creation_marker_mode(&path), WorktreeMode::Existing);
+        let (branch, upstream) = read_creation_marker(&path).unwrap();
+        assert_eq!(
+            (branch.as_str(), upstream.as_deref()),
+            ("feat", Some("main"))
+        );
+        assert!(write_creation_marker(&repo, "other", "feat2", "main").unwrap());
+        assert_eq!(
+            read_creation_marker_mode(&creation_marker_path(&repo, "other")),
+            WorktreeMode::Fresh
         );
     }
 }

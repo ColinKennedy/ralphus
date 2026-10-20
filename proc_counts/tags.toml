@@ -120,3 +120,12 @@ tag = "review-base-update-modes"
 [[test]]
 id = "ralphus-daemon guardian_merge::tests::a_checked_out_local_base_refreshes_its_upstream_instead_of_failing"
 tag = "base-fetch-checked-out-local"
+
+# Existing-branch worktree materialization (RAL-700): local branch at its tip, and a remote-only branch fetched.
+[[test]]
+id = "ralphus-daemon worktrees::tests::existing_branch_mode_checks_out_local_tip_without_touching_config"
+tag = "existing-branch-worktree-local"
+
+[[test]]
+id = "ralphus-daemon worktrees::tests::existing_branch_mode_fetches_remote_only_branch"
+tag = "existing-branch-worktree-remote"
