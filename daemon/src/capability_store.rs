@@ -778,6 +778,91 @@ impl Store {
     }
 }
 
+/// An enabled capability that is not known to be failing, reduced to what a
+/// prompt may say about it: never a command, argument, env or header value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UsableCapability {
+    pub kind: CapabilityKind,
+    pub name: String,
+    pub description: Option<String>,
+}
+
+/// Longest description kept per capability.
+const DESCRIPTION_MAX_CHARS: usize = 160;
+
+impl Store {
+    /// The capabilities `profile` has enabled whose catalog status is not
+    /// `failing` (an MCP server that did not start) or `missing` (a skill
+    /// folder that is gone). A skill's description is the `description:` of
+    /// its `SKILL.md` front matter; the catalog stores none for an MCP server.
+    ///
+    /// # Errors
+    /// Propagates any SQLite failure.
+    pub fn usable_capabilities(
+        &self,
+        profile: &str,
+        allow_ralphus_mcp: bool,
+    ) -> StoreResult<Vec<UsableCapability>> {
+        let mut out = Vec::new();
+        for (kind, name) in self.list_enabled_capabilities(profile)? {
+            let Some(item) = self.get_capability_item(kind, &name, allow_ralphus_mcp)? else {
+                continue;
+            };
+            let status: Option<String> = self
+                .conn
+                .query_row(
+                    "SELECT status FROM capability_items WHERE kind = ? AND name = ?",
+                    rusqlite::params![kind.as_str(), name],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            if matches!(status.as_deref(), Some("failing" | "missing")) {
+                continue;
+            }
+            let description = match kind {
+                CapabilityKind::Skill => item
+                    .skill
+                    .as_ref()
+                    .and_then(|s| skill_description(Path::new(&s.path))),
+                CapabilityKind::Mcp if name == RALPHUS_MCP_NAME => {
+                    Some("drives ralphus itself".to_string())
+                }
+                CapabilityKind::Mcp => None,
+            };
+            out.push(UsableCapability {
+                kind,
+                name,
+                description,
+            });
+        }
+        Ok(out)
+    }
+}
+
+/// The `description:` value of a skill folder's `SKILL.md` front matter,
+/// trimmed to [`DESCRIPTION_MAX_CHARS`]; `None` when there is none.
+fn skill_description(root: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(root.join("SKILL.md")).ok()?;
+    let mut lines = text.lines();
+    if lines.next()?.trim() != "---" {
+        return None;
+    }
+    for line in lines {
+        if line.trim() == "---" {
+            break;
+        }
+        if let Some(value) = line.strip_prefix("description:") {
+            let value = value.trim().trim_matches(|c| c == '"' || c == '\'');
+            let value = value.split_whitespace().collect::<Vec<_>>().join(" ");
+            if value.is_empty() {
+                return None;
+            }
+            return Some(value.chars().take(DESCRIPTION_MAX_CHARS).collect());
+        }
+    }
+    None
+}
+
 /// Every file of a skill folder as `{path, content_base64}`.
 ///
 /// # Errors

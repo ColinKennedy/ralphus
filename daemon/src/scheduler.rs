@@ -4039,6 +4039,11 @@ fn run_cell_worker(
     spec.executable = selection.executable.clone();
     if spec.prompt.is_some() {
         spec.capabilities = capabilities_for_agent(store, &row.agent, &selection.backend);
+        if spec.closing_turn_prompt.is_some() {
+            spec.closing_turn_prompt = Some(crate::live_actions::live_handoff_question_for(
+                store, squad_id, &spec.cwd,
+            ));
+        }
     }
     spec.prompt = spec
         .prompt
