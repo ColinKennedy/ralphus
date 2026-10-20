@@ -4725,10 +4725,10 @@ fn check_capability(daemon: &Daemon, kind: &str, name: &str) -> Reply {
             }
         }
     };
-    if let (Some(tools), CapabilityKind::Mcp) = (&tools, kind)
-        && let Err(e) = daemon.lock().set_capability_tools(name, tools)
-    {
-        return store_error(&e);
+    if let (Some(tools), CapabilityKind::Mcp) = (&tools, kind) {
+        if let Err(e) = daemon.lock().set_capability_tools(name, tools) {
+            return store_error(&e);
+        }
     }
     // The built-in ralphus entry is not stored, so there is no row to update.
     let builtin = kind == CapabilityKind::Mcp && name == crate::capability_store::RALPHUS_MCP_NAME;
