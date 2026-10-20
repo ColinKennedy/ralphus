@@ -403,8 +403,8 @@ fn http_agent() -> ureq::Agent {
 /// and video up to 100 MiB (paid plans), and returns no deletable id.
 /// GitLab: project uploads (`POST /projects/:id/uploads`), any type up to 100
 /// MiB, deletable by id. Neither needs the PR/MR to exist yet. GitLab's
-/// project-relative URL is made absolute, so the file shows in an MR filed in
-/// another project of the same fork network too.
+/// upload path is made absolute (see [`gitlab_upload_url`]), so the file shows
+/// in an MR filed in another project of the same fork network too.
 ///
 /// # Errors
 ///
@@ -466,11 +466,10 @@ pub fn upload_attachment(
                 &format!("multipart/form-data; boundary={boundary}"),
                 &body,
             )?;
-            let relative = value["url"]
-                .as_str()
+            let url = gitlab_upload_url(api_base, &target.repo_path, &value)
                 .ok_or_else(|| "GitLab upload returned no URL".to_string())?;
             Ok(Uploaded {
-                url: gitlab_absolute_url(api_base, &target.repo_path, relative),
+                url,
                 upload_id: value["id"].as_i64().map(|id| id.to_string()),
             })
         }
@@ -536,15 +535,28 @@ fn github_uploads_base(api_base: &str) -> String {
     }
 }
 
-/// GitLab's project-relative upload URL (`/uploads/<secret>/<file>`) as an
-/// absolute one under the project's web URL; any other URL is kept as is.
-fn gitlab_absolute_url(api_base: &str, repo_path: &str, url: &str) -> String {
-    if !url.starts_with('/') {
-        return url.to_string();
-    }
+/// The absolute URL of a GitLab upload, from the upload's API answer.
+///
+/// `full_path` is the path the web server actually serves the file at
+/// (`/-/project/<id>/uploads/<secret>/<file>` on current GitLab, where the
+/// `<namespace>/<project>/uploads/...` form answers 404), so it is preferred
+/// and only needs the web base in front. A server that sends no `full_path`
+/// gets its project-relative `url` (`/uploads/<secret>/<file>`) placed under
+/// the project's web URL. A URL that is already absolute is kept as is.
+fn gitlab_upload_url(api_base: &str, repo_path: &str, value: &serde_json::Value) -> Option<String> {
     let web_base = api_base.strip_suffix("/api/v4").unwrap_or(api_base);
+    if let Some(full_path) = value["full_path"].as_str().filter(|p| !p.is_empty()) {
+        if !full_path.starts_with('/') {
+            return Some(full_path.to_string());
+        }
+        return Some(format!("{web_base}{full_path}"));
+    }
+    let url = value["url"].as_str()?;
+    if !url.starts_with('/') {
+        return Some(url.to_string());
+    }
     let project = repo_path.replace("%2F", "/").replace("%2f", "/");
-    format!("{web_base}/{project}{url}")
+    Some(format!("{web_base}/{project}{url}"))
 }
 
 /// Percent-encode a query-string value.
@@ -807,7 +819,9 @@ mod tests {
     fn gitlab_uploads_go_straight_to_the_forge_with_an_absolute_url() {
         let root = TestDir::new();
         captured(root.path(), &[("a.gif", b"GIF89a")]);
-        let (base, forge) = mock_forge(vec![r#"{"id": 5, "url": "/uploads/s3cr3t/a.gif"}"#]);
+        let (base, forge) = mock_forge(vec![
+            r#"{"id": 5, "url": "/uploads/s3cr3t/a.gif", "full_path": "/-/project/42/uploads/s3cr3t/a.gif"}"#,
+        ]);
         let target = UploadTarget {
             forge: UploadForge::Gitlab,
             api_base: format!("{base}/api/v4"),
@@ -818,7 +832,7 @@ mod tests {
         let got = deliver(&req, Some("tok"), root.path(), &NoFfmpeg);
         assert_eq!(
             got[0].url.as_deref(),
-            Some(format!("{base}/acme/w/uploads/s3cr3t/a.gif").as_str())
+            Some(format!("{base}/-/project/42/uploads/s3cr3t/a.gif").as_str())
         );
         assert_eq!(got[0].upload_id.as_deref(), Some("5"));
         let seen = forge.join().unwrap();
@@ -881,18 +895,49 @@ mod tests {
     }
 
     #[test]
-    fn gitlabs_relative_upload_url_becomes_absolute() {
+    fn gitlab_upload_url_prefers_full_path() {
+        let answer = serde_json::json!({
+            "url": "/uploads/x/a.png",
+            "full_path": "/-/project/86439269/uploads/x/a.png",
+        });
         assert_eq!(
-            gitlab_absolute_url(
-                "https://gitlab.example/sub/api/v4",
-                "grp%2Fproj",
-                "/uploads/x/a.png"
-            ),
-            "https://gitlab.example/sub/grp/proj/uploads/x/a.png"
+            gitlab_upload_url("https://gitlab.com/api/v4", "g%2Fp", &answer).as_deref(),
+            Some("https://gitlab.com/-/project/86439269/uploads/x/a.png")
         );
         assert_eq!(
-            gitlab_absolute_url("https://gitlab.com/api/v4", "g%2Fp", "https://cdn/a.png"),
-            "https://cdn/a.png"
+            gitlab_upload_url(
+                "https://gitlab.example/sub/api/v4",
+                "grp%2Fproj",
+                &serde_json::json!({"full_path": "/-/project/7/uploads/x/a.png"})
+            )
+            .as_deref(),
+            Some("https://gitlab.example/sub/-/project/7/uploads/x/a.png")
+        );
+    }
+
+    #[test]
+    fn gitlab_upload_url_without_full_path_uses_the_project_url() {
+        assert_eq!(
+            gitlab_upload_url(
+                "https://gitlab.example/sub/api/v4",
+                "grp%2Fproj",
+                &serde_json::json!({"url": "/uploads/x/a.png"})
+            )
+            .as_deref(),
+            Some("https://gitlab.example/sub/grp/proj/uploads/x/a.png")
+        );
+        assert_eq!(
+            gitlab_upload_url(
+                "https://gitlab.com/api/v4",
+                "g%2Fp",
+                &serde_json::json!({"url": "https://cdn/a.png"})
+            )
+            .as_deref(),
+            Some("https://cdn/a.png")
+        );
+        assert_eq!(
+            gitlab_upload_url("https://gitlab.com/api/v4", "g%2Fp", &serde_json::json!({})),
+            None
         );
     }
 
