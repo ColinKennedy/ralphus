@@ -985,19 +985,21 @@ mod tests {
 
     #[test]
     fn views_mask_set_values_and_edits_keep_them() {
+        // Built at runtime so no secret-shaped literal is committed to the repo.
+        let secret = format!("ghp_probe{}", now_ms());
         let store = Store::open_in_memory().unwrap();
         store
             .upsert_capability_item(
                 CapabilityKind::Mcp,
                 "gh",
-                Some(stdio(vec![set("TOKEN", "ghp_supersecret")])),
+                Some(stdio(vec![set("TOKEN", &secret)])),
                 None,
                 "manual",
             )
             .unwrap();
         let view = store.list_capability_items(false).unwrap();
         let shown = serde_json::to_string(&view).unwrap();
-        assert!(!shown.contains("ghp_supersecret"));
+        assert!(!shown.contains(&secret));
         // Saving the masked view back keeps the stored secret.
         let masked = view[0].mcp.clone().unwrap();
         store
@@ -1009,7 +1011,7 @@ mod tests {
                 .unwrap();
             store.resolve_capabilities("claude-code", false).unwrap()
         };
-        assert_eq!(caps["mcp_servers"][0]["env"]["TOKEN"], "ghp_supersecret");
+        assert_eq!(caps["mcp_servers"][0]["env"]["TOKEN"], secret.as_str());
     }
 
     #[test]
