@@ -13171,23 +13171,34 @@ fn claim_post_merge_checkout_with(
             parent.join(format!("{POST_MERGE_WORKTREE_DIR}-{attempt}"))
         };
         let ws = ws_root.at(&dir);
-        let dir_str = dir.to_string_lossy().to_string();
+        // The directory as its machine names it: what git is told and what the
+        // review records.
+        let dir_str = ws.root_string();
         if is_held(&dir) {
             held.push(dir_str);
             continue;
         }
-        if ws.root().exists() {
+        // A remote directory is seen through the `.git` file a linked
+        // worktree keeps; a provider can read a file but not test a directory.
+        let present = |ws: &Workspace| {
+            if ws.is_local() {
+                ws.root().exists()
+            } else {
+                ws.exists(".git")
+            }
+        };
+        if present(&ws) {
             let _ = combined_ws.git(&["worktree", "remove", "--force", &dir_str]);
         }
-        if ws.root().exists() && !is_valid_linked_worktree(&ws) {
+        if present(&ws) && !is_valid_linked_worktree(&ws) {
             let _ = combined_ws.git(&["worktree", "prune"]);
             if ws.is_local() {
                 let _ = std::fs::remove_dir_all(&dir);
             }
         }
-        if !ws.root().exists() {
+        if !present(&ws) {
             match combined_ws.git(&["worktree", "add", "--detach", &dir_str, tip]) {
-                Ok(_) => return Ok(dir),
+                Ok(_) => return Ok(PathBuf::from(dir_str)),
                 Err(error) => {
                     last_error = format!("post-merge scratch checkout failed: {error}");
                     continue;
@@ -13198,7 +13209,7 @@ fn claim_post_merge_checkout_with(
             match ws.git(&["checkout", "-f", "--detach", tip]) {
                 Ok(_) => {
                     let _ = ws.git(&["clean", "-fdx"]);
-                    return Ok(dir);
+                    return Ok(PathBuf::from(dir_str));
                 }
                 Err(error) => {
                     last_error = format!("post-merge scratch reset failed: {error}");
@@ -15622,18 +15633,17 @@ fn rebased_branch_status(
 /// the current `base_branch`.  If `base_branch` looks like a remote-tracking ref
 /// (e.g. `origin/main`) only refs under that remote are returned; otherwise local
 /// branches are returned.  Returns an empty list on any git error.
-pub fn list_base_branches(git_root: &str, base_branch: &str) -> Vec<String> {
-    let root = Path::new(git_root);
+pub fn list_base_branches(
+    root: &(impl crate::workspace::GitAt + ?Sized),
+    base_branch: &str,
+) -> Vec<String> {
     let ref_prefix = if let Some(slash) = base_branch.find('/') {
         let remote = &base_branch[..slash];
         format!("refs/remotes/{remote}/")
     } else {
         "refs/heads/".to_string()
     };
-    match git(
-        root,
-        &["for-each-ref", "--format=%(refname:short)", &ref_prefix],
-    ) {
+    match root.git_at(&["for-each-ref", "--format=%(refname:short)", &ref_prefix]) {
         Ok(s) => s
             .lines()
             .map(str::trim)

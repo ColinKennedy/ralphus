@@ -7546,8 +7546,9 @@ fn project_branches(daemon: &Daemon, name: &str) -> Reply {
     let project = daemon.with_read_snapshot(|c| Store::get_project_conn(c, name));
     match project {
         Ok(Some(p)) if p.vcs == "git" => {
-            let mut branches = crate::guardian_merge::list_base_branches(&p.path, "main");
-            for b in crate::guardian_merge::list_base_branches(&p.path, "origin/HEAD") {
+            let mut branches =
+                crate::guardian_merge::list_base_branches(Path::new(&p.path), "main");
+            for b in crate::guardian_merge::list_base_branches(Path::new(&p.path), "origin/HEAD") {
                 if !branches.contains(&b) {
                     branches.push(b);
                 }
@@ -20552,8 +20553,14 @@ fn guardian_base_branches(daemon: &Daemon, id: &str) -> Reply {
         Ok(g) => g,
         Err(e) => return store_error(&e),
     };
-    let branches =
-        crate::guardian_merge::list_base_branches(&guardian.git_root, &guardian.base_branch);
+    // The review's branches live where its repository does: its machine for
+    // a remote review.
+    let ws = crate::workspace::Workspace::for_guardian(
+        &daemon.store_handle(),
+        id,
+        guardian.git_root.as_str(),
+    );
+    let branches = crate::guardian_merge::list_base_branches(&ws, &guardian.base_branch);
     json(200, &branches)
 }
 

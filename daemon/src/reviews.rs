@@ -745,6 +745,19 @@ pub fn collect_remote_upstream_prefetch_targets(
     let tasks_by_idx: BTreeMap<i64, &TaskRow> = tasks.iter().map(|t| (t.idx, t)).collect();
     for (pos, (_, rev_id_opt)) in cell_info.iter().enumerate() {
         let Some(rev_id) = rev_id_opt else { continue };
+        // A review fed by a remote cell takes its declared upstream as written
+        // (see `remote_cell_derivation`); nothing is fetched into the daemon's
+        // checkout for it.
+        if cells[pos]
+            .machine
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|m| {
+                !m.is_empty() && !m.eq_ignore_ascii_case(ralphus_core::schema::LOCAL_MACHINE)
+            })
+        {
+            continue;
+        }
         let Some(upstream) = review_map
             .get(rev_id)
             .copied()
