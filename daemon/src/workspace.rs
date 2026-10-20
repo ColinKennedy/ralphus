@@ -1025,7 +1025,7 @@ fn copy_local_artifact(
 }
 
 #[cfg(unix)]
-fn set_executable(path: &Path) -> Result<(), String> {
+pub(crate) fn set_executable(path: &Path) -> Result<(), String> {
     use std::os::unix::fs::PermissionsExt;
 
     let mut permissions = std::fs::metadata(path)
@@ -1041,7 +1041,7 @@ fn set_executable(path: &Path) -> Result<(), String> {
 }
 
 #[cfg(not(unix))]
-fn set_executable(_path: &Path) -> Result<(), String> {
+pub(crate) fn set_executable(_path: &Path) -> Result<(), String> {
     Ok(())
 }
 

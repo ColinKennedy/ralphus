@@ -114,6 +114,11 @@ pub struct MachineProviderView {
 /// an explicit error rather than invoked and hoped for.
 pub const PROTOCOL_VERSION: i64 = 1;
 
+/// The provider-service contract version (`docs/machine-provider-service.md`):
+/// what a provider service's allocation API and an allocation's Machine API
+/// both reply with.
+pub const SERVICE_PROTOCOL_VERSION: i64 = 2;
+
 /// How a `machine` value resolved.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ResolvedMachine {

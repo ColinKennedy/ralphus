@@ -21,7 +21,8 @@
 //! `&dyn Runner` call and nothing above it needs to know a machine exists.
 
 use std::collections::BTreeMap;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
+use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -29,7 +30,7 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 
 use crate::cancel::CancelToken;
-use crate::machines::{PROTOCOL_VERSION, ResolvedMachine};
+use crate::machines::{PROTOCOL_VERSION, ResolvedMachine, SERVICE_PROTOCOL_VERSION};
 use crate::runner::{EVENT_MARKER, LiveUsage, Runner, RunnerResult, RunnerSpec};
 use crate::store::Store;
 
@@ -415,6 +416,152 @@ struct ProviderResponse {
     /// Display-only -- see [`RetirementOutcome::Deferred`].
     #[serde(default)]
     retry_at_ms: Option<i64>,
+    /// Machine API replies only (contract v2): what kind of refusal an
+    /// `ok: false` reply is, e.g. `unreachable` or `unknown_allocation`.
+    #[serde(default)]
+    reason_code: Option<String>,
+    /// Machine API replies only: what the user should do about a refusal,
+    /// shown verbatim.
+    #[serde(default)]
+    remediation: Option<String>,
+    /// Machine API replies only: the runner's `RALPHUS_EVENT:` payloads,
+    /// oldest first -- what a program provider writes to stderr instead.
+    #[serde(default)]
+    events: Vec<String>,
+    /// `materialize` over the Machine API only: the selected files, since the
+    /// machine cannot write onto the daemon host itself.
+    #[serde(default)]
+    files: Vec<MaterializedFile>,
+}
+
+/// One file of a Machine API `materialize` reply.
+#[derive(Debug, Deserialize)]
+struct MaterializedFile {
+    /// Where the file goes, relative to the requested destination and
+    /// `/`-separated; empty when the source was this one file.
+    #[serde(default)]
+    path: String,
+    content_base64: String,
+    #[serde(default)]
+    executable: bool,
+}
+
+/// How a [`ProviderRunner`] reaches its machine.
+enum Transport {
+    /// A program provider (contract v1): one process per verb, the request on
+    /// stdin, the reply on stdout and `RALPHUS_EVENT:` lines on stderr.
+    Program {
+        /// Provider program path.
+        program: String,
+        /// Arguments always prepended, before the verb.
+        args: Vec<String>,
+    },
+    /// An allocation's Machine API (contract v2): `POST <endpoint>/<verb>`.
+    Http {
+        endpoint: String,
+        /// The allocation's bearer token. Sent only as a header, never
+        /// logged.
+        token: String,
+    },
+}
+
+/// The agent for Machine API calls. `exec` may run a whole cell
+/// synchronously when the machine does not hand back a handle, so a reply is
+/// allowed to take as long as a cell may.
+fn machine_api_agent() -> &'static ureq::Agent {
+    static AGENT: std::sync::LazyLock<ureq::Agent> = std::sync::LazyLock::new(|| {
+        crate::forge::bounded_http_agent(Duration::from_secs(24 * 60 * 60))
+    });
+    &AGENT
+}
+
+/// The JSON body for a Machine API call: the v1 stdin payload (an object, or
+/// nothing), with the v1 `--handle`/`--since` flags as fields.
+fn machine_api_body(payload: &str, extra: &[String]) -> Result<serde_json::Value, String> {
+    let mut body = if payload.trim().is_empty() {
+        serde_json::Value::Object(serde_json::Map::new())
+    } else {
+        serde_json::from_str(payload).map_err(|e| format!("request is not JSON: {e}"))?
+    };
+    let fields = body
+        .as_object_mut()
+        .ok_or_else(|| "request is not a JSON object".to_string())?;
+    for pair in extra.chunks(2) {
+        let [flag, value] = pair else {
+            return Err(format!("flag {:?} has no value", pair[0]));
+        };
+        match flag.as_str() {
+            "--handle" => {
+                fields.insert("handle".into(), value.clone().into());
+            }
+            "--since" => {
+                let since: i64 = value
+                    .parse()
+                    .map_err(|_| format!("--since {value:?} is not a number"))?;
+                fields.insert("since".into(), since.into());
+            }
+            other => return Err(format!("no Machine API field for flag {other:?}")),
+        }
+    }
+    Ok(body)
+}
+
+/// Forward one `RALPHUS_EVENT:` payload to Cartographer and keep its usage
+/// snapshot, whichever transport it arrived on.
+fn forward_event(
+    cartographer: Option<&crate::store_lock::StoreHandle>,
+    spec: (&str, &str, &str),
+    live_usage: &Mutex<Option<LiveUsage>>,
+    json: &str,
+) {
+    let (squad_id, cell_id, task) = spec;
+    let fwd = crate::runner::forward_runner_event(cartographer, squad_id, cell_id, task, json);
+    // RAL-161/RAL-201: keep the latest snapshot so a caller polling this
+    // handle can enforce `maximum_budget_usd` the same way a local cell does
+    // -- without this a remote cell's live cost cap is silently unenforced
+    // (usage still lands in the DB via `forward_runner_event`, but nothing
+    // acts on it mid-run).
+    if let Some(usage) = fwd.live_usage {
+        *live_usage.lock().expect("poisoned") = Some(usage);
+    }
+}
+
+/// Write a Machine API `materialize` reply's files under `destination`.
+fn write_materialized(destination: &Path, files: &[MaterializedFile]) -> Result<(), String> {
+    use base64::Engine as _;
+    if files.is_empty() {
+        return Err("the machine returned no files".to_string());
+    }
+    for file in files {
+        let relative = Path::new(&file.path);
+        let escapes = relative
+            .components()
+            .any(|c| !matches!(c, std::path::Component::Normal(_)));
+        if !file.path.is_empty() && escapes {
+            return Err(format!(
+                "the machine returned file {:?}, which is not a plain relative path",
+                file.path
+            ));
+        }
+        let target = if file.path.is_empty() {
+            destination.to_path_buf()
+        } else {
+            destination.join(relative)
+        };
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(&file.content_base64)
+            .map_err(|e| format!("file {:?} is not valid base64: {e}", file.path))?;
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("could not create {}: {e}", parent.display()))?;
+        }
+        std::fs::write(&target, bytes)
+            .map_err(|e| format!("could not write {}: {e}", target.display()))?;
+        if file.executable {
+            crate::workspace::set_executable(&target)?;
+        }
+    }
+    Ok(())
 }
 
 /// Releases a remote run's waypoint-halt and Arbiter-stop registrations when
@@ -449,15 +596,15 @@ impl Drop for LivenessEntry<'_> {
     }
 }
 
-/// Runs cells on one machine by invoking a registered provider program.
+/// Runs cells on one machine, through a registered provider program or an
+/// allocation's Machine API.
 pub struct ProviderRunner {
-    /// Provider program path.
-    program: String,
-    /// Arguments always prepended, before the verb.
-    args: Vec<String>,
-    /// The scheme this provider was registered under, for diagnostics.
+    transport: Transport,
+    /// The scheme this provider was registered under (a program provider) or
+    /// the provider service's name, for diagnostics.
     scheme: String,
-    /// The opaque machine uri, passed through verbatim.
+    /// The opaque machine uri, passed through verbatim (a program provider),
+    /// or the allocation id.
     uri: String,
     /// Whether this provider implements the `channel` verb (RAL-185 D7). When
     /// true, `run` commands reuse one long-lived process instead of spawning
@@ -497,11 +644,40 @@ impl ProviderRunner {
         scheme: impl Into<String>,
         uri: impl Into<String>,
     ) -> Self {
+        Self::with_transport(
+            Transport::Program {
+                program: program.into(),
+                args,
+            },
+            scheme.into(),
+            uri.into(),
+        )
+    }
+
+    /// Build a runner for one allocation of a provider service, reached
+    /// through its Machine API at `endpoint` with the allocation's `token`.
+    #[must_use]
+    pub fn over_http(
+        provider: impl Into<String>,
+        allocation_id: impl Into<String>,
+        endpoint: impl Into<String>,
+        token: impl Into<String>,
+    ) -> Self {
+        Self::with_transport(
+            Transport::Http {
+                endpoint: endpoint.into().trim_end_matches('/').to_string(),
+                token: token.into(),
+            },
+            provider.into(),
+            allocation_id.into(),
+        )
+    }
+
+    fn with_transport(transport: Transport, scheme: String, uri: String) -> Self {
         Self {
-            program: program.into(),
-            args,
-            scheme: scheme.into(),
-            uri: uri.into(),
+            transport,
+            scheme,
+            uri,
             supports_channel: false,
             cartographer: None,
             live_usage: Arc::new(Mutex::new(None)),
@@ -572,8 +748,14 @@ impl ProviderRunner {
         spec: &RunnerSpec,
         extra: &[String],
     ) -> Result<ProviderResponse, String> {
-        let mut cmd = Command::new(&self.program);
-        cmd.args(&self.args)
+        let (program, args) = match &self.transport {
+            Transport::Program { program, args } => (program, args),
+            Transport::Http { endpoint, token } => {
+                return self.invoke_http(endpoint, token, verb, payload, spec, extra);
+            }
+        };
+        let mut cmd = Command::new(program);
+        cmd.args(args)
             .arg(verb)
             .arg("--uri")
             .arg(&self.uri)
@@ -588,8 +770,8 @@ impl ProviderRunner {
         }
         let mut child = cmd.spawn().map_err(|e| {
             format!(
-                "could not run machine provider {:?} ({}): {e}",
-                self.scheme, self.program
+                "could not run machine provider {:?} ({program}): {e}",
+                self.scheme
             )
         })?;
         // ralphus[ignore-rlog-pair]: this low-level helper has no Store; its Store-owning caller records the structured workflow outcome
@@ -622,23 +804,12 @@ impl ProviderRunner {
                 let mut tail = String::new();
                 for line in BufReader::new(stderr).lines().map_while(Result::ok) {
                     if let Some(json) = line.trim_end().strip_prefix(EVENT_MARKER) {
-                        let fwd = crate::runner::forward_runner_event(
+                        forward_event(
                             cartographer.as_ref(),
-                            &squad_id,
-                            &cell_id,
-                            &task,
+                            (&squad_id, &cell_id, &task),
+                            &live_usage,
                             json,
                         );
-                        // RAL-161/RAL-201: keep the latest snapshot so a
-                        // caller polling this handle can enforce
-                        // `maximum_budget_usd` the same way a local cell
-                        // does -- without this a remote cell's live cost
-                        // cap is silently unenforced (usage still lands in
-                        // the DB via `forward_runner_event`, but nothing acts
-                        // on it mid-run).
-                        if let Some(usage) = fwd.live_usage {
-                            *live_usage.lock().expect("poisoned") = Some(usage);
-                        }
                     } else {
                         // Keep a bounded tail purely so a provider that dies
                         // without valid JSON can still explain itself.
@@ -685,29 +856,120 @@ impl ProviderRunner {
         self.check_response(verb, resp)
     }
 
+    /// [`Self::invoke_with`] over an allocation's Machine API: the same
+    /// request as JSON to `POST <endpoint>/<verb>`, the same reply, and the
+    /// runner's events from the reply's `events` instead of stderr.
+    fn invoke_http(
+        &self,
+        endpoint: &str,
+        token: &str,
+        verb: &str,
+        payload: &str,
+        spec: &RunnerSpec,
+        extra: &[String],
+    ) -> Result<ProviderResponse, String> {
+        let body = machine_api_body(payload, extra).map_err(|e| {
+            format!(
+                "machine provider {:?}: could not build the {verb} request: {e}",
+                self.scheme
+            )
+        })?;
+        let url = format!("{endpoint}/{verb}");
+        // ralphus[ignore-rlog-pair]: this low-level helper has no Store; its Store-owning caller records the structured workflow outcome
+        crate::rlog!(
+            INFO,
+            "ralphus [remote] provider service {} verb={verb} allocation={} squad={} cell={}",
+            self.scheme,
+            self.uri,
+            spec.squad_id,
+            spec.cell_id
+        );
+        let reply = machine_api_agent()
+            .post(&url)
+            .set("Authorization", &format!("Bearer {token}"))
+            .set("Content-Type", "application/json")
+            .send_string(&body.to_string());
+        let (status, reply) = match reply {
+            Ok(resp) => (resp.status(), resp),
+            Err(ureq::Error::Status(code, resp)) => (code, resp),
+            Err(e) => {
+                return Err(format!(
+                    "machine provider {:?} could not be reached at {url}: {e}; check that the \
+                     provider service is running and reachable from the daemon host",
+                    self.scheme
+                ));
+            }
+        };
+        let mut text = String::new();
+        reply.into_reader().read_to_string(&mut text).map_err(|e| {
+            format!(
+                "machine provider {:?} reply to {verb} could not be read: {e}",
+                self.scheme
+            )
+        })?;
+        let resp: ProviderResponse = serde_json::from_str(text.trim()).map_err(|e| {
+            format!(
+                "machine provider {:?} answered {verb} with HTTP {status} and unparseable JSON: \
+                 {e} ({})",
+                self.scheme,
+                redact_remote_text(&truncate(text.trim(), 300))
+            )
+        })?;
+        for event in &resp.events {
+            forward_event(
+                self.cartographer.as_ref(),
+                (&spec.squad_id, &spec.cell_id, &spec.task),
+                &self.live_usage,
+                event,
+            );
+        }
+        let resp = self.check_response(verb, resp)?;
+        if status >= 400 {
+            return Err(format!(
+                "machine provider {:?} answered {verb} with HTTP {status}",
+                self.scheme
+            ));
+        }
+        Ok(resp)
+    }
+
     /// The checks every provider reply gets, whether it came from a one-shot
-    /// spawn or a channel: secrets redacted, the contract version accepted,
-    /// and an `ok: false` reply turned into an error rather than read as an
-    /// empty success.
+    /// spawn, a channel or a Machine API: secrets redacted, the contract
+    /// version accepted, and an `ok: false` reply turned into an error rather
+    /// than read as an empty success.
     fn check_response(
         &self,
         verb: &str,
         mut resp: ProviderResponse,
     ) -> Result<ProviderResponse, String> {
         redact_provider_response(&mut resp);
+        let expected = match self.transport {
+            Transport::Program { .. } => PROTOCOL_VERSION,
+            Transport::Http { .. } => SERVICE_PROTOCOL_VERSION,
+        };
         // A provider declaring the wrong contract version is refused rather
         // than trusted -- the whole point of versioning it (1.13).
         if let Some(v) = resp.protocol_version {
-            if v != PROTOCOL_VERSION {
+            if v != expected {
                 return Err(format!(
-                    "machine provider {:?} replied with contract version {v}, but this daemon implements {PROTOCOL_VERSION}",
+                    "machine provider {:?} replied with contract version {v}, but this daemon implements {expected}",
                     self.scheme
                 ));
             }
         }
         if !resp.ok {
+            let reason = resp
+                .reason_code
+                .as_deref()
+                .map(|code| format!(" [{code}]"))
+                .unwrap_or_default();
+            let remediation = resp
+                .remediation
+                .as_deref()
+                .map(|r| format!("; {r}"))
+                .unwrap_or_default();
             return Err(format!(
-                "machine provider {:?} rejected the {verb}: {}",
+                "machine provider {:?} rejected the {verb}{reason}: {}{remediation}",
                 self.scheme,
                 resp.error.as_deref().unwrap_or("no reason given")
             ));
@@ -757,6 +1019,7 @@ fn redact_remote_text(text: &str) -> String {
 fn redact_provider_response(response: &mut ProviderResponse) {
     for text in [
         &mut response.error,
+        &mut response.remediation,
         &mut response.output,
         &mut response.detail,
         &mut response.stdout,
@@ -1409,10 +1672,13 @@ impl ProviderRunner {
     /// the fallback is semantically identical, only slower. A *command* that
     /// runs and fails still fails, because that arrives as a normal reply.
     fn run_via_channel(&self, payload: &str) -> Option<ProviderResponse> {
+        let Transport::Program { program, args } = &self.transport else {
+            return None;
+        };
         if !self.supports_channel {
             return None;
         }
-        match crate::channel::request(&self.scheme, &self.uri, &self.program, &self.args, payload) {
+        match crate::channel::request(&self.scheme, &self.uri, program, args, payload) {
             Ok(line) => match serde_json::from_str::<ProviderResponse>(&line) {
                 Ok(resp) => Some(resp),
                 Err(e) => {
@@ -1531,7 +1797,18 @@ impl ProviderRunner {
             executable,
         })
         .map_err(|e| format!("could not serialize materialize request: {e}"))?;
-        self.invoke(VERB_MATERIALIZE, &payload, spec).map(|_| ())
+        let resp = self.invoke(VERB_MATERIALIZE, &payload, spec)?;
+        match self.transport {
+            // A program provider runs on the daemon host and wrote the files.
+            Transport::Program { .. } => Ok(()),
+            Transport::Http { .. } => write_materialized(Path::new(destination), &resp.files)
+                .map_err(|e| {
+                    format!(
+                        "machine provider {:?} materialize of {source:?}: {e}",
+                        self.scheme
+                    )
+                }),
+        }
     }
 
     /// Best-effort cleanup of one `probe_remote_root` scratch file after a
@@ -3490,5 +3767,229 @@ else:
         async_provider
             .cleanup(&cleanup_req("proj"), &spec(Some("asyncscheme:Y")))
             .expect("async provider's cleanup must dispatch generically");
+    }
+
+    /// One request a [`machine_api`] stand-in received: `(url, authorization
+    /// header, body)`.
+    type SeenRequest = (String, String, serde_json::Value);
+
+    /// A Machine API stand-in: answers each verb with its `(verb, status,
+    /// body)` entry in `replies` until a second passes with no request, and
+    /// hands back what each request was: `(url, authorization header, body)`.
+    fn machine_api(
+        replies: Vec<(&'static str, u16, String)>,
+    ) -> (String, std::thread::JoinHandle<Vec<SeenRequest>>) {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}/v1/m/alloc-1/", server.server_addr());
+        let handle = std::thread::spawn(move || {
+            let mut seen = Vec::new();
+            loop {
+                let wait = Duration::from_secs(if seen.is_empty() { 30 } else { 1 });
+                let Ok(Some(mut req)) = server.recv_timeout(wait) else {
+                    break;
+                };
+                let verb = req.url().rsplit('/').next().unwrap_or_default().to_string();
+                let (status, reply) = replies
+                    .iter()
+                    .find(|(v, ..)| *v == verb)
+                    .map(|(_, status, body)| (*status, body.clone()))
+                    .unwrap_or((404, format!("no stub reply for {verb}")));
+                let auth = req
+                    .headers()
+                    .iter()
+                    .find(|h| h.field.equiv("Authorization"))
+                    .map(|h| h.value.to_string())
+                    .unwrap_or_default();
+                let mut body = String::new();
+                req.as_reader().read_to_string(&mut body).unwrap();
+                seen.push((
+                    req.url().to_string(),
+                    auth,
+                    serde_json::from_str(&body).unwrap_or(serde_json::Value::Null),
+                ));
+                let _ =
+                    req.respond(tiny_http::Response::from_string(reply).with_status_code(status));
+            }
+            seen
+        });
+        (endpoint, handle)
+    }
+
+    #[test]
+    fn a_machine_api_exec_posts_the_spec_and_forwards_reply_events() {
+        let event = r#"{"source":"llm-invoke","message":"done","payload":{}}"#;
+        let reply = serde_json::json!({
+            "ok": true,
+            "protocol_version": 2,
+            "events": [event],
+            "result": {"status": "done", "summary": "ran on the allocation"},
+        });
+        let (endpoint, server) = machine_api(vec![(VERB_EXEC, 200, reply.to_string())]);
+        let s = store();
+        let provider = ProviderRunner::over_http("fleet", "alloc-1", endpoint, "alloc-token")
+            .with_cartographer(Arc::clone(&s));
+
+        let r = provider.run(&spec(Some("fleet")));
+
+        assert_eq!(r.status, "done", "{r:?}");
+        assert_eq!(r.summary, "ran on the allocation");
+        let seen = server.join().unwrap();
+        assert_eq!(seen.len(), 1);
+        let (url, auth, body) = &seen[0];
+        assert_eq!(url, "/v1/m/alloc-1/exec");
+        assert_eq!(auth, "Bearer alloc-token");
+        assert_eq!(body["cell_id"], "s0");
+        let page = s
+            .lock()
+            .cartographer_query(&crate::cartographer::CartographerFilter {
+                squad_id: Some("squad-1".to_string()),
+                ..crate::cartographer::CartographerFilter::recent(50)
+            })
+            .unwrap();
+        assert!(
+            page.rows.iter().any(|row| row.source == "llm-invoke"),
+            "a reply's events must reach Cartographer like stderr markers do"
+        );
+    }
+
+    #[test]
+    fn a_machine_api_handle_verb_sends_the_handle_and_cursor_as_fields() {
+        let (endpoint, server) = machine_api(vec![
+            (
+                VERB_EXEC,
+                200,
+                r#"{"ok":true,"protocol_version":2,"handle":"job-9"}"#.to_string(),
+            ),
+            (
+                VERB_STATUS,
+                200,
+                r#"{"ok":true,"protocol_version":2,"state":"done","result":{"status":"done","summary":"async"}}"#
+                    .to_string(),
+            ),
+            (
+                VERB_STREAM,
+                200,
+                r#"{"ok":true,"protocol_version":2,"output":"","next":0}"#.to_string(),
+            ),
+        ]);
+        let provider = ProviderRunner::over_http("fleet", "alloc-1", endpoint, "t");
+
+        let r = provider.run(&spec(Some("fleet")));
+
+        assert_eq!(r.status, "done", "{r:?}");
+        let seen = server.join().unwrap();
+        let status = seen
+            .iter()
+            .find(|(url, ..)| url.ends_with("/status"))
+            .expect("the handle is polled");
+        assert_eq!(status.2["handle"], "job-9");
+    }
+
+    #[test]
+    fn a_machine_api_refusal_carries_its_reason_and_remediation() {
+        let reply = r#"{"ok":false,"protocol_version":2,"error":"wslbox is powered off","reason_code":"unreachable","remediation":"start the machine or pick another provider"}"#;
+        let (endpoint, server) = machine_api(vec![("ping", 503, reply.to_string())]);
+        let provider = ProviderRunner::over_http("fleet", "alloc-1", endpoint, "t");
+
+        let err = provider.ping(&spec(Some("fleet"))).expect_err("refused");
+
+        assert!(err.contains("[unreachable]"), "{err}");
+        assert!(err.contains("wslbox is powered off"), "{err}");
+        assert!(err.contains("start the machine"), "{err}");
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn a_machine_api_reply_must_declare_the_service_contract() {
+        let (endpoint, server) = machine_api(vec![(
+            "ping",
+            200,
+            r#"{"ok":true,"protocol_version":1}"#.to_string(),
+        )]);
+        let provider = ProviderRunner::over_http("fleet", "alloc-1", endpoint, "t");
+
+        let err = provider.ping(&spec(Some("fleet"))).expect_err("v1 reply");
+
+        assert!(err.contains("contract version 1"), "{err}");
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn an_unreachable_machine_api_says_where_it_looked() {
+        // Bind and drop a listener so the port is known to be closed.
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let provider = ProviderRunner::over_http(
+            "fleet",
+            "alloc-1",
+            format!("http://127.0.0.1:{port}/v1/m/alloc-1"),
+            "secret-token-value",
+        );
+
+        let err = provider
+            .ping(&spec(Some("fleet")))
+            .expect_err("closed port");
+
+        assert!(
+            err.contains(&format!("127.0.0.1:{port}/v1/m/alloc-1/ping")),
+            "{err}"
+        );
+        assert!(!err.contains("secret-token-value"), "{err}");
+    }
+
+    #[test]
+    fn a_machine_api_materialize_writes_the_returned_files_here() {
+        use base64::Engine as _;
+        let encode = |s: &str| base64::engine::general_purpose::STANDARD.encode(s);
+        let reply = serde_json::json!({
+            "ok": true,
+            "protocol_version": 2,
+            "files": [
+                {"path": "shot.png", "content_base64": encode("png bytes")},
+                {"path": "clips/run.gif", "content_base64": encode("gif bytes")},
+            ],
+        });
+        let (endpoint, server) = machine_api(vec![(VERB_MATERIALIZE, 200, reply.to_string())]);
+        let provider = ProviderRunner::over_http("fleet", "alloc-1", endpoint, "t");
+        let dest = std::env::temp_dir().join(format!("ral-fleet-mat-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dest);
+
+        provider
+            .materialize(
+                "/m/exhibits",
+                &dest.to_string_lossy(),
+                false,
+                &spec(Some("fleet")),
+            )
+            .expect("materialized");
+
+        assert_eq!(
+            std::fs::read_to_string(dest.join("shot.png")).unwrap(),
+            "png bytes"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dest.join("clips").join("run.gif")).unwrap(),
+            "gif bytes"
+        );
+        server.join().unwrap();
+        let _ = std::fs::remove_dir_all(&dest);
+    }
+
+    #[test]
+    fn a_machine_api_materialize_refuses_paths_outside_the_destination() {
+        let dest = std::env::temp_dir().join(format!("ral-fleet-esc-{}", std::process::id()));
+        for path in ["../escape.txt", "/etc/escape.txt", "a/../../escape.txt"] {
+            let files = [MaterializedFile {
+                path: path.to_string(),
+                content_base64: String::new(),
+                executable: false,
+            }];
+            let err = write_materialized(&dest, &files).expect_err(path);
+            assert!(err.contains("not a plain relative path"), "{path}: {err}");
+        }
+        assert!(!dest.exists());
     }
 }
