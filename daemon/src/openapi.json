@@ -4741,6 +4741,47 @@
         "description": "Destructive: removes or irreversibly changes state."
       }
     },
+    "/api/ingest": {
+      "post": {
+        "operationId": "postIngest",
+        "summary": "Backs `ralphus ingest`.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/JsonObject"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Dry run: the resolved base, agent and task descriptions, without creating anything.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/JsonValue"
+                }
+              }
+            }
+          },
+          "201": {
+            "description": "Created: the squad, review and per-branch cells.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/JsonValue"
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
     "/api/internal/fork-credential": {
       "get": {
         "operationId": "getInternalForkCredential",
