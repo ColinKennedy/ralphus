@@ -535,6 +535,31 @@ tool guidance, but without the waypoint section (`waypoint_context` false). The 
   /api/squads/{id}/cells/{t}/{c}/live-handoffs`, shown by `ralphus cell show`)
   and turned into its review's **live actions** when the review first runs
   them.
+- **`EXHIBIT: <kind> | <what to show>`** — an **exhibit request** inside a live
+  handoff (a line of the handoff's text, not a `RALPHUS_` marker, so it does
+  not end the handoff). `<kind>` is `gif`, `video`, `screenshot` or `output`
+  (case-insensitive; anything else is ignored and logged). At most four per
+  handoff. Lifted out of the handoff text by `exhibits::split_handoff` before
+  deduplication and carried to the merged live action by handoff number, so
+  dedupe can neither drop nor reassign one; each becomes an **exhibit slot**.
+- **`RALPHUS_EXHIBIT: {json}`** — one line per exhibit slot in a live run
+  agent's reply: `{"slot": "<action>.<slot>", "file": "<name in
+  $RALPHUS_EXHIBIT_DIR>", "caption": "..."}` or `{"slot": "...", "missing":
+  "<why>"}`. Parsed by `exhibits::parse_reports`; a line naming another
+  action's slot, an unknown slot, or a file outside the run's exhibit
+  directory is ignored and logged. Slots a run leaves unreported get one
+  follow-up turn (the same session resumed where the backend supports it).
+- **`EXHIBIT_REQUEST: {json}`** — the PR writer's own exhibit requests, in the
+  header of its reply (before `===DESCRIPTION===`), when the review's
+  `infer_exhibits` setting is on: `{"owner": <live action id> | "new", "kind":
+  ..., "describe": ..., "why": ...}`. Parsed by `exhibits::parse_inferred`;
+  `owner` is only honoured when that action covers the PR's branch.
+- **`<!-- ralphus:exhibits:start -->` … `<!-- ralphus:exhibits:end -->`** and
+  **`<!-- ralphus:exhibit:start action=<a> slot=<s> -->` … `<!--
+  ralphus:exhibit:end action=<a> slot=<s> -->`** — the managed `## Exhibits`
+  section of a PR/MR description and one slot's block inside it. Only the
+  text between a slot's own markers is ever rewritten (a re-run replaces it);
+  a slot whose markers were edited is skipped and logged, never repaired.
 - **`RALPHUS_PROPHECY: <kind>: <note>`** — an append-only design note from
   a prompt cell. Every standalone marker line is carried in the runner
   result, rather than only the last one; `<kind>` is one of `discovery`,

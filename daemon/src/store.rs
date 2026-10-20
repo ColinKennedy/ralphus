@@ -1156,6 +1156,24 @@ pub struct ProjectReviewSettings {
     /// block (and whose own per-review override) leaves the cap unset.
     #[serde(default)]
     pub base_shift_maximum_rebuilds: Option<u32>,
+    /// Project default for whether reviews collect exhibits (screenshots,
+    /// GIFs, videos) for their PRs/MRs. Unset resolves to `true`.
+    #[serde(default)]
+    pub exhibits_enabled: Option<bool>,
+    /// Project default for the most exhibits one PR/MR shows (at least 1).
+    #[serde(default)]
+    pub exhibits_max_per_pr: Option<u32>,
+    /// Project default for whether a live run may propose exhibits nobody
+    /// asked for. Unset resolves to `true`.
+    #[serde(default)]
+    pub infer_exhibits: Option<bool>,
+    /// Project default for the exhibit kinds to try, most preferred first
+    /// (a non-empty, duplicate-free subset of `gif`/`video`/`screenshot`).
+    #[serde(default)]
+    pub exhibit_kind_preference: Option<Vec<String>>,
+    /// Project default for the longest video exhibit, in seconds (at least 1).
+    #[serde(default)]
+    pub exhibit_max_video_seconds: Option<u32>,
     /// RAL-476: fallback owning user for a review whose squad has no
     /// `submitter` of its own (e.g. an auto-review triggered with no
     /// explicit submission) -- see `Store::create_guardian_keyed`'s owner
@@ -1234,6 +1252,11 @@ impl ProjectReviewSettings {
             // just above -- DB-backed project settings don't cover this one either.
             retry_after_unknown_default_seconds: None,
             base_shift_maximum_rebuilds: self.base_shift_maximum_rebuilds,
+            exhibits_enabled: self.exhibits_enabled,
+            exhibits_max_per_pr: self.exhibits_max_per_pr,
+            infer_exhibits: self.infer_exhibits,
+            exhibit_kind_preference: self.exhibit_kind_preference,
+            exhibit_max_video_seconds: self.exhibit_max_video_seconds,
         }
     }
 }
@@ -2898,6 +2921,49 @@ impl Store {
                 action_idx  INTEGER NOT NULL,
                 branch_id   TEXT NOT NULL,
                 PRIMARY KEY (guardian_id, action_idx, branch_id)
+            );
+            -- Exhibit slots (`crate::exhibits`): what a reviewer should be
+            -- shown, one row per request, owned by exactly one live action.
+            -- `origin` is `handoff`, `recipe` or `inferred`.
+            CREATE TABLE IF NOT EXISTS guardian_exhibit_requests (
+                guardian_id   TEXT NOT NULL REFERENCES guardians(id) ON DELETE CASCADE,
+                action_idx    INTEGER NOT NULL,
+                slot_idx      INTEGER NOT NULL,
+                kind          TEXT NOT NULL,
+                describe      TEXT NOT NULL,
+                origin        TEXT NOT NULL,
+                why           TEXT,
+                created_at_ms INTEGER NOT NULL,
+                PRIMARY KEY (guardian_id, action_idx, slot_idx)
+            );
+            -- Exhibit requests the PR writer added before the review had a
+            -- live action for their branch; assigned to slots when the
+            -- review's live actions are written.
+            CREATE TABLE IF NOT EXISTS guardian_pending_exhibits (
+                guardian_id   TEXT NOT NULL REFERENCES guardians(id) ON DELETE CASCADE,
+                branch_id     TEXT NOT NULL,
+                kind          TEXT NOT NULL,
+                describe      TEXT NOT NULL,
+                why           TEXT,
+                created_at_ms INTEGER NOT NULL
+            );
+            -- What a live run delivered for an exhibit slot; a re-run
+            -- replaces the row.
+            CREATE TABLE IF NOT EXISTS guardian_exhibit_fills (
+                guardian_id     TEXT NOT NULL REFERENCES guardians(id) ON DELETE CASCADE,
+                action_idx      INTEGER NOT NULL,
+                slot_idx        INTEGER NOT NULL,
+                delivered_kind  TEXT,
+                url             TEXT,
+                caption         TEXT,
+                text            TEXT,
+                missing_reason  TEXT,
+                local_path      TEXT,
+                forge_upload_id TEXT,
+                stale_upload_ids TEXT,
+                run_id          TEXT,
+                updated_at_ms   INTEGER NOT NULL,
+                PRIMARY KEY (guardian_id, action_idx, slot_idx)
             );
             -- A PR whose `## Live-Test Results` section needs re-rendering.
             -- A row lives until the forge accepts the update.
@@ -4618,6 +4684,15 @@ impl Store {
             // worktree exhausting its attempts can no longer stop automatic
             // rebuild for the review's other worktrees.
             "ALTER TABLE guardians ADD COLUMN base_shift_rebuild_attempts_by_project TEXT",
+            // Exhibits (`crate::exhibits`): this review's own overrides of the
+            // exhibit settings. NULL inherits the project/global default;
+            // `exhibit_kind_preference` is a JSON array of kind names, most
+            // preferred first.
+            "ALTER TABLE guardians ADD COLUMN exhibits_enabled INTEGER",
+            "ALTER TABLE guardians ADD COLUMN exhibits_max_per_pr INTEGER",
+            "ALTER TABLE guardians ADD COLUMN infer_exhibits INTEGER",
+            "ALTER TABLE guardians ADD COLUMN exhibit_kind_preference TEXT",
+            "ALTER TABLE guardians ADD COLUMN exhibit_max_video_seconds INTEGER",
         ] {
             self.run_idempotent_migration(stmt);
         }
@@ -20604,6 +20679,11 @@ command = "e"
             live_actions: Some(true),
             rebuild_on: Some(vec!["feedback".to_string(), "auto_fix".to_string()]),
             base_shift_maximum_rebuilds: Some(5),
+            exhibits_enabled: Some(false),
+            exhibits_max_per_pr: Some(2),
+            infer_exhibits: Some(false),
+            exhibit_kind_preference: Some(vec!["screenshot".to_string(), "gif".to_string()]),
+            exhibit_max_video_seconds: Some(20),
             default_pr_user: Some("alice".to_string()),
             forks_only: Some(true),
         };

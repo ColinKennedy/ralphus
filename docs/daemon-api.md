@@ -2235,6 +2235,45 @@ starts a fresh campaign. It can also be set as a `[review]
 base_shift_maximum_rebuilds` project default in `.ralphus.toml`; a value of 0
 is rejected as "must be at least 1".
 
+The exhibit settings control the screenshots, GIFs and short videos a review's
+live runs capture and show in its PRs/MRs:
+
+| Field | Type | Default | Meaning |
+|---|---|---|---|
+| `exhibits_enabled` | boolean | `true` | Whether the review's PRs/MRs show exhibits at all. |
+| `exhibits_max_per_pr` | integer, at least 1 | `6` | The most exhibits one PR/MR shows. |
+| `infer_exhibits` | boolean | `true` | Whether a live run may propose exhibits nobody asked for. |
+| `exhibit_kind_preference` | array of strings | `["gif", "video", "screenshot"]` | The visual kinds to deliver, most preferred first. Every entry is one of `gif`, `video`, `screenshot`; the list is non-empty and names each kind at most once. A kind left out is never delivered. |
+| `exhibit_max_video_seconds` | integer, at least 1 | `15` | The longest a delivered video may run, in seconds. |
+
+They are not `[[review]]` task-file keys. Each is set per review through `POST
+/api/guardians/{id}/settings` or `POST .../details` (absent leaves it as-is, a
+value sets it, an explicit `null` clears it back to inheriting), per project
+through `POST /api/projects/{name}/review-settings`, or as a `[review]` default
+in `.ralphus.toml` or the global config. The review view reports each one twice:
+its own value (`exhibits_enabled`, ..., `null` when inheriting) and the resolved
+value (`effective_exhibits_enabled`, `effective_exhibits_max_per_pr`,
+`effective_infer_exhibits`, `effective_exhibit_kind_preference`,
+`effective_exhibit_max_video_seconds`). Precedence: the review's own value wins
+over the project's review-settings default, which wins over the project's
+`.ralphus.toml`, which wins over the global config, which wins over the default
+above; for `exhibit_kind_preference` the nearest layer that sets a list replaces
+it outright. The chain is resolved every time the review is read, so changing a
+project or global default reaches existing reviews that have no value of their
+own. A `0` for either integer is a `400 invalid_value` ("must be at least 1"),
+and an empty kind list, an unknown kind or a repeated kind is a `400
+invalid_exhibit_kind_preference`. `ReviewConfig::validate` applies the same
+rules to `.ralphus.toml` and global-config values; when resolving, a stored or
+configured `0` is skipped like an unset layer, and unknown or repeated kinds
+are dropped (an order left empty falls back to the default). On the project endpoint,
+`exhibits_enabled`, `infer_exhibits` and `exhibit_kind_preference` clear with
+`null`, and the two integers clear with `clear_exhibits_max_per_pr: true` /
+`clear_exhibit_max_video_seconds: true` (sending a value together with its
+clear flag is a `400`). That endpoint reports the resolved defaults under
+`effective.exhibits_enabled`, `effective.exhibits_max_per_pr`,
+`effective.infer_exhibits`, `effective.exhibit_kind_preference` and
+`effective.exhibit_max_video_seconds`.
+
 `retry_after_unknown_default_seconds` (RAL-517, optional non-negative integer,
 default 30) is the wait, in whole seconds, the `pi` agent backend uses when it
 recognizes a provider error as retryable but the message names no concrete
@@ -5596,6 +5635,25 @@ once). Up to 2 earlier runs of the action follow as a collapsed one-line list,
 newest first; secrets are redacted and unknown details are stated as unknown. An action attributed to several branches
 (`guardian_live_action_branches`, resolved from its source cells when the
 actions are written) appears on each branch's PR but runs once.
+
+*Exhibits.* The same refresh also writes a managed `## Exhibits` section
+(`<!-- ralphus:exhibits:start -->` … `<!-- ralphus:exhibits:end -->`, placed
+before the live-test results) holding one block per **exhibit slot**
+(`<!-- ralphus:exhibit:start action=<a> slot=<s> -->` … `:end … -->`) of the
+live actions attributed to that PR's branch, capped at the review's
+`exhibits_max_per_pr` and omitted when `exhibits_enabled` is off. Before
+rendering, each captured, not-yet-uploaded file is uploaded through the PR
+row's own client (GitHub `POST uploads.github.com/user-attachments/assets?name=…&content_type=…&repository_id=…`,
+raw bytes; GitLab `POST /projects/:id/uploads`, multipart) and a superseded
+GitLab upload is deleted (`DELETE /projects/:id/uploads/:upload_id`) only once
+its replacement is in. On GitHub a failed upload falls back to `gh pr edit
+--attach` (gh 2.99+, logged in), after which the description is restored, so
+the daemon remains its only writer. Only the text between a slot's own markers
+is rewritten; a slot whose markers were edited is skipped and logged.
+`GET /api/guardians/{id}/exhibits` lists a review's slots with their fills,
+and `GET /api/guardians/{id}/exhibits/{action}/{slot}/file` serves a slot's
+captured file (the board shows it while it is not uploaded). See
+[`exhibits.md`](exhibits.md) for the request/report syntax and limits.
 
 A live agent ends its reply with `RALPHUS_LIVE_RESULT: {"verdict": "...",
 "summary": "...", "fix_attempted": bool, "fix_confirmed": bool, "recipe":

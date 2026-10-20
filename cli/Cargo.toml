@@ -29,6 +29,8 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 toml = { workspace = true }
 ureq = { workspace = true, features = ["tls"] }
+png = { workspace = true }
+gif = { workspace = true }
 
 [dev-dependencies]
 tiny_http = { workspace = true }

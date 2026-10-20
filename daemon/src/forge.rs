@@ -751,6 +751,21 @@ impl ForgeClient {
         self.kind
     }
 
+    /// The forge's web host (`github.com` for `https://api.github.com`), as
+    /// `gh`/`glab` name it.
+    #[must_use]
+    pub fn web_host(&self) -> String {
+        let host = self
+            .api_base
+            .split("://")
+            .nth(1)
+            .unwrap_or(&self.api_base)
+            .split('/')
+            .next()
+            .unwrap_or_default();
+        host.strip_prefix("api.").unwrap_or(host).to_string()
+    }
+
     /// `owner/repo` (GitHub) or encoded namespace path (GitLab) this client
     /// operates on — stored verbatim on `guardian_pull_requests.repo`.
     #[must_use]
@@ -2513,6 +2528,158 @@ impl ForgeClient {
         }
     }
 
+    /// Upload a file a PR/MR description can embed (an exhibit), returning
+    /// the URL to embed and, where the forge can delete uploads, its id.
+    ///
+    /// GitHub: the `user-attachments` upload a description's drag-and-drop
+    /// uses, sent with the token (`uploads.github.com/user-attachments/assets`).
+    /// It accepts PNG, GIF, WebP, SVG, MP4, WebM and MOV only, images up to
+    /// 10 MiB and video up to 100 MiB (paid plans), and returns no deletable
+    /// id. GitLab: project uploads (`POST /projects/:id/uploads`), any type up
+    /// to 100 MiB, deletable by id. Logs the outbound call (start/done/error)
+    /// via `rlog!`.
+    pub fn upload_attachment(
+        &self,
+        name: &str,
+        content_type: &str,
+        bytes: &[u8],
+    ) -> Result<UploadedAttachment, String> {
+        // ralphus[ignore-rlog-pair]: this provider boundary has no Store; its caller records the structured workflow outcome
+        crate::rlog!(
+            INFO,
+            "ralphus [forge] upload attachment start kind={} repo={} name={name} bytes={}",
+            self.kind.as_str(),
+            self.repo_path,
+            bytes.len()
+        );
+        let result = self.upload_attachment_inner(name, content_type, bytes);
+        match &result {
+            // ralphus[ignore-rlog-pair]: this provider boundary has no Store; its caller records the structured workflow outcome
+            Ok(up) => crate::rlog!(
+                INFO,
+                "ralphus [forge] upload attachment done kind={} repo={} name={name} url={}",
+                self.kind.as_str(),
+                self.repo_path,
+                up.url
+            ),
+            // ralphus[ignore-rlog-pair]: this provider boundary has no Store; its caller records the structured workflow outcome
+            Err(e) => crate::rlog!(
+                ERROR,
+                "ralphus [forge] upload attachment failed kind={} repo={} name={name}: {e}",
+                self.kind.as_str(),
+                self.repo_path
+            ),
+        }
+        result
+    }
+
+    fn upload_attachment_inner(
+        &self,
+        name: &str,
+        content_type: &str,
+        bytes: &[u8],
+    ) -> Result<UploadedAttachment, String> {
+        let token = self.require_token()?;
+        match self.kind {
+            ForgeKind::GitHub => {
+                let repo_url = format!("{}/repos/{}", self.api_base, self.repo_path);
+                let repo = self.get_github_cached(&repo_url, token)?;
+                let repository_id = repo["id"]
+                    .as_i64()
+                    .ok_or_else(|| format!("GitHub repo {} has no numeric id", self.repo_path))?;
+                let url = format!(
+                    "{}/user-attachments/assets?name={}&content_type={}&repository_id={repository_id}",
+                    github_uploads_base(&self.api_base),
+                    percent_encode_query(name),
+                    percent_encode_query(content_type),
+                );
+                let value = self.send_bytes(
+                    http_agent()
+                        .post(&url)
+                        .set("Authorization", &format!("Bearer {token}"))
+                        .set("Accept", "application/json"),
+                    content_type,
+                    bytes,
+                )?;
+                let url = value["url"]
+                    .as_str()
+                    .or_else(|| value["href"].as_str())
+                    .ok_or_else(|| "GitHub attachment upload returned no URL".to_string())?;
+                Ok(UploadedAttachment {
+                    url: url.to_string(),
+                    upload_id: None,
+                })
+            }
+            ForgeKind::GitLab => {
+                let url = format!("{}/projects/{}/uploads", self.api_base, self.repo_path);
+                let boundary = format!("ralphus-{:x}", crate::store::now_ms());
+                let safe_name = name.replace(['"', '\r', '\n'], "_");
+                let mut body = format!(
+                    "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"{safe_name}\"\r\nContent-Type: {content_type}\r\n\r\n"
+                )
+                .into_bytes();
+                body.extend_from_slice(bytes);
+                body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+                let value = self.send_bytes(
+                    http_agent().post(&url).set("PRIVATE-TOKEN", token),
+                    &format!("multipart/form-data; boundary={boundary}"),
+                    &body,
+                )?;
+                let url = value["url"]
+                    .as_str()
+                    .ok_or_else(|| "GitLab upload returned no URL".to_string())?;
+                Ok(UploadedAttachment {
+                    url: url.to_string(),
+                    upload_id: value["id"].as_i64().map(|id| id.to_string()),
+                })
+            }
+        }
+    }
+
+    /// Delete an upload by the id [`Self::upload_attachment`] returned. Only
+    /// GitLab can; on GitHub this is an error naming that limit. Logs the
+    /// outbound call (start/done/error) via `rlog!`.
+    pub fn delete_attachment(&self, upload_id: &str) -> Result<(), String> {
+        // ralphus[ignore-rlog-pair]: this provider boundary has no Store; its caller records the structured workflow outcome
+        crate::rlog!(
+            INFO,
+            "ralphus [forge] delete attachment start kind={} repo={} id={upload_id}",
+            self.kind.as_str(),
+            self.repo_path
+        );
+        let result = match self.kind {
+            ForgeKind::GitHub => Err("GitHub has no API to delete an attachment".to_string()),
+            ForgeKind::GitLab => self.require_token().and_then(|token| {
+                let url = format!(
+                    "{}/projects/{}/uploads/{upload_id}",
+                    self.api_base, self.repo_path
+                );
+                let result = http_agent().delete(&url).set("PRIVATE-TOKEN", token).call();
+                self.count_response("DELETE", &url, &result);
+                result
+                    .map(|_| ())
+                    .map_err(|e| self.describe_evicting(e).to_string())
+            }),
+        };
+        match &result {
+            // ralphus[ignore-rlog-pair]: this provider boundary has no Store; its caller records the structured workflow outcome
+            Ok(()) => crate::rlog!(
+                INFO,
+                "ralphus [forge] delete attachment done kind={} repo={} id={upload_id}",
+                self.kind.as_str(),
+                self.repo_path
+            ),
+            // ralphus[ignore-rlog-pair]: this provider boundary has no Store; its caller records the structured workflow outcome
+            Err(e) => crate::rlog!(
+                WARNING,
+                "ralphus [forge] delete attachment failed kind={} repo={} id={upload_id}: {e}",
+                self.kind.as_str(),
+                self.repo_path
+            ),
+        }
+        result
+    }
+
     /// Add (`present = true`) or remove (`present = false`) one label on an
     /// open PR/MR. Idempotent in both directions: adding a label already on
     /// the PR/MR and removing one that is not both succeed, so a reconcile pass
@@ -3502,6 +3669,38 @@ impl ForgeClient {
     }
 }
 
+/// A file uploaded for a PR/MR description to embed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UploadedAttachment {
+    /// The URL a description embeds.
+    pub url: String,
+    /// The forge's id for the upload, when it can be deleted (GitLab).
+    pub upload_id: Option<String>,
+}
+
+/// Where GitHub takes attachment uploads for `api_base`: `uploads.github.com`
+/// for github.com, otherwise `api_base` itself (a test forge).
+fn github_uploads_base(api_base: &str) -> String {
+    if api_base.trim_end_matches('/') == "https://api.github.com" {
+        "https://uploads.github.com".to_string()
+    } else {
+        api_base.trim_end_matches('/').to_string()
+    }
+}
+
+/// Percent-encode a query-string value.
+fn percent_encode_query(value: &str) -> String {
+    let mut out = String::new();
+    for b in value.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
+            out.push(char::from(b));
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
+}
+
 /// Parse a GitHub comments-array response (shared by both
 /// `/issues/{n}/comments` and `/pulls/{n}/comments` -- their item shape is
 /// identical) into normalised [`PrComment`]s.
@@ -3562,6 +3761,23 @@ impl ForgeClient {
         let result = req
             .set("Content-Type", "application/json")
             .send_string(&payload.to_string());
+        if let Ok(resp) = &result {
+            self.record_quota_headers(resp);
+        }
+        self.count_response(&method, &url, &result);
+        parse_body(result.map_err(|e| self.describe_evicting(e))?)
+    }
+
+    /// `POST` raw bytes with `content_type`, parsing the JSON response body;
+    /// [`Self::send`] for a non-JSON payload (a file upload).
+    fn send_bytes(
+        &self,
+        req: ureq::Request,
+        content_type: &str,
+        bytes: &[u8],
+    ) -> Result<serde_json::Value, String> {
+        let (method, url) = (req.method().to_string(), req.url().to_string());
+        let result = req.set("Content-Type", content_type).send_bytes(bytes);
         if let Ok(resp) = &result {
             self.record_quota_headers(resp);
         }
@@ -10781,5 +10997,93 @@ mod pool_rotation_tests {
         assert!(c.get_pull_request_base_state(11).is_err());
         mock.finish();
         assert!(seen.lock().unwrap().iter().all(|(m, _)| m == "GET"));
+    }
+}
+
+/// Live round trips of the exhibit upload against real forges. `#[ignore]`d:
+/// they need a throwaway repo, an open PR/MR in it and a token, named by
+/// `RALPHUS_LIVE_GITHUB_REPO` (`owner/repo`) + `RALPHUS_LIVE_GITHUB_PR` +
+/// `RALPHUS_GITHUB_TOKEN`, and `RALPHUS_LIVE_GITLAB_PROJECT` (encoded path)
+/// + `RALPHUS_LIVE_GITLAB_MR` + `RALPHUS_GITLAB_TOKEN`. Each skips when its
+/// variables are unset. Run with
+/// `cargo nextest run -p ralphus-daemon --lib --run-ignored only -E 'test(/live_exhibit/)'`.
+#[cfg(test)]
+mod live_exhibit_tests {
+    use super::*;
+
+    /// A valid 1x1 PNG.
+    const PNG: &[u8] = &[
+        0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44,
+        0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1F,
+        0x15, 0xC4, 0x89, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9C, 0x63, 0xF8,
+        0xCF, 0xC0, 0xF0, 0x1F, 0x00, 0x05, 0x00, 0x01, 0xFF, 0x89, 0x99, 0x3D, 0x1D, 0x00, 0x00,
+        0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+    ];
+
+    fn env(name: &str) -> Option<String> {
+        std::env::var(name).ok().filter(|v| !v.trim().is_empty())
+    }
+
+    fn round_trip(client: &ForgeClient, number: i64) -> UploadedAttachment {
+        let up = client
+            .upload_attachment("ralphus-live-exhibit.png", "image/png", PNG)
+            .expect("upload");
+        let body = format!(
+            "Live exhibit round trip.\n\n<!-- ralphus:exhibit:start action=0 slot=0 -->\n![probe]({})\n<!-- ralphus:exhibit:end action=0 slot=0 -->",
+            up.url
+        );
+        client
+            .update_pull_request_description(number, &body)
+            .expect("update description");
+        let read = client.get_pull_request_description(number).expect("read");
+        assert!(read.contains(&up.url), "{read}");
+        assert!(read.contains("ralphus:exhibit:start"), "{read}");
+        up
+    }
+
+    #[test]
+    #[ignore = "needs a live GitHub repo, PR and token"]
+    fn live_exhibit_github_upload_and_embed() {
+        let (Some(repo), Some(pr), Some(token)) = (
+            env("RALPHUS_LIVE_GITHUB_REPO"),
+            env("RALPHUS_LIVE_GITHUB_PR"),
+            env("RALPHUS_GITHUB_TOKEN"),
+        ) else {
+            eprintln!("SKIP: RALPHUS_LIVE_GITHUB_* unset");
+            return;
+        };
+        let client = ForgeClient::new(
+            ForgeKind::GitHub,
+            "https://api.github.com".to_string(),
+            repo,
+            Some(token),
+        );
+        let up = round_trip(&client, pr.parse().unwrap());
+        assert!(up.url.starts_with("https://github.com/user-attachments/assets/"));
+        assert!(up.upload_id.is_none());
+        assert!(client.delete_attachment("anything").is_err());
+    }
+
+    #[test]
+    #[ignore = "needs a live GitLab project, MR and token"]
+    fn live_exhibit_gitlab_upload_embed_and_delete() {
+        let (Some(project), Some(mr), Some(token)) = (
+            env("RALPHUS_LIVE_GITLAB_PROJECT"),
+            env("RALPHUS_LIVE_GITLAB_MR"),
+            env("RALPHUS_GITLAB_TOKEN"),
+        ) else {
+            eprintln!("SKIP: RALPHUS_LIVE_GITLAB_* unset");
+            return;
+        };
+        let client = ForgeClient::new(
+            ForgeKind::GitLab,
+            "https://gitlab.com/api/v4".to_string(),
+            project,
+            Some(token),
+        );
+        let up = round_trip(&client, mr.parse().unwrap());
+        assert!(up.url.starts_with("/uploads/"), "{}", up.url);
+        let id = up.upload_id.expect("GitLab returns a deletable id");
+        client.delete_attachment(&id).expect("delete");
     }
 }

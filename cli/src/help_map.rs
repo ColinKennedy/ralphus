@@ -800,8 +800,15 @@ root is reset and its prepare steps run again.",
             "--rebuild-on [none|inherit|rebase|feedback|auto_fix...]",
             "--followup [on|off|inherit]",
             "--followup-auto-start [on|off|inherit]",
+            "--exhibits-enabled [true|false|inherit]",
+            "--exhibits-max-per-pr [count-or-inherit]",
+            "--infer-exhibits [true|false|inherit]",
+            "--exhibit-kind-preference [inherit|gif|video|screenshot...]",
+            "--exhibit-max-video-seconds [seconds-or-inherit]",
         ],
-        "Update per-review opt-out settings.",
+        "Update per-review opt-out settings. The exhibit flags take a value or `inherit`: counts \
+and seconds are at least 1, and --exhibit-kind-preference is a comma list of gif, video and \
+screenshot, most preferred first (e.g. `screenshot,gif`).",
         false,
         false,
         &[],
@@ -1581,10 +1588,18 @@ value for each (file config + database).",
             "--auto-run/--no-auto-run",
             "--live-actions/--no-live-actions",
             "--skip-worktrees/--no-skip-worktrees",
+            "--exhibits-enabled [true|false|inherit]",
+            "--exhibits-max-per-pr [count-or-inherit]",
+            "--infer-exhibits [true|false|inherit]",
+            "--exhibit-kind-preference [inherit|gif|video|screenshot...]",
+            "--exhibit-max-video-seconds [seconds-or-inherit]",
         ],
         "Update a project's DEFAULT review settings, applied to future reviews only (an \
 Arbiter-created review with no [[review]] block, or any review whose own block leaves a field \
-unset) -- existing reviews are unaffected.",
+unset) -- existing reviews are unaffected. The exhibit defaults are the exception: every review \
+without its own override follows them on its next read. The exhibit flags take a value or \
+`inherit`: counts and seconds are at least 1, and --exhibit-kind-preference is a comma list of \
+gif, video and screenshot, most preferred first.",
         false,
         false,
         &[],

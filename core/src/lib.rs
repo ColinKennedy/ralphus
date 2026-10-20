@@ -7,6 +7,7 @@
 pub mod agent_resume;
 mod bench_demo;
 pub mod cors;
+pub mod gh_attach;
 pub mod git_remote;
 pub mod git_spawn;
 pub mod health_catalog;

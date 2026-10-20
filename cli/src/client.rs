@@ -338,6 +338,67 @@ fn set_tri_state<T: Into<Value>>(obj: &mut Value, key: &str, value: Option<Optio
     }
 }
 
+/// The exhibit settings shared by [`GuardianSettings`] and
+/// [`ProjectReviewSettingsPatch`]. Each field is `None` to leave the setting
+/// as-is, `Some(None)` to clear it back to inherit, and `Some(Some(v))` to
+/// set it. The counts are at least 1 and the kind list is a non-empty,
+/// duplicate-free order drawn from `gif`/`video`/`screenshot`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ExhibitFlags {
+    pub exhibits_enabled: Option<Option<bool>>,
+    pub exhibits_max_per_pr: Option<Option<u32>>,
+    pub infer_exhibits: Option<Option<bool>>,
+    pub exhibit_kind_preference: Option<Option<Vec<String>>>,
+    pub exhibit_max_video_seconds: Option<Option<u32>>,
+}
+
+impl ExhibitFlags {
+    /// Write these fields into a `/api/guardians/{id}/settings` body, where
+    /// every clear is a JSON `null`.
+    fn write_review_body(&self, body: &mut Value) {
+        set_tri_state(body, "exhibits_enabled", self.exhibits_enabled);
+        set_tri_state(body, "exhibits_max_per_pr", self.exhibits_max_per_pr);
+        set_tri_state(body, "infer_exhibits", self.infer_exhibits);
+        set_tri_state(
+            body,
+            "exhibit_kind_preference",
+            self.exhibit_kind_preference
+                .clone()
+                .map(|v| v.map(|l| json!(l))),
+        );
+        set_tri_state(
+            body,
+            "exhibit_max_video_seconds",
+            self.exhibit_max_video_seconds,
+        );
+    }
+
+    /// Write these fields into a `/api/projects/{name}/review-settings` body,
+    /// where the two counts are cleared with their `clear_*` flags and the
+    /// rest with a JSON `null`.
+    fn write_project_body(&self, body: &mut Value) {
+        set_tri_state(body, "exhibits_enabled", self.exhibits_enabled);
+        set_tri_state(body, "infer_exhibits", self.infer_exhibits);
+        set_tri_state(
+            body,
+            "exhibit_kind_preference",
+            self.exhibit_kind_preference
+                .clone()
+                .map(|v| v.map(|l| json!(l))),
+        );
+        for (key, value) in [
+            ("exhibits_max_per_pr", self.exhibits_max_per_pr),
+            ("exhibit_max_video_seconds", self.exhibit_max_video_seconds),
+        ] {
+            match value {
+                None => {}
+                Some(None) => body[format!("clear_{key}")] = json!(true),
+                Some(Some(n)) => body[key] = json!(n),
+            }
+        }
+    }
+}
+
 impl DaemonClient {
     // ---- health / validate / submit ------------------------------------
 
@@ -577,6 +638,7 @@ impl DaemonClient {
         set_if_some(&mut body, "auto_run", patch.auto_run);
         set_if_some(&mut body, "live_actions", patch.live_actions);
         set_rebuild_on(&mut body, patch.rebuild_on.clone());
+        patch.exhibits.write_project_body(&mut body);
         self.post(&format!("/api/projects/{name}/review-settings"), Some(body))
     }
 
@@ -2068,6 +2130,7 @@ impl DaemonClient {
             "followup_auto_start",
             settings.followup_auto_start,
         );
+        settings.exhibits.write_review_body(&mut body);
         self.post(
             &format!("/api/guardians/{guardian_id}/settings"),
             Some(body),
@@ -2701,6 +2764,8 @@ pub struct GuardianSettings<'a> {
     /// Whether an accepted follow-up squad starts at once; same shape as
     /// [`Self::followup_enabled`], inheriting `[followup] auto_start`.
     pub followup_auto_start: Option<Option<bool>>,
+    /// This review's own exhibit overrides.
+    pub exhibits: ExhibitFlags,
 }
 
 /// RAL-408: bundled optional fields for
@@ -2774,6 +2839,8 @@ pub struct ProjectReviewSettingsPatch<'a> {
     /// clears it back to inherit (sent as JSON `null`), `Some(Some(list))`
     /// sets it (an empty list never rebuilds automatically).
     pub rebuild_on: Option<Option<Vec<String>>>,
+    /// The project's default exhibit settings.
+    pub exhibits: ExhibitFlags,
 }
 
 #[cfg(test)]
@@ -2861,6 +2928,42 @@ mod tests {
         let client = DaemonClient::new(server.url());
         let result = client.guardian_rebuild("g1").unwrap();
         assert_eq!(result["ok"], true);
+    }
+
+    #[test]
+    fn exhibit_flags_write_review_and_project_bodies() {
+        let flags = ExhibitFlags {
+            exhibits_enabled: Some(Some(false)),
+            exhibits_max_per_pr: Some(None),
+            infer_exhibits: None,
+            exhibit_kind_preference: Some(Some(vec!["video".into(), "gif".into()])),
+            exhibit_max_video_seconds: Some(Some(20)),
+        };
+        let mut review = json!({});
+        flags.write_review_body(&mut review);
+        assert_eq!(
+            review,
+            json!({
+                "exhibits_enabled": false,
+                "exhibits_max_per_pr": null,
+                "exhibit_kind_preference": ["video", "gif"],
+                "exhibit_max_video_seconds": 20,
+            })
+        );
+        let mut project = json!({});
+        flags.write_project_body(&mut project);
+        assert_eq!(
+            project,
+            json!({
+                "exhibits_enabled": false,
+                "clear_exhibits_max_per_pr": true,
+                "exhibit_kind_preference": ["video", "gif"],
+                "exhibit_max_video_seconds": 20,
+            })
+        );
+        let mut empty = json!({});
+        ExhibitFlags::default().write_review_body(&mut empty);
+        assert_eq!(empty, json!({}));
     }
 
     #[test]

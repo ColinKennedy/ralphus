@@ -134,3 +134,13 @@ tag = "existing-branch-worktree-remote"
 [[test]]
 id = "ralphus-daemon capability_probe::tests::probe_stdio_counts_tools_from_a_real_server"
 tag = "capability-probe"
+
+# The `gh` exhibit-fallback probe for GitHub projects (`gh --version`, `gh auth status`).
+[[test]]
+id = "ralphus-daemon health_sweep::tests::gh_check_for_a_github_project_probes_version_and_login_and_never_fails"
+tag = "health-gh-exhibit-fallback"
+
+# Converting a captured exhibit with ffmpeg (`exhibit_media::prepare`).
+[[test]]
+id = "ralphus-daemon exhibit_media::tests::a_real_ffmpeg_turns_a_gif_into_a_still_when_the_preference_allows_only_stills"
+tag = "exhibit-media-ffmpeg"

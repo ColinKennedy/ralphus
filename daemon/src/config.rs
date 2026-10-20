@@ -435,6 +435,36 @@ pub struct ReviewConfig {
     /// not consolidate/replace existing per-site delay constants).
     #[serde(default)]
     pub retry_after_unknown_default_seconds: Option<u64>,
+    /// Whether a review collects exhibits (screenshots, GIFs, videos) for its
+    /// PRs/MRs (`crate::exhibits`). `None` means unset, which resolves to
+    /// `true` (see [`Self::exhibits_enabled`]); per-project scalars win over
+    /// the global layer. The database-backed project settings and a
+    /// per-review override (`GuardianView::exhibits_enabled`) win over this,
+    /// resolved on every read.
+    #[serde(default)]
+    pub exhibits_enabled: Option<bool>,
+    /// The most exhibits one PR/MR shows. `None` resolves to
+    /// [`crate::exhibits::DEFAULT_MAX_PER_PR`]; `0` is rejected by
+    /// [`Self::validate`]. Layered like [`Self::exhibits_enabled`].
+    #[serde(default)]
+    pub exhibits_max_per_pr: Option<u32>,
+    /// Whether a live run may propose exhibits nobody asked for. `None`
+    /// resolves to `true`. Layered like [`Self::exhibits_enabled`].
+    #[serde(default)]
+    pub infer_exhibits: Option<bool>,
+    /// The visual exhibit kinds to deliver, most preferred first: a
+    /// non-empty, duplicate-free list drawn from
+    /// [`ralphus_core::schema::EXHIBIT_KIND_PREFERENCE_VALUES`]. `None`
+    /// resolves to [`crate::exhibits::DEFAULT_KIND_PREFERENCE`]. The nearest
+    /// layer that sets it replaces the whole list. Layered like
+    /// [`Self::exhibits_enabled`].
+    #[serde(default)]
+    pub exhibit_kind_preference: Option<Vec<String>>,
+    /// The longest a delivered video exhibit may run, in seconds. `None`
+    /// resolves to [`crate::exhibits::DEFAULT_MAX_VIDEO_SECONDS`]; `0` is
+    /// rejected by [`Self::validate`]. Layered like [`Self::exhibits_enabled`].
+    #[serde(default)]
+    pub exhibit_max_video_seconds: Option<u32>,
 }
 
 /// The paragraph of [`DEFAULT_AUTO_FIX_PROMPT_TEMPLATE`] that lets the agent
@@ -825,6 +855,44 @@ impl ReviewConfig {
         )
     }
 
+    /// Whether reviews collect exhibits (unset resolves to `true`).
+    #[must_use]
+    pub fn exhibits_enabled(&self) -> bool {
+        self.exhibits_enabled.unwrap_or(true)
+    }
+
+    /// The most exhibits one PR/MR shows (unset resolves to
+    /// [`crate::exhibits::DEFAULT_MAX_PER_PR`]).
+    #[must_use]
+    pub fn exhibits_max_per_pr(&self) -> usize {
+        self.exhibits_max_per_pr
+            .map_or(crate::exhibits::DEFAULT_MAX_PER_PR, |v| v as usize)
+    }
+
+    /// Whether a live run may propose exhibits of its own (unset resolves to
+    /// `true`).
+    #[must_use]
+    pub fn infer_exhibits(&self) -> bool {
+        self.infer_exhibits.unwrap_or(true)
+    }
+
+    /// The exhibit kinds to deliver, most preferred first (unset resolves to
+    /// [`crate::exhibits::DEFAULT_KIND_PREFERENCE`]). Entries that are not a
+    /// known kind are dropped; a list left empty by that falls back to the
+    /// default, so a bad stored value never disables every kind.
+    #[must_use]
+    pub fn exhibit_kind_preference(&self) -> Vec<crate::exhibits::ExhibitKind> {
+        exhibit_kinds_or_default(self.exhibit_kind_preference.as_deref())
+    }
+
+    /// The longest a delivered video exhibit may run, in seconds (unset
+    /// resolves to [`crate::exhibits::DEFAULT_MAX_VIDEO_SECONDS`]).
+    #[must_use]
+    pub fn exhibit_max_video_seconds(&self) -> u32 {
+        self.exhibit_max_video_seconds
+            .unwrap_or(crate::exhibits::DEFAULT_MAX_VIDEO_SECONDS)
+    }
+
     /// Validate this config's own scalars, independent of a `[[review]]`
     /// submission's own validation (`ralphus_core::validate`). RAL-395: a
     /// project-level `auto_fix_prompt_template` default must contain the
@@ -855,6 +923,16 @@ impl ReviewConfig {
             .is_some_and(|b| b.trim().is_empty())
         {
             return Err("[review] default_base_branch must not be empty".to_string());
+        }
+        if self.exhibits_max_per_pr == Some(0) {
+            return Err("[review] exhibits_max_per_pr must be at least 1".to_string());
+        }
+        if self.exhibit_max_video_seconds == Some(0) {
+            return Err("[review] exhibit_max_video_seconds must be at least 1".to_string());
+        }
+        if let Some(kinds) = self.exhibit_kind_preference.as_deref() {
+            ralphus_core::schema::check_exhibit_kind_preference(kinds)
+                .map_err(|message| format!("[review] {message}"))?;
         }
         // RAL-517: unlike `auto_fix_retry_base_seconds` above,
         // `retry_after_unknown_default_seconds` is deliberately allowed to be
@@ -943,7 +1021,37 @@ impl ReviewConfig {
             retry_after_unknown_default_seconds: over
                 .retry_after_unknown_default_seconds
                 .or(self.retry_after_unknown_default_seconds),
+            exhibits_enabled: over.exhibits_enabled.or(self.exhibits_enabled),
+            exhibits_max_per_pr: over.exhibits_max_per_pr.or(self.exhibits_max_per_pr),
+            infer_exhibits: over.infer_exhibits.or(self.infer_exhibits),
+            exhibit_kind_preference: over
+                .exhibit_kind_preference
+                .or(self.exhibit_kind_preference),
+            exhibit_max_video_seconds: over
+                .exhibit_max_video_seconds
+                .or(self.exhibit_max_video_seconds),
         }
+    }
+}
+
+/// Parse a stored/configured `exhibit_kind_preference` list into visual
+/// exhibit kinds, most preferred first. Unknown or non-visual names and
+/// repeats are dropped; `None` or a list left empty falls back to
+/// [`crate::exhibits::DEFAULT_KIND_PREFERENCE`].
+#[must_use]
+pub fn exhibit_kinds_or_default(names: Option<&[String]>) -> Vec<crate::exhibits::ExhibitKind> {
+    let mut kinds = Vec::new();
+    for name in names.unwrap_or_default() {
+        if let Some(kind) = crate::exhibits::ExhibitKind::parse(name) {
+            if kind.is_visual() && !kinds.contains(&kind) {
+                kinds.push(kind);
+            }
+        }
+    }
+    if kinds.is_empty() {
+        crate::exhibits::DEFAULT_KIND_PREFERENCE.to_vec()
+    } else {
+        kinds
     }
 }
 
@@ -1119,6 +1227,29 @@ pub const REVIEW_FIELD_PARITY: &[(&str, ReviewFieldDefault)] = &[
         ReviewFieldDefault::ProjectDefault(|c| {
             c.discourage_tests_during_auto_pull_request_fixes.is_some()
         }),
+    ),
+    // The exhibit settings are not `[[review]]` keys: they are set per
+    // review through the settings API, or as project/global defaults. They
+    // are listed so the project-settings UI parity check covers them.
+    (
+        "exhibits_enabled",
+        ReviewFieldDefault::ProjectDefault(|c| c.exhibits_enabled.is_some()),
+    ),
+    (
+        "exhibits_max_per_pr",
+        ReviewFieldDefault::ProjectDefault(|c| c.exhibits_max_per_pr.is_some()),
+    ),
+    (
+        "infer_exhibits",
+        ReviewFieldDefault::ProjectDefault(|c| c.infer_exhibits.is_some()),
+    ),
+    (
+        "exhibit_kind_preference",
+        ReviewFieldDefault::ProjectDefault(|c| c.exhibit_kind_preference.is_some()),
+    ),
+    (
+        "exhibit_max_video_seconds",
+        ReviewFieldDefault::ProjectDefault(|c| c.exhibit_max_video_seconds.is_some()),
     ),
 ];
 
@@ -4783,6 +4914,128 @@ initialization_timeout_sec = 30
             ..ReviewConfig::default()
         };
         assert!(c.validate().is_ok());
+    }
+
+    // ── exhibit settings ─────────────────────────────────────────────────
+
+    #[test]
+    fn exhibit_settings_default_when_unset() {
+        let c = ReviewConfig::default();
+        assert!(c.exhibits_enabled());
+        assert_eq!(c.exhibits_max_per_pr(), crate::exhibits::DEFAULT_MAX_PER_PR);
+        assert!(c.infer_exhibits());
+        assert_eq!(
+            c.exhibit_kind_preference(),
+            crate::exhibits::DEFAULT_KIND_PREFERENCE.to_vec()
+        );
+        assert_eq!(
+            c.exhibit_max_video_seconds(),
+            crate::exhibits::DEFAULT_MAX_VIDEO_SECONDS
+        );
+        assert!(c.validate().is_ok());
+    }
+
+    #[test]
+    fn exhibit_settings_read_from_toml() {
+        use crate::exhibits::ExhibitKind;
+        let c = from_toml_str(
+            "[review]\nexhibits_enabled = false\nexhibits_max_per_pr = 2\ninfer_exhibits = false\n\
+             exhibit_kind_preference = [\"screenshot\", \"gif\"]\nexhibit_max_video_seconds = 40\n",
+        );
+        assert!(!c.exhibits_enabled());
+        assert_eq!(c.exhibits_max_per_pr(), 2);
+        assert!(!c.infer_exhibits());
+        assert_eq!(
+            c.exhibit_kind_preference(),
+            vec![ExhibitKind::Screenshot, ExhibitKind::Gif]
+        );
+        assert_eq!(c.exhibit_max_video_seconds(), 40);
+        assert!(c.validate().is_ok());
+    }
+
+    #[test]
+    fn exhibit_settings_merge_project_over_global() {
+        let global = ReviewConfig {
+            exhibits_enabled: Some(false),
+            exhibits_max_per_pr: Some(3),
+            exhibit_kind_preference: Some(vec!["video".into()]),
+            exhibit_max_video_seconds: Some(9),
+            ..ReviewConfig::default()
+        };
+        let project = ReviewConfig {
+            exhibits_max_per_pr: Some(4),
+            infer_exhibits: Some(false),
+            exhibit_kind_preference: Some(vec!["screenshot".into(), "video".into()]),
+            ..ReviewConfig::default()
+        };
+        let merged = global.clone().merge(project);
+        assert_eq!(merged.exhibits_enabled, Some(false));
+        assert_eq!(merged.exhibits_max_per_pr, Some(4));
+        assert_eq!(merged.infer_exhibits, Some(false));
+        assert_eq!(
+            merged.exhibit_kind_preference,
+            Some(vec!["screenshot".to_string(), "video".to_string()])
+        );
+        assert_eq!(merged.exhibit_max_video_seconds, Some(9));
+        assert_eq!(global.clone().merge(ReviewConfig::default()), global);
+    }
+
+    #[test]
+    fn exhibit_settings_validate_rejects_zero_and_bad_kind_lists() {
+        for (c, needle) in [
+            (
+                ReviewConfig {
+                    exhibits_max_per_pr: Some(0),
+                    ..ReviewConfig::default()
+                },
+                "exhibits_max_per_pr",
+            ),
+            (
+                ReviewConfig {
+                    exhibit_max_video_seconds: Some(0),
+                    ..ReviewConfig::default()
+                },
+                "exhibit_max_video_seconds",
+            ),
+            (
+                ReviewConfig {
+                    exhibit_kind_preference: Some(Vec::new()),
+                    ..ReviewConfig::default()
+                },
+                "exhibit_kind_preference",
+            ),
+            (
+                ReviewConfig {
+                    exhibit_kind_preference: Some(vec!["gif".into(), "gif".into()]),
+                    ..ReviewConfig::default()
+                },
+                "more than once",
+            ),
+            (
+                ReviewConfig {
+                    exhibit_kind_preference: Some(vec!["output".into()]),
+                    ..ReviewConfig::default()
+                },
+                "\"output\"",
+            ),
+        ] {
+            let err = c.validate().unwrap_err();
+            assert!(err.contains(needle), "{err}");
+        }
+    }
+
+    #[test]
+    fn exhibit_kinds_or_default_drops_unknown_and_falls_back_when_empty() {
+        use crate::exhibits::ExhibitKind;
+        let names = vec!["output".to_string(), "video".into(), "video".into()];
+        assert_eq!(
+            exhibit_kinds_or_default(Some(&names)),
+            vec![ExhibitKind::Video]
+        );
+        assert_eq!(
+            exhibit_kinds_or_default(Some(&[])),
+            crate::exhibits::DEFAULT_KIND_PREFERENCE.to_vec()
+        );
     }
 
     #[test]

@@ -715,12 +715,7 @@ impl Store {
     ///
     /// On a database failure.
     pub fn request_live_refresh_for_pr(&self, pr_id: &str, guardian_id: &str) -> Result<()> {
-        let any: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM guardian_live_runs WHERE guardian_id=? AND kind='live'",
-            rusqlite::params![guardian_id],
-            |r| r.get(0),
-        )?;
-        if any > 0 {
+        if self.has_live_publishable(guardian_id)? {
             self.request_pr_live_refresh(pr_id, guardian_id)?;
         }
         Ok(())
@@ -758,18 +753,25 @@ impl Store {
         Ok(())
     }
 
-    /// Ask for a refresh of every open PR/MR of a review that has live runs.
-    ///
-    /// # Errors
-    ///
-    /// On a database failure.
-    pub fn request_live_refresh_for_guardian(&self, guardian_id: &str) -> Result<()> {
+    /// Whether a review has anything the PR descriptions show: a live run or
+    /// an exhibit slot.
+    fn has_live_publishable(&self, guardian_id: &str) -> Result<bool> {
         let any: i64 = self.conn.query_row(
             "SELECT COUNT(*) FROM guardian_live_runs WHERE guardian_id=? AND kind='live'",
             rusqlite::params![guardian_id],
             |r| r.get(0),
         )?;
-        if any == 0 {
+        Ok(any > 0 || self.guardian_has_exhibits(guardian_id)?)
+    }
+
+    /// Ask for a refresh of every open PR/MR of a review that has live runs
+    /// or exhibit slots.
+    ///
+    /// # Errors
+    ///
+    /// On a database failure.
+    pub fn request_live_refresh_for_guardian(&self, guardian_id: &str) -> Result<()> {
+        if !self.has_live_publishable(guardian_id)? {
             return Ok(());
         }
         for pr in self.list_pull_requests_for_guardian(guardian_id)? {
@@ -1427,16 +1429,55 @@ pub fn refresh_pr_with(
     let section = render_section(&runs);
     // A PR whose body carries the details section keeps it current.
     let has_details = pr.description.contains(DETAILS_START);
-    if section.is_none() && !has_details {
+    let exhibit_slots = crate::exhibits::pr_slots(store, &pr, &guardian).map_err(|e| e.to_string())?;
+    if section.is_none() && exhibit_slots.is_empty() && !has_details {
         return Ok(RefreshOutcome::Skipped);
     }
     let client = client_for(&pr, &guardian)
         .ok_or_else(|| format!("no forge client for {} on PR #{number}", pr.repo))?;
+    let exhibit_slots = if exhibit_slots.is_empty() {
+        exhibit_slots
+    } else {
+        // Captured files go up through this PR's own client first, so every
+        // slot rendered below carries a URL this forge serves.
+        let slots: Vec<_> = exhibit_slots.iter().map(|(slot, _)| slot.clone()).collect();
+        crate::exhibit_delivery::upload_pending(store, &guardian.id, number, &client, &slots);
+        crate::exhibits::pr_slots(store, &pr, &guardian).map_err(|e| e.to_string())?
+    };
     let current = client.get_pull_request_description(number)?;
     let mut updated = match &section {
         Some(section) => splice_section(&current, section),
         None => current.clone(),
     };
+    if !exhibit_slots.is_empty() {
+        let blocks: Vec<_> = exhibit_slots
+            .iter()
+            .map(|(slot, label)| {
+                (
+                    slot.key,
+                    crate::exhibits::render_slot(slot, label, client.kind()),
+                )
+            })
+            .collect();
+        let spliced = crate::exhibits::splice_exhibits(&updated, &blocks);
+        if !spliced.damaged.is_empty() {
+            crate::rlog!(
+                WARNING,
+                "ralphus [guardian] review {} PR #{number}: {} exhibit slot(s) not written, their markers were edited",
+                guardian.id,
+                spliced.damaged.len()
+            );
+            crate::cartographer::Note::new("guardian")
+                .guardian(&guardian.id)
+                .scope("live_action")
+                .emit(
+                    &store.lock(),
+                    "exhibit slots skipped: damaged markers",
+                    serde_json::json!({ "pr_id": pr.id, "pr_number": number, "slots": spliced.damaged }),
+                );
+        }
+        updated = spliced.body;
+    }
     let mut details_published: (Vec<i64>, Vec<crate::appraisal::ReviewAppraisal>) =
         (Vec::new(), Vec::new());
     if has_details || current.contains(DETAILS_START) {
@@ -1512,6 +1553,7 @@ pub fn refresh_pr_with(
                 "pr_number": number,
                 "repo": pr.repo,
                 "runs": runs.len(),
+                "exhibit_slots": exhibit_slots.len(),
             }),
         );
     Ok(RefreshOutcome::Updated)
@@ -2595,6 +2637,178 @@ live
             assert_eq!(stored.description, text);
             assert_eq!(stored.base_ref, "main");
         }
+    }
+
+    /// A captured exhibit file waiting for upload, in `dir`, as a fill of a
+    /// new slot of live action 0.
+    fn pending_exhibit(
+        store: &crate::store_lock::StoreHandle,
+        gid: &str,
+        dir: &std::path::Path,
+        stale: &[&str],
+    ) -> crate::exhibits::SlotKey {
+        let guard = store.lock();
+        let key = guard
+            .add_exhibit_requests(
+                gid,
+                0,
+                crate::exhibits::ExhibitOrigin::Handoff,
+                &[(
+                    crate::exhibits::ExhibitRequest {
+                        kind: crate::exhibits::ExhibitKind::Screenshot,
+                        describe: "the greeting".into(),
+                    },
+                    None,
+                )],
+            )
+            .unwrap()[0];
+        let file = dir.join("shot.png");
+        std::fs::write(&file, b"\x89PNG").unwrap();
+        guard
+            .set_exhibit_fill(
+                gid,
+                key,
+                &crate::exhibits::ExhibitFill {
+                    delivered_kind: Some(crate::exhibits::ExhibitKind::Screenshot),
+                    caption: Some("Hello shown".into()),
+                    local_path: Some(file.to_string_lossy().to_string()),
+                    stale_upload_ids: stale.iter().map(|s| (*s).to_string()).collect(),
+                    updated_at_ms: 1,
+                    ..crate::exhibits::ExhibitFill::default()
+                },
+            )
+            .unwrap();
+        key
+    }
+
+    #[test]
+    fn exhibits_upload_through_each_forges_api_then_land_in_their_slot() {
+        for kind in [crate::forge::ForgeKind::GitHub, crate::forge::ForgeKind::GitLab] {
+            let github = kind == crate::forge::ForgeKind::GitHub;
+            let (store, gid, pr_id) =
+                published_fixture(if github { "github" } else { "gitlab" }, "acme/widget");
+            let dir = crate::exhibit_media::tests::TestDir::new();
+            let key = pending_exhibit(&store, &gid, dir.path(), &[]);
+            let mock = crate::mock_forge::MockForge::start(move |server| {
+                let mut urls = Vec::new();
+                if github {
+                    let repo = server.recv();
+                    urls.push(repo.url().to_string());
+                    repo.respond(tiny_http::Response::from_string(r#"{"id": 42}"#)).unwrap();
+                    let up = server.recv();
+                    urls.push(up.url().to_string());
+                    up.respond(
+                        tiny_http::Response::from_string(
+                            r#"{"url": "https://github.com/user-attachments/assets/abc"}"#,
+                        )
+                        .with_status_code(201),
+                    )
+                    .unwrap();
+                } else {
+                    let mut up = server.recv();
+                    urls.push(up.url().to_string());
+                    let mut sent = Vec::new();
+                    std::io::Read::read_to_end(up.as_reader(), &mut sent).unwrap();
+                    assert!(String::from_utf8_lossy(&sent).contains("filename=\"shot.png\""));
+                    up.respond(
+                        tiny_http::Response::from_string(
+                            r#"{"id": 12, "url": "/uploads/s3cr3t/shot.png"}"#,
+                        )
+                        .with_status_code(201),
+                    )
+                    .unwrap();
+                }
+                let get = server.recv();
+                urls.push(get.url().to_string());
+                let field = if github { "body" } else { "description" };
+                get.respond(tiny_http::Response::from_string(
+                    serde_json::json!({ field: "My notes." }).to_string(),
+                ))
+                .unwrap();
+                let mut write = server.recv();
+                let mut sent = String::new();
+                std::io::Read::read_to_string(write.as_reader(), &mut sent).unwrap();
+                write.respond(tiny_http::Response::from_string("{}")).unwrap();
+                (urls, sent)
+            });
+            let repo = if github { "acme/widget" } else { "acme%2Fwidget" };
+            let client = std::cell::RefCell::new(Some(mock.client(kind, repo)));
+            let outcome =
+                refresh_pr_with(&store, &pr_id, &|_, _| client.borrow_mut().take()).unwrap();
+            assert_eq!(outcome, RefreshOutcome::Updated);
+            let (urls, sent) = mock.finish();
+            if github {
+                assert_eq!(urls[0], "/repos/acme/widget");
+                assert_eq!(
+                    urls[1],
+                    "/user-attachments/assets?name=shot.png&content_type=image%2Fpng&repository_id=42"
+                );
+            } else {
+                assert_eq!(urls[0], "/projects/acme%2Fwidget/uploads");
+            }
+            let sent: serde_json::Value = serde_json::from_str(&sent).unwrap();
+            let text = sent
+                .as_object()
+                .unwrap()
+                .values()
+                .next()
+                .unwrap()
+                .as_str()
+                .unwrap()
+                .to_string();
+            let url = if github {
+                "https://github.com/user-attachments/assets/abc"
+            } else {
+                "/uploads/s3cr3t/shot.png"
+            };
+            assert!(text.starts_with("My notes."), "{text}");
+            assert!(text.contains(&crate::exhibits::slot_start(key)), "{text}");
+            assert!(text.contains(&format!("![Hello shown]({url})")), "{text}");
+            assert!(text.contains("- [x] **Screenshot**"), "{text}");
+            // The exhibits section sits before the live-test results.
+            assert!(
+                text.find(crate::exhibits::SECTION_START).unwrap() < text.find(SECTION_START).unwrap()
+            );
+            let fill = store.lock().guardian_exhibit_slots(&gid).unwrap()[0]
+                .fill
+                .clone()
+                .unwrap();
+            assert_eq!(fill.url.as_deref(), Some(url));
+        }
+    }
+
+    #[test]
+    fn a_gitlab_replacement_deletes_the_old_upload_only_after_the_new_one_is_in() {
+        let (store, gid, pr_id) = published_fixture("gitlab", "acme/widget");
+        let dir = crate::exhibit_media::tests::TestDir::new();
+        pending_exhibit(&store, &gid, dir.path(), &["11"]);
+        let mock = crate::mock_forge::MockForge::start(move |server| {
+            let mut seen = Vec::new();
+            for reply in [
+                r#"{"id": 12, "url": "/uploads/new/shot.png"}"#,
+                "",
+                r#"{"description": ""}"#,
+                "{}",
+            ] {
+                let req = server.recv();
+                seen.push(format!("{} {}", req.method(), req.url()));
+                req.respond(tiny_http::Response::from_string(reply)).unwrap();
+            }
+            seen
+        });
+        let client = std::cell::RefCell::new(Some(
+            mock.client(crate::forge::ForgeKind::GitLab, "acme%2Fwidget"),
+        ));
+        refresh_pr_with(&store, &pr_id, &|_, _| client.borrow_mut().take()).unwrap();
+        let seen = mock.finish();
+        assert_eq!(seen[0], "POST /projects/acme%2Fwidget/uploads");
+        assert_eq!(seen[1], "DELETE /projects/acme%2Fwidget/uploads/11");
+        let fill = store.lock().guardian_exhibit_slots(&gid).unwrap()[0]
+            .fill
+            .clone()
+            .unwrap();
+        assert!(fill.stale_upload_ids.is_empty());
+        assert_eq!(fill.forge_upload_id.as_deref(), Some("12"));
     }
 
     #[test]

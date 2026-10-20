@@ -84,6 +84,9 @@
        * @property {RebuildOnDraft} rebuildOn - When this review's prepared build is rebuilt; `inherit` means the project default applies.
        * @property {RebuildOnDraft} originalRebuildOn
        * @property {string[]} rebuildOnEffective - The resolved triggers shown while inheriting.
+       * @property {ExhibitSettingsDraft} exhibits - This review's own exhibit settings; blank fields inherit.
+       * @property {ExhibitSettingsDraft} originalExhibits
+       * @property {ExhibitSettingsEffective} exhibitsEffective - What each exhibit field resolves to right now.
        * @property {{[project: string]: boolean}} squash
        * @property {string[]} originalSquashOn
        * @property {string[]} projects
@@ -313,6 +316,166 @@
       }
       // RALPHUS-REBUILD-ON:END
 
+      // RALPHUS-EXHIBIT-SETTINGS:BEGIN
+      // A review's exhibit settings (screenshots, GIFs and videos shown in its
+      // PRs/MRs), shared by the review Setup modal and the project Review
+      // Settings modal. Pure apart from `esc`; node --test slices this region
+      // (test/board-exhibit-settings.test.mjs).
+
+      /**
+       * One modal's draft of the five exhibit settings, held as the raw text
+       * of each control so an untouched field compares equal to its seed. An
+       * empty string means "inherit".
+       * @typedef {object} ExhibitSettingsDraft
+       * @property {string} enabled - "" | "true" | "false"
+       * @property {string} maxPerPr - A whole number of at least 1, or "".
+       * @property {string} infer - "" | "true" | "false"
+       * @property {string} kinds - A comma list of gif/video/screenshot, most preferred first, or "".
+       * @property {string} maxVideoSeconds - A whole number of at least 1, or "".
+       */
+
+      /**
+       * The values a draft falls back to while a field inherits.
+       * @typedef {object} ExhibitSettingsEffective
+       * @property {boolean} enabled
+       * @property {number} maxPerPr
+       * @property {boolean} infer
+       * @property {string[]} kinds
+       * @property {number} maxVideoSeconds
+       */
+
+      /**
+       * The raw (own) exhibit settings of a review or project, as the daemon
+       * sends them: null/absent inherits.
+       * @typedef {object} ExhibitSettingsRaw
+       * @property {boolean|null} [exhibits_enabled]
+       * @property {number|null} [exhibits_max_per_pr]
+       * @property {boolean|null} [infer_exhibits]
+       * @property {string[]|null} [exhibit_kind_preference]
+       * @property {number|null} [exhibit_max_video_seconds]
+       */
+
+      /** The exhibit kinds a preference list may name, in the default order. */
+      const EXHIBIT_KINDS = ["gif", "video", "screenshot"];
+
+      /**
+       * Seeds a draft from a review/project's own exhibit settings.
+       * @param {ExhibitSettingsRaw} raw
+       * @returns {ExhibitSettingsDraft}
+       */
+      function buildExhibitSettingsDraft(raw) {
+        const bool = (/** @type {boolean|null|undefined} */ v) => (v === null || v === undefined ? "" : String(!!v));
+        const num = (/** @type {number|null|undefined} */ v) => (v === null || v === undefined ? "" : String(v));
+        const kinds = Array.isArray(raw.exhibit_kind_preference) ? raw.exhibit_kind_preference.join(", ") : "";
+        return {
+          enabled: bool(raw.exhibits_enabled),
+          maxPerPr: num(raw.exhibits_max_per_pr),
+          infer: bool(raw.infer_exhibits),
+          kinds,
+          maxVideoSeconds: num(raw.exhibit_max_video_seconds),
+        };
+      }
+
+      /**
+       * Parses a kind-preference text field. Blank inherits (`kinds: null`);
+       * otherwise every entry must be one of `EXHIBIT_KINDS`, none repeated,
+       * with at least one given. Order is kept.
+       * @param {string} text
+       * @returns {{kinds: string[]|null, error: string}}
+       */
+      function parseExhibitKinds(text) {
+        if (text.trim() === "") return { kinds: null, error: "" };
+        const kinds = text.split(",").map((k) => k.trim().toLowerCase()).filter((k) => k !== "");
+        if (kinds.length === 0) return { kinds: null, error: "exhibit kinds: name at least one of gif, video, screenshot (or leave blank to inherit)" };
+        for (let i = 0; i < kinds.length; i++) {
+          if (!EXHIBIT_KINDS.includes(kinds[i])) return { kinds: null, error: `exhibit kinds: "${kinds[i]}" is not one of gif, video, screenshot` };
+          if (kinds.indexOf(kinds[i]) !== i) return { kinds: null, error: `exhibit kinds: "${kinds[i]}" is listed more than once` };
+        }
+        return { kinds, error: "" };
+      }
+
+      /**
+       * Parses a count field. Blank inherits (`value: null`); otherwise it
+       * must be a whole number of at least 1.
+       * @param {string} text
+       * @param {string} label - Field name for the error message.
+       * @returns {{value: number|null, error: string}}
+       */
+      function parseExhibitCount(text, label) {
+        const t = text.trim();
+        if (t === "") return { value: null, error: "" };
+        if (!/^\d+$/.test(t) || Number(t) < 1) return { value: null, error: `${label}: must be a whole number of at least 1 (or blank to inherit)` };
+        return { value: Number(t), error: "" };
+      }
+
+      /**
+       * The request-body fields for whatever changed between `draft` and
+       * `original`, or an error naming the first invalid field. A cleared
+       * field is sent as `null`, except the two counts when `clearFlags` is
+       * set, which are cleared with `clear_<field>: true` (the project
+       * settings endpoint's convention).
+       * @param {ExhibitSettingsDraft} draft
+       * @param {ExhibitSettingsDraft} original
+       * @param {boolean} clearFlags
+       * @returns {{body: {[key: string]: *}, error: string}}
+       */
+      function exhibitSettingsPatch(draft, original, clearFlags) {
+        /** @type {{[key: string]: *}} */
+        const body = {};
+        const bool = (/** @type {string} */ v) => (v === "" ? null : v === "true");
+        if (draft.enabled !== original.enabled) body.exhibits_enabled = bool(draft.enabled);
+        if (draft.infer !== original.infer) body.infer_exhibits = bool(draft.infer);
+        /** @type {[string, keyof ExhibitSettingsDraft, string][]} */
+        const counts = [["exhibits_max_per_pr", "maxPerPr", "exhibits per PR"], ["exhibit_max_video_seconds", "maxVideoSeconds", "max video seconds"]];
+        for (const [key, field, label] of counts) {
+          if (draft[field].trim() === original[field].trim()) continue;
+          const parsed = parseExhibitCount(draft[field], label);
+          if (parsed.error) return { body: {}, error: parsed.error };
+          if (parsed.value === null && clearFlags) body[`clear_${key}`] = true;
+          else body[key] = parsed.value;
+        }
+        const kinds = parseExhibitKinds(draft.kinds);
+        if (kinds.error) return { body: {}, error: kinds.error };
+        const originalKinds = parseExhibitKinds(original.kinds);
+        if (JSON.stringify(kinds.kinds) !== JSON.stringify(originalKinds.kinds)) body.exhibit_kind_preference = kinds.kinds;
+        return { body, error: "" };
+      }
+
+      const EXHIBITS_ENABLED_TIP = "Whether this review's PRs/MRs show exhibits -- screenshots, GIFs or short videos its live runs capture so a reader can see the change working. 'inherit' follows the next layer up (project settings, then .ralphus.toml/global config, then on). Applies on Save.";
+      const EXHIBITS_INFER_TIP = "Whether the agent writing a live run may add exhibits nobody asked for when it sees something worth showing. Turn off to show only the exhibits a cell or action explicitly requested. 'inherit' follows the next layer up (on by default). Applies on Save.";
+      const EXHIBITS_MAX_PER_PR_TIP = "The most exhibits one PR/MR shows; extra requests are dropped, explicitly requested ones kept first. A whole number of at least 1; blank inherits the value shown. Applies on Save.";
+      const EXHIBITS_KINDS_TIP = "Which kinds of visual exhibit to deliver, most preferred first: a comma list of gif, video and screenshot, each at most once (e.g. 'screenshot, gif'). A kind left out is never captured. Blank inherits the order shown. Applies on Save.";
+      const EXHIBITS_MAX_VIDEO_TIP = "The longest a delivered video or GIF exhibit may run, in seconds; longer recordings are cut. A whole number of at least 1; blank inherits the value shown. Applies on Save.";
+
+      /**
+       * Renders the exhibit settings controls: two inherit/on/off selects,
+       * two number inputs and a kind-order text input. Every control calls
+       * the global `onChange(field, value)` handler, where `field` is a key
+       * of `ExhibitSettingsDraft`.
+       * @param {ExhibitSettingsDraft} draft
+       * @param {ExhibitSettingsEffective} effective - What each field resolves to while inheriting.
+       * @param {string} onChange
+       * @param {string} inheritWord - How the inherit choice is labelled ("project default", "file-config/global default").
+       * @returns {string}
+       */
+      function renderExhibitFieldsHtml(draft, effective, onChange, inheritWord) {
+        const tri = (/** @type {keyof ExhibitSettingsDraft} */ field, /** @type {boolean} */ eff, /** @type {string} */ label, /** @type {string} */ tip) => {
+          const opt = (/** @type {string} */ value, /** @type {string} */ text) => `<option value="${value}" ${draft[field] === value ? "selected" : ""}>${esc(text)}</option>`;
+          return `<div class="kv-row"><span class="k">${esc(label)}</span>
+              <select style="${REVIEW_EDIT_INPUT_STYLE}" onchange="${onChange}('${field}',this.value)" data-tip="${esc(tip)}">
+                ${opt("", `inherit ${inheritWord} (${eff ? "on" : "off"})`)}${opt("true", "on")}${opt("false", "off")}
+              </select></div>`;
+        };
+        const count = (/** @type {keyof ExhibitSettingsDraft} */ field, /** @type {number} */ eff, /** @type {string} */ label, /** @type {string} */ tip) =>
+          `<div class="kv-row"><span class="k">${esc(label)}</span><input type="number" min="1" step="1" class="mono" style="${REVIEW_EDIT_INPUT_STYLE};width:80px" value="${esc(draft[field])}" placeholder="${esc(String(eff))}" oninput="${onChange}('${field}',this.value)" data-tip="${esc(tip)}"></div>`;
+        return `${tri("enabled", effective.enabled, "show exhibits", EXHIBITS_ENABLED_TIP)}
+            ${tri("infer", effective.infer, "infer exhibits", EXHIBITS_INFER_TIP)}
+            ${count("maxPerPr", effective.maxPerPr, "exhibits per PR", EXHIBITS_MAX_PER_PR_TIP)}
+            <div class="kv-row"><span class="k">exhibit kinds</span><input type="text" class="mono" style="${REVIEW_EDIT_INPUT_STYLE};width:200px" value="${esc(draft.kinds)}" placeholder="${esc(effective.kinds.join(", "))}" oninput="${onChange}('kinds',this.value)" data-tip="${esc(EXHIBITS_KINDS_TIP)}"></div>
+            ${count("maxVideoSeconds", effective.maxVideoSeconds, "max video seconds", EXHIBITS_MAX_VIDEO_TIP)}`;
+      }
+      // RALPHUS-EXHIBIT-SETTINGS:END
+
       /**
        * Builds an env-override scope's draft rows from its currently-saved
        * `own` overrides object (a string value overrides the inherited one;
@@ -359,6 +522,14 @@
         const followupEnabled = g.effective_followup_enabled !== false;
         const followupAutoStart = g.effective_followup_auto_start !== false;
         const rebuildOnEffective = normalizeRebuildOn(g.effective_rebuild_on === undefined ? REBUILD_TRIGGERS : g.effective_rebuild_on);
+        /** @type {ExhibitSettingsEffective} */
+        const exhibitsEffective = {
+          enabled: g.effective_exhibits_enabled !== false,
+          maxPerPr: g.effective_exhibits_max_per_pr || 6,
+          infer: g.effective_infer_exhibits !== false,
+          kinds: g.effective_exhibit_kind_preference || EXHIBIT_KINDS,
+          maxVideoSeconds: g.effective_exhibit_max_video_seconds || 15,
+        };
         return {
           gid: g.id,
           name: g.name,
@@ -391,6 +562,9 @@
           rebuildOn: buildRebuildOnDraft(g.rebuild_on, rebuildOnEffective),
           originalRebuildOn: buildRebuildOnDraft(g.rebuild_on, rebuildOnEffective),
           rebuildOnEffective,
+          exhibits: buildExhibitSettingsDraft(g),
+          originalExhibits: buildExhibitSettingsDraft(g),
+          exhibitsEffective,
           squash,
           originalSquashOn: squashOn.slice(),
           projects,
@@ -626,6 +800,13 @@
         setRebuildTrigger(d.rebuildOn, trigger, checked);
         refreshRebuildOnFields("review", d.rebuildOn, d.rebuildOnEffective);
       }
+      /**
+       * Stages one exhibit setting's control text (blank inherits); checked on Save.
+       * @param {keyof ExhibitSettingsDraft} field
+       * @param {string} value
+       * @returns {void}
+       */
+      function onEditExhibitSetting(field, value) { if (reviewEditDraft) reviewEditDraft.exhibits[field] = value; }
       /**
        * Stages one git project's squash toggle.
        * @param {string} project
@@ -1034,6 +1215,8 @@
             <div ${grp("live-actions")}><h3 class="section">live actions</h3>
               <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--muted);margin-top:4px" data-tip="Overrides the project default for this review only: once every member cell has finished and the review's build is prepared, collect how each cell's agent said it would test its work live, merge similar ones, and have an agent run each against the review's tip -- once, automatically. It may commit fixes; ralphus carries them onto the top branch. Rerun from the review's live actions section. Costs agent time; on by default for new reviews unless the project turns it off, so uncheck it to disable it for this review. Applies on Save.">
                 <input type="checkbox" ${draft.liveActions ? "checked" : ""} onchange="onEditLiveActions(this.checked)">run live actions</label></div>
+            <div ${grp("exhibits")}><h3 class="section" data-tip="Screenshots, GIFs and short videos that this review's live runs capture and show in its PRs/MRs. Each setting overrides the project default for this review only; 'inherit' and blank fields follow the project default, which can change later. Applies on Save.">exhibits</h3>
+              ${renderExhibitFieldsHtml(draft.exhibits, draft.exhibitsEffective, "onEditExhibitSetting", "project default")}</div>
             <div ${grp("followup")}><h3 class="section">follow-up</h3>
               <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--muted);margin-top:4px" data-tip="Overrides the global [followup] default for this review only: when it merges, offer to turn the follow-up work its agents deferred (deferred prophecies) into a new squad. On unless the global config turns it off. Applies on Save.">
                 <input type="checkbox" ${draft.followupEnabled ? "checked" : ""} onchange="onEditFollowupEnabled(this.checked)">offer follow-up work when this review merges</label>
@@ -1129,6 +1312,13 @@
         if (draft.followupEnabled !== draft.originalFollowupEnabled) body.followup_enabled = draft.followupEnabled;
         if (draft.followupAutoStart !== draft.originalFollowupAutoStart) body.followup_auto_start = draft.followupAutoStart;
         if (rebuildOnChanged(draft.rebuildOn, draft.originalRebuildOn)) body.rebuild_on = rebuildOnBodyValue(draft.rebuildOn);
+        const exhibits = exhibitSettingsPatch(draft.exhibits, draft.originalExhibits, false);
+        if (exhibits.error) {
+          const errEl = document.getElementById("review-edit-err");
+          if (errEl) errEl.textContent = exhibits.error;
+          return;
+        }
+        Object.assign(body, exhibits.body);
         const squashOn = draft.projects.filter((p) => draft.squash[p]).sort();
         if (JSON.stringify(squashOn) !== JSON.stringify(draft.originalSquashOn.slice().sort())) {
           body.squash_projects = squashOn;
@@ -1163,4 +1353,4 @@
         }
       }
 
-      void [onEditBaseUpdateMode, onEditResolverAgent, onEditResolverModel, onEditProofScope, onEditCiDeferral, onEditProofSkipAutoClean, onEditSeparatePrBranch, onEditMatchPrBranchName, onEditAutoSubmitPrStack, onEditDualRootPr, onEditAutoFixPrErrors, onEditAutoFixPromptTemplate, onEditDiscourageTests, onEditRebuildOnInherit, onEditRebuildOnTrigger];
+      void [onEditBaseUpdateMode, onEditResolverAgent, onEditResolverModel, onEditProofScope, onEditCiDeferral, onEditProofSkipAutoClean, onEditSeparatePrBranch, onEditMatchPrBranchName, onEditAutoSubmitPrStack, onEditDualRootPr, onEditAutoFixPrErrors, onEditAutoFixPromptTemplate, onEditDiscourageTests, onEditRebuildOnInherit, onEditRebuildOnTrigger, onEditExhibitSetting];

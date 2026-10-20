@@ -1156,6 +1156,43 @@ pub struct GuardianView {
     /// base_shift_maximum_rebuilds` default and the live global config --
     /// the value `rebuild_on_base_shift` gates its retry campaign on.
     pub effective_base_shift_maximum_rebuilds: u32,
+    /// This review's own override for whether it collects exhibits for its
+    /// PRs/MRs. `None` inherits the project/global default.
+    pub exhibits_enabled: Option<bool>,
+    /// [`Self::exhibits_enabled`] resolved against the database-backed
+    /// project setting, the project's `.ralphus.toml [review]` value and the
+    /// live global config on every read -- `true` when every layer is unset.
+    pub effective_exhibits_enabled: bool,
+    /// This review's own cap on exhibits per PR/MR. `None` inherits.
+    pub exhibits_max_per_pr: Option<u32>,
+    /// [`Self::exhibits_max_per_pr`] resolved like
+    /// [`Self::effective_exhibits_enabled`] -- always at least 1,
+    /// [`crate::exhibits::DEFAULT_MAX_PER_PR`] when every layer is unset.
+    pub effective_exhibits_max_per_pr: u32,
+    /// This review's own override for whether a live run may propose
+    /// exhibits nobody asked for. `None` inherits.
+    pub infer_exhibits: Option<bool>,
+    /// [`Self::infer_exhibits`] resolved like
+    /// [`Self::effective_exhibits_enabled`] -- `true` when every layer is
+    /// unset.
+    pub effective_infer_exhibits: bool,
+    /// This review's own exhibit kind order, most preferred first. `None`
+    /// inherits.
+    pub exhibit_kind_preference: Option<Vec<String>>,
+    /// [`Self::exhibit_kind_preference`] resolved like
+    /// [`Self::effective_exhibits_enabled`]: the nearest layer that sets a
+    /// list replaces the whole list; the default order
+    /// ([`crate::exhibits::DEFAULT_KIND_PREFERENCE`]) when every layer is
+    /// unset. Always non-empty.
+    pub effective_exhibit_kind_preference: Vec<String>,
+    /// This review's own cap on a video exhibit's length, in seconds. `None`
+    /// inherits.
+    pub exhibit_max_video_seconds: Option<u32>,
+    /// [`Self::exhibit_max_video_seconds`] resolved like
+    /// [`Self::effective_exhibits_enabled`] -- always at least 1,
+    /// [`crate::exhibits::DEFAULT_MAX_VIDEO_SECONDS`] when every layer is
+    /// unset.
+    pub effective_exhibit_max_video_seconds: u32,
     /// RAL-507: failed unattended base-shift rebuild attempts consumed by
     /// the review's current retry campaign. 0 when no campaign is open.
     pub base_shift_rebuild_attempts: u32,
@@ -4204,6 +4241,88 @@ impl Store {
         }
     }
 
+    /// Set this review's own override for whether it collects exhibits.
+    /// `None` inherits the project/global default.
+    ///
+    /// # Errors
+    /// [`StoreError::NotFound`] when no such guardian exists.
+    pub fn set_guardian_exhibits_enabled(&self, id: &str, enabled: Option<bool>) -> Result<()> {
+        self.set_guardian_exhibit_column(id, "exhibits_enabled", enabled.map(i64::from))
+    }
+
+    /// Set this review's own cap on exhibits per PR/MR. `None` inherits the
+    /// project/global default. The caller rejects `0`.
+    ///
+    /// # Errors
+    /// [`StoreError::NotFound`] when no such guardian exists.
+    pub fn set_guardian_exhibits_max_per_pr(&self, id: &str, cap: Option<u32>) -> Result<()> {
+        self.set_guardian_exhibit_column(id, "exhibits_max_per_pr", cap.map(i64::from))
+    }
+
+    /// Set this review's own override for whether a live run may propose
+    /// exhibits nobody asked for. `None` inherits the project/global default.
+    ///
+    /// # Errors
+    /// [`StoreError::NotFound`] when no such guardian exists.
+    pub fn set_guardian_infer_exhibits(&self, id: &str, enabled: Option<bool>) -> Result<()> {
+        self.set_guardian_exhibit_column(id, "infer_exhibits", enabled.map(i64::from))
+    }
+
+    /// Set this review's own cap on a video exhibit's length, in seconds.
+    /// `None` inherits the project/global default. The caller rejects `0`.
+    ///
+    /// # Errors
+    /// [`StoreError::NotFound`] when no such guardian exists.
+    pub fn set_guardian_exhibit_max_video_seconds(
+        &self,
+        id: &str,
+        seconds: Option<u32>,
+    ) -> Result<()> {
+        self.set_guardian_exhibit_column(id, "exhibit_max_video_seconds", seconds.map(i64::from))
+    }
+
+    /// Set this review's own exhibit kind order, most preferred first.
+    /// `None` inherits the project/global default. The caller validates the
+    /// list with `ralphus_core::schema::check_exhibit_kind_preference`.
+    ///
+    /// # Errors
+    /// [`StoreError::NotFound`] when no such guardian exists.
+    pub fn set_guardian_exhibit_kind_preference(
+        &self,
+        id: &str,
+        kinds: Option<&[String]>,
+    ) -> Result<()> {
+        let json = kinds.map(|list| serde_json::to_string(list).unwrap_or_else(|_| "[]".into()));
+        let n = self.conn.execute(
+            "UPDATE guardians SET exhibit_kind_preference=?, updated_at_ms=? WHERE id=?",
+            params![json, crate::store::now_ms(), id],
+        )?;
+        if n == 0 {
+            Err(StoreError::NotFound)
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Write one integer-valued exhibit override column. `column` is always
+    /// one of this module's literal column names, never caller input.
+    fn set_guardian_exhibit_column(
+        &self,
+        id: &str,
+        column: &'static str,
+        value: Option<i64>,
+    ) -> Result<()> {
+        let n = self.conn.execute(
+            &format!("UPDATE guardians SET {column}=?, updated_at_ms=? WHERE id=?"),
+            params![value, crate::store::now_ms(), id],
+        )?;
+        if n == 0 {
+            Err(StoreError::NotFound)
+        } else {
+            Ok(())
+        }
+    }
+
     /// RAL-507: open (or re-open) the review's base-shift retry campaign
     /// against `targets` with a full budget: clears the attempt counter and
     /// the exhaustion-notified marker, and stores the campaign's target
@@ -6157,7 +6276,7 @@ impl Store {
     pub(crate) fn get_guardian_conn(conn: &Connection, id: &str) -> Result<GuardianView> {
         let row = conn
             .query_row(
-                "SELECT id, name, base_branch, git_root, review_branch, status, detail, checks, squad_id, combined_worktree, conflicts_found, conflicts_fixed, conflicts_committed, skip_worktree_checks, review_type, skip_worktrees, created_at_ms, resolver_agent, resolver_model, base_commit, change_summary, base_commits, manual_commands, action_hints, summary_agent, summary_model, manual_commands_agent, manual_commands_model, manual_commands_agent_session_id, squash_projects, auto_pr_feedback, input_values, proof_scope, proof_skip_auto_clean, machine, build_env_overrides, manual_checks_env_overrides, maximum_budget_usd, merge_attempt, skip_base_updates, manual_checks_started_at_ms, notice_kind, notice_message, notice_at_ms, match_pr_branch_name, auto_submit_pr_stack, origin, auto_build_json, separate_pr_branch, readable_review_branch, review_branch_name, project, auto_fix_pr_errors, auto_fix_prompt_template, manual_checks_finished_at_ms, post_merge_status, post_merge_detail, post_merge_started_at_ms, post_merge_finished_at_ms, owner, dual_root_pr, discourage_tests_during_auto_pull_request_fixes, base_shift_maximum_rebuilds, base_shift_rebuild_attempts, base_shift_rebuild_targets, base_shift_exhausted_notified_at_ms, auto_cancel_outdated_pr_pipelines, cache_manual_checks, manual_checks_cached, manual_checks_basis, manual_checks_focus, summary_format, base_shift_rebuild_attempts_by_project, rebuild_on, skip_manual_checks, auto_run, followup_enabled, followup_auto_start, post_appraisals, ci_deferral, live_actions, live_actions_auto_ran_at_ms, base_update_mode, live_actions_default_on
+                "SELECT id, name, base_branch, git_root, review_branch, status, detail, checks, squad_id, combined_worktree, conflicts_found, conflicts_fixed, conflicts_committed, skip_worktree_checks, review_type, skip_worktrees, created_at_ms, resolver_agent, resolver_model, base_commit, change_summary, base_commits, manual_commands, action_hints, summary_agent, summary_model, manual_commands_agent, manual_commands_model, manual_commands_agent_session_id, squash_projects, auto_pr_feedback, input_values, proof_scope, proof_skip_auto_clean, machine, build_env_overrides, manual_checks_env_overrides, maximum_budget_usd, merge_attempt, skip_base_updates, manual_checks_started_at_ms, notice_kind, notice_message, notice_at_ms, match_pr_branch_name, auto_submit_pr_stack, origin, auto_build_json, separate_pr_branch, readable_review_branch, review_branch_name, project, auto_fix_pr_errors, auto_fix_prompt_template, manual_checks_finished_at_ms, post_merge_status, post_merge_detail, post_merge_started_at_ms, post_merge_finished_at_ms, owner, dual_root_pr, discourage_tests_during_auto_pull_request_fixes, base_shift_maximum_rebuilds, base_shift_rebuild_attempts, base_shift_rebuild_targets, base_shift_exhausted_notified_at_ms, auto_cancel_outdated_pr_pipelines, cache_manual_checks, manual_checks_cached, manual_checks_basis, manual_checks_focus, summary_format, base_shift_rebuild_attempts_by_project, rebuild_on, skip_manual_checks, auto_run, followup_enabled, followup_auto_start, post_appraisals, ci_deferral, live_actions, live_actions_auto_ran_at_ms, base_update_mode, live_actions_default_on, exhibits_enabled, exhibits_max_per_pr, infer_exhibits, exhibit_kind_preference, exhibit_max_video_seconds
                   FROM guardians WHERE id=?", // `skip_worktree_checks` (col 13) is read-only legacy data (RAL-285) -- see `GuardianRow::legacy_skip_worktree_checks`.
                 /*
                 "SELECT id, name, base_branch, git_root, review_branch, status, detail, checks, squad_id, combined_worktree, conflicts_found, conflicts_fixed, conflicts_committed, skip_worktree_checks, review_type, skip_worktrees, created_at_ms, resolver_agent, resolver_model, base_commit, change_summary, base_commits, manual_commands, action_hints, summary_agent, summary_model, manual_commands_agent, manual_commands_model, manual_commands_agent_session_id, squash_projects, auto_pr_feedback, input_values, proof_scope, proof_skip_auto_clean, machine, build_env_overrides, manual_checks_env_overrides, maximum_budget_usd, merge_attempt, skip_base_updates, manual_checks_started_at_ms, notice_kind, notice_message, notice_at_ms, match_pr_branch_name, auto_submit_pr_stack, origin, auto_build_json, separate_pr_branch, readable_review_branch, review_branch_name, project, auto_fix_pr_errors, auto_fix_prompt_template, manual_checks_finished_at_ms, post_merge_status, post_merge_detail, post_merge_started_at_ms, post_merge_finished_at_ms, owner, dual_root_pr, discourage_tests_during_auto_pull_request_fixes, base_shift_maximum_rebuilds, base_shift_rebuild_attempts, base_shift_rebuild_targets, base_shift_exhausted_notified_at_ms, auto_cancel_outdated_pr_pipelines, cache_manual_checks, manual_checks_cached, manual_checks_basis, manual_checks_focus
@@ -6318,7 +6437,7 @@ impl Store {
     /// (`crate::store_pool`) can serve it without the writer lock.
     pub(crate) fn list_guardians_conn(conn: &Connection) -> Result<Vec<GuardianView>> {
         let mut stmt = conn.prepare(
-            "SELECT id, name, base_branch, git_root, review_branch, status, detail, checks, squad_id, combined_worktree, conflicts_found, conflicts_fixed, conflicts_committed, skip_worktree_checks, review_type, skip_worktrees, created_at_ms, resolver_agent, resolver_model, base_commit, change_summary, base_commits, manual_commands, action_hints, summary_agent, summary_model, manual_commands_agent, manual_commands_model, manual_commands_agent_session_id, squash_projects, auto_pr_feedback, input_values, proof_scope, proof_skip_auto_clean, machine, build_env_overrides, manual_checks_env_overrides, maximum_budget_usd, merge_attempt, skip_base_updates, manual_checks_started_at_ms, notice_kind, notice_message, notice_at_ms, match_pr_branch_name, auto_submit_pr_stack, origin, auto_build_json, separate_pr_branch, readable_review_branch, review_branch_name, project, auto_fix_pr_errors, auto_fix_prompt_template, manual_checks_finished_at_ms, post_merge_status, post_merge_detail, post_merge_started_at_ms, post_merge_finished_at_ms, owner, dual_root_pr, discourage_tests_during_auto_pull_request_fixes, base_shift_maximum_rebuilds, base_shift_rebuild_attempts, base_shift_rebuild_targets, base_shift_exhausted_notified_at_ms, auto_cancel_outdated_pr_pipelines, cache_manual_checks, manual_checks_cached, manual_checks_basis, manual_checks_focus, summary_format, base_shift_rebuild_attempts_by_project, rebuild_on, skip_manual_checks, auto_run, followup_enabled, followup_auto_start, post_appraisals, ci_deferral, live_actions, live_actions_auto_ran_at_ms, base_update_mode, live_actions_default_on
+            "SELECT id, name, base_branch, git_root, review_branch, status, detail, checks, squad_id, combined_worktree, conflicts_found, conflicts_fixed, conflicts_committed, skip_worktree_checks, review_type, skip_worktrees, created_at_ms, resolver_agent, resolver_model, base_commit, change_summary, base_commits, manual_commands, action_hints, summary_agent, summary_model, manual_commands_agent, manual_commands_model, manual_commands_agent_session_id, squash_projects, auto_pr_feedback, input_values, proof_scope, proof_skip_auto_clean, machine, build_env_overrides, manual_checks_env_overrides, maximum_budget_usd, merge_attempt, skip_base_updates, manual_checks_started_at_ms, notice_kind, notice_message, notice_at_ms, match_pr_branch_name, auto_submit_pr_stack, origin, auto_build_json, separate_pr_branch, readable_review_branch, review_branch_name, project, auto_fix_pr_errors, auto_fix_prompt_template, manual_checks_finished_at_ms, post_merge_status, post_merge_detail, post_merge_started_at_ms, post_merge_finished_at_ms, owner, dual_root_pr, discourage_tests_during_auto_pull_request_fixes, base_shift_maximum_rebuilds, base_shift_rebuild_attempts, base_shift_rebuild_targets, base_shift_exhausted_notified_at_ms, auto_cancel_outdated_pr_pipelines, cache_manual_checks, manual_checks_cached, manual_checks_basis, manual_checks_focus, summary_format, base_shift_rebuild_attempts_by_project, rebuild_on, skip_manual_checks, auto_run, followup_enabled, followup_auto_start, post_appraisals, ci_deferral, live_actions, live_actions_auto_ran_at_ms, base_update_mode, live_actions_default_on, exhibits_enabled, exhibits_max_per_pr, infer_exhibits, exhibit_kind_preference, exhibit_max_video_seconds
               FROM guardians ORDER BY created_at_ms DESC", // `skip_worktree_checks` (col 13) is read-only legacy data (RAL-285) -- see `GuardianRow::legacy_skip_worktree_checks`.
         )?;
         let rows = stmt
@@ -6471,6 +6590,11 @@ impl Store {
             live_actions_auto_ran_at_ms: r.get(81)?,
             base_update_mode: r.get(82)?,
             live_actions_default_on: r.get::<_, Option<i64>>(83)?.is_some_and(|v| v != 0),
+            exhibits_enabled: r.get::<_, Option<i64>>(84)?.map(|v| v != 0),
+            exhibits_max_per_pr: r.get::<_, Option<i64>>(85)?,
+            infer_exhibits: r.get::<_, Option<i64>>(86)?.map(|v| v != 0),
+            exhibit_kind_preference: r.get(87)?,
+            exhibit_max_video_seconds: r.get::<_, Option<i64>>(88)?,
         })
     }
 
@@ -7005,6 +7129,47 @@ impl Store {
         }
         .rebuild_on();
 
+        // Exhibit settings, layered per-review override > database-backed
+        // project default > explicit `.ralphus.toml [review]` value > the
+        // live global config > the built-in default, resolved on every read
+        // so a project or global change reaches existing reviews. A stored
+        // `0` (never written by the API) is skipped like an unset layer.
+        let positive = |v: Option<i64>| v.and_then(|v| u32::try_from(v).ok()).filter(|v| *v > 0);
+        let exhibits_max_per_pr = positive(row.exhibits_max_per_pr);
+        let exhibit_max_video_seconds = positive(row.exhibit_max_video_seconds);
+        let exhibit_kind_preference: Option<Vec<String>> = row
+            .exhibit_kind_preference
+            .as_deref()
+            .and_then(|json| serde_json::from_str(json).ok());
+        let effective_exhibits = crate::config::ReviewConfig {
+            exhibits_enabled: row
+                .exhibits_enabled
+                .or(db_settings.exhibits_enabled)
+                .or(explicit_project.exhibits_enabled)
+                .or(live_global.exhibits_enabled),
+            exhibits_max_per_pr: exhibits_max_per_pr
+                .or(db_settings.exhibits_max_per_pr.filter(|v| *v > 0))
+                .or(explicit_project.exhibits_max_per_pr.filter(|v| *v > 0))
+                .or(live_global.exhibits_max_per_pr.filter(|v| *v > 0)),
+            infer_exhibits: row
+                .infer_exhibits
+                .or(db_settings.infer_exhibits)
+                .or(explicit_project.infer_exhibits)
+                .or(live_global.infer_exhibits),
+            exhibit_kind_preference: exhibit_kind_preference
+                .clone()
+                .or_else(|| db_settings.exhibit_kind_preference.clone())
+                .or_else(|| explicit_project.exhibit_kind_preference.clone())
+                .or_else(|| live_global.exhibit_kind_preference.clone()),
+            exhibit_max_video_seconds: exhibit_max_video_seconds
+                .or(db_settings.exhibit_max_video_seconds.filter(|v| *v > 0))
+                .or(explicit_project
+                    .exhibit_max_video_seconds
+                    .filter(|v| *v > 0))
+                .or(live_global.exhibit_max_video_seconds.filter(|v| *v > 0)),
+            ..crate::config::ReviewConfig::default()
+        };
+
         // RAL-193: this review's own agent cost -- conflict resolution and
         // prover calls made by the guardian merge machinery -- scoped to
         // the current merge attempt and cumulatively across every
@@ -7100,6 +7265,21 @@ impl Store {
                 .base_shift_maximum_rebuilds
                 .and_then(|v| u32::try_from(v).ok()),
             effective_base_shift_maximum_rebuilds,
+            exhibits_enabled: row.exhibits_enabled,
+            effective_exhibits_enabled: effective_exhibits.exhibits_enabled(),
+            exhibits_max_per_pr,
+            effective_exhibits_max_per_pr: u32::try_from(effective_exhibits.exhibits_max_per_pr())
+                .unwrap_or(u32::MAX),
+            infer_exhibits: row.infer_exhibits,
+            effective_infer_exhibits: effective_exhibits.infer_exhibits(),
+            exhibit_kind_preference,
+            effective_exhibit_kind_preference: effective_exhibits
+                .exhibit_kind_preference()
+                .into_iter()
+                .map(|kind| kind.as_str().to_string())
+                .collect(),
+            exhibit_max_video_seconds,
+            effective_exhibit_max_video_seconds: effective_exhibits.exhibit_max_video_seconds(),
             base_shift_rebuild_attempts: row
                 .base_shift_rebuild_attempts
                 .clamp(0, i64::from(u32::MAX)) as u32,
@@ -7701,6 +7881,13 @@ struct GuardianRow {
     /// Whether the review was created under the enabled-by-default live-actions
     /// policy; rows that predate it keep resolving an unset setting to off.
     live_actions_default_on: bool,
+    /// This review's own exhibit overrides as stored; `None` inherits.
+    /// `exhibit_kind_preference` is a JSON array of kind names.
+    exhibits_enabled: Option<bool>,
+    exhibits_max_per_pr: Option<i64>,
+    infer_exhibits: Option<bool>,
+    exhibit_kind_preference: Option<String>,
+    exhibit_max_video_seconds: Option<i64>,
 }
 
 #[cfg(test)]
@@ -9897,6 +10084,51 @@ mod tests {
     // RAL-521: `cache_manual_checks` defaults to ON (caching enabled) and
     // the per-review override flips it off/on, with the effective value
     // resolving through the hydration chain.
+    #[test]
+    fn exhibit_settings_default_then_follow_review_overrides_in_json() {
+        let store = Store::open_in_memory().unwrap();
+        let id = store.create_guardian("r", "main", "/repo").unwrap();
+        let json = serde_json::to_value(store.get_guardian(&id).unwrap()).unwrap();
+        assert!(json["exhibits_enabled"].is_null());
+        assert_eq!(json["effective_exhibits_enabled"], true);
+        assert_eq!(json["effective_exhibits_max_per_pr"], 6);
+        assert_eq!(json["effective_infer_exhibits"], true);
+        assert_eq!(
+            json["effective_exhibit_kind_preference"],
+            serde_json::json!(["gif", "video", "screenshot"])
+        );
+        assert_eq!(json["effective_exhibit_max_video_seconds"], 15);
+
+        store
+            .set_guardian_exhibits_enabled(&id, Some(false))
+            .unwrap();
+        store
+            .set_guardian_exhibits_max_per_pr(&id, Some(3))
+            .unwrap();
+        store
+            .set_guardian_exhibit_kind_preference(&id, Some(&["screenshot".to_string()]))
+            .unwrap();
+        let g = store.get_guardian(&id).unwrap();
+        assert_eq!(g.exhibits_enabled, Some(false));
+        assert!(!g.effective_exhibits_enabled);
+        assert_eq!(g.exhibits_max_per_pr, Some(3));
+        assert_eq!(g.effective_exhibits_max_per_pr, 3);
+        assert_eq!(g.effective_exhibit_kind_preference, vec!["screenshot"]);
+
+        // A raw zero (never written through the API) is skipped like unset.
+        store
+            .conn
+            .execute(
+                "UPDATE guardians SET exhibits_max_per_pr=0 WHERE id=?",
+                params![id],
+            )
+            .unwrap();
+        let g = store.get_guardian(&id).unwrap();
+        assert_eq!(g.exhibits_max_per_pr, None);
+        assert_eq!(g.effective_exhibits_max_per_pr, 6);
+        assert!(store.set_guardian_exhibits_enabled("nope", None).is_err());
+    }
+
     #[test]
     fn cache_manual_checks_defaults_on_and_toggles_independently() {
         let store = Store::open_in_memory().unwrap();
