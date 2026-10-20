@@ -2805,15 +2805,13 @@ fn task_index(daemon: &Daemon, query: &str) -> Reply {
 }
 
 /// Per-task resource usage for every running cell with a live subprocess
-/// (RAL-11). Snapshots the running set + PIDs under the lock, then samples
-/// CPU/RAM/GPU with the lock released (sampling briefly sleeps to measure CPU).
+/// (RAL-11). Reads only the running squads, from the read pool, then samples
+/// CPU/RAM/GPU (sampling briefly sleeps to measure CPU).
 fn resources(daemon: &Daemon) -> Reply {
-    let squads = {
-        let store = daemon.lock();
-        match store.list_squads() {
-            Ok(squads) => squads,
-            Err(e) => return store_error(&e),
-        }
+    let squads = match daemon.with_read_snapshot(|c| Store::list_squads_in_state_conn(c, "running"))
+    {
+        Ok(squads) => squads,
+        Err(e) => return store_error(&e),
     };
     let procs = daemon.procs_handle();
     let rows = crate::resources::build(&squads, &procs);
