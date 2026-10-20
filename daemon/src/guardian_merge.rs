@@ -1708,23 +1708,28 @@ fn git_path(wt: &Workspace, rel: &str) -> Option<PathBuf> {
     if p.is_empty() {
         return None;
     }
-    let path = Path::new(p);
-    Some(if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        wt.root().join(path)
-    })
+    Some(wt.resolve(p))
 }
 
 /// Whether a rebase is currently in progress in `wt` (its state directory
 /// exists). Used to decide whether `rebase --continue` still has work to do.
 ///
+/// On a remote machine the directory is detected by the `head-name` file
+/// git writes into it for every rebase: a provider can read a file but has no
+/// way to test for a directory.
+///
 /// `pub(crate)`: also read by `server.rs`'s live conflicting-files endpoint
 /// (RAL-148) to report whether a branch's worktree is mid-rebase.
 pub(crate) fn rebase_in_progress(wt: &Workspace) -> bool {
-    ["rebase-merge", "rebase-apply"]
-        .iter()
-        .any(|d| git_path(wt, d).is_some_and(|p| p.exists()))
+    ["rebase-merge", "rebase-apply"].iter().any(|d| {
+        git_path(wt, d).is_some_and(|p| {
+            if wt.is_local() {
+                p.exists()
+            } else {
+                wt.exists(p.join("head-name"))
+            }
+        })
+    })
 }
 
 /// Git's own interactive-rebase todo-list progress for an in-progress rebase
@@ -1737,15 +1742,15 @@ pub(crate) fn rebase_in_progress(wt: &Workspace) -> bool {
 /// must treat that as "no progress to report", not an error.
 pub fn rebase_command_progress(wt: &Workspace) -> Option<(i64, i64)> {
     let state_dir = git_path(wt, "rebase-merge")?;
-    let done = count_command_lines(&state_dir.join("done"))?;
-    let remaining = count_command_lines(&state_dir.join("git-rebase-todo")).unwrap_or(0);
+    let done = count_command_lines(wt, &state_dir.join("done"))?;
+    let remaining = count_command_lines(wt, &state_dir.join("git-rebase-todo")).unwrap_or(0);
     Some((done, done + remaining))
 }
 
-/// Count non-blank, non-comment lines in a rebase-todo-style file. `None` if
-/// the file can't be read (missing, or a transient race).
-fn count_command_lines(path: &Path) -> Option<i64> {
-    let content = std::fs::read_to_string(path).ok()?;
+/// Count non-blank, non-comment lines in a rebase-todo-style file in `wt`.
+/// `None` if the file can't be read (missing, or a transient race).
+fn count_command_lines(wt: &Workspace, path: &Path) -> Option<i64> {
+    let content = wt.read_file(path)?;
     Some(
         content
             .lines()

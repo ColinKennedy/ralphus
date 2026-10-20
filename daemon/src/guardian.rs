@@ -6803,9 +6803,14 @@ impl Store {
         }
         // RAL-145: git's own rebase-todo progress is a live filesystem read,
         // so it's gated to the (normally singular) branch actually mid-rebase
-        // rather than scanned across every branch on every board poll.
+        // rather than scanned across every branch on every board poll. A
+        // remote review's worktrees are on its machine, and hydration is no
+        // place for a provider round trip, so it reports no progress.
+        let remote_review = row.machine.as_deref().map(str::trim).is_some_and(|m| {
+            !m.is_empty() && !m.eq_ignore_ascii_case(ralphus_core::schema::LOCAL_MACHINE)
+        });
         for b in &mut branches {
-            if b.merge_status != "in_progress" {
+            if remote_review || b.merge_status != "in_progress" {
                 continue;
             }
             let Some(wt) = b.worktree.as_deref() else {

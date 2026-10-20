@@ -1314,6 +1314,34 @@ echo {json}
     }
 
     #[test]
+    fn a_rebase_on_a_remote_machine_is_detected_there() {
+        // The state directory exists only on the machine; a local
+        // `Path::exists` would always say no rebase is running.
+        let dir = std::env::temp_dir().join(format!("ral-b1-rebase-{}", std::process::id()));
+        let script = write_script(
+            &dir,
+            r#"{"ok":true,"protocol_version":1,"exit_code":0,"stdout":"/srv/repo/.git/worktrees/wt/rebase-merge"}"#,
+        );
+        let store = Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
+        store
+            .lock()
+            .register_machine_provider(
+                "ib",
+                "",
+                &script.to_string_lossy(),
+                &[],
+                crate::machines::PROTOCOL_VERSION,
+                false,
+            )
+            .unwrap();
+        let ws = Workspace::on("/srv/wt", Some("ib:A")).with_store(store);
+        assert!(crate::guardian_merge::rebase_in_progress(&ws));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn a_remote_reviews_forge_remote_is_resolved_on_its_machine() {
         // PR routing reads remote names from the review's repository. For a
         // remote review that is the machine's, whose git answers here with an

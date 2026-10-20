@@ -13284,17 +13284,18 @@ fn guardian_branch_conflicts(daemon: &Daemon, id: &str, branch_id: &str) -> Repl
     let Some(worktree) = worktree else {
         return empty();
     };
-    let wt = std::path::Path::new(&worktree);
-    if !wt.exists() {
+    // The worktree is on the review's machine; a local one that is gone has
+    // nothing to report.
+    let ws =
+        crate::workspace::Workspace::for_guardian(&daemon.store_handle(), id, worktree.as_str());
+    if ws.is_local() && !std::path::Path::new(&worktree).exists() {
         return empty();
     }
     json(
         200,
         &BranchConflictsView {
-            files: crate::guardian_merge::conflicted_files(&crate::workspace::Workspace::local(wt)),
-            rebase_in_progress: crate::guardian_merge::rebase_in_progress(
-                &crate::workspace::Workspace::local(wt),
-            ),
+            files: crate::guardian_merge::conflicted_files(&ws),
+            rebase_in_progress: crate::guardian_merge::rebase_in_progress(&ws),
         },
     )
 }
