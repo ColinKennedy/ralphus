@@ -133,6 +133,8 @@ Private repositories:
 | Pull requests | Read-only |
 | Commit statuses | Read-only |
 
+![The fine-grained token's repository permissions: Commit statuses, Metadata and Pull requests all set to Read-only](images/github-poll-pool-token-fine-grained-permissions.png)
+
 Public repositories only: choose "Public Repositories (read-only)" and add no
 permissions.
 
