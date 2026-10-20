@@ -80,6 +80,7 @@ fn exec_review_settings(cmd: ProjectReviewSettingsCommand, client: &DaemonClient
             auto_run,
             live_actions,
             rebuild_on,
+            exhibits,
         } => {
             let patch = ProjectReviewSettingsPatch {
                 default_resolver_agent: resolver_agent.as_deref(),
@@ -111,6 +112,7 @@ fn exec_review_settings(cmd: ProjectReviewSettingsCommand, client: &DaemonClient
                 auto_run,
                 live_actions,
                 rebuild_on,
+                exhibits,
             };
             Ok(client.set_project_review_settings(&name, &patch)?)
         }

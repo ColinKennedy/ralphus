@@ -2663,6 +2663,85 @@ fn branch_change_context(
     Some((commits, diff_stat, patch))
 }
 
+/// The files `position`'s branch changes (repo-relative), over the same
+/// unique range the PR writer is shown.
+fn branch_changed_paths(root: &Path, guardian: &GuardianView, position: i64) -> Vec<String> {
+    let qualified_base = guardian_merge::qualify_ambiguous_ref(root, &guardian.base_branch);
+    let Ok(base_sha) = git(root, &["rev-parse", &qualified_base]) else {
+        return Vec::new();
+    };
+    let Some((prev, tip)) = commit_range_for(base_sha.trim(), guardian, position) else {
+        return Vec::new();
+    };
+    git(
+        root,
+        &[
+            "diff",
+            "--name-only",
+            "--no-renames",
+            &format!("{prev}..{tip}"),
+        ],
+    )
+    .unwrap_or_default()
+    .lines()
+    .map(str::trim)
+    .filter(|l| !l.is_empty())
+    .map(str::to_string)
+    .collect()
+}
+
+/// Turn the project's `.ralphus.toml` exhibit recipes that match this branch's
+/// changes into exhibit slots (or pending requests), when the review shows
+/// exhibits at all.
+fn apply_exhibit_recipes(
+    store: &crate::store_lock::StoreHandle,
+    guardian: &GuardianView,
+    root: &Path,
+    position: i64,
+    branch_id: &str,
+) {
+    if !crate::exhibit_settings::resolve(store, guardian).enabled {
+        return;
+    }
+    let changed = branch_changed_paths(root, guardian, position);
+    if changed.is_empty() {
+        return;
+    }
+    let (requests, warnings) = crate::exhibits::recipe_requests(root, &changed);
+    for warning in &warnings {
+        crate::rlog!(
+            WARNING,
+            "ralphus [pr] review {} exhibit recipe file skipped: {warning}",
+            guardian.id
+        );
+    }
+    if requests.is_empty() && warnings.is_empty() {
+        return;
+    }
+    let guard = store.lock();
+    let attached = guard
+        .apply_branch_exhibits(
+            &guardian.id,
+            branch_id,
+            crate::exhibits::ExhibitOrigin::Recipe,
+            &requests,
+        )
+        .unwrap_or(0);
+    crate::cartographer::Note::new("guardian")
+        .guardian(&guardian.id)
+        .scope("live_action")
+        .emit(
+            &guard,
+            "exhibit recipes matched for PR",
+            serde_json::json!({
+                "branch_id": branch_id,
+                "recipes": requests.iter().map(|r| r.why.clone()).collect::<Vec<_>>(),
+                "attached_now": attached,
+                "warnings": warnings,
+            }),
+        );
+}
+
 /// The exact trailer ralphus adds to its own commits; it is noise to a PR
 /// reader, so it is removed from commit text before it reaches the writer
 /// agent or the fallback description. Other trailers are kept.
@@ -3021,6 +3100,15 @@ fn attribute_description(
     crate::pr_attribution::with_attribution(description)
 }
 
+/// What the PR writer produced: title, description, the reviewer-relevant
+/// prophecies, and any exhibit requests it added.
+type SynthesizedPr = (
+    String,
+    String,
+    Vec<crate::prophecy::ProphecyView>,
+    Vec<crate::exhibits::InferredRequest>,
+);
+
 /// Synthesize a suggested PR title + description from one branch's unique
 /// commit range, using the same `Runner`/`RunnerSpec` mechanism
 /// `guardian_merge::generate_final_summary` uses for the change summary.
@@ -3050,7 +3138,8 @@ fn synthesize_pr_text(
     template: Option<&str>,
     trace_context: Option<&str>,
     prophecies: &[crate::prophecy::ProphecyView],
-) -> (String, String, Vec<crate::prophecy::ProphecyView>) {
+    exhibit_note: Option<&str>,
+) -> SynthesizedPr {
     let root = PathBuf::from(&guardian.git_root);
     let fallback_title = guardian
         .branches
@@ -3075,6 +3164,7 @@ fn synthesize_pr_text(
                 fallback_title,
                 template.unwrap_or_default().to_string(),
                 deterministic_relevant_prophecies(prophecies),
+                Vec::new(),
             );
         }
     };
@@ -3090,6 +3180,7 @@ fn synthesize_pr_text(
             fallback_title,
             template.unwrap_or_default().to_string(),
             deterministic_relevant_prophecies(prophecies),
+            Vec::new(),
         );
     };
     let fallback_description = fallback_pr_description(&commits, &diff_stat, template);
@@ -3113,6 +3204,7 @@ fn synthesize_pr_text(
                 fallback_title,
                 fallback_description,
                 deterministic_relevant_prophecies(prophecies),
+                Vec::new(),
             );
         }
     };
@@ -3184,7 +3276,8 @@ fn synthesize_pr_text(
          appear in the PR, with no quoting or escaping of any of it>\n\n\
          The description should explain what changed and why, focused on developer \
          intent rather than file-level detail. Keep it under {MAX_PR_DESCRIPTION_CHARS} \
-         characters.{template_note}{prophecy_note}"
+         characters.{template_note}{prophecy_note}{}",
+        exhibit_note.unwrap_or_default()
     );
     let spec = pr_writer_spec(guardian, position, resolved, prompt, trace_context);
     // ralphus[ignore-rlog-pair]: this low-level helper has no Store; its Store-owning caller records the structured workflow outcome
@@ -3211,7 +3304,12 @@ fn synthesize_pr_text(
                     .filter(|p| relevant_ids.contains(&p.id))
                     .cloned()
                     .collect();
-                return (title, description, relevant);
+                let inferred = if exhibit_note.is_some() {
+                    crate::exhibits::parse_inferred(&result.summary)
+                } else {
+                    Vec::new()
+                };
+                return (title, description, relevant, inferred);
             }
         }
     }
@@ -3228,9 +3326,11 @@ fn synthesize_pr_text(
         fallback_title,
         fallback_description,
         deterministic_relevant_prophecies(prophecies),
+        Vec::new(),
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn resolve_title_description(
     runner: &dyn Runner,
     guardian: &GuardianView,
@@ -3239,7 +3339,8 @@ fn resolve_title_description(
     client: &crate::forge::ForgeClient,
     trace_context: Option<&str>,
     prophecies: &[crate::prophecy::ProphecyView],
-) -> (String, String, Vec<crate::prophecy::ProphecyView>) {
+    exhibit_note: Option<&str>,
+) -> SynthesizedPr {
     if let (Some(t), Some(d)) = (&req.title, &req.description) {
         // Both title and description were given explicitly, so the
         // synthesis call never runs -- there is no model turn to ask about
@@ -3249,21 +3350,24 @@ fn resolve_title_description(
             t.clone(),
             d.clone(),
             deterministic_relevant_prophecies(prophecies),
+            Vec::new(),
         );
     }
     let template = client.fetch_pr_template();
-    let (synth_title, synth_description, relevant_prophecies) = synthesize_pr_text(
+    let (synth_title, synth_description, relevant_prophecies, inferred) = synthesize_pr_text(
         runner,
         guardian,
         position,
         template.as_deref(),
         trace_context,
         prophecies,
+        exhibit_note,
     );
     (
         req.title.clone().unwrap_or(synth_title),
         req.description.clone().unwrap_or(synth_description),
         relevant_prophecies,
+        inferred,
     )
 }
 
@@ -8992,15 +9096,46 @@ fn submit_stacked_branch_pr(
     {
         Some(existing) => adopt(existing),
         None => {
-            let (title, description, reviewer_relevant_prophecies) = resolve_title_description(
-                runner,
-                guardian,
-                req,
-                position,
-                &route.client,
-                trace_context,
-                &unpublished_prophecies,
-            );
+            apply_exhibit_recipes(store, guardian, root, position, branch_id);
+            let exhibit_note = crate::exhibits::inference_prompt(store, guardian, branch_id);
+            let (title, description, reviewer_relevant_prophecies, inferred_exhibits) =
+                resolve_title_description(
+                    runner,
+                    guardian,
+                    req,
+                    position,
+                    &route.client,
+                    trace_context,
+                    &unpublished_prophecies,
+                    exhibit_note.as_deref(),
+                );
+            if !inferred_exhibits.is_empty() {
+                let guard = store.lock();
+                match guard.apply_branch_exhibits(
+                    id,
+                    branch_id,
+                    crate::exhibits::ExhibitOrigin::Inferred,
+                    &inferred_exhibits,
+                ) {
+                    Ok(attached) => crate::cartographer::Note::new("guardian")
+                        .guardian(id)
+                        .scope("live_action")
+                        .emit(
+                            &guard,
+                            "exhibit requests inferred for PR",
+                            serde_json::json!({
+                                "branch_id": branch_id,
+                                "requested": inferred_exhibits.len(),
+                                "attached_now": attached,
+                                "why": inferred_exhibits.iter().map(|r| r.why.clone()).collect::<Vec<_>>(),
+                            }),
+                        ),
+                    Err(e) => crate::rlog!(
+                        WARNING,
+                        "ralphus [pr] review {id} branch {branch_id} could not record inferred exhibit requests: {e}"
+                    ),
+                }
+            }
             let description =
                 attribute_description(runner, guardian, position, trace_context, &description);
             let description = match format_prophecy_details_block(&reviewer_relevant_prophecies) {
@@ -13002,8 +13137,8 @@ mod tests {
             "TITLE: Add x\nRELEVANT_PROPHECY_IDS: 2, 7\n===DESCRIPTION===\nAdds x.".to_string(),
         );
 
-        let (title, description, relevant) =
-            synthesize_pr_text(&runner, &guardian, 0, None, None, &prophecies);
+        let (title, description, relevant, _) =
+            synthesize_pr_text(&runner, &guardian, 0, None, None, &prophecies, None);
 
         assert_eq!(title, "Add x");
         assert_eq!(description, "Adds x.");
@@ -24518,6 +24653,88 @@ token_env = "RALPHUS_TEST_FORGE_TOKEN"
     }
 
     #[test]
+    fn exhibit_recipes_match_only_the_branchs_own_changed_files() {
+        // Spawns `git diff --name-only` over the branch's unique range
+        // (tagged in proc_counts/tags.toml).
+        let root = tmp_dir("pr-exhibit-recipes");
+        g(&root, &["init", "--initial-branch", "main"]);
+        gwrite(
+            &root,
+            ".ralphus.toml",
+            "[[exhibit.recipe]]\nname = \"recording\"\nkind = \"gif\"\ndescribe = \"the chart recording\"\npaths = [\"website/**\"]\ncommand = \"node record.js\"\n",
+        );
+        g(&root, &["add", "."]);
+        g(&root, &["commit", "--message", "base"]);
+        for (branch, file) in [
+            ("review/a", "docs/a.md"),
+            ("review/b", "website/src/Chart.tsx"),
+        ] {
+            g(&root, &["checkout", "-b", branch]);
+            std::fs::create_dir_all(root.join(file).parent().unwrap()).unwrap();
+            gwrite(&root, file, "x\n");
+            g(&root, &["add", "."]);
+            g(&root, &["commit", "--message", file]);
+        }
+        g(&root, &["checkout", "main"]);
+        let store = store();
+        let gid = store
+            .create_guardian("recipes", "main", root.to_str().unwrap())
+            .unwrap();
+        for branch in ["a", "b"] {
+            store.add_guardian_branch(&gid, branch).unwrap();
+        }
+        let ids: Vec<String> = store
+            .get_guardian(&gid)
+            .unwrap()
+            .branches
+            .iter()
+            .map(|b| b.id.clone())
+            .collect();
+        for ((id, review_branch), worktree) in ids
+            .iter()
+            .zip(["review/a", "review/b"])
+            .zip(["worktree-a", "worktree-b"])
+        {
+            store
+                .set_branch_review(&gid, id, review_branch, worktree)
+                .unwrap();
+        }
+        let guardian = store.get_guardian(&gid).unwrap();
+        assert_eq!(
+            branch_changed_paths(&root, &guardian, 0),
+            vec!["docs/a.md".to_string()]
+        );
+        assert_eq!(
+            branch_changed_paths(&root, &guardian, 1),
+            vec!["website/src/Chart.tsx".to_string()]
+        );
+        let handle: crate::store_lock::StoreHandle =
+            std::sync::Arc::new(crate::store_lock::StoreMutex::new(store));
+        // Branch a changes nothing under website/: no request.
+        apply_exhibit_recipes(&handle, &guardian, &root, 0, &ids[0]);
+        // Branch b does: one pending request, waiting for a live action.
+        apply_exhibit_recipes(&handle, &guardian, &root, 1, &ids[1]);
+        let pending: Vec<(String, String, String)> = handle
+            .lock()
+            .conn
+            .prepare("SELECT branch_id, describe, origin FROM guardian_pending_exhibits")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .map(|row| row.unwrap())
+            .collect();
+        assert_eq!(
+            pending,
+            vec![(
+                ids[1].clone(),
+                "the chart recording (capture with: node record.js)".to_string(),
+                "recipe".to_string()
+            )]
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn pr_text_uses_only_the_branchs_unique_range_and_never_the_review_summary() {
         let root = tmp_dir("pr-text-unique-range");
         g(&root, &["init", "--initial-branch", "main"]);
@@ -24571,13 +24788,14 @@ token_env = "RALPHUS_TEST_FORGE_TOKEN"
         let guardian = store.get_guardian(&gid).unwrap();
         let runner = CapturingFailureRunner(Mutex::new(None));
 
-        let (title, description, relevant) = synthesize_pr_text(
+        let (title, description, relevant, _) = synthesize_pr_text(
             &runner,
             &guardian,
             1,
             Some("## Summary\n\n<!-- fill this in -->"),
             None,
             &[],
+            None,
         );
         assert!(relevant.is_empty(), "no prophecies were given to judge");
 
@@ -24666,7 +24884,8 @@ token_env = "RALPHUS_TEST_FORGE_TOKEN"
         let guardian = store.get_guardian(&gid).unwrap();
         let runner = CapturingFailureRunner(Mutex::new(None));
 
-        let (_, description, _) = synthesize_pr_text(&runner, &guardian, 0, None, None, &[]);
+        let (_, description, _, _) =
+            synthesize_pr_text(&runner, &guardian, 0, None, None, &[], None);
 
         assert!(description.contains("add x"), "{description}");
         assert!(

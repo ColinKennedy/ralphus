@@ -1371,6 +1371,41 @@ pub fn check_rebuild_on(values: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+/// The exhibit kinds an `exhibit_kind_preference` list may name, in the
+/// default preference order (most preferred first).
+pub const EXHIBIT_KIND_PREFERENCE_VALUES: &[&str] = &["gif", "video", "screenshot"];
+
+/// Check an `exhibit_kind_preference` list: it must be non-empty, every entry
+/// must be one of [`EXHIBIT_KIND_PREFERENCE_VALUES`] (exact lowercase), and
+/// none may repeat. The order is the preference order and is kept as given.
+/// The error is a complete sentence naming the offending entry and the
+/// allowed values.
+pub fn check_exhibit_kind_preference(values: &[String]) -> Result<(), String> {
+    let allowed = EXHIBIT_KIND_PREFERENCE_VALUES
+        .iter()
+        .map(|value| format!("\"{value}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
+    if values.is_empty() {
+        return Err(format!(
+            "'exhibit_kind_preference' must name at least one of {allowed}"
+        ));
+    }
+    for (index, value) in values.iter().enumerate() {
+        if !EXHIBIT_KIND_PREFERENCE_VALUES.contains(&value.as_str()) {
+            return Err(format!(
+                "'exhibit_kind_preference' entries must be one of {allowed} -- got \"{value}\""
+            ));
+        }
+        if values[..index].contains(value) {
+            return Err(format!(
+                "'exhibit_kind_preference' lists \"{value}\" more than once; each of {allowed} may appear at most once"
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Valid values for `[[task.cell]] mode` / `[[task.proof]]` (and
 /// `[[task.cell.proof]]`) `mode`: how a `command` cell/proof step behaves on
 /// failure. See [`CellDef::mode`]/[`ProofStep::mode`].
@@ -4317,5 +4352,28 @@ mod tests {
         cell.temperature = Some(0.0);
 
         assert_eq!(resolve_cell_temperature(&task, &cell), Some(0.0));
+    }
+
+    fn kinds(values: &[&str]) -> Vec<String> {
+        values.iter().map(|v| (*v).to_string()).collect()
+    }
+
+    #[test]
+    fn exhibit_kind_preference_accepts_any_order_of_the_closed_set() {
+        assert!(check_exhibit_kind_preference(&kinds(&["gif", "video", "screenshot"])).is_ok());
+        assert!(check_exhibit_kind_preference(&kinds(&["screenshot", "gif"])).is_ok());
+        assert!(check_exhibit_kind_preference(&kinds(&["video"])).is_ok());
+    }
+
+    #[test]
+    fn exhibit_kind_preference_rejects_empty_unknown_and_duplicates() {
+        let empty = check_exhibit_kind_preference(&[]).unwrap_err();
+        assert!(empty.contains("at least one"), "{empty}");
+        let unknown = check_exhibit_kind_preference(&kinds(&["gif", "output"])).unwrap_err();
+        assert!(unknown.contains("\"output\""), "{unknown}");
+        let upper = check_exhibit_kind_preference(&kinds(&["GIF"])).unwrap_err();
+        assert!(upper.contains("\"GIF\""), "{upper}");
+        let dup = check_exhibit_kind_preference(&kinds(&["gif", "video", "gif"])).unwrap_err();
+        assert!(dup.contains("more than once"), "{dup}");
     }
 }

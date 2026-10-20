@@ -593,6 +593,10 @@ struct ProjectsSummary {
     results: Vec<CheckResult>,
     any_project_registered: bool,
     any_git_project: bool,
+    /// Whether any registered project is hosted on GitHub (its clone URL or
+    /// its checkout's remotes name github.com), which is when the `gh`
+    /// exhibit fallback matters.
+    any_github_project: bool,
 }
 
 /// Validates every project registered with the daemon. Contributes empty
@@ -606,6 +610,7 @@ fn check_projects(daemon_url: &str) -> ProjectsSummary {
             results: Vec::new(),
             any_project_registered: false,
             any_git_project: false,
+            any_github_project: false,
         };
     };
     let has_remote_providers = client
@@ -618,6 +623,13 @@ fn check_projects(daemon_url: &str) -> ProjectsSummary {
     let any_git_project = projects
         .iter()
         .any(|p| p["vcs"].as_str().unwrap_or("git") == "git");
+    let any_github_project = projects.iter().any(|p| {
+        p["clone_url"].as_str().is_some_and(names_github)
+            || p["path"].as_str().is_some_and(|path| {
+                std::fs::read_to_string(Path::new(path).join(".git").join("config"))
+                    .is_ok_and(|config| names_github(&config))
+            })
+    });
     let results = projects
         .iter()
         .flat_map(|p| {
@@ -645,7 +657,13 @@ fn check_projects(daemon_url: &str) -> ProjectsSummary {
         results,
         any_project_registered,
         any_git_project,
+        any_github_project,
     }
+}
+
+/// Whether a URL or git config text names a github.com remote.
+fn names_github(text: &str) -> bool {
+    text.contains("github.com")
 }
 
 /// RAL-338: fork registration health, evaluated daemon-side (see
@@ -792,9 +810,39 @@ fn check_ollama() -> CheckResult {
 /// binary is ever required, and a missing one must never fail this check --
 /// it just means the fallback path is unavailable if the primary token env
 /// var also turns out to be unset.
-fn check_gh_for(found: Option<String>) -> CheckResult {
+///
+/// For a GitHub project `gh` is also the fallback that uploads live-action
+/// exhibits (`gh pr edit --attach`, gh 2.99+), so a missing, older or
+/// logged-out `gh` warns there -- still never fails.
+fn check_gh_for(gh: &GhProbe, github_in_use: bool) -> CheckResult {
     const ROLE: &str = "optional fallback token source for GitHub auth (`gh auth token`), used only when RALPHUS_GITHUB_TOKEN / [forge].token_env is unset";
-    match found {
+    let exhibit_problem = match (&gh.path, gh.version) {
+        (None, _) => Some("not found on PATH".to_string()),
+        (Some(_), None) => Some("its version could not be read".to_string()),
+        (Some(_), Some(v)) if !ralphus_core::gh_attach::supports_attach(v) => Some(format!(
+            "gh {} is older than {}, the first with `--attach`",
+            ralphus_core::gh_attach::format_version(v),
+            ralphus_core::gh_attach::format_version(ralphus_core::gh_attach::MIN_VERSION)
+        )),
+        (Some(_), Some(_)) if !gh.logged_in => {
+            Some("gh is not logged in to github.com".to_string())
+        }
+        _ => None,
+    };
+    if github_in_use {
+        if let Some(problem) = exhibit_problem {
+            return CheckResult::harness(
+                "gh",
+                WARN,
+                format!(
+                    "{problem}: GitHub PRs may not get screenshots or GIFs when the direct upload fails ({ROLE}; also the exhibit upload fallback)"
+                ),
+                ralphus_core::gh_attach::IMPACT,
+                ralphus_core::gh_attach::REMEDIATION,
+            );
+        }
+    }
+    match &gh.path {
         Some(path) => CheckResult::harness(
             "gh",
             PASS,
@@ -812,8 +860,44 @@ fn check_gh_for(found: Option<String>) -> CheckResult {
     }
 }
 
-fn check_gh() -> CheckResult {
-    check_gh_for(which("gh"))
+/// What `ralphus check health` learned about `gh`.
+struct GhProbe {
+    path: Option<String>,
+    version: Option<(u32, u32, u32)>,
+    logged_in: bool,
+}
+
+/// Find `gh`, and -- only when a GitHub project needs its exhibit fallback --
+/// read its version and login state.
+fn probe_gh(github_in_use: bool) -> GhProbe {
+    let path = which("gh");
+    if path.is_none() || !github_in_use {
+        return GhProbe {
+            path,
+            version: None,
+            logged_in: false,
+        };
+    }
+    let version = std::process::Command::new("gh")
+        .arg("--version")
+        .output()
+        .ok()
+        .and_then(|out| {
+            ralphus_core::gh_attach::parse_version(&String::from_utf8_lossy(&out.stdout))
+        });
+    let logged_in = std::process::Command::new("gh")
+        .args(["auth", "status", "--hostname", "github.com"])
+        .output()
+        .is_ok_and(|out| out.status.success());
+    GhProbe {
+        path,
+        version,
+        logged_in,
+    }
+}
+
+fn check_gh(github_in_use: bool) -> CheckResult {
+    check_gh_for(&probe_gh(github_in_use), github_in_use)
 }
 
 fn check_glab_for(found: Option<String>) -> CheckResult {
@@ -2021,6 +2105,7 @@ pub fn run_checks(
 
     let projects = check_projects(daemon_url);
     let git_required = !projects.any_project_registered || projects.any_git_project;
+    let github_in_use = projects.any_github_project;
     results.push(check_git(git_required).with_id(ID_GIT));
     results.extend(projects.results);
     results.extend(
@@ -2031,7 +2116,7 @@ pub fn run_checks(
 
     results.push(check_runner().with_id(ID_RUNNER));
     results.push(check_ollama().with_id(ID_OLLAMA));
-    results.push(check_gh().with_id(ID_GH));
+    results.push(check_gh(github_in_use).with_id(ID_GH));
     results.push(check_glab().with_id(ID_GLAB));
     results.push(check_ripgrep());
     results.push(
@@ -2872,9 +2957,17 @@ mod tests {
 
     // ── optional forge CLI fallbacks (RAL-415) ─────────────────────────────
 
+    fn gh(path: Option<&str>, version: Option<(u32, u32, u32)>, logged_in: bool) -> GhProbe {
+        GhProbe {
+            path: path.map(str::to_string),
+            version,
+            logged_in,
+        }
+    }
+
     #[test]
     fn check_gh_never_fails_when_missing() {
-        let result = check_gh_for(None);
+        let result = check_gh_for(&gh(None, None, false), false);
         assert_ne!(result.status, FAIL);
         assert!(result.detail.contains("fallback"));
         assert_eq!(result.section, HARNESS);
@@ -2882,9 +2975,44 @@ mod tests {
 
     #[test]
     fn check_gh_reports_path_when_found() {
-        let result = check_gh_for(Some("/usr/bin/gh".to_string()));
+        let result = check_gh_for(&gh(Some("/usr/bin/gh"), None, false), false);
         assert_ne!(result.status, FAIL);
         assert!(result.detail.contains("/usr/bin/gh"));
+    }
+
+    #[test]
+    fn check_gh_warns_a_github_project_that_its_prs_may_lack_screenshots() {
+        for probe in [
+            gh(None, None, false),
+            gh(Some("/usr/bin/gh"), Some((2, 93, 0)), true),
+            gh(Some("/usr/bin/gh"), Some((2, 99, 0)), false),
+        ] {
+            let result = check_gh_for(&probe, true);
+            assert_eq!(result.status, WARN, "{}", result.detail);
+            assert!(
+                result.detail.contains("screenshots or GIFs"),
+                "{}",
+                result.detail
+            );
+        }
+        let old = check_gh_for(&gh(Some("/usr/bin/gh"), Some((2, 93, 0)), true), true);
+        assert!(
+            old.detail.contains("2.93.0") && old.detail.contains("2.99.0"),
+            "{}",
+            old.detail
+        );
+    }
+
+    #[test]
+    fn check_gh_passes_a_github_project_with_a_new_logged_in_gh() {
+        let result = check_gh_for(&gh(Some("/usr/bin/gh"), Some((2, 99, 0)), true), true);
+        assert_eq!(result.status, PASS);
+    }
+
+    #[test]
+    fn check_gh_does_not_warn_without_a_github_project() {
+        let result = check_gh_for(&gh(Some("/usr/bin/gh"), Some((2, 93, 0)), false), false);
+        assert_eq!(result.status, PASS);
     }
 
     #[test]

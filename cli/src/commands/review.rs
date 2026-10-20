@@ -29,7 +29,7 @@ use std::collections::BTreeMap;
 use serde_json::Value;
 
 use crate::args::GlobalOpts;
-use crate::client::{DaemonClient, DaemonError, GuardianSettings};
+use crate::client::{DaemonClient, DaemonError, ExhibitFlags, GuardianSettings};
 use crate::commands::{CommandError, emit, run_and_report};
 use crate::flags::{Scanner, UsageError};
 use crate::selector::{
@@ -160,6 +160,10 @@ pub enum ReviewCommand {
         /// This review's own follow-up auto-start override
         /// (`--followup-auto-start on|off|inherit`), same shape.
         followup_auto_start: Option<Option<bool>>,
+        /// This review's own exhibit overrides (`--exhibits-enabled`,
+        /// `--exhibits-max-per-pr`, `--infer-exhibits`,
+        /// `--exhibit-kind-preference`, `--exhibit-max-video-seconds`).
+        exhibits: ExhibitFlags,
     },
     /// Tear down and rebuild a settled review's prepared build now.
     Rebuild {
@@ -527,6 +531,10 @@ pub fn parse(args: &[String]) -> ReviewCommand {
                 Ok(value) => value,
                 Err(UsageError(message)) => return ReviewCommand::UsageError(message),
             };
+            let exhibits = match take_exhibit_flags(&mut scanner) {
+                Ok(value) => value,
+                Err(UsageError(message)) => return ReviewCommand::UsageError(message),
+            };
             with_selector(scanner, |selector| ReviewCommand::Settings {
                 selector,
                 skip_worktrees,
@@ -555,6 +563,7 @@ pub fn parse(args: &[String]) -> ReviewCommand {
                 rebuild_on,
                 followup_enabled,
                 followup_auto_start,
+                exhibits,
             })
         }
         Some("rebuild") => with_selector(scanner, |selector| ReviewCommand::Rebuild { selector }),
@@ -769,6 +778,116 @@ pub(crate) fn take_override_switch(
             "{name}: expected on, off, or inherit, got {other:?}"
         ))),
     }
+}
+
+/// Take a `<true|false|inherit>` value flag: `None` when absent,
+/// `Some(None)` for `inherit` (clear the override), `Some(Some(b))` for
+/// `true`/`false` (case-insensitive).
+///
+/// # Errors
+/// Any other value, or the flag with no value.
+pub(crate) fn take_bool_or_inherit(
+    scanner: &mut Scanner,
+    name: &str,
+) -> Result<Option<Option<bool>>, UsageError> {
+    let Some(raw) = scanner.take_value(name)? else {
+        return Ok(None);
+    };
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "true" => Ok(Some(Some(true))),
+        "false" => Ok(Some(Some(false))),
+        "inherit" => Ok(Some(None)),
+        _ => Err(UsageError(format!(
+            "{name}: expected true, false, or inherit, got {raw:?}"
+        ))),
+    }
+}
+
+/// Take a `<n|inherit>` value flag whose number must be at least 1: `None`
+/// when absent, `Some(None)` for `inherit`, `Some(Some(n))` otherwise.
+///
+/// # Errors
+/// `0`, a non-number, or the flag with no value.
+pub(crate) fn take_count_or_inherit(
+    scanner: &mut Scanner,
+    name: &str,
+) -> Result<Option<Option<u32>>, UsageError> {
+    let Some(raw) = scanner.take_value(name)? else {
+        return Ok(None);
+    };
+    let raw = raw.trim();
+    if raw.eq_ignore_ascii_case("inherit") {
+        return Ok(Some(None));
+    }
+    match raw.parse::<u32>() {
+        Ok(n) if n >= 1 => Ok(Some(Some(n))),
+        _ => Err(UsageError(format!(
+            "{name}: expected a whole number of at least 1, or inherit, got {raw:?}"
+        ))),
+    }
+}
+
+/// Parse the values of a repeatable `--exhibit-kind-preference`: kinds drawn
+/// from `gif`, `video`, `screenshot` (repeated or comma-separated, most
+/// preferred first, each at most once), or the single keyword `inherit` to
+/// clear the override (returned as `None`). Entries are trimmed and
+/// lowercased; the order is kept.
+///
+/// # Errors
+/// An empty list, an unknown or repeated kind, or `inherit` combined with
+/// kinds.
+pub(crate) fn parse_exhibit_kind_preference(
+    values: &[String],
+) -> Result<Option<Vec<String>>, UsageError> {
+    let tokens: Vec<String> = values
+        .iter()
+        .flat_map(|value| value.split(','))
+        .map(|token| token.trim().to_ascii_lowercase())
+        .filter(|token| !token.is_empty())
+        .collect();
+    if tokens.iter().any(|token| token == "inherit") {
+        return match tokens.as_slice() {
+            [_] => Ok(None),
+            _ => Err(UsageError(
+                "--exhibit-kind-preference: `inherit` must be the only value".to_string(),
+            )),
+        };
+    }
+    ralphus_core::schema::check_exhibit_kind_preference(&tokens)
+        .map_err(|message| UsageError(format!("--exhibit-kind-preference: {message}")))?;
+    Ok(Some(tokens))
+}
+
+/// Take every `--exhibit-kind-preference <kinds|inherit>` (repeatable; each
+/// value may itself be a comma list). `None` when the flag is absent.
+///
+/// # Errors
+/// See [`parse_exhibit_kind_preference`].
+pub(crate) fn take_exhibit_kind_preference(
+    scanner: &mut Scanner,
+) -> Result<Option<Option<Vec<String>>>, UsageError> {
+    let values = scanner
+        .take_repeated("--exhibit-kind-preference")
+        .unwrap_or_default();
+    if values.is_empty() {
+        return Ok(None);
+    }
+    parse_exhibit_kind_preference(&values).map(Some)
+}
+
+/// Take every exhibit-setting flag shared by `review settings` and `project
+/// review-settings set` (see [`ExhibitFlags`]).
+///
+/// # Errors
+/// The first invalid value, as a usage error naming its flag.
+pub(crate) fn take_exhibit_flags(scanner: &mut Scanner) -> Result<ExhibitFlags, UsageError> {
+    Ok(ExhibitFlags {
+        exhibits_enabled: take_bool_or_inherit(scanner, "--exhibits-enabled")?,
+        exhibits_max_per_pr: take_count_or_inherit(scanner, "--exhibits-max-per-pr")?,
+        infer_exhibits: take_bool_or_inherit(scanner, "--infer-exhibits")?,
+        exhibit_kind_preference: take_exhibit_kind_preference(scanner)?,
+        exhibit_max_video_seconds: take_count_or_inherit(scanner, "--exhibit-max-video-seconds")?,
+    })
 }
 
 pub(crate) fn take_tri_bool(scanner: &mut Scanner, name: &str) -> Option<bool> {
@@ -1628,6 +1747,7 @@ pub fn dispatch(cmd: ReviewCommand, opts: &GlobalOpts) -> i32 {
             rebuild_on,
             followup_enabled,
             followup_auto_start,
+            exhibits,
         } => run_and_report(opts, None, || {
             let resolved = resolve_guardian_selector(&client, &selector, DEFAULT_REVIEW_LIST_HINT)?;
             let settings = GuardianSettings {
@@ -1657,6 +1777,7 @@ pub fn dispatch(cmd: ReviewCommand, opts: &GlobalOpts) -> i32 {
                 rebuild_on,
                 followup_enabled,
                 followup_auto_start,
+                exhibits,
             };
             let result = client.guardian_settings(&resolved.guardian_id, &settings)?;
             emit(opts, &result, |_| println!("{selector} settings updated"));
@@ -3854,6 +3975,92 @@ mod tests {
                 ReviewCommand::Settings { auto_run, .. } => assert_eq!(auto_run, want),
                 other => panic!("unexpected: {other:?}"),
             }
+        }
+    }
+
+    fn exhibits_of(args: &[&str]) -> Result<ExhibitFlags, String> {
+        let mut argv = vec!["settings", "g1"];
+        argv.extend_from_slice(args);
+        match parse(&v(&argv)) {
+            ReviewCommand::Settings { exhibits, .. } => Ok(exhibits),
+            ReviewCommand::UsageError(message) => Err(message),
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_settings_exhibit_flags_values_and_inherit() {
+        assert_eq!(exhibits_of(&[]).unwrap(), ExhibitFlags::default());
+        let flags = exhibits_of(&[
+            "--exhibits-enabled",
+            "false",
+            "--exhibits-max-per-pr",
+            "3",
+            "--infer-exhibits",
+            "TRUE",
+            "--exhibit-kind-preference",
+            "Screenshot, gif",
+            "--exhibit-max-video-seconds",
+            "inherit",
+        ])
+        .unwrap();
+        assert_eq!(flags.exhibits_enabled, Some(Some(false)));
+        assert_eq!(flags.exhibits_max_per_pr, Some(Some(3)));
+        assert_eq!(flags.infer_exhibits, Some(Some(true)));
+        assert_eq!(
+            flags.exhibit_kind_preference,
+            Some(Some(vec!["screenshot".to_string(), "gif".to_string()]))
+        );
+        assert_eq!(flags.exhibit_max_video_seconds, Some(None));
+        let flags = exhibits_of(&[
+            "--exhibits-enabled",
+            "inherit",
+            "--exhibit-kind-preference",
+            "video",
+            "--exhibit-kind-preference",
+            "gif",
+        ])
+        .unwrap();
+        assert_eq!(flags.exhibits_enabled, Some(None));
+        assert_eq!(
+            flags.exhibit_kind_preference,
+            Some(Some(vec!["video".to_string(), "gif".to_string()]))
+        );
+        assert_eq!(
+            exhibits_of(&["--exhibit-kind-preference", "inherit"])
+                .unwrap()
+                .exhibit_kind_preference,
+            Some(None)
+        );
+    }
+
+    #[test]
+    fn settings_exhibit_flags_reject_zero_and_invalid_values() {
+        for (args, needle) in [
+            (&["--exhibits-max-per-pr", "0"][..], "--exhibits-max-per-pr"),
+            (
+                &["--exhibit-max-video-seconds", "0"][..],
+                "--exhibit-max-video-seconds",
+            ),
+            (
+                &["--exhibits-max-per-pr", "-2"][..],
+                "--exhibits-max-per-pr",
+            ),
+            (&["--exhibits-enabled", "yes"][..], "--exhibits-enabled"),
+            (&["--infer-exhibits", "on"][..], "--infer-exhibits"),
+            (
+                &["--exhibit-kind-preference", "gif,gif"][..],
+                "more than once",
+            ),
+            (&["--exhibit-kind-preference", "output"][..], "\"output\""),
+            (&["--exhibit-kind-preference", ","][..], "at least one"),
+            (
+                &["--exhibit-kind-preference", "inherit,gif"][..],
+                "must be the only value",
+            ),
+        ] {
+            let err = exhibits_of(args).unwrap_err();
+            assert!(err.contains(needle), "{args:?}: {err}");
         }
     }
 

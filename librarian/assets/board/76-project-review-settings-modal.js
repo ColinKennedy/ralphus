@@ -4,7 +4,9 @@
       // equivalents of every `ralphus review settings` opt-out flag.
       // Applied to FUTURE reviews only (an Arbiter-created review with no
       // `[[review]]` block, or any review whose own block leaves a field
-      // unset); existing reviews are unaffected.
+      // unset); existing reviews are unaffected, except by the CI-deferral
+      // and exhibit defaults, which existing reviews without a setting of
+      // their own follow too.
       //
       // Reuses `66-review-edit-modal.js`'s shared field renderers
       // (`renderResolverFieldsHtml`/`renderProofScopeFieldsHtml`/
@@ -79,6 +81,9 @@
        * @property {boolean} originalLiveActions
        * @property {RebuildOnDraft} rebuildOn - Default for when a future review rebuilds its prepared build; `inherit` means the file-config/global value applies.
        * @property {RebuildOnDraft} originalRebuildOn
+       * @property {ExhibitSettingsDraft} exhibits - This project's default exhibit settings; blank fields inherit the file-config/global value.
+       * @property {ExhibitSettingsDraft} originalExhibits
+       * @property {ExhibitSettingsEffective} exhibitsEffective - What each exhibit field resolves to right now.
        */
 
       /** @type {ProjectReviewSettingsDraft|null} */
@@ -138,6 +143,22 @@
         const skipManualChecks = boolOr(s.skip_manual_checks, effective.skip_manual_checks);
         const autoRun = boolOr(s.auto_run, effective.auto_run);
         const liveActions = boolOr(s.live_actions, effective.live_actions);
+        /** @type {ExhibitSettingsRaw} */
+        const exhibitsRaw = {
+          exhibits_enabled: s.exhibits_enabled,
+          exhibits_max_per_pr: s.exhibits_max_per_pr,
+          infer_exhibits: s.infer_exhibits,
+          exhibit_kind_preference: s.exhibit_kind_preference,
+          exhibit_max_video_seconds: s.exhibit_max_video_seconds,
+        };
+        /** @type {ExhibitSettingsEffective} */
+        const exhibitsEffective = {
+          enabled: effective.exhibits_enabled !== false,
+          maxPerPr: effective.exhibits_max_per_pr || 6,
+          infer: effective.infer_exhibits !== false,
+          kinds: effective.exhibit_kind_preference || EXHIBIT_KINDS,
+          maxVideoSeconds: effective.exhibit_max_video_seconds || 15,
+        };
         return {
           project,
           cwd: proj ? proj.path : "",
@@ -169,6 +190,9 @@
           liveActions, originalLiveActions: liveActions,
           rebuildOn: buildRebuildOnDraft(s.rebuild_on, effective.rebuild_on),
           originalRebuildOn: buildRebuildOnDraft(s.rebuild_on, effective.rebuild_on),
+          exhibits: buildExhibitSettingsDraft(exhibitsRaw),
+          originalExhibits: buildExhibitSettingsDraft(exhibitsRaw),
+          exhibitsEffective,
         };
       }
 
@@ -407,6 +431,14 @@
         refreshRebuildOnFields("project", d.rebuildOn, d.effective.rebuild_on);
       }
 
+      /**
+       * Stages one exhibit default's control text (blank inherits); checked on Save.
+       * @param {keyof ExhibitSettingsDraft} field
+       * @param {string} value
+       * @returns {void}
+       */
+      function onProjectEditExhibitSetting(field, value) { if (projectReviewSettingsDraft) projectReviewSettingsDraft.exhibits[field] = value; }
+
       const PROJECT_REVIEW_SETTINGS_BASE_SHIFT_CAP_TIP = "Maximum unattended rebuild attempts per base-shift retry campaign (a persistent conflict, failed proof, or outage stops automatic rebasing once spent, and the mailbox says so). Blank inherits the file-config/global value shown below; manual Merge/rebase resets the budget.";
       const PROJECT_REVIEW_SETTINGS_BUDGET_TIP = "USD spend cap applied to a future review's own resolver/prover cost when neither its [[review]] block nor the Arbiter sets one. Blank means unbounded (inherits the file-config/global value shown below).";
       const PROJECT_REVIEW_SETTINGS_MACHINE_TIP = "The machine (scheme:uri, or \"local\") a future review's worktrees and merge run on when nothing more specific sets one. Blank inherits the file-config/global value shown below.";
@@ -463,6 +495,9 @@
               <input type="checkbox" ${draft.liveActions ? "checked" : ""} onchange="onProjectEditLiveActions(this.checked)">run live actions</label>
             <h3 class="section" data-tip="${esc(REBUILD_ON_TIP)}">rebuild preparation when</h3>
             ${renderRebuildOnFieldsHtml("project", draft.rebuildOn, draft.effective.rebuild_on, "inherit the file-config/global default", "Follow the file-config/global default for when a future review rebuilds its prepared build (every trigger when nothing sets one), for a future review that declares no explicit rebuild_on of its own. Untick to set this project's own default. Applies on Save.", "onProjectEditRebuildOnInherit", "onProjectEditRebuildOnTrigger")}
+            <h3 class="section" data-tip="Screenshots, GIFs and short videos that live runs capture and show in a review's PRs/MRs. Unlike most defaults here these are not limited to future reviews: every review in this project without its own exhibit setting follows them on its next read. Blank fields and 'inherit' follow the .ralphus.toml/global config. Applies on Save.">exhibits</h3>
+            <div class="k" style="margin-top:4px" data-tip="Exhibit defaults are read each time a review renders its PRs/MRs, so a change here reaches existing reviews that have no exhibit setting of their own.">Also applies to existing reviews that have no exhibit setting of their own.</div>
+            ${renderExhibitFieldsHtml(draft.exhibits, draft.exhibitsEffective, "onProjectEditExhibitSetting", "file-config/global default")}
             ${err}
             <div class="btn-row" style="margin-top:12px"><button class="btn" onclick="closeProjectReviewSettingsModal()">Cancel</button><button class="btn primary" onclick="saveProjectReviewSettings()" data-tip="Apply every change made in this modal in a single request. Only fields you actually touched are sent -- an untouched field keeps inheriting from the file-config/global default.">Save</button></div>
           </div></div>`;
@@ -519,6 +554,13 @@
         if (draft.autoRun !== draft.originalAutoRun) body.auto_run = draft.autoRun;
         if (draft.liveActions !== draft.originalLiveActions) body.live_actions = draft.liveActions;
         if (rebuildOnChanged(draft.rebuildOn, draft.originalRebuildOn)) body.rebuild_on = rebuildOnBodyValue(draft.rebuildOn);
+        const exhibits = exhibitSettingsPatch(draft.exhibits, draft.originalExhibits, true);
+        if (exhibits.error) {
+          projectReviewSettingsError = exhibits.error;
+          renderProjectReviewSettingsModal();
+          return;
+        }
+        Object.assign(body, exhibits.body);
         if (Object.keys(body).length === 0) { closeProjectReviewSettingsModal(); return; }
         try {
           const r = await fetch(`/api/projects/${encodeURIComponent(draft.project)}/review-settings`, {
@@ -539,4 +581,4 @@
         closeProjectReviewSettingsModal();
       }
 
-      void [onProjectEditBaseUpdateMode, onProjectEditResolverAgent, onProjectEditResolverModel, onProjectEditMachine, onProjectEditMaximumBudgetUsd, onProjectEditProofScope, onProjectEditCiDeferral, onProjectEditProofSkipAutoClean, onProjectEditSkipWorktrees, onProjectEditSkipBaseUpdates, onProjectEditBaseShiftMaximumRebuilds, onProjectEditSeparatePrBranch, onProjectEditDualRootPr, onProjectEditMatchPrBranchName, onProjectEditAutoBuild, onProjectEditAutoSubmitPrStack, onProjectEditAutoFixPrErrors, onProjectEditAutoFixPromptTemplate, onProjectEditDiscourageTests, onProjectEditAutoCancelOutdatedPrPipelines, onProjectEditRebuildOnInherit, onProjectEditRebuildOnTrigger];
+      void [onProjectEditBaseUpdateMode, onProjectEditResolverAgent, onProjectEditResolverModel, onProjectEditMachine, onProjectEditMaximumBudgetUsd, onProjectEditProofScope, onProjectEditCiDeferral, onProjectEditProofSkipAutoClean, onProjectEditSkipWorktrees, onProjectEditSkipBaseUpdates, onProjectEditBaseShiftMaximumRebuilds, onProjectEditSeparatePrBranch, onProjectEditDualRootPr, onProjectEditMatchPrBranchName, onProjectEditAutoBuild, onProjectEditAutoSubmitPrStack, onProjectEditAutoFixPrErrors, onProjectEditAutoFixPromptTemplate, onProjectEditDiscourageTests, onProjectEditAutoCancelOutdatedPrPipelines, onProjectEditRebuildOnInherit, onProjectEditRebuildOnTrigger, onProjectEditExhibitSetting];

@@ -460,6 +460,7 @@
             </div>${open ? `<div class="cmd-full">
               <div class="cmd-preview mono" data-tip="What the agent is told to try against the review's tip.">${esc(a.prompt)}</div>
               <div class="hint live-sources" data-tip="The cells whose agents posted this handoff when they finished.">from ${sources}</div>
+              ${exhibitSlotsHtml(g.id, a.idx)}
               ${r ? liveRunDetailsHtml(g, r) : ""}
             </div>` : ""}`;
         }).join("");
@@ -595,7 +596,103 @@
        */
       function toggleLiveActionDetails(key) {
         liveActionOpen[key] = !liveActionOpen[key];
+        // The exhibit list is fetched the first time any of the review's live
+        // actions is expanded -- never for a collapsed section.
+        const gid = key.split(":live:")[0];
+        if (liveActionOpen[key] && exhibitViews[gid] === undefined) {
+          void pollExhibits(gid).then(() => {
+            if (selectedGuardian === gid) preserveUserState(document.getElementById("review-detail"), renderReviewDetail);
+          });
+        }
         renderReviewDetail();
+      }
+      /**
+       * Each review's exhibit slots, fetched on first expanding one of its
+       * live actions. `null` means the daemon has no such endpoint.
+       * @type {{[gid: string]: ExhibitsView|null}}
+       */
+      const exhibitViews = {};
+      /** @type {{[key: string]: string}} Loaded previews, keyed `<gid>:<action>.<slot>`, as `data:` URLs. */
+      const exhibitPreviews = {};
+      /**
+       * Fetches one review's exhibit slots.
+       * @param {string} gid - The review id.
+       * @returns {Promise<void>}
+       */
+      function pollExhibits(gid) {
+        return fetch(`/api/guardians/${encodeURIComponent(gid)}/exhibits`)
+          .then(async (r) => {
+            if (r.status === 404) { exhibitViews[gid] = null; return; }
+            if (!r.ok) return;
+            /** @type {ExhibitsView} */
+            const view = await r.json();
+            exhibitViews[gid] = { exhibits: Array.isArray(view.exhibits) ? view.exhibits : [] };
+          })
+          .catch(() => { /* transient -- the next expand retries */ });
+      }
+      /**
+       * Loads one captured exhibit file for an inline preview (on click only).
+       * @param {string} gid - The review id.
+       * @param {number} action - The live action's idx.
+       * @param {number} slot - The slot's idx.
+       * @returns {void}
+       */
+      function previewExhibit(gid, action, slot) {
+        const key = `${gid}:${action}.${slot}`;
+        void guardedAction(`exhibit-preview:${key}`, () =>
+          fetch(`/api/guardians/${encodeURIComponent(gid)}/exhibits/${action}/${slot}/file`)
+            .then(async (r) => {
+              if (!r.ok) return;
+              /** @type {ExhibitFileView} */
+              const file = await r.json();
+              exhibitPreviews[key] = `data:${file.content_type};base64,${file.data_base64}`;
+              renderReviewDetail();
+            }));
+      }
+      /**
+       * One live action's exhibit slots, for its expanded details.
+       * @param {string} gid - The review id.
+       * @param {number} actionIdx - The live action's idx.
+       * @returns {string}
+       */
+      function exhibitSlotsHtml(gid, actionIdx) {
+        const view = exhibitViews[gid];
+        if (view === null) return "";
+        if (view === undefined) {
+          return `<div class="hint" data-tip="What a reviewer should see in the PR description, captured by this action's runs.">exhibits: loading…</div>`;
+        }
+        const slots = view.exhibits.filter((s) => s.action_idx === actionIdx);
+        if (!slots.length) return "";
+        const rows = slots.map((s) => {
+          const key = `${gid}:${s.action_idx}.${s.slot_idx}`;
+          const delivered = s.url || s.text || s.has_file;
+          const state = s.url
+            ? `<span class="cmd-status passed" data-tip="${esc(`Uploaded to the forge and shown in the PR description.\n${s.url}`)}">in PR</span>`
+            : s.has_file
+              ? `<span class="cmd-status running" data-tip="${esc(`Captured; it is uploaded the next time the PR description is written.${s.missing_reason ? `\n${s.missing_reason}` : ""}`)}">captured</span>`
+              : s.text
+                ? `<span class="cmd-status passed" data-tip="Captured text, shown inline in the PR description.">in PR</span>`
+                : `<span class="cmd-status idle" data-tip="${esc(s.missing_reason ? `Not captured: ${s.missing_reason}` : "No run has captured this yet.")}">${s.missing_reason ? "missing" : "pending"}</span>`;
+          const asked = s.origin === "inferred"
+            ? `added by the PR writer${s.why ? `: ${s.why}` : ""}`
+            : s.origin === "recipe" ? "from a .ralphus.toml recipe" : "asked for by the agent that made the change";
+          const kind = s.delivered_kind && s.delivered_kind !== s.kind ? `${s.kind} → ${s.delivered_kind}` : s.kind;
+          const preview = exhibitPreviews[key];
+          const media = preview
+            ? (preview.startsWith("data:video/")
+              ? `<video class="exhibit-preview" src="${esc(preview)}" controls muted data-tip="The captured recording, as kept by the daemon."></video>`
+              : `<img class="exhibit-preview" src="${esc(preview)}" alt="${esc(s.caption || s.describe)}" data-tip="The captured image, as kept by the daemon.">`)
+            : "";
+          const previewBtn = s.has_file && !preview
+            ? `<button class="btn" data-click="previewExhibit" data-guardian-id="${esc(gid)}" data-action="${s.action_idx}" data-slot="${s.slot_idx}" data-tip="Load the captured file here to see what the PR will show.">Preview</button>`
+            : "";
+          return `<div class="exhibit-row">
+              <span class="cmd-label" data-tip="${esc(`Kind of exhibit: what was asked for${s.delivered_kind && s.delivered_kind !== s.kind ? ", then what was delivered" : ""}.`)}">${esc(kind)}</span>
+              <span class="cmd-text" data-tip="${esc(`${s.describe}\n\nWho asked: ${asked}.${s.caption ? `\nCaption: ${s.caption}` : ""}`)}">${esc(s.describe)}</span>
+              ${state}${previewBtn}
+            </div>${s.text && delivered ? `<div class="run-out" data-tip="The captured output, as the PR shows it.">${esc(s.text)}</div>` : ""}${media}`;
+        }).join("");
+        return `<div class="exhibits" data-tip="What a reviewer should see in this action's PR descriptions: pictures, recordings or output its runs capture.">${rows}</div>`;
       }
       /**
        * Shows one live run's agent session in the inspector's Live View,

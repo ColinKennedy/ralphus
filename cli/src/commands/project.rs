@@ -19,6 +19,10 @@ use crate::flags::{Scanner, UsageError};
 
 const SHORT_DESCRIPTION_MAX: usize = 80;
 
+// `ReviewSettings` carries `ProjectReviewSettingsCommand::Set`'s one optional
+// field per review setting and is built once per invocation, so the size gap
+// to the small variants costs nothing.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone)]
 pub enum ProjectCommand {
     Help,
@@ -105,6 +109,10 @@ pub enum ProjectReviewSettingsCommand {
         /// it back to inherit, `Some(Some(list))` sets it (an empty list never
         /// rebuilds automatically).
         rebuild_on: Option<Option<Vec<String>>>,
+        /// The project's default exhibit settings (`--exhibits-enabled`,
+        /// `--exhibits-max-per-pr`, `--infer-exhibits`,
+        /// `--exhibit-kind-preference`, `--exhibit-max-video-seconds`).
+        exhibits: crate::client::ExhibitFlags,
     },
     UsageError(String),
 }
@@ -384,6 +392,7 @@ fn parse_review_settings_set(
     let auto_run = crate::commands::review::take_tri_bool(scanner, "--auto-run");
     let live_actions = crate::commands::review::take_tri_bool(scanner, "--live-actions");
     let rebuild_on = crate::commands::review::take_rebuild_on(scanner)?;
+    let exhibits = crate::commands::review::take_exhibit_flags(scanner)?;
     if clear_maximum_budget_usd && maximum_budget_usd_raw.is_some() {
         return Err(UsageError(
             "review-settings set: --clear-maximum-budget-usd cannot be combined with \
@@ -451,6 +460,7 @@ fn parse_review_settings_set(
         auto_run,
         live_actions,
         rebuild_on,
+        exhibits,
     })
 }
 
@@ -610,6 +620,7 @@ fn dispatch_review_settings(cmd: ProjectReviewSettingsCommand, opts: &GlobalOpts
             auto_run,
             live_actions,
             rebuild_on,
+            exhibits,
         } => {
             let patch = crate::client::ProjectReviewSettingsPatch {
                 default_resolver_agent: resolver_agent.as_deref(),
@@ -641,6 +652,7 @@ fn dispatch_review_settings(cmd: ProjectReviewSettingsCommand, opts: &GlobalOpts
                 auto_run,
                 live_actions,
                 rebuild_on,
+                exhibits,
             };
             match client.set_project_review_settings(&name, &patch) {
                 Ok(payload) => {
@@ -759,6 +771,27 @@ fn render_review_settings(payload: &Value) {
         list(&settings["rebuild_on"]).unwrap_or_else(|| "(inherited)".to_string()),
         list(&effective["rebuild_on"]).unwrap_or_else(|| "(all)".to_string())
     );
+    row_bool("exhibits enabled:", "exhibits_enabled");
+    let row_count = |label: &str, key: &str| {
+        println!(
+            "  {label:<26} {:<24} (effective: {})",
+            settings[key]
+                .as_u64()
+                .map_or("(inherited)".to_string(), |v| v.to_string()),
+            effective[key]
+                .as_u64()
+                .map_or_else(String::new, |v| v.to_string())
+        );
+    };
+    row_count("exhibits max per pr:", "exhibits_max_per_pr");
+    row_bool("infer exhibits:", "infer_exhibits");
+    println!(
+        "  {:<26} {:<24} (effective: {})",
+        "exhibit kind preference:",
+        list(&settings["exhibit_kind_preference"]).unwrap_or_else(|| "(inherited)".to_string()),
+        list(&effective["exhibit_kind_preference"]).unwrap_or_default()
+    );
+    row_count("exhibit max video seconds:", "exhibit_max_video_seconds");
 }
 
 #[must_use]
@@ -1464,6 +1497,43 @@ mod tests {
                 assert_eq!(auto_submit_pr_stack, Some(false));
             }
             other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_review_settings_set_exhibit_flags() {
+        match project_rebuild_on_of(&[
+            "--exhibits-enabled",
+            "true",
+            "--exhibits-max-per-pr",
+            "inherit",
+            "--exhibit-kind-preference",
+            "gif,video",
+            "--exhibit-max-video-seconds",
+            "12",
+        ]) {
+            ProjectCommand::ReviewSettings(ProjectReviewSettingsCommand::Set {
+                exhibits, ..
+            }) => {
+                assert_eq!(exhibits.exhibits_enabled, Some(Some(true)));
+                assert_eq!(exhibits.exhibits_max_per_pr, Some(None));
+                assert_eq!(exhibits.infer_exhibits, None);
+                assert_eq!(
+                    exhibits.exhibit_kind_preference,
+                    Some(Some(vec!["gif".to_string(), "video".to_string()]))
+                );
+                assert_eq!(exhibits.exhibit_max_video_seconds, Some(Some(12)));
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+        for bad in [
+            &["--exhibits-max-per-pr", "0"][..],
+            &["--exhibit-kind-preference", "png"][..],
+        ] {
+            match project_rebuild_on_of(bad) {
+                ProjectCommand::ReviewSettings(ProjectReviewSettingsCommand::UsageError(_)) => {}
+                other => panic!("{bad:?} should be a usage error: {other:?}"),
+            }
         }
     }
 

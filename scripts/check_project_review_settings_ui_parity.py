@@ -55,6 +55,11 @@ MAPPING = {
     "auto_run": "auto_run",
     "live_actions": "live_actions",
     "rebuild_on": "rebuild_on",
+    "exhibits_enabled": "exhibits_enabled",
+    "exhibits_max_per_pr": "exhibits_max_per_pr",
+    "infer_exhibits": "infer_exhibits",
+    "exhibit_kind_preference": "exhibit_kind_preference",
+    "exhibit_max_video_seconds": "exhibit_max_video_seconds",
 }
 # `REVIEW_FIELD_PARITY` TOML key -> substantive reason it's deliberately not
 # exposed by the project-settings API/UI despite having a `ProjectDefault`

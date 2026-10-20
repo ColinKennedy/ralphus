@@ -800,8 +800,15 @@ root is reset and its prepare steps run again.",
             "--rebuild-on [none|inherit|rebase|feedback|auto_fix...]",
             "--followup [on|off|inherit]",
             "--followup-auto-start [on|off|inherit]",
+            "--exhibits-enabled [true|false|inherit]",
+            "--exhibits-max-per-pr [count-or-inherit]",
+            "--infer-exhibits [true|false|inherit]",
+            "--exhibit-kind-preference [inherit|gif|video|screenshot...]",
+            "--exhibit-max-video-seconds [seconds-or-inherit]",
         ],
-        "Update per-review opt-out settings.",
+        "Update per-review opt-out settings. The exhibit flags take a value or `inherit`: counts \
+and seconds are at least 1, and --exhibit-kind-preference is a comma list of gif, video and \
+screenshot, most preferred first (e.g. `screenshot,gif`).",
         false,
         false,
         &[],
@@ -1581,10 +1588,18 @@ value for each (file config + database).",
             "--auto-run/--no-auto-run",
             "--live-actions/--no-live-actions",
             "--skip-worktrees/--no-skip-worktrees",
+            "--exhibits-enabled [true|false|inherit]",
+            "--exhibits-max-per-pr [count-or-inherit]",
+            "--infer-exhibits [true|false|inherit]",
+            "--exhibit-kind-preference [inherit|gif|video|screenshot...]",
+            "--exhibit-max-video-seconds [seconds-or-inherit]",
         ],
         "Update a project's DEFAULT review settings, applied to future reviews only (an \
 Arbiter-created review with no [[review]] block, or any review whose own block leaves a field \
-unset) -- existing reviews are unaffected.",
+unset) -- existing reviews are unaffected. The exhibit defaults are the exception: every review \
+without its own override follows them on its next read. The exhibit flags take a value or \
+`inherit`: counts and seconds are at least 1, and --exhibit-kind-preference is a comma list of \
+gif, video and screenshot, most preferred first.",
         false,
         false,
         &[],
@@ -2356,6 +2371,50 @@ const CELL_CHILDREN: &[HelpNode] = &[
     ),
 ];
 
+const EXHIBIT_CHILDREN: &[HelpNode] = &[
+    // ralphus[ignore-endpoint-cli]: captures this machine's screen or a window with local OS tools; no daemon call
+    node(
+        "screenshot",
+        &[],
+        &[
+            "--output [file.png]",
+            "--pid [integer]",
+            "--screen",
+            "--window [title]",
+        ],
+        "Capture a PNG of one process's main window (--pid), the window with a title (--window: an \
+exact match, else the first title containing it -- for toolkits such as Tk that do not record \
+their process id on X11), or the whole screen (--screen) on this machine, using the OS's own tools (Windows: PowerShell/.NET, the window need not be in front; \
+macOS: screencapture, screen only; Linux: grim, ImageMagick import or gnome-screenshot). A \
+relative --output lands in $RALPHUS_EXHIBIT_DIR when set -- a live action's exhibit directory. \
+Prints the written path. Never contacts the daemon.",
+        false,
+        false,
+        &[],
+    ),
+    // ralphus[ignore-endpoint-cli]: records this machine's screen or a window with local OS tools; no daemon call
+    node(
+        "record",
+        &[],
+        &[
+            "--fps [integer]",
+            "--output [file.gif|file.mp4]",
+            "--pid [integer]",
+            "--screen",
+            "--seconds [integer]",
+            "--window [title]",
+        ],
+        "Record a short GIF or MP4 of one process's window (--pid), a window by title (--window) \
+or the screen (--screen): \
+ffmpeg when it is on PATH, otherwise timed stills encoded into a GIF (an .mp4 needs ffmpeg). \
+--seconds 1-60 (default 5), --fps 1-30 (default 10). A relative --output lands in \
+$RALPHUS_EXHIBIT_DIR when set. Prints the written path.",
+        true, // slow: blocks for the recording's length
+        false,
+        &[],
+    ),
+];
+
 // ralphus[ignore-endpoint-cli]: prints the CLI's own compiled help_map registered_leaves tree; no daemon call
 const SHOW_CHILDREN: &[HelpNode] = &[node(
     "help-map",
@@ -2895,6 +2954,15 @@ Python's per-selector --environment/--env-file overrides are not yet ported.)",
             false,
             false,
             CELL_CHILDREN,
+        ),
+        node(
+            "exhibit",
+            &[],
+            &[],
+            "Capture screenshots and short recordings for live-action exhibits (see docs/exhibits.md).",
+            false,
+            false,
+            EXHIBIT_CHILDREN,
         ),
         node(
             "show",

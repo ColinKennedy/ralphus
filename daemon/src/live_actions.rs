@@ -164,7 +164,16 @@ decides what to fix. A test may span several lines; it ends at the next line tha
 starts with a RALPHUS_ marker. Write one per distinct thing worth testing (for example \
 one per product you touched). If this change cannot be meaningfully tested \
 live (a pure refactor, documentation only), write \
-'RALPHUS_LIVE_ACTION: (nothing to test live)'.";
+'RALPHUS_LIVE_ACTION: (nothing to test live)'.\n\
+\n\
+Inside a test, you may add up to four lines of the form \
+'EXHIBIT: <kind> | <what to show>' naming what a code reviewer must SEE to \
+believe the change works -- the final state of the screen, frame, render or \
+output, not the setup. <kind> is one of gif (motion or interaction), video, \
+screenshot (a still result) or output (text from a terminal or log). Ask only \
+for what is visible and matters to the change; a change with nothing to see \
+asks for nothing, or for output. Example: \
+'EXHIBIT: gif | dragging the zoom slider from 0 to 1 magnifies the chart'.";
 
 /// Most capabilities named per kind in the handoff question; the rest are
 /// counted.
@@ -504,7 +513,12 @@ pub fn review_member_cells_conn(
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CollectedHandoff {
     pub source_cell: String,
+    /// The test steps, without the handoff's `EXHIBIT:` lines.
     pub text: String,
+    /// The exhibit requests the handoff carried.
+    pub exhibits: Vec<crate::exhibits::ExhibitRequest>,
+    /// `EXHIBIT:` lines that could not be used, verbatim.
+    pub rejected_exhibits: Vec<String>,
 }
 
 /// The handoffs that seed a review's live actions: for each task among the
@@ -534,9 +548,12 @@ pub fn collect_review_handoffs_conn(
     for cell in latest.values() {
         let handoffs = cell_live_handoffs_conn(conn, &cell.squad_id, cell.task_idx, cell.cell_idx)?;
         for text in handoffs.tests {
+            let split = crate::exhibits::split_handoff(&text);
             out.push(CollectedHandoff {
                 source_cell: cell.uri(),
-                text,
+                text: split.text,
+                exhibits: split.requests,
+                rejected_exhibits: split.rejected,
             });
         }
     }
@@ -562,6 +579,9 @@ pub struct NewLiveAction {
     pub label: String,
     pub prompt: String,
     pub source_cells: Vec<String>,
+    /// The exhibit requests of the handoffs merged into this action; they
+    /// become its exhibit slots.
+    pub exhibits: Vec<crate::exhibits::ExhibitRequest>,
 }
 
 /// A review's live actions, in order.
@@ -651,7 +671,15 @@ impl crate::store::Store {
                     rusqlite::params![guardian_id, idx, branch_id],
                 )?;
             }
+            let requests: Vec<_> = action.exhibits.iter().map(|r| (r.clone(), None)).collect();
+            self.add_exhibit_requests(
+                guardian_id,
+                idx,
+                crate::exhibits::ExhibitOrigin::Handoff,
+                &requests,
+            )?;
         }
+        self.assign_pending_exhibits(guardian_id)?;
         Ok(true)
     }
 }
@@ -679,6 +707,7 @@ pub fn undeduplicated(handoffs: &[CollectedHandoff]) -> Vec<NewLiveAction> {
             label: fallback_label(&h.text),
             prompt: h.text.clone(),
             source_cells: vec![h.source_cell.clone()],
+            exhibits: h.exhibits.clone(),
         })
         .collect()
 }
@@ -733,6 +762,7 @@ pub fn parse_dedupe_answer(
             return None;
         }
         let mut sources: Vec<String> = Vec::new();
+        let mut merged: Vec<&CollectedHandoff> = Vec::new();
         for n in entry.sources {
             // The agent is shown 1-based numbers.
             let i = n.checked_sub(1)?;
@@ -744,7 +774,12 @@ pub fn parse_dedupe_answer(
             if !sources.contains(&handoff.source_cell) {
                 sources.push(handoff.source_cell.clone());
             }
+            merged.push(handoff);
         }
+        // Exhibit requests follow their handoff by number, never by what the
+        // agent wrote, so merging can neither drop nor reassign one.
+        let exhibits =
+            crate::exhibits::merge_requests(merged.iter().map(|h| h.exhibits.as_slice()));
         let label = entry.label.trim();
         out.push(NewLiveAction {
             label: if label.is_empty() {
@@ -754,6 +789,7 @@ pub fn parse_dedupe_answer(
             },
             prompt: prompt.to_string(),
             source_cells: sources,
+            exhibits,
         });
     }
     covered.iter().all(|c| *c).then_some(out)
@@ -926,6 +962,9 @@ pub struct LiveRunRequest<'a> {
     pub cwd: &'a str,
     /// Whether the run may commit fixes that will be carried back.
     pub allow_commits: bool,
+    /// The exhibit slots of the live action being run, which this run (and
+    /// only this run) fills. Empty for user actions.
+    pub exhibit_slots: Vec<crate::exhibits::ExhibitSlot>,
 }
 
 /// How a live run ended.
@@ -1116,12 +1155,27 @@ pub fn execute_live_run(
     } else {
         LIVE_ACTION_READ_ONLY_SYSTEM_PROMPT
     };
+    let exhibit_settings = crate::exhibit_settings::resolve(store, req.guardian);
+    let exhibits = ExhibitRun::start(req, &exhibit_settings, ws.machine().is_some());
+    let mut prompt = format!("Live action: {}\n\n{}", req.label, req.prompt);
+    if let Some(dir) = exhibits.dir.as_deref() {
+        env.insert(
+            crate::exhibits::DIR_ENV.to_string(),
+            dir.to_string_lossy().to_string(),
+        );
+        prompt.push_str("\n\n");
+        prompt.push_str(&crate::exhibits::run_prompt_section(
+            &req.exhibit_slots,
+            &exhibit_settings,
+            dir,
+        ));
+    }
     let mut spec = RunnerSpec {
         squad_id: live_run_squad_id(gid),
         task: LIVE_ACTION_TASK.to_string(),
         cell_id: cell_id.clone(),
         cwd: req.cwd.to_string(),
-        prompt: Some(format!("Live action: {}\n\n{}", req.label, req.prompt)),
+        prompt: Some(prompt),
         command: None,
         shell: None,
         agent: resolved.backend.clone(),
@@ -1225,6 +1279,9 @@ pub fn execute_live_run(
             });
     }
     done.base_tip.clone_from(&base_tip);
+    if done.end != LiveRunEnd::Cancelled {
+        done.cost_usd += exhibits.finish(store, runner, cancel, &spec, &result, &exhibit_settings);
+    }
 
     if let Some(base) = base_tip.as_deref() {
         if req.allow_commits && done.end != LiveRunEnd::Cancelled {
@@ -1273,6 +1330,190 @@ pub fn execute_live_run(
         done.commits.len()
     );
     done
+}
+
+/// A live run's exhibit side: the directory it saves into, the slots it owns,
+/// and -- once the agent is done -- reading back what it captured.
+struct ExhibitRun<'a> {
+    guardian_id: &'a str,
+    run_id: &'a str,
+    action_idx: i64,
+    slots: &'a [crate::exhibits::ExhibitSlot],
+    /// Where the agent saves exhibits; `None` when the run has no slots or
+    /// cannot capture any (a remote review machine).
+    dir: Option<std::path::PathBuf>,
+    root: std::path::PathBuf,
+    /// Why no directory was set up although the action has slots.
+    unavailable: Option<String>,
+}
+
+impl<'a> ExhibitRun<'a> {
+    fn start(
+        req: &'a LiveRunRequest<'a>,
+        settings: &crate::exhibits::ExhibitSettings,
+        remote: bool,
+    ) -> Self {
+        let root = crate::exhibit_delivery::exhibits_root();
+        if !req.exhibit_slots.is_empty() {
+            crate::exhibit_delivery::prune_cache(&root, crate::exhibit_delivery::MAX_CACHE_AGE);
+        }
+        let mut run = Self {
+            guardian_id: req.guardian.id.as_str(),
+            run_id: req.run_id,
+            action_idx: i64::try_from(req.action_index).unwrap_or(i64::MAX),
+            slots: &req.exhibit_slots,
+            dir: None,
+            root,
+            unavailable: None,
+        };
+        if req.exhibit_slots.is_empty() || !settings.enabled {
+            return run;
+        }
+        if remote {
+            run.unavailable =
+                Some("exhibits from a remote review machine are not supported yet".to_string());
+            return run;
+        }
+        let dir = crate::exhibit_delivery::run_dir(&run.root, run.guardian_id, run.run_id);
+        match std::fs::create_dir_all(&dir) {
+            Ok(()) => run.dir = Some(dir),
+            Err(e) => run.unavailable = Some(format!("could not create {}: {e}", dir.display())),
+        }
+        run
+    }
+
+    /// Read back the run's reports, give the agent one more turn for any slot
+    /// it left unreported, and record every slot's fill. Returns the cost of
+    /// the extra turn.
+    fn finish(
+        &self,
+        store: &crate::store_lock::StoreHandle,
+        runner: &dyn Runner,
+        cancel: &CancelToken,
+        spec: &RunnerSpec,
+        result: &crate::runner::RunnerResult,
+        settings: &crate::exhibits::ExhibitSettings,
+    ) -> f64 {
+        if self.slots.is_empty() || !settings.enabled {
+            return 0.0;
+        }
+        let Some(dir) = self.dir.as_deref() else {
+            let reason = self
+                .unavailable
+                .clone()
+                .unwrap_or_else(|| "exhibits are unavailable for this run".to_string());
+            let reports: Vec<_> = self
+                .slots
+                .iter()
+                .map(|s| crate::exhibits::SlotReport::Missing {
+                    key: s.key,
+                    reason: reason.clone(),
+                })
+                .collect();
+            self.record(store, &reports, Path::new(""), settings);
+            return 0.0;
+        };
+        let (mut reports, mut ignored) =
+            crate::exhibits::parse_reports(&result.summary, self.action_idx, self.slots);
+        let mut cost = 0.0;
+        let missing: Vec<crate::exhibits::ExhibitSlot> = self
+            .slots
+            .iter()
+            .filter(|s| !reports.iter().any(|r| r.key() == s.key))
+            .cloned()
+            .collect();
+        if !missing.is_empty() && result.status == "done" && !cancel.is_cancelled() {
+            let resume = result.agent_session_id.clone();
+            let earlier = (resume.is_none()).then(|| clean_report(&result.summary));
+            let mut followup = spec.clone();
+            followup.cell_id = format!("{}-exhibits", spec.cell_id);
+            followup.prompt = Some(crate::exhibits::followup_prompt(
+                &missing,
+                settings,
+                dir,
+                earlier.as_deref(),
+            ));
+            followup.resume_agent_session_id.clone_from(&resume);
+            followup.assigned_agent_session_id = None;
+            note(
+                store,
+                self.guardian_id,
+                crate::logging::LogLevel::INFO,
+                "live run exhibit follow-up starting",
+                serde_json::json!({
+                    "run_id": self.run_id,
+                    "cell_id": followup.cell_id,
+                    "slots": missing.iter().map(|s| crate::exhibits::slot_label(s.key)).collect::<Vec<_>>(),
+                    "resumed_session": resume.is_some(),
+                }),
+            );
+            let extra = crate::guardian_merge::run_agent_with_stall_recovery(
+                store,
+                &mut followup,
+                runner,
+                cancel,
+                None,
+            );
+            let _ = crate::guardian_merge::record_guardian_call_cost(
+                store,
+                self.guardian_id,
+                None,
+                "live_action_exhibits",
+                &extra,
+            );
+            cost = extra.cost_usd;
+            let (more, more_ignored) =
+                crate::exhibits::parse_reports(&extra.summary, self.action_idx, &missing);
+            reports.extend(more);
+            ignored.extend(more_ignored);
+        }
+        if !ignored.is_empty() {
+            note(
+                store,
+                self.guardian_id,
+                crate::logging::LogLevel::WARNING,
+                "live run exhibit reports ignored",
+                serde_json::json!({ "run_id": self.run_id, "lines": ignored }),
+            );
+        }
+        self.record(store, &reports, dir, settings);
+        cost
+    }
+
+    fn record(
+        &self,
+        store: &crate::store_lock::StoreHandle,
+        reports: &[crate::exhibits::SlotReport],
+        dir: &Path,
+        settings: &crate::exhibits::ExhibitSettings,
+    ) {
+        let summary = crate::exhibit_delivery::record_run_reports(
+            store,
+            self.guardian_id,
+            self.run_id,
+            self.slots,
+            reports,
+            dir,
+            &self.root,
+            settings,
+            &crate::exhibit_media::Ffmpeg,
+        );
+        note(
+            store,
+            self.guardian_id,
+            if summary.missing.is_empty() {
+                crate::logging::LogLevel::INFO
+            } else {
+                crate::logging::LogLevel::WARNING
+            },
+            "live run exhibits recorded",
+            serde_json::json!({
+                "run_id": self.run_id,
+                "delivered": summary.delivered,
+                "missing": summary.missing,
+            }),
+        );
+    }
 }
 
 /// The agent's report without ralphus's own reply markers: everything from a
@@ -1409,6 +1650,7 @@ mod tests {
             prompt: "Start the app and check it greets.",
             cwd,
             allow_commits,
+            exhibit_slots: Vec::new(),
         }
     }
 
@@ -1661,6 +1903,8 @@ prompt = "second"
         CollectedHandoff {
             source_cell: cell.to_string(),
             text: text.to_string(),
+            exhibits: Vec::new(),
+            rejected_exhibits: Vec::new(),
         }
     }
 
@@ -1682,6 +1926,201 @@ prompt = "second"
             vec!["c1".to_string(), "c2".to_string()]
         );
         assert_eq!(actions[1].label, "CLI review show");
+    }
+
+    #[test]
+    fn exhibit_requests_follow_their_handoff_numbers_through_dedupe() {
+        let mut a = handoff("c1", "open the zoom tool");
+        a.exhibits = vec![crate::exhibits::ExhibitRequest {
+            kind: crate::exhibits::ExhibitKind::Gif,
+            describe: "drag zoom".into(),
+        }];
+        let mut b = handoff("c2", "open the zoom tool again");
+        b.exhibits = vec![
+            crate::exhibits::ExhibitRequest {
+                kind: crate::exhibits::ExhibitKind::Gif,
+                describe: "Drag zoom".into(),
+            },
+            crate::exhibits::ExhibitRequest {
+                kind: crate::exhibits::ExhibitKind::Screenshot,
+                describe: "final view".into(),
+            },
+        ];
+        let mut c = handoff("c3", "run the CLI");
+        c.exhibits = vec![crate::exhibits::ExhibitRequest {
+            kind: crate::exhibits::ExhibitKind::Output,
+            describe: "help text".into(),
+        }];
+        // The agent merged 1 and 2 and dropped every EXHIBIT word from its
+        // prompts; the requests still land on the right actions.
+        let reply = r#"{"live_actions": [
+            {"label": "Zoom", "prompt": "open the zoom tool", "sources": [2, 1]},
+            {"label": "CLI", "prompt": "run the CLI", "sources": [3]}
+        ]}"#;
+        let actions = parse_dedupe_answer(reply, &[a, b, c]).unwrap();
+        let describe = |i: usize| {
+            actions[i]
+                .exhibits
+                .iter()
+                .map(|r| r.describe.as_str())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(describe(0), vec!["Drag zoom", "final view"]);
+        assert_eq!(describe(1), vec!["help text"]);
+    }
+
+    /// A live-action agent that saves one exhibit file into the run's exhibit
+    /// directory and replies with `replies[n]` on its n-th call.
+    struct ExhibitAgent {
+        replies: Vec<String>,
+        seen: parking_lot::Mutex<Vec<RunnerSpec>>,
+    }
+
+    impl Runner for ExhibitAgent {
+        fn run(&self, spec: &RunnerSpec) -> crate::runner::RunnerResult {
+            if let Some(dir) = spec.env_overrides.get(crate::exhibits::DIR_ENV) {
+                std::fs::write(Path::new(dir).join("view.png"), b"\x89PNG").unwrap();
+            }
+            let mut seen = self.seen.lock();
+            let reply = self.replies.get(seen.len()).cloned().unwrap_or_default();
+            seen.push(spec.clone());
+            let mut result = crate::runner::RunnerResult::failure("");
+            result.status = "done".to_string();
+            result.error = None;
+            result.summary = reply;
+            result
+        }
+    }
+
+    #[test]
+    fn a_live_run_captures_its_slots_and_asks_once_more_for_the_ones_it_skipped() {
+        let (store, g, dir) = setup("exhibits");
+        let root = crate::exhibit_media::tests::TestDir::new();
+        crate::exhibit_delivery::set_test_root(root.path());
+        store
+            .lock()
+            .add_exhibit_requests(
+                &g.id,
+                0,
+                crate::exhibits::ExhibitOrigin::Handoff,
+                &[
+                    (
+                        crate::exhibits::ExhibitRequest {
+                            kind: crate::exhibits::ExhibitKind::Screenshot,
+                            describe: "the greeting".into(),
+                        },
+                        None,
+                    ),
+                    (
+                        crate::exhibits::ExhibitRequest {
+                            kind: crate::exhibits::ExhibitKind::Gif,
+                            describe: "the greeting animating".into(),
+                        },
+                        None,
+                    ),
+                ],
+            )
+            .unwrap();
+        let slots = store.lock().guardian_exhibit_slots(&g.id).unwrap();
+        let agent = ExhibitAgent {
+            replies: vec![
+                "It greets.\nRALPHUS_EXHIBIT: {\"slot\": \"0.0\", \"file\": \"view.png\", \"caption\": \"Hello shown\"}\nRALPHUS_LIVE_RESULT: {\"verdict\": \"passed\", \"summary\": \"ok\"}".to_string(),
+                "RALPHUS_EXHIBIT: {\"slot\": \"0.1\", \"missing\": \"the greeting does not animate\"}".to_string(),
+            ],
+            seen: parking_lot::Mutex::new(Vec::new()),
+        };
+        let cwd = dir.to_string_lossy().to_string();
+        let mut req = request(&g, &cwd, false);
+        req.exhibit_slots = slots;
+        let outcome = execute_live_run(&store, &agent, &req, &CancelToken::never());
+        assert_eq!(outcome.end, LiveRunEnd::Finished);
+
+        let seen = agent.seen.lock();
+        assert_eq!(seen.len(), 2, "one follow-up for the unreported slot");
+        let first = seen[0].prompt.clone().unwrap();
+        assert!(
+            first.contains("- 0.0 (screenshot): the greeting"),
+            "{first}"
+        );
+        assert!(seen[0].env_overrides.contains_key(crate::exhibits::DIR_ENV));
+        let second = seen[1].prompt.clone().unwrap();
+        assert!(
+            second.contains("0.1") && !second.contains("- 0.0"),
+            "{second}"
+        );
+        // No session id to resume, so the follow-up carries the earlier report.
+        assert!(seen[1].resume_agent_session_id.is_none());
+        assert!(second.contains("It greets."), "{second}");
+        drop(seen);
+
+        let now = store.lock().guardian_exhibit_slots(&g.id).unwrap();
+        let shot = now[0].fill.as_ref().unwrap();
+        assert_eq!(
+            shot.delivered_kind,
+            Some(crate::exhibits::ExhibitKind::Screenshot)
+        );
+        assert_eq!(shot.caption.as_deref(), Some("Hello shown"));
+        assert!(Path::new(shot.local_path.as_deref().unwrap()).is_file());
+        assert_eq!(
+            now[1].fill.as_ref().unwrap().missing_reason.as_deref(),
+            Some("the greeting does not animate")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_resumable_session_gets_the_follow_up_as_a_resumed_turn() {
+        struct Resumable(parking_lot::Mutex<Vec<RunnerSpec>>);
+        impl Runner for Resumable {
+            fn run(&self, spec: &RunnerSpec) -> crate::runner::RunnerResult {
+                self.0.lock().push(spec.clone());
+                let mut result = crate::runner::RunnerResult::failure("");
+                result.status = "done".to_string();
+                result.error = None;
+                result.agent_session_id = Some("sess-1".to_string());
+                result
+            }
+        }
+        let (store, g, dir) = setup("exhibits-resume");
+        let root = crate::exhibit_media::tests::TestDir::new();
+        crate::exhibit_delivery::set_test_root(root.path());
+        store
+            .lock()
+            .add_exhibit_requests(
+                &g.id,
+                0,
+                crate::exhibits::ExhibitOrigin::Handoff,
+                &[(
+                    crate::exhibits::ExhibitRequest {
+                        kind: crate::exhibits::ExhibitKind::Gif,
+                        describe: "it moving".into(),
+                    },
+                    None,
+                )],
+            )
+            .unwrap();
+        let agent = Resumable(parking_lot::Mutex::new(Vec::new()));
+        let cwd = dir.to_string_lossy().to_string();
+        let mut req = request(&g, &cwd, false);
+        req.exhibit_slots = store.lock().guardian_exhibit_slots(&g.id).unwrap();
+        execute_live_run(&store, &agent, &req, &CancelToken::never());
+        let seen = agent.0.lock();
+        assert_eq!(seen.len(), 2);
+        assert_eq!(seen[1].resume_agent_session_id.as_deref(), Some("sess-1"));
+        assert!(
+            !seen[1]
+                .prompt
+                .clone()
+                .unwrap()
+                .contains("What the live test found")
+        );
+        drop(seen);
+        let slots = store.lock().guardian_exhibit_slots(&g.id).unwrap();
+        assert_eq!(
+            slots[0].fill.as_ref().unwrap().missing_reason.as_deref(),
+            Some("the live run did not report it")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1810,6 +2249,10 @@ prompt = "second"
             label: "a".into(),
             prompt: "do a".into(),
             source_cells: vec!["c1".into()],
+            exhibits: vec![crate::exhibits::ExhibitRequest {
+                kind: crate::exhibits::ExhibitKind::Gif,
+                describe: "the thing moving".into(),
+            }],
         }];
         assert!(store.insert_guardian_live_actions(&gid, &first).unwrap());
         assert!(
@@ -1820,6 +2263,7 @@ prompt = "second"
                         label: "b".into(),
                         prompt: "do b".into(),
                         source_cells: vec![],
+                        exhibits: Vec::new(),
                     }]
                 )
                 .unwrap(),
@@ -1829,6 +2273,11 @@ prompt = "second"
         assert_eq!(stored.len(), 1);
         assert_eq!(stored[0].prompt, "do a");
         assert_eq!(stored[0].source_cells, vec!["c1".to_string()]);
+        // The action's exhibit requests became its slots, once.
+        let slots = store.guardian_exhibit_slots(&gid).unwrap();
+        assert_eq!(slots.len(), 1);
+        assert_eq!(slots[0].key.action_idx, 0);
+        assert_eq!(slots[0].request.describe, "the thing moving");
     }
 
     #[test]

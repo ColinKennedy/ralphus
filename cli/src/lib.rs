@@ -4,6 +4,7 @@
 
 pub mod agents;
 pub mod args;
+pub mod capture;
 pub mod client;
 pub mod commands;
 pub mod config;

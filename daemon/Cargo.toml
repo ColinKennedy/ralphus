@@ -63,6 +63,8 @@ git2 = { workspace = true }
 
 [dev-dependencies]
 ureq = { workspace = true }
+# Builds the GIF fixture `exhibit_media`'s real-ffmpeg conversion test reads.
+gif = { workspace = true }
 # `Connection::trace`, used to count the statements a store call issues.
 rusqlite = { workspace = true, features = ["trace"] }
 

@@ -34,6 +34,12 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 # transitively; promoted to a direct dependency here rather than left implicit.
 parking_lot = "0.12"
 ureq = { version = "2", default-features = false }
+# `ralphus exhibit record`'s ffmpeg-less path: read the PNG stills the OS's own
+# screenshot tool writes and encode them into a GIF. Both are small pure-Rust
+# crates; a screen-capture crate such as xcap was rejected because on Linux it
+# needs PipeWire/Wayland system libraries (and bindgen) to build.
+png = "0.17"
+gif = "0.13"
 ed25519-dalek = "2"
 base64 = "0.22"
 # Hostname lookup for secure-dist seat binding. Used instead of a raw WinAPI /

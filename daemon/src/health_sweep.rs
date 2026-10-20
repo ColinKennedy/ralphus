@@ -261,20 +261,78 @@ fn check_runner() -> SweepCheck {
 }
 
 /// RAL-546: `gh` PATH resolution plus `gh --version`, via the shared
-/// [`version_probe`] helper. Always `pass`es, found or not -- `gh` is
-/// optional, the same "never a hard fail" rule ripgrep's checks follow.
-fn check_gh() -> SweepCheck {
+/// [`version_probe`] helper. Never a hard fail -- `gh` is optional, the same
+/// rule ripgrep's checks follow. When a registered project is on GitHub, `gh`
+/// is also the fallback that uploads live-action exhibits, so a missing,
+/// pre-2.99 or logged-out `gh` warns that those PRs may get no screenshots
+/// or GIFs.
+fn check_gh(github_in_use: bool) -> SweepCheck {
     let probe = version_probe::probe_version(
         "gh",
         &["--version"],
         version_probe::DEFAULT_VERSION_PROBE_TIMEOUT,
         |out| version_probe::first_token_after_prefix(out, "gh version "),
     );
+    let logged_in = || {
+        std::process::Command::new("gh")
+            .args(["auth", "status", "--hostname", "github.com"])
+            .output()
+            .is_ok_and(|out| out.status.success())
+    };
+    let (status, detail) = assess_gh(&probe, github_in_use, logged_in);
     SweepCheck {
         id: ID_GH,
-        status: PASS,
-        detail: probe.detail("gh"),
+        status,
+        detail,
     }
+}
+
+/// [`check_gh`]'s verdict for a probed `gh`. `logged_in` runs only when the
+/// login state matters (a GitHub project and a new-enough `gh`).
+fn assess_gh(
+    probe: &version_probe::VersionProbe,
+    github_in_use: bool,
+    logged_in: impl FnOnce() -> bool,
+) -> (&'static str, String) {
+    let detail = probe.detail("gh");
+    if !github_in_use {
+        return (PASS, detail);
+    }
+    let problem = match probe {
+        version_probe::VersionProbe::Ok { version, .. } => {
+            match ralphus_core::gh_attach::parse_version(&format!("gh version {version}")) {
+                Some(v) if !ralphus_core::gh_attach::supports_attach(v) => Some(format!(
+                    "older than {}, the first with --attach",
+                    ralphus_core::gh_attach::format_version(ralphus_core::gh_attach::MIN_VERSION)
+                )),
+                Some(_) if !logged_in() => Some("not logged in to github.com".to_string()),
+                Some(_) => None,
+                None => Some("its version could not be read".to_string()),
+            }
+        }
+        _ => Some("unavailable".to_string()),
+    };
+    match problem {
+        Some(problem) => (
+            WARN,
+            format!(
+                "{detail}; {problem}: GitHub PRs may not get screenshots or GIFs when the direct upload fails"
+            ),
+        ),
+        None => (PASS, detail),
+    }
+}
+
+/// Whether any registered project is hosted on GitHub, judged from its
+/// clone URL or its checkout's git config without running git.
+fn any_github_project(projects: &[crate::store::ProjectView]) -> bool {
+    projects.iter().any(|p| {
+        p.clone_url
+            .as_deref()
+            .is_some_and(|u| u.contains("github.com"))
+            || std::fs::read_to_string(std::path::Path::new(&p.path).join(".git").join("config"))
+                .is_ok_and(|config| config.contains("github.com"))
+    })
 }
 
 /// RAL-546: `glab` PATH resolution plus `glab --version`, via the shared
@@ -570,11 +628,17 @@ fn check_login(probe: &dyn LoginProbe, db_override: Option<&str>) -> SweepCheck 
 pub fn run_sweep(store: &StoreHandle) -> SweepReport {
     // allow-lock-io: see the doc comment above -- one short DB read, released
     // before any of the slower external probing below.
-    let overrides = AgentCommandOverrides::load(&store.lock());
+    let (overrides, projects) = {
+        let guard = store.lock();
+        (
+            AgentCommandOverrides::load(&guard),
+            guard.list_projects().unwrap_or_default(),
+        )
+    };
     let mut checks = vec![
         check_git(),
         check_runner(),
-        check_gh(),
+        check_gh(any_github_project(&projects)),
         check_glab(),
         check_rg(),
         check_nvidia_smi(),
@@ -666,6 +730,46 @@ mod tests {
         std::sync::Arc::new(crate::store_lock::StoreMutex::new(
             Store::open_in_memory().expect("open in-memory store"),
         ))
+    }
+
+    fn gh_ok(version: &str) -> version_probe::VersionProbe {
+        version_probe::VersionProbe::Ok {
+            path: "/usr/bin/gh".to_string(),
+            version: version.to_string(),
+        }
+    }
+
+    #[test]
+    fn gh_warns_a_github_project_whose_prs_may_lack_screenshots() {
+        let (status, detail) = assess_gh(&gh_ok("2.93.0"), true, || true);
+        assert_eq!(status, WARN);
+        assert!(
+            detail.contains("2.99.0") && detail.contains("screenshots or GIFs"),
+            "{detail}"
+        );
+        let (status, detail) = assess_gh(&gh_ok("2.99.0"), true, || false);
+        assert_eq!(status, WARN);
+        assert!(detail.contains("not logged in"), "{detail}");
+        let (status, _) = assess_gh(&version_probe::VersionProbe::NotFound, true, || true);
+        assert_eq!(status, WARN);
+    }
+
+    #[test]
+    fn gh_check_for_a_github_project_probes_version_and_login_and_never_fails() {
+        // Spawns `gh --version` and, for a new-enough gh, `gh auth status`
+        // (tagged in proc_counts/tags.toml).
+        let check = check_gh(true);
+        assert_ne!(check.status, "fail", "{check:?}");
+    }
+
+    #[test]
+    fn gh_passes_without_a_github_project_or_with_a_usable_gh() {
+        let (status, _) = assess_gh(&gh_ok("2.93.0"), false, || panic!("login not needed"));
+        assert_eq!(status, PASS);
+        let (status, _) = assess_gh(&version_probe::VersionProbe::NotFound, false, || true);
+        assert_eq!(status, PASS);
+        let (status, _) = assess_gh(&gh_ok("2.99.0"), true, || true);
+        assert_eq!(status, PASS);
     }
 
     #[test]
@@ -819,7 +923,7 @@ mod tests {
     fn gh_and_glab_checks_never_fail_even_when_not_installed() {
         // RAL-546: gh/glab are optional -- absence is a `pass` with a "not
         // found" detail, never a `fail` that would sink the whole sweep.
-        let gh = check_gh();
+        let gh = check_gh(false);
         assert_eq!(gh.status, PASS, "{gh:?}");
         let glab = check_glab();
         assert_eq!(glab.status, PASS, "{glab:?}");

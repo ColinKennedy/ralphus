@@ -713,6 +713,25 @@ pub fn ensure_live_actions(
             );
         return Vec::new();
     }
+    let rejected: Vec<&str> = handoffs
+        .iter()
+        .flat_map(|h| h.rejected_exhibits.iter().map(String::as_str))
+        .collect();
+    if !rejected.is_empty() {
+        crate::rlog!(
+            WARNING,
+            "ralphus [guardian] review {guardian_id} ignored {} unusable EXHIBIT line(s)",
+            rejected.len()
+        );
+        crate::cartographer::Note::new("guardian")
+            .guardian(guardian_id)
+            .scope("live_action")
+            .emit(
+                &store.lock(),
+                "unusable exhibit requests ignored",
+                serde_json::json!({ "lines": rejected }),
+            );
+    }
     let cwd = checkout
         .path
         .clone()
@@ -909,6 +928,19 @@ fn execute_queued_run(
     let memory = store.lock_free_memory();
     memory.register_live_run_cancel(&run.run_id, cancel.clone());
     let runner = runners(store);
+    // Only a live action owns exhibit slots; a user action's index numbers a
+    // different list.
+    let exhibit_slots = if run.kind == "live" {
+        store
+            .lock()
+            .guardian_exhibit_slots(&guardian.id)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|s| s.key.action_idx == run.action_idx)
+            .collect()
+    } else {
+        Vec::new()
+    };
     let outcome = crate::live_actions::execute_live_run(
         store,
         runner.as_ref(),
@@ -920,6 +952,7 @@ fn execute_queued_run(
             prompt: &prompt,
             cwd: &cwd,
             allow_commits: target.allow_commits,
+            exhibit_slots,
         },
         &cancel,
     );
@@ -2092,6 +2125,7 @@ prompt = "second"
                     format!("cell:{}:0:0", f.squad),
                     format!("cell:{second_squad}:0:0"),
                 ],
+                exhibits: Vec::new(),
             };
             assert!(
                 guard

@@ -14,6 +14,7 @@
 pub mod agent;
 pub mod cell;
 pub mod env;
+pub mod exhibit;
 pub mod forge;
 pub mod ingest;
 pub mod initialize;
@@ -255,6 +256,7 @@ pub enum Command {
     Machine(machine::MachineCommand),
     Agent(agent::AgentCommand),
     Show(show::ShowCommand),
+    Exhibit(exhibit::ExhibitCommand),
     Squad(squad::SquadCommand),
     Mailbox(mailbox::MailboxCommand),
     QuickStart(quick_start::QuickStartCommand),
@@ -375,6 +377,7 @@ pub fn parse_args(args: &[String]) -> Command {
         Some("machine") => Command::Machine(machine::parse(&scanner.remaining())),
         Some("agent") => Command::Agent(agent::parse(&scanner.remaining())),
         Some("show") => Command::Show(show::parse(&scanner.remaining())),
+        Some("exhibit") => Command::Exhibit(exhibit::parse(&scanner.remaining())),
         Some("squad") => Command::Squad(squad::parse(&scanner.remaining())),
         Some("mailbox") => Command::Mailbox(mailbox::parse(&scanner.remaining())),
         Some("quick-start") => Command::QuickStart(quick_start::parse(&scanner.remaining())),
@@ -604,6 +607,7 @@ pub fn dispatch(cmd: Command, opts: &GlobalOpts) -> i32 {
         Command::Machine(c) => machine::dispatch(c, opts),
         Command::Agent(c) => agent::dispatch(c, opts),
         Command::Show(c) => show::dispatch(c, opts),
+        Command::Exhibit(c) => exhibit::dispatch(c, opts),
         Command::Squad(c) => squad::dispatch(c, opts),
         Command::Mailbox(c) => mailbox::dispatch(c, opts),
         Command::QuickStart(c) => quick_start::dispatch(c, opts),

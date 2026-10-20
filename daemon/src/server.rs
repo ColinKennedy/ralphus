@@ -2156,6 +2156,12 @@ fn route_for_user(
         ("GET", ["api", "guardians", id, "branches", branch_id, "notes"]) => {
             guardian_branch_notes(daemon, id, branch_id)
         }
+        // ralphus[ignore-endpoint-cli]: board live-actions section's exhibit list; the PR/MR description shows the same slots
+        ("GET", ["api", "guardians", id, "exhibits"]) => guardian_exhibits(daemon, id),
+        // ralphus[ignore-endpoint-cli]: board preview of a captured exhibit file not yet uploaded to the forge
+        ("GET", ["api", "guardians", id, "exhibits", action, slot, "file"]) => {
+            guardian_exhibit_file(daemon, id, action, slot)
+        }
         // ralphus[ignore-endpoint-cli]: board 'Forge rate limit' section of the branch inspector; no CLI equivalent
         (
             "GET",
@@ -3276,6 +3282,15 @@ struct EffectiveReviewDefaults {
     /// (per-review override > database default > `.ralphus.toml`/global >
     /// every event).
     rebuild_on: Vec<String>,
+    /// The resolved exhibit defaults (database default > `.ralphus.toml`/
+    /// global > the built-in default): collection on/off, the per-PR cap,
+    /// whether exhibits may be inferred, the kind order (most preferred
+    /// first) and the video length cap in seconds.
+    exhibits_enabled: bool,
+    exhibits_max_per_pr: usize,
+    infer_exhibits: bool,
+    exhibit_kind_preference: Vec<String>,
+    exhibit_max_video_seconds: u32,
 }
 
 impl EffectiveReviewDefaults {
@@ -3309,6 +3324,15 @@ impl EffectiveReviewDefaults {
             auto_run: cfg.auto_run(),
             live_actions: cfg.live_actions(),
             rebuild_on: cfg.rebuild_on(),
+            exhibits_enabled: cfg.exhibits_enabled(),
+            exhibits_max_per_pr: cfg.exhibits_max_per_pr(),
+            infer_exhibits: cfg.infer_exhibits(),
+            exhibit_kind_preference: cfg
+                .exhibit_kind_preference()
+                .into_iter()
+                .map(|kind| kind.as_str().to_string())
+                .collect(),
+            exhibit_max_video_seconds: cfg.exhibit_max_video_seconds(),
         }
     }
 }
@@ -3462,6 +3486,34 @@ struct ProjectReviewSettingsBody {
     base_shift_maximum_rebuilds: Option<u32>,
     #[serde(default)]
     clear_base_shift_maximum_rebuilds: bool,
+    /// Project default for whether reviews collect exhibits. Absent leaves it
+    /// as-is, a bool sets it, and an explicit JSON `null` clears it back to
+    /// inherit.
+    #[serde(default, deserialize_with = "deserialize_present")]
+    exhibits_enabled: Option<Option<bool>>,
+    /// Project default cap on exhibits per PR/MR. Zero is invalid (the cap
+    /// must be at least 1), so clearing uses the explicit
+    /// `clear_exhibits_max_per_pr` flag -- same convention as
+    /// `base_shift_maximum_rebuilds`.
+    #[serde(default)]
+    exhibits_max_per_pr: Option<u32>,
+    #[serde(default)]
+    clear_exhibits_max_per_pr: bool,
+    /// Project default for whether a live run may propose exhibits nobody
+    /// asked for; same absent/bool/`null` shape as `exhibits_enabled`.
+    #[serde(default, deserialize_with = "deserialize_present")]
+    infer_exhibits: Option<Option<bool>>,
+    /// Project default exhibit kind order, most preferred first: a non-empty,
+    /// duplicate-free list drawn from `gif`/`video`/`screenshot`. Absent
+    /// leaves it as-is, a list sets it, and an explicit JSON `null` clears it.
+    #[serde(default, deserialize_with = "deserialize_present")]
+    exhibit_kind_preference: Option<Option<Vec<String>>>,
+    /// Project default cap on a video exhibit's length, in seconds (at least
+    /// 1); cleared with `clear_exhibit_max_video_seconds`.
+    #[serde(default)]
+    exhibit_max_video_seconds: Option<u32>,
+    #[serde(default)]
+    clear_exhibit_max_video_seconds: bool,
     /// RAL-476: fallback owning user for reviews whose squad has no
     /// `submitter` of its own -- see [`crate::store::ProjectReviewSettings`].
     #[serde(default)]
@@ -3528,6 +3580,33 @@ fn set_project_review_settings(daemon: &Daemon, name: &str, body: &str) -> Reply
             "'base_shift_maximum_rebuilds' must be at least 1",
             vec![],
         );
+    }
+    for (name, value, clear) in [
+        (
+            "exhibits_max_per_pr",
+            req.exhibits_max_per_pr,
+            req.clear_exhibits_max_per_pr,
+        ),
+        (
+            "exhibit_max_video_seconds",
+            req.exhibit_max_video_seconds,
+            req.clear_exhibit_max_video_seconds,
+        ),
+    ] {
+        if clear && value.is_some() {
+            return error(
+                400,
+                "invalid_value",
+                &format!("'clear_{name}' cannot be combined with '{name}'"),
+                vec![],
+            );
+        }
+        if let Some(reply) = reject_zero_exhibit_count(name, value) {
+            return reply;
+        }
+    }
+    if let Some(reply) = reject_invalid_exhibit_kind_preference(&req.exhibit_kind_preference) {
+        return reply;
     }
     if let Some(scope) = req.default_proof_scope.as_deref().filter(|s| !s.is_empty()) {
         if !ralphus_core::schema::PROOF_SCOPE_VALUES.contains(&scope) {
@@ -3706,6 +3785,25 @@ fn set_project_review_settings(daemon: &Daemon, name: &str, body: &str) -> Reply
     }
     if let Some(v) = req.rebuild_on {
         settings.rebuild_on = v;
+    }
+    if let Some(v) = req.exhibits_enabled {
+        settings.exhibits_enabled = v;
+    }
+    if req.clear_exhibits_max_per_pr {
+        settings.exhibits_max_per_pr = None;
+    } else if let Some(v) = req.exhibits_max_per_pr {
+        settings.exhibits_max_per_pr = Some(v);
+    }
+    if let Some(v) = req.infer_exhibits {
+        settings.infer_exhibits = v;
+    }
+    if let Some(v) = req.exhibit_kind_preference {
+        settings.exhibit_kind_preference = v;
+    }
+    if req.clear_exhibit_max_video_seconds {
+        settings.exhibit_max_video_seconds = None;
+    } else if let Some(v) = req.exhibit_max_video_seconds {
+        settings.exhibit_max_video_seconds = Some(v);
     }
     if let Some(v) = req.default_pr_user {
         settings.default_pr_user = clear_if_empty(v);
@@ -13575,6 +13673,116 @@ fn guardian_branch_notes(daemon: &Daemon, id: &str, branch_id: &str) -> Reply {
     )
 }
 
+/// A review's exhibit slots, each with its owning live action's label and its
+/// current fill, plus the review's resolved exhibit settings.
+fn guardian_exhibits(daemon: &Daemon, id: &str) -> Reply {
+    let guard = daemon.lock();
+    let guardian = match guard.get_guardian(id) {
+        Ok(g) => g,
+        Err(e) => return store_error(&e),
+    };
+    let slots = match guard.guardian_exhibit_slots(id) {
+        Ok(s) => s,
+        Err(e) => return store_error(&e),
+    };
+    let labels: std::collections::HashMap<i64, String> = guard
+        .guardian_live_actions(id)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|a| (a.idx, a.label))
+        .collect();
+    let items: Vec<serde_json::Value> = slots
+        .iter()
+        .map(|s| {
+            serde_json::json!({
+                "action_idx": s.key.action_idx,
+                "slot_idx": s.key.slot_idx,
+                "action_label": labels.get(&s.key.action_idx),
+                "kind": s.request.kind,
+                "describe": s.request.describe,
+                "origin": s.origin,
+                "why": s.why,
+                "delivered_kind": s.fill.as_ref().and_then(|f| f.delivered_kind),
+                "url": s.fill.as_ref().and_then(|f| f.url.clone()),
+                "caption": s.fill.as_ref().and_then(|f| f.caption.clone()),
+                "text": s.fill.as_ref().and_then(|f| f.text.clone()),
+                "missing_reason": s.fill.as_ref().and_then(|f| f.missing_reason.clone()),
+                "has_file": s.fill.as_ref().is_some_and(|f| f.local_path.is_some()),
+                "updated_at_ms": s.fill.as_ref().map(|f| f.updated_at_ms),
+            })
+        })
+        .collect();
+    json(
+        200,
+        &serde_json::json!({
+            "settings": crate::exhibit_settings::from_view(&guardian),
+            "exhibits": items,
+        }),
+    )
+}
+
+/// The largest captured file the board preview endpoint returns.
+const MAX_EXHIBIT_PREVIEW_BYTES: u64 = 20 * 1024 * 1024;
+
+/// One slot's captured file, base64-encoded with its content type, so the
+/// board can preview it before (or without) a forge upload.
+fn guardian_exhibit_file(daemon: &Daemon, id: &str, action: &str, slot: &str) -> Reply {
+    let (Ok(action), Ok(slot)) = (action.parse::<i64>(), slot.parse::<i64>()) else {
+        return error(
+            400,
+            "invalid_value",
+            "action and slot must be integers",
+            vec![],
+        );
+    };
+    let local = match daemon.lock().guardian_exhibit_slots(id) {
+        Ok(slots) => slots
+            .into_iter()
+            .find(|s| s.key.action_idx == action && s.key.slot_idx == slot)
+            .and_then(|s| s.fill)
+            .and_then(|f| f.local_path),
+        Err(e) => return store_error(&e),
+    };
+    let Some(local) = local else {
+        return error(404, "not_found", "no captured file for that slot", vec![]);
+    };
+    let path = std::path::PathBuf::from(&local);
+    // Only files kept in the daemon's own exhibit store are ever served.
+    let root = crate::exhibit_delivery::exhibits_root();
+    let inside = match (path.canonicalize(), root.canonicalize()) {
+        (Ok(file), Ok(root)) => file.starts_with(root),
+        _ => false,
+    };
+    if !inside {
+        return error(404, "not_found", "the captured file is gone", vec![]);
+    }
+    match std::fs::metadata(&path) {
+        Ok(m) if m.len() > MAX_EXHIBIT_PREVIEW_BYTES => {
+            return error(
+                413,
+                "too_large",
+                "the captured file is too large to preview",
+                vec![],
+            );
+        }
+        Err(_) => return error(404, "not_found", "the captured file is gone", vec![]),
+        Ok(_) => {}
+    }
+    match std::fs::read(&path) {
+        Ok(bytes) => {
+            use base64::Engine as _;
+            json(
+                200,
+                &serde_json::json!({
+                    "content_type": crate::exhibit_media::content_type(&path),
+                    "data_base64": base64::engine::general_purpose::STANDARD.encode(bytes),
+                }),
+            )
+        }
+        Err(_) => error(404, "not_found", "the captured file is gone", vec![]),
+    }
+}
+
 /// Epoch milliseconds `delay` from `now_ms`, saturating.
 fn after_ms(now_ms: i64, delay: std::time::Duration) -> i64 {
     now_ms.saturating_add(i64::try_from(delay.as_millis()).unwrap_or(i64::MAX))
@@ -15398,6 +15606,138 @@ struct GuardianSettingsBody {
     #[serde(default, deserialize_with = "deserialize_present")]
     // ralphus[ignore-review-parity]: set on a live review only; the default lives in the global config's [followup] table, not in task files
     followup_auto_start: Option<Option<bool>>,
+    /// This review's own override of whether it collects exhibits for its
+    /// PRs/MRs. Absent leaves it untouched, a bool sets it, and an explicit
+    /// `null` clears it so the review inherits the project/global default.
+    #[serde(default, deserialize_with = "deserialize_present")]
+    // ralphus[ignore-review-parity]: exhibit settings are set per review or per project, not in task files
+    exhibits_enabled: Option<Option<bool>>,
+    /// This review's own cap on exhibits per PR/MR (at least 1); same
+    /// absent/value/`null` shape as [`Self::exhibits_enabled`].
+    #[serde(default, deserialize_with = "deserialize_present")]
+    // ralphus[ignore-review-parity]: exhibit settings are set per review or per project, not in task files
+    exhibits_max_per_pr: Option<Option<u32>>,
+    /// This review's own override of whether a live run may propose exhibits
+    /// nobody asked for; same shape as [`Self::exhibits_enabled`].
+    #[serde(default, deserialize_with = "deserialize_present")]
+    // ralphus[ignore-review-parity]: exhibit settings are set per review or per project, not in task files
+    infer_exhibits: Option<Option<bool>>,
+    /// This review's own exhibit kind order, most preferred first: a
+    /// non-empty, duplicate-free list drawn from `gif`/`video`/`screenshot`;
+    /// same shape as [`Self::exhibits_enabled`].
+    #[serde(default, deserialize_with = "deserialize_present")]
+    // ralphus[ignore-review-parity]: exhibit settings are set per review or per project, not in task files
+    exhibit_kind_preference: Option<Option<Vec<String>>>,
+    /// This review's own cap on a video exhibit's length, in seconds (at
+    /// least 1); same shape as [`Self::exhibits_enabled`].
+    #[serde(default, deserialize_with = "deserialize_present")]
+    // ralphus[ignore-review-parity]: exhibit settings are set per review or per project, not in task files
+    exhibit_max_video_seconds: Option<Option<u32>>,
+}
+
+/// One request's per-review exhibit overrides, shared by
+/// [`GuardianSettingsBody`] and [`GuardianDetailsBody`]. Each field is absent
+/// (`None`, untouched), `Some(None)` (clear back to inherit) or
+/// `Some(Some(v))` (set).
+struct ExhibitOverridesPatch<'a> {
+    enabled: Option<Option<bool>>,
+    max_per_pr: Option<Option<u32>>,
+    infer: Option<Option<bool>>,
+    kind_preference: &'a Option<Option<Vec<String>>>,
+    max_video_seconds: Option<Option<u32>>,
+}
+
+impl ExhibitOverridesPatch<'_> {
+    /// The 400 for a zero cap or an invalid kind list, or `None` when every
+    /// present field is valid.
+    fn reject_invalid(&self) -> Option<Reply> {
+        reject_zero_exhibit_count("exhibits_max_per_pr", self.max_per_pr.flatten())
+            .or_else(|| {
+                reject_zero_exhibit_count(
+                    "exhibit_max_video_seconds",
+                    self.max_video_seconds.flatten(),
+                )
+            })
+            .or_else(|| reject_invalid_exhibit_kind_preference(self.kind_preference))
+    }
+
+    /// Write every present field to review `id`.
+    fn apply(&self, store: &Store, id: &str) -> Result<(), Reply> {
+        if let Some(v) = self.enabled {
+            store
+                .set_guardian_exhibits_enabled(id, v)
+                .map_err(|e| store_error(&e))?;
+        }
+        if let Some(v) = self.max_per_pr {
+            store
+                .set_guardian_exhibits_max_per_pr(id, v)
+                .map_err(|e| store_error(&e))?;
+        }
+        if let Some(v) = self.infer {
+            store
+                .set_guardian_infer_exhibits(id, v)
+                .map_err(|e| store_error(&e))?;
+        }
+        if let Some(v) = self.kind_preference {
+            store
+                .set_guardian_exhibit_kind_preference(id, v.as_deref())
+                .map_err(|e| store_error(&e))?;
+        }
+        if let Some(v) = self.max_video_seconds {
+            store
+                .set_guardian_exhibit_max_video_seconds(id, v)
+                .map_err(|e| store_error(&e))?;
+        }
+        Ok(())
+    }
+}
+
+impl GuardianSettingsBody {
+    fn exhibit_patch(&self) -> ExhibitOverridesPatch<'_> {
+        ExhibitOverridesPatch {
+            enabled: self.exhibits_enabled,
+            max_per_pr: self.exhibits_max_per_pr,
+            infer: self.infer_exhibits,
+            kind_preference: &self.exhibit_kind_preference,
+            max_video_seconds: self.exhibit_max_video_seconds,
+        }
+    }
+}
+
+impl GuardianDetailsBody {
+    fn exhibit_patch(&self) -> ExhibitOverridesPatch<'_> {
+        ExhibitOverridesPatch {
+            enabled: self.exhibits_enabled,
+            max_per_pr: self.exhibits_max_per_pr,
+            infer: self.infer_exhibits,
+            kind_preference: &self.exhibit_kind_preference,
+            max_video_seconds: self.exhibit_max_video_seconds,
+        }
+    }
+}
+
+/// The 400 for an exhibit count/length setting of `0`, or `None` otherwise.
+fn reject_zero_exhibit_count(name: &str, value: Option<u32>) -> Option<Reply> {
+    (value == Some(0)).then(|| {
+        error(
+            400,
+            "invalid_value",
+            &format!("'{name}' must be at least 1"),
+            vec![],
+        )
+    })
+}
+
+/// The 400 for an `exhibit_kind_preference` list that is empty, repeats a
+/// kind or names one outside `gif`/`video`/`screenshot`, or `None` when the
+/// request carries no list (absent or `null`) or a valid one.
+fn reject_invalid_exhibit_kind_preference(value: &Option<Option<Vec<String>>>) -> Option<Reply> {
+    let Some(Some(kinds)) = value else {
+        return None;
+    };
+    ralphus_core::schema::check_exhibit_kind_preference(kinds)
+        .err()
+        .map(|message| error(400, "invalid_exhibit_kind_preference", &message, vec![]))
 }
 
 /// Deserialize a field that distinguishes "absent" (`None`, via
@@ -15561,6 +15901,21 @@ struct GuardianDetailsBody {
     /// See [`GuardianSettingsBody::followup_auto_start`].
     #[serde(default, deserialize_with = "deserialize_present")]
     followup_auto_start: Option<Option<bool>>,
+    /// See [`GuardianSettingsBody::exhibits_enabled`].
+    #[serde(default, deserialize_with = "deserialize_present")]
+    exhibits_enabled: Option<Option<bool>>,
+    /// See [`GuardianSettingsBody::exhibits_max_per_pr`].
+    #[serde(default, deserialize_with = "deserialize_present")]
+    exhibits_max_per_pr: Option<Option<u32>>,
+    /// See [`GuardianSettingsBody::infer_exhibits`].
+    #[serde(default, deserialize_with = "deserialize_present")]
+    infer_exhibits: Option<Option<bool>>,
+    /// See [`GuardianSettingsBody::exhibit_kind_preference`].
+    #[serde(default, deserialize_with = "deserialize_present")]
+    exhibit_kind_preference: Option<Option<Vec<String>>>,
+    /// See [`GuardianSettingsBody::exhibit_max_video_seconds`].
+    #[serde(default, deserialize_with = "deserialize_present")]
+    exhibit_max_video_seconds: Option<Option<u32>>,
     /// Full desired squash membership: every project in this list gets
     /// squash turned ON, every other project in the review's
     /// [`crate::guardian::GuardianView::projects`] gets it turned OFF.
@@ -16014,6 +16369,9 @@ fn guardian_settings(daemon: &Daemon, id: &str, body: &str) -> Reply {
     if let Some(reply) = reject_invalid_rebuild_on(&req.rebuild_on) {
         return reply;
     }
+    if let Some(reply) = req.exhibit_patch().reject_invalid() {
+        return reply;
+    }
     if let Some(reply) = reject_invalid_ci_deferral(req.ci_deferral.as_deref()) {
         return reply;
     }
@@ -16171,6 +16529,9 @@ fn guardian_settings(daemon: &Daemon, id: &str, body: &str) -> Reply {
         if let Err(e) = store.set_guardian_followup_auto_start(id, enabled) {
             return store_error(&e);
         }
+    }
+    if let Err(reply) = req.exhibit_patch().apply(&store, id) {
+        return reply;
     }
     // RAL-213: every setting above is a plain DB column write that a running
     // merge never re-reads mid-flight -- restart it now so the new setting
@@ -16351,6 +16712,9 @@ fn guardian_details(daemon: &Daemon, id: &str, body: &str) -> Reply {
         return error(400, "bad_request", "invalid body", vec![]);
     };
     if let Some(reply) = reject_invalid_rebuild_on(&req.rebuild_on) {
+        return reply;
+    }
+    if let Some(reply) = req.exhibit_patch().reject_invalid() {
         return reply;
     }
     if let Some(reply) = reject_invalid_ci_deferral(req.ci_deferral.as_deref()) {
@@ -16567,6 +16931,9 @@ fn guardian_details(daemon: &Daemon, id: &str, body: &str) -> Reply {
         if let Err(e) = store.set_guardian_followup_auto_start(id, enabled) {
             return store_error(&e);
         }
+    }
+    if let Err(reply) = req.exhibit_patch().apply(&store, id) {
+        return reply;
     }
     if let Some(desired) = &req.squash_projects {
         for project in &guardian.projects {
@@ -25893,6 +26260,116 @@ triage=true
             body["effective"]["base_shift_maximum_rebuilds"], 3,
             "clearing the override must fall back to the built-in default"
         );
+    }
+
+    #[test]
+    fn project_review_settings_route_sets_clears_and_resolves_exhibit_defaults() {
+        let d = daemon();
+        let repo = tmp_git_repo("rs-exhibits");
+        route(
+            &d,
+            "POST",
+            "/api/projects",
+            &register_body("proj", &repo.to_string_lossy(), ""),
+        );
+        let url = "/api/projects/proj/review-settings";
+        let gid = d
+            .lock()
+            .create_guardian("r", "main", &repo.to_string_lossy())
+            .unwrap();
+        let r = route(
+            &d,
+            "POST",
+            url,
+            r#"{"exhibits_enabled":false,"exhibits_max_per_pr":3,"infer_exhibits":false,
+                "exhibit_kind_preference":["video"],"exhibit_max_video_seconds":8}"#,
+        );
+        assert_eq!(r.status, 200, "{}", r.body);
+        let body: serde_json::Value = serde_json::from_str(&r.body).unwrap();
+        assert_eq!(body["settings"]["exhibits_enabled"], false);
+        assert_eq!(body["settings"]["exhibits_max_per_pr"], 3);
+        assert_eq!(body["effective"]["exhibits_enabled"], false);
+        assert_eq!(body["effective"]["exhibits_max_per_pr"], 3);
+        assert_eq!(body["effective"]["infer_exhibits"], false);
+        assert_eq!(
+            body["effective"]["exhibit_kind_preference"],
+            serde_json::json!(["video"])
+        );
+        assert_eq!(body["effective"]["exhibit_max_video_seconds"], 8);
+        // An existing review picks the project default up on its next read.
+        let v = view_of(&d, &gid);
+        assert_eq!(v["effective_exhibits_max_per_pr"], 3);
+        assert_eq!(
+            v["effective_exhibit_kind_preference"],
+            serde_json::json!(["video"])
+        );
+
+        let r = route(
+            &d,
+            "POST",
+            url,
+            r#"{"exhibits_enabled":null,"clear_exhibits_max_per_pr":true,"infer_exhibits":null,
+                "exhibit_kind_preference":null,"clear_exhibit_max_video_seconds":true}"#,
+        );
+        assert_eq!(r.status, 200, "{}", r.body);
+        let body: serde_json::Value = serde_json::from_str(&r.body).unwrap();
+        for key in [
+            "exhibits_enabled",
+            "exhibits_max_per_pr",
+            "infer_exhibits",
+            "exhibit_kind_preference",
+            "exhibit_max_video_seconds",
+        ] {
+            assert!(body["settings"][key].is_null(), "{key}: {}", r.body);
+        }
+        assert_eq!(body["effective"]["exhibits_enabled"], true);
+        assert_eq!(body["effective"]["exhibits_max_per_pr"], 6);
+        assert_eq!(body["effective"]["exhibit_max_video_seconds"], 15);
+        assert_eq!(
+            body["effective"]["exhibit_kind_preference"],
+            serde_json::json!(["gif", "video", "screenshot"])
+        );
+    }
+
+    #[test]
+    fn project_review_settings_route_rejects_invalid_exhibit_defaults() {
+        let d = daemon();
+        let repo = tmp_git_repo("rs-exhibits-invalid");
+        route(
+            &d,
+            "POST",
+            "/api/projects",
+            &register_body("proj", &repo.to_string_lossy(), ""),
+        );
+        let url = "/api/projects/proj/review-settings";
+        for (body, code) in [
+            (r#"{"exhibits_max_per_pr":0}"#, "invalid_value"),
+            (r#"{"exhibit_max_video_seconds":0}"#, "invalid_value"),
+            (
+                r#"{"exhibits_max_per_pr":2,"clear_exhibits_max_per_pr":true}"#,
+                "invalid_value",
+            ),
+            (
+                r#"{"exhibit_kind_preference":[]}"#,
+                "invalid_exhibit_kind_preference",
+            ),
+            (
+                r#"{"exhibit_kind_preference":["screenshot","screenshot"]}"#,
+                "invalid_exhibit_kind_preference",
+            ),
+            (
+                r#"{"exhibit_kind_preference":["png"],"exhibits_enabled":false}"#,
+                "invalid_exhibit_kind_preference",
+            ),
+        ] {
+            let r = route(&d, "POST", url, body);
+            assert_eq!(r.status, 400, "{body}: {}", r.body);
+            assert!(r.body.contains(code), "{body}: {}", r.body);
+        }
+        let r = route(&d, "GET", url, "");
+        let body: serde_json::Value = serde_json::from_str(&r.body).unwrap();
+        assert!(body["settings"]["exhibits_enabled"].is_null(), "{}", r.body);
+        assert!(body["settings"]["exhibit_kind_preference"].is_null());
     }
 
     #[test]
@@ -35246,6 +35723,96 @@ remediation_attempts=1
     fn view_of(d: &Daemon, gid: &str) -> serde_json::Value {
         let r = route(d, "GET", &format!("/api/guardians/{gid}"), "");
         serde_json::from_str(&r.body).unwrap()
+    }
+
+    #[test]
+    fn guardian_settings_and_details_set_and_clear_exhibit_overrides() {
+        let d = daemon();
+        let gid = make_guardian(&d);
+        for endpoint in ["settings", "details"] {
+            let url = format!("/api/guardians/{gid}/{endpoint}");
+            let post = |body: serde_json::Value| route(&d, "POST", &url, &body.to_string());
+
+            let r = post(serde_json::json!({
+                "exhibits_enabled": false,
+                "exhibits_max_per_pr": 2,
+                "infer_exhibits": false,
+                "exhibit_kind_preference": ["screenshot", "gif"],
+                "exhibit_max_video_seconds": 30,
+            }));
+            assert_eq!(r.status, 200, "{endpoint}: {}", r.body);
+            let v = view_of(&d, &gid);
+            assert_eq!(v["exhibits_enabled"], false, "{endpoint}");
+            assert_eq!(v["effective_exhibits_enabled"], false);
+            assert_eq!(v["effective_exhibits_max_per_pr"], 2);
+            assert_eq!(v["effective_infer_exhibits"], false);
+            assert_eq!(
+                v["effective_exhibit_kind_preference"],
+                serde_json::json!(["screenshot", "gif"])
+            );
+            assert_eq!(v["effective_exhibit_max_video_seconds"], 30);
+
+            // A request that does not mention them leaves them alone.
+            let r = post(serde_json::json!({"cache_manual_checks": true}));
+            assert_eq!(r.status, 200, "{}", r.body);
+            assert_eq!(view_of(&d, &gid)["exhibits_max_per_pr"], 2);
+
+            let r = post(serde_json::json!({
+                "exhibits_enabled": null,
+                "exhibits_max_per_pr": null,
+                "infer_exhibits": null,
+                "exhibit_kind_preference": null,
+                "exhibit_max_video_seconds": null,
+            }));
+            assert_eq!(r.status, 200, "{}", r.body);
+            let v = view_of(&d, &gid);
+            assert!(v["exhibits_enabled"].is_null());
+            assert!(v["exhibit_kind_preference"].is_null());
+            assert_eq!(v["effective_exhibits_enabled"], true);
+            assert_eq!(v["effective_exhibits_max_per_pr"], 6);
+            assert_eq!(
+                v["effective_exhibit_kind_preference"],
+                serde_json::json!(["gif", "video", "screenshot"])
+            );
+            assert_eq!(v["effective_exhibit_max_video_seconds"], 15);
+        }
+    }
+
+    #[test]
+    fn guardian_settings_and_details_reject_invalid_exhibit_overrides() {
+        let d = daemon();
+        let gid = make_guardian(&d);
+        for endpoint in ["settings", "details"] {
+            let url = format!("/api/guardians/{gid}/{endpoint}");
+            for (body, code) in [
+                (r#"{"exhibits_max_per_pr":0}"#, "invalid_value"),
+                (r#"{"exhibit_max_video_seconds":0}"#, "invalid_value"),
+                (
+                    r#"{"exhibit_kind_preference":[]}"#,
+                    "invalid_exhibit_kind_preference",
+                ),
+                (
+                    r#"{"exhibit_kind_preference":["gif","gif"]}"#,
+                    "invalid_exhibit_kind_preference",
+                ),
+                (
+                    r#"{"exhibit_kind_preference":["output"]}"#,
+                    "invalid_exhibit_kind_preference",
+                ),
+                (
+                    r#"{"exhibit_kind_preference":["video"],"exhibits_max_per_pr":0}"#,
+                    "invalid_value",
+                ),
+            ] {
+                let r = route(&d, "POST", &url, body);
+                assert_eq!(r.status, 400, "{endpoint} {body}: {}", r.body);
+                assert!(r.body.contains(code), "{endpoint} {body}: {}", r.body);
+            }
+            // Nothing from a rejected request was written.
+            let v = view_of(&d, &gid);
+            assert!(v["exhibit_kind_preference"].is_null(), "{endpoint}");
+            assert!(v["exhibits_max_per_pr"].is_null(), "{endpoint}");
+        }
     }
 
     const EVERY_REBUILD_EVENT: [&str; 3] = ["rebase", "feedback", "auto_fix"];

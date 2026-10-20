@@ -423,6 +423,38 @@
        * @property {LiveRunRow[]} runs
        */
       /**
+       * One exhibit slot of a review: something a reviewer should see in the
+       * PR/MR description, owned by one live action, and what its runs have
+       * delivered so far.
+       * @typedef {object} ExhibitSlotView
+       * @property {number} action_idx - The owning live action's `idx`.
+       * @property {number} slot_idx
+       * @property {string|null} action_label
+       * @property {"gif"|"video"|"screenshot"|"output"} kind - What was asked for.
+       * @property {string} describe - What to show.
+       * @property {"handoff"|"recipe"|"inferred"} origin - Who asked: the change's own agent, a config recipe, or the PR writer.
+       * @property {string|null} why - Why an inferred request was added.
+       * @property {"gif"|"video"|"screenshot"|"output"|null} delivered_kind - What a run actually delivered, which can be lower in the preference order.
+       * @property {string|null} url - The uploaded file's URL on the forge.
+       * @property {string|null} caption
+       * @property {string|null} text - An `output` slot's text.
+       * @property {string|null} missing_reason - Why nothing was delivered (or why an upload failed).
+       * @property {boolean} has_file - Whether a captured file is kept on the daemon (previewable).
+       * @property {number|null} updated_at_ms
+       */
+      /**
+       * `GET /api/guardians/{id}/exhibits`.
+       * @typedef {object} ExhibitsView
+       * @property {ExhibitSlotView[]} exhibits
+       */
+      /**
+       * `GET /api/guardians/{id}/exhibits/{action}/{slot}/file`: a captured
+       * exhibit file for the board's preview.
+       * @typedef {object} ExhibitFileView
+       * @property {string} content_type
+       * @property {string} data_base64
+       */
+      /**
        * @typedef {object} BranchConflicts
        * @property {string[]} files - Paths (relative to the branch's worktree root) still carrying unresolved conflict markers. Empty once resolved, or if the worktree doesn't exist (yet, or anymore).
        * @property {boolean} rebase_in_progress - Whether the worktree is currently mid-`git rebase`. Can be false while `files` is still non-empty.
@@ -643,6 +675,16 @@
        * @property {string} [origin] - RAL-318: provenance of this review -- "explicit" (an authored [[review]] block, or any other pre-existing creation path -- the default/normal case) or "arbiter" (created automatically by the Arbiter/Triage subsystem when a pooled cell count threshold or cron schedule fired).
        * @property {number} [base_shift_maximum_rebuilds] - RAL-507: this review's own override for the unattended base-shift rebuild campaign's retry cap, or null/absent to inherit the project/global default (`effective_base_shift_maximum_rebuilds` is what the campaign actually enforces).
        * @property {number} [effective_base_shift_maximum_rebuilds] - RAL-507: base_shift_maximum_rebuilds resolved against the project/global default -- the cap `base_shift_rebuild_attempts` is compared against to decide the campaign is exhausted.
+       * @property {boolean|null} [exhibits_enabled] - This review's own override for whether its PRs/MRs show exhibits, or null to inherit the project/global default.
+       * @property {boolean} [effective_exhibits_enabled] - `exhibits_enabled` resolved against the project settings, `.ralphus.toml` and global config on every read (true when nothing sets it).
+       * @property {number|null} [exhibits_max_per_pr] - This review's own cap on exhibits per PR/MR (at least 1), or null to inherit.
+       * @property {number} [effective_exhibits_max_per_pr] - The resolved cap (6 when nothing sets it).
+       * @property {boolean|null} [infer_exhibits] - This review's own override for whether a live run may propose exhibits nobody asked for, or null to inherit.
+       * @property {boolean} [effective_infer_exhibits] - The resolved value (true when nothing sets it).
+       * @property {string[]|null} [exhibit_kind_preference] - This review's own exhibit kind order ("gif"/"video"/"screenshot", most preferred first), or null to inherit.
+       * @property {string[]} [effective_exhibit_kind_preference] - The resolved, never-empty order (gif, video, screenshot when nothing sets it).
+       * @property {number|null} [exhibit_max_video_seconds] - This review's own cap on a video exhibit's length in seconds (at least 1), or null to inherit.
+       * @property {number} [effective_exhibit_max_video_seconds] - The resolved cap (15 when nothing sets it).
        * @property {number} [base_shift_rebuild_attempts] - RAL-507: failed rebuild attempts recorded so far against the base-shift campaign's current target SHAs. Whole-review failed-pass count, not any one worktree's spend (see `base_shift_rebuild_attempts_by_project` for that) -- reset to 0 by `clear_guardian_base_shift_campaign`, which fires on every manual Merge / rebase.
        * @property {{[project: string]: number}|null} [base_shift_rebuild_attempts_by_project] - RAL-542: failed rebuild attempts consumed by each worktree's own slice of the budget, keyed by project root; a worktree absent from the map has spent none. This is what the daemon gates automatic rebuild on, so compare it (not `base_shift_rebuild_attempts`) against `effective_base_shift_maximum_rebuilds`. Null when no campaign is open.
        * @property {{[project: string]: string}|null} [base_shift_rebuild_targets] - RAL-507: the target base SHA per project this campaign's attempts have been counted against; a shift to a different target starts a fresh campaign with a full budget instead of continuing this counter. Null when no base-shift campaign is open.
@@ -1057,6 +1099,11 @@
        * @property {boolean|null|undefined} auto_run
        * @property {boolean|null|undefined} live_actions
        * @property {string[]|null|undefined} rebuild_on - Which events rebuild a review's prepared build: any of "rebase", "feedback", "auto_fix". `[]` = manual only; null/absent = inherit.
+       * @property {boolean|null|undefined} exhibits_enabled - Whether reviews show exhibits in their PRs/MRs; null/absent = inherit.
+       * @property {number|null|undefined} exhibits_max_per_pr - The most exhibits one PR/MR shows (at least 1); null/absent = inherit.
+       * @property {boolean|null|undefined} infer_exhibits - Whether a live run may propose exhibits nobody asked for; null/absent = inherit.
+       * @property {string[]|null|undefined} exhibit_kind_preference - Exhibit kinds ("gif"/"video"/"screenshot"), most preferred first; null/absent = inherit.
+       * @property {number|null|undefined} exhibit_max_video_seconds - The longest a video exhibit may run, in seconds (at least 1); null/absent = inherit.
        */
       /**
        * RAL-408: the fully resolved effective review-setting defaults (file
@@ -1089,6 +1136,11 @@
        * @property {boolean} auto_run
        * @property {boolean} live_actions
        * @property {string[]|undefined} rebuild_on - The resolved file-config/global rebuild triggers a review inherits when neither it nor its project sets any.
+       * @property {boolean|undefined} exhibits_enabled - The resolved exhibit on/off default.
+       * @property {number|undefined} exhibits_max_per_pr - The resolved per-PR exhibit cap.
+       * @property {boolean|undefined} infer_exhibits - The resolved inferred-exhibits default.
+       * @property {string[]|undefined} exhibit_kind_preference - The resolved exhibit kind order, most preferred first.
+       * @property {number|undefined} exhibit_max_video_seconds - The resolved video length cap, in seconds.
        */
       /**
        * RAL-408: `GET/POST /api/projects/{name}/review-settings`'s response
