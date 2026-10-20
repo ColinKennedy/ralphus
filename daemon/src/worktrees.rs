@@ -3059,11 +3059,22 @@ pub(crate) fn provision_review_repository(
         .with_store(std::sync::Arc::clone(store))
         .git(&["rev-parse", "--path-format=absolute", "--git-common-dir"])
         .map_err(|e| format!("{who}: could not find the repository behind {workspace}: {e}"))?;
-    Path::new(common.trim())
+    let repository = Path::new(common.trim())
         .parent()
         .map(|p| p.to_string_lossy().replace('\\', "/"))
         .filter(|p| !p.is_empty())
-        .ok_or_else(|| format!("{who}: unexpected git common dir {:?}", common.trim()))
+        .ok_or_else(|| format!("{who}: unexpected git common dir {:?}", common.trim()))?;
+    // A provider's clone usually has the base branch checked out, and git
+    // refuses to fetch into a checked-out branch, so the review's base could
+    // never advance to its upstream. Nobody works in this checkout: detach it.
+    let repo_ws = crate::workspace::Workspace::on(repository.as_str(), Some(machine))
+        .with_store(std::sync::Arc::clone(store));
+    if repo_ws.git(&["symbolic-ref", "-q", "HEAD"]).is_ok() {
+        repo_ws
+            .git(&["checkout", "--quiet", "--detach"])
+            .map_err(|e| format!("{who}: could not detach HEAD in {repository}: {e}"))?;
+    }
+    Ok(repository)
 }
 
 /// The remote counterpart of [`set_explicit_upstream`] +

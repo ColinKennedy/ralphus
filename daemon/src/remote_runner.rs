@@ -1638,7 +1638,7 @@ impl ProviderRunner {
                 "{} {} failed on machine {:?} (exit {code}): {}",
                 req.program,
                 req.args.join(" "),
-                self.scheme,
+                format!("{}:{}", self.scheme, self.uri),
                 resp.stdout.unwrap_or_default().trim()
             )),
         }

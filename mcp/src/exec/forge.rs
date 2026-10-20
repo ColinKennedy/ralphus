@@ -15,7 +15,7 @@ pub fn execute(cmd: ForgeCommand, client: &DaemonClient) -> ExecResult {
             host,
             label,
             token,
-        } => Ok(client.add_forge_pool_token(&kind, &host, &label, &token)?),
+        } => Ok(client.add_forge_pool_token(&kind, &host, &label, token.expose())?),
         ForgeCommand::PoolRemove { kind, host, label } => {
             client.remove_forge_pool_token(&kind, &host, &label)?;
             Ok(json!({"removed": true}))

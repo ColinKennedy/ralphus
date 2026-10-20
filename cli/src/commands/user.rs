@@ -16,7 +16,7 @@ pub enum UserCommand {
     SetForgeToken {
         user: String,
         host: String,
-        token: String,
+        token: crate::args::Secret,
     },
     ListForgeTokens {
         user: String,
@@ -65,7 +65,11 @@ fn parse_set_forge_token(args: &[String]) -> UserCommand {
             "user set-forge-token requires a <user> argument".to_string(),
         );
     };
-    UserCommand::SetForgeToken { user, host, token }
+    UserCommand::SetForgeToken {
+        user,
+        host,
+        token: crate::args::Secret::new(token),
+    }
 }
 
 fn parse_list_forge_tokens(args: &[String]) -> UserCommand {
@@ -117,7 +121,7 @@ pub fn dispatch(cmd: UserCommand, opts: &GlobalOpts) -> i32 {
         }
         UserCommand::SetForgeToken { user, host, token } => run_and_report(opts, None, || {
             let client = opts.client();
-            let record = client.set_user_forge_token(&user, &host, &token)?;
+            let record = client.set_user_forge_token(&user, &host, token.expose())?;
             emit(opts, &record, |_| {
                 println!("forge token set for user {user:?} host {host:?}");
             });
@@ -183,7 +187,10 @@ mod tests {
             UserCommand::SetForgeToken { user, host, token } => {
                 assert_eq!(user, "alice");
                 assert_eq!(host, "gitlab.com");
-                assert_eq!(token, "glpat-x");
+                assert_eq!(token.expose(), "glpat-x");
+                // `main` logs every parsed command with `{:?}`.
+                let logged = format!("{:?}", UserCommand::SetForgeToken { user, host, token });
+                assert!(!logged.contains("glpat-x"), "{logged}");
             }
             other => panic!("unexpected: {other:?}"),
         }

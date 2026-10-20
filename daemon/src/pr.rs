@@ -4178,10 +4178,11 @@ fn resync_pr_bases_inner(
         return Ok(0);
     }
     let root = PathBuf::from(&guardian.git_root);
+    let review_ws = crate::workspace::Workspace::for_guardian(store, &guardian.id, &root);
     let forge_cfg = crate::config::resolve_forge(&root);
     let clone_url = project_clone_url(store, guardian.project.as_deref());
     let remote_name = crate::forge::resolve_parent_remote_name(
-        &root,
+        &review_ws,
         &guardian.base_branch,
         &forge_cfg,
         clone_url.as_deref(),
@@ -4201,14 +4202,14 @@ fn resync_pr_bases_inner(
 
     let routing = resolve_pr_repo_routing(
         store,
-        &root,
+        &review_ws,
         &guardian.base_branch,
         &forge_cfg,
         guardian.owner.as_deref(),
     );
     let (parent_client, fork_client) = (routing.parent_client, routing.fork_client);
     let resolved_client_err = if parent_client.is_none() && fork_client.is_none() {
-        crate::forge::resolve_remote(&root, &guardian.base_branch, &forge_cfg).err()
+        crate::forge::resolve_remote(&review_ws, &guardian.base_branch, &forge_cfg).err()
     } else {
         None
     };
@@ -4630,7 +4631,7 @@ pub fn reconcile_ci_deferral(
     let forge_cfg = crate::config::resolve_forge(&root);
     let routing = resolve_pr_repo_routing(
         store,
-        &root,
+        &crate::workspace::Workspace::for_guardian(store, &guardian.id, &root),
         &guardian.base_branch,
         &forge_cfg,
         guardian.owner.as_deref(),
@@ -5079,7 +5080,7 @@ pub fn check_pr_merges(store: &crate::store_lock::StoreHandle, id: &str) -> bool
         // single `resolve_remote` call that can only ever match one of them.
         let routing = resolve_pr_repo_routing(
             store,
-            &root,
+            &crate::workspace::Workspace::for_guardian(store, &guardian.id, &root),
             &guardian.base_branch,
             &forge_cfg,
             guardian.owner.as_deref(),
@@ -5232,7 +5233,7 @@ fn maybe_promote_fork_root(
     // may have named (never the fork's).
     let clone_url = project_clone_url(store, guardian.project.as_deref());
     let parent_remote_name = crate::forge::resolve_parent_remote_name(
-        &root,
+        &crate::workspace::Workspace::for_guardian(store, &guardian.id, &root),
         &guardian.base_branch,
         &forge_cfg,
         clone_url.as_deref(),
@@ -6337,7 +6338,7 @@ pub fn sync_open_pr_branches(store: &crate::store_lock::StoreHandle, id: &str) {
     // guardian.
     let routing = resolve_pr_repo_routing(
         store,
-        &root,
+        &ws,
         &guardian.base_branch,
         &forge_cfg,
         guardian.owner.as_deref(),
@@ -6655,7 +6656,7 @@ pub fn detect_forge_reorder(
     // row's own stored `repo` -- see [`PrRepoRouting`].
     let routing = resolve_pr_repo_routing(
         store,
-        &root,
+        &crate::workspace::Workspace::for_guardian(store, &guardian.id, &root),
         &guardian.base_branch,
         &forge_cfg,
         guardian.owner.as_deref(),
@@ -7101,7 +7102,7 @@ pub fn poll_pr_base_drift(
     // uses whichever repository it's actually filed on.
     let routing = resolve_pr_repo_routing(
         store,
-        &root,
+        &crate::workspace::Workspace::for_guardian(store, &guardian.id, &root),
         &guardian.base_branch,
         &forge_cfg,
         guardian.owner.as_deref(),
@@ -12109,7 +12110,7 @@ pub fn pull_pr_commits(
     // on (the fork in fork mode, including the root's).
     let routing = resolve_pr_repo_routing(
         store,
-        &root,
+        &ws,
         &guardian.base_branch,
         &forge_cfg,
         guardian.owner.as_deref(),
@@ -12492,7 +12493,7 @@ fn action_pr_feedback_inner(
     // `repo` for both the comments read and (below) the push-back remote.
     let routing = resolve_pr_repo_routing(
         store,
-        &root,
+        &ws,
         &guardian.base_branch,
         &forge_cfg,
         guardian.owner.as_deref(),

@@ -17,7 +17,7 @@ pub enum ForgeCommand {
         kind: String,
         host: String,
         label: String,
-        token: String,
+        token: crate::args::Secret,
     },
     PoolRemove {
         kind: String,
@@ -80,7 +80,7 @@ fn parse_add(args: &[String]) -> ForgeCommand {
         kind,
         host,
         label,
-        token,
+        token: crate::args::Secret::new(token),
     }
 }
 
@@ -114,9 +114,9 @@ pub fn dispatch(cmd: ForgeCommand, opts: &GlobalOpts) -> i32 {
             label,
             token,
         } => run_and_report(opts, None, || {
-            let record = opts
-                .client()
-                .add_forge_pool_token(&kind, &host, &label, &token)?;
+            let record =
+                opts.client()
+                    .add_forge_pool_token(&kind, &host, &label, token.expose())?;
             emit(opts, &record, |_| {
                 println!("added {kind} poll token {label:?} for {host}");
             });
@@ -175,9 +175,19 @@ mod tests {
         match parse(&v(&[
             "pool", "add", "gitlab", "ci-bot", "--token", "glpat-x",
         ])) {
-            ForgeCommand::PoolAdd { host, label, .. } => {
+            cmd @ ForgeCommand::PoolAdd { .. } => {
+                // `main` logs every parsed command with `{:?}`.
+                let logged = format!("{cmd:?}");
+                assert!(!logged.contains("glpat-x"), "{logged}");
+                let ForgeCommand::PoolAdd {
+                    host, label, token, ..
+                } = cmd
+                else {
+                    unreachable!()
+                };
                 assert_eq!(host, "gitlab.com");
                 assert_eq!(label, "ci-bot");
+                assert_eq!(token.expose(), "glpat-x");
             }
             other => panic!("{other:?}"),
         }

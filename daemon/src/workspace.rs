@@ -1505,15 +1505,31 @@ echo {json}
 
         assert_eq!(ws.machine(), Some("ib:A"));
         assert_eq!(ws.root_string(), "/m/root/repo/.git/.ralphus");
+        // A provider clone has its base branch checked out, which git refuses
+        // to fetch into; provisioning detaches it so the base can advance.
+        let requests = std::fs::read_to_string(dir.join("requests.log")).unwrap();
+        assert!(requests.contains("\"--detach\""), "{requests}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A fake provider that answers every verb with `json` and appends each
+    /// request payload it receives to `requests.log` beside it.
     fn write_script(dir: &Path, json: &str) -> PathBuf {
         std::fs::create_dir_all(dir).unwrap();
+        let log = dir.join("requests.log");
         let (script, body) = if cfg!(windows) {
-            (dir.join("p.cmd"), format!("@echo off\r\necho {json}\r\n"))
+            (
+                dir.join("p.cmd"),
+                format!(
+                    "@echo off\r\nmore >> \"{}\"\r\necho {json}\r\n",
+                    log.display()
+                ),
+            )
         } else {
-            (dir.join("p.sh"), format!("#!/bin/sh\necho '{json}'\n"))
+            (
+                dir.join("p.sh"),
+                format!("#!/bin/sh\ncat >> '{}'\necho '{json}'\n", log.display()),
+            )
         };
         std::fs::write(&script, body).unwrap();
         #[cfg(unix)]

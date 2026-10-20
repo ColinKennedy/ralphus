@@ -17331,7 +17331,7 @@ fn guardian_unlink_prs(daemon: &Daemon, id: &str) -> Reply {
         // sent to the parent repo.
         match crate::pr::forge_client_for_stack(
             &daemon.store_handle(),
-            root,
+            &crate::workspace::Workspace::for_guardian(&daemon.store_handle(), &guardian.id, root),
             &guardian.base_branch,
             &forge_cfg,
             guardian.owner.as_deref(),

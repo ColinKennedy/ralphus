@@ -9003,7 +9003,7 @@ fn run_feedback_pass(
                 let clone_url =
                     crate::pr::project_clone_url_for_root(store, Path::new(&branch_project));
                 Some(crate::forge::resolve_parent_remote_name(
-                    Path::new(&branch_project),
+                    &root,
                     &base,
                     &forge_cfg,
                     clone_url.as_deref(),
@@ -9089,7 +9089,7 @@ fn run_feedback_pass(
                             crate::forge::effective_forge_identity(None, owner.as_deref());
                         match crate::forge::resolve_remote_with_store(
                             store,
-                            Path::new(&branch_project),
+                            &root,
                             remote_name,
                             &forge_cfg,
                             identity.as_deref(),
@@ -15834,7 +15834,9 @@ fn fetch_base_branch(
             let refspec = format!("+refs/heads/{branch}:refs/heads/{base}");
             return match ws.git(&["fetch", "--no-write-fetch-head", remote, &refspec]) {
                 Ok(_) => Ok(()),
-                Err(e) if e.contains("refusing to fetch into branch") => {
+                // Git 2.40+ says "refusing to fetch into branch ... checked
+                // out at"; older git "Refusing to fetch into current branch".
+                Err(e) if e.to_ascii_lowercase().contains("refusing to fetch into") => {
                     warn_checked_out_base_once(store, target);
                     let tracking = format!("+refs/heads/{branch}:refs/remotes/{remote}/{branch}");
                     ws.git(&["fetch", "--no-write-fetch-head", remote, &tracking])
