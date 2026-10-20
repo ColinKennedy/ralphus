@@ -2956,6 +2956,7 @@ fn pr_writer_spec(
         retry_after_unknown_default_seconds,
         maximum_timeout: None,
         pass_score: None,
+        closing_turn_prompt: None,
     }
 }
 
@@ -12949,6 +12950,7 @@ mod tests {
                 turns: None,
                 prophecies: Vec::new(),
                 appraisal: None,
+                closing_summary: None,
                 thinking_stall_last_line: None,
             }
         }

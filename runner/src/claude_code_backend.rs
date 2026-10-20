@@ -372,6 +372,10 @@ impl ModelBackend for ClaudeCodeBackend {
         true
     }
 
+    fn supports_closing_turn(&self) -> bool {
+        true
+    }
+
     fn supports_thinking(&self) -> bool {
         true
     }

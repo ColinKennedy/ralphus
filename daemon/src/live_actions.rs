@@ -145,13 +145,13 @@ const HANDOFF_MAX_CHARS: usize = 4000;
 /// Most handoffs kept from one cell.
 const MAX_HANDOFFS_PER_CELL: usize = 8;
 
-/// Appended to every prompt cell's system prompt (`RunnerSpec::from_row`): the
-/// question whose answer becomes the review's live actions.
-pub const LIVE_HANDOFF_SYSTEM_PROMPT: &str = "## Live Test Handoff\n\
+/// Asked of every squad prompt cell in its closing turn (`RunnerSpec::from_row`
+/// sets `closing_turn_prompt` to it): the question whose answer becomes the
+/// review's live actions.
+pub const LIVE_HANDOFF_QUESTION: &str = "## Live Test Handoff\n\
 Operational note, not a change to your task: after this work is merged into a \
 review, ralphus may test it live with a separate agent that has not seen this \
-conversation. When you finish, and before any RALPHUS_GHOST section, say how \
-you would test this change live if you had to: run the real program the way a \
+conversation. Say how you would test this change live if you had to: run the real program the way a \
 user would, exercise what you changed, and check the result. Write each test on \
 its own, starting on a new line with the exact marker 'RALPHUS_LIVE_ACTION:' \
 followed by a short title for the test (a few words, e.g. 'GUI shows the Ready \
@@ -724,6 +724,7 @@ pub fn deduplicate_handoffs(
             .retry_after_unknown_default_seconds(),
         maximum_timeout: None,
         pass_score: None,
+        closing_turn_prompt: None,
     };
     // Recorded before the agent starts, so the board can follow the
     // generation live -- the same way it follows auto-action generation.
@@ -862,6 +863,17 @@ pub struct LiveRunOutcome {
     /// The agent's full final reply, before marker lines are dropped from
     /// `report`; the structured result line is parsed out of it.
     pub raw_reply: String,
+    /// What a later recheck needs to resume this run's agent session; `None`
+    /// when the backend cannot resume or reported no session.
+    pub session: Option<LiveRunSession>,
+}
+
+/// The agent session of a finished live run, kept so it can be resumed once.
+#[derive(Debug, Clone)]
+pub struct LiveRunSession {
+    /// The spec the run started with.
+    pub spec: RunnerSpec,
+    pub agent_session_id: String,
 }
 
 fn outcome(end: LiveRunEnd, cell_id: &str, error: Option<String>) -> LiveRunOutcome {
@@ -877,6 +889,7 @@ fn outcome(end: LiveRunEnd, cell_id: &str, error: Option<String>) -> LiveRunOutc
         sent_prompt: None,
         sent_system_prompt: None,
         raw_reply: String::new(),
+        session: None,
     }
 }
 
@@ -1027,6 +1040,7 @@ pub fn execute_live_run(
             .retry_after_unknown_default_seconds(),
         maximum_timeout: None,
         pass_score: None,
+        closing_turn_prompt: None,
     };
 
     note(
@@ -1078,6 +1092,15 @@ pub fn execute_live_run(
     done.sent_prompt = sent_prompt;
     done.sent_system_prompt = sent_system_prompt;
     done.cost_usd = result.cost_usd;
+    if !crate::agent_profiles::is_native_backend(&spec.agent) {
+        done.session = result
+            .agent_session_id
+            .clone()
+            .map(|agent_session_id| LiveRunSession {
+                spec: spec.clone(),
+                agent_session_id,
+            });
+    }
     done.base_tip.clone_from(&base_tip);
 
     if let Some(base) = base_tip.as_deref() {

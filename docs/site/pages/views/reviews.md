@@ -144,7 +144,9 @@ been prepared while every one of its cells has finished. They never wait for CI.
 A rebase, feedback, an auto-fix or a daemon restart never runs them again; after
 that, use **▶ Run all** or a row's **▶ Run** in the review's live actions
 section (or `ralphus review live run <selector> [--index N]`). Runs of one review
-go one at a time. Select a run to watch it in **Live View**, live while it runs
+go one at a time. When a run's recipe lists commands it was not recorded running exactly (or passes without any matched command), the agent is asked once, in the same session, to correct its result before the report is posted; the original result is kept for audit.
+
+Select a run to watch it in **Live View**, live while it runs
 and as a transcript afterwards; its report is also posted to the review's
 conversation.
 

@@ -330,6 +330,7 @@ pub fn run_generation(
             crate::config::DEFAULT_RETRY_AFTER_UNKNOWN_DEFAULT_SECONDS,
         maximum_timeout: None,
         pass_score: None,
+        closing_turn_prompt: None,
     };
     let runner = SubprocessRunner::from_env();
     let result = runner.run_cancellable(&spec, cancel);

@@ -114,6 +114,7 @@ fn maybe_run_commit_step(spec: &RunnerSpec) -> Option<RunnerResult> {
         ghost: None,
         prophecies: Vec::new(),
         appraisal: None,
+        closing_summary: None,
     })
 }
 
@@ -187,6 +188,7 @@ impl Runner for StageDoneRunner {
             turns: None,
             prophecies: Vec::new(),
             appraisal: None,
+            closing_summary: None,
         }
     }
 }
@@ -253,6 +255,7 @@ impl Runner for LossyRunner {
             turns: None,
             prophecies: Vec::new(),
             appraisal: None,
+            closing_summary: None,
         }
     }
 }
@@ -306,6 +309,7 @@ impl Runner for MarkerStrippingRunner {
             turns: None,
             prophecies: Vec::new(),
             appraisal: None,
+            closing_summary: None,
         }
     }
 }
@@ -339,6 +343,7 @@ impl Runner for FeedbackRunner {
             turns: None,
             prophecies: Vec::new(),
             appraisal: None,
+            closing_summary: None,
         }
     }
 }
@@ -415,6 +420,7 @@ impl Runner for RaceInjectingRunner {
             turns: None,
             prophecies: Vec::new(),
             appraisal: None,
+            closing_summary: None,
         }
     }
 }
@@ -447,6 +453,7 @@ impl Runner for SilentNoOpFeedbackRunner {
             turns: None,
             prophecies: Vec::new(),
             appraisal: None,
+            closing_summary: None,
         }
     }
 }
@@ -480,6 +487,7 @@ impl Runner for NamedFeedbackRunner {
             turns: None,
             prophecies: Vec::new(),
             appraisal: None,
+            closing_summary: None,
         }
     }
 }
@@ -539,6 +547,7 @@ impl Runner for AutoFixRunner {
             ghost: None,
             prophecies: Vec::new(),
             appraisal: None,
+            closing_summary: None,
         }
     }
 }
@@ -3566,6 +3575,7 @@ impl Runner for ManualCommandsRunner {
             retry_after_secs: None,
             prophecies: Vec::new(),
             appraisal: None,
+            closing_summary: None,
         }
     }
 }
@@ -4041,6 +4051,7 @@ impl Runner for FailingAutoBuildRunner {
                 turns: None,
                 prophecies: Vec::new(),
                 appraisal: None,
+                closing_summary: None,
             };
         }
         RunnerResult::failure("only auto_build is faked in this test")
@@ -4194,6 +4205,7 @@ fn proof_scope_nothing_suppresses_final_verify() {
                 turns: None,
                 prophecies: Vec::new(),
                 appraisal: None,
+                closing_summary: None,
             }
         }
     }
@@ -6650,6 +6662,7 @@ command = "cargo test --workspace"
                     turns: None,
                     prophecies: Vec::new(),
                     appraisal: None,
+                    closing_summary: None,
                 };
             }
 
@@ -6702,6 +6715,7 @@ command = "cargo test --workspace"
                 turns: None,
                 prophecies: Vec::new(),
                 appraisal: None,
+                closing_summary: None,
             }
         }
     }
@@ -6856,6 +6870,7 @@ impl Runner for SelfCommittingFeedbackRunner {
             ghost: None,
             prophecies: Vec::new(),
             appraisal: None,
+            closing_summary: None,
         }
     }
 }
@@ -7307,6 +7322,7 @@ fn stage_done_marker_present_in_resolver_system_prompt() {
                 turns: None,
                 prophecies: Vec::new(),
                 appraisal: None,
+                closing_summary: None,
             }
         }
     }
@@ -7436,6 +7452,7 @@ fn resolver_system_prompt_is_scope_agnostic_and_honest() {
                     turns: None,
                     prophecies: Vec::new(),
                     appraisal: None,
+                    closing_summary: None,
                 }
             }
         }
@@ -7597,6 +7614,7 @@ fn conflict_resolver_does_not_sweep_untouched_build_artifact_into_commit() {
                 turns: None,
                 prophecies: Vec::new(),
                 appraisal: None,
+                closing_summary: None,
             }
         }
     }
@@ -7788,6 +7806,7 @@ impl Runner for PartialResolutionRunner {
             turns: None,
             prophecies: Vec::new(),
             appraisal: None,
+            closing_summary: None,
         }
     }
 }
@@ -7927,6 +7946,7 @@ impl Runner for NeverResolvesRunner {
             turns: None,
             prophecies: Vec::new(),
             appraisal: None,
+            closing_summary: None,
         }
     }
 }
@@ -8382,6 +8402,7 @@ impl Runner for ManualCommandsCountingRunner {
                 turns: None,
                 prophecies: Vec::new(),
                 appraisal: None,
+                closing_summary: None,
             };
         }
         RunnerResult::failure("unexpected runner call")
@@ -8576,6 +8597,7 @@ impl Runner for FeedbackManualCommandsCountingRunner {
                 turns: None,
                 prophecies: Vec::new(),
                 appraisal: None,
+                closing_summary: None,
             };
         }
         let _ = std::fs::write(PathBuf::from(&spec.cwd).join("note.txt"), "reviewed\n");
@@ -8600,6 +8622,7 @@ impl Runner for FeedbackManualCommandsCountingRunner {
             turns: None,
             prophecies: Vec::new(),
             appraisal: None,
+            closing_summary: None,
         }
     }
 }
@@ -9657,6 +9680,7 @@ fn settings_change_restarts_a_stuck_merge_and_new_setting_takes_effect() {
                 turns: None,
                 prophecies: Vec::new(),
                 appraisal: None,
+                closing_summary: None,
             }
         }
     }

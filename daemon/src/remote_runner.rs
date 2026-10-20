@@ -1802,6 +1802,7 @@ mod tests {
                 turns: None,
                 prophecies: Vec::new(),
                 appraisal: None,
+                closing_summary: None,
             }
         }
     }
@@ -1845,6 +1846,7 @@ mod tests {
                 crate::config::DEFAULT_RETRY_AFTER_UNKNOWN_DEFAULT_SECONDS,
             maximum_timeout: None,
             pass_score: None,
+            closing_turn_prompt: None,
         }
     }
 

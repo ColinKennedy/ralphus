@@ -436,6 +436,8 @@ pub struct RunEvidence {
     /// Whether `recipe` holds every proposed command, so an empty list means
     /// none was proposed. False on rows stored before steps were annotated.
     pub recipe_annotated: bool,
+    /// The result the agent first reported, as JSON, when a recheck revised it.
+    pub original_result: Option<String>,
     pub branch_ids: Vec<String>,
     pub integration_branch_id: Option<String>,
     pub integration_pushed: Option<bool>,
@@ -576,6 +578,38 @@ impl Store {
         Ok(())
     }
 
+    /// Replace a run's verdict with the one its recheck produced, keeping the
+    /// result first reported (verdict, summary, fix flags, recipe) as JSON in
+    /// `original_result`. Only the first revision's original is kept.
+    ///
+    /// # Errors
+    ///
+    /// On a database failure.
+    pub fn record_live_run_revision(
+        &self,
+        run_id: &str,
+        verdict: Verdict,
+        parsed: &ParsedResult,
+        recipe: &[RecipeStep],
+    ) -> Result<()> {
+        let before = self.live_run_evidence(run_id)?;
+        if before.original_result.is_none() {
+            let original = serde_json::json!({
+                "verdict": before.verdict,
+                "summary": before.verdict_summary,
+                "fix_attempted": before.fix_attempted,
+                "fix_confirmed": before.fix_confirmed,
+                "recipe": before.recipe,
+            })
+            .to_string();
+            self.conn.execute(
+                "UPDATE guardian_live_run_evidence SET original_result=? WHERE run_id=?",
+                rusqlite::params![original, run_id],
+            )?;
+        }
+        self.record_live_run_verdict(run_id, verdict, Some(parsed), recipe)
+    }
+
     /// Record where a run's commits were carried and whether that was pushed.
     ///
     /// # Errors
@@ -607,7 +641,8 @@ impl Store {
             .conn
             .query_row(
                 "SELECT sent_prompt, sent_system_prompt, verdict, verdict_summary, fix_attempted,
-                        fix_confirmed, recipe, branch_ids, integration_branch_id, integration_pushed
+                        fix_confirmed, recipe, branch_ids, integration_branch_id, integration_pushed,
+                        original_result
                  FROM guardian_live_run_evidence WHERE run_id=?",
                 rusqlite::params![run_id],
                 |r| {
@@ -630,6 +665,7 @@ impl Store {
                             .unwrap_or_default(),
                         integration_branch_id: r.get(8)?,
                         integration_pushed: flag(9)?,
+                        original_result: r.get(10)?,
                     })
                 },
             )
@@ -1603,6 +1639,82 @@ pub fn process_pr_refreshes_background(store: &crate::store_lock::StoreHandle) {
         process_pr_refreshes_with(&store, &client_for);
         RUNNING.store(false, Ordering::SeqCst);
     });
+}
+
+// ---- the recheck ------------------------------------------------------------
+
+/// System prompt of the one resumed turn that re-examines a run's result.
+pub const RECHECK_SYSTEM_PROMPT: &str = "\
+You are re-examining the result of a live test you just ran. You may re-run commands in this \
+checkout to back your claims, but make no edits and no commits. Reply with a corrected final \
+`RALPHUS_LIVE_RESULT:` line (the same JSON shape as before) whose `recipe` lists only commands \
+you actually ran, exactly as recorded.";
+
+/// Whether a finished run's recipe leaves something to recheck: a step not run
+/// or only run as part of a different command, or a verdict no recorded command backs.
+#[must_use]
+pub fn needs_recheck(ev: &RunEvidence) -> bool {
+    verdict_unbacked(ev)
+        || (ev.recipe_annotated
+            && ev
+                .recipe
+                .iter()
+                .any(|s| matches!(s.status, StepMatch::NotRun | StepMatch::Variant)))
+}
+
+/// The recorded call sharing the most words with `command`, if any shares one.
+fn closest_recorded<'a>(command: &str, calls: &'a [RecordedCall]) -> Option<&'a str> {
+    let words: std::collections::HashSet<&str> = command.split_whitespace().collect();
+    calls
+        .iter()
+        .map(|c| {
+            let shared = c
+                .command
+                .split_whitespace()
+                .filter(|w| words.contains(w))
+                .count();
+            (shared, c.command.as_str())
+        })
+        .filter(|(shared, _)| *shared > 0)
+        .max_by_key(|(shared, _)| *shared)
+        .map(|(_, command)| command)
+}
+
+/// The recheck's user prompt: each recipe step, how it matched the recorded
+/// calls, and the recorded command (or, for a step not run, the closest one).
+#[must_use]
+pub fn recheck_prompt(ev: &RunEvidence, calls: &[RecordedCall]) -> String {
+    let mut out = String::from(
+        "Your recorded shell calls do not fully back the recipe you reported. Each step below \
+         shows how it matched what you actually ran.\n\n\
+         | Recipe step | Match | Recorded command |\n|---|---|---|\n",
+    );
+    let cell = |text: &str| text.replace('|', "\\|").replace('\n', " ");
+    for step in &ev.recipe {
+        let (status, recorded) = match step.status {
+            StepMatch::Exact => ("exact", step.recorded_command.clone()),
+            StepMatch::Variant => ("variant", step.recorded_command.clone()),
+            StepMatch::NotRun => (
+                "not run",
+                closest_recorded(&step.command, calls)
+                    .map_or_else(|| "(none)".to_string(), |c| format!("closest: {c}")),
+            ),
+        };
+        out.push_str(&format!(
+            "| {} | {status} | {} |\n",
+            cell(&step.command),
+            cell(&recorded)
+        ));
+    }
+    if ev.recipe.is_empty() {
+        out.push_str("| (no recipe reported) | not run | (none) |\n");
+    }
+    out.push_str(
+        "\nRe-run any step you still stand behind, then end your reply with a corrected \
+         `RALPHUS_LIVE_RESULT:` line. If a step cannot be backed, leave it out and lower the \
+         verdict accordingly.",
+    );
+    out
 }
 
 /// Fold a finished live run's evidence into the store: the sent prompts, the

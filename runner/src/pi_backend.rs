@@ -419,6 +419,10 @@ impl ModelBackend for PiBackend {
         true
     }
 
+    fn supports_closing_turn(&self) -> bool {
+        true
+    }
+
     fn supports_temperature(&self) -> bool {
         true
     }
