@@ -5996,7 +5996,7 @@ fn mark_branch_pr_closed_externally(
         .unwrap_or_else(|| guardian.git_root.clone());
     let already_landed = crate::guardian_merge::branch_diff_is_empty(
         store,
-        std::path::Path::new(&root),
+        &crate::workspace::Workspace::for_guardian(store, id, root.as_str()),
         &pr.base_ref,
         &pr.branch_alias,
     );

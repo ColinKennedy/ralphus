@@ -1285,18 +1285,16 @@ fn is_ancestor(root: &Workspace, ancestor: &str, descendant: &str) -> bool {
 #[must_use]
 fn purge_carry_refs(root: &Workspace, id: &str) -> Vec<String> {
     let mut failures = Vec::new();
-    let listed = git(
-        root.root(),
-        &[
+    let listed = root
+        .git(&[
             "for-each-ref",
             "--format=%(refname)",
             &format!("refs/ralphus/carry/{id}"),
-        ],
-    )
-    .unwrap_or_else(|e| {
-        failures.push(format!("list refs/ralphus/carry/{id}: {e}"));
-        String::new()
-    });
+        ])
+        .unwrap_or_else(|e| {
+            failures.push(format!("list refs/ralphus/carry/{id}: {e}"));
+            String::new()
+        });
     for name in listed.lines().map(str::trim).filter(|s| !s.is_empty()) {
         if let Err(e) = root.git(&["update-ref", "-d", name]) {
             failures.push(format!("{name}: {e}"));
@@ -1313,7 +1311,7 @@ fn purge_carry_refs(root: &Workspace, id: &str) -> Vec<String> {
 /// ref it created, covering normal completion, early return, and panic-unwind, so
 /// a build never leaks protection refs.
 struct CarryRefs {
-    pins: Vec<(PathBuf, String)>,
+    pins: Vec<(Workspace, String)>,
 }
 
 impl CarryRefs {
@@ -1321,13 +1319,14 @@ impl CarryRefs {
         Self { pins: Vec::new() }
     }
 
-    /// Pin `sha` under `refs/ralphus/carry/<id>/<slug>` in `root`. Best-effort:
-    /// on failure the commit simply falls back to bare-SHA reachability (still
-    /// valid until gc), so pinning never blocks a merge.
-    fn pin(&mut self, root: &Path, id: &str, slug: &str, sha: &str) {
+    /// Pin `sha` under `refs/ralphus/carry/<id>/<slug>` in `root` (on its
+    /// machine). Best-effort: on failure the commit simply falls back to
+    /// bare-SHA reachability (still valid until gc), so pinning never blocks a
+    /// merge.
+    fn pin(&mut self, root: &Workspace, id: &str, slug: &str, sha: &str) {
         let name = format!("refs/ralphus/carry/{id}/{slug}");
-        if git(root, &["update-ref", &name, sha]).is_ok() {
-            self.pins.push((root.to_path_buf(), name));
+        if root.git(&["update-ref", &name, sha]).is_ok() {
+            self.pins.push((root.clone(), name));
         }
     }
 }
@@ -1335,7 +1334,7 @@ impl CarryRefs {
 impl Drop for CarryRefs {
     fn drop(&mut self) {
         for (root, name) in &self.pins {
-            let _ = git(root, &["update-ref", "-d", name]);
+            let _ = root.git(&["update-ref", "-d", name]);
         }
     }
 }
@@ -7208,7 +7207,7 @@ pub fn run_merge_cancellable(
         let proot = ws_root.at(PathBuf::from(proj));
         cleanup_failures.extend(purge_carry_refs(&proot, id));
         if let Some(sha) = old_base_by_proj.get(proj) {
-            carry.pin(proot.root(), id, "base", sha);
+            carry.pin(&proot, id, "base", sha);
         }
         for ob in proj_branches {
             // A shared-worktree review keeps every branch on its one combined
@@ -7221,7 +7220,7 @@ pub fn run_merge_cancellable(
             };
             if let Ok(sha) = proot.git(&["rev-parse", "--verify", &rev]) {
                 let sha = sha.trim().to_string();
-                carry.pin(proot.root(), id, &ob.position.to_string(), &sha);
+                carry.pin(&proot, id, &ob.position.to_string(), &sha);
                 old_tips_by_proj
                     .entry(proj.clone())
                     .or_default()
@@ -7244,7 +7243,7 @@ pub fn run_merge_cancellable(
                 .cloned()
                 .filter(|sha| resolve_commit(&proot, sha).is_some())
             {
-                carry.pin(proot.root(), id, &format!("baseline-{}", ob.position), &sha);
+                carry.pin(&proot, id, &format!("baseline-{}", ob.position), &sha);
                 old_tips_by_proj.entry(proj.clone()).or_default().push(sha);
             }
         }
@@ -7259,7 +7258,7 @@ pub fn run_merge_cancellable(
                     == *proj
         }) {
             if let Some(sha) = resolve_commit(&proot, &review_ref_of(id, ob)) {
-                carry.pin(proot.root(), id, &format!("disabled-{}", ob.position), &sha);
+                carry.pin(&proot, id, &format!("disabled-{}", ob.position), &sha);
                 old_tips_by_proj.entry(proj.clone()).or_default().push(sha);
             }
         }
@@ -14285,15 +14284,25 @@ fn hold_branch_for_unfinished_task<F: Fn(GuardianStatus, Option<&str>)>(
 /// unanswerable comparison must not silently pick a side.
 pub(crate) fn branch_diff_is_empty(
     store: &crate::store_lock::StoreHandle,
-    root: &Path,
+    root: &Workspace,
     upstream: &str,
     head: &str,
 ) -> Result<bool, String> {
+    if !root.is_local() {
+        // A remote review's repository is on its machine (always git: a
+        // review stacks git branches). `--name-only` separates "no
+        // difference" (empty output) from a failure, which `--quiet`'s exit
+        // code cannot through a provider.
+        return root
+            .git(&["diff", "--name-only", upstream, head])
+            .map(|names| names.trim().is_empty());
+    }
     let vcs = {
         let guard = store.lock();
-        crate::vcs::for_project_root(&guard, root)?
+        crate::vcs::for_project_root(&guard, root.root())?
     };
-    vcs.differs(root, upstream, head).map(|differs| !differs)
+    vcs.differs(root.root(), upstream, head)
+        .map(|differs| !differs)
 }
 
 /// The post-build empty check for a branch built from `carry` (`carried`:
@@ -14321,7 +14330,7 @@ fn built_branch_is_empty(
     }
     let range_empty = carry.source == carry.upstream
         || matches!(
-            branch_diff_is_empty(store, root.root(), &carry.upstream, &carry.source),
+            branch_diff_is_empty(store, root, &carry.upstream, &carry.source),
             Ok(true)
         );
     if !range_empty || carry.new_since.is_some() {
@@ -14347,7 +14356,7 @@ fn note_if_branch_is_empty(
 ) -> bool {
     // An unanswerable comparison must never fail a review on a guess, so it
     // reports "not empty" and leaves the stored flag untouched.
-    let is_empty = match branch_diff_is_empty(store, root.root(), upstream, branch) {
+    let is_empty = match branch_diff_is_empty(store, root, upstream, branch) {
         Ok(is_empty) => is_empty,
         Err(e) => {
             crate::rlog!(

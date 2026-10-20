@@ -1314,6 +1314,36 @@ echo {json}
     }
 
     #[test]
+    fn a_remote_branchs_emptiness_is_judged_on_its_machine() {
+        // The daemon has no such repository; only the machine can answer.
+        let dir = std::env::temp_dir().join(format!("ral-b3-empty-{}", std::process::id()));
+        let script = write_script(
+            &dir,
+            r#"{"ok":true,"protocol_version":1,"exit_code":0,"stdout":"src/changed.rs"}"#,
+        );
+        let store = Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
+        store
+            .lock()
+            .register_machine_provider(
+                "ib",
+                "",
+                &script.to_string_lossy(),
+                &[],
+                crate::machines::PROTOCOL_VERSION,
+                false,
+            )
+            .unwrap();
+        let ws = Workspace::on("/srv/repo", Some("ib:A")).with_store(Arc::clone(&store));
+        assert_eq!(
+            crate::guardian_merge::branch_diff_is_empty(&store, &ws, "main", "feature"),
+            Ok(false)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn a_rebase_on_a_remote_machine_is_detected_there() {
         // The state directory exists only on the machine; a local
         // `Path::exists` would always say no rebase is running.
