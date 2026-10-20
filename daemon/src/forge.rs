@@ -48,7 +48,6 @@
 //! TODO: Replace with real user-service authentication once RAL-245 is complete.
 
 use std::collections::HashMap;
-use std::path::Path;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -4980,7 +4979,11 @@ fn extract_glab_token(text: &str) -> Option<String> {
 /// `[forge].remote` never wins over what `base_branch` itself resolves to —
 /// it is a fallback only, consulted when neither of the above resolves.
 #[must_use]
-pub(crate) fn resolve_remote_name(root: &Path, base_branch: &str, cfg: &ForgeConfig) -> String {
+pub(crate) fn resolve_remote_name(
+    root: &(impl crate::workspace::GitAt + ?Sized),
+    base_branch: &str,
+    cfg: &ForgeConfig,
+) -> String {
     resolve_remote_name_excluding(root, base_branch, cfg, None)
 }
 
@@ -4993,7 +4996,7 @@ pub(crate) fn resolve_remote_name(root: &Path, base_branch: &str, cfg: &ForgeCon
 /// and is therefore byte-identical to before this exclusion existed.
 #[must_use]
 pub(crate) fn resolve_remote_name_excluding(
-    root: &Path,
+    root: &(impl crate::workspace::GitAt + ?Sized),
     base_branch: &str,
     cfg: &ForgeConfig,
     exclude: Option<&str>,
@@ -5009,8 +5012,8 @@ pub(crate) fn resolve_remote_name_excluding(
 /// All remote names currently configured in `root` (`git remote`, one per
 /// line). Empty on any git failure -- no remotes configured is not an error
 /// worth surfacing here, callers just find no URL match and fall through.
-fn configured_remote_names(root: &Path) -> Vec<String> {
-    crate::guardian_merge::git(root, &["remote"])
+fn configured_remote_names(root: &(impl crate::workspace::GitAt + ?Sized)) -> Vec<String> {
+    root.git_at(&["remote"])
         .map(|out| {
             out.lines()
                 .map(str::trim)
@@ -5027,10 +5030,14 @@ fn configured_remote_names(root: &Path) -> Vec<String> {
 /// match" -- a probe that could not be answered is not the same claim as "this
 /// remote's URL differs", and callers must not invent a new remote on the
 /// strength of a failed probe they never actually completed.
-fn remote_url_is(root: &Path, name: &str, target: &(String, String)) -> Result<bool, String> {
-    let configured =
-        crate::guardian_merge::git(root, &["config", "--get", &format!("remote.{name}.url")])
-            .map_err(|e| format!("could not read remote.{name}.url: {e}"))?;
+fn remote_url_is(
+    root: &(impl crate::workspace::GitAt + ?Sized),
+    name: &str,
+    target: &(String, String),
+) -> Result<bool, String> {
+    let configured = root
+        .git_at(&["config", "--get", &format!("remote.{name}.url")])
+        .map_err(|e| format!("could not read remote.{name}.url: {e}"))?;
     Ok(parse_remote_url(configured.trim()).as_ref() == Some(target))
 }
 
@@ -5051,7 +5058,7 @@ fn remote_url_is(root: &Path, name: &str, target: &(String, String)) -> Result<b
 /// remotes after a failing one are not probed; the caller doesn't need a full
 /// scan once it can no longer trust the scan's completeness.
 fn find_remote_matching_url(
-    root: &Path,
+    root: &(impl crate::workspace::GitAt + ?Sized),
     url: &str,
     exclude: Option<&str>,
 ) -> Result<Option<String>, String> {
@@ -5075,34 +5082,33 @@ fn find_remote_matching_url(
 /// [`crate::project_forks::ensure_fork_remote`]'s match-or-create shape for
 /// the parent/origin case, which (unlike a fork remote) has no natural
 /// per-user distinct name to fall back on.
-fn ensure_remote_for_url(root: &Path, preferred_name: &str, url: &str) -> Result<String, String> {
-    match crate::guardian_merge::git(
-        root,
-        &["config", "--get", &format!("remote.{preferred_name}.url")],
-    ) {
+fn ensure_remote_for_url(
+    root: &(impl crate::workspace::GitAt + ?Sized),
+    preferred_name: &str,
+    url: &str,
+) -> Result<String, String> {
+    match root.git_at(&["config", "--get", &format!("remote.{preferred_name}.url")]) {
         Ok(existing) if existing.trim() == url => return Ok(preferred_name.to_string()),
         Ok(_) => {
             // preferred_name is already taken by something else -- don't
             // clobber a remote this project didn't create; fall back below.
         }
         Err(_) => {
-            return crate::guardian_merge::git(root, &["remote", "add", preferred_name, url])
+            return root
+                .git_at(&["remote", "add", preferred_name, url])
                 .map(|_| preferred_name.to_string());
         }
     }
     let fallback = format!("{preferred_name}-project");
-    match crate::guardian_merge::git(
-        root,
-        &["config", "--get", &format!("remote.{fallback}.url")],
-    ) {
+    match root.git_at(&["config", "--get", &format!("remote.{fallback}.url")]) {
         Ok(existing) if existing.trim() == url => Ok(fallback),
         Ok(_) => Err(format!(
             "both \"{preferred_name}\" and \"{fallback}\" are already configured as different \
              remotes; could not add a remote for \"{url}\""
         )),
-        Err(_) => {
-            crate::guardian_merge::git(root, &["remote", "add", &fallback, url]).map(|_| fallback)
-        }
+        Err(_) => root
+            .git_at(&["remote", "add", &fallback, url])
+            .map(|_| fallback),
     }
 }
 
@@ -5140,7 +5146,7 @@ fn ensure_remote_for_url(root: &Path, preferred_name: &str, url: &str) -> Result
 /// falls through to it rather than being treated as a confirmed non-match.
 #[must_use]
 pub(crate) fn resolve_parent_remote_name(
-    root: &Path,
+    root: &(impl crate::workspace::GitAt + ?Sized),
     base_branch: &str,
     cfg: &ForgeConfig,
     clone_url: Option<&str>,
@@ -5668,9 +5674,12 @@ pub(crate) fn default_remote_name(cfg: &ForgeConfig) -> String {
 /// remote. Returns `None` when `base_branch` has no `/` at all, or its
 /// leading segment isn't a real remote (so it's read as a literal branch name
 /// that happens to contain a slash, e.g. a personal `colin/main`).
-fn remote_from_base_branch(root: &Path, base_branch: &str) -> Option<String> {
+fn remote_from_base_branch(
+    root: &(impl crate::workspace::GitAt + ?Sized),
+    base_branch: &str,
+) -> Option<String> {
     let (candidate, _) = base_branch.split_once('/')?;
-    crate::guardian_merge::git(root, &["remote", "get-url", candidate]).ok()?;
+    root.git_at(&["remote", "get-url", candidate]).ok()?;
     Some(candidate.to_string())
 }
 
@@ -5684,20 +5693,21 @@ fn remote_from_base_branch(root: &Path, base_branch: &str) -> Option<String> {
 /// An empty `base_branch` returns `None` without shelling out: `format!`ing it
 /// into the rev-parse argument would leave a bare `@{u}`, i.e. exactly the
 /// current-checkout reading this function exists to avoid.
-fn remote_from_branch_upstream(root: &Path, base_branch: &str) -> Option<String> {
+fn remote_from_branch_upstream(
+    root: &(impl crate::workspace::GitAt + ?Sized),
+    base_branch: &str,
+) -> Option<String> {
     if base_branch.trim().is_empty() {
         return None;
     }
-    let upstream = crate::guardian_merge::git(
-        root,
-        &[
+    let upstream = root
+        .git_at(&[
             "rev-parse",
             "--abbrev-ref",
             "--symbolic-full-name",
             &format!("{base_branch}@{{u}}"),
-        ],
-    )
-    .ok()?;
+        ])
+        .ok()?;
     let upstream = upstream.trim();
     // At least one real git version/config returns `remotes/<remote>/<branch>`
     // here instead of the documented `<remote>/<branch>` for `--abbrev-ref`
@@ -5722,7 +5732,7 @@ fn remote_from_branch_upstream(root: &Path, base_branch: &str) -> Option<String>
 /// [`ForgeClient::require_token`]). Logs the resolved kind/repo/api_base (or
 /// the failure reason) via `rlog!`.
 pub fn resolve_remote(
-    root: &Path,
+    root: &(impl crate::workspace::GitAt + ?Sized),
     base_branch: &str,
     cfg: &ForgeConfig,
 ) -> Result<ForgeClient, String> {
@@ -5736,7 +5746,7 @@ pub fn resolve_remote(
 /// fork-excluded remote (see [`resolve_remote_name_excluding`]), or a
 /// registered fork's own `remote_name`.
 pub fn resolve_remote_for(
-    root: &Path,
+    root: &(impl crate::workspace::GitAt + ?Sized),
     remote_name: &str,
     cfg: &ForgeConfig,
 ) -> Result<ForgeClient, String> {
@@ -5824,7 +5834,7 @@ pub(crate) fn stored_token_for_identity(
 /// or network call runs under it.
 pub(crate) fn resolve_remote_with_store(
     store: &crate::store_lock::StoreHandle,
-    root: &Path,
+    root: &(impl crate::workspace::GitAt + ?Sized),
     remote_name: &str,
     cfg: &ForgeConfig,
     identity: Option<&str>,
@@ -5852,7 +5862,7 @@ pub(crate) fn resolve_remote_with_store(
 /// since the REST API and git-push authentication are entirely separate
 /// paths.
 pub fn resolve_remote_for_as(
-    root: &Path,
+    root: &(impl crate::workspace::GitAt + ?Sized),
     remote_name: &str,
     cfg: &ForgeConfig,
     token_override: Option<&str>,
@@ -5868,7 +5878,7 @@ pub fn resolve_remote_for_as(
 /// `lookup_user` is only the name reported by [`ForgeClient::require_token`]'s
 /// error; `lookup` supplies the stored token for the remote's host.
 fn resolve_remote_for_logged(
-    root: &Path,
+    root: &(impl crate::workspace::GitAt + ?Sized),
     remote_name: &str,
     cfg: &ForgeConfig,
     lookup_user: Option<&str>,
@@ -5891,13 +5901,14 @@ fn resolve_remote_for_logged(
 }
 
 fn resolve_remote_for_inner(
-    root: &Path,
+    root: &(impl crate::workspace::GitAt + ?Sized),
     remote_name: &str,
     cfg: &ForgeConfig,
     lookup_user: Option<&str>,
     lookup: &dyn Fn(&str) -> Option<StoredToken>,
 ) -> Result<ForgeClient, String> {
-    let url = crate::guardian_merge::git(root, &["remote", "get-url", remote_name])
+    let url = root
+        .git_at(&["remote", "get-url", remote_name])
         .map_err(|e| format!("could not read remote '{remote_name}': {e}"))?;
     let (host, path) = parse_remote_url(url.trim())
         .ok_or_else(|| format!("could not parse remote url: {}", url.trim()))?;
@@ -7749,7 +7760,7 @@ mod tests {
         dir
     }
 
-    fn g(root: &Path, args: &[&str]) -> String {
+    fn g(root: &std::path::Path, args: &[&str]) -> String {
         let out = std::process::Command::new("git")
             .args(args)
             .current_dir(root)

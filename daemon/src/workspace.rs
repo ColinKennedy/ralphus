@@ -51,6 +51,10 @@ pub struct Workspace {
     /// combined checkout, ...) are translated through it in [`Self::at`] and
     /// when resolving an absolute path. `None` everywhere else.
     path_map: Option<Arc<(PathBuf, PathBuf)>>,
+    /// The path as the daemon names it, before any `path_map` translation:
+    /// the registered project path config and project lookups are keyed by.
+    /// Equal to `root` for every workspace that was not translated.
+    local_root: PathBuf,
 }
 
 /// One remote-produced branch of a review: the daemon-local project root it
@@ -227,8 +231,10 @@ impl Workspace {
     /// overhead — see the module doc.
     #[must_use]
     pub fn local(root: impl Into<PathBuf>) -> Self {
+        let root = root.into();
         Self {
-            root: root.into(),
+            local_root: root.clone(),
+            root,
             machine: None,
             store: None,
             path_map: None,
@@ -245,8 +251,10 @@ impl Workspace {
                 !m.is_empty() && !m.eq_ignore_ascii_case(ralphus_core::schema::LOCAL_MACHINE)
             })
             .map(str::to_string);
+        let root = root.into();
         Self {
-            root: root.into(),
+            local_root: root.clone(),
+            root,
             machine,
             store: None,
             path_map: None,
@@ -360,12 +368,22 @@ impl Workspace {
     /// the derived directory is on the same host by construction.
     #[must_use]
     pub fn at(&self, path: impl Into<PathBuf>) -> Self {
+        let local_root = path.into();
         Self {
-            root: self.map_path(&path.into()),
+            root: self.map_path(&local_root),
             machine: self.machine.clone(),
             store: self.store.clone(),
             path_map: self.path_map.clone(),
+            local_root,
         }
+    }
+
+    /// The path the daemon knows this workspace by -- the registered project
+    /// path config and project lookups are keyed by -- as opposed to
+    /// [`Self::root`], where it is on its machine.
+    #[must_use]
+    pub fn local_root(&self) -> &Path {
+        &self.local_root
     }
 
     /// Translate a daemon-local path under this review's project root to the
@@ -857,6 +875,55 @@ fn is_absolute_anywhere(path: &Path) -> bool {
             && (bytes[2] == b'/' || bytes[2] == b'\\'))
 }
 
+/// Somewhere `git` can run: a directory on the daemon's host, or a
+/// [`Workspace`] on whatever machine it names.
+///
+/// Lets a helper that only *runs git* (resolving a remote name, reading a
+/// remote's URL) take either, so local callers keep passing a path while a
+/// remote review's callers pass its workspace and the commands run there.
+pub trait GitAt {
+    /// Run `git` with `args` here, returning stdout.
+    ///
+    /// # Errors
+    /// The command's failure message.
+    fn git_at(&self, args: &[&str]) -> Result<String, String>;
+
+    /// The path the daemon knows this place by, for config, project and
+    /// cache lookups keyed by the registered project path -- never for
+    /// running anything.
+    fn local_path(&self) -> &Path;
+}
+
+impl GitAt for Path {
+    fn git_at(&self, args: &[&str]) -> Result<String, String> {
+        crate::guardian_merge::git(self, args)
+    }
+
+    fn local_path(&self) -> &Path {
+        self
+    }
+}
+
+impl GitAt for PathBuf {
+    fn git_at(&self, args: &[&str]) -> Result<String, String> {
+        crate::guardian_merge::git(self, args)
+    }
+
+    fn local_path(&self) -> &Path {
+        self
+    }
+}
+
+impl GitAt for Workspace {
+    fn git_at(&self, args: &[&str]) -> Result<String, String> {
+        self.git(args)
+    }
+
+    fn local_path(&self) -> &Path {
+        self.local_root()
+    }
+}
+
 /// The environment every remote `git` invocation runs under, so nothing it
 /// does can wait on an interactive editor.
 fn non_interactive_git_env() -> std::collections::BTreeMap<String, String> {
@@ -1243,6 +1310,45 @@ echo {json}
         let err = ws.git(&["status"]).expect_err("non-zero exit must fail");
         assert!(err.contains("git status"), "must name the command: {err}");
         assert!(err.contains("exit 1"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_remote_reviews_forge_remote_is_resolved_on_its_machine() {
+        // PR routing reads remote names from the review's repository. For a
+        // remote review that is the machine's, whose git answers here with an
+        // upstream on a remote the daemon's own checkout does not have.
+        let dir = std::env::temp_dir().join(format!("ral-a1-remote-{}", std::process::id()));
+        let script = write_script(
+            &dir,
+            r#"{"ok":true,"protocol_version":1,"exit_code":0,"stdout":"machine-remote/main"}"#,
+        );
+        let store = Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
+        store
+            .lock()
+            .register_machine_provider(
+                "ib",
+                "",
+                &script.to_string_lossy(),
+                &[],
+                crate::machines::PROTOCOL_VERSION,
+                false,
+            )
+            .unwrap();
+        let ws = Workspace::on("/srv/repo", Some("ib:A")).with_store(store);
+
+        let remote = crate::forge::resolve_parent_remote_name(
+            &ws,
+            "main",
+            &crate::config::ForgeConfig::default(),
+            None,
+            None,
+        );
+
+        assert_eq!(remote, "machine-remote");
+        assert_eq!(GitAt::local_path(&ws), Path::new("/srv/repo"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

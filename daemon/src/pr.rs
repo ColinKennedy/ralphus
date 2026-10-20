@@ -48,7 +48,7 @@ use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 
 use crate::guardian::{BranchView, GuardianView, MergeStatus};
-use crate::guardian_merge::{self, git};
+use crate::guardian_merge;
 use crate::runner::{Runner, RunnerSpec};
 use crate::server::Reply;
 
@@ -3071,7 +3071,9 @@ fn pr_writer_spec(
         // here) -- without it a profile-backed agent authenticates against the
         // wrong endpoint, or not at all.
         env_overrides: resolved.env,
-        machine: None,
+        // The writer reads the branch's worktree, which lives on the review's
+        // machine.
+        machine: guardian.machine.clone(),
         tool_arg_truncate_chars: None,
         thrash_max_compactions: None,
         thrash_min_turn_gap: None,
@@ -3776,7 +3778,7 @@ impl PrRepoRouting {
 /// pass would flag as drifted again).
 fn forge_parent_remote_name(
     store: &crate::store_lock::StoreHandle,
-    root: &Path,
+    root: &(impl crate::workspace::GitAt + ?Sized),
     base_branch: &str,
     forge_cfg: &crate::config::ForgeConfig,
     owner: Option<&str>,
@@ -3797,7 +3799,7 @@ fn forge_parent_remote_name(
 /// PR.
 pub fn forge_client_for_pr(
     store: &crate::store_lock::StoreHandle,
-    root: &Path,
+    root: &(impl crate::workspace::GitAt + ?Sized),
     base_branch: &str,
     forge_cfg: &crate::config::ForgeConfig,
     repo: &str,
@@ -3816,7 +3818,7 @@ pub fn forge_client_for_pr(
 /// stack members -- so a stack number must never be sent to the parent.
 pub fn forge_client_for_stack(
     store: &crate::store_lock::StoreHandle,
-    root: &Path,
+    root: &(impl crate::workspace::GitAt + ?Sized),
     base_branch: &str,
     forge_cfg: &crate::config::ForgeConfig,
     owner: Option<&str>,
@@ -3880,13 +3882,13 @@ pub(crate) fn project_clone_url_for_root(
 /// stored forge tokens clear the memo ([`invalidate_pr_routing_cache`]).
 fn resolve_pr_repo_routing(
     store: &crate::store_lock::StoreHandle,
-    root: &Path,
+    root: &(impl crate::workspace::GitAt + ?Sized),
     base_branch: &str,
     forge_cfg: &crate::config::ForgeConfig,
     owner: Option<&str>,
 ) -> PrRepoRouting {
     let key = (
-        root.to_path_buf(),
+        root.local_path().to_path_buf(),
         base_branch.to_string(),
         format!("{forge_cfg:?}"),
         owner.map(str::to_string),
@@ -3933,14 +3935,14 @@ pub(crate) fn invalidate_pr_routing_cache() {
 
 fn resolve_pr_repo_routing_uncached(
     store: &crate::store_lock::StoreHandle,
-    root: &Path,
+    root: &(impl crate::workspace::GitAt + ?Sized),
     base_branch: &str,
     forge_cfg: &crate::config::ForgeConfig,
     owner: Option<&str>,
 ) -> PrRepoRouting {
     let project_name = store
         .lock()
-        .project_name_for_path(root.to_str().unwrap_or_default());
+        .project_name_for_path(root.local_path().to_str().unwrap_or_default());
     let fork = project_name.as_deref().and_then(|p| {
         owner
             .filter(|o| !o.is_empty())
@@ -6531,6 +6533,7 @@ pub fn verify_and_repair_stack_ancestry(
         return false;
     }
     let root = PathBuf::from(&guardian.git_root);
+    let review_ws = crate::workspace::Workspace::for_guardian(store, &guardian.id, &root);
 
     let prs = store
         .lock()
@@ -6560,11 +6563,9 @@ pub fn verify_and_repair_stack_ancestry(
         let Ok(Some(succ_tip)) = fetch_remote_pr_tip(store, &succ_pr.id) else {
             continue;
         };
-        if git(
-            &root,
-            &["merge-base", "--is-ancestor", &pred_tip, &succ_tip],
-        )
-        .is_ok()
+        if review_ws
+            .git(&["merge-base", "--is-ancestor", &pred_tip, &succ_tip])
+            .is_ok()
         {
             continue; // this link holds
         }
@@ -7521,19 +7522,20 @@ fn refresh_pr_forge_cache_for_guardian(
     // fetch consulted this, so a rate-limited forge still got a full round of
     // git fetches and base-drift calls every cycle -- the retry storm the
     // backoff exists to prevent.
-    let backed_off = {
-        let root = PathBuf::from(&guardian.git_root);
-        let forge_cfg = crate::config::resolve_forge(&root);
-        resolve_pr_repo_routing(
-            store,
-            &root,
-            &guardian.base_branch,
-            &forge_cfg,
-            guardian.owner.as_deref(),
-        )
-        .client_for("")
-        .is_some_and(is_backed_off)
-    };
+    let root = PathBuf::from(&guardian.git_root);
+    let forge_cfg = crate::config::resolve_forge(&root);
+    // Every git step below (remote lookups, the batched fetch, rev-parse,
+    // ancestry) runs where the review's repository lives.
+    let review_ws = crate::workspace::Workspace::for_guardian(store, &guardian.id, &root);
+    let backed_off = resolve_pr_repo_routing(
+        store,
+        &review_ws,
+        &guardian.base_branch,
+        &forge_cfg,
+        guardian.owner.as_deref(),
+    )
+    .client_for("")
+    .is_some_and(is_backed_off);
     if backed_off {
         // ralphus[ignore-rlog-pair]: rate-limit path records the structured outcome; this routine only skips a poll
         crate::rlog!(
@@ -7552,11 +7554,9 @@ fn refresh_pr_forge_cache_for_guardian(
     if prs.is_empty() || (!include_drift && !prs.iter().any(|pr| comment_poll_due(&pr.id))) {
         return;
     }
-    let root = PathBuf::from(&guardian.git_root);
-    let forge_cfg = crate::config::resolve_forge(&root);
     let routing = resolve_pr_repo_routing(
         store,
-        &root,
+        &review_ws,
         &guardian.base_branch,
         &forge_cfg,
         guardian.owner.as_deref(),
@@ -7609,7 +7609,7 @@ fn refresh_pr_forge_cache_for_guardian(
                     .collect();
                 let mut args: Vec<&str> = vec!["fetch", "--no-write-fetch-head", &remote_name];
                 args.extend(refspecs.iter().map(String::as_str));
-                git(&root, &args).map(|_| ())
+                review_ws.git(&args).map(|_| ())
             });
         prs.iter()
             .zip(guards.iter())
@@ -7631,13 +7631,14 @@ fn refresh_pr_forge_cache_for_guardian(
                     let local_ref = local_ref_for_pr(&guardian, pr);
                     let local_sha = local_ref
                         .as_deref()
-                        .and_then(|r| git(&root, &["rev-parse", r]).ok())
+                        .and_then(|r| review_ws.git(&["rev-parse", r]).ok())
                         .map(|s| s.trim().to_string());
-                    let remote_sha = git(&root, &["rev-parse", &sync_fetch_ref(&pr.id)])
+                    let remote_sha = review_ws
+                        .git(&["rev-parse", &sync_fetch_ref(&pr.id)])
                         .ok()
                         .map(|s| s.trim().to_string());
                     let (pr_ahead, worktree_ahead, in_sync) = classify_sync_drift(
-                        &root,
+                        &review_ws,
                         remote_sha.as_deref(),
                         local_sha.as_deref(),
                         pr.last_pushed_sha.as_deref(),
@@ -10533,8 +10534,11 @@ fn auto_submit_terminal_branches(
     }
     let fork_remote_exclude = fork_routing.as_ref().map(|r| r.fork.remote_name.as_str());
     let clone_url = project_clone_url(store, guardian.project.as_deref());
+    // Remote names and URLs are read where the review's repository lives --
+    // the review's machine for a remote review.
+    let review_ws = crate::workspace::Workspace::for_guardian(store, &guardian.id, &root);
     let parent_remote_name = crate::forge::resolve_parent_remote_name(
-        &root,
+        &review_ws,
         &guardian.base_branch,
         &forge_cfg,
         clone_url.as_deref(),
@@ -10570,14 +10574,16 @@ fn auto_submit_terminal_branches(
         Some(routing) => routing.fork_client.clone(),
         None => crate::forge::resolve_remote_with_store(
             store,
-            &root,
+            &review_ws,
             &parent_remote_name,
             &forge_cfg,
             crate::forge::effective_forge_identity(Some(&poller_user), guardian.owner.as_deref())
                 .as_deref(),
         )?,
     };
-    if fork_routing.is_none() {
+    // A remote review pushes with its machine's own git credentials; the
+    // helper only configures the daemon's checkout.
+    if fork_routing.is_none() && review_ws.is_local() {
         wire_parent_credential_helper(
             store,
             &root,
@@ -11134,8 +11140,11 @@ fn submit_pull_requests_inner(
     // is correct regardless of fork mode; only the push target differs.
     let fork_remote_exclude = fork_routing.as_ref().map(|r| r.fork.remote_name.as_str());
     let clone_url = project_clone_url(store, guardian.project.as_deref());
+    // Remote names and URLs are read where the review's repository lives --
+    // the review's machine for a remote review.
+    let review_ws = crate::workspace::Workspace::for_guardian(store, &guardian.id, &root);
     let parent_remote_name = crate::forge::resolve_parent_remote_name(
-        &root,
+        &review_ws,
         &guardian.base_branch,
         &forge_cfg,
         clone_url.as_deref(),
@@ -11171,14 +11180,16 @@ fn submit_pull_requests_inner(
         Some(routing) => routing.fork_client.clone(),
         None => crate::forge::resolve_remote_with_store(
             store,
-            &root,
+            &review_ws,
             &parent_remote_name,
             &forge_cfg,
             crate::forge::effective_forge_identity(Some(user), guardian.owner.as_deref())
                 .as_deref(),
         )?,
     };
-    if fork_routing.is_none() {
+    // A remote review pushes with its machine's own git credentials; the
+    // helper only configures the daemon's checkout.
+    if fork_routing.is_none() && review_ws.is_local() {
         wire_parent_credential_helper(
             store,
             &root,
@@ -11452,6 +11463,7 @@ fn fetch_pr_branches_skipping_gone<'a>(
 #[cfg(test)]
 mod gone_pr_branch_tests {
     use super::*;
+    use crate::guardian_merge::git;
 
     const MISSING_B: &str = "fatal: couldn't find remote ref b\n";
 
@@ -11739,13 +11751,14 @@ fn pr_log_label(
 /// [`compute_sync_status`]'s prior inline version for the full rationale on
 /// preferring `last_pushed` over raw ancestry.
 fn classify_sync_drift(
-    root: &Path,
+    root: &(impl crate::workspace::GitAt + ?Sized),
     remote_sha: Option<&str>,
     local_sha: Option<&str>,
     last_pushed: Option<&str>,
 ) -> (bool, bool, bool) {
     let is_ancestor = |ancestor: &str, descendant: &str| {
-        git(root, &["merge-base", "--is-ancestor", ancestor, descendant]).is_ok()
+        root.git_at(&["merge-base", "--is-ancestor", ancestor, descendant])
+            .is_ok()
     };
     match (remote_sha, local_sha) {
         (Some(r), Some(l)) if r == l => (false, false, true),
@@ -11779,12 +11792,14 @@ fn fetch_remote_pr_tip(
         .map_err(|e| e.to_string())?;
     let root = PathBuf::from(&guardian.git_root);
     let forge_cfg = crate::config::resolve_forge(&root);
+    // The sync ref lives in the review's repository, on its machine.
+    let review_ws = crate::workspace::Workspace::for_guardian(store, &guardian.id, &root);
     // RAL-338: this PR's branch alias lives on the fork's remote in fork
     // mode, including the root's (its PR is filed against the parent, but
     // its ref still lives on the fork).
     let routing = resolve_pr_repo_routing(
         store,
-        &root,
+        &review_ws,
         &guardian.base_branch,
         &forge_cfg,
         guardian.owner.as_deref(),
@@ -11815,7 +11830,8 @@ fn fetch_remote_pr_tip(
         .get(pr_id)
         .map(|at| now.duration_since(*at));
     if since_last_fetch.is_some() {
-        let local = git(&root, &["rev-parse", "--verify", "--quiet", &dest_ref])
+        let local = review_ws
+            .git(&["rev-parse", "--verify", "--quiet", &dest_ref])
             .ok()
             .map(|s| s.trim().to_string());
         let forge_head = forge_head.as_ref().map(|(age, head)| (*age, head.as_str()));
@@ -11838,16 +11854,14 @@ fn fetch_remote_pr_tip(
     // non-fast-forward from whatever this ref last pointed at, which a
     // plain refspec would otherwise refuse to write.
     let refspec = format!("+{}:{dest_ref}", pr.branch_alias);
-    let fetched = git(
-        &root,
-        &["fetch", "--no-write-fetch-head", &remote_name, &refspec],
-    )
-    .ok();
+    let fetched = review_ws
+        .git(&["fetch", "--no-write-fetch-head", &remote_name, &refspec])
+        .ok();
     if fetched.is_some() {
         last_pr_fetches().lock().insert(pr_id.to_string(), now);
     }
     Ok(fetched
-        .and_then(|_| git(&root, &["rev-parse", &dest_ref]).ok())
+        .and_then(|_| review_ws.git(&["rev-parse", &dest_ref]).ok())
         .map(|s| s.trim().to_string()))
 }
 
@@ -11868,13 +11882,14 @@ fn fetch_remote_pr_tip(
 /// neither side matches the fork point (never synced yet, or both sides
 /// changed independently since) -- that's a true two-sided divergence.
 fn classify_pr_sync(
-    root: &Path,
+    root: &(impl crate::workspace::GitAt + ?Sized),
     remote_sha: Option<&str>,
     local_sha: Option<&str>,
     last_pushed: Option<&str>,
 ) -> (bool, bool, bool) {
     let is_ancestor = |ancestor: &str, descendant: &str| {
-        git(root, &["merge-base", "--is-ancestor", ancestor, descendant]).is_ok()
+        root.git_at(&["merge-base", "--is-ancestor", ancestor, descendant])
+            .is_ok()
     };
     match (remote_sha, local_sha) {
         (Some(r), Some(l)) if r == l => (false, false, true),
@@ -11992,12 +12007,16 @@ fn compute_sync_status_inner(
         .with_read_snapshot(|conn| crate::store::Store::get_guardian_conn(conn, &pr.guardian_id))
         .map_err(|e| e.to_string())?;
     let _remote_scope = crate::machine_strict::enter(guardian.machine.as_deref());
-    let root = PathBuf::from(&guardian.git_root);
+    let review_ws = crate::workspace::Workspace::for_guardian(
+        store,
+        &guardian.id,
+        PathBuf::from(&guardian.git_root),
+    );
 
     let local_ref = local_ref_for_pr(&guardian, &pr);
     let local_sha = local_ref
         .as_deref()
-        .and_then(|r| git(&root, &["rev-parse", r]).ok())
+        .and_then(|r| review_ws.git(&["rev-parse", r]).ok())
         .map(|s| s.trim().to_string());
     let cached_remote = match remote_tip {
         RemoteTip::Live => None,
@@ -12009,7 +12028,7 @@ fn compute_sync_status_inner(
     };
 
     let (pr_ahead, worktree_ahead, in_sync) = classify_pr_sync(
-        &root,
+        &review_ws,
         remote_sha.as_deref(),
         local_sha.as_deref(),
         pr.last_pushed_sha.as_deref(),
@@ -12270,7 +12289,11 @@ pub fn sync_remote_pr_commits(
                 crate::store::Store::get_guardian_conn(conn, &pr.guardian_id)
             })
             .map_err(|e| e.to_string())?;
-        let root = PathBuf::from(&guardian.git_root);
+        let review_ws = crate::workspace::Workspace::for_guardian(
+            store,
+            &guardian.id,
+            PathBuf::from(&guardian.git_root),
+        );
         let local_ref = if let Some(bid) = &pr.branch_id {
             guardian
                 .branches
@@ -12282,7 +12305,7 @@ pub fn sync_remote_pr_commits(
         };
         let local_sha = local_ref
             .as_deref()
-            .and_then(|r| git(&root, &["rev-parse", r]).ok())
+            .and_then(|r| review_ws.git(&["rev-parse", r]).ok())
             .map(|s| s.trim().to_string());
         // A review branch whose ref is gone (its worktrees were purged for a
         // rebuild, as after a branch left the review) has no worktree to pull
@@ -12292,7 +12315,7 @@ pub fn sync_remote_pr_commits(
             continue;
         }
         let (pr_ahead, _, _) = classify_pr_sync(
-            &root,
+            &review_ws,
             remote_sha.as_deref(),
             local_sha.as_deref(),
             pr.last_pushed_sha.as_deref(),
@@ -12893,6 +12916,7 @@ mod tests {
     use super::*;
     use crate::guardian::GuardianStatus;
     use crate::guardian::MergeStatus;
+    use crate::guardian_merge::git;
     use crate::mock_forge::{MockForge, MockForgeServer};
     use crate::store::Store;
     use git2::build::CheckoutBuilder;

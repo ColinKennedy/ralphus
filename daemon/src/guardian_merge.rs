@@ -14075,8 +14075,10 @@ fn fetch_branch_for_remote_cell(
         .map(|g| g.base_branch.as_str())
         .unwrap_or_default();
     let clone_url = crate::pr::project_clone_url_for_root(store, root);
+    // The remote is resolved in the repository the branch is fetched into:
+    // the review machine's for a remote review, the daemon's otherwise.
     let remote = crate::forge::resolve_parent_remote_name(
-        root,
+        &Workspace::for_guardian(store, guardian_id, root),
         base_branch,
         &crate::config::resolve_forge(root),
         clone_url.as_deref(),
