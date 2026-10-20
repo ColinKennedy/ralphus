@@ -777,6 +777,33 @@ fn resolve_squad_branch(
     })?
 }
 
+/// Whether `machine` names a remote machine rather than the daemon's own host
+/// (unset, blank, or `local`).
+fn is_remote_machine(machine: Option<&str>) -> bool {
+    machine.map(str::trim).is_some_and(|m| {
+        !m.is_empty() && !m.eq_ignore_ascii_case(ralphus_core::schema::LOCAL_MACHINE)
+    })
+}
+
+/// [`resolve_squad_branch`] for a cell on a remote machine: allocate from the
+/// store's claims alone. The daemon's checkout (its worktree list, its
+/// remote-tracking refs) does not describe the machine, and reading it would
+/// be daemon-host work for a remote cell. An `origin/<branch>` base -- the
+/// remote a provider's clone creates -- is a remote-tracking branch and needs
+/// no claim, as locally.
+fn resolve_remote_squad_branch(
+    store: &StoreHandle,
+    project: &ProjectView,
+    base_branch: &str,
+    squad_id: &str,
+) -> Result<String, String> {
+    if base_branch.starts_with("origin/") {
+        return Ok(base_branch.to_string());
+    }
+    let guard = store.lock();
+    resolve_squad_branch_claim(&guard, project, base_branch, squad_id, &HashMap::new())
+}
+
 /// [`resolve_squad_branch`]'s claim decision.
 ///
 /// Takes a live `&Store` rather than the handle **on purpose**: this reads every
@@ -2244,14 +2271,19 @@ impl ProjectStartupAdapter for GitProjectStartupAdapter {
         // below needs again) is queried at most once per project root for
         // this whole submission, via `ctx.on_disk_worktrees` -- not once per
         // branch -- see `PlaceholderContext::on_disk_worktrees`'s doc comment.
+        // A remote cell's worktree lives on its machine, so the daemon's own
+        // checkout says nothing about which branches are taken there.
+        let remote = is_remote_machine(ctx.machine);
         let root_key = Path::new(&project.path).to_path_buf();
-        if !ctx.on_disk_worktrees.borrow().contains_key(&root_key) {
+        if !remote && !ctx.on_disk_worktrees.borrow().contains_key(&root_key) {
             let snapshot = existing_and_reserved_worktree_branches(&root_key);
             ctx.on_disk_worktrees
                 .borrow_mut()
                 .insert(root_key.clone(), snapshot);
         }
-        let branch = {
+        let branch = if remote {
+            resolve_remote_squad_branch(store, project, branch, ctx.squad_id)
+        } else {
             let all = ctx.on_disk_worktrees.borrow();
             let on_disk = all.get(&root_key).expect("populated just above");
             resolve_squad_branch(store, project, branch, ctx.squad_id, on_disk)
@@ -2264,7 +2296,7 @@ impl ProjectStartupAdapter for GitProjectStartupAdapter {
         })?;
         let branch = branch.as_str();
         let resolved = match ctx.machine {
-            Some(machine) if !machine.trim().is_empty() => provision_remote_with_targets(
+            Some(machine) if remote => provision_remote_with_targets(
                 store,
                 machine,
                 project,
@@ -3298,6 +3330,11 @@ pub fn collect_remote_upstream_prefetch_targets(
         let Some(cwd) = cell.cwd.as_deref() else {
             continue;
         };
+        // A remote cell's machine clones and fetches the project itself; its
+        // upstream is never fetched into the daemon's checkout.
+        if is_remote_machine(cell.machine.as_deref()) {
+            continue;
+        }
         let mut placeholders = Vec::new();
         if classify_placeholder(cwd).ok().flatten().is_some() {
             placeholders.push(cwd);
@@ -5499,6 +5536,73 @@ mod tests {
             !worktree_dir(&repo, "feat-r").exists(),
             "a remote cell must not materialize a local worktree"
         );
+    }
+
+    #[test]
+    fn a_remote_cells_branch_ignores_worktrees_in_the_daemons_checkout() {
+        // The daemon's checkout says nothing about which branches are taken
+        // on the cell's machine: a local worktree on `feat-r` must not push a
+        // remote cell onto `feat-r-2`.
+        let repo = init_repo("remote-branch-alloc");
+        let local_wt = repo.parent().unwrap().join("remote-branch-alloc-local-wt");
+        crate::guardian_merge::git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "feat-r",
+                &local_wt.to_string_lossy(),
+            ],
+        )
+        .expect("local worktree on feat-r");
+        let script = fake_provisioner(
+            "remote-branch-alloc-p",
+            r#"{"ok":true,"protocol_version":1,"workspace":"/remote/wt/feat-r"}"#,
+        );
+        let store = std::sync::Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
+        store
+            .lock()
+            .register_project_with_clone_url_ex(
+                "proj",
+                "",
+                &repo.to_string_lossy(),
+                "git",
+                Some(&repo.to_string_lossy()),
+                None,
+            )
+            .unwrap();
+        store
+            .lock()
+            .register_machine_provider(
+                "ib",
+                "",
+                &script.to_string_lossy(),
+                &[],
+                crate::machines::PROTOCOL_VERSION,
+                false,
+            )
+            .unwrap();
+        let mut cells = vec![cell_row_on(
+            0,
+            0,
+            "s0",
+            Some("ralphus:new-worktree/feat-r?upstream=main"),
+            Some("ib:A"),
+        )];
+        let tasks = vec![task_row(0, Some("proj"))];
+        let targets = targets_map(&[target_for("ib:A", "/srv/ralphus")]);
+        resolve_placeholders_with_targets(&store, "squad-1", &mut cells, &tasks, &targets)
+            .expect("remote provision");
+
+        let claims = store.lock().task_worktree_claims("proj", "feat-r").unwrap();
+        assert_eq!(
+            claims.iter().map(|c| c.branch.as_str()).collect::<Vec<_>>(),
+            vec!["feat-r"]
+        );
+        let _ = std::fs::remove_dir_all(&local_wt);
     }
 
     #[test]
