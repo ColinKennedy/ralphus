@@ -3775,6 +3775,23 @@ fn run_cell_worker(
             return;
         }
     }
+    // RAL-615 on a remote machine: the worktree was provisioned there at
+    // submit, so its initialization commands run there now, before the cell.
+    if let (Some(machine), Some(cwd)) = (remote_machine(row.machine.as_deref()), row.cwd.as_deref())
+    {
+        if let Err(message) =
+            crate::worktrees::initialize_remote_worktree(store, squad_id, cwd, Some(machine))
+        {
+            fail_cell_for_worktree(store, squad_id, row, &message);
+            let mut prog = progress.lock().expect("progress mutex poisoned");
+            prog.status[i] = CellState::Failed;
+            prog.failed.insert(row.task_idx);
+            return;
+        }
+        if cancel.is_cancelled() {
+            return;
+        }
+    }
     // Acquire a global slot; released when `_permit` drops at function end.
     // RAL-280: ranked, not plain `acquire()` — cells that unblock a Review's
     // rebase jump ahead of other ready cells contending for the same freed slot.

@@ -1327,6 +1327,44 @@ echo {json}
     }
 
     #[test]
+    fn worktree_initialization_runs_on_a_remote_cells_machine() {
+        let dir = std::env::temp_dir().join(format!("ral-d6-init-{}", std::process::id()));
+        let script = write_script(
+            &dir,
+            r#"{"ok":true,"protocol_version":1,"exit_code":0,"stdout":"installed"}"#,
+        );
+        let store = Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
+        store
+            .lock()
+            .register_machine_provider(
+                "ib",
+                "",
+                &script.to_string_lossy(),
+                &[],
+                crate::machines::PROTOCOL_VERSION,
+                false,
+            )
+            .unwrap();
+        let ws = Workspace::on("/srv/wt", Some("ib:A")).with_store(store);
+        let events = Arc::new(parking_lot::Mutex::new(0_usize));
+        let seen = Arc::clone(&events);
+        let spec = crate::worktree_init::InitSpec {
+            commands: vec!["npm ci".to_string()],
+            timeout: std::time::Duration::from_secs(60),
+            env: std::collections::BTreeMap::new(),
+            rerun_existing: true,
+            recorder: Arc::new(move |_| *seen.lock() += 1),
+        };
+        let outcome = crate::worktree_init::run_in(&ws, &spec).expect("init succeeds");
+        assert!(outcome.ok);
+        assert!(outcome.output.contains("installed"), "{outcome:?}");
+        assert_eq!(*events.lock(), 2, "started + finished");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn a_remote_branchs_emptiness_is_judged_on_its_machine() {
         // The daemon has no such repository; only the machine can answer.
         let dir = std::env::temp_dir().join(format!("ral-b3-empty-{}", std::process::id()));

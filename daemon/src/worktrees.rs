@@ -3580,6 +3580,40 @@ pub(crate) fn ensure_claimed_worktree(
 /// RAL-615: the initialization the cells bound to `wt` carry, as a spec whose
 /// recorder persists each run's outcome on those cells and logs it to
 /// Cartographer. `None` when no cell sharing the worktree has a command.
+/// One lock per remote worktree, so cells sharing it initialize it once.
+static REMOTE_INIT: LazyLock<parking_lot::Mutex<HashMap<String, Arc<parking_lot::Mutex<()>>>>> =
+    LazyLock::new(|| parking_lot::Mutex::new(HashMap::new()));
+
+/// Run a remote cell's worktree `initialization_commands` on its machine when
+/// they are still due (never run, or failed/edited since), before the cell
+/// starts. A remote worktree is provisioned at submit rather than through the
+/// claimed-worktree path that initializes a local one, so this is its
+/// counterpart. `Ok` when there is nothing to run.
+///
+/// # Errors
+/// The initialization failure message ([`crate::worktree_init::FAILURE_PREFIX`]).
+pub(crate) fn initialize_remote_worktree(
+    store: &StoreHandle,
+    squad_id: &str,
+    cwd: &str,
+    machine: Option<&str>,
+) -> Result<(), String> {
+    let lock = REMOTE_INIT
+        .lock()
+        .entry(cwd.to_string())
+        .or_default()
+        .clone();
+    let _initializing = lock.lock();
+    let Some(spec) = init_spec_for_worktree(store, squad_id, Path::new(cwd)) else {
+        return Ok(());
+    };
+    if !spec.rerun_existing {
+        return Ok(());
+    }
+    let ws = crate::workspace::Workspace::on(cwd, machine).with_store(Arc::clone(store));
+    crate::worktree_init::run_in(&ws, &spec).map(|_| ())
+}
+
 fn init_spec_for_worktree(
     store: &StoreHandle,
     squad_id: &str,

@@ -109,10 +109,41 @@ pub(crate) fn unregister(root: &Path, branch: &str) {
 /// Run `spec`'s commands in `wt` and report through the recorder. `Err` is the
 /// human-readable failure (command, exit status, trimmed output).
 pub(crate) fn run(wt: &Path, spec: &InitSpec) -> Result<InitOutcome, String> {
-    (spec.recorder)(&InitEvent::Started);
-    let started = Instant::now();
     let cwd = wt.to_string_lossy().into_owned();
     let cancel = crate::cancel::CancelToken::never();
+    run_with(spec, |command, remaining| {
+        crate::proof::run_command_proof_capture_with_timeout(
+            &cwd,
+            command,
+            &opentelemetry::Context::new(),
+            &spec.env,
+            &cancel,
+            Some(remaining),
+        )
+    })
+}
+
+/// [`run`] in a worktree on another machine, through its workspace. A remote
+/// command cannot be given its own timeout, so the budget is only checked
+/// between commands there.
+pub(crate) fn run_in(
+    ws: &crate::workspace::Workspace,
+    spec: &InitSpec,
+) -> Result<InitOutcome, String> {
+    let cancel = crate::cancel::CancelToken::never();
+    run_with(spec, |command, _remaining| {
+        ws.run_command_with_env(command, &spec.env, &cancel)
+    })
+}
+
+/// The shared body of [`run`] and [`run_in`]: `exec` runs one command with
+/// the time left in the budget and reports `(succeeded, output)`.
+fn run_with(
+    spec: &InitSpec,
+    mut exec: impl FnMut(&str, Duration) -> (bool, String),
+) -> Result<InitOutcome, String> {
+    (spec.recorder)(&InitEvent::Started);
+    let started = Instant::now();
     let mut output = String::new();
     let mut failure: Option<(String, String)> = None;
     for command in &spec.commands {
@@ -121,14 +152,7 @@ pub(crate) fn run(wt: &Path, spec: &InitSpec) -> Result<InitOutcome, String> {
             failure = Some((command.clone(), "timeout".to_string()));
             break;
         }
-        let (ok, out) = crate::proof::run_command_proof_capture_with_timeout(
-            &cwd,
-            command,
-            &opentelemetry::Context::new(),
-            &spec.env,
-            &cancel,
-            Some(spec.timeout - elapsed),
-        );
+        let (ok, out) = exec(command, spec.timeout - elapsed);
         if !out.trim().is_empty() {
             output.push_str(out.trim_end());
             output.push('\n');
