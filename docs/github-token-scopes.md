@@ -50,11 +50,18 @@ would fail. Use `repo` either way.
 
 ### Why `workflow`
 
-GitHub rejects any push that adds or changes a file under
-`.github/workflows/` unless the token has `workflow`. Agents routinely touch CI
-files, so without it a review branch's push fails partway through the stack.
+ralphus pushes a review's branches to GitHub over HTTPS with the user token.
+GitHub rejects any push containing a commit that adds, edits or deletes a file
+under `.github/workflows/` unless the token has `workflow` — `repo` alone
+allows pushing everything else, but not that. Agents routinely touch CI files
+(for example, adding a test step to `.github/workflows/ci.yml`), and because a
+review's branches are pushed as a stack, one rejected branch can leave the
+push stopped partway through.
+
 If you are certain no ralphus task will ever edit workflow files you can omit
-it, but the failure is a confusing push rejection, so it is recommended.
+it, but you only find out when a push is rejected, so it is recommended.
+
+A poll-pool token never pushes, so it never needs `workflow`.
 
 ## Poll-pool token
 
