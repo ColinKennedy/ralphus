@@ -83,8 +83,8 @@ pub fn lock_path(project_dir: &str) -> String {
 
 /// The identity metadata file written alongside a project's clone --
 /// human-auditable record of what a directory represents. Not itself the
-/// authoritative identity check (the provider trusts `git remote get-url
-/// origin` on the actual clone for that, since it can't be stale the way a
+/// authoritative identity check (the provider trusts the clone's stored
+/// `remote.origin.url` for that, since it can't be stale the way a
 /// separate file theoretically could), but useful for a human who SSHes in
 /// to inspect an unfamiliar directory under `remote_root`. Written by a
 /// plain POSIX `printf` in `crate::provision`, not a real JSON encoder --
