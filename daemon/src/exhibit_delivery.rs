@@ -13,7 +13,9 @@
 use std::path::{Path, PathBuf};
 
 use crate::exhibit_media::{Prepared, Transcoder};
-use crate::exhibits::{ExhibitFill, ExhibitKind, ExhibitSettings, ExhibitSlot, SlotKey, SlotReport};
+use crate::exhibits::{
+    ExhibitFill, ExhibitKind, ExhibitSettings, ExhibitSlot, SlotKey, SlotReport,
+};
 
 /// Longest text an `output` exhibit keeps.
 const MAX_TEXT_CHARS: usize = 4_000;
@@ -54,7 +56,13 @@ fn kept_dir(root: &Path, guardian_id: &str) -> PathBuf {
 fn safe(value: &str) -> String {
     value
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect()
 }
 
@@ -194,8 +202,14 @@ pub fn upload_pending(
         };
         match (fill.url.as_deref(), fill.local_path.as_deref()) {
             (None, Some(local)) => {
-                let uploaded =
-                    upload_one(store, guardian_id, pr_number, client, slot.key, Path::new(local));
+                let uploaded = upload_one(
+                    store,
+                    guardian_id,
+                    pr_number,
+                    client,
+                    slot.key,
+                    Path::new(local),
+                );
                 if uploaded && !fill.stale_upload_ids.is_empty() {
                     delete_stale(store, guardian_id, client, slot.key, &fill.stale_upload_ids);
                 }
@@ -221,7 +235,12 @@ fn upload_one(
     let bytes = match std::fs::read(local) {
         Ok(bytes) => bytes,
         Err(e) => {
-            set_upload_problem(store, guardian_id, key, &format!("the captured file is gone: {e}"));
+            set_upload_problem(
+                store,
+                guardian_id,
+                key,
+                &format!("the captured file is gone: {e}"),
+            );
             return false;
         }
     };
@@ -272,18 +291,32 @@ fn upload_one(
                     serde_json::json!({ "slot": key, "error": message }),
                 );
             drop(guard);
-            set_upload_problem(store, guardian_id, key, &format!("upload failed: {message}"));
+            set_upload_problem(
+                store,
+                guardian_id,
+                key,
+                &format!("upload failed: {message}"),
+            );
             false
         }
     }
 }
 
-fn set_upload_problem(store: &crate::store_lock::StoreHandle, guardian_id: &str, key: SlotKey, reason: &str) {
+fn set_upload_problem(
+    store: &crate::store_lock::StoreHandle,
+    guardian_id: &str,
+    key: SlotKey,
+    reason: &str,
+) {
     let guard = store.lock();
     let Ok(slots) = guard.guardian_exhibit_slots(guardian_id) else {
         return;
     };
-    let Some(mut fill) = slots.into_iter().find(|s| s.key == key).and_then(|s| s.fill) else {
+    let Some(mut fill) = slots
+        .into_iter()
+        .find(|s| s.key == key)
+        .and_then(|s| s.fill)
+    else {
         return;
     };
     fill.missing_reason = Some(reason.to_string());
@@ -346,7 +379,9 @@ pub fn gh_attach_status(host: &str) -> Result<(), String> {
         .output()
         .map_err(|e| format!("could not run gh auth status: {e}"))?;
     if !auth.status.success() {
-        return Err(format!("gh is not logged in to {host} (run `gh auth login`)"));
+        return Err(format!(
+            "gh is not logged in to {host} (run `gh auth login`)"
+        ));
     }
     Ok(())
 }
@@ -362,10 +397,21 @@ fn attachment_urls(text: &str) -> Vec<String> {
 /// Upload `file` with `gh pr edit --attach`, returning its URL. `gh` writes
 /// the file into the description; the description is put back exactly as it
 /// was before, so only the daemon's own rendering decides what it says.
-fn gh_attach(client: &crate::forge::ForgeClient, pr_number: i64, file: &Path) -> Result<String, String> {
+fn gh_attach(
+    client: &crate::forge::ForgeClient,
+    pr_number: i64,
+    file: &Path,
+) -> Result<String, String> {
     let before = client.get_pull_request_description(pr_number)?;
     let out = std::process::Command::new("gh")
-        .args(["pr", "edit", &pr_number.to_string(), "-R", client.repo_label(), "--attach"])
+        .args([
+            "pr",
+            "edit",
+            &pr_number.to_string(),
+            "-R",
+            client.repo_label(),
+            "--attach",
+        ])
         .arg(file)
         .output()
         .map_err(|e| format!("could not run gh: {e}"))?;
@@ -417,9 +463,27 @@ mod tests {
                 0,
                 ExhibitOrigin::Handoff,
                 &[
-                    (ExhibitRequest { kind: ExhibitKind::Gif, describe: "moving".into() }, None),
-                    (ExhibitRequest { kind: ExhibitKind::Output, describe: "cli".into() }, None),
-                    (ExhibitRequest { kind: ExhibitKind::Screenshot, describe: "end".into() }, None),
+                    (
+                        ExhibitRequest {
+                            kind: ExhibitKind::Gif,
+                            describe: "moving".into(),
+                        },
+                        None,
+                    ),
+                    (
+                        ExhibitRequest {
+                            kind: ExhibitKind::Output,
+                            describe: "cli".into(),
+                        },
+                        None,
+                    ),
+                    (
+                        ExhibitRequest {
+                            kind: ExhibitKind::Screenshot,
+                            describe: "end".into(),
+                        },
+                        None,
+                    ),
                 ],
             )
             .unwrap();
@@ -431,8 +495,16 @@ mod tests {
         std::fs::write(dir.join("a.gif"), b"GIF89a").unwrap();
         std::fs::write(dir.join("out.txt"), b"hello").unwrap();
         let reports = vec![
-            SlotReport::File { key: slots[0].key, file: "a.gif".into(), caption: Some("see it".into()) },
-            SlotReport::File { key: slots[1].key, file: "out.txt".into(), caption: None },
+            SlotReport::File {
+                key: slots[0].key,
+                file: "a.gif".into(),
+                caption: Some("see it".into()),
+            },
+            SlotReport::File {
+                key: slots[1].key,
+                file: "out.txt".into(),
+                caption: None,
+            },
         ];
         let summary = record_run_reports(
             &handle,
@@ -445,7 +517,10 @@ mod tests {
             &ExhibitSettings::default(),
             &NoFfmpeg,
         );
-        assert_eq!(summary.delivered, vec!["0.0".to_string(), "0.1".to_string()]);
+        assert_eq!(
+            summary.delivered,
+            vec!["0.0".to_string(), "0.1".to_string()]
+        );
         assert_eq!(summary.missing, vec!["0.2".to_string()]);
         let now = handle.lock().guardian_exhibit_slots(&gid).unwrap();
         let gif = now[0].fill.as_ref().unwrap();
@@ -469,7 +544,13 @@ mod tests {
                 &gid,
                 0,
                 ExhibitOrigin::Handoff,
-                &[(ExhibitRequest { kind: ExhibitKind::Screenshot, describe: "end".into() }, None)],
+                &[(
+                    ExhibitRequest {
+                        kind: ExhibitKind::Screenshot,
+                        describe: "end".into(),
+                    },
+                    None,
+                )],
             )
             .unwrap();
         let handle = std::sync::Arc::new(crate::store_lock::StoreMutex::new(store));
@@ -497,6 +578,11 @@ mod tests {
         let now = handle.lock().guardian_exhibit_slots(&gid).unwrap();
         let fill = now[0].fill.as_ref().unwrap();
         assert!(fill.local_path.is_none());
-        assert!(fill.missing_reason.as_deref().unwrap().contains("not in the run's exhibit directory"));
+        assert!(
+            fill.missing_reason
+                .as_deref()
+                .unwrap()
+                .contains("not in the run's exhibit directory")
+        );
     }
 }

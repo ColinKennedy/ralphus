@@ -358,7 +358,11 @@ impl crate::store::Store {
             .collect();
         let mut keys: Vec<(ExhibitKind, String)> =
             existing.iter().map(|s| s.request.dedupe_key()).collect();
-        let mut next = existing.iter().map(|s| s.key.slot_idx + 1).max().unwrap_or(0);
+        let mut next = existing
+            .iter()
+            .map(|s| s.key.slot_idx + 1)
+            .max()
+            .unwrap_or(0);
         let now = crate::store::now_ms();
         let mut created = Vec::new();
         for (request, why) in requests {
@@ -411,7 +415,11 @@ impl crate::store::Store {
             .and_then(|s| s.fill);
         let mut stale = fill.stale_upload_ids.clone();
         if let Some(prev) = &previous {
-            for id in prev.stale_upload_ids.iter().chain(prev.forge_upload_id.iter()) {
+            for id in prev
+                .stale_upload_ids
+                .iter()
+                .chain(prev.forge_upload_id.iter())
+            {
                 if Some(id) != fill.forge_upload_id.as_ref() && !stale.contains(id) {
                     stale.push(id.clone());
                 }
@@ -535,8 +543,11 @@ pub const DEFAULT_MAX_PER_PR: usize = 6;
 pub const DEFAULT_MAX_VIDEO_SECONDS: u32 = 15;
 
 /// The default order visual kinds are delivered in.
-pub const DEFAULT_KIND_PREFERENCE: [ExhibitKind; 3] =
-    [ExhibitKind::Gif, ExhibitKind::Video, ExhibitKind::Screenshot];
+pub const DEFAULT_KIND_PREFERENCE: [ExhibitKind; 3] = [
+    ExhibitKind::Gif,
+    ExhibitKind::Video,
+    ExhibitKind::Screenshot,
+];
 
 /// A review's resolved exhibit settings.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
@@ -595,13 +606,21 @@ pub fn pr_slots(
             .live_action_branch_ids(&guardian.id, action)
             .unwrap_or_default()
     };
-    Ok(slots_for_pr(&slots, pr.branch_id.as_deref(), &attribution, settings.max_per_pr)
-        .into_iter()
-        .map(|slot| {
-            let label = labels.get(&slot.key.action_idx).cloned().unwrap_or_default();
-            (slot, label)
-        })
-        .collect())
+    Ok(slots_for_pr(
+        &slots,
+        pr.branch_id.as_deref(),
+        &attribution,
+        settings.max_per_pr,
+    )
+    .into_iter()
+    .map(|slot| {
+        let label = labels
+            .get(&slot.key.action_idx)
+            .cloned()
+            .unwrap_or_default();
+        (slot, label)
+    })
+    .collect())
 }
 
 // ---- which slots a PR shows -----------------------------------------------
@@ -694,8 +713,10 @@ pub fn inference_prompt(
              ORDER BY c.squad_id, c.task_idx, c.idx LIMIT 3",
         )
         .and_then(|mut stmt| {
-            stmt.query_map(rusqlite::params![guardian.id, branch_id], |r| r.get::<_, String>(0))?
-                .collect::<std::result::Result<Vec<_>, _>>()
+            stmt.query_map(rusqlite::params![guardian.id, branch_id], |r| {
+                r.get::<_, String>(0)
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()
         })
         .unwrap_or_default();
     let actions: Vec<crate::live_actions::LiveAction> = guard
@@ -709,7 +730,9 @@ pub fn inference_prompt(
             attributed.is_empty() || attributed.iter().any(|b| b == branch_id)
         })
         .collect();
-    let slots = guard.guardian_exhibit_slots(&guardian.id).unwrap_or_default();
+    let slots = guard
+        .guardian_exhibit_slots(&guardian.id)
+        .unwrap_or_default();
     drop(guard);
     let mut out = String::from(
         "\n\nREVIEWER EXHIBITS. A separate agent will run this change live and capture \
@@ -750,6 +773,42 @@ pub fn inference_prompt(
     Some(out)
 }
 
+/// The requests the project's `.ralphus.toml` recipes make for a branch that
+/// changes `changed` (repo-relative paths), plus a warning per unreadable
+/// recipe file. A recipe's `command` travels inside the request's text, so
+/// the live run that owns the slot is told how to capture it.
+#[must_use]
+pub fn recipe_requests(
+    repo_root: &std::path::Path,
+    changed: &[String],
+) -> (Vec<InferredRequest>, Vec<String>) {
+    let refs: Vec<&str> = changed.iter().map(String::as_str).collect();
+    let (matched, warnings) = ralphus_core::exhibit_recipes::recipes_for_changes(repo_root, &refs);
+    let requests = matched
+        .into_iter()
+        .filter_map(|m| {
+            let kind = ExhibitKind::parse(&m.recipe.kind)?;
+            let describe = match &m.recipe.command {
+                Some(command) => format!("{} (capture with: {command})", m.recipe.describe.trim()),
+                None => m.recipe.describe.trim().to_string(),
+            };
+            Some(InferredRequest {
+                owner: InferredOwner::New,
+                request: ExhibitRequest {
+                    kind,
+                    describe: describe.chars().take(DESCRIBE_MAX_CHARS).collect(),
+                },
+                why: Some(format!(
+                    "recipe \"{}\" in {}",
+                    m.recipe.name,
+                    m.source.display()
+                )),
+            })
+        })
+        .collect();
+    (requests, warnings)
+}
+
 /// The PR writer's exhibit requests: every `EXHIBIT_REQUEST:` line before the
 /// description marker, at most [`MAX_INFERRED_PER_PR`].
 #[must_use]
@@ -771,7 +830,9 @@ pub fn parse_inferred(reply: &str) -> Vec<InferredRequest> {
             continue;
         }
         let owner = match &raw.owner {
-            serde_json::Value::Number(n) => n.as_i64().map_or(InferredOwner::New, InferredOwner::Action),
+            serde_json::Value::Number(n) => {
+                n.as_i64().map_or(InferredOwner::New, InferredOwner::Action)
+            }
             serde_json::Value::String(s) => s
                 .trim()
                 .parse::<i64>()
@@ -782,7 +843,10 @@ pub fn parse_inferred(reply: &str) -> Vec<InferredRequest> {
             kind,
             describe: describe.chars().take(DESCRIBE_MAX_CHARS).collect(),
         };
-        if out.iter().any(|r| r.request.dedupe_key() == request.dedupe_key()) {
+        if out
+            .iter()
+            .any(|r| r.request.dedupe_key() == request.dedupe_key())
+        {
             continue;
         }
         out.push(InferredRequest {
@@ -798,27 +862,34 @@ pub fn parse_inferred(reply: &str) -> Vec<InferredRequest> {
 }
 
 impl crate::store::Store {
-    /// Attach the PR writer's requests for `branch_id`: to the named live
-    /// action when it exists and covers the branch, else to the branch's first
-    /// live action. With no live action for the branch yet, a request waits
-    /// as pending until the review's live actions are written
+    /// Attach requests for `branch_id` (from the PR writer or a recipe): to
+    /// the named live action when it exists and covers the branch, else to the
+    /// branch's first live action. With no live action for the branch yet, a
+    /// request waits as pending until the review's live actions are written
     /// ([`Self::assign_pending_exhibits`]). Returns how many became slots now.
     ///
     /// # Errors
     ///
     /// On a database failure.
-    pub fn apply_inferred_exhibits(
+    pub fn apply_branch_exhibits(
         &self,
         guardian_id: &str,
         branch_id: &str,
+        origin: ExhibitOrigin,
         requests: &[InferredRequest],
     ) -> Result<usize> {
         let actions = self.guardian_live_actions(guardian_id)?;
         let covers = |idx: i64| {
-            let attributed = self.live_action_branch_ids(guardian_id, idx).unwrap_or_default();
+            let attributed = self
+                .live_action_branch_ids(guardian_id, idx)
+                .unwrap_or_default();
             attributed.is_empty() || attributed.iter().any(|b| b == branch_id)
         };
-        let branch_actions: Vec<i64> = actions.iter().map(|a| a.idx).filter(|i| covers(*i)).collect();
+        let branch_actions: Vec<i64> = actions
+            .iter()
+            .map(|a| a.idx)
+            .filter(|i| covers(*i))
+            .collect();
         let mut attached = 0;
         for r in requests {
             let owner = match r.owner {
@@ -831,7 +902,7 @@ impl crate::store::Store {
                         .add_exhibit_requests(
                             guardian_id,
                             idx,
-                            ExhibitOrigin::Inferred,
+                            origin,
                             &[(r.request.clone(), r.why.clone())],
                         )?
                         .len();
@@ -839,14 +910,15 @@ impl crate::store::Store {
                 None => {
                     self.conn.execute(
                         "INSERT INTO guardian_pending_exhibits
-                            (guardian_id, branch_id, kind, describe, why, created_at_ms)
-                         VALUES (?, ?, ?, ?, ?, ?)",
+                            (guardian_id, branch_id, kind, describe, why, origin, created_at_ms)
+                         VALUES (?, ?, ?, ?, ?, ?, ?)",
                         rusqlite::params![
                             guardian_id,
                             branch_id,
                             r.request.kind.as_str(),
                             r.request.describe,
                             r.why,
+                            origin.as_str(),
                             crate::store::now_ms()
                         ],
                     )?;
@@ -866,10 +938,10 @@ impl crate::store::Store {
     ///
     /// On a database failure.
     pub fn assign_pending_exhibits(&self, guardian_id: &str) -> Result<()> {
-        let pending: Vec<(i64, String, String, String, Option<String>)> = self
+        let pending: Vec<(String, String, String, Option<String>, String)> = self
             .conn
             .prepare(
-                "SELECT rowid, branch_id, kind, describe, why FROM guardian_pending_exhibits
+                "SELECT branch_id, kind, describe, why, origin FROM guardian_pending_exhibits
                  WHERE guardian_id=? ORDER BY rowid",
             )?
             .query_map(rusqlite::params![guardian_id], |r| {
@@ -879,11 +951,13 @@ impl crate::store::Store {
         if pending.is_empty() {
             return Ok(());
         }
-        let mut by_branch: std::collections::BTreeMap<String, Vec<(ExhibitRequest, Option<String>)>> =
+        type Waiting = Vec<(ExhibitOrigin, ExhibitRequest, Option<String>)>;
+        let mut by_branch: std::collections::BTreeMap<String, Waiting> =
             std::collections::BTreeMap::new();
-        for (_, branch, kind, describe, why) in &pending {
+        for (branch, kind, describe, why, origin) in &pending {
             if let Some(kind) = ExhibitKind::parse(kind) {
                 by_branch.entry(branch.clone()).or_default().push((
+                    ExhibitOrigin::parse(origin),
                     ExhibitRequest {
                         kind,
                         describe: describe.clone(),
@@ -937,7 +1011,9 @@ impl crate::store::Store {
                     idx
                 }
             };
-            self.add_exhibit_requests(guardian_id, idx, ExhibitOrigin::Inferred, &requests)?;
+            for (origin, request, why) in requests {
+                self.add_exhibit_requests(guardian_id, idx, origin, &[(request, why)])?;
+            }
         }
         self.conn.execute(
             "DELETE FROM guardian_pending_exhibits WHERE guardian_id=?",
@@ -1124,7 +1200,8 @@ pub fn resolve_reported_file(dir: &std::path::Path, file: &str) -> Option<std::p
     let path = dir.join(name);
     let canonical_dir = dir.canonicalize().ok()?;
     let canonical = path.canonicalize().ok()?;
-    (canonical.parent() == Some(canonical_dir.as_path()) && canonical.is_file()).then_some(canonical)
+    (canonical.parent() == Some(canonical_dir.as_path()) && canonical.is_file())
+        .then_some(canonical)
 }
 
 // ---- rendering --------------------------------------------------------------
@@ -1155,11 +1232,7 @@ fn one_line(text: &str) -> String {
 }
 
 fn fenced(text: &str) -> String {
-    let longest = text
-        .split(|c| c != '`')
-        .map(str::len)
-        .max()
-        .unwrap_or(0);
+    let longest = text.split(|c| c != '`').map(str::len).max().unwrap_or(0);
     let fence = "`".repeat(longest.max(2) + 1);
     let clipped: String = text.chars().take(OUTPUT_MAX_CHARS).collect();
     let more = if text.chars().count() > OUTPUT_MAX_CHARS {
@@ -1182,7 +1255,11 @@ fn media(kind: ExhibitKind, url: &str, caption: &str, forge: crate::forge::Forge
 
 /// One slot's block, markers included.
 #[must_use]
-pub fn render_slot(slot: &ExhibitSlot, action_label: &str, forge: crate::forge::ForgeKind) -> String {
+pub fn render_slot(
+    slot: &ExhibitSlot,
+    action_label: &str,
+    forge: crate::forge::ForgeKind,
+) -> String {
     let requested = slot.request.kind;
     let describe = one_line(&slot.request.describe);
     let source = if action_label.trim().is_empty() {
@@ -1192,7 +1269,10 @@ pub fn render_slot(slot: &ExhibitSlot, action_label: &str, forge: crate::forge::
     };
     let mut out = slot_start(slot.key);
     out.push('\n');
-    let delivered = slot.fill.as_ref().filter(|f| f.url.is_some() || f.text.is_some());
+    let delivered = slot
+        .fill
+        .as_ref()
+        .filter(|f| f.url.is_some() || f.text.is_some());
     match delivered {
         Some(fill) => {
             let kind = fill.delivered_kind.unwrap_or(requested);
@@ -1224,7 +1304,9 @@ pub fn render_slot(slot: &ExhibitSlot, action_label: &str, forge: crate::forge::
                 match (fill.local_path.is_some(), fill.missing_reason.as_deref()) {
                     (true, reason) => out.push_str(&format!(
                         "  _Captured, not uploaded yet{}; the file is on the ralphus board._\n",
-                        reason.map(|r| format!(" ({})", one_line(r))).unwrap_or_default()
+                        reason
+                            .map(|r| format!(" ({})", one_line(r)))
+                            .unwrap_or_default()
                     )),
                     (false, Some(reason)) => {
                         out.push_str(&format!("  _Not captured: {}_\n", one_line(reason)));
@@ -1395,7 +1477,9 @@ mod tests {
 
     #[test]
     fn split_handoff_rejects_unknown_kinds_empty_descriptions_and_overflow() {
-        let mut text = String::from("steps\nEXHIBIT: hologram | spin it\nEXHIBIT: gif |   \nEXHIBIT: gif no pipe");
+        let mut text = String::from(
+            "steps\nEXHIBIT: hologram | spin it\nEXHIBIT: gif |   \nEXHIBIT: gif no pipe",
+        );
         for i in 0..6 {
             text.push_str(&format!("\nEXHIBIT: screenshot | view {i}"));
         }
@@ -1407,13 +1491,17 @@ mod tests {
 
     #[test]
     fn split_handoff_drops_duplicate_requests_within_one_handoff() {
-        let split = split_handoff("EXHIBIT: gif | Drag  the slider\nEXHIBIT: GIF | drag the slider");
+        let split =
+            split_handoff("EXHIBIT: gif | Drag  the slider\nEXHIBIT: GIF | drag the slider");
         assert_eq!(split.requests.len(), 1);
     }
 
     #[test]
     fn merge_requests_keeps_order_drops_duplicates_and_caps() {
-        let a = vec![req(ExhibitKind::Gif, "one"), req(ExhibitKind::Screenshot, "two")];
+        let a = vec![
+            req(ExhibitKind::Gif, "one"),
+            req(ExhibitKind::Screenshot, "two"),
+        ];
         let b = vec![
             req(ExhibitKind::Gif, "ONE"),
             req(ExhibitKind::Video, "three"),
@@ -1422,7 +1510,10 @@ mod tests {
         ];
         let merged = merge_requests([a.as_slice(), b.as_slice()]);
         assert_eq!(
-            merged.iter().map(|r| r.describe.as_str()).collect::<Vec<_>>(),
+            merged
+                .iter()
+                .map(|r| r.describe.as_str())
+                .collect::<Vec<_>>(),
             vec!["one", "two", "three", "four"]
         );
     }
@@ -1449,7 +1540,10 @@ mod tests {
 
     #[test]
     fn a_filled_video_is_a_bare_url_on_github_and_an_image_link_on_gitlab() {
-        let s = filled(slot(0, 0, ExhibitKind::Video, "the slider"), "https://x/v.mp4");
+        let s = filled(
+            slot(0, 0, ExhibitKind::Video, "the slider"),
+            "https://x/v.mp4",
+        );
         let gh = render_slot(&s, "", ForgeKind::GitHub);
         assert!(gh.contains("- [x] **Video** — the slider\n"));
         assert!(gh.contains("\nhttps://x/v.mp4\n"));
@@ -1459,7 +1553,10 @@ mod tests {
 
     #[test]
     fn a_lower_delivered_kind_is_called_out() {
-        let mut s = filled(slot(0, 0, ExhibitKind::Gif, "the slider"), "https://x/a.png");
+        let mut s = filled(
+            slot(0, 0, ExhibitKind::Gif, "the slider"),
+            "https://x/a.png",
+        );
         s.fill.as_mut().unwrap().delivered_kind = Some(ExhibitKind::Screenshot);
         let text = render_slot(&s, "", ForgeKind::GitHub);
         assert!(text.contains("- [x] **GIF** (delivered as screenshot) — the slider"));
@@ -1475,7 +1572,9 @@ mod tests {
             ..ExhibitFill::default()
         });
         let text = render_slot(&s, "", ForgeKind::GitHub);
-        assert!(text.contains("- [ ] **GIF** — the slider\n  _Not captured: no display on the review machine_\n"));
+        assert!(text.contains(
+            "- [ ] **GIF** — the slider\n  _Not captured: no display on the review machine_\n"
+        ));
     }
 
     #[test]
@@ -1522,7 +1621,10 @@ mod tests {
         let c = slot(9, 0, ExhibitKind::Video, "three");
         let first = splice_exhibits("Intro", &[block(&a), block(&b), block(&c)]).body;
         // A human note between slots must survive.
-        let edited = first.replace(&slot_end(b.key), &format!("{}\n\nReviewer note.", slot_end(b.key)));
+        let edited = first.replace(
+            &slot_end(b.key),
+            &format!("{}\n\nReviewer note.", slot_end(b.key)),
+        );
 
         let a2 = filled(a.clone(), "https://x/new.gif");
         let second = splice_exhibits(&edited, &[block(&a2)]);
@@ -1607,12 +1709,17 @@ mod tests {
         };
         let on_a = slots_for_pr(&slots, Some("br-a"), &attribution, 10);
         assert_eq!(
-            on_a.iter().map(|s| s.request.describe.as_str()).collect::<Vec<_>>(),
+            on_a.iter()
+                .map(|s| s.request.describe.as_str())
+                .collect::<Vec<_>>(),
             vec!["a0", "a1", "unattributed"]
         );
         let capped = slots_for_pr(&slots, Some("br-a"), &attribution, 2);
         assert_eq!(
-            capped.iter().map(|s| s.request.describe.as_str()).collect::<Vec<_>>(),
+            capped
+                .iter()
+                .map(|s| s.request.describe.as_str())
+                .collect::<Vec<_>>(),
             vec!["a0", "unattributed"]
         );
         assert_eq!(slots_for_pr(&slots, None, &attribution, 10).len(), 4);
@@ -1620,7 +1727,10 @@ mod tests {
 
     #[test]
     fn a_run_only_fills_its_own_actions_slots_and_the_last_report_wins() {
-        let slots = vec![slot(7, 0, ExhibitKind::Gif, "a"), slot(7, 1, ExhibitKind::Output, "b")];
+        let slots = vec![
+            slot(7, 0, ExhibitKind::Gif, "a"),
+            slot(7, 1, ExhibitKind::Output, "b"),
+        ];
         let reply = "report\n\
             RALPHUS_EXHIBIT: {\"slot\": \"7.0\", \"file\": \"first.gif\"}\n\
             RALPHUS_EXHIBIT: {\"slot\": \"7.0\", \"file\": \"better.gif\", \"caption\": \"the points thin out\"}\n\
@@ -1644,7 +1754,11 @@ mod tests {
                 },
             ]
         );
-        assert_eq!(ignored.len(), 3, "another action's slot, an unknown slot, and junk");
+        assert_eq!(
+            ignored.len(),
+            3,
+            "another action's slot, an unknown slot, and junk"
+        );
     }
 
     #[test]
@@ -1657,12 +1771,18 @@ mod tests {
         assert!(resolve_reported_file(dir.path(), "sub/deep.png").is_none());
         assert!(resolve_reported_file(dir.path(), "../ok.png").is_none());
         assert!(resolve_reported_file(dir.path(), "missing.png").is_none());
-        assert!(resolve_reported_file(dir.path(), "sub").is_none(), "a directory is not a file");
+        assert!(
+            resolve_reported_file(dir.path(), "sub").is_none(),
+            "a directory is not a file"
+        );
     }
 
     #[test]
     fn the_run_prompt_names_every_slot_the_order_and_the_report_format() {
-        let slots = vec![slot(3, 0, ExhibitKind::Gif, "drag it"), slot(3, 1, ExhibitKind::Output, "the log")];
+        let slots = vec![
+            slot(3, 0, ExhibitKind::Gif, "drag it"),
+            slot(3, 1, ExhibitKind::Output, "the log"),
+        ];
         let settings = ExhibitSettings {
             kind_preference: vec![ExhibitKind::Video, ExhibitKind::Gif],
             max_video_seconds: 9,
@@ -1674,8 +1794,17 @@ mod tests {
         assert!(text.contains("video, then gif"));
         assert!(text.contains("under 9 seconds"));
         assert!(text.contains(REPORT_MARKER));
-        let follow = followup_prompt(&slots[..1], &settings, std::path::Path::new("/tmp/ex"), Some("it worked"));
-        assert!(follow.contains("still missing") && follow.contains("it worked") && !follow.contains("3.1"));
+        let follow = followup_prompt(
+            &slots[..1],
+            &settings,
+            std::path::Path::new("/tmp/ex"),
+            Some("it worked"),
+        );
+        assert!(
+            follow.contains("still missing")
+                && follow.contains("it worked")
+                && !follow.contains("3.1")
+        );
     }
 
     #[test]
@@ -1730,9 +1859,10 @@ mod tests {
         live_action(&store, &g, 0, Some("br-a"));
         live_action(&store, &g, 1, Some("br-b"));
         let attached = store
-            .apply_inferred_exhibits(
+            .apply_branch_exhibits(
                 &g,
                 "br-a",
+                ExhibitOrigin::Inferred,
                 &[
                     ask("named and covering", InferredOwner::Action(0)),
                     // Action 1 is another branch's: falls back to br-a's action.
@@ -1743,7 +1873,11 @@ mod tests {
             .unwrap();
         assert_eq!(attached, 3);
         let slots = store.guardian_exhibit_slots(&g).unwrap();
-        assert!(slots.iter().all(|s| s.key.action_idx == 0 && s.origin == ExhibitOrigin::Inferred));
+        assert!(
+            slots
+                .iter()
+                .all(|s| s.key.action_idx == 0 && s.origin == ExhibitOrigin::Inferred)
+        );
         assert_eq!(slots[0].why.as_deref(), Some("visible"));
     }
 
@@ -1752,7 +1886,12 @@ mod tests {
         let store = crate::store::Store::open_in_memory().unwrap();
         let g = store.create_guardian("r", "main", "/repo").unwrap();
         let now = store
-            .apply_inferred_exhibits(&g, "br-a", &[ask("a panel", InferredOwner::Action(0))])
+            .apply_branch_exhibits(
+                &g,
+                "br-a",
+                ExhibitOrigin::Inferred,
+                &[ask("a panel", InferredOwner::Action(0))],
+            )
             .unwrap();
         assert_eq!(now, 0);
         assert!(store.guardian_exhibit_slots(&g).unwrap().is_empty());
@@ -1772,11 +1911,21 @@ mod tests {
         let actions = store.guardian_live_actions(&g).unwrap();
         assert_eq!(actions.len(), 2);
         let slots = store.guardian_exhibit_slots(&g).unwrap();
-        assert!(slots.iter().any(|s| s.key.action_idx == 0 && s.request.describe == "a moving"));
-        assert!(slots.iter().any(|s| s.key.action_idx == 1 && s.request.describe == "a panel"));
+        assert!(
+            slots
+                .iter()
+                .any(|s| s.key.action_idx == 0 && s.request.describe == "a moving")
+        );
+        assert!(
+            slots
+                .iter()
+                .any(|s| s.key.action_idx == 1 && s.request.describe == "a panel")
+        );
         let pending: i64 = store
             .conn
-            .query_row("SELECT COUNT(*) FROM guardian_pending_exhibits", [], |r| r.get(0))
+            .query_row("SELECT COUNT(*) FROM guardian_pending_exhibits", [], |r| {
+                r.get(0)
+            })
             .unwrap();
         assert_eq!(pending, 0);
     }
@@ -1788,8 +1937,8 @@ mod tests {
         store
             .conn
             .execute(
-                "INSERT INTO guardian_pending_exhibits (guardian_id, branch_id, kind, describe, why, created_at_ms)
-                 VALUES (?, 'br-z', 'gif', 'z moving', NULL, 0)",
+                "INSERT INTO guardian_pending_exhibits (guardian_id, branch_id, kind, describe, why, origin, created_at_ms)
+                 VALUES (?, 'br-z', 'gif', 'z moving', NULL, 'recipe', 0)",
                 rusqlite::params![g],
             )
             .unwrap();
@@ -1814,7 +1963,10 @@ mod tests {
         assert_eq!(actions.len(), 2);
         assert_eq!(actions[1].idx, 1);
         assert!(actions[1].label.starts_with("Exhibits: "));
-        assert_eq!(store.live_action_branch_ids(&g, 1).unwrap(), vec!["br-z".to_string()]);
+        assert_eq!(
+            store.live_action_branch_ids(&g, 1).unwrap(),
+            vec!["br-z".to_string()]
+        );
         let slots = store.guardian_exhibit_slots(&g).unwrap();
         assert_eq!(slots.len(), 1);
         assert_eq!(slots[0].key.action_idx, 1);
@@ -1871,7 +2023,10 @@ mod tests {
             ..ExhibitFill::default()
         };
         let replaced = store.set_exhibit_fill(g, key, &second).unwrap();
-        assert_eq!(replaced.and_then(|f| f.forge_upload_id).as_deref(), Some("11"));
+        assert_eq!(
+            replaced.and_then(|f| f.forge_upload_id).as_deref(),
+            Some("11")
+        );
         let now = store.guardian_exhibit_slots(g).unwrap();
         let fill = now[0].fill.clone().unwrap();
         assert_eq!(fill.url.as_deref(), Some("https://x/2.gif"));
@@ -1885,8 +2040,14 @@ mod tests {
             ..ExhibitFill::default()
         };
         store.set_exhibit_fill(g, key, &third).unwrap();
-        let fill = store.guardian_exhibit_slots(g).unwrap()[0].fill.clone().unwrap();
-        assert_eq!(fill.stale_upload_ids, vec!["11".to_string(), "12".to_string()]);
+        let fill = store.guardian_exhibit_slots(g).unwrap()[0]
+            .fill
+            .clone()
+            .unwrap();
+        assert_eq!(
+            fill.stale_upload_ids,
+            vec!["11".to_string(), "12".to_string()]
+        );
         assert_eq!(fill.url, None);
         store
             .record_exhibit_upload(g, key, "https://x/3.gif", Some("13"))
@@ -1894,7 +2055,10 @@ mod tests {
         store
             .clear_stale_exhibit_uploads(g, key, &["11".to_string()])
             .unwrap();
-        let fill = store.guardian_exhibit_slots(g).unwrap()[0].fill.clone().unwrap();
+        let fill = store.guardian_exhibit_slots(g).unwrap()[0]
+            .fill
+            .clone()
+            .unwrap();
         assert_eq!(fill.url.as_deref(), Some("https://x/3.gif"));
         assert_eq!(fill.forge_upload_id.as_deref(), Some("13"));
         assert_eq!(fill.stale_upload_ids, vec!["12".to_string()]);

@@ -273,6 +273,7 @@
       CLICK_HANDLERS.openLiveRunPane = (e, ds) => openLiveRunPane(ds.guardianId || "", ds.runId || "");
       CLICK_HANDLERS.openLiveActionsHeader = (e, ds) => openLiveActionsHeader(ds.guardianId || "");
       CLICK_HANDLERS.toggleLiveActionDetails = (e, ds) => toggleLiveActionDetails(ds.key || "");
+      CLICK_HANDLERS.previewExhibit = (e, ds) => previewExhibit(ds.guardianId || "", Number(ds.action), Number(ds.slot));
       CLICK_HANDLERS.rebuildPreparationNow = (e, ds) => rebuildPreparationNow(ds.guardianId || "");
       CLICK_HANDLERS.selectReviewCommandRow = (e, ds) => selectReviewCommandRow(ds.guardianId || "", ds.key || "", ds.cmd || "");
       CLICK_HANDLERS.scopeReviewDockToCommand = (e, ds) => scopeReviewDockToCommand(ds.guardianId || "", ds.key || "", ds.cmd || "");

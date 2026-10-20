@@ -423,6 +423,38 @@
        * @property {LiveRunRow[]} runs
        */
       /**
+       * One exhibit slot of a review: something a reviewer should see in the
+       * PR/MR description, owned by one live action, and what its runs have
+       * delivered so far.
+       * @typedef {object} ExhibitSlotView
+       * @property {number} action_idx - The owning live action's `idx`.
+       * @property {number} slot_idx
+       * @property {string|null} action_label
+       * @property {"gif"|"video"|"screenshot"|"output"} kind - What was asked for.
+       * @property {string} describe - What to show.
+       * @property {"handoff"|"recipe"|"inferred"} origin - Who asked: the change's own agent, a config recipe, or the PR writer.
+       * @property {string|null} why - Why an inferred request was added.
+       * @property {"gif"|"video"|"screenshot"|"output"|null} delivered_kind - What a run actually delivered, which can be lower in the preference order.
+       * @property {string|null} url - The uploaded file's URL on the forge.
+       * @property {string|null} caption
+       * @property {string|null} text - An `output` slot's text.
+       * @property {string|null} missing_reason - Why nothing was delivered (or why an upload failed).
+       * @property {boolean} has_file - Whether a captured file is kept on the daemon (previewable).
+       * @property {number|null} updated_at_ms
+       */
+      /**
+       * `GET /api/guardians/{id}/exhibits`.
+       * @typedef {object} ExhibitsView
+       * @property {ExhibitSlotView[]} exhibits
+       */
+      /**
+       * `GET /api/guardians/{id}/exhibits/{action}/{slot}/file`: a captured
+       * exhibit file for the board's preview.
+       * @typedef {object} ExhibitFileView
+       * @property {string} content_type
+       * @property {string} data_base64
+       */
+      /**
        * @typedef {object} BranchConflicts
        * @property {string[]} files - Paths (relative to the branch's worktree root) still carrying unresolved conflict markers. Empty once resolved, or if the worktree doesn't exist (yet, or anymore).
        * @property {boolean} rebase_in_progress - Whether the worktree is currently mid-`git rebase`. Can be false while `files` is still non-empty.

@@ -122,7 +122,7 @@ impl Transcoder for Ffmpeg {
 
     fn run(&self, args: &[String]) -> Result<(), String> {
         let out = std::process::Command::new("ffmpeg")
-            .args(["-hide_banner", "-loglevel", "error", "-y"])
+            .args(["-hide_banner", "-loglevel", "error", "-nostdin", "-y"])
             .args(args)
             .output()
             .map_err(|e| format!("could not run ffmpeg: {e}"))?;
@@ -135,7 +135,14 @@ impl Transcoder for Ffmpeg {
 
     fn duration_seconds(&self, path: &Path) -> Option<f64> {
         let out = std::process::Command::new("ffprobe")
-            .args(["-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0"])
+            .args([
+                "-v",
+                "error",
+                "-show_entries",
+                "format=duration",
+                "-of",
+                "csv=p=0",
+            ])
             .arg(path)
             .output()
             .ok()?;
@@ -212,7 +219,15 @@ pub fn prepare(
         if !allowed(kind) {
             continue;
         }
-        match attempt(source, media, kind, out_stem, max_video_seconds, ffmpeg, has_ffmpeg) {
+        match attempt(
+            source,
+            media,
+            kind,
+            out_stem,
+            max_video_seconds,
+            ffmpeg,
+            has_ffmpeg,
+        ) {
             Ok(path) => return Prepared::File { path, kind },
             Err(e) => last_error = e,
         }
@@ -235,9 +250,7 @@ fn attempt(
     ffmpeg: &dyn Transcoder,
     has_ffmpeg: bool,
 ) -> Result<PathBuf, String> {
-    let need = |what: &str| {
-        format!("{what}, and ffmpeg is not on PATH to convert it")
-    };
+    let need = |what: &str| format!("{what}, and ffmpeg is not on PATH to convert it");
     match (kind, media) {
         (ExhibitKind::Screenshot, MediaType::Image) if fits(media, size(source)) => {
             Ok(source.to_path_buf())
@@ -259,11 +272,20 @@ fn attempt(
         (ExhibitKind::Screenshot, _) => {
             let out = out_stem.with_extension("png");
             let mut args = vec!["-i".to_string(), p(source)];
-            if matches!(media, MediaType::Gif | MediaType::Video | MediaType::OtherVideo) {
+            if matches!(
+                media,
+                MediaType::Gif | MediaType::Video | MediaType::OtherVideo
+            ) {
                 // The last frame shows the end state an exhibit is about.
                 args = vec!["-sseof".into(), "-0.1".into(), "-i".into(), p(source)];
             }
-            args.extend(["-frames:v".into(), "1".into(), "-vf".into(), "scale='min(1920,iw)':-2".into(), p(&out)]);
+            args.extend([
+                "-frames:v".into(),
+                "1".into(),
+                "-vf".into(),
+                "scale='min(1920,iw)':-2".into(),
+                p(&out),
+            ]);
             ffmpeg.run(&args)?;
             check(&out, MediaType::Image)
         }
@@ -407,7 +429,13 @@ pub(crate) mod tests {
         let gif = file(dir.path(), "a.gif", 1000);
         let ff = fake(false, 0);
         let out = prepare(&gif, &dir.path().join("o"), &PREF, 15, 100, &ff);
-        assert_eq!(out, Prepared::File { path: gif, kind: ExhibitKind::Gif });
+        assert_eq!(
+            out,
+            Prepared::File {
+                path: gif,
+                kind: ExhibitKind::Gif
+            }
+        );
     }
 
     #[test]
@@ -422,7 +450,11 @@ pub(crate) mod tests {
             }
             fn run(&self, args: &[String]) -> Result<(), String> {
                 let out = args.last().unwrap();
-                let bytes = if out.ends_with(".gif") { MAX_IMAGE_BYTES as usize + 10 } else { 1000 };
+                let bytes = if out.ends_with(".gif") {
+                    MAX_IMAGE_BYTES as usize + 10
+                } else {
+                    1000
+                };
                 std::fs::write(out, vec![0u8; bytes]).unwrap();
                 self.0.calls.borrow_mut().push(args.to_vec());
                 Ok(())
@@ -453,7 +485,11 @@ pub(crate) mod tests {
             }
             fn run(&self, args: &[String]) -> Result<(), String> {
                 let out = args.last().unwrap();
-                let bytes = if out.ends_with(".gif") { MAX_IMAGE_BYTES as usize + 10 } else { 500 };
+                let bytes = if out.ends_with(".gif") {
+                    MAX_IMAGE_BYTES as usize + 10
+                } else {
+                    500
+                };
                 std::fs::write(out, vec![0u8; bytes]).unwrap();
                 Ok(())
             }
@@ -463,7 +499,13 @@ pub(crate) mod tests {
         }
         let pref = [ExhibitKind::Gif, ExhibitKind::Screenshot];
         let out = prepare(&gif, &dir.path().join("o"), &pref, 15, 100, &GifsTooBig);
-        assert!(matches!(out, Prepared::File { kind: ExhibitKind::Screenshot, .. }));
+        assert!(matches!(
+            out,
+            Prepared::File {
+                kind: ExhibitKind::Screenshot,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -474,7 +516,13 @@ pub(crate) mod tests {
         ff.duration = Some(40.0);
         let pref = [ExhibitKind::Video];
         let out = prepare(&mp4, &dir.path().join("o"), &pref, 15, 100, &ff);
-        assert!(matches!(out, Prepared::File { kind: ExhibitKind::Video, .. }));
+        assert!(matches!(
+            out,
+            Prepared::File {
+                kind: ExhibitKind::Video,
+                ..
+            }
+        ));
         let calls = ff.calls.borrow();
         assert_eq!(calls[0][0..2], ["-t".to_string(), "15".to_string()]);
     }
@@ -485,7 +533,14 @@ pub(crate) mod tests {
         let exr = file(dir.path(), "render.exr", 2000);
         let without = prepare(&exr, &dir.path().join("o"), &PREF, 15, 100, &fake(false, 0));
         assert!(matches!(without, Prepared::Undeliverable { reason } if reason.contains("ffmpeg")));
-        let with = prepare(&exr, &dir.path().join("o"), &PREF, 15, 100, &fake(true, 800));
+        let with = prepare(
+            &exr,
+            &dir.path().join("o"),
+            &PREF,
+            15,
+            100,
+            &fake(true, 800),
+        );
         match with {
             Prepared::File { path, kind } => {
                 assert_eq!(kind, ExhibitKind::Screenshot);
@@ -501,7 +556,12 @@ pub(crate) mod tests {
         let txt = dir.path().join("out.txt");
         std::fs::write(&txt, "abcdef").unwrap();
         let out = prepare(&txt, &dir.path().join("o"), &PREF, 15, 3, &fake(false, 0));
-        assert_eq!(out, Prepared::Text { text: "abc".to_string() });
+        assert_eq!(
+            out,
+            Prepared::Text {
+                text: "abc".to_string()
+            }
+        );
     }
 
     #[test]
@@ -526,15 +586,24 @@ pub(crate) mod tests {
             let file = std::fs::File::create(&gif).unwrap();
             let mut enc = gif::Encoder::new(file, 2, 2, &[0, 0, 0, 255, 255, 255]).unwrap();
             for shade in [0u8, 1] {
-                let mut frame = gif::Frame::default();
-                frame.width = 2;
-                frame.height = 2;
-                frame.buffer = std::borrow::Cow::Owned(vec![shade; 4]);
+                let frame = gif::Frame {
+                    width: 2,
+                    height: 2,
+                    buffer: std::borrow::Cow::Owned(vec![shade; 4]),
+                    ..gif::Frame::default()
+                };
                 enc.write_frame(&frame).unwrap();
             }
         }
         // A GIF fits as is, so ask for a still only to force a conversion.
-        let out = prepare(&gif, &dir.path().join("o"), &[ExhibitKind::Screenshot], 15, 100, &Ffmpeg);
+        let out = prepare(
+            &gif,
+            &dir.path().join("o"),
+            &[ExhibitKind::Screenshot],
+            15,
+            100,
+            &Ffmpeg,
+        );
         match out {
             Prepared::File { path, kind } => {
                 assert_eq!(kind, ExhibitKind::Screenshot);

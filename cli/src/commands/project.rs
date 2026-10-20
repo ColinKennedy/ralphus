@@ -19,6 +19,10 @@ use crate::flags::{Scanner, UsageError};
 
 const SHORT_DESCRIPTION_MAX: usize = 80;
 
+// `ReviewSettings` carries `ProjectReviewSettingsCommand::Set`'s one optional
+// field per review setting and is built once per invocation, so the size gap
+// to the small variants costs nothing.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone)]
 pub enum ProjectCommand {
     Help,

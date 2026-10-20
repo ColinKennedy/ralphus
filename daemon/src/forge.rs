@@ -11002,10 +11002,10 @@ mod pool_rotation_tests {
 
 /// Live round trips of the exhibit upload against real forges. `#[ignore]`d:
 /// they need a throwaway repo, an open PR/MR in it and a token, named by
-/// `RALPHUS_LIVE_GITHUB_REPO` (`owner/repo`) + `RALPHUS_LIVE_GITHUB_PR` +
-/// `RALPHUS_GITHUB_TOKEN`, and `RALPHUS_LIVE_GITLAB_PROJECT` (encoded path)
-/// + `RALPHUS_LIVE_GITLAB_MR` + `RALPHUS_GITLAB_TOKEN`. Each skips when its
-/// variables are unset. Run with
+/// `RALPHUS_LIVE_GITHUB_REPO` (`owner/repo`), `RALPHUS_LIVE_GITHUB_PR` and
+/// `RALPHUS_GITHUB_TOKEN`, and by `RALPHUS_LIVE_GITLAB_PROJECT` (encoded
+/// path), `RALPHUS_LIVE_GITLAB_MR` and `RALPHUS_GITLAB_TOKEN`. Each skips when
+/// its variables are unset. Run with
 /// `cargo nextest run -p ralphus-daemon --lib --run-ignored only -E 'test(/live_exhibit/)'`.
 #[cfg(test)]
 mod live_exhibit_tests {
@@ -11059,7 +11059,10 @@ mod live_exhibit_tests {
             Some(token),
         );
         let up = round_trip(&client, pr.parse().unwrap());
-        assert!(up.url.starts_with("https://github.com/user-attachments/assets/"));
+        assert!(
+            up.url
+                .starts_with("https://github.com/user-attachments/assets/")
+        );
         assert!(up.upload_id.is_none());
         assert!(client.delete_attachment("anything").is_err());
     }

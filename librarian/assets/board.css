@@ -511,6 +511,10 @@
          right -- so it reads at the muted register, never at body weight. */
       .hint { font-size: 12.5px; color: var(--muted); line-height: 1.45; margin-top: 6px; }
       .hint.live-sources { display: flex; flex-wrap: wrap; align-items: center; gap: 4px; min-width: 0; overflow-wrap: anywhere; }
+      .exhibits { margin-top: 6px; display: flex; flex-direction: column; gap: 4px; }
+      .exhibit-row { display: flex; align-items: center; gap: 6px; min-width: 0; }
+      .exhibit-row .cmd-text { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+      .exhibit-preview { max-width: 100%; max-height: 320px; border: 1px solid var(--border-soft); border-radius: 4px; }
       .hint.live-sources .btn { max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
       /* `.empty` is tuned for a whole tab having nothing in it -- centered under
          40px of air. Inside a review that register is wrong: these are section

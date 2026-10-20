@@ -1498,6 +1498,84 @@
         }
       }
     },
+    "/api/guardians/{id}/exhibits": {
+      "get": {
+        "operationId": "getGuardiansByIdExhibits",
+        "summary": "Board live-actions section's exhibit list; the PR/MR description shows the same slots",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/JsonValue"
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/api/guardians/{id}/exhibits/{action}/{slot}/file": {
+      "get": {
+        "operationId": "getGuardiansByIdExhibitsByActionBySlotFile",
+        "summary": "Board preview of a captured exhibit file not yet uploaded to the forge",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "action",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "name": "slot",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/JsonValue"
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
     "/api/guardians/{id}/branches/{branch_id}/conflicts": {
       "get": {
         "operationId": "getGuardiansByIdBranchesByBranchIdConflicts",

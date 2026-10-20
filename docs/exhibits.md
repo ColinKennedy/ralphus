@@ -39,6 +39,27 @@ Houdini, Maya, anything with output a person would look at.
    assigned when they are created (a branch with none gets a small
    "Exhibits" live action of its own).
 
+   **Projects can also require exhibits deterministically**, with recipes in
+   any `.ralphus.toml`:
+
+   ```toml
+   [[exhibit.recipe]]
+   name = "hda-flipbook"
+   kind = "gif"                      # gif | video | screenshot | output
+   describe = "flipbook frames 1-48 of tests/scenes/smoke.hip"
+   paths = ["otls/**", "*.hda"]      # relative to this .ralphus.toml's folder
+   command = "hython tools/ralphus_flipbook.py --out $RALPHUS_EXHIBIT_DIR"
+   ```
+
+   When a PR is written, each changed file is checked against the recipes in
+   the `.ralphus.toml` files from its own folder up to the repository root;
+   the nearest file wins for a recipe `name`, so a subfolder refines or
+   overrides a parent's recipe only for the files inside it. A matching
+   recipe becomes a slot like any other (its `command` is passed to the
+   capturing agent). An unreadable or invalid recipe file is skipped and
+   logged. Recipes apply whenever `exhibits_enabled` is on, regardless of
+   `infer_exhibits`.
+
 4. **The live run captures them.** The run's prompt lists its own action's
    slots and gives it a directory (`$RALPHUS_EXHIBIT_DIR`); the agent saves a
    file per slot and reports it with a `RALPHUS_EXHIBIT:` line. Slots it

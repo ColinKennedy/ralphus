@@ -16,6 +16,7 @@
 
 mod agent;
 mod cell;
+mod exhibit;
 mod forge;
 mod machine;
 mod mailbox;
@@ -121,6 +122,7 @@ pub fn execute(cmd: Command, client: &DaemonClient) -> ExecResult {
         Command::Machine(c) => machine::execute(c, client),
         Command::Agent(c) => agent::execute(c, client),
         Command::Show(c) => show::execute(c),
+        Command::Exhibit(c) => exhibit::execute(c),
         Command::Squad(c) => squad::execute(c, client),
         Command::Mailbox(c) => mailbox::execute(c, client),
         Command::QuickStart(_) => Err(usage("quick-start is excluded from the MCP tool surface")),

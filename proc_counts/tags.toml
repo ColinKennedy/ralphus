@@ -144,3 +144,8 @@ tag = "health-gh-exhibit-fallback"
 [[test]]
 id = "ralphus-daemon exhibit_media::tests::a_real_ffmpeg_turns_a_gif_into_a_still_when_the_preference_allows_only_stills"
 tag = "exhibit-media-ffmpeg"
+
+# Matching exhibit recipes to a PR branch's changed files (`git diff --name-only`).
+[[test]]
+id = "ralphus-daemon pr::tests::exhibit_recipes_match_only_the_branchs_own_changed_files"
+tag = "exhibit-recipes"

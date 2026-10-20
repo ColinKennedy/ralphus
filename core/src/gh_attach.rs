@@ -19,7 +19,10 @@ pub const REMEDIATION: &str = "Install or update the GitHub CLI to 2.99 or later
 #[must_use]
 pub fn parse_version(output: &str) -> Option<(u32, u32, u32)> {
     let line = output.lines().next()?;
-    let version = line.strip_prefix("gh version ")?.split_whitespace().next()?;
+    let version = line
+        .strip_prefix("gh version ")?
+        .split_whitespace()
+        .next()?;
     let mut parts = version.split('.').map(|p| {
         p.chars()
             .take_while(char::is_ascii_digit)

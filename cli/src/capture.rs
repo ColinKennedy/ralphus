@@ -203,8 +203,8 @@ impl RecordFormat {
 /// When the format is unsupported, no capture path is available, or the
 /// capture fails.
 pub fn record(target: &Target, seconds: u32, fps: u32, out: &Path) -> Result<(), String> {
-    let format = RecordFormat::for_path(out)
-        .ok_or_else(|| "record to a .gif or .mp4 file".to_string())?;
+    let format =
+        RecordFormat::for_path(out).ok_or_else(|| "record to a .gif or .mp4 file".to_string())?;
     if on_path("ffmpeg") {
         if let Some(input) = ffmpeg_input(target)? {
             return record_with_ffmpeg(&input, seconds, fps, format, out);
@@ -225,7 +225,12 @@ fn ffmpeg_input(target: &Target) -> Result<Option<Vec<String>>, String> {
             Target::Screen => v(&["-f", "gdigrab", "-i", "desktop"]),
             Target::Pid(pid) => {
                 let title = windows_window_title(*pid)?;
-                vec!["-f".into(), "gdigrab".into(), "-i".into(), format!("title={title}")]
+                vec![
+                    "-f".into(),
+                    "gdigrab".into(),
+                    "-i".into(),
+                    format!("title={title}"),
+                ]
             }
         }));
     }
@@ -236,7 +241,9 @@ fn ffmpeg_input(target: &Target) -> Result<Option<Vec<String>>, String> {
         });
     }
     Ok(match (target, std::env::var("DISPLAY")) {
-        (Target::Screen, Ok(display)) => Some(vec!["-f".into(), "x11grab".into(), "-i".into(), display]),
+        (Target::Screen, Ok(display)) => {
+            Some(vec!["-f".into(), "x11grab".into(), "-i".into(), display])
+        }
         _ => None,
     })
 }
@@ -268,11 +275,21 @@ fn record_with_ffmpeg(
     out: &Path,
 ) -> Result<(), String> {
     let mut cmd = Command::new("ffmpeg");
-    cmd.args(["-hide_banner", "-loglevel", "error", "-y", "-framerate"])
-        .arg(fps.to_string())
-        .args(input)
-        .arg("-t")
-        .arg(seconds.to_string());
+    // `-t` must limit the *input*: as an output option the grab never ends,
+    // and the GIF palette filter, which waits for the end of its input,
+    // buffers frames forever.
+    cmd.args([
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-nostdin",
+        "-y",
+        "-framerate",
+    ])
+    .arg(fps.to_string())
+    .arg("-t")
+    .arg(seconds.to_string())
+    .args(input);
     match format {
         RecordFormat::Gif => cmd.args([
             "-vf",
@@ -331,7 +348,8 @@ fn scratch_dir() -> Result<PathBuf, String> {
             .map(|d| d.as_nanos())
             .unwrap_or(0)
     ));
-    std::fs::create_dir_all(&dir).map_err(|e| format!("could not create {}: {e}", dir.display()))?;
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| format!("could not create {}: {e}", dir.display()))?;
     Ok(dir)
 }
 
@@ -349,7 +367,9 @@ fn decode_png(path: &Path) -> Result<Rgba, String> {
     let file = std::fs::File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
     let mut decoder = png::Decoder::new(std::io::BufReader::new(file));
     decoder.set_transformations(png::Transformations::normalize_to_color8());
-    let mut reader = decoder.read_info().map_err(|e| format!("{}: {e}", path.display()))?;
+    let mut reader = decoder
+        .read_info()
+        .map_err(|e| format!("{}: {e}", path.display()))?;
     let mut buf = vec![0; reader.output_buffer_size()];
     let info = reader
         .next_frame(&mut buf)
@@ -383,7 +403,8 @@ fn shrink(frame: Rgba, max_width: u32) -> Rgba {
         return frame;
     }
     let width = max_width;
-    let height = (u64::from(frame.height) * u64::from(width) / u64::from(frame.width)).max(1) as u32;
+    let height =
+        (u64::from(frame.height) * u64::from(width) / u64::from(frame.width)).max(1) as u32;
     let mut pixels = Vec::with_capacity((width * height * 4) as usize);
     for y in 0..height {
         let sy = (u64::from(y) * u64::from(frame.height) / u64::from(height)) as usize;
@@ -461,7 +482,9 @@ mod tests {
         encoder.set_color(png::ColorType::Rgb);
         encoder.set_depth(png::BitDepth::Eight);
         let mut writer = encoder.write_header().unwrap();
-        let data: Vec<u8> = (0..width * height).flat_map(|_| [shade, 0, 255 - shade]).collect();
+        let data: Vec<u8> = (0..width * height)
+            .flat_map(|_| [shade, 0, 255 - shade])
+            .collect();
         writer.write_image_data(&data).unwrap();
     }
 
@@ -504,10 +527,83 @@ mod tests {
         assert_eq!(small.pixels.len(), 960 * 540 * 4);
     }
 
+    /// Live captures on a real desktop. `#[ignore]`d: they need a display
+    /// (run with `--run-ignored only -E 'test(/live_capture/)'`).
+    #[test]
+    #[ignore = "needs a desktop session"]
+    fn live_capture_screen_still_and_still_based_gif() {
+        let dir = scratch_dir().unwrap();
+        let png = dir.join("screen.png");
+        screenshot(&Target::Screen, &png).unwrap();
+        assert!(std::fs::read(&png).unwrap().starts_with(b"\x89PNG"));
+        let gif = dir.join("screen.gif");
+        record_stills(&Target::Screen, 1, 2, &gif).unwrap();
+        assert!(std::fs::read(&gif).unwrap().starts_with(b"GIF89a"));
+        if on_path("ffmpeg") {
+            let mp4 = dir.join("screen.mp4");
+            record(&Target::Screen, 1, 5, &mp4).unwrap();
+            assert_eq!(&std::fs::read(&mp4).unwrap()[4..8], b"ftyp");
+            let gif2 = dir.join("screen-ffmpeg.gif");
+            record(&Target::Screen, 1, 5, &gif2).unwrap();
+            assert!(std::fs::read(&gif2).unwrap().starts_with(b"GIF89a"));
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[ignore = "needs a desktop session"]
+    #[cfg(windows)]
+    fn live_capture_one_windows_process_window() {
+        // A window owned by the very process whose id is captured.
+        let mut child = std::process::Command::new("powershell")
+            .args([
+                "-NoProfile",
+                "-Command",
+                "Add-Type -AssemblyName System.Windows.Forms; \
+                 $f = New-Object System.Windows.Forms.Form; $f.Text = 'ralphus capture probe'; \
+                 $f.Width = 320; $f.Height = 200; $f.ShowDialog() | Out-Null",
+            ])
+            .spawn()
+            .unwrap();
+        let dir = scratch_dir().unwrap();
+        let png = dir.join("window.png");
+        // Wait for the window to appear.
+        let mut result = Err(String::new());
+        for _ in 0..20 {
+            std::thread::sleep(Duration::from_millis(500));
+            result = screenshot(&Target::Pid(child.id()), &png);
+            if result.is_ok() {
+                break;
+            }
+        }
+        let gif = dir.join("window.gif");
+        let recorded = record_stills(&Target::Pid(child.id()), 1, 2, &gif);
+        let _ = child.kill();
+        let _ = child.wait();
+        result.unwrap();
+        recorded.unwrap();
+        let frame = decode_png(&png).unwrap();
+        // The form, not the whole screen.
+        assert!(
+            frame.width < 1000 && frame.height < 1000,
+            "{}x{}",
+            frame.width,
+            frame.height
+        );
+        assert!(std::fs::read(&gif).unwrap().starts_with(b"GIF89a"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn record_format_comes_from_the_extension() {
-        assert_eq!(RecordFormat::for_path(Path::new("a.GIF")), Some(RecordFormat::Gif));
-        assert_eq!(RecordFormat::for_path(Path::new("a.mp4")), Some(RecordFormat::Mp4));
+        assert_eq!(
+            RecordFormat::for_path(Path::new("a.GIF")),
+            Some(RecordFormat::Gif)
+        );
+        assert_eq!(
+            RecordFormat::for_path(Path::new("a.mp4")),
+            Some(RecordFormat::Mp4)
+        );
         assert_eq!(RecordFormat::for_path(Path::new("a.mov")), None);
     }
 }

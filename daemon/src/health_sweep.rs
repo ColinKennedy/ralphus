@@ -743,7 +743,10 @@ mod tests {
     fn gh_warns_a_github_project_whose_prs_may_lack_screenshots() {
         let (status, detail) = assess_gh(&gh_ok("2.93.0"), true, || true);
         assert_eq!(status, WARN);
-        assert!(detail.contains("2.99.0") && detail.contains("screenshots or GIFs"), "{detail}");
+        assert!(
+            detail.contains("2.99.0") && detail.contains("screenshots or GIFs"),
+            "{detail}"
+        );
         let (status, detail) = assess_gh(&gh_ok("2.99.0"), true, || false);
         assert_eq!(status, WARN);
         assert!(detail.contains("not logged in"), "{detail}");

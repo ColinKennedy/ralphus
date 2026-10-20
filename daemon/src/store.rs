@@ -2945,6 +2945,7 @@ impl Store {
                 kind          TEXT NOT NULL,
                 describe      TEXT NOT NULL,
                 why           TEXT,
+                origin        TEXT NOT NULL DEFAULT 'inferred',
                 created_at_ms INTEGER NOT NULL
             );
             -- What a live run delivered for an exhibit slot; a re-run

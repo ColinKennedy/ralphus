@@ -2156,6 +2156,12 @@ fn route_for_user(
         ("GET", ["api", "guardians", id, "branches", branch_id, "notes"]) => {
             guardian_branch_notes(daemon, id, branch_id)
         }
+        // ralphus[ignore-endpoint-cli]: board live-actions section's exhibit list; the PR/MR description shows the same slots
+        ("GET", ["api", "guardians", id, "exhibits"]) => guardian_exhibits(daemon, id),
+        // ralphus[ignore-endpoint-cli]: board preview of a captured exhibit file not yet uploaded to the forge
+        ("GET", ["api", "guardians", id, "exhibits", action, slot, "file"]) => {
+            guardian_exhibit_file(daemon, id, action, slot)
+        }
         // ralphus[ignore-endpoint-cli]: board 'Forge rate limit' section of the branch inspector; no CLI equivalent
         (
             "GET",
@@ -13665,6 +13671,116 @@ fn guardian_branch_notes(daemon: &Daemon, id: &str, branch_id: &str) -> Reply {
             "notes": notes,
         }),
     )
+}
+
+/// A review's exhibit slots, each with its owning live action's label and its
+/// current fill, plus the review's resolved exhibit settings.
+fn guardian_exhibits(daemon: &Daemon, id: &str) -> Reply {
+    let guard = daemon.lock();
+    let guardian = match guard.get_guardian(id) {
+        Ok(g) => g,
+        Err(e) => return store_error(&e),
+    };
+    let slots = match guard.guardian_exhibit_slots(id) {
+        Ok(s) => s,
+        Err(e) => return store_error(&e),
+    };
+    let labels: std::collections::HashMap<i64, String> = guard
+        .guardian_live_actions(id)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|a| (a.idx, a.label))
+        .collect();
+    let items: Vec<serde_json::Value> = slots
+        .iter()
+        .map(|s| {
+            serde_json::json!({
+                "action_idx": s.key.action_idx,
+                "slot_idx": s.key.slot_idx,
+                "action_label": labels.get(&s.key.action_idx),
+                "kind": s.request.kind,
+                "describe": s.request.describe,
+                "origin": s.origin,
+                "why": s.why,
+                "delivered_kind": s.fill.as_ref().and_then(|f| f.delivered_kind),
+                "url": s.fill.as_ref().and_then(|f| f.url.clone()),
+                "caption": s.fill.as_ref().and_then(|f| f.caption.clone()),
+                "text": s.fill.as_ref().and_then(|f| f.text.clone()),
+                "missing_reason": s.fill.as_ref().and_then(|f| f.missing_reason.clone()),
+                "has_file": s.fill.as_ref().is_some_and(|f| f.local_path.is_some()),
+                "updated_at_ms": s.fill.as_ref().map(|f| f.updated_at_ms),
+            })
+        })
+        .collect();
+    json(
+        200,
+        &serde_json::json!({
+            "settings": crate::exhibit_settings::from_view(&guardian),
+            "exhibits": items,
+        }),
+    )
+}
+
+/// The largest captured file the board preview endpoint returns.
+const MAX_EXHIBIT_PREVIEW_BYTES: u64 = 20 * 1024 * 1024;
+
+/// One slot's captured file, base64-encoded with its content type, so the
+/// board can preview it before (or without) a forge upload.
+fn guardian_exhibit_file(daemon: &Daemon, id: &str, action: &str, slot: &str) -> Reply {
+    let (Ok(action), Ok(slot)) = (action.parse::<i64>(), slot.parse::<i64>()) else {
+        return error(
+            400,
+            "invalid_value",
+            "action and slot must be integers",
+            vec![],
+        );
+    };
+    let local = match daemon.lock().guardian_exhibit_slots(id) {
+        Ok(slots) => slots
+            .into_iter()
+            .find(|s| s.key.action_idx == action && s.key.slot_idx == slot)
+            .and_then(|s| s.fill)
+            .and_then(|f| f.local_path),
+        Err(e) => return store_error(&e),
+    };
+    let Some(local) = local else {
+        return error(404, "not_found", "no captured file for that slot", vec![]);
+    };
+    let path = std::path::PathBuf::from(&local);
+    // Only files kept in the daemon's own exhibit store are ever served.
+    let root = crate::exhibit_delivery::exhibits_root();
+    let inside = match (path.canonicalize(), root.canonicalize()) {
+        (Ok(file), Ok(root)) => file.starts_with(root),
+        _ => false,
+    };
+    if !inside {
+        return error(404, "not_found", "the captured file is gone", vec![]);
+    }
+    match std::fs::metadata(&path) {
+        Ok(m) if m.len() > MAX_EXHIBIT_PREVIEW_BYTES => {
+            return error(
+                413,
+                "too_large",
+                "the captured file is too large to preview",
+                vec![],
+            );
+        }
+        Err(_) => return error(404, "not_found", "the captured file is gone", vec![]),
+        Ok(_) => {}
+    }
+    match std::fs::read(&path) {
+        Ok(bytes) => {
+            use base64::Engine as _;
+            json(
+                200,
+                &serde_json::json!({
+                    "content_type": crate::exhibit_media::content_type(&path),
+                    "data_base64": base64::engine::general_purpose::STANDARD.encode(bytes),
+                }),
+            )
+        }
+        Err(_) => error(404, "not_found", "the captured file is gone", vec![]),
+    }
 }
 
 /// Epoch milliseconds `delay` from `now_ms`, saturating.

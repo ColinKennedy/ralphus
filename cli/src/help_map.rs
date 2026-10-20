@@ -2371,6 +2371,42 @@ const CELL_CHILDREN: &[HelpNode] = &[
     ),
 ];
 
+const EXHIBIT_CHILDREN: &[HelpNode] = &[
+    // ralphus[ignore-endpoint-cli]: captures this machine's screen or a window with local OS tools; no daemon call
+    node(
+        "screenshot",
+        &[],
+        &["--output [file.png]", "--pid [integer]", "--screen"],
+        "Capture a PNG of one process's main window (--pid) or the whole screen (--screen) on this \
+machine, using the OS's own tools (Windows: PowerShell/.NET, the window need not be in front; \
+macOS: screencapture, screen only; Linux: grim, ImageMagick import or gnome-screenshot). A \
+relative --output lands in $RALPHUS_EXHIBIT_DIR when set -- a live action's exhibit directory. \
+Prints the written path. Never contacts the daemon.",
+        false,
+        false,
+        &[],
+    ),
+    // ralphus[ignore-endpoint-cli]: records this machine's screen or a window with local OS tools; no daemon call
+    node(
+        "record",
+        &[],
+        &[
+            "--fps [integer]",
+            "--output [file.gif|file.mp4]",
+            "--pid [integer]",
+            "--screen",
+            "--seconds [integer]",
+        ],
+        "Record a short GIF or MP4 of one process's window (--pid) or the screen (--screen): \
+ffmpeg when it is on PATH, otherwise timed stills encoded into a GIF (an .mp4 needs ffmpeg). \
+--seconds 1-60 (default 5), --fps 1-30 (default 10). A relative --output lands in \
+$RALPHUS_EXHIBIT_DIR when set. Prints the written path.",
+        true, // slow: blocks for the recording's length
+        false,
+        &[],
+    ),
+];
+
 // ralphus[ignore-endpoint-cli]: prints the CLI's own compiled help_map registered_leaves tree; no daemon call
 const SHOW_CHILDREN: &[HelpNode] = &[node(
     "help-map",
@@ -2910,6 +2946,15 @@ Python's per-selector --environment/--env-file overrides are not yet ported.)",
             false,
             false,
             CELL_CHILDREN,
+        ),
+        node(
+            "exhibit",
+            &[],
+            &[],
+            "Capture screenshots and short recordings for live-action exhibits (see docs/exhibits.md).",
+            false,
+            false,
+            EXHIBIT_CHILDREN,
         ),
         node(
             "show",

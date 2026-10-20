@@ -1429,7 +1429,8 @@ pub fn refresh_pr_with(
     let section = render_section(&runs);
     // A PR whose body carries the details section keeps it current.
     let has_details = pr.description.contains(DETAILS_START);
-    let exhibit_slots = crate::exhibits::pr_slots(store, &pr, &guardian).map_err(|e| e.to_string())?;
+    let exhibit_slots =
+        crate::exhibits::pr_slots(store, &pr, &guardian).map_err(|e| e.to_string())?;
     if section.is_none() && exhibit_slots.is_empty() && !has_details {
         return Ok(RefreshOutcome::Skipped);
     }
@@ -2683,7 +2684,10 @@ live
 
     #[test]
     fn exhibits_upload_through_each_forges_api_then_land_in_their_slot() {
-        for kind in [crate::forge::ForgeKind::GitHub, crate::forge::ForgeKind::GitLab] {
+        for kind in [
+            crate::forge::ForgeKind::GitHub,
+            crate::forge::ForgeKind::GitLab,
+        ] {
             let github = kind == crate::forge::ForgeKind::GitHub;
             let (store, gid, pr_id) =
                 published_fixture(if github { "github" } else { "gitlab" }, "acme/widget");
@@ -2694,7 +2698,8 @@ live
                 if github {
                     let repo = server.recv();
                     urls.push(repo.url().to_string());
-                    repo.respond(tiny_http::Response::from_string(r#"{"id": 42}"#)).unwrap();
+                    repo.respond(tiny_http::Response::from_string(r#"{"id": 42}"#))
+                        .unwrap();
                     let up = server.recv();
                     urls.push(up.url().to_string());
                     up.respond(
@@ -2728,10 +2733,16 @@ live
                 let mut write = server.recv();
                 let mut sent = String::new();
                 std::io::Read::read_to_string(write.as_reader(), &mut sent).unwrap();
-                write.respond(tiny_http::Response::from_string("{}")).unwrap();
+                write
+                    .respond(tiny_http::Response::from_string("{}"))
+                    .unwrap();
                 (urls, sent)
             });
-            let repo = if github { "acme/widget" } else { "acme%2Fwidget" };
+            let repo = if github {
+                "acme/widget"
+            } else {
+                "acme%2Fwidget"
+            };
             let client = std::cell::RefCell::new(Some(mock.client(kind, repo)));
             let outcome =
                 refresh_pr_with(&store, &pr_id, &|_, _| client.borrow_mut().take()).unwrap();
@@ -2767,7 +2778,8 @@ live
             assert!(text.contains("- [x] **Screenshot**"), "{text}");
             // The exhibits section sits before the live-test results.
             assert!(
-                text.find(crate::exhibits::SECTION_START).unwrap() < text.find(SECTION_START).unwrap()
+                text.find(crate::exhibits::SECTION_START).unwrap()
+                    < text.find(SECTION_START).unwrap()
             );
             let fill = store.lock().guardian_exhibit_slots(&gid).unwrap()[0]
                 .fill
@@ -2792,7 +2804,8 @@ live
             ] {
                 let req = server.recv();
                 seen.push(format!("{} {}", req.method(), req.url()));
-                req.respond(tiny_http::Response::from_string(reply)).unwrap();
+                req.respond(tiny_http::Response::from_string(reply))
+                    .unwrap();
             }
             seen
         });

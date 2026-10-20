@@ -1367,9 +1367,8 @@ impl<'a> ExhibitRun<'a> {
             return run;
         }
         if remote {
-            run.unavailable = Some(
-                "exhibits from a remote review machine are not supported yet".to_string(),
-            );
+            run.unavailable =
+                Some("exhibits from a remote review machine are not supported yet".to_string());
             return run;
         }
         let dir = crate::exhibit_delivery::run_dir(&run.root, run.guardian_id, run.run_id);
@@ -2036,10 +2035,16 @@ prompt = "second"
         let seen = agent.seen.lock();
         assert_eq!(seen.len(), 2, "one follow-up for the unreported slot");
         let first = seen[0].prompt.clone().unwrap();
-        assert!(first.contains("- 0.0 (screenshot): the greeting"), "{first}");
+        assert!(
+            first.contains("- 0.0 (screenshot): the greeting"),
+            "{first}"
+        );
         assert!(seen[0].env_overrides.contains_key(crate::exhibits::DIR_ENV));
         let second = seen[1].prompt.clone().unwrap();
-        assert!(second.contains("0.1") && !second.contains("- 0.0"), "{second}");
+        assert!(
+            second.contains("0.1") && !second.contains("- 0.0"),
+            "{second}"
+        );
         // No session id to resume, so the follow-up carries the earlier report.
         assert!(seen[1].resume_agent_session_id.is_none());
         assert!(second.contains("It greets."), "{second}");
@@ -2047,7 +2052,10 @@ prompt = "second"
 
         let now = store.lock().guardian_exhibit_slots(&g.id).unwrap();
         let shot = now[0].fill.as_ref().unwrap();
-        assert_eq!(shot.delivered_kind, Some(crate::exhibits::ExhibitKind::Screenshot));
+        assert_eq!(
+            shot.delivered_kind,
+            Some(crate::exhibits::ExhibitKind::Screenshot)
+        );
         assert_eq!(shot.caption.as_deref(), Some("Hello shown"));
         assert!(Path::new(shot.local_path.as_deref().unwrap()).is_file());
         assert_eq!(
@@ -2096,7 +2104,13 @@ prompt = "second"
         let seen = agent.0.lock();
         assert_eq!(seen.len(), 2);
         assert_eq!(seen[1].resume_agent_session_id.as_deref(), Some("sess-1"));
-        assert!(!seen[1].prompt.clone().unwrap().contains("What the live test found"));
+        assert!(
+            !seen[1]
+                .prompt
+                .clone()
+                .unwrap()
+                .contains("What the live test found")
+        );
         drop(seen);
         let slots = store.lock().guardian_exhibit_slots(&g.id).unwrap();
         assert_eq!(

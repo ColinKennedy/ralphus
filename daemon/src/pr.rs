@@ -2663,6 +2663,85 @@ fn branch_change_context(
     Some((commits, diff_stat, patch))
 }
 
+/// The files `position`'s branch changes (repo-relative), over the same
+/// unique range the PR writer is shown.
+fn branch_changed_paths(root: &Path, guardian: &GuardianView, position: i64) -> Vec<String> {
+    let qualified_base = guardian_merge::qualify_ambiguous_ref(root, &guardian.base_branch);
+    let Ok(base_sha) = git(root, &["rev-parse", &qualified_base]) else {
+        return Vec::new();
+    };
+    let Some((prev, tip)) = commit_range_for(base_sha.trim(), guardian, position) else {
+        return Vec::new();
+    };
+    git(
+        root,
+        &[
+            "diff",
+            "--name-only",
+            "--no-renames",
+            &format!("{prev}..{tip}"),
+        ],
+    )
+    .unwrap_or_default()
+    .lines()
+    .map(str::trim)
+    .filter(|l| !l.is_empty())
+    .map(str::to_string)
+    .collect()
+}
+
+/// Turn the project's `.ralphus.toml` exhibit recipes that match this branch's
+/// changes into exhibit slots (or pending requests), when the review shows
+/// exhibits at all.
+fn apply_exhibit_recipes(
+    store: &crate::store_lock::StoreHandle,
+    guardian: &GuardianView,
+    root: &Path,
+    position: i64,
+    branch_id: &str,
+) {
+    if !crate::exhibit_settings::resolve(store, guardian).enabled {
+        return;
+    }
+    let changed = branch_changed_paths(root, guardian, position);
+    if changed.is_empty() {
+        return;
+    }
+    let (requests, warnings) = crate::exhibits::recipe_requests(root, &changed);
+    for warning in &warnings {
+        crate::rlog!(
+            WARNING,
+            "ralphus [pr] review {} exhibit recipe file skipped: {warning}",
+            guardian.id
+        );
+    }
+    if requests.is_empty() && warnings.is_empty() {
+        return;
+    }
+    let guard = store.lock();
+    let attached = guard
+        .apply_branch_exhibits(
+            &guardian.id,
+            branch_id,
+            crate::exhibits::ExhibitOrigin::Recipe,
+            &requests,
+        )
+        .unwrap_or(0);
+    crate::cartographer::Note::new("guardian")
+        .guardian(&guardian.id)
+        .scope("live_action")
+        .emit(
+            &guard,
+            "exhibit recipes matched for PR",
+            serde_json::json!({
+                "branch_id": branch_id,
+                "recipes": requests.iter().map(|r| r.why.clone()).collect::<Vec<_>>(),
+                "attached_now": attached,
+                "warnings": warnings,
+            }),
+        );
+}
+
 /// The exact trailer ralphus adds to its own commits; it is noise to a PR
 /// reader, so it is removed from commit text before it reaches the writer
 /// agent or the fallback description. Other trailers are kept.
@@ -9017,6 +9096,7 @@ fn submit_stacked_branch_pr(
     {
         Some(existing) => adopt(existing),
         None => {
+            apply_exhibit_recipes(store, guardian, root, position, branch_id);
             let exhibit_note = crate::exhibits::inference_prompt(store, guardian, branch_id);
             let (title, description, reviewer_relevant_prophecies, inferred_exhibits) =
                 resolve_title_description(
@@ -9031,7 +9111,12 @@ fn submit_stacked_branch_pr(
                 );
             if !inferred_exhibits.is_empty() {
                 let guard = store.lock();
-                match guard.apply_inferred_exhibits(id, branch_id, &inferred_exhibits) {
+                match guard.apply_branch_exhibits(
+                    id,
+                    branch_id,
+                    crate::exhibits::ExhibitOrigin::Inferred,
+                    &inferred_exhibits,
+                ) {
                     Ok(attached) => crate::cartographer::Note::new("guardian")
                         .guardian(id)
                         .scope("live_action")
@@ -24568,6 +24653,88 @@ token_env = "RALPHUS_TEST_FORGE_TOKEN"
     }
 
     #[test]
+    fn exhibit_recipes_match_only_the_branchs_own_changed_files() {
+        // Spawns `git diff --name-only` over the branch's unique range
+        // (tagged in proc_counts/tags.toml).
+        let root = tmp_dir("pr-exhibit-recipes");
+        g(&root, &["init", "--initial-branch", "main"]);
+        gwrite(
+            &root,
+            ".ralphus.toml",
+            "[[exhibit.recipe]]\nname = \"flipbook\"\nkind = \"gif\"\ndescribe = \"the scatter flipbook\"\npaths = [\"houdini/**\"]\ncommand = \"hython flip.py\"\n",
+        );
+        g(&root, &["add", "."]);
+        g(&root, &["commit", "--message", "base"]);
+        for (branch, file) in [
+            ("review/a", "docs/a.md"),
+            ("review/b", "houdini/otls/scatter.hda"),
+        ] {
+            g(&root, &["checkout", "-b", branch]);
+            std::fs::create_dir_all(root.join(file).parent().unwrap()).unwrap();
+            gwrite(&root, file, "x\n");
+            g(&root, &["add", "."]);
+            g(&root, &["commit", "--message", file]);
+        }
+        g(&root, &["checkout", "main"]);
+        let store = store();
+        let gid = store
+            .create_guardian("recipes", "main", root.to_str().unwrap())
+            .unwrap();
+        for branch in ["a", "b"] {
+            store.add_guardian_branch(&gid, branch).unwrap();
+        }
+        let ids: Vec<String> = store
+            .get_guardian(&gid)
+            .unwrap()
+            .branches
+            .iter()
+            .map(|b| b.id.clone())
+            .collect();
+        for ((id, review_branch), worktree) in ids
+            .iter()
+            .zip(["review/a", "review/b"])
+            .zip(["worktree-a", "worktree-b"])
+        {
+            store
+                .set_branch_review(&gid, id, review_branch, worktree)
+                .unwrap();
+        }
+        let guardian = store.get_guardian(&gid).unwrap();
+        assert_eq!(
+            branch_changed_paths(&root, &guardian, 0),
+            vec!["docs/a.md".to_string()]
+        );
+        assert_eq!(
+            branch_changed_paths(&root, &guardian, 1),
+            vec!["houdini/otls/scatter.hda".to_string()]
+        );
+        let handle: crate::store_lock::StoreHandle =
+            std::sync::Arc::new(crate::store_lock::StoreMutex::new(store));
+        // Branch a changes nothing under houdini/: no request.
+        apply_exhibit_recipes(&handle, &guardian, &root, 0, &ids[0]);
+        // Branch b does: one pending request, waiting for a live action.
+        apply_exhibit_recipes(&handle, &guardian, &root, 1, &ids[1]);
+        let pending: Vec<(String, String, String)> = handle
+            .lock()
+            .conn
+            .prepare("SELECT branch_id, describe, origin FROM guardian_pending_exhibits")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .map(|row| row.unwrap())
+            .collect();
+        assert_eq!(
+            pending,
+            vec![(
+                ids[1].clone(),
+                "the scatter flipbook (capture with: hython flip.py)".to_string(),
+                "recipe".to_string()
+            )]
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn pr_text_uses_only_the_branchs_unique_range_and_never_the_review_summary() {
         let root = tmp_dir("pr-text-unique-range");
         g(&root, &["init", "--initial-branch", "main"]);
@@ -24717,7 +24884,8 @@ token_env = "RALPHUS_TEST_FORGE_TOKEN"
         let guardian = store.get_guardian(&gid).unwrap();
         let runner = CapturingFailureRunner(Mutex::new(None));
 
-        let (_, description, _, _) = synthesize_pr_text(&runner, &guardian, 0, None, None, &[], None);
+        let (_, description, _, _) =
+            synthesize_pr_text(&runner, &guardian, 0, None, None, &[], None);
 
         assert!(description.contains("add x"), "{description}");
         assert!(
