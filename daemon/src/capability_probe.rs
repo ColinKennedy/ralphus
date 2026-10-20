@@ -146,9 +146,10 @@ fn probe_stdio(command: &str, args: &[String], env: &BTreeMap<String, String>) -
     std::thread::spawn(move || {
         for line in BufReader::new(stdout).lines() {
             let Ok(line) = line else { break };
-            if let Ok(value) = serde_json::from_str::<Value>(line.trim())
-                && tx.send(value).is_err()
-            {
+            let Ok(value) = serde_json::from_str::<Value>(line.trim()) else {
+                continue;
+            };
+            if tx.send(value).is_err() {
                 break;
             }
         }

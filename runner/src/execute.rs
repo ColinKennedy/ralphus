@@ -499,10 +499,11 @@ fn run_with_backend(
     // still contributes what it wrote.
     let mut prophecies = crate::prophecy::ProphecyScanner::new();
 
-    if let Some(capabilities) = spec.capabilities.as_ref()
-        && !capabilities.is_empty()
-        && !backend.supports_capabilities()
-    {
+    let undelivered = spec
+        .capabilities
+        .as_ref()
+        .filter(|capabilities| !capabilities.is_empty() && !backend.supports_capabilities());
+    if let Some(capabilities) = undelivered {
         crate::cartographer::emit_scoped(
             "runner",
             "capabilities not delivered: backend does not support them",

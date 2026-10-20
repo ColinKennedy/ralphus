@@ -182,13 +182,13 @@ fn unmask_entries(incoming: Vec<AgentEnvEntry>, stored: &[AgentEnvEntry]) -> Vec
     incoming
         .into_iter()
         .map(|mut e| {
-            if e.kind == AgentEnvKind::Set
-                && e.value == crate::redact::REDACTED
-                && let Some(old) = stored
+            if e.kind == AgentEnvKind::Set && e.value == crate::redact::REDACTED {
+                let old = stored
                     .iter()
-                    .find(|s| s.key == e.key && s.kind == AgentEnvKind::Set)
-            {
-                e.value.clone_from(&old.value);
+                    .find(|s| s.key == e.key && s.kind == AgentEnvKind::Set);
+                if let Some(old) = old {
+                    e.value.clone_from(&old.value);
+                }
             }
             e
         })
