@@ -84,10 +84,9 @@ So a pool token needs **read access to the repository and nothing else**:
 
 - **Private repositories:** `repo`. Classic tokens have no read-only private-repo
   scope, so this unavoidably grants write too; ralphus will not use it for
-  writes, but the token itself can. A fine-grained token with *Pull requests*,
-  *Commit statuses* and *Checks* set to **Read-only** (plus the automatic
-  *Metadata*) is the least-privileged alternative if your organization allows
-  them.
+  writes, but the token itself can. A read-only
+  [fine-grained token](#fine-grained-tokens) is the least-privileged
+  alternative if your organization allows them.
 
   ![The classic-token scope list with only the repo box (and its sub-scopes) ticked](images/github-poll-pool-token-scopes.png)
 - **Public repositories only:** **no scopes at all.** A classic token with
@@ -95,6 +94,57 @@ So a pool token needs **read access to the repository and nothing else**:
   from 60 to 5,000 requests/hour) and can read any public repository.
 
 Do not tick `workflow` or anything else for a pool token.
+
+## Fine-grained tokens
+
+Fine-grained tokens set per-repository permissions instead of scopes. The
+tightest settings for each token follow; the permission names come from
+GitHub's documented requirements for each endpoint above.
+
+For both tokens:
+
+- **Resource owner:** the account or organization that owns the repository.
+  An organization may have to allow or approve fine-grained tokens first.
+- **Repository access:** "Only select repositories" — the project's
+  repositories, plus your fork if you use [fork routing](fork-workflows.md).
+- Every permission not listed below stays at **No access**, and every
+  account permission stays at **No access**.
+
+### User token
+
+| Repository permission | Level | Why |
+|---|---|---|
+| Metadata | Read-only (set automatically) | Repository lookup |
+| Contents | Read and write | `git push`, reading the PR template |
+| Workflows | Read and write | Pushing changes to `.github/workflows/`; replaces the classic `workflow` scope |
+| Pull requests | Read and write | Opening and updating PRs, comments, labels, PR stacks |
+| Actions | Read and write | Listing and cancelling CI runs, reading job logs |
+| Commit statuses | Read-only | CI status |
+| Checks | Read-only | Check runs |
+
+### Poll-pool token
+
+Private repositories:
+
+| Repository permission | Level |
+|---|---|
+| Metadata | Read-only (set automatically) |
+| Pull requests | Read-only |
+| Commit statuses | Read-only |
+| Checks | Read-only |
+
+Public repositories only: choose "Public Repositories (read-only)" and add no
+permissions.
+
+Unlike a classic pool token, a fine-grained one is genuinely read-only.
+
+### Not confirmed
+
+- **PR stacks:** GitHub's stacks API is new; it is assumed to use the
+  *Pull requests* permission.
+- **Exhibit uploads:** these go through an upload endpoint GitHub does not
+  document, so fine-grained tokens may not work for them at all. If uploads
+  fail with a fine-grained user token, use a classic one.
 
 ## Same or different?
 
