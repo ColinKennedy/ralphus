@@ -21293,6 +21293,7 @@ pub fn serve<A: ToSocketAddrs>(
         std::io::Error::other(e.to_string())
     })?;
     let schema_open_ms = startup_started.elapsed().as_millis();
+    crate::machine_strict::announce(&store);
     crate::cartographer::Note::new("daemon").emit(
         &store,
         format!(

@@ -199,6 +199,11 @@ pub fn run_command_proof_capture_in_shell(
     timeout: Option<Duration>,
     shell: Option<&str>,
 ) -> (bool, String) {
+    if let Err(e) =
+        crate::machine_strict::check_local("command", || format!("{command:?} in {cwd}"))
+    {
+        return (false, e);
+    }
     let span = crate::otel::start_span("proof.command", parent, SpanKind::Internal);
     span.set_attribute("proof.cwd", cwd.to_string());
     span.set_attribute("proof.command", command.to_string());

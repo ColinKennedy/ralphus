@@ -83,6 +83,45 @@ placeholder (`ralphus:new-worktree/<branch>`) and the entity URI
 
 Attempting to register a provider under either name is rejected.
 
+## Machine strict mode (development only)
+
+> **You probably do not want this on a production server.** Strict mode
+> exists for developing ralphus's remote support. It turns every place ralphus
+> still falls back to the daemon's own host into a failed step, so a gap
+> ralphus has not closed yet stops real work instead of degrading quietly.
+
+Work assigned to a remote machine should never run a `git` command, a shell
+command, or an agent on the daemon's host. When some code path still does,
+the work usually "succeeds" -- against the daemon's own checkout -- and
+nothing says so. Strict mode makes that visible:
+
+| | Work assigned to a remote machine runs something locally |
+|---|---|
+| **strict mode off** (default) | Allowed. Logged once per kind (`git`, `command`, `agent`) and machine as a WARNING, so the leak stays visible. |
+| **strict mode on** | Refused. The step fails with a message naming what it tried to run, where, and for which machine. |
+
+Work assigned to `local` (or to no machine) is never checked, and neither is
+work that legitimately belongs on the daemon: forge REST calls, its database,
+Cartographer, reading its own configuration, and invoking providers.
+
+Turn it on in the global `config.toml`:
+
+```toml
+[machine]
+strict = true
+```
+
+`RALPHUS_MACHINE_STRICT=1` (or `0`) overrides the config key, which is how
+tests and CI enable it. Both are read once, so a change needs a daemon
+restart. While it is on, the daemon logs a WARNING at startup saying so.
+
+How it decides: the thread doing a remote-assigned unit of work holds a
+**remote scope** naming the machine (`crate::machine_strict`), and the
+daemon's local `git`, command and agent entry points check it before running
+anything. A scope belongs to one thread, so work handed to another thread is
+not checked -- strict mode can miss a leak that way, but it never fails
+purely local work.
+
 ## Registering a provider
 
 Registration is an **administrative action**, done over the API (or the CLI

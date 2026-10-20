@@ -1718,10 +1718,20 @@ impl MachineRouter {
     }
 }
 
+/// Whether a spec the router is about to run on the daemon host may run
+/// there: refused under machine strict mode when the calling thread is doing
+/// remote work (see [`crate::machine_strict`]).
+fn local_agent_allowed(spec: &RunnerSpec) -> Result<(), String> {
+    crate::machine_strict::check_local("agent", || format!("cell {} in {}", spec.cell_id, spec.cwd))
+}
+
 impl Runner for MachineRouter {
     fn run(&self, spec: &RunnerSpec) -> RunnerResult {
         match self.route(spec) {
-            Ok(None) => self.local.run(spec),
+            Ok(None) => match local_agent_allowed(spec) {
+                Ok(()) => self.local.run(spec),
+                Err(e) => RunnerResult::failure(e),
+            },
             Ok(Some(remote)) => remote.run(spec),
             Err(e) => RunnerResult::failure(e),
         }
@@ -1729,7 +1739,10 @@ impl Runner for MachineRouter {
 
     fn run_cancellable(&self, spec: &RunnerSpec, cancel: &CancelToken) -> RunnerResult {
         match self.route(spec) {
-            Ok(None) => self.local.run_cancellable(spec, cancel),
+            Ok(None) => match local_agent_allowed(spec) {
+                Ok(()) => self.local.run_cancellable(spec, cancel),
+                Err(e) => RunnerResult::failure(e),
+            },
             Ok(Some(remote)) => remote.run_cancellable(spec, cancel),
             Err(e) => RunnerResult::failure(e),
         }

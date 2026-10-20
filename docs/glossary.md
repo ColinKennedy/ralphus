@@ -131,6 +131,8 @@ above: users see "Triage", the code says "Arbiter".
 | **channel** | A provider's *reused transport*: one long-lived process serving many commands instead of a fresh spawn per command. Opt-in per provider (`--channel`), with automatic fallback to per-command spawns. **Deliberately not called a "cell"**, which is already taken above. |
 | **workspace** | A directory *plus the machine it lives on* (`crate::workspace::Workspace`). Introduced because a bare path answers "which folder" but not "which host". |
 | **local** | Reserved machine value meaning the daemon's own host. Also the implicit default. |
+| **machine strict mode** | A **development-only** switch (`[machine] strict`, `RALPHUS_MACHINE_STRICT`) that fails any local git, command or agent run the daemon attempts on behalf of work assigned to a remote machine, instead of letting it fall back to the daemon host. Off by default; not meant for production servers. See `docs/machine-providers.md`. |
+| **remote scope** | `crate::machine_strict::RemoteScope`: the per-thread marker saying "this thread is working for machine X", which strict mode's checks read. |
 | **target** | One statically-configured `[machine.targets.<name>]` entry (RAL-355 Phase 2): a `machine` value plus that machine's durable `remote_root` and runner policy. Config-file-only for v1 (`daemon/src/machine_targets.rs`, global scope only — no project-local override, unlike **agent profile**). A target's `machine` field holds the *full* `<scheme>:<uri>` value, never just the **uri** half, to avoid colliding with that already-taken term. |
 
 ## Capabilities (RAL-695)
