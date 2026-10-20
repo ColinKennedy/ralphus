@@ -13747,7 +13747,7 @@ fn guardian_exhibit_file(daemon: &Daemon, id: &str, action: &str, slot: &str) ->
         return error(404, "not_found", "no captured file for that slot", vec![]);
     };
     let path = std::path::PathBuf::from(&local);
-    // Only files kept in the daemon's own exhibit store are ever served.
+    // Only files kept in this machine's exhibit cache are ever served.
     let root = crate::exhibit_delivery::exhibits_root();
     let inside = match (path.canonicalize(), root.canonicalize()) {
         (Ok(file), Ok(root)) => file.starts_with(root),
@@ -13774,7 +13774,7 @@ fn guardian_exhibit_file(daemon: &Daemon, id: &str, action: &str, slot: &str) ->
             json(
                 200,
                 &serde_json::json!({
-                    "content_type": crate::exhibit_media::content_type(&path),
+                    "content_type": ralphus_runner::exhibit_media::content_type(&path),
                     "data_base64": base64::engine::general_purpose::STANDARD.encode(bytes),
                 }),
             )

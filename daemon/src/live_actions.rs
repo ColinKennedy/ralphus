@@ -875,6 +875,7 @@ pub fn deduplicate_handoffs(
         maximum_timeout: None,
         pass_score: None,
         closing_turn_prompt: None,
+        exhibit: None,
     };
     // Recorded before the agent starts, so the board can follow the
     // generation live -- the same way it follows auto-action generation.
@@ -1156,18 +1157,20 @@ pub fn execute_live_run(
         LIVE_ACTION_READ_ONLY_SYSTEM_PROMPT
     };
     let exhibit_settings = crate::exhibit_settings::resolve(store, req.guardian);
-    let exhibits = ExhibitRun::start(req, &exhibit_settings, ws.machine().is_some());
+    let exhibits = ExhibitRun::start(req, &exhibit_settings, ws.machine());
     let mut prompt = format!("Live action: {}\n\n{}", req.label, req.prompt);
-    if let Some(dir) = exhibits.dir.as_deref() {
-        env.insert(
-            crate::exhibits::DIR_ENV.to_string(),
-            dir.to_string_lossy().to_string(),
-        );
+    if exhibits.active {
+        if let Some(dir) = exhibits.local_dir() {
+            env.insert(
+                crate::exhibits::DIR_ENV.to_string(),
+                dir.to_string_lossy().to_string(),
+            );
+        }
         prompt.push_str("\n\n");
         prompt.push_str(&crate::exhibits::run_prompt_section(
             &req.exhibit_slots,
             &exhibit_settings,
-            dir,
+            exhibits.machine.is_none(),
         ));
     }
     let mut spec = RunnerSpec {
@@ -1218,6 +1221,7 @@ pub fn execute_live_run(
         maximum_timeout: None,
         pass_score: None,
         closing_turn_prompt: None,
+        exhibit: exhibits.capture(),
     };
 
     note(
@@ -1274,7 +1278,12 @@ pub fn execute_live_run(
             .agent_session_id
             .clone()
             .map(|agent_session_id| LiveRunSession {
-                spec: spec.clone(),
+                // A turn resumed later (the recipe check) captures nothing:
+                // this run's exhibits are delivered below.
+                spec: RunnerSpec {
+                    exhibit: None,
+                    ..spec.clone()
+                },
                 agent_session_id,
             });
     }
@@ -1332,59 +1341,68 @@ pub fn execute_live_run(
     done
 }
 
-/// A live run's exhibit side: the directory it saves into, the slots it owns,
-/// and -- once the agent is done -- reading back what it captured.
+/// A live run's exhibit side: the slots it owns, the directory its machine
+/// creates for captures, and -- once the agent is done -- having that machine
+/// deliver what was captured.
 struct ExhibitRun<'a> {
     guardian_id: &'a str,
     run_id: &'a str,
     action_idx: i64,
     slots: &'a [crate::exhibits::ExhibitSlot],
-    /// Where the agent saves exhibits; `None` when the run has no slots or
-    /// cannot capture any (a remote review machine).
-    dir: Option<std::path::PathBuf>,
-    root: std::path::PathBuf,
-    /// Why no directory was set up although the action has slots.
-    unavailable: Option<String>,
+    guardian: &'a crate::guardian::GuardianView,
+    /// The machine the run happens on; `None` for the daemon's own.
+    machine: Option<String>,
+    /// Whether the run captures exhibits at all (it has slots and exhibits
+    /// are on).
+    active: bool,
 }
 
 impl<'a> ExhibitRun<'a> {
     fn start(
         req: &'a LiveRunRequest<'a>,
         settings: &crate::exhibits::ExhibitSettings,
-        remote: bool,
+        machine: Option<&str>,
     ) -> Self {
-        let root = crate::exhibit_delivery::exhibits_root();
-        if !req.exhibit_slots.is_empty() {
-            crate::exhibit_delivery::prune_cache(&root, crate::exhibit_delivery::MAX_CACHE_AGE);
-        }
-        let mut run = Self {
+        Self {
             guardian_id: req.guardian.id.as_str(),
             run_id: req.run_id,
             action_idx: i64::try_from(req.action_index).unwrap_or(i64::MAX),
             slots: &req.exhibit_slots,
-            dir: None,
-            root,
-            unavailable: None,
-        };
-        if req.exhibit_slots.is_empty() || !settings.enabled {
-            return run;
+            guardian: req.guardian,
+            machine: machine.map(str::to_string),
+            active: !req.exhibit_slots.is_empty() && settings.enabled,
         }
-        if remote {
-            run.unavailable =
-                Some("exhibits from a remote review machine are not supported yet".to_string());
-            return run;
+    }
+
+    fn run_ref(&self) -> ralphus_runner::exhibit_upload::RunRef {
+        ralphus_runner::exhibit_upload::RunRef {
+            guardian_id: self.guardian_id.to_string(),
+            run_id: self.run_id.to_string(),
         }
-        let dir = crate::exhibit_delivery::run_dir(&run.root, run.guardian_id, run.run_id);
-        match std::fs::create_dir_all(&dir) {
-            Ok(()) => run.dir = Some(dir),
-            Err(e) => run.unavailable = Some(format!("could not create {}: {e}", dir.display())),
-        }
-        run
+    }
+
+    /// The live run spec's `capture` work: its machine's runner creates the
+    /// run's exhibit directory and names it in the prompt.
+    fn capture(&self) -> Option<ralphus_runner::exhibit_upload::ExhibitWork> {
+        self.active
+            .then(|| ralphus_runner::exhibit_upload::ExhibitWork::Capture(self.run_ref()))
+    }
+
+    /// The run's exhibit directory, when the run is on the daemon's own
+    /// machine (another machine's directory is only known there).
+    fn local_dir(&self) -> Option<std::path::PathBuf> {
+        (self.active && self.machine.is_none()).then(|| {
+            ralphus_runner::exhibit_upload::run_dir(
+                &crate::exhibit_delivery::exhibits_root(),
+                self.guardian_id,
+                self.run_id,
+            )
+        })
     }
 
     /// Read back the run's reports, give the agent one more turn for any slot
-    /// it left unreported, and record every slot's fill. Returns the cost of
-    /// the extra turn.
+    /// it left unreported, have the run's machine deliver the captured files,
+    /// and record every slot's fill. Returns the cost of the extra turn.
     fn finish(
         &self,
         store: &crate::store_lock::StoreHandle,
@@ -1394,25 +1412,9 @@ impl<'a> ExhibitRun<'a> {
         result: &crate::runner::RunnerResult,
         settings: &crate::exhibits::ExhibitSettings,
     ) -> f64 {
-        if self.slots.is_empty() || !settings.enabled {
+        if !self.active {
             return 0.0;
         }
-        let Some(dir) = self.dir.as_deref() else {
-            let reason = self
-                .unavailable
-                .clone()
-                .unwrap_or_else(|| "exhibits are unavailable for this run".to_string());
-            let reports: Vec<_> = self
-                .slots
-                .iter()
-                .map(|s| crate::exhibits::SlotReport::Missing {
-                    key: s.key,
-                    reason: reason.clone(),
-                })
-                .collect();
-            self.record(store, &reports, Path::new(""), settings);
-            return 0.0;
-        };
         let (mut reports, mut ignored) =
             crate::exhibits::parse_reports(&result.summary, self.action_idx, self.slots);
         let mut cost = 0.0;
@@ -1430,7 +1432,7 @@ impl<'a> ExhibitRun<'a> {
             followup.prompt = Some(crate::exhibits::followup_prompt(
                 &missing,
                 settings,
-                dir,
+                self.machine.is_none(),
                 earlier.as_deref(),
             ));
             followup.resume_agent_session_id.clone_from(&resume);
@@ -1476,32 +1478,42 @@ impl<'a> ExhibitRun<'a> {
                 serde_json::json!({ "run_id": self.run_id, "lines": ignored }),
             );
         }
-        self.record(store, &reports, dir, settings);
-        cost
-    }
-
-    fn record(
-        &self,
-        store: &crate::store_lock::StoreHandle,
-        reports: &[crate::exhibits::SlotReport],
-        dir: &Path,
-        settings: &crate::exhibits::ExhibitSettings,
-    ) {
-        let summary = crate::exhibit_delivery::record_run_reports(
+        let files = crate::exhibit_delivery::upload_files(self.slots, &reports);
+        let (outcomes, undelivered) = if files.is_empty() {
+            (Vec::new(), String::new())
+        } else {
+            self.deliver(
+                runner,
+                spec,
+                files,
+                settings,
+                upload_destination(store, self.guardian),
+            )
+        };
+        let summary = crate::exhibit_delivery::record_run(
             store,
             self.guardian_id,
             self.run_id,
             self.slots,
-            reports,
-            dir,
-            &self.root,
-            settings,
-            &crate::exhibit_media::Ffmpeg,
+            &reports,
+            &outcomes,
+            &undelivered,
         );
+        let kept: Vec<_> = outcomes
+            .iter()
+            .filter_map(|o| {
+                o.upload_error.as_ref().map(|e| {
+                    serde_json::json!({
+                        "slot": format!("{}.{}", o.action_idx, o.slot_idx),
+                        "upload_error": e,
+                    })
+                })
+            })
+            .collect();
         note(
             store,
             self.guardian_id,
-            if summary.missing.is_empty() {
+            if summary.missing.is_empty() && kept.is_empty() {
                 crate::logging::LogLevel::INFO
             } else {
                 crate::logging::LogLevel::WARNING
@@ -1509,10 +1521,132 @@ impl<'a> ExhibitRun<'a> {
             "live run exhibits recorded",
             serde_json::json!({
                 "run_id": self.run_id,
+                "machine": self.machine,
                 "delivered": summary.delivered,
                 "missing": summary.missing,
+                "kept_for_later_upload": kept,
             }),
         );
+        cost
+    }
+
+    /// Have the run's machine prepare and upload `files` straight to the
+    /// review's forge: in-process for the daemon's own machine, through the
+    /// runner (with the forge token only in its environment) for another.
+    /// Returns the outcomes and why a file without one went undelivered.
+    fn deliver(
+        &self,
+        runner: &dyn Runner,
+        spec: &RunnerSpec,
+        files: Vec<ralphus_runner::exhibit_upload::UploadFile>,
+        settings: &crate::exhibits::ExhibitSettings,
+        destination: UploadDestination,
+    ) -> (Vec<ralphus_runner::exhibit_upload::SlotOutcome>, String) {
+        use ralphus_runner::exhibit_upload::{ExhibitWork, TOKEN_ENV, UploadRequest};
+        let UploadDestination {
+            target,
+            token,
+            problem: target_problem,
+        } = destination;
+        let request = UploadRequest {
+            run: self.run_ref(),
+            target,
+            target_problem,
+            files,
+            kind_preference: settings.kind_preference.clone(),
+            max_video_seconds: settings.max_video_seconds,
+            keep_undelivered: self.machine.is_none(),
+        };
+        let Some(machine) = self.machine.as_deref() else {
+            let outcomes = ralphus_runner::exhibit_upload::deliver(
+                &request,
+                token.as_deref(),
+                &crate::exhibit_delivery::exhibits_root(),
+                &ralphus_runner::exhibit_media::Ffmpeg,
+            );
+            return (outcomes, String::new());
+        };
+        let mut upload = spec.clone();
+        upload.cell_id = format!("{}-exhibit-upload", spec.cell_id);
+        upload.prompt = None;
+        upload.command = None;
+        upload.resume_agent_session_id = None;
+        upload.assigned_agent_session_id = None;
+        upload.closing_turn_prompt = None;
+        // Only the token: none of the agent's or the review's environment.
+        upload.env_overrides = token
+            .map(|t| std::collections::BTreeMap::from([(TOKEN_ENV.to_string(), t)]))
+            .unwrap_or_default();
+        upload.exhibit = Some(ExhibitWork::Upload(request));
+        let result = runner.run(&upload);
+        if result.status != "done" {
+            return (
+                Vec::new(),
+                format!(
+                    "the runner on {machine} could not deliver it: {}",
+                    result.error.as_deref().unwrap_or(&result.summary)
+                ),
+            );
+        }
+        match serde_json::from_str(&result.summary) {
+            Ok(outcomes) => (
+                outcomes,
+                format!("the runner on {machine} did not report delivering it"),
+            ),
+            Err(e) => (
+                Vec::new(),
+                format!(
+                    "the runner on {machine} sent no upload report ({e}); it may be older than \
+                     the daemon and need updating"
+                ),
+            ),
+        }
+    }
+}
+
+/// Where a review's exhibits are uploaded, and the token to do it with.
+struct UploadDestination {
+    target: Option<ralphus_runner::exhibit_upload::UploadTarget>,
+    token: Option<String>,
+    /// Why there is no target.
+    problem: Option<String>,
+}
+
+/// The upload destination of a review's exhibits: the repository of the
+/// forge client that owns its PR stack (the fork's when the project has a
+/// registered fork, else the parent's), where its PRs/MRs are filed.
+fn upload_destination(
+    store: &crate::store_lock::StoreHandle,
+    guardian: &crate::guardian::GuardianView,
+) -> UploadDestination {
+    let root = Path::new(&guardian.git_root);
+    let client = crate::pr::forge_client_for_stack(
+        store,
+        root,
+        &guardian.base_branch,
+        &crate::config::resolve_forge(root),
+        guardian.owner.as_deref(),
+    );
+    let Some(client) = client else {
+        return UploadDestination {
+            target: None,
+            token: None,
+            problem: Some(
+                "no forge client could be resolved for this review's repository".to_string(),
+            ),
+        };
+    };
+    match client.upload_target() {
+        Ok((target, token)) => UploadDestination {
+            target: Some(target),
+            token: Some(token),
+            problem: None,
+        },
+        Err(e) => UploadDestination {
+            target: None,
+            token: None,
+            problem: Some(format!("cannot upload to {}: {e}", client.repo_label())),
+        },
     }
 }
 
@@ -1979,6 +2113,8 @@ prompt = "second"
     impl Runner for ExhibitAgent {
         fn run(&self, spec: &RunnerSpec) -> crate::runner::RunnerResult {
             if let Some(dir) = spec.env_overrides.get(crate::exhibits::DIR_ENV) {
+                // The runner creates the directory; this fake stands in for it.
+                std::fs::create_dir_all(dir).unwrap();
                 std::fs::write(Path::new(dir).join("view.png"), b"\x89PNG").unwrap();
             }
             let mut seen = self.seen.lock();
@@ -1995,7 +2131,7 @@ prompt = "second"
     #[test]
     fn a_live_run_captures_its_slots_and_asks_once_more_for_the_ones_it_skipped() {
         let (store, g, dir) = setup("exhibits");
-        let root = crate::exhibit_media::tests::TestDir::new();
+        let root = crate::exhibit_delivery::TestDir::new();
         crate::exhibit_delivery::set_test_root(root.path());
         store
             .lock()
@@ -2043,6 +2179,11 @@ prompt = "second"
             "{first}"
         );
         assert!(seen[0].env_overrides.contains_key(crate::exhibits::DIR_ENV));
+        assert!(first.contains(ralphus_runner::exhibit_upload::DIR_PLACEHOLDER));
+        assert!(matches!(
+            seen[0].exhibit,
+            Some(ralphus_runner::exhibit_upload::ExhibitWork::Capture(_))
+        ));
         let second = seen[1].prompt.clone().unwrap();
         assert!(
             second.contains("0.1") && !second.contains("- 0.0"),
@@ -2060,11 +2201,162 @@ prompt = "second"
             Some(crate::exhibits::ExhibitKind::Screenshot)
         );
         assert_eq!(shot.caption.as_deref(), Some("Hello shown"));
+        // This review has no forge, so the daemon-machine capture is kept for
+        // an upload once its PR exists.
         assert!(Path::new(shot.local_path.as_deref().unwrap()).is_file());
+        assert!(shot.url.is_none() && shot.missing_reason.is_none());
         assert_eq!(
             now[1].fill.as_ref().unwrap().missing_reason.as_deref(),
             Some("the greeting does not animate")
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A remote machine's runner: records each spec and answers with `reply`.
+    struct RemoteRunner {
+        reply: crate::runner::RunnerResult,
+        seen: parking_lot::Mutex<Vec<RunnerSpec>>,
+    }
+
+    impl Runner for RemoteRunner {
+        fn run(&self, spec: &RunnerSpec) -> crate::runner::RunnerResult {
+            self.seen.lock().push(spec.clone());
+            self.reply.clone()
+        }
+    }
+
+    fn done(summary: &str) -> crate::runner::RunnerResult {
+        let mut result = crate::runner::RunnerResult::failure("");
+        result.status = "done".to_string();
+        result.error = None;
+        result.summary = summary.to_string();
+        result
+    }
+
+    fn one_gif() -> Vec<ralphus_runner::exhibit_upload::UploadFile> {
+        vec![ralphus_runner::exhibit_upload::UploadFile {
+            action_idx: 0,
+            slot_idx: 0,
+            requested: crate::exhibits::ExhibitKind::Gif,
+            file: "a.gif".into(),
+        }]
+    }
+
+    fn remote_live_spec(cwd: &str) -> RunnerSpec {
+        RunnerSpec::for_command_proof("s", "t", "c", cwd, "true", "claude", None)
+            .with_machine(Some("ssh:box".into()))
+    }
+
+    #[test]
+    fn a_remote_run_uploads_from_its_own_machine_with_only_the_token() {
+        use ralphus_runner::exhibit_upload::{ExhibitWork, TOKEN_ENV, UploadForge, UploadTarget};
+        let (store, g, dir) = setup("exhibits-remote");
+        store
+            .lock()
+            .add_exhibit_requests(
+                &g.id,
+                0,
+                crate::exhibits::ExhibitOrigin::Handoff,
+                &[(
+                    crate::exhibits::ExhibitRequest {
+                        kind: crate::exhibits::ExhibitKind::Gif,
+                        describe: "it moving".into(),
+                    },
+                    None,
+                )],
+            )
+            .unwrap();
+        let cwd = dir.to_string_lossy().to_string();
+        let mut req = request(&g, &cwd, false);
+        req.exhibit_slots = store.lock().guardian_exhibit_slots(&g.id).unwrap();
+        let settings = crate::exhibits::ExhibitSettings::default();
+        let run = ExhibitRun::start(&req, &settings, Some("ssh:box"));
+        assert!(
+            run.local_dir().is_none(),
+            "the daemon cannot name a remote path"
+        );
+        assert!(run.capture().is_some());
+        let mut live = remote_live_spec(&cwd);
+        live.env_overrides
+            .insert("ANTHROPIC_API_KEY".into(), "agent-secret".into());
+        let runner = RemoteRunner {
+            reply: done(
+                r#"[{"action_idx":0,"slot_idx":0,"delivered_kind":"gif","url":"https://forge/a.gif"}]"#,
+            ),
+            seen: parking_lot::Mutex::new(Vec::new()),
+        };
+        let (outcomes, _) = run.deliver(
+            &runner,
+            &live,
+            one_gif(),
+            &settings,
+            UploadDestination {
+                target: Some(UploadTarget {
+                    forge: UploadForge::Github,
+                    api_base: "https://api.github.com".into(),
+                    repo_path: "acme/w".into(),
+                    repository_id: Some(9),
+                }),
+                token: Some("forge-token".into()),
+                problem: None,
+            },
+        );
+        assert_eq!(outcomes[0].url.as_deref(), Some("https://forge/a.gif"));
+        let seen = runner.seen.lock();
+        let upload = &seen[0];
+        assert_eq!(upload.machine.as_deref(), Some("ssh:box"));
+        assert!(upload.prompt.is_none() && upload.command.is_none());
+        assert_eq!(
+            upload.env_overrides,
+            std::collections::BTreeMap::from([(TOKEN_ENV.to_string(), "forge-token".to_string())]),
+            "the token and nothing of the agent's environment"
+        );
+        let Some(ExhibitWork::Upload(request)) = &upload.exhibit else {
+            panic!("not an upload: {:?}", upload.exhibit);
+        };
+        assert!(
+            !request.keep_undelivered,
+            "nothing waits on a remote machine"
+        );
+        let wire = serde_json::to_string(upload).unwrap();
+        assert!(
+            !wire.contains("forge-token"),
+            "the token never enters the spec: {wire}"
+        );
+        drop(seen);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_remote_runner_that_cannot_upload_leaves_a_reason() {
+        let (store, g, dir) = setup("exhibits-remote-old");
+        let cwd = dir.to_string_lossy().to_string();
+        let req = request(&g, &cwd, false);
+        let settings = crate::exhibits::ExhibitSettings::default();
+        let run = ExhibitRun::start(&req, &settings, Some("ssh:box"));
+        for reply in [
+            crate::runner::RunnerResult::failure("exactly one of prompt/command must be set"),
+            done("It greets."),
+        ] {
+            let runner = RemoteRunner {
+                reply,
+                seen: parking_lot::Mutex::new(Vec::new()),
+            };
+            let (outcomes, undelivered) = run.deliver(
+                &runner,
+                &remote_live_spec(&cwd),
+                one_gif(),
+                &settings,
+                UploadDestination {
+                    target: None,
+                    token: None,
+                    problem: Some("no forge".into()),
+                },
+            );
+            assert!(outcomes.is_empty());
+            assert!(undelivered.contains("ssh:box"), "{undelivered}");
+        }
+        drop(store);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2082,7 +2374,7 @@ prompt = "second"
             }
         }
         let (store, g, dir) = setup("exhibits-resume");
-        let root = crate::exhibit_media::tests::TestDir::new();
+        let root = crate::exhibit_delivery::TestDir::new();
         crate::exhibit_delivery::set_test_root(root.path());
         store
             .lock()

@@ -127,6 +127,9 @@ pub struct CellSpec {
     /// RAL-695: the MCP servers and skills enabled for this agent, resolved
     /// daemon-side. `None` when the key is absent.
     pub capabilities: Option<crate::capabilities::CapabilitySet>,
+    /// A live run's exhibit work: create its directory before the agent
+    /// runs, or upload what it captured instead of running anything.
+    pub exhibit: Option<crate::exhibit_upload::ExhibitWork>,
 }
 
 impl CellSpec {
@@ -197,8 +200,20 @@ impl CellSpec {
         let capabilities = field(obj, "capabilities")
             .map(|v| crate::capabilities::CapabilitySet::from_value(v).map_err(SpecError))
             .transpose()?;
+        let exhibit = field(obj, "exhibit")
+            .map(|v| {
+                serde_json::from_value::<crate::exhibit_upload::ExhibitWork>(v.clone())
+                    .map_err(|e| SpecError(format!("exhibit is invalid: {e}")))
+            })
+            .transpose()?;
 
-        if prompt.is_some() == command.is_some() {
+        let uploading = matches!(exhibit, Some(crate::exhibit_upload::ExhibitWork::Upload(_)));
+        if uploading && (prompt.is_some() || command.is_some()) {
+            return Err(SpecError(
+                "an exhibit upload sets neither prompt nor command".to_string(),
+            ));
+        }
+        if !uploading && prompt.is_some() == command.is_some() {
             return Err(SpecError(
                 "exactly one of prompt/command must be set".to_string(),
             ));
@@ -240,6 +255,7 @@ impl CellSpec {
             waypoint_context,
             closing_turn_prompt,
             capabilities,
+            exhibit,
         })
     }
 }
@@ -572,6 +588,43 @@ mod tests {
         v["command"] = serde_json::json!("echo hi");
         let err = CellSpec::from_json(&v.to_string()).unwrap_err();
         assert!(err.0.contains("exactly one"));
+    }
+
+    fn upload_work() -> serde_json::Value {
+        serde_json::json!({"upload": {
+            "run": {"guardian_id": "g", "run_id": "r"},
+            "files": [],
+            "kind_preference": ["gif"],
+            "max_video_seconds": 5,
+        }})
+    }
+
+    #[test]
+    fn an_exhibit_upload_sets_neither_prompt_nor_command() {
+        let mut v = base();
+        v["exhibit"] = upload_work();
+        let err = CellSpec::from_json(&v.to_string()).unwrap_err();
+        assert!(err.0.contains("neither prompt nor command"), "{}", err.0);
+        v.as_object_mut().unwrap().remove("prompt");
+        let spec = CellSpec::from_json(&v.to_string()).unwrap();
+        assert!(matches!(
+            spec.exhibit,
+            Some(crate::exhibit_upload::ExhibitWork::Upload(_))
+        ));
+    }
+
+    #[test]
+    fn an_exhibit_capture_rides_on_a_prompt_cell() {
+        let mut v = base();
+        v["exhibit"] = serde_json::json!({"capture": {"guardian_id": "g", "run_id": "r"}});
+        let spec = CellSpec::from_json(&v.to_string()).unwrap();
+        assert!(matches!(
+            spec.exhibit,
+            Some(crate::exhibit_upload::ExhibitWork::Capture(_))
+        ));
+        v["exhibit"] = serde_json::json!({"hologram": {}});
+        let err = CellSpec::from_json(&v.to_string()).unwrap_err();
+        assert!(err.0.contains("exhibit"), "{}", err.0);
     }
 
     #[test]

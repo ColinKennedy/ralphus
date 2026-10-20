@@ -13,8 +13,8 @@ a Qt desktop app, anything with output a person would look at.
    lines like
 
    ```
-   EXHIBIT: gif | dragging the density slider from 0 to 1 thins the points
-   EXHIBIT: screenshot | the viewport at density 0.5
+   EXHIBIT: gif | dragging the zoom slider from 0 to 1 magnifies the chart
+   EXHIBIT: screenshot | the chart at 50% zoom
    ```
 
    Kinds are `gif`, `video`, `screenshot` and `output` (text). The agent is
@@ -48,8 +48,11 @@ a Qt desktop app, anything with output a person would look at.
    kind = "gif"                      # gif | video | screenshot | output
    describe = "the checkout flow in tests/e2e/smoke.spec.ts"
    paths = ["src/**", "*.tsx"]      # relative to this .ralphus.toml's folder
-   command = "node tools/record_flow.js --out $RALPHUS_EXHIBIT_DIR"
+   command = "node tools/record_flow.js --out <<RALPHUS_EXHIBIT_DIR>>"
    ```
+
+   `<<RALPHUS_EXHIBIT_DIR>>` in a recipe's `command` becomes the run's exhibit
+   directory on whichever machine runs the live action.
 
    When a PR is written, each changed file is checked against the recipes in
    the `.ralphus.toml` files from its own folder up to the repository root;
@@ -61,20 +64,37 @@ a Qt desktop app, anything with output a person would look at.
    `infer_exhibits`.
 
 4. **The live run captures them.** The run's prompt lists its own action's
-   slots and gives it a directory (`$RALPHUS_EXHIBIT_DIR`); the agent saves a
-   file per slot and reports it with a `RALPHUS_EXHIBIT:` line. Slots it
+   slots and names a directory, which the runner creates on the machine
+   running the live action (the review's machine, local or remote) in that
+   machine's per-user cache; on the daemon's own machine
+   `$RALPHUS_EXHIBIT_DIR` names it too. The agent saves a file per slot and
+   reports it with a `RALPHUS_EXHIBIT:` line. Slots it
    leaves unreported get one more turn -- the same agent session resumed on
    claude-code, codex and pi; a fresh run, given the first run's report, on
    backends that cannot resume (ollama). A run can only fill its own
    action's slots.
 
-5. **Files are fitted and uploaded.** The capturing machine fits each file to
-   what both forges embed (see limits below), stepping down the review's kind
-   preference when it cannot -- a GIF that will not shrink under 10 MiB
-   becomes a video, then a still. When the description is next written the
-   file is uploaded through the forge's REST API and the slot's block is
-   replaced with the image or player. A re-run replaces a slot's exhibit (on
-   GitLab the old upload is deleted once the new one is in).
+5. **The capturing machine fits and uploads them.** When the live run ends,
+   the machine that ran it fits each file to what both forges embed (see
+   limits below; trimming and converting use `ffmpeg` when that machine has
+   it), stepping down the review's kind preference when it cannot -- a GIF
+   that will not shrink under 10 MiB becomes a video, then a still. It then
+   uploads the file straight to the forge's REST API, into the repository the
+   review's PRs/MRs are filed in -- an upload needs no PR/MR to exist yet.
+   The daemon never receives the file: it records the URL, and when the
+   description is next written the slot's block shows the image or player.
+   The forge token reaches a remote machine only in the environment of that
+   one upload, never in the spec the runner reads or the agent's
+   environment. A re-run replaces a slot's exhibit (on GitLab the old upload
+   is deleted once the new one is in).
+
+   When a run on the daemon's own machine cannot upload yet (no forge token,
+   the forge refused), its file is kept in the daemon machine's cache and
+   uploaded when the PR/MR description is next written, with the `gh`
+   fallback below. A remote machine keeps nothing: a file it cannot upload is
+   reported missing with the reason. The remote machine's `ralphus-runner`
+   must be at least as new as the daemon for this; an older one leaves the
+   slots missing with a note saying so.
 
 ## Capturing
 
@@ -111,7 +131,8 @@ with the title for those.
 | Delete an upload | not possible | yes |
 | Private repo | file is private (anonymous 404) | file is private (sign-in) |
 
-GitHub uploads use the token ralphus already has. When that upload fails and
+GitHub uploads use the token ralphus already has. For a live run on the
+daemon's own machine, when that upload fails and
 `gh` 2.99+ is installed and logged in, `gh pr edit --attach` is the fallback
 (ralphus restores the description afterwards, so it stays the only writer of
 what the description says). `ralphus check health` warns a GitHub project
@@ -137,8 +158,6 @@ or the board's review and project settings.
 
 ## Limits of this version
 
-- Live runs on a **remote review machine** do not capture exhibits yet; their
-  slots are marked "not supported yet".
 - Before/after comparisons are not captured.
 - A slot whose markers someone edited by hand is skipped (and logged), never
   rewritten.

@@ -34,59 +34,7 @@ const DESCRIBE_MAX_CHARS: usize = 300;
 /// Longest text excerpt an `output` slot shows.
 const OUTPUT_MAX_CHARS: usize = 4_000;
 
-/// What a slot asks to show. `Gif`, `Video` and `Screenshot` are visual and
-/// are delivered in the review's preference order; `Output` is text, shown
-/// inline and never uploaded.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize)]
-#[serde(rename_all = "lowercase")]
-pub enum ExhibitKind {
-    Gif,
-    Video,
-    Screenshot,
-    Output,
-}
-
-impl ExhibitKind {
-    /// Every kind, in declaration order.
-    pub const ALL: [ExhibitKind; 4] = [Self::Gif, Self::Video, Self::Screenshot, Self::Output];
-
-    /// The stored/config lowercase name.
-    #[must_use]
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Gif => "gif",
-            Self::Video => "video",
-            Self::Screenshot => "screenshot",
-            Self::Output => "output",
-        }
-    }
-
-    /// Parse a kind name, ignoring case and surrounding space.
-    #[must_use]
-    pub fn parse(name: &str) -> Option<Self> {
-        let name = name.trim();
-        Self::ALL
-            .into_iter()
-            .find(|k| k.as_str().eq_ignore_ascii_case(name))
-    }
-
-    /// Whether this kind is a picture or recording (everything but `output`).
-    #[must_use]
-    pub fn is_visual(self) -> bool {
-        self != Self::Output
-    }
-
-    /// How the kind is named in a PR/MR description.
-    #[must_use]
-    pub fn display(self) -> &'static str {
-        match self {
-            Self::Gif => "GIF",
-            Self::Video => "Video",
-            Self::Screenshot => "Screenshot",
-            Self::Output => "Output",
-        }
-    }
-}
+pub use ralphus_core::exhibit_recipes::ExhibitKind;
 
 /// Where a request came from. Earlier origins win when a PR's slot cap cuts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
@@ -231,8 +179,10 @@ pub struct ExhibitFill {
     pub text: Option<String>,
     /// Why nothing was delivered.
     pub missing_reason: Option<String>,
-    /// The captured file, kept in the daemon's state directory until it is
-    /// uploaded.
+    /// A capture waiting in the daemon machine's exhibit cache for a later
+    /// upload: set only for a live run on the daemon's own machine whose
+    /// upload could not happen when the run ended (a run's machine uploads
+    /// its captures itself, so a remote run never has one).
     pub local_path: Option<String>,
     /// The forge's id for the upload, when the forge can delete uploads
     /// (GitLab); used to remove the file a re-run replaces.
@@ -1029,7 +979,9 @@ impl crate::store::Store {
 /// The reply marker a live-action agent reports one slot under.
 pub const REPORT_MARKER: &str = "RALPHUS_EXHIBIT:";
 
-/// The environment variable naming the directory a run saves exhibits into.
+/// The environment variable naming the directory a run saves exhibits into,
+/// set for a run on the daemon's own machine (the daemon cannot know the
+/// directory's path on another machine).
 pub const DIR_ENV: &str = "RALPHUS_EXHIBIT_DIR";
 
 /// How a slot is named to an agent: `<action>.<slot>`.
@@ -1039,11 +991,14 @@ pub fn slot_label(key: SlotKey) -> String {
 }
 
 /// The prompt section that asks a live run to capture its action's slots.
+/// The directory is named by `ralphus_runner::exhibit_upload::DIR_PLACEHOLDER`,
+/// which the runner on the run's machine replaces with the directory it
+/// created there; `dir_env` says whether [`DIR_ENV`] names it too.
 #[must_use]
 pub fn run_prompt_section(
     slots: &[ExhibitSlot],
     settings: &ExhibitSettings,
-    dir: &std::path::Path,
+    dir_env: bool,
 ) -> String {
     let order = settings
         .kind_preference
@@ -1054,15 +1009,26 @@ pub fn run_prompt_section(
     let mut out = format!(
         "## Exhibits for the reviewer\n\
 After testing, capture what a code reviewer must see, one file per item below, \
-saved in {} (also in ${DIR_ENV}). Capture the final visible result, not the setup. \
+saved in {}{}. Capture the final visible result, not the setup. \
+For an app, capture just its window with the title bar, not the whole screen; on a \
+display with no window manager (a bare Xvfb) start one first (`openbox &`, `xfwm4 &` \
+or `twm &`, whichever is installed) so the window has a title bar. On X11, \
+`import -frame -window <id>` keeps the title bar (plain `-window` drops it), and a \
+whole-screen shot of a bare display is cropped to its window automatically. \
 For a visual item deliver the first kind of {order} that shows it; keep any video \
 under {} seconds and any GIF short (a few seconds, small window). For an output \
 item save the relevant text as a .txt file. If the steps you ran did not show an \
 item, run whatever else shows it now. Use the project's own capture tools when it has \
-them; otherwise `ralphus exhibit screenshot --pid <process id> -o <name>.png` or \
-`ralphus exhibit record --pid <process id> --seconds 5 -o <name>.gif` (or --screen \
+them; otherwise, when the `ralphus` command is available, \
+`ralphus exhibit screenshot --pid <process id> -o <dir>/<name>.png` or \
+`ralphus exhibit record --pid <process id> --seconds 5 -o <dir>/<name>.gif` (or --screen \
 instead of --pid) captures a window you started into that directory.\n",
-        dir.display(),
+        ralphus_runner::exhibit_upload::DIR_PLACEHOLDER,
+        if dir_env {
+            format!(" (also in ${DIR_ENV})")
+        } else {
+            String::new()
+        },
         settings.max_video_seconds,
     );
     for slot in slots {
@@ -1089,7 +1055,7 @@ lines before the RALPHUS_LIVE_RESULT line."
 pub fn followup_prompt(
     missing: &[ExhibitSlot],
     settings: &ExhibitSettings,
-    dir: &std::path::Path,
+    dir_env: bool,
     earlier_report: Option<&str>,
 ) -> String {
     let mut out = String::from(
@@ -1101,7 +1067,7 @@ now, running whatever your test skipped. Do not change any code.\n\n",
         out.push_str(report.trim());
         out.push_str("\n\n");
     }
-    out.push_str(&run_prompt_section(missing, settings, dir));
+    out.push_str(&run_prompt_section(missing, settings, dir_env));
     out
 }
 
@@ -1188,21 +1154,6 @@ pub fn parse_reports(
         }
     }
     (kept, ignored)
-}
-
-/// The file a report names, when it really is a regular file directly inside
-/// `dir` (no `..`, no absolute path, no symlink escaping it).
-#[must_use]
-pub fn resolve_reported_file(dir: &std::path::Path, file: &str) -> Option<std::path::PathBuf> {
-    let name = std::path::Path::new(file).file_name()?;
-    if std::path::Path::new(file).components().count() != 1 {
-        return None;
-    }
-    let path = dir.join(name);
-    let canonical_dir = dir.canonicalize().ok()?;
-    let canonical = path.canonicalize().ok()?;
-    (canonical.parent() == Some(canonical_dir.as_path()) && canonical.is_file())
-        .then_some(canonical)
 }
 
 // ---- rendering --------------------------------------------------------------
@@ -1763,22 +1714,6 @@ mod tests {
     }
 
     #[test]
-    fn a_reported_file_must_sit_directly_in_the_run_directory() {
-        let dir = crate::exhibit_media::tests::TestDir::new();
-        std::fs::write(dir.path().join("ok.png"), b"x").unwrap();
-        std::fs::create_dir_all(dir.path().join("sub")).unwrap();
-        std::fs::write(dir.path().join("sub").join("deep.png"), b"x").unwrap();
-        assert!(resolve_reported_file(dir.path(), "ok.png").is_some());
-        assert!(resolve_reported_file(dir.path(), "sub/deep.png").is_none());
-        assert!(resolve_reported_file(dir.path(), "../ok.png").is_none());
-        assert!(resolve_reported_file(dir.path(), "missing.png").is_none());
-        assert!(
-            resolve_reported_file(dir.path(), "sub").is_none(),
-            "a directory is not a file"
-        );
-    }
-
-    #[test]
     fn the_run_prompt_names_every_slot_the_order_and_the_report_format() {
         let slots = vec![
             slot(3, 0, ExhibitKind::Gif, "drag it"),
@@ -1789,18 +1724,21 @@ mod tests {
             max_video_seconds: 9,
             ..ExhibitSettings::default()
         };
-        let text = run_prompt_section(&slots, &settings, std::path::Path::new("/tmp/ex"));
+        let text = run_prompt_section(&slots, &settings, true);
         assert!(text.contains("- 3.0 (gif): drag it"));
         assert!(text.contains("- 3.1 (output): the log"));
         assert!(text.contains("video, then gif"));
         assert!(text.contains("under 9 seconds"));
         assert!(text.contains(REPORT_MARKER));
-        let follow = followup_prompt(
-            &slots[..1],
-            &settings,
-            std::path::Path::new("/tmp/ex"),
-            Some("it worked"),
+        assert!(text.contains("just its window with the title bar"));
+        assert!(text.contains(ralphus_runner::exhibit_upload::DIR_PLACEHOLDER));
+        let env = format!("${DIR_ENV}");
+        assert!(text.contains(&env));
+        assert!(
+            !run_prompt_section(&slots, &settings, false).contains(&env),
+            "another machine's directory is not in the daemon's environment"
         );
+        let follow = followup_prompt(&slots[..1], &settings, false, Some("it worked"));
         assert!(
             follow.contains("still missing")
                 && follow.contains("it worked")
