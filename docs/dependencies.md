@@ -188,10 +188,12 @@ gives each of those sub-checks its own catalog id (`remote-resolve`,
 `remote-git-version`, `remote-git-identity-name`, `remote-git-identity-email`,
 `remote-push-credentials`, `remote-runner`), every one of them `OnDemand`
 (never part of the daemon's hourly background sweep — see
-`daemon/src/health_sweep.rs`'s module doc comment). `remote-push-credentials`
-and `remote-runner` are *documented-unverified*: both always report a `warn`
-explaining why no safe, non-mutating check exists yet, rather than a real
-pass/fail.
+`daemon/src/health_sweep.rs`'s module doc comment). `remote-runner` runs
+`<runner_command> --version` on the machine for an installed runner, and for
+an uploaded one checks that its artifacts exist on the daemon host.
+`remote-push-credentials` is *documented-unverified*: it always reports a
+`warn` explaining why no safe, non-mutating check exists yet, rather than a
+real pass/fail.
 
 ## 3. Optional / conditional dependencies
 

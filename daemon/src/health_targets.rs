@@ -6,16 +6,13 @@
 //! and without expanding the SSH provider's `run` verb beyond git (a
 //! security-relevant restriction `ssh-provider/src/fileops.rs` imposes
 //! deliberately): SSH reachability, `capabilities`, the remote-root
-//! readiness probe, git version, and git identity. Two checks are
-//! *documented as unverified* rather than genuinely probed, and always
-//! report `warn` with an explanation instead of a real pass/fail --
-//! push-credential verification (no safe, non-mutating way to confirm push
-//! authorization exists yet) and, as of RAL-416, remote runner-executable
-//! resolution (`runner`, catalog id `remote-runner`): confirming the
-//! configured `runner_command` resolves on the remote would need the SSH
-//! provider's `run` verb to accept an arbitrary program, the same
-//! remote-command-execution scope question `run`'s git-only restriction was
-//! deliberately drawn to avoid. Not implemented at all here -- see each
+//! readiness probe, git version, git identity, and the runner (`runner`,
+//! catalog id `remote-runner`): an installed runner must answer
+//! `--version` on the machine, an uploaded one needs its artifacts on the
+//! daemon host. One check is *documented as unverified* rather than genuinely
+//! probed, and always reports `warn` with an explanation instead of a real
+//! pass/fail -- push-credential verification (no safe, non-mutating way to
+//! confirm push authorization exists yet). Not implemented at all here -- see each
 //! check's own comment or `REMOTE_IMPROVEMENTS.local.md`'s Phase 9 notes for
 //! why: remote clock/timezone skew (no non-git remote command verb exists to
 //! ask for it) and project-specific clone-URL reachability (needs project
@@ -105,6 +102,91 @@ fn capability_check(caps: &Capabilities) -> TargetCheck {
         status: PASS,
         detail: parts.join(", "),
         id: ID_REMOTE_CAPABILITIES,
+    }
+}
+
+/// Whether `target`'s runner is usable: an installed runner must answer
+/// `--version` as `ralphus-runner` on the machine; an uploaded one is copied
+/// from the daemon host on first use, so its artifacts must exist here.
+fn runner_check(
+    provider: &crate::remote_runner::ProviderRunner,
+    spec: &RunnerSpec,
+    target: &crate::machine_targets::MachineTarget,
+) -> TargetCheck {
+    let check = |status, detail: String| TargetCheck {
+        name: "runner".to_string(),
+        status,
+        detail,
+        id: ID_REMOTE_RUNNER,
+    };
+    match target.runner_mode {
+        crate::machine_targets::RunnerMode::Installed => {
+            // An empty `program` hands the provider one authored shell
+            // command, as `Workspace::run_command` does.
+            let req = RunRequest {
+                cwd: target.remote_root.clone(),
+                program: String::new(),
+                args: vec![format!("{} --version", target.runner_command)],
+                env: std::collections::BTreeMap::new(),
+                shell: None,
+            };
+            match provider.run_vcs(&req, spec) {
+                Ok(out) if out.trim_start().starts_with("ralphus-runner") => {
+                    check(PASS, out.trim().to_string())
+                }
+                Ok(out) => check(
+                    FAIL,
+                    format!(
+                        "'{} --version' answered {:?}, not a ralphus-runner version",
+                        target.runner_command,
+                        out.trim()
+                    ),
+                ),
+                Err(e) => check(
+                    FAIL,
+                    format!(
+                        "'{} --version' failed on the machine: {e}",
+                        target.runner_command
+                    ),
+                ),
+            }
+        }
+        crate::machine_targets::RunnerMode::Upload => {
+            if target.runner_artifacts.is_empty() {
+                return check(
+                    FAIL,
+                    "runner mode is upload but no [runner.artifacts] are configured".to_string(),
+                );
+            }
+            let missing: Vec<&str> = target
+                .runner_artifacts
+                .values()
+                .map(String::as_str)
+                .filter(|path| !std::path::Path::new(path).is_file())
+                .collect();
+            if missing.is_empty() {
+                check(
+                    PASS,
+                    format!(
+                        "uploaded on first use; artifacts present for {}",
+                        target
+                            .runner_artifacts
+                            .keys()
+                            .map(String::as_str)
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
+                )
+            } else {
+                check(
+                    FAIL,
+                    format!(
+                        "runner artifacts missing on the daemon host: {}",
+                        missing.join(", ")
+                    ),
+                )
+            }
+        }
     }
 }
 
@@ -292,17 +374,7 @@ fn check_one_target(
         id: ID_REMOTE_PUSH_CREDENTIALS,
     });
 
-    checks.push(TargetCheck {
-        name: "runner".to_string(),
-        status: WARN,
-        detail: format!(
-            "not verified -- confirming '{}' resolves on the remote would require the SSH \
-             provider's run verb to accept an arbitrary program, which is deliberately scoped \
-             to git only",
-            target.runner_command
-        ),
-        id: ID_REMOTE_RUNNER,
-    });
+    checks.push(runner_check(&provider, &spec, target));
 
     report(checks)
 }
@@ -530,15 +602,83 @@ mod tests {
                 false,
             )
             .unwrap();
-        let report = check_one_target(&store, &target("t", "healthtest2:A", "/srv/ralphus"));
+        // The fake answers every `run` with the git version, so the runner is
+        // checked in upload mode here (artifact on the daemon host); installed
+        // mode has its own test below.
+        let artifact = dir.join("ralphus-runner");
+        std::fs::write(&artifact, "runner").unwrap();
+        let mut t = target("t", "healthtest2:A", "/srv/ralphus");
+        t.runner_mode = crate::machine_targets::RunnerMode::Upload;
+        t.runner_artifacts.insert(
+            "x86_64-unknown-linux-musl".to_string(),
+            artifact.to_string_lossy().into_owned(),
+        );
+        let report = check_one_target(&store, &t);
         assert!(!report.any_fail(), "{:?}", report.checks);
         let names: Vec<&str> = report.checks.iter().map(|c| c.name.as_str()).collect();
         assert!(names.contains(&"ssh_reachable"));
         assert!(names.contains(&"capabilities"));
         assert!(names.contains(&"remote_root"));
         assert!(names.contains(&"git_version"));
+        assert!(names.contains(&"runner"));
         assert!(names.contains(&"push_credentials"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_installed_runner_is_checked_on_the_machine() {
+        let dir = std::env::temp_dir().join(format!("ral355-health-runner-{}", std::process::id()));
+        let py = fake_provider(
+            &dir,
+            &[
+                (
+                    "ping",
+                    "{\"ok\": true, \"protocol_version\": 1, \"detail\": \"reachable\"}",
+                ),
+                (
+                    "run",
+                    "{\"ok\": true, \"protocol_version\": 1, \"exit_code\": 0, \"stdout\": \"ralphus-runner 0.9.0\"}",
+                ),
+            ],
+        );
+        let store = Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
+        store
+            .lock()
+            .register_machine_provider(
+                "healthtest3",
+                "",
+                "python",
+                &[py.to_string_lossy().into_owned()],
+                crate::machines::PROTOCOL_VERSION,
+                false,
+            )
+            .unwrap();
+        let report = check_one_target(&store, &target("t", "healthtest3:A", "/srv/ralphus"));
+        let runner = report
+            .checks
+            .iter()
+            .find(|c| c.name == "runner")
+            .expect("runner check");
+        assert_eq!(runner.status, PASS, "{runner:?}");
+        assert!(runner.detail.contains("ralphus-runner 0.9.0"), "{runner:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn upload_mode_without_its_artifact_fails_the_runner_check() {
+        let mut t = target("t", "ssh:x", "/srv/ralphus");
+        t.runner_mode = crate::machine_targets::RunnerMode::Upload;
+        t.runner_artifacts.insert(
+            "x86_64-unknown-linux-musl".to_string(),
+            "/definitely/not/here/ralphus-runner".to_string(),
+        );
+        let provider = crate::remote_runner::ProviderRunner::new("unused", vec![], "ssh", "x");
+        let spec = synthetic_spec("t", "/srv/ralphus");
+        let check = runner_check(&provider, &spec, &t);
+        assert_eq!(check.status, FAIL, "{check:?}");
+        assert!(check.detail.contains("/definitely/not/here"), "{check:?}");
     }
 
     #[test]

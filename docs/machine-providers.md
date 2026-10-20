@@ -23,11 +23,13 @@ provider's business.
 > branching on scheme. Guardian
 > reviews now dispatch to a remote review's assigned machine too (RAL-185
 > Phase 3/RAL-201) — the merge worktree, stacked rebase, conflict-resolution
-> agent, chat/feedback/summary agent invocations, and manual preparation all route
-> through the review's machine. See `REMOTE.local.md` for the full phase
-> history and its "Known limitations" section for what still runs local-only
-> even on a remote review (build-config resolution, the empty-branch VCS
-> check, and a couple of local-fs reads around rebase-state detection).
+> agent, chat/feedback/summary agent invocations, PR submission and sync,
+> checks and actions (board-launched and auto-run), and manual preparation
+> all route through the review's machine. A remote review's project
+> `.ralphus.toml` is still resolved from the daemon's own copy of the project
+> rather than read from the machine. [Machine strict mode](#machine-strict-mode-development-only)
+> turns any remaining daemon-host fallback into a visible failure while
+> developing ralphus.
 
 > **Platform support:** Linux and Windows daemon hosts are fully supported.
 > macOS as a daemon host is **experimental** (RAL-398) — see "Platform
