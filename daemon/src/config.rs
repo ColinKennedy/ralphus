@@ -176,6 +176,16 @@ pub struct ReviewConfig {
     /// scalars win over the global layer, same as `skip_worktrees`.
     #[serde(default)]
     pub default_resolver_model: Option<String>,
+    /// The base branch `ralphus ingest` uses when no PR among the ingested
+    /// branches names one and `--base` is absent. Read only by ingest's
+    /// base-resolution fallback ([`crate::ingest_defaults`]), never as a
+    /// default for Arbiter- or squad-created reviews (a static project
+    /// override of a review's base would silently rebase pooled work onto the
+    /// wrong branch -- see `REVIEW_FIELD_PARITY`'s `upstream` entry). Only
+    /// checked for being non-empty; per-project scalars win over the global
+    /// layer, same as `skip_worktrees`.
+    #[serde(default)]
+    pub default_base_branch: Option<String>,
     /// RAL-342/RAL-338: the machine (`scheme:uri`) a review's worktrees and
     /// merge run on when neither an explicit `[[review]].machine` nor the
     /// Arbiter (which never has a `[[review]]` block to read one from) sets
@@ -501,6 +511,7 @@ pub const DEFAULT_RETRY_AFTER_UNKNOWN_DEFAULT_SECONDS: u64 = 30;
 pub const REVIEW_CONFIG_KEYS: &[&str] = &[
     "default_resolver_agent",
     "default_resolver_model",
+    "default_base_branch",
     "default_machine",
     "default_maximum_budget_usd",
     "default_proof_scope",
@@ -587,6 +598,16 @@ impl ReviewConfig {
     #[must_use]
     pub fn default_resolver_model(&self) -> Option<&str> {
         self.default_resolver_model.as_deref()
+    }
+
+    /// The configured ingest base-branch fallback, trimmed; unset or
+    /// whitespace-only resolves to `None`.
+    #[must_use]
+    pub fn default_base_branch(&self) -> Option<&str> {
+        self.default_base_branch
+            .as_deref()
+            .map(str::trim)
+            .filter(|b| !b.is_empty())
     }
 
     /// The configured default review machine (`scheme:uri`), unset resolves
@@ -828,6 +849,13 @@ impl ReviewConfig {
         if self.base_shift_maximum_rebuilds == Some(0) {
             return Err("[review] base_shift_maximum_rebuilds must be at least 1".to_string());
         }
+        if self
+            .default_base_branch
+            .as_deref()
+            .is_some_and(|b| b.trim().is_empty())
+        {
+            return Err("[review] default_base_branch must not be empty".to_string());
+        }
         // RAL-517: unlike `auto_fix_retry_base_seconds` above,
         // `retry_after_unknown_default_seconds` is deliberately allowed to be
         // `0` -- see the field's own doc comment. `auto_fix_retry_base_seconds`
@@ -860,6 +888,7 @@ impl ReviewConfig {
             proof_skip_auto_clean: over.proof_skip_auto_clean.or(self.proof_skip_auto_clean),
             default_resolver_agent: over.default_resolver_agent.or(self.default_resolver_agent),
             default_resolver_model: over.default_resolver_model.or(self.default_resolver_model),
+            default_base_branch: over.default_base_branch.or(self.default_base_branch),
             default_machine: over.default_machine.or(self.default_machine),
             default_maximum_budget_usd: over
                 .default_maximum_budget_usd
@@ -4080,6 +4109,42 @@ mod tests {
 
     // ── default_resolver_model/default_machine/default_maximum_budget_usd
     // (RAL-342/RAL-338) ──────────────────────────────────────────────────
+
+    #[test]
+    fn parse_default_base_branch() {
+        let c = from_toml_str(
+            "[review]
+default_base_branch = \" develop \"
+",
+        );
+        assert_eq!(c.default_base_branch(), Some("develop"));
+    }
+
+    #[test]
+    fn merge_default_base_branch_project_wins() {
+        let global = from_toml_str(
+            "[review]
+default_base_branch = \"main\"
+",
+        );
+        let project = from_toml_str(
+            "[review]
+default_base_branch = \"develop\"
+",
+        );
+        assert_eq!(global.merge(project).default_base_branch(), Some("develop"));
+    }
+
+    #[test]
+    fn validate_rejects_blank_default_base_branch() {
+        for blank in ["", "   "] {
+            let c = ReviewConfig {
+                default_base_branch: Some(blank.to_string()),
+                ..ReviewConfig::default()
+            };
+            assert!(c.validate().is_err(), "{blank:?}");
+        }
+    }
 
     #[test]
     fn default_resolver_model_unset_resolves_to_none() {

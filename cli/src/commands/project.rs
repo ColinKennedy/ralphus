@@ -74,6 +74,7 @@ pub enum ProjectReviewSettingsCommand {
         name: String,
         resolver_agent: Option<String>,
         resolver_model: Option<String>,
+        default_base_branch: Option<String>,
         machine: Option<String>,
         maximum_budget_usd: Option<f64>,
         clear_maximum_budget_usd: bool,
@@ -347,6 +348,7 @@ fn parse_review_settings_set(
 ) -> Result<ProjectReviewSettingsCommand, UsageError> {
     let resolver_agent = scanner.take_value("--resolver-agent")?;
     let resolver_model = scanner.take_value("--resolver-model")?;
+    let default_base_branch = scanner.take_value("--default-base-branch")?;
     let machine = scanner.take_value("--machine")?;
     let maximum_budget_usd_raw = scanner.take_value("--maximum-budget-usd")?;
     let clear_maximum_budget_usd = scanner.take_bool("--clear-maximum-budget-usd");
@@ -422,6 +424,7 @@ fn parse_review_settings_set(
         name,
         resolver_agent,
         resolver_model,
+        default_base_branch,
         machine,
         maximum_budget_usd,
         clear_maximum_budget_usd,
@@ -580,6 +583,7 @@ fn dispatch_review_settings(cmd: ProjectReviewSettingsCommand, opts: &GlobalOpts
             name,
             resolver_agent,
             resolver_model,
+            default_base_branch,
             machine,
             maximum_budget_usd,
             clear_maximum_budget_usd,
@@ -610,6 +614,7 @@ fn dispatch_review_settings(cmd: ProjectReviewSettingsCommand, opts: &GlobalOpts
             let patch = crate::client::ProjectReviewSettingsPatch {
                 default_resolver_agent: resolver_agent.as_deref(),
                 default_resolver_model: resolver_model.as_deref(),
+                default_base_branch: default_base_branch.as_deref(),
                 default_machine: machine.as_deref(),
                 default_maximum_budget_usd: maximum_budget_usd,
                 clear_maximum_budget_usd,
@@ -681,6 +686,7 @@ fn render_review_settings(payload: &Value) {
     };
     row_str("resolver agent:", "default_resolver_agent");
     row_str("resolver model:", "default_resolver_model");
+    row_str("ingest base branch:", "default_base_branch");
     row_str("machine:", "default_machine");
     println!(
         "  {:<26} {:<24} (effective: {})",

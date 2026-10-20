@@ -510,6 +510,7 @@ impl DaemonClient {
             "default_resolver_model",
             patch.default_resolver_model,
         );
+        set_if_some(&mut body, "default_base_branch", patch.default_base_branch);
         set_if_some(&mut body, "default_machine", patch.default_machine);
         set_if_some(
             &mut body,
@@ -2611,6 +2612,7 @@ pub struct GuardianSettings<'a> {
 pub struct ProjectReviewSettingsPatch<'a> {
     pub default_resolver_agent: Option<&'a str>,
     pub default_resolver_model: Option<&'a str>,
+    pub default_base_branch: Option<&'a str>,
     pub default_machine: Option<&'a str>,
     pub default_maximum_budget_usd: Option<f64>,
     /// Explicitly reset `default_maximum_budget_usd` to unbounded --

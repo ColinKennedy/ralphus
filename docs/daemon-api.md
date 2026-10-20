@@ -759,6 +759,7 @@ instead of falling through to a global, non-project-aware default:
 | `.ralphus.toml [review]` key | Mirrors `[[review]]`'s... | Unset resolves to |
 | --- | --- | --- |
 | `default_resolver_model` | `model` | each backend's own default (`"qwen3:8b"` for ollama, `None` otherwise) |
+| `default_base_branch` | none (not a `[[review]]` key) | none; read only by existing-branch ingest, which falls back through the repository default branch and the closest of `main`/`master`/`beta` |
 | `default_machine` | `machine` | the local machine |
 | `default_maximum_budget_usd` | `maximum_budget_usd` | unbounded |
 | `default_proof_scope` | `proof_scope` | `"each_branch"` |

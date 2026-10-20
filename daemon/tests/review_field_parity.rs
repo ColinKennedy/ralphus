@@ -36,12 +36,19 @@ const PAIRS: &[(&str, &str)] = &[
 /// Project-default (`REVIEW_CONFIG_KEYS`) entries with no `[[review]]`
 /// TOML counterpart to pair with -- the reverse of
 /// [`REVIEW_DEF_ONLY_EXCLUSIONS`] below.
-const CONFIG_DEF_ONLY_EXCLUSIONS: &[(&str, &str)] = &[(
-    "checks",
-    "no longer an authored [[review]] key since the preparation redesign; the \
-     project default still seeds a review's check gates when none are set \
-     via the daemon API",
-)];
+const CONFIG_DEF_ONLY_EXCLUSIONS: &[(&str, &str)] = &[
+    (
+        "checks",
+        "no longer an authored [[review]] key since the preparation redesign; the \
+         project default still seeds a review's check gates when none are set \
+         via the daemon API",
+    ),
+    (
+        "default_base_branch",
+        "read only by existing-branch ingest to pick a base, so no authored \
+         [[review]] block has a per-review counterpart",
+    ),
+];
 
 const REVIEW_DEF_ONLY_EXCLUSIONS: &[(&str, &str)] = &[
     ("id", "identity is assigned for each individual review"),

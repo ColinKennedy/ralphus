@@ -1072,6 +1072,11 @@ pub struct ProjectReviewSettings {
     pub default_resolver_agent: Option<String>,
     #[serde(default)]
     pub default_resolver_model: Option<String>,
+    /// The base branch `ralphus ingest` falls back to; see
+    /// [`crate::config::ReviewConfig::default_base_branch`]. Read only by
+    /// ingest, never applied to other reviews.
+    #[serde(default)]
+    pub default_base_branch: Option<String>,
     #[serde(default)]
     pub default_machine: Option<String>,
     #[serde(default)]
@@ -1197,6 +1202,7 @@ impl ProjectReviewSettings {
             proof_skip_auto_clean: self.verify_skip_auto_clean,
             default_resolver_agent: self.default_resolver_agent,
             default_resolver_model: self.default_resolver_model,
+            default_base_branch: self.default_base_branch,
             default_machine: self.default_machine,
             default_maximum_budget_usd: self.default_maximum_budget_usd,
             skip_base_updates: self.skip_base_updates,
@@ -20537,6 +20543,7 @@ command = "e"
         let settings = ProjectReviewSettings {
             default_resolver_agent: Some("claude-code".to_string()),
             default_resolver_model: Some("opus".to_string()),
+            default_base_branch: Some("develop".to_string()),
             default_machine: Some("local".to_string()),
             default_maximum_budget_usd: Some(5.0),
             default_proof_scope: Some("final_branch".to_string()),
