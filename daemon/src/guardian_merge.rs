@@ -3379,7 +3379,7 @@ fn resolve_conflicts_with_agent(
         // overwriting it, so notes from earlier passes/rebuilds accumulate.
         if let Some(ghost_text) = result.ghost.as_deref().map(str::trim) {
             if !ghost_text.is_empty() {
-                let revision = crate::ghost::current_revision(&wt.root_string());
+                let revision = crate::ghost::current_revision_in(wt);
                 let guard = store.lock();
                 if guard
                     .upsert_ghost(
@@ -3830,11 +3830,10 @@ fn run_commit_checks(
             }),
         );
     }
-    let wt_str = wt.root_string();
     if !checks.is_empty() {
         let uri = crate::ghost::review_uri(id, Some(branch_id));
         let note = crate::ghost::proof_outcome_note(checks.len(), checks.len());
-        let revision = crate::ghost::current_revision(&wt_str);
+        let revision = crate::ghost::current_revision_in(wt);
         let guard = store.lock();
         if guard
             .upsert_ghost(

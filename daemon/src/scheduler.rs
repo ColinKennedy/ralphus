@@ -3891,8 +3891,7 @@ fn run_cell_worker(
                     // carrying context across an attempt boundary, so the
                     // guidance rides in on it.
                     let uri = crate::ghost::cell_uri(squad_id, row.task_idx, row.idx);
-                    let revision =
-                        crate::ghost::current_revision(row.cwd.as_deref().unwrap_or_default());
+                    let revision = cell_revision(store, row);
                     store_ok(
                         &guard,
                         squad_id,
@@ -4589,8 +4588,7 @@ fn run_cell_worker(
                 if let Some(bearing_text) = crate::waypoints::render_bearing_block(wp_id, &bearings)
                 {
                     let uri = crate::ghost::cell_uri(squad_id, row.task_idx, row.idx);
-                    let revision =
-                        crate::ghost::current_revision(row.cwd.as_deref().unwrap_or_default());
+                    let revision = cell_revision(store, row);
                     store_ok(
                         &guard,
                         squad_id,
@@ -4779,7 +4777,7 @@ fn run_cell_worker(
     if let Some(ghost_text) = result.ghost.as_deref().map(str::trim) {
         if !ghost_text.is_empty() {
             let uri = crate::ghost::cell_uri(squad_id, row.task_idx, row.idx);
-            let revision = crate::ghost::current_revision(row.cwd.as_deref().unwrap_or_default());
+            let revision = cell_revision(store, row);
             let guard = store.lock();
             if guard
                 .upsert_ghost(
@@ -4813,7 +4811,7 @@ fn run_cell_worker(
     // live as `prophecy` events dedupe against these on the store's unique
     // key, so this only fills in whatever the live path missed.
     if !result.prophecies.is_empty() {
-        let revision = crate::ghost::current_revision(row.cwd.as_deref().unwrap_or_default());
+        let revision = cell_revision(store, row);
         let guard = store.lock();
         let target = crate::prophecy::CellProphecyTarget {
             task_idx: row.task_idx,
@@ -5182,6 +5180,18 @@ fn check_task_no_commits_guard(
         guard.set_task_error(squad_id, task_idx, Some(&error)),
     );
     false
+}
+
+/// The commit a cell's worktree is at, read on the cell's own machine (see
+/// [`crate::ghost::current_revision`]).
+fn cell_revision(
+    store: &crate::store_lock::StoreHandle,
+    row: &crate::store::CellRow,
+) -> Option<String> {
+    let cwd = row.cwd.as_deref().filter(|c| !c.is_empty())?;
+    crate::ghost::current_revision_in(
+        &crate::workspace::Workspace::on(cwd, row.machine.as_deref()).with_store(Arc::clone(store)),
+    )
 }
 
 /// `machine` with the daemon's own host (unset, blank or `local`) as `None`.
