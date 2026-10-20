@@ -3183,6 +3183,9 @@ struct EffectiveReviewDefaults {
     resolver_agent: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     resolver_model: Option<String>,
+    /// The base branch `ralphus ingest` falls back to (no other review reads it).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    default_base_branch: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     machine: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -3237,6 +3240,7 @@ impl EffectiveReviewDefaults {
         Self {
             resolver_agent: cfg.default_resolver_agent().to_string(),
             resolver_model: cfg.default_resolver_model().map(str::to_string),
+            default_base_branch: cfg.default_base_branch().map(str::to_string),
             machine: cfg.default_machine().map(str::to_string),
             maximum_budget_usd: cfg.default_maximum_budget_usd(),
             proof_scope: cfg.default_proof_scope().to_string(),
@@ -3323,6 +3327,10 @@ struct ProjectReviewSettingsBody {
     default_resolver_agent: Option<String>,
     #[serde(default)]
     default_resolver_model: Option<String>,
+    /// The base branch `ralphus ingest` falls back to; an empty string clears
+    /// it, a whitespace-only value is rejected.
+    #[serde(default)]
+    default_base_branch: Option<String>,
     #[serde(default)]
     default_machine: Option<String>,
     #[serde(default)]
@@ -3430,6 +3438,18 @@ fn set_project_review_settings(daemon: &Daemon, name: &str, body: &str) -> Reply
     };
     if let Some(reply) = reject_invalid_rebuild_on(&req.rebuild_on) {
         return reply;
+    }
+    if req
+        .default_base_branch
+        .as_deref()
+        .is_some_and(|b| !b.is_empty() && b.trim().is_empty())
+    {
+        return error(
+            400,
+            "invalid_value",
+            "'default_base_branch' must not be whitespace-only (use an empty string to clear it)",
+            vec![],
+        );
     }
     if req.clear_maximum_budget_usd && req.default_maximum_budget_usd.is_some() {
         return error(
@@ -3558,6 +3578,9 @@ fn set_project_review_settings(daemon: &Daemon, name: &str, body: &str) -> Reply
     }
     if let Some(v) = req.default_resolver_model {
         settings.default_resolver_model = clear_if_empty(v);
+    }
+    if let Some(v) = req.default_base_branch {
+        settings.default_base_branch = clear_if_empty(v.trim().to_string());
     }
     if let Some(v) = req.default_machine {
         settings.default_machine = clear_if_empty(v);

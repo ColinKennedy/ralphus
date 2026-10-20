@@ -983,7 +983,7 @@ pub(crate) fn resolve_registered_remote_upstream(
 /// never cloned or fetched with its HEAD resolved) — this FAILS with a clear
 /// error rather than guessing `main`/`master`, consistent with RAL-100's
 /// no-guessing intent.
-fn default_branch(root: &Path) -> Result<String, String> {
+pub(crate) fn default_branch(root: &Path) -> Result<String, String> {
     let mut candidates = vec!["origin".to_string()];
     if let Ok(remotes) = git(root, &["remote"]) {
         let mut rest: Vec<String> = remotes
