@@ -8777,22 +8777,24 @@ fn submit_stacked_branch_pr(
                     "ralphus [pr] review {id} branch id={branch_id} own-name PR lookup failed \
                      ({e}); using the derived alias"
                 );
-                let _ = store.lock().cartographer_log(crate::cartographer::CartographerEntry {
-                    level: crate::logging::LogLevel::WARNING,
-                    source: "pr",
-                    message: "own-name PR lookup failed; using the derived alias",
-                    scope: Some("branch"),
-                    squad_id: None,
-                    guardian_id: Some(id),
-                    cell_id: None,
-                    task: None,
-                    log_path: None,
-                    payload: serde_json::json!({
-                        "branch_id": branch_id,
-                        "error": e,
-                    }),
-                    admin_only: false,
-                });
+                let _ = store
+                    .lock()
+                    .cartographer_log(crate::cartographer::CartographerEntry {
+                        level: crate::logging::LogLevel::WARNING,
+                        source: "pr",
+                        message: "own-name PR lookup failed; using the derived alias",
+                        scope: Some("branch"),
+                        squad_id: None,
+                        guardian_id: Some(id),
+                        cell_id: None,
+                        task: None,
+                        log_path: None,
+                        payload: serde_json::json!({
+                            "branch_id": branch_id,
+                            "error": e,
+                        }),
+                        admin_only: false,
+                    });
                 None
             }
         }
