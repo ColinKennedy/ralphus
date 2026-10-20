@@ -717,6 +717,7 @@ pub fn deduplicate_handoffs(
         thrash_max_compactions: None,
         thrash_min_turn_gap: None,
         allow_personal_settings: false,
+        capabilities: None,
         allow_personal_memory: false,
         waypoint_context: false,
         retry_attempt: 0,
@@ -1033,6 +1034,15 @@ pub fn execute_live_run(
         thrash_max_compactions: None,
         thrash_min_turn_gap: None,
         allow_personal_settings: false,
+        // The resolver agent's own profile decides what the live run may use.
+        capabilities: crate::scheduler::capabilities_for_agent(
+            store,
+            req.guardian
+                .resolver_agent
+                .as_deref()
+                .unwrap_or(&resolved.backend),
+            &resolved.backend,
+        ),
         allow_personal_memory: false,
         waypoint_context: false,
         retry_attempt: 0,

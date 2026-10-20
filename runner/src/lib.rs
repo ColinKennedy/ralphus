@@ -8,6 +8,7 @@ pub mod agent_backend;
 pub mod agent_isolation;
 pub mod appraisal;
 pub mod backend;
+pub mod capabilities;
 pub mod cartographer;
 pub mod claude_code_backend;
 pub mod cli_agent_common;

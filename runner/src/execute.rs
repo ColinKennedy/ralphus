@@ -499,6 +499,24 @@ fn run_with_backend(
     // still contributes what it wrote.
     let mut prophecies = crate::prophecy::ProphecyScanner::new();
 
+    if let Some(capabilities) = spec.capabilities.as_ref()
+        && !capabilities.is_empty()
+        && !backend.supports_capabilities()
+    {
+        crate::cartographer::emit_scoped(
+            "runner",
+            "capabilities not delivered: backend does not support them",
+            "warning",
+            Some("cell"),
+            event_context(spec),
+            serde_json::json!({
+                "agent": spec.agent,
+                "mcp_servers": capabilities.mcp_servers.len(),
+                "skills": capabilities.skills.len(),
+            }),
+        );
+    }
+
     for attempt in 0..MAX_ASYNC_ATTEMPTS {
         let options = RunOptions {
             model: spec.model.as_deref(),
@@ -518,6 +536,7 @@ fn run_with_backend(
             allow_personal_memory: spec.allow_personal_memory,
             retry_attempt: spec.retry_attempt,
             retry_after_unknown_default_seconds: spec.retry_after_unknown_default_seconds,
+            capabilities: spec.capabilities.as_ref(),
         };
         let mut outcome: BackendOutcome = match backend.run(&prompt, workspace, &options) {
             Ok(o) => o,
@@ -660,6 +679,7 @@ fn run_with_backend(
                 allow_personal_memory: spec.allow_personal_memory,
                 retry_attempt: spec.retry_attempt,
                 retry_after_unknown_default_seconds: spec.retry_after_unknown_default_seconds,
+                capabilities: spec.capabilities.as_ref(),
             };
             outcome = match backend.nudge(workspace, &nudge_options) {
                 Ok(Some(o)) => o,
@@ -1033,6 +1053,7 @@ fn run_closing_turn(
         allow_personal_memory: spec.allow_personal_memory,
         retry_attempt: spec.retry_attempt,
         retry_after_unknown_default_seconds: spec.retry_after_unknown_default_seconds,
+        capabilities: spec.capabilities.as_ref(),
     };
     let message = format!("{CLOSING_TURN_INTRO}\n\n{question}\n\n{CLOSING_GHOST_QUESTION}");
     let outcome = match backend.run(&message, workspace, &options) {
@@ -1886,6 +1907,7 @@ RALPHUS_BEARING: accepted: renamed every call site"
 
     fn test_spec(proof: bool) -> CellSpec {
         CellSpec {
+            capabilities: None,
             squad_id: "sq".into(),
             task: "t".into(),
             cell_id: "c".into(),
@@ -2223,6 +2245,7 @@ RALPHUS_APPRAISAL: {{\"score\": {score}, \"summary\": \"s\"}}"
         ));
         std::fs::create_dir_all(&dir).unwrap();
         let spec = CellSpec {
+            capabilities: None,
             squad_id: "r".into(),
             task: "t".into(),
             cell_id: "s".into(),

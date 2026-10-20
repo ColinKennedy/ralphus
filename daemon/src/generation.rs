@@ -323,6 +323,7 @@ pub fn run_generation(
         thrash_max_compactions: None,
         thrash_min_turn_gap: None,
         allow_personal_settings: false,
+        capabilities: None,
         allow_personal_memory: false,
         waypoint_context: false,
         retry_attempt: 0,

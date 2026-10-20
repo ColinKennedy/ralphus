@@ -565,6 +565,7 @@ mod tests {
             thrash_max_compactions: None,
             thrash_min_turn_gap: None,
             allow_personal_settings: false,
+            capabilities: None,
             allow_personal_memory: false,
             waypoint_context: true,
             retry_attempt: 0,

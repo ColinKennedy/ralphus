@@ -2614,6 +2614,40 @@ pub fn resolve_agent_isolation(cwd: &Path) -> AgentIsolationConfig {
     }
 }
 
+/// Daemon-wide agent catalog settings (`[agents]` table, RAL-695). Global
+/// only: a project `.ralphus.toml` cannot widen what the catalog offers.
+#[derive(Debug, Default, Deserialize, Clone, Copy, PartialEq, Eq)]
+pub struct AgentsConfig {
+    /// Whether the ralphus MCP server is offered in the capability catalog.
+    /// `None`/`false` keeps it out of the catalog (the default).
+    #[serde(default)]
+    pub allow_ralphus_mcp: Option<bool>,
+}
+
+impl AgentsConfig {
+    /// Whether the ralphus MCP server may be enabled for an agent profile.
+    #[must_use]
+    pub fn allow_ralphus_mcp(&self) -> bool {
+        self.allow_ralphus_mcp.unwrap_or(false)
+    }
+}
+
+/// Parse an `AgentsConfig` from the given TOML text; the default when the
+/// `[agents]` table is absent.
+#[must_use]
+pub fn agents_from_toml_str(s: &str) -> AgentsConfig {
+    parse_config_file(s).agents.unwrap_or_default()
+}
+
+/// The effective global `[agents]` config.
+#[must_use]
+pub fn resolve_agents_config() -> AgentsConfig {
+    global_config_path()
+        .and_then(|p| read_config_text(&p))
+        .map(|s| agents_from_toml_str(&s))
+        .unwrap_or_default()
+}
+
 /// Command-execution defaults (`[command]` table, RAL-631).
 #[derive(Debug, Default, Deserialize, Clone, PartialEq, Eq)]
 pub struct CommandConfig {
@@ -2992,6 +3026,8 @@ struct ConfigFile {
     env_overrides: Option<EnvOverridesConfig>,
     #[serde(default)]
     agent_isolation: Option<AgentIsolationConfig>,
+    #[serde(default)]
+    agents: Option<AgentsConfig>,
     #[serde(default)]
     command: Option<CommandConfig>,
     #[serde(default)]
@@ -5994,6 +6030,26 @@ shell = \"bash\"
         .unwrap();
         assert_eq!(resolve_command_shell(&base), Some("bash".to_string()));
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn agents_config_hides_ralphus_mcp_unless_enabled() {
+        assert!(!agents_from_toml_str("").allow_ralphus_mcp());
+        assert!(
+            !agents_from_toml_str(
+                "[agents]
+"
+            )
+            .allow_ralphus_mcp()
+        );
+        assert!(
+            agents_from_toml_str(
+                "[agents]
+allow_ralphus_mcp = true
+"
+            )
+            .allow_ralphus_mcp()
+        );
     }
 
     #[test]

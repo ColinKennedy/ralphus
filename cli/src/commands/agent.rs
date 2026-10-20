@@ -112,6 +112,9 @@ pub enum AgentCommand {
     /// Administrative -- editing it affects every profile using that
     /// backend.
     BackendCommand(AgentBackendCommandCommand),
+    /// `agent capability ...` (RAL-695): the MCP server / skill catalog and
+    /// each profile's toggles.
+    Capability(AgentCapabilityCommand),
     UsageError(String),
 }
 
@@ -125,6 +128,7 @@ pub fn parse(args: &[String]) -> AgentCommand {
         Some("backend-command") => {
             AgentCommand::BackendCommand(parse_backend_command(&scanner.remaining()))
         }
+        Some("capability") => AgentCommand::Capability(parse_capability(&scanner.remaining())),
         Some(other) => AgentCommand::UsageError(format!("unknown agent subcommand: {other}")),
     }
 }
@@ -194,6 +198,155 @@ pub enum AgentBackendCommandCommand {
         backend: String,
     },
     UsageError(String),
+}
+
+/// `agent capability ...` (RAL-695).
+#[derive(Debug, Clone)]
+pub enum AgentCapabilityCommand {
+    Help,
+    List,
+    /// `add`/`edit`: `body` is the daemon request body; `replace` selects
+    /// `PATCH` over `POST`.
+    Save {
+        kind: String,
+        name: String,
+        body: Value,
+        replace: bool,
+    },
+    Remove {
+        kind: String,
+        name: String,
+    },
+    Check {
+        kind: String,
+        name: String,
+    },
+    Import,
+    Profile {
+        profile: String,
+    },
+    Toggle {
+        profile: String,
+        kind: String,
+        name: String,
+        enabled: bool,
+    },
+    Delivery {
+        profile: String,
+        mode: String,
+        args: Vec<String>,
+    },
+    UsageError(String),
+}
+
+fn env_json(pairs: Vec<(String, String, String)>) -> Value {
+    Value::Array(
+        pairs
+            .into_iter()
+            .map(|(key, kind, value)| serde_json::json!({"key": key, "kind": kind, "value": value}))
+            .collect(),
+    )
+}
+
+fn parse_capability_save(args: &[String], replace: bool) -> Result<AgentCapabilityCommand, String> {
+    let mut scanner = Scanner::new(args);
+    let command = scanner.take_value("--command").map_err(|e| e.0)?;
+    let url = scanner.take_value("--url").map_err(|e| e.0)?;
+    let path = scanner.take_value("--path").map_err(|e| e.0)?;
+    let cmd_args = scanner.take_repeated("--arg").map_err(|e| e.0)?;
+    let sets = scanner.take_repeated("--set").map_err(|e| e.0)?;
+    let links = scanner.take_repeated("--link").map_err(|e| e.0)?;
+    let header_sets = scanner.take_repeated("--header").map_err(|e| e.0)?;
+    let header_links = scanner.take_repeated("--header-link").map_err(|e| e.0)?;
+    let mut env = parse_env_pairs(sets, "set", "--set")?;
+    env.extend(parse_env_pairs(links, "link", "--link")?);
+    let mut headers = parse_env_pairs(header_sets, "set", "--header")?;
+    headers.extend(parse_env_pairs(header_links, "link", "--header-link")?);
+    let mut positional = scanner.remaining().into_iter();
+    let (Some(kind), Some(name)) = (positional.next(), positional.next()) else {
+        return Err("requires <kind> and <name> arguments".to_string());
+    };
+    let body = if kind == "skill" {
+        let Some(path) = path else {
+            return Err("a skill requires --path <folder>".to_string());
+        };
+        serde_json::json!({"kind": kind, "name": name, "skill": {"path": path}})
+    } else {
+        serde_json::json!({
+            "kind": kind, "name": name,
+            "mcp": {
+                "command": command, "args": cmd_args, "env": env_json(env),
+                "url": url, "headers": env_json(headers),
+            },
+        })
+    };
+    Ok(AgentCapabilityCommand::Save {
+        kind,
+        name,
+        body,
+        replace,
+    })
+}
+
+fn kind_and_name(rest: Vec<String>, verb: &str) -> Result<(String, String), String> {
+    let mut it = rest.into_iter();
+    match (it.next(), it.next()) {
+        (Some(k), Some(n)) => Ok((k, n)),
+        _ => Err(format!("{verb} requires <kind> and <name> arguments")),
+    }
+}
+
+fn parse_capability(args: &[String]) -> AgentCapabilityCommand {
+    use AgentCapabilityCommand as C;
+    let mut scanner = Scanner::new(&args[1.min(args.len())..]);
+    let verb = args.first().map(String::as_str);
+    let result: Result<C, String> = match verb {
+        None | Some("help" | "--help" | "-h") => Ok(C::Help),
+        Some("list") => Ok(C::List),
+        Some("import") => Ok(C::Import),
+        Some("add") => parse_capability_save(&scanner.remaining(), false),
+        Some("edit") => parse_capability_save(&scanner.remaining(), true),
+        Some("remove") => kind_and_name(scanner.remaining(), "remove")
+            .map(|(kind, name)| C::Remove { kind, name }),
+        Some("check") => {
+            kind_and_name(scanner.remaining(), "check").map(|(kind, name)| C::Check { kind, name })
+        }
+        Some("profile") => scanner
+            .remaining()
+            .into_iter()
+            .next()
+            .map(|profile| C::Profile { profile })
+            .ok_or_else(|| "profile requires a <profile> argument".to_string()),
+        Some(v @ ("enable" | "disable")) => {
+            let mut rest = scanner.remaining().into_iter();
+            match (rest.next(), rest.next(), rest.next()) {
+                (Some(profile), Some(kind), Some(name)) => Ok(C::Toggle {
+                    profile,
+                    kind,
+                    name,
+                    enabled: v == "enable",
+                }),
+                _ => Err(format!("{v} requires <profile> <kind> <name> arguments")),
+            }
+        }
+        Some("delivery") => (|| {
+            let mode = scanner.take_value("--mode").map_err(|e| e.0)?;
+            let cmd_args = scanner.take_repeated("--arg").map_err(|e| e.0)?;
+            match (mode, scanner.remaining().into_iter().next()) {
+                (Some(mode), Some(profile)) => Ok(C::Delivery {
+                    profile,
+                    mode,
+                    args: cmd_args,
+                }),
+                _ => Err(
+                    "delivery requires <profile> and --mode backend_default|extra_args|none"
+                        .to_string(),
+                ),
+            }
+        })(),
+        Some(other) => Err(format!("unknown agent capability subcommand: {other}")),
+    };
+    result.unwrap_or_else(C::UsageError)
 }
 
 fn parse_profile(args: &[String]) -> AgentProfileCommand {
@@ -345,9 +498,64 @@ pub fn dispatch(cmd: AgentCommand, opts: &GlobalOpts) -> i32 {
         }
         AgentCommand::Profile(c) => dispatch_profile(c, opts),
         AgentCommand::BackendCommand(c) => dispatch_backend_command(c, opts),
+        AgentCommand::Capability(c) => dispatch_capability(c, opts),
         AgentCommand::UsageError(m) => {
             println!("usage error: {m}");
             2
+        }
+    }
+}
+
+fn dispatch_capability(cmd: AgentCapabilityCommand, opts: &GlobalOpts) -> i32 {
+    use AgentCapabilityCommand as C;
+    let client = opts.client();
+    let reply = match cmd {
+        C::Help => {
+            println!(
+                "{}",
+                crate::help_map::command_help(&["agent", "capability"])
+                    .expect("agent capability help exists")
+            );
+            return 0;
+        }
+        C::UsageError(m) => {
+            println!("usage error: {m}");
+            return 2;
+        }
+        C::List => client.list_capabilities(),
+        C::Save {
+            kind,
+            name,
+            body,
+            replace,
+        } => client.save_capability(&kind, &name, body, replace),
+        C::Remove { kind, name } => client.remove_capability(&kind, &name),
+        C::Check { kind, name } => client.check_capability(&kind, &name),
+        C::Import => client.import_capabilities(),
+        C::Profile { profile } => client.get_profile_capabilities(&profile),
+        C::Toggle {
+            profile,
+            kind,
+            name,
+            enabled,
+        } => client.set_profile_capability(&profile, &kind, &name, enabled),
+        C::Delivery {
+            profile,
+            mode,
+            args,
+        } => client.set_profile_capability_delivery(&profile, &mode, &args),
+    };
+    match reply {
+        Ok(payload) => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&payload).unwrap_or_default()
+            );
+            0
+        }
+        Err(e) => {
+            CommandError::Daemon(e).print(false, None);
+            1
         }
     }
 }

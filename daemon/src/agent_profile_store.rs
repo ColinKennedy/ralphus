@@ -467,6 +467,7 @@ impl Store {
             rusqlite::params![name],
         )?;
         if n > 0 {
+            self.delete_profile_capabilities(name)?;
             crate::rlog!(INFO, "ralphus [store] agent profile {name:?} deleted");
             let _ = self.cartographer_log(crate::cartographer::CartographerEntry {
                 level: crate::logging::LogLevel::INFO,

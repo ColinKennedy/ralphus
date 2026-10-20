@@ -1505,6 +1505,43 @@ fn route_for_user(
         ("DELETE", ["api", "agent-profiles", name]) => admin_gated(daemon, user_header, || {
             delete_agent_profile(daemon, &url_decode(name), query)
         }),
+        // RAL-695: the capability catalog (MCP servers and skills) and each
+        // agent profile's toggles. Admin-gated like the profiles they attach to.
+        ("GET", ["api", "capabilities"]) => {
+            admin_gated(daemon, user_header, || list_capabilities(daemon))
+        }
+        ("POST", ["api", "capabilities"]) => {
+            admin_gated(daemon, user_header, || save_capability(daemon, None, body))
+        }
+        ("POST", ["api", "capabilities", "import"]) => {
+            admin_gated(daemon, user_header, || import_capabilities(daemon))
+        }
+        ("PATCH", ["api", "capabilities", kind, name]) => admin_gated(daemon, user_header, || {
+            save_capability(daemon, Some((kind, &url_decode(name))), body)
+        }),
+        ("DELETE", ["api", "capabilities", kind, name]) => admin_gated(daemon, user_header, || {
+            delete_capability(daemon, kind, &url_decode(name))
+        }),
+        ("POST", ["api", "capabilities", kind, name, "check"]) => {
+            admin_gated(daemon, user_header, || {
+                check_capability(daemon, kind, &url_decode(name))
+            })
+        }
+        ("GET", ["api", "agent-profiles", name, "capabilities"]) => {
+            admin_gated(daemon, user_header, || {
+                profile_capabilities(daemon, &url_decode(name))
+            })
+        }
+        ("POST", ["api", "agent-profiles", name, "capabilities"]) => {
+            admin_gated(daemon, user_header, || {
+                toggle_profile_capability(daemon, &url_decode(name), body)
+            })
+        }
+        ("POST", ["api", "agent-profiles", name, "capabilities", "delivery"]) => {
+            admin_gated(daemon, user_header, || {
+                set_profile_capability_delivery(daemon, &url_decode(name), body)
+            })
+        }
         // Per Q4: a built-in backend's invoked command is a single global
         // setting shared by every profile using that backend (not per-profile).
         ("GET", ["api", "agent-backend-commands"]) => {
@@ -4490,6 +4527,337 @@ fn save_agent_profile(daemon: &Daemon, existing_name: Option<&str>, body: &str) 
     ) {
         Ok(()) => json(200, &serde_json::json!({"name": name})),
         Err(e) => agent_profile_save_error(e),
+    }
+}
+
+// ── RAL-695: capability catalog ─────────────────────────────────────────────
+
+fn capability_error(e: crate::capability_store::CapabilityError) -> Reply {
+    use crate::capability_store::CapabilityError as E;
+    match e {
+        E::Invalid(m) => error(400, "invalid_value", &m, vec![]),
+        E::NotFound(m) => error(404, "not_found", &m, vec![]),
+        E::Store(e) => store_error(&e),
+    }
+}
+
+fn parse_capability_kind(kind: &str) -> Result<crate::capability_store::CapabilityKind, Reply> {
+    crate::capability_store::CapabilityKind::parse(kind).ok_or_else(|| {
+        error(
+            400,
+            "invalid_value",
+            "kind must be \"mcp\" or \"skill\"",
+            vec![],
+        )
+    })
+}
+
+fn allow_ralphus_mcp() -> bool {
+    crate::config::resolve_agents_config().allow_ralphus_mcp()
+}
+
+/// Whether `backend` delivers capabilities itself, and whether a profile's
+/// delivery mode is configurable.
+fn capability_support(backend: &str) -> serde_json::Value {
+    let supported = matches!(
+        backend,
+        "claude-code" | "claude-cli" | "codex" | "codex-cli" | "pi"
+    );
+    serde_json::json!({
+        "backend": backend,
+        "supported": supported,
+        "delivery_configurable": backend == "raw",
+    })
+}
+
+/// `GET /api/capabilities`: the catalog with statuses; `Set` env/header
+/// values are masked.
+fn list_capabilities(daemon: &Daemon) -> Reply {
+    let allow = allow_ralphus_mcp();
+    match daemon.lock().list_capability_items(allow) {
+        Ok(items) => json(
+            200,
+            &serde_json::json!({"items": items, "allow_ralphus_mcp": allow}),
+        ),
+        Err(e) => store_error(&e),
+    }
+}
+
+#[derive(Deserialize)]
+struct SaveCapabilityBody {
+    #[serde(default)]
+    kind: String,
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    mcp: Option<crate::capability_store::McpConfig>,
+    #[serde(default)]
+    skill: Option<crate::capability_store::SkillConfig>,
+}
+
+fn capability_exists(
+    daemon: &Daemon,
+    kind: crate::capability_store::CapabilityKind,
+    name: &str,
+) -> bool {
+    matches!(
+        daemon
+            .lock()
+            .get_capability_item(kind, name, allow_ralphus_mcp()),
+        Ok(Some(_))
+    )
+}
+
+fn record_skill_check(daemon: &Daemon, name: &str, path: &str) {
+    let (status, detail) = match crate::capability_probe::check_skill(path) {
+        Ok(()) => ("found", None),
+        Err(m) => ("missing", Some(m)),
+    };
+    let _ = daemon.lock().set_capability_status(
+        crate::capability_store::CapabilityKind::Skill,
+        name,
+        status,
+        detail.as_deref(),
+        None,
+    );
+}
+
+/// `POST /api/capabilities` (create) / `PATCH /api/capabilities/{kind}/{name}`
+/// (replace). A masked `Set` value in an edit keeps the stored one.
+fn save_capability(daemon: &Daemon, existing: Option<(&str, &str)>, body: &str) -> Reply {
+    let Ok(req) = serde_json::from_str::<SaveCapabilityBody>(body) else {
+        return error(400, "bad_request", "body must be a JSON object", vec![]);
+    };
+    let (kind, name) = match existing {
+        Some((k, n)) => (k.to_string(), n.to_string()),
+        None => (req.kind.clone(), req.name.trim().to_string()),
+    };
+    let kind = match parse_capability_kind(&kind) {
+        Ok(k) => k,
+        Err(r) => return r,
+    };
+    if existing.is_none() && capability_exists(daemon, kind, &name) {
+        return error(
+            409,
+            "already_exists",
+            &format!("a {} named {name:?} already exists", kind.as_str()),
+            vec![],
+        );
+    }
+    let skill = req.skill;
+    let saved = daemon
+        .lock()
+        .upsert_capability_item(kind, &name, req.mcp, skill.clone(), "manual");
+    if let Err(e) = saved {
+        return capability_error(e);
+    }
+    if let Some(skill) = skill {
+        record_skill_check(daemon, &name, &skill.path);
+    }
+    json(
+        200,
+        &serde_json::json!({"kind": kind.as_str(), "name": name}),
+    )
+}
+
+/// `DELETE /api/capabilities/{kind}/{name}`.
+fn delete_capability(daemon: &Daemon, kind: &str, name: &str) -> Reply {
+    let kind = match parse_capability_kind(kind) {
+        Ok(k) => k,
+        Err(r) => return r,
+    };
+    match daemon.lock().delete_capability_item(kind, name) {
+        Ok(true) => json(200, &serde_json::json!({"removed": true})),
+        Ok(false) => error(
+            404,
+            "not_found",
+            &format!("no {} named {name:?} in the catalog", kind.as_str()),
+            vec![],
+        ),
+        Err(e) => store_error(&e),
+    }
+}
+
+/// `POST /api/capabilities/{kind}/{name}/check`: probe an MCP server
+/// (`initialize` + `tools/list`) or check a skill folder, on this host. The
+/// subprocess runs with no store lock held.
+fn check_capability(daemon: &Daemon, kind: &str, name: &str) -> Reply {
+    use crate::capability_store::CapabilityKind;
+    let kind = match parse_capability_kind(kind) {
+        Ok(k) => k,
+        Err(r) => return r,
+    };
+    let fetched = daemon
+        .lock()
+        .get_capability_item(kind, name, allow_ralphus_mcp());
+    let item = match fetched {
+        Ok(Some(item)) => item,
+        Ok(None) => {
+            return error(
+                404,
+                "not_found",
+                &format!("no {} named {name:?} in the catalog", kind.as_str()),
+                vec![],
+            );
+        }
+        Err(e) => return store_error(&e),
+    };
+    let (status, detail, tool_count) = match kind {
+        CapabilityKind::Mcp => {
+            let outcome = crate::capability_probe::probe_mcp(&item.mcp.unwrap_or_default());
+            (
+                if outcome.ok { "ok" } else { "failing" },
+                outcome.detail,
+                outcome.tool_count,
+            )
+        }
+        CapabilityKind::Skill => {
+            match crate::capability_probe::check_skill(&item.skill.unwrap_or_default().path) {
+                Ok(()) => ("found", None, None),
+                Err(m) => ("missing", Some(m), None),
+            }
+        }
+    };
+    // The built-in ralphus entry is not stored, so there is no row to update.
+    let builtin = kind == CapabilityKind::Mcp && name == crate::capability_store::RALPHUS_MCP_NAME;
+    if !builtin {
+        let recorded =
+            daemon
+                .lock()
+                .set_capability_status(kind, name, status, detail.as_deref(), tool_count);
+        if let Err(e) = recorded {
+            return store_error(&e);
+        }
+    }
+    json(
+        200,
+        &serde_json::json!({
+            "kind": kind.as_str(), "name": name, "status": status,
+            "status_detail": detail.map(|d| crate::redact::redact_all(&d)),
+            "tool_count": tool_count,
+        }),
+    )
+}
+
+/// `POST /api/capabilities/import`: read the daemon user's own CLI configs and
+/// skill folders into the catalog. Names already in the catalog are skipped.
+fn import_capabilities(daemon: &Daemon) -> Reply {
+    let Some(home) = crate::capability_probe::home_dir() else {
+        return error(500, "internal", "the daemon has no home directory", vec![]);
+    };
+    let mut added = Vec::new();
+    let mut skipped = Vec::new();
+    for c in crate::capability_probe::discover_from_home(&home) {
+        let label =
+            serde_json::json!({"kind": c.kind.as_str(), "name": c.name, "origin": c.origin});
+        if capability_exists(daemon, c.kind, &c.name) {
+            skipped.push(label);
+            continue;
+        }
+        let source = format!("import:{}", c.origin);
+        let skill_path = c.skill.as_ref().map(|s| s.path.clone());
+        let saved = daemon
+            .lock()
+            .upsert_capability_item(c.kind, &c.name, c.mcp, c.skill, &source);
+        if saved.is_err() {
+            skipped.push(label);
+            continue;
+        }
+        if let Some(path) = skill_path {
+            record_skill_check(daemon, &c.name, &path);
+        }
+        added.push(label);
+    }
+    json(
+        200,
+        &serde_json::json!({"added": added, "skipped": skipped}),
+    )
+}
+
+/// `GET /api/agent-profiles/{name}/capabilities`: what the profile has
+/// enabled, its delivery mode and whether its backend can receive them.
+fn profile_capabilities(daemon: &Daemon, name: &str) -> Reply {
+    let guard = daemon.lock();
+    let backend = if ralphus_core::schema::RESERVED_AGENT_NAMES.contains(&name) {
+        name.to_string()
+    } else {
+        match guard.get_agent_profile(name) {
+            Ok(Some(p)) => p.backend,
+            Ok(None) => {
+                return error(
+                    404,
+                    "not_found",
+                    &format!("agent profile {name:?} does not exist"),
+                    vec![],
+                );
+            }
+            Err(e) => return store_error(&e),
+        }
+    };
+    let enabled = match guard.list_enabled_capabilities(name) {
+        Ok(e) => e,
+        Err(e) => return store_error(&e),
+    };
+    let delivery = match guard.get_capability_delivery(name) {
+        Ok(d) => d,
+        Err(e) => return store_error(&e),
+    };
+    json(
+        200,
+        &serde_json::json!({
+            "profile": name,
+            "enabled": enabled
+                .iter()
+                .map(|(k, n)| serde_json::json!({"kind": k.as_str(), "name": n}))
+                .collect::<Vec<_>>(),
+            "delivery": delivery,
+            "support": capability_support(&backend),
+        }),
+    )
+}
+
+#[derive(Deserialize)]
+struct ToggleCapabilityBody {
+    kind: String,
+    name: String,
+    enabled: bool,
+}
+
+/// `POST /api/agent-profiles/{name}/capabilities`: enable or disable one item.
+fn toggle_profile_capability(daemon: &Daemon, profile: &str, body: &str) -> Reply {
+    let Ok(req) = serde_json::from_str::<ToggleCapabilityBody>(body) else {
+        return error(
+            400,
+            "bad_request",
+            "body must include \"kind\", \"name\" and \"enabled\"",
+            vec![],
+        );
+    };
+    let kind = match parse_capability_kind(&req.kind) {
+        Ok(k) => k,
+        Err(r) => return r,
+    };
+    match daemon.lock().set_capability_enabled(
+        profile,
+        kind,
+        &req.name,
+        req.enabled,
+        allow_ralphus_mcp(),
+    ) {
+        Ok(()) => json(200, &serde_json::json!({"enabled": req.enabled})),
+        Err(e) => capability_error(e),
+    }
+}
+
+/// `POST /api/agent-profiles/{name}/capabilities/delivery`.
+fn set_profile_capability_delivery(daemon: &Daemon, profile: &str, body: &str) -> Reply {
+    let Ok(delivery) = serde_json::from_str::<crate::capability_store::CapabilityDelivery>(body)
+    else {
+        return error(400, "bad_request", "body must include \"mode\"", vec![]);
+    };
+    match daemon.lock().set_capability_delivery(profile, &delivery) {
+        Ok(()) => json(200, &delivery),
+        Err(e) => capability_error(e),
     }
 }
 
@@ -21522,6 +21890,13 @@ fn manual_action_label(method: &str, segs: &[&str]) -> Option<&'static str> {
             "cancel_and_merge" => "cancel and re-merge review",
             _ => return None,
         },
+        ("POST", ["api", "capabilities", "import"]) => "import capabilities",
+        ("POST", ["api", "capabilities", _, _, "check"]) => "check capability",
+        ("POST", ["api", "capabilities"]) | ("PATCH", ["api", "capabilities", _, _]) => {
+            "save capability"
+        }
+        ("DELETE", ["api", "capabilities", _, _]) => "remove capability",
+        ("POST", ["api", "agent-profiles", _, "capabilities", ..]) => "set agent capability",
         ("POST" | "PATCH", ["api", "agent-profiles", ..]) => "save agent profile",
         ("DELETE", ["api", "agent-profiles", _]) => "delete agent profile",
         ("POST", ["api", "agent-backend-commands", _]) => "set agent backend command",
@@ -35559,6 +35934,44 @@ remediation_attempts=1
         let r = route(&d, "POST", "/api/triage/types", r#"{"name":"  "}"#);
         assert_eq!(r.status, 400);
         assert!(r.body.contains("invalid_value"));
+    }
+
+    // ── capability catalog routes (RAL-695) ─────────────────────────────────
+
+    #[test]
+    fn capability_routes_mask_set_values_and_reject_duplicates() {
+        let d = daemon();
+        let body = r#"{"kind":"mcp","name":"files","mcp":{"command":"srv","args":["-x"],"env":[{"key":"TOKEN","kind":"set","value":"hunter2-secret"}]}}"#;
+        let r = route(&d, "POST", "/api/capabilities", body);
+        assert_eq!(r.status, 200, "{}", r.body);
+        assert!(!r.body.contains("hunter2-secret"), "{}", r.body);
+
+        let r = route(&d, "POST", "/api/capabilities", body);
+        assert_eq!(r.status, 409, "{}", r.body);
+
+        let r = route(&d, "GET", "/api/capabilities", "");
+        assert_eq!(r.status, 200, "{}", r.body);
+        assert!(r.body.contains("\"files\""), "{}", r.body);
+        assert!(!r.body.contains("hunter2-secret"), "{}", r.body);
+        assert!(r.body.contains("\"untested\""), "{}", r.body);
+
+        let r = route(
+            &d,
+            "POST",
+            "/api/agent-profiles/claude-code/capabilities",
+            r#"{"kind":"mcp","name":"files","enabled":true}"#,
+        );
+        assert_eq!(r.status, 200, "{}", r.body);
+        let r = route(
+            &d,
+            "GET",
+            "/api/agent-profiles/claude-code/capabilities",
+            "",
+        );
+        assert!(r.body.contains("\"files\""), "{}", r.body);
+        assert!(r.body.contains("\"supported\":true"), "{}", r.body);
+        let r = route(&d, "GET", "/api/agent-profiles/ollama/capabilities", "");
+        assert!(r.body.contains("\"supported\":false"), "{}", r.body);
     }
 
     // ── DB-backed agent profile / backend command routes (RAL-473) ──────────

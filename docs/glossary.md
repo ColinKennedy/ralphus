@@ -130,6 +130,14 @@ above: users see "Triage", the code says "Arbiter".
 | **local** | Reserved machine value meaning the daemon's own host. Also the implicit default. |
 | **target** | One statically-configured `[machine.targets.<name>]` entry (RAL-355 Phase 2): a `machine` value plus that machine's durable `remote_root` and runner policy. Config-file-only for v1 (`daemon/src/machine_targets.rs`, global scope only — no project-local override, unlike **agent profile**). A target's `machine` field holds the *full* `<scheme>:<uri>` value, never just the **uri** half, to avoid colliding with that already-taken term. |
 
+## Capabilities (RAL-695)
+
+| Term | Meaning |
+|---|---|
+| **capability** | One entry in ralphus's own catalog of MCP servers and skills (`kind` = `mcp` or `skill`), stored in the daemon DB. Not a per-tool permission (that is a separate, later concern) and not to be confused with `thinking_capable` on a profile. |
+| **capability toggle** | An agent profile's (or built-in backend's) enabled/disabled flag for one capability. Default: nothing enabled. A spawned agent receives exactly its enabled capabilities and nothing from the user's personal configs. |
+| **capability delivery** | How a `raw` command profile receives its capabilities: `backend_default`, `extra_args` or `none`. |
+
 ## Storage and identity
 
 | Term | Meaning |

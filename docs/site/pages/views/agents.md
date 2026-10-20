@@ -13,3 +13,13 @@ Each row represents one agent profile: its **name**, the **backend** it uses (bu
 **Editing a built-in backend's command** (e.g., pointing `claude-code` at a wrapper script) changes behavior for every profile using that backend; the UI shows the list of affected profiles before you save, so the blast radius is clear.
 
 **Deleting a profile** shows which stored cells, proofs, or reviews reference it and requires explicit confirmation — running invocations remain unchanged, but future starts or restarts use the current database state and may fail if a referenced profile no longer exists.
+
+## MCP servers and skills (capabilities)
+
+Below the profiles, the **Capabilities** section holds ralphus's own catalog of MCP servers and skills. A spawned agent gets *only* the items its profile has enabled, and nothing is enabled by default: personal MCP servers and skills from the user's own `~/.claude.json`, Codex or Pi configs are never picked up by an agent, even when personal settings are otherwise allowed.
+
+**Catalog.** Each row shows the item's kind, name, source (`manual`, `import:<origin>` or `builtin`) and a status. An MCP server is `untested`, `ok` (with its tool count) or `failing` (with the reason); a skill is `found` or `missing`. **Check** probes a server on the daemon host (spawn, `initialize`, `tools/list`, stop) or looks for the skill folder's `SKILL.md`. **Import** reads the daemon user's `~/.claude.json`, `~/.codex/config.toml`, `~/.config/mcp/mcp.json` and skill folders, skipping names already present. MCP environment variables and HTTP headers use the same `Set`/`Link` model as profiles; `Set` values are masked and redacted everywhere.
+
+**Per-profile toggles.** Selecting a profile — built-ins included — lists every catalog item with an enable checkbox. Claude Code receives the enabled servers through `--mcp-config` with `--strict-mcp-config` and its skills in the isolated config directory; Codex through `[mcp_servers.*]` in its isolated `CODEX_HOME`; Pi through an `mcp.json` there. The native agents (`claude`, `anthropic`, `ollama`) cannot receive either, and the tab says so. A profile on the `raw` backend has a **delivery** selector: the backend default, extra arguments appended to its command (`{mcp_config}` and `{skills_dir}` expand to the generated paths), or none.
+
+**The ralphus MCP server** is listed only when the global config sets `[agents] allow_ralphus_mcp = true`; it defaults to `false`.

@@ -124,6 +124,9 @@ pub struct CellSpec {
     /// in a resumed turn's user message instead. `None` (the default, and
     /// every non-cell invocation) keeps single-turn behaviour.
     pub closing_turn_prompt: Option<String>,
+    /// RAL-695: the MCP servers and skills enabled for this agent, resolved
+    /// daemon-side. `None` when the key is absent.
+    pub capabilities: Option<crate::capabilities::CapabilitySet>,
 }
 
 impl CellSpec {
@@ -191,6 +194,9 @@ impl CellSpec {
             opt_uint(obj, "retry_after_unknown_default_seconds")?.unwrap_or(30);
         let waypoint_context = opt_bool(obj, "waypoint_context")?.unwrap_or(true);
         let closing_turn_prompt = opt_str(obj, "closing_turn_prompt")?;
+        let capabilities = field(obj, "capabilities")
+            .map(|v| crate::capabilities::CapabilitySet::from_value(v).map_err(SpecError))
+            .transpose()?;
 
         if prompt.is_some() == command.is_some() {
             return Err(SpecError(
@@ -233,6 +239,7 @@ impl CellSpec {
             retry_after_unknown_default_seconds,
             waypoint_context,
             closing_turn_prompt,
+            capabilities,
         })
     }
 }

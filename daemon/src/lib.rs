@@ -18,6 +18,8 @@ pub mod auto_run;
 pub mod base_update;
 pub mod branch_runs;
 pub mod cancel;
+pub mod capability_probe;
+pub mod capability_store;
 pub mod cartographer;
 pub mod cell_blocking;
 pub mod cell_copy;

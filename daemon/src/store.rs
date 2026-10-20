@@ -2054,6 +2054,30 @@ impl Store {
                 created_at_ms    INTEGER NOT NULL,
                 updated_at_ms    INTEGER NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS capability_items (
+                kind          TEXT NOT NULL,
+                name          TEXT NOT NULL,
+                source        TEXT NOT NULL DEFAULT 'manual',
+                config_json   TEXT NOT NULL DEFAULT '{}',
+                status        TEXT NOT NULL DEFAULT 'untested',
+                status_detail TEXT,
+                tool_count    INTEGER,
+                checked_at_ms INTEGER,
+                created_at_ms INTEGER NOT NULL,
+                updated_at_ms INTEGER NOT NULL,
+                PRIMARY KEY (kind, name)
+            );
+            CREATE TABLE IF NOT EXISTS agent_capability_enabled (
+                profile TEXT NOT NULL,
+                kind    TEXT NOT NULL,
+                name    TEXT NOT NULL,
+                PRIMARY KEY (profile, kind, name)
+            );
+            CREATE TABLE IF NOT EXISTS agent_capability_delivery (
+                profile   TEXT PRIMARY KEY,
+                mode      TEXT NOT NULL,
+                args_json TEXT NOT NULL DEFAULT '[]'
+            );
             CREATE TABLE IF NOT EXISTS agent_backend_commands (
                 backend       TEXT PRIMARY KEY,
                 command       TEXT NOT NULL,

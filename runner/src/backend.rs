@@ -195,6 +195,11 @@ pub struct RunOptions<'a> {
     /// an immediate retry, same convention as everywhere else this ticket's
     /// setting is threaded (see `daemon::config::ReviewConfig`'s field doc).
     pub retry_after_unknown_default_seconds: u64,
+    /// RAL-695: the MCP servers and skills enabled for this agent. `Some`
+    /// (even when empty) makes the set the session's *only* source of MCP
+    /// servers and skills, regardless of `allow_personal_settings`; `None`
+    /// (a hand-written spec) leaves the harness's own discovery untouched.
+    pub capabilities: Option<&'a crate::capabilities::CapabilitySet>,
 }
 
 /// RAL-292: the sole turn content sent by [`ModelBackend::nudge`]'s default
@@ -318,6 +323,31 @@ pub trait ModelBackend {
     /// be kept in sync by hand.
     fn supports_thinking(&self) -> bool {
         false
+    }
+
+    /// RAL-695: whether this backend can deliver a
+    /// [`CapabilitySet`](crate::capabilities::CapabilitySet). Defaults to
+    /// `false` (the native tool loop and the raw harness); a backend that
+    /// returns `true` also overrides
+    /// [`provision_capabilities`](Self::provision_capabilities).
+    fn supports_capabilities(&self) -> bool {
+        false
+    }
+
+    /// RAL-695: write this harness's own MCP/skill configuration for
+    /// `capabilities` into the session's isolated config directory and return
+    /// the extra launcher arguments it needs. Backends call it from `run`;
+    /// the default reports the backend as unsupported.
+    fn provision_capabilities(
+        &self,
+        workspace: &Workspace,
+        options: &RunOptions<'_>,
+        capabilities: &crate::capabilities::CapabilitySet,
+    ) -> Result<crate::capabilities::Provisioning, BackendError> {
+        let _ = (workspace, options, capabilities);
+        Err(BackendError(
+            "this agent backend does not support MCP server or skill capabilities".to_string(),
+        ))
     }
 
     /// Whether a run can be resumed by its `agent_session_id` with a fresh user

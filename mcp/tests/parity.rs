@@ -95,7 +95,10 @@ fn dummy_json(chip: &ralphus_mcp::chip::Chip) -> serde_json::Value {
     // -- `Chip` doesn't retain the original hint text, so these are matched
     // by property name instead, the same way `chip.rs`'s own module doc
     // singles this shape out as a special case.
-    let scalar = if matches!(chip.property_name().as_str(), "input" | "set" | "link") {
+    let scalar = if matches!(
+        chip.property_name().as_str(),
+        "input" | "set" | "link" | "header" | "header_link"
+    ) {
         serde_json::Value::String("x=1".to_string())
     } else {
         chip.choices.as_ref().map_or_else(

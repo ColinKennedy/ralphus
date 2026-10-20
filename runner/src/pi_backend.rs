@@ -155,6 +155,25 @@ impl McpInitializer for PiBackend {
     }
 }
 
+/// Adds the MCP adapter package to the `packages` of the Pi `settings.json`
+/// at `path` unless it is already listed.
+fn ensure_mcp_adapter_listed(path: &Path) -> Result<(), BackendError> {
+    let mut settings = read_mcp_json_object(path).map_err(BackendError)?;
+    if settings
+        .get("packages")
+        .is_some_and(contains_mcp_adapter_package)
+    {
+        return Ok(());
+    }
+    let packages = settings
+        .entry("packages".to_string())
+        .or_insert_with(|| Value::Array(Vec::new()));
+    if let Value::Array(list) = packages {
+        list.push(Value::String(MCP_ADAPTER_PACKAGE.to_string()));
+    }
+    crate::capabilities::write_json(path, &Value::Object(settings))
+}
+
 fn read_mcp_json_object(path: &Path) -> Result<serde_json::Map<String, Value>, String> {
     match std::fs::read_to_string(path) {
         Ok(text) => serde_json::from_str(&text)
@@ -239,7 +258,9 @@ impl ModelBackend for PiBackend {
         // resolves once here and feeds both `apply_context_settings` (so it
         // never touches the operator's real directory once isolated) and
         // `spawn`'s own env override.
-        let isolate = !options.allow_personal_settings || !options.allow_personal_memory;
+        let isolate = !options.allow_personal_settings
+            || !options.allow_personal_memory
+            || options.capabilities.is_some();
         let ambient_dir = std::env::var_os("PI_CODING_AGENT_DIR").map(std::path::PathBuf::from);
         // Pi's documented default when PI_CODING_AGENT_DIR is absent is
         // ~/.pi/agent.  Isolation must preserve the login from that real
@@ -291,6 +312,11 @@ impl ModelBackend for PiBackend {
             None
         };
         let known_config_dir = isolated_dir.clone().or_else(|| ambient_dir.clone());
+        let provisioning = match options.capabilities {
+            Some(capabilities) => self.provision_capabilities(workspace, options, capabilities)?,
+            None => crate::capabilities::Provisioning::default(),
+        };
+        let _provisioning_cleanup = crate::capabilities::CleanupGuard::new(&provisioning);
 
         apply_context_settings(
             known_config_dir.as_deref(),
@@ -324,7 +350,10 @@ impl ModelBackend for PiBackend {
         // the new cell's task text, not a generic "continue".
         let workspace_guard = materialize_workspace_guard()
             .map_err(|e| BackendError(format!("could not materialize Pi workspace guard: {e}")))?;
-        let args = build_args(options, system_prompt_file.as_deref(), &workspace_guard);
+        let mut args = build_args(options, system_prompt_file.as_deref(), &workspace_guard);
+        // Extra delivery args go before the trailing bare `-p`.
+        let at = args.len().saturating_sub(1);
+        args.splice(at..at, provisioning.args.iter().cloned());
 
         let mut child = spawn(
             &program,
@@ -417,6 +446,31 @@ impl ModelBackend for PiBackend {
 
     fn supports_effort(&self) -> bool {
         true
+    }
+
+    fn supports_capabilities(&self) -> bool {
+        true
+    }
+
+    /// RAL-695: the enabled MCP servers become the adapter's `mcp.json` in the
+    /// isolated agent directory, the adapter package is made sure to be listed
+    /// in the isolated `settings.json`, and the enabled skills replace
+    /// `skills/`.
+    fn provision_capabilities(
+        &self,
+        workspace: &Workspace,
+        _options: &RunOptions<'_>,
+        capabilities: &crate::capabilities::CapabilitySet,
+    ) -> Result<crate::capabilities::Provisioning, BackendError> {
+        let dir = crate::agent_isolation::isolated_config_dir(workspace.root(), "pi");
+        crate::capabilities::provision_with(capabilities, &dir, |dir| {
+            crate::capabilities::write_skills(&dir.join("skills"), &capabilities.skills)?;
+            crate::capabilities::write_json(&dir.join("mcp.json"), &capabilities.mcp_json())?;
+            if !capabilities.mcp_servers.is_empty() {
+                ensure_mcp_adapter_listed(&dir.join("settings.json"))?;
+            }
+            Ok(crate::capabilities::Provisioning::default())
+        })
     }
 
     fn supports_closing_turn(&self) -> bool {
