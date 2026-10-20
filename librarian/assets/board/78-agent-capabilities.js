@@ -27,7 +27,7 @@
        * @property {{kind: string, name: string}[]} enabled
        * @property {{mode: string, args: string[]}} delivery
        * @property {{backend: string, supported: boolean, delivery_configurable: boolean, tool_filter: boolean}} support
-       * @property {Object<string, string[]>} denied_tools - denied tool names per MCP server.
+       * @property {{[server: string]: string[]}} denied_tools - denied tool names per MCP server.
        */
       /**
        * The open add/edit form.
@@ -81,7 +81,9 @@
         if (listed.length === 0 && stale.length === 0) {
           return `<div style="margin-left:18px;color:var(--muted)" data-tip="Run Check on this server in the catalog to list its tools.">${esc(it.name)}: check the server to list its tools</div>`;
         }
-        const rows = [...listed.map((t) => [t, false]), ...stale.map((t) => [t, true])]
+        /** @type {[string, boolean][]} */
+        const toolEntries = [...listed.map((t) => /** @type {[string, boolean]} */ ([t, false])), ...stale.map((t) => /** @type {[string, boolean]} */ ([t, true]))];
+        const rows = toolEntries
           .map(
             ([t, isStale]) =>
               `<label style="display:block;white-space:nowrap" data-tip="${isStale ? "The server no longer lists this tool; the deny is kept until you clear it." : "Uncheck to stop this profile's agent calling the tool. New tools a server adds are allowed."}">
