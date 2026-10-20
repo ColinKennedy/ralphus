@@ -2546,6 +2546,13 @@ fn synthesize_proof_instructions(
     let retry_after_unknown_default_seconds =
         crate::config::resolve(std::path::Path::new(&git_root))
             .retry_after_unknown_default_seconds();
+    // The agent runs on the review's machine, in the repository there; the
+    // daemon's `git_root` names nothing on a remote machine.
+    let cwd = if review_machine.is_some() {
+        Workspace::for_guardian(store, id, git_root.as_str()).root_string()
+    } else {
+        git_root
+    };
     let mut spec = RunnerSpec {
         // RAL-102: squad_id/cell_id together key the cell session name
         // (see `crate::cell_session::session_name`) — must be unique per guardian so
@@ -2554,7 +2561,7 @@ fn synthesize_proof_instructions(
         squad_id: format!("guardian-{id}"),
         task: "proof-synthesis".to_string(),
         cell_id: format!("synthesizer-{}", branch.replace(['/', '.'], "-")),
-        cwd: git_root,
+        cwd,
         prompt: Some(lines.join("\n")),
         command: None,
         shell: None,
@@ -13332,12 +13339,24 @@ fn prepare_action_hints(
                 .transpose()?;
             let mut action_env = env.clone();
             let workspace_identity = format!("{:x}", Sha256::digest(combined_str.as_bytes()));
-            let build_root = std::env::temp_dir()
-                .join("ralphus")
-                .join("prepared-builds")
-                .join(id)
-                .join(&workspace_identity[..16])
-                .join(format!("action-{index}"));
+            // The build root lives where the action runs: a temp directory on
+            // the daemon's host, or under the review repository's
+            // `.git/.ralphus` on its machine (a remote review's commands never
+            // see the daemon's disk).
+            let build_root = if root.is_local() {
+                std::env::temp_dir()
+                    .join("ralphus")
+                    .join("prepared-builds")
+                    .join(id)
+                    .join(&workspace_identity[..16])
+                    .join(format!("action-{index}"))
+            } else {
+                PathBuf::from(format!(
+                    "{}/.git/.ralphus/prepared-builds/{id}/{}/action-{index}",
+                    root.root_string(),
+                    &workspace_identity[..16]
+                ))
+            };
             let lifecycle = hints[index].lifecycle.as_ref();
             let preserve_build_root = lifecycle
                 .and_then(|value| value.build_root_policy.as_deref())
@@ -13388,7 +13407,15 @@ fn prepare_action_hints(
                         }
                     }
                 }
-                if !preserve_build_root && build_root.exists() {
+                if !root.is_local() {
+                    if !preserve_build_root {
+                        root.remove_path(&build_root, true);
+                    }
+                    // A provider creates parent directories when it writes a
+                    // file; it has no verb for creating a bare directory.
+                    root.write_file(build_root.join(".ralphus-build-root"), "")
+                        .map_err(|error| format!("failed to create build root: {error}"))?;
+                } else if !preserve_build_root && build_root.exists() {
                     std::fs::remove_dir_all(&build_root).map_err(|error| {
                         format!(
                             "failed to reset build root {}: {error}",
@@ -13396,12 +13423,14 @@ fn prepare_action_hints(
                         )
                     })?;
                 }
-                std::fs::create_dir_all(&build_root).map_err(|error| {
-                    format!(
-                        "failed to create build root {}: {error}",
-                        build_root.display()
-                    )
-                })?;
+                if root.is_local() {
+                    std::fs::create_dir_all(&build_root).map_err(|error| {
+                        format!(
+                            "failed to create build root {}: {error}",
+                            build_root.display()
+                        )
+                    })?;
+                }
                 if !preserve_build_root {
                     if let Some(shared_root) = &shared_store_cwd {
                         if shared_root.exists() {
@@ -13840,7 +13869,10 @@ fn materialize_action_artifacts(
         .join(guardian_id)
         .join(stage_key);
     let mut uses_daemon_stage = false;
-    let action_platform = if action.run_on.as_deref() == Some("review_machine") {
+    // An action runs on a remote review's machine unless it is pinned to the
+    // daemon (`run_on = "daemon"`), so that machine's platform is the one its
+    // artifacts must match.
+    let action_platform = if !workspace.is_local() && action.run_on.as_deref() != Some("daemon") {
         workspace.target_platform()?
     } else {
         (
@@ -13858,7 +13890,13 @@ fn materialize_action_artifacts(
                         artifact.source
                     ));
                 }
-                let probe = artifact_exists_command(&artifact.source);
+                let probe = artifact_exists_command(
+                    &artifact.source,
+                    action_platform
+                        .0
+                        .as_deref()
+                        .is_some_and(|os| normalize_target_os(os) == "windows"),
+                );
                 if !workspace.run_command_with_env(&probe, env, cancel).0 {
                     return Err(format!(
                         "retained artifact {:?} does not exist",
@@ -14037,16 +14075,16 @@ fn anchor_command_executable(
     Ok(Some(format!("{absolute}{rest}")))
 }
 
-fn artifact_exists_command(relative: &str) -> String {
-    #[cfg(windows)]
-    {
+/// A shell command that succeeds when `relative` exists, in the syntax of the
+/// machine it runs on (`windows`: `cmd`; otherwise POSIX `sh`) -- not the
+/// daemon's, which differs for a remote review.
+fn artifact_exists_command(relative: &str, windows: bool) -> String {
+    if windows {
         format!(
             "if exist \"{}\" (exit /b 0) else (exit /b 1)",
             relative.replace('"', "\"\"")
         )
-    }
-    #[cfg(not(windows))]
-    {
+    } else {
         format!("test -e '{}'", relative.replace('\'', "'\"'\"'"))
     }
 }
@@ -22476,6 +22514,20 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn the_artifact_probe_uses_the_machines_shell_not_the_daemons() {
+        // A Windows daemon checking a Linux review machine must send POSIX
+        // `sh`, and the other way round.
+        assert_eq!(
+            artifact_exists_command("out/app", false),
+            "test -e 'out/app'"
+        );
+        assert_eq!(
+            artifact_exists_command("out\\app.exe", true),
+            "if exist \"out\\app.exe\" (exit /b 0) else (exit /b 1)"
+        );
     }
 
     #[test]
