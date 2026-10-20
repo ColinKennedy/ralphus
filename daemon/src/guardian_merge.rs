@@ -18915,16 +18915,25 @@ mod tests {
     }
 
     fn g(root: &Path, args: &[&str]) {
-        let status = std::process::Command::new("git")
-            .args(args)
-            .current_dir(root)
-            .env("GIT_AUTHOR_NAME", "t")
-            .env("GIT_AUTHOR_EMAIL", "t@t")
-            .env("GIT_COMMITTER_NAME", "t")
-            .env("GIT_COMMITTER_EMAIL", "t@t")
-            .env("GIT_EDITOR", "true")
-            .status()
-            .expect("git");
+        // Retry once: under a heavily parallel run a transient filesystem
+        // hiccup (index lock held by a scanner, say) can fail a first attempt.
+        let run = || {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(root)
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@t")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@t")
+                .env("GIT_EDITOR", "true")
+                .status()
+                .expect("git")
+        };
+        let mut status = run();
+        if !status.success() {
+            std::thread::sleep(std::time::Duration::from_millis(250));
+            status = run();
+        }
         assert!(
             status.success(),
             "git {args:?} in {} failed",
