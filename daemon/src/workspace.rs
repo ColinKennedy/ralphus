@@ -125,13 +125,16 @@ static MACHINE_REPOSITORIES: std::sync::LazyLock<
 /// cell's own workspace there (`git rev-parse --git-common-dir`), so no
 /// provider has to report its storage layout.
 ///
-/// `None` when no contributing cell ran on `machine` (e.g. a remote review fed
-/// only by local cells), which leaves the workspace's paths untouched.
+/// When no contributing cell ran on `machine` (e.g. a remote review fed only
+/// by local cells), the project is provisioned there for the review itself
+/// ([`crate::worktrees::provision_review_repository`]). `None` only when that
+/// fails too, which leaves the workspace's paths untouched.
 fn machine_repository_for(
     guardian_id: &str,
     machine: &str,
     root: &Path,
     sources: &[RemoteBranchSource],
+    review: &ReviewProjects,
     store: &crate::store_lock::StoreHandle,
 ) -> Option<(PathBuf, PathBuf)> {
     for source in sources.iter().filter(|s| s.machine == machine) {
@@ -154,7 +157,58 @@ fn machine_repository_for(
         MACHINE_REPOSITORIES.lock().insert(key, repository.clone());
         return Some((source.local_root.clone(), repository));
     }
-    None
+    let local_root = review.local_root_for(root)?;
+    let key = (guardian_id.to_string(), local_root.clone());
+    if let Some(repository) = MACHINE_REPOSITORIES.lock().get(&key).cloned() {
+        return Some((local_root, repository));
+    }
+    match crate::worktrees::provision_review_repository(
+        store,
+        guardian_id,
+        machine,
+        &local_root.to_string_lossy(),
+        &review.base_branch,
+    ) {
+        Ok(repository) => {
+            let repository = PathBuf::from(repository);
+            MACHINE_REPOSITORIES.lock().insert(key, repository.clone());
+            Some((local_root, repository))
+        }
+        Err(e) => {
+            // ralphus[ignore-rlog-pair]: resolved while building a workspace, whose callers may hold the store lock
+            crate::rlog!(
+                WARNING,
+                "ralphus [workspace] review {guardian_id} could not be provisioned on machine \
+                 {machine}: {e}"
+            );
+            None
+        }
+    }
+}
+
+/// The project roots a review spans and the base branch it builds on, for
+/// provisioning it on a machine none of its cells ran on.
+#[derive(Default)]
+struct ReviewProjects {
+    git_root: String,
+    projects: Vec<String>,
+    base_branch: String,
+}
+
+impl ReviewProjects {
+    /// The review project `root` belongs to: the longest project root it is
+    /// under, or the review's own `git_root`.
+    fn local_root_for(&self, root: &Path) -> Option<PathBuf> {
+        self.projects
+            .iter()
+            .map(PathBuf::from)
+            .filter(|p| root.starts_with(p))
+            .max_by_key(|p| p.as_os_str().len())
+            .or_else(|| {
+                let git_root = PathBuf::from(&self.git_root);
+                (!self.git_root.is_empty() && root.starts_with(&git_root)).then_some(git_root)
+            })
+    }
 }
 
 impl std::fmt::Debug for Workspace {
@@ -218,9 +272,14 @@ impl Workspace {
         let loaded = store.with_read_snapshot_or_lock_when_shared_cache(|conn| {
             let g = crate::store::Store::get_guardian_conn(conn, guardian_id)?;
             let sources = remote_branch_sources(conn, &g);
-            Ok((g.machine, sources))
+            let review = ReviewProjects {
+                git_root: g.git_root,
+                projects: g.projects,
+                base_branch: g.base_branch,
+            };
+            Ok((g.machine, sources, review))
         });
-        let (machine, sources) = {
+        let (machine, sources, review) = {
             match loaded {
                 Ok(found) => found,
                 Err(e) => {
@@ -244,15 +303,21 @@ impl Workspace {
                             ),
                             serde_json::json!({ "error": e.to_string() }),
                         );
-                    (None, Vec::new())
+                    (None, Vec::new(), ReviewProjects::default())
                 }
             }
         };
         let mut workspace = Self::on(root, machine.as_deref()).with_store(Arc::clone(store));
         if let Some(machine) = workspace.machine.clone() {
-            workspace.path_map =
-                machine_repository_for(guardian_id, &machine, &workspace.root, &sources, store)
-                    .map(Arc::new);
+            workspace.path_map = machine_repository_for(
+                guardian_id,
+                &machine,
+                &workspace.root,
+                &sources,
+                &review,
+                store,
+            )
+            .map(Arc::new);
             workspace.root = workspace.map_path(&workspace.root);
         }
         workspace
@@ -1178,6 +1243,53 @@ echo {json}
         let err = ws.git(&["status"]).expect_err("non-zero exit must fail");
         assert!(err.contains("git status"), "must name the command: {err}");
         assert!(err.contains("exit 1"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_review_on_a_machine_none_of_its_cells_used_is_provisioned_there() {
+        // With no contributing cell on the review's machine there is no
+        // workspace to discover the repository from; the review provisions
+        // the project itself instead of sending the daemon's own paths.
+        let dir = std::env::temp_dir().join(format!("ral-a8-ws-{}", std::process::id()));
+        // One reply answers both verbs the fallback makes: `provision` reads
+        // `workspace`, the follow-up `git rev-parse --git-common-dir` reads
+        // `stdout`.
+        let script = write_script(
+            &dir,
+            r#"{"ok":true,"protocol_version":1,"workspace":"/m/root/wt","exit_code":0,"stdout":"/m/root/repo/.git"}"#,
+        );
+        let store = Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
+        let local_root = dir.join("project");
+        let local_root_str = local_root.to_string_lossy().into_owned();
+        let id = {
+            let guard = store.lock();
+            guard
+                .register_machine_provider(
+                    "ib",
+                    "",
+                    &script.to_string_lossy(),
+                    &[],
+                    crate::machines::PROTOCOL_VERSION,
+                    false,
+                )
+                .unwrap();
+            // Not git, so no clone URL or machine target is required -- the
+            // fallback itself is what is under test.
+            guard
+                .register_project("p", "", &local_root_str, "svn")
+                .unwrap();
+            let id = guard.create_guardian("r", "main", &local_root_str).unwrap();
+            guard.set_guardian_machine(&id, Some("ib:A")).unwrap();
+            id
+        };
+
+        let ws = Workspace::for_guardian(&store, &id, local_root.join(".git").join(".ralphus"));
+
+        assert_eq!(ws.machine(), Some("ib:A"));
+        assert_eq!(ws.root_string(), "/m/root/repo/.git/.ralphus");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

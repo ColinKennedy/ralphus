@@ -2770,70 +2770,18 @@ fn provision_remote_with_targets(
     squad_id: &str,
     targets: &std::collections::BTreeMap<String, crate::machine_targets::MachineTarget>,
 ) -> Result<String, String> {
-    // allow-lock-io: registry lookups only, no network/subprocess work here.
-    let provider = crate::remote_runner::provider_from_store(&store.lock(), machine)
-        .map_err(|e| format!("cell '{}': {e}", cell.cell_id))?
-        .ok_or_else(|| {
-            // `provision_remote_with_targets` is only called for a non-empty
-            // machine, so a local resolution here means the value changed
-            // under us.
-            format!(
-                "cell '{}': machine \"{machine}\" resolved to the local host",
-                cell.cell_id
-            )
-        })?;
-    // Only git has a clone URL to resolve; every other kind gets `None` and
-    // the provider decides how to obtain the source.
-    let url = if project.vcs == "git" {
-        Some(project.clone_url.clone().ok_or_else(|| {
-            format!(
-                "cell '{}': git project {:?} has no registered clone URL; re-register it with `ralphus project git --name {} --path <local-path> --url <clone-url>` before using it on a remote machine",
-                cell.cell_id, project.name, project.name
-            )
-        })?)
-    } else {
-        None
-    };
-    // RAL-355 Phase 2/4: a git project's remote workspace needs a durable
-    // `remote_root` to provision persistent storage under -- refused here,
-    // before ever dispatching to the provider, the same "fail before
-    // provider dispatch" shape the missing-clone-URL check above already
-    // uses, rather than letting the provider discover the gap at its own
-    // runtime and report a less actionable error.
-    let target = crate::machine_targets::find_by_machine(targets, machine);
-    let remote_root = if project.vcs == "git" {
-        let target = target.ok_or_else(|| {
-            format!(
-                "cell '{}': machine {machine:?} has no [machine.targets.*] entry configured with a remote_root; register one before provisioning a git project there",
-                cell.cell_id
-            )
-        })?;
-        Some(target.remote_root.clone())
-    } else {
-        None
-    };
-    let req = crate::remote_runner::ProvisionRequest {
-        project: project.name.clone(),
-        source: crate::remote_runner::WorkspaceSource {
-            kind: project.vcs.clone(),
-            url,
-            branch: Some(branch.to_string()),
-            upstream: Some(upstream.to_string()),
-        },
-        squad_id: squad_id.to_string(),
-        cell_id: cell.cell_id.clone(),
-        remote_root,
-        runner: target.map(|target| crate::remote_runner::TargetRunnerConfig {
-            mode: match target.runner_mode {
-                crate::machine_targets::RunnerMode::Installed => "installed",
-                crate::machine_targets::RunnerMode::Upload => "upload",
-            }
-            .to_string(),
-            command: target.runner_command.clone(),
-            artifacts: target.runner_artifacts.clone(),
-            remote_root: target.remote_root.clone(),
-        }),
-    };
+    let who = format!("cell '{}'", cell.cell_id);
+    let provider = remote_provider(store, machine, &who)?;
+    let req = provision_request(
+        &who,
+        machine,
+        project,
+        branch,
+        upstream,
+        squad_id,
+        &cell.cell_id,
+        targets,
+    )?;
     let spec = crate::runner::RunnerSpec::from_row(squad_id, cell);
     let result = provider
         .provision(&req, &spec)
@@ -2890,6 +2838,161 @@ fn provision_remote_with_targets(
         }
     }
     result
+}
+
+/// The provider behind `machine`. `who` ("cell 'x'", "review guardian-3")
+/// prefixes the error.
+fn remote_provider(
+    store: &StoreHandle,
+    machine: &str,
+    who: &str,
+) -> Result<crate::remote_runner::ProviderRunner, String> {
+    // allow-lock-io: registry lookups only, no network/subprocess work here.
+    crate::remote_runner::provider_from_store(&store.lock(), machine)
+        .map_err(|e| format!("{who}: {e}"))?
+        // Only called for a non-empty machine, so a local resolution here
+        // means the value changed under us.
+        .ok_or_else(|| format!("{who}: machine \"{machine}\" resolved to the local host"))
+}
+
+/// The `provision` request for `branch` of `project` on `machine`, refusing
+/// before any provider dispatch when a git project lacks what a remote clone
+/// needs. `who` prefixes the errors.
+#[allow(clippy::too_many_arguments)]
+fn provision_request(
+    who: &str,
+    machine: &str,
+    project: &crate::store::ProjectView,
+    branch: &str,
+    upstream: &str,
+    squad_id: &str,
+    cell_id: &str,
+    targets: &std::collections::BTreeMap<String, crate::machine_targets::MachineTarget>,
+) -> Result<crate::remote_runner::ProvisionRequest, String> {
+    // Only git has a clone URL to resolve; every other kind gets `None` and
+    // the provider decides how to obtain the source.
+    let url = if project.vcs == "git" {
+        Some(project.clone_url.clone().ok_or_else(|| {
+            format!(
+                "{who}: git project {:?} has no registered clone URL; re-register it with `ralphus project git --name {} --path <local-path> --url <clone-url>` before using it on a remote machine",
+                project.name, project.name
+            )
+        })?)
+    } else {
+        None
+    };
+    // RAL-355 Phase 2/4: a git project's remote workspace needs a durable
+    // `remote_root` to provision persistent storage under -- refused here,
+    // before ever dispatching to the provider, the same "fail before
+    // provider dispatch" shape the missing-clone-URL check above already
+    // uses, rather than letting the provider discover the gap at its own
+    // runtime and report a less actionable error.
+    let target = crate::machine_targets::find_by_machine(targets, machine);
+    let remote_root = if project.vcs == "git" {
+        let target = target.ok_or_else(|| {
+            format!(
+                "{who}: machine {machine:?} has no [machine.targets.*] entry configured with a remote_root; register one before provisioning a git project there"
+            )
+        })?;
+        Some(target.remote_root.clone())
+    } else {
+        None
+    };
+    Ok(crate::remote_runner::ProvisionRequest {
+        project: project.name.clone(),
+        source: crate::remote_runner::WorkspaceSource {
+            kind: project.vcs.clone(),
+            url,
+            branch: Some(branch.to_string()),
+            upstream: Some(upstream.to_string()),
+        },
+        squad_id: squad_id.to_string(),
+        cell_id: cell_id.to_string(),
+        remote_root,
+        runner: target.map(|target| crate::remote_runner::TargetRunnerConfig {
+            mode: match target.runner_mode {
+                crate::machine_targets::RunnerMode::Installed => "installed",
+                crate::machine_targets::RunnerMode::Upload => "upload",
+            }
+            .to_string(),
+            command: target.runner_command.clone(),
+            artifacts: target.runner_artifacts.clone(),
+            remote_root: target.remote_root.clone(),
+        }),
+    })
+}
+
+/// The branch a review provisions on its machine when none of its cells ran
+/// there: a review-owned name no merge ever checks out, so the anchor
+/// worktree it lives in never blocks one.
+#[must_use]
+pub(crate) fn review_anchor_branch(guardian_id: &str) -> String {
+    format!("ralphus-review-anchor/{guardian_id}")
+}
+
+/// Provision the project at daemon path `project_root` on `machine` for
+/// review `guardian_id`, and return that project's repository **on the
+/// machine** (the parent of its git common dir).
+///
+/// A review assigned a machine its cells never ran on has no workspace
+/// there to discover the repository from; this gives it one, through the
+/// same provider `provision` verb cells use, anchored on
+/// [`review_anchor_branch`] at `base_branch`.
+pub(crate) fn provision_review_repository(
+    store: &StoreHandle,
+    guardian_id: &str,
+    machine: &str,
+    project_root: &str,
+    base_branch: &str,
+) -> Result<String, String> {
+    let who = format!("review {guardian_id}");
+    let project = {
+        let guard = store.lock();
+        guard
+            .project_name_for_path(project_root)
+            .and_then(|name| guard.get_project(&name).ok().flatten())
+    }
+    .ok_or_else(|| {
+        format!(
+            "{who}: no registered project at {project_root:?}, so it cannot be provisioned on \
+             machine \"{machine}\"; register it with `ralphus project git`"
+        )
+    })?;
+    let targets = crate::machine_targets::load_machine_targets()
+        .map_err(|e| format!("{who}: could not load machine targets: {e}"))?;
+    let provider = remote_provider(store, machine, &who)?;
+    let branch = review_anchor_branch(guardian_id);
+    let req = provision_request(
+        &who,
+        machine,
+        &project,
+        &branch,
+        base_branch,
+        guardian_id,
+        "review-anchor",
+        &targets,
+    )?;
+    let spec = crate::runner::RunnerSpec::for_command_proof(
+        "review-merge",
+        "review-merge",
+        machine,
+        ".",
+        "",
+        "claude",
+        None,
+    );
+    let workspace = provider
+        .provision(&req, &spec)
+        .map_err(|e| format!("{who}: {e}"))?;
+    let common = crate::workspace::Workspace::on(workspace.as_str(), Some(machine))
+        .with_store(std::sync::Arc::clone(store))
+        .git(&["rev-parse", "--path-format=absolute", "--git-common-dir"])
+        .map_err(|e| format!("{who}: could not find the repository behind {workspace}: {e}"))?;
+    Path::new(common.trim())
+        .parent()
+        .map(|p| p.to_string_lossy().replace('\\', "/"))
+        .filter(|p| !p.is_empty())
+        .ok_or_else(|| format!("{who}: unexpected git common dir {:?}", common.trim()))
 }
 
 /// The remote counterpart of [`set_explicit_upstream`] +
