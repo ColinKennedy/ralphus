@@ -19,6 +19,8 @@ Tick these on the "New personal access token (classic)" page:
   `public_repo`, `repo:invite` and `security_events`.
 - **`workflow`**
 
+![The classic-token scope list with the repo box (and all its sub-scopes) and workflow ticked](images/github-user-token-scopes.png)
+
 Leave everything else unticked. ralphus does not call any org, user-profile,
 key, hook, package, gist, notification, project, codespace, Copilot or
 enterprise endpoint, so `admin:*`, `write:packages`, `user`, `gist`,
