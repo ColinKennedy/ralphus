@@ -255,7 +255,7 @@ mkdir -p {project_dir_q} {worktrees_parent_q}
 exec 9>{lock_path_q}
 flock 9
 if [ -d {repo_dir_q}/.git ]; then
-    recorded_url=$(git -C {repo_dir_q} remote get-url origin 2>/dev/null) || fail "existing repository at {repo_dir_q} has no 'origin' remote"
+    recorded_url=$(git -C {repo_dir_q} config --get remote.origin.url 2>/dev/null) || fail "existing repository at {repo_dir_q} has no 'origin' remote"
     if [ "$recorded_url" != {url_q} ]; then
         fail "origin mismatch for {project_name_q}: expected {url_q} but {repo_dir_q} has origin $recorded_url -- a directory hash collision or manual tampering, refusing to adopt it"
     fi
@@ -490,7 +490,14 @@ mod tests {
             "feat",
             "main",
         ));
-        assert!(script.contains("remote get-url origin"), "{script}");
+        // The stored URL, not `remote get-url`: that applies the account's
+        // `url.*.insteadOf` rewrites, so an https clone on a machine that
+        // rewrites https to ssh read back as a mismatch and was refused.
+        assert!(
+            script.contains("config --get remote.origin.url"),
+            "{script}"
+        );
+        assert!(!script.contains("remote get-url"), "{script}");
         assert!(script.contains("origin mismatch"), "{script}");
     }
 
