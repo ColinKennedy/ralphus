@@ -11,7 +11,7 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::exhibits::ExhibitKind;
+use ralphus_core::exhibit_recipes::ExhibitKind;
 
 /// Largest image or GIF either forge embeds.
 pub const MAX_IMAGE_BYTES: u64 = 10 * 1024 * 1024;
@@ -112,7 +112,7 @@ pub struct Ffmpeg;
 
 impl Transcoder for Ffmpeg {
     fn available(&self) -> bool {
-        std::process::Command::new("ffmpeg")
+        tool("ffmpeg")
             .arg("-version")
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
@@ -121,7 +121,7 @@ impl Transcoder for Ffmpeg {
     }
 
     fn run(&self, args: &[String]) -> Result<(), String> {
-        let out = std::process::Command::new("ffmpeg")
+        let out = tool("ffmpeg")
             .args(["-hide_banner", "-loglevel", "error", "-nostdin", "-y"])
             .args(args)
             .output()
@@ -134,7 +134,7 @@ impl Transcoder for Ffmpeg {
     }
 
     fn duration_seconds(&self, path: &Path) -> Option<f64> {
-        let out = std::process::Command::new("ffprobe")
+        let out = tool("ffprobe")
             .args([
                 "-v",
                 "error",
@@ -148,6 +148,13 @@ impl Transcoder for Ffmpeg {
             .ok()?;
         String::from_utf8_lossy(&out.stdout).trim().parse().ok()
     }
+}
+
+/// `program` without the forge token an upload run carries.
+fn tool(program: &str) -> std::process::Command {
+    let mut command = std::process::Command::new(program);
+    command.env_remove(crate::exhibit_upload::TOKEN_ENV);
+    command
 }
 
 /// A file ready to embed, or why there is none.
@@ -365,7 +372,9 @@ pub(crate) mod tests {
             let dir = std::env::temp_dir().join(format!(
                 "ralphus-exhibits-{}-{}-{}",
                 std::process::id(),
-                crate::store::now_ms(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| d.as_millis()),
                 N.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
             ));
             std::fs::create_dir_all(&dir).unwrap();
@@ -421,7 +430,11 @@ pub(crate) mod tests {
         path
     }
 
-    const PREF: [ExhibitKind; 3] = crate::exhibits::DEFAULT_KIND_PREFERENCE;
+    const PREF: [ExhibitKind; 3] = [
+        ExhibitKind::Gif,
+        ExhibitKind::Video,
+        ExhibitKind::Screenshot,
+    ];
 
     #[test]
     fn a_fitting_file_is_used_as_is_without_ffmpeg() {

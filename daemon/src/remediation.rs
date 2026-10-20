@@ -574,6 +574,7 @@ mod tests {
             maximum_timeout: None,
             pass_score: None,
             closing_turn_prompt: None,
+            exhibit: None,
         }
     }
 

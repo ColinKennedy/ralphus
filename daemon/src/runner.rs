@@ -375,6 +375,12 @@ pub struct RunnerSpec {
     /// them in a resumed turn after the work completes.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub closing_turn_prompt: Option<String>,
+    /// A live run's exhibit work for the runner on whichever machine runs the
+    /// spec: `capture` creates the run's exhibit directory there before its
+    /// agent starts, `upload` delivers what it captured instead of running an
+    /// agent. See `ralphus_runner::exhibit_upload`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exhibit: Option<ralphus_runner::exhibit_upload::ExhibitWork>,
 }
 
 /// Wall-clock hard-cap accounting for the task-file `maximum_timeout_seconds`
@@ -824,6 +830,7 @@ impl RunnerSpec {
             },
             pass_score: None,
             closing_turn_prompt,
+            exhibit: None,
         }
     }
 
@@ -942,6 +949,7 @@ impl RunnerSpec {
             maximum_timeout: None,
             pass_score: None,
             closing_turn_prompt: None,
+            exhibit: None,
         }
     }
 
@@ -1041,6 +1049,7 @@ impl RunnerSpec {
             maximum_timeout: None,
             pass_score: None,
             closing_turn_prompt: None,
+            exhibit: None,
         }
     }
 }
@@ -3330,6 +3339,7 @@ mod tests {
             maximum_timeout: None,
             pass_score: None,
             closing_turn_prompt: None,
+            exhibit: None,
         }
     }
 

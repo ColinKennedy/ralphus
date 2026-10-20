@@ -181,6 +181,9 @@ pub fn preflight_agent(
 /// exception escape to a nonzero process exit with no JSON on stdout.
 #[must_use]
 pub fn run_cell(spec: &CellSpec, keep_temporary_files: bool) -> CellResult {
+    if let Some(crate::exhibit_upload::ExhibitWork::Upload(request)) = &spec.exhibit {
+        return crate::exhibit_upload::run_upload_cell(request);
+    }
     let workspace = match Workspace::create(&spec.cwd) {
         Ok(w) => w,
         Err(e) => return CellResult::failed(e.to_string(), ""),
@@ -193,8 +196,21 @@ pub fn run_cell(spec: &CellSpec, keep_temporary_files: bool) -> CellResult {
     let Some(prompt) = &spec.prompt else {
         return CellResult::failed("spec has neither prompt nor command", "");
     };
+    let prompt = match &spec.exhibit {
+        Some(crate::exhibit_upload::ExhibitWork::Capture(run)) => {
+            match crate::exhibit_upload::prepare_capture(
+                &crate::exhibit_upload::exhibits_root(),
+                run,
+                prompt,
+            ) {
+                Ok(prompt) => std::borrow::Cow::Owned(prompt),
+                Err(e) => return CellResult::failed(e, ""),
+            }
+        }
+        _ => std::borrow::Cow::Borrowed(prompt.as_str()),
+    };
 
-    run_prompt(spec, prompt, &workspace, keep_temporary_files)
+    run_prompt(spec, &prompt, &workspace, keep_temporary_files)
 }
 
 fn run_command(
@@ -1909,6 +1925,7 @@ RALPHUS_BEARING: accepted: renamed every call site"
     fn test_spec(proof: bool) -> CellSpec {
         CellSpec {
             capabilities: None,
+            exhibit: None,
             squad_id: "sq".into(),
             task: "t".into(),
             cell_id: "c".into(),
@@ -2247,6 +2264,7 @@ RALPHUS_APPRAISAL: {{\"score\": {score}, \"summary\": \"s\"}}"
         std::fs::create_dir_all(&dir).unwrap();
         let spec = CellSpec {
             capabilities: None,
+            exhibit: None,
             squad_id: "r".into(),
             task: "t".into(),
             cell_id: "s".into(),

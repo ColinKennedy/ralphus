@@ -142,8 +142,14 @@ tag = "health-gh-exhibit-fallback"
 
 # Converting a captured exhibit with ffmpeg (`exhibit_media::prepare`).
 [[test]]
-id = "ralphus-daemon exhibit_media::tests::a_real_ffmpeg_turns_a_gif_into_a_still_when_the_preference_allows_only_stills"
+id = "ralphus-runner exhibit_media::tests::a_real_ffmpeg_turns_a_gif_into_a_still_when_the_preference_allows_only_stills"
 tag = "exhibit-media-ffmpeg"
+
+# Delivering a live run's exhibits from the machine that ran it (the
+# `ralphus-runner` binary given an `exhibit: upload` spec).
+[[test]]
+id = "ralphus-runner::exhibit_upload_cell the_runner_binary_uploads_a_runs_capture_with_the_token_from_its_environment"
+tag = "exhibit-upload-runner"
 
 # Matching exhibit recipes to a PR branch's changed files (`git diff --name-only`).
 [[test]]
