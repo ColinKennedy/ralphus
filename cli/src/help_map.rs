@@ -2773,6 +2773,27 @@ Python's per-selector --environment/--env-file overrides are not yet ported.)",
             &[],
         ),
         node(
+            "ingest",
+            &["branch [str...]"],
+            &[
+                "--base [branch]",
+                "--label [text]",
+                "--pr [integer]",
+                "--prompt [text]",
+                "--prompt-file [path]",
+                "--review [selector]",
+                "--yes",
+            ],
+            "Attach existing branches, and any open PRs on them, to a review (RAL-702). Each \
+branch becomes one task with one prompt cell, chained in command-line order; --review attaches \
+to an existing review instead of creating one. Prints the chosen base and agent with the rule \
+that chose each, the PRs it will adopt, and the force-push warning, then asks to proceed unless \
+--yes.",
+            false,
+            false,
+            &[],
+        ),
+        node(
             "submit",
             &["file [str...]"],
             &[

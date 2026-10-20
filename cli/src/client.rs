@@ -349,6 +349,10 @@ impl DaemonClient {
         self.post("/api/squads/validate", Some(json!({"toml": toml_text})))
     }
 
+    pub fn ingest(&self, body: &Value) -> Result<Value, DaemonError> {
+        self.post("/api/ingest", Some(body.clone()))
+    }
+
     pub fn submit(
         &self,
         toml_text: &str,

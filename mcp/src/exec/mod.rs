@@ -61,6 +61,7 @@ pub fn execute(cmd: Command, client: &DaemonClient) -> ExecResult {
         Command::License => Ok(json!({"license": ralphus_core::license::embedded_license()})),
         Command::Validate { files } => exec_validate(client, &files),
         Command::Submit(args) => exec_submit(client, args),
+        Command::Ingest(args) => exec_ingest(client, args),
         Command::Status {
             squad_id,
             concurrency,
@@ -141,6 +142,19 @@ fn exec_validate(client: &DaemonClient, files: &[String]) -> ExecResult {
     }
     let combined = texts.join("\n\n");
     Ok(client.validate(&combined)?)
+}
+
+fn exec_ingest(
+    client: &DaemonClient,
+    args: ralphus_cli::commands::ingest::IngestArgs,
+) -> ExecResult {
+    let path = std::env::current_dir()
+        .map_err(|e| usage(format!("cannot determine the working directory: {e}")))?
+        .to_string_lossy()
+        .into_owned();
+    let mut body = ralphus_cli::commands::ingest::build_request(client, &args, &path)?;
+    body["dry_run"] = json!(!args.yes);
+    Ok(client.ingest(&body)?)
 }
 
 fn exec_submit(client: &DaemonClient, args: misc::SubmitArgs) -> ExecResult {

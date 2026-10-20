@@ -15,6 +15,7 @@ pub mod agent;
 pub mod cell;
 pub mod env;
 pub mod forge;
+pub mod ingest;
 pub mod initialize;
 pub mod internal;
 pub mod machine;
@@ -168,6 +169,7 @@ pub enum Command {
         files: Vec<String>,
     },
     Submit(misc::SubmitArgs),
+    Ingest(ingest::IngestArgs),
     Status {
         squad_id: Option<String>,
         concurrency: bool,
@@ -277,6 +279,7 @@ pub fn parse_args(args: &[String]) -> Command {
             files: scanner.remaining(),
         },
         Some("submit") => misc::parse_submit(&mut scanner),
+        Some("ingest") => ingest::parse_ingest(&mut scanner),
         Some("status") => {
             let concurrency = scanner.take_bool("--concurrency");
             Command::Status {
@@ -533,6 +536,7 @@ pub fn dispatch(cmd: Command, opts: &GlobalOpts) -> i32 {
         }
         Command::Validate { files } => misc::cmd_validate(opts, &files),
         Command::Submit(args) => misc::cmd_submit(opts, args),
+        Command::Ingest(args) => ingest::cmd_ingest(opts, args),
         Command::Status {
             squad_id,
             concurrency,
