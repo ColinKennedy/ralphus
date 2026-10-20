@@ -1278,7 +1278,12 @@ pub fn execute_live_run(
             .agent_session_id
             .clone()
             .map(|agent_session_id| LiveRunSession {
-                spec: spec.clone(),
+                // A turn resumed later (the recipe check) captures nothing:
+                // this run's exhibits are delivered below.
+                spec: RunnerSpec {
+                    exhibit: None,
+                    ..spec.clone()
+                },
                 agent_session_id,
             });
     }
