@@ -166,6 +166,119 @@ one per product you touched). If this change cannot be meaningfully tested \
 live (a pure refactor, documentation only), write \
 'RALPHUS_LIVE_ACTION: (nothing to test live)'.";
 
+/// Most capabilities named per kind in the handoff question; the rest are
+/// counted.
+const INVENTORY_MAX_PER_KIND: usize = 12;
+
+/// The sentence telling a cell what the agent that will run its live tests
+/// has available. Names and descriptions only.
+#[must_use]
+pub fn format_live_test_inventory(caps: &[crate::capability_store::UsableCapability]) -> String {
+    use crate::capability_store::CapabilityKind;
+    let list = |kind: CapabilityKind| -> Option<String> {
+        let items: Vec<_> = caps.iter().filter(|c| c.kind == kind).collect();
+        if items.is_empty() {
+            return None;
+        }
+        let mut parts: Vec<String> = items
+            .iter()
+            .take(INVENTORY_MAX_PER_KIND)
+            .map(|c| match &c.description {
+                Some(d) => format!("{} ({d})", c.name),
+                None => c.name.clone(),
+            })
+            .collect();
+        if items.len() > INVENTORY_MAX_PER_KIND {
+            parts.push(format!("and {} more", items.len() - INVENTORY_MAX_PER_KIND));
+        }
+        Some(parts.join("; "))
+    };
+    let mcp = list(CapabilityKind::Mcp);
+    let skills = list(CapabilityKind::Skill);
+    if mcp.is_none() && skills.is_none() {
+        return "Live tests will be run by an agent with no MCP servers or skills: propose \
+                tests that need only a shell (commands, curl, files)."
+            .to_string();
+    }
+    let mut out = String::from("Live tests will be run by an agent with:");
+    if let Some(mcp) = mcp {
+        out.push_str(&format!(" MCP servers: {mcp}."));
+    }
+    if let Some(skills) = skills {
+        out.push_str(&format!(" Skills: {skills}."));
+    }
+    out.push_str(" Propose tests that agent can actually run.");
+    out
+}
+
+/// [`LIVE_HANDOFF_QUESTION`] followed by what the review's agent can do. The
+/// agent is the squad's review's resolver agent -- the one a live run uses --
+/// or, while no review exists yet, the review default agent for `cwd`.
+#[must_use]
+pub fn live_handoff_question_for(
+    store: &crate::store_lock::StoreHandle,
+    squad_id: &str,
+    cwd: &str,
+) -> String {
+    let (stored_agent, stored_model) = {
+        let guard = store.lock();
+        guard
+            .guardians_for_squad(squad_id)
+            .ok()
+            .and_then(|ids| ids.first().and_then(|id| guard.get_guardian(id).ok()))
+            .map_or((None, None), |g| (g.resolver_agent, g.resolver_model))
+    };
+    let Ok(resolved) = crate::guardian_merge::resolve_resolver_agent(
+        stored_agent.as_deref(),
+        stored_model.as_deref(),
+        store,
+        Path::new(cwd),
+    ) else {
+        return LIVE_HANDOFF_QUESTION.to_string();
+    };
+    let profile = stored_agent
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map_or_else(
+            || {
+                let default = store
+                    .lock()
+                    .resolve_review_config(Path::new(cwd))
+                    .default_resolver_agent()
+                    .to_string();
+                if store
+                    .lock()
+                    .get_agent_profile(&default)
+                    .ok()
+                    .flatten()
+                    .is_some()
+                {
+                    default
+                } else {
+                    resolved.backend.clone()
+                }
+            },
+            ToString::to_string,
+        );
+    let allow_ralphus_mcp = crate::config::resolve_agents_config().allow_ralphus_mcp();
+    let caps = {
+        let guard = store.lock();
+        let name = if guard.get_agent_profile(&profile).ok().flatten().is_some() {
+            profile.as_str()
+        } else {
+            resolved.backend.as_str()
+        };
+        guard
+            .usable_capabilities(name, allow_ralphus_mcp)
+            .unwrap_or_default()
+    };
+    format!(
+        "{LIVE_HANDOFF_QUESTION}\n\n{}",
+        format_live_test_inventory(&caps)
+    )
+}
+
 /// The live handoffs one agent reply carries.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LiveHandoffs {
@@ -1739,5 +1852,91 @@ prompt = "second"
         );
         assert_eq!(out.end, LiveRunEnd::OverBudget);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn add_mcp(store: &crate::store_lock::StoreHandle, profile: &str, name: &str, status: &str) {
+        use crate::capability_store::{CapabilityKind, McpConfig};
+        let guard = store.lock();
+        guard
+            .upsert_capability_item(
+                CapabilityKind::Mcp,
+                name,
+                Some(McpConfig {
+                    command: Some("SECRET-COMMAND".to_string()),
+                    args: vec!["SECRET-ARG".to_string()],
+                    ..McpConfig::default()
+                }),
+                None,
+                "manual",
+            )
+            .unwrap();
+        guard
+            .set_capability_status(CapabilityKind::Mcp, name, status, None, None)
+            .unwrap();
+        guard
+            .set_capability_enabled(profile, CapabilityKind::Mcp, name, true, false)
+            .unwrap();
+    }
+
+    fn mem_store() -> Arc<crate::store_lock::StoreMutex> {
+        Arc::new(crate::store_lock::StoreMutex::new(
+            crate::store::Store::open_in_memory().unwrap(),
+        ))
+    }
+
+    #[test]
+    fn handoff_question_lists_the_reviews_resolver_agent_capabilities() {
+        let store = mem_store();
+        add_mcp(&store, "claude-code", "playwright", "ok");
+        add_mcp(&store, "claude-code", "broken", "failing");
+        add_mcp(&store, "ollama", "other-agent-only", "ok");
+        {
+            let guard = store.lock();
+            let gid = guard
+                .create_guardian_for_squad("r", "main", "/repo", Some("squad-x"))
+                .unwrap();
+            guard
+                .set_guardian_resolver(&gid, Some(Some("claude-code")), None)
+                .unwrap();
+        }
+        let q = live_handoff_question_for(&store, "squad-x", "/nonexistent-cwd");
+        assert!(q.starts_with(LIVE_HANDOFF_QUESTION));
+        assert!(q.contains("MCP servers: playwright."), "{q}");
+        assert!(!q.contains("broken"), "failing server listed: {q}");
+        assert!(!q.contains("other-agent-only"), "{q}");
+        assert!(!q.contains("SECRET"), "{q}");
+    }
+
+    #[test]
+    fn handoff_question_without_a_review_uses_the_default_review_agent() {
+        let store = mem_store();
+        add_mcp(&store, "ollama", "playwright", "untested");
+        add_mcp(&store, "claude-code", "not-the-default", "ok");
+        let q = live_handoff_question_for(&store, "squad-none", "/nonexistent-cwd");
+        assert!(q.contains("MCP servers: playwright."), "{q}");
+        assert!(!q.contains("not-the-default"), "{q}");
+    }
+
+    #[test]
+    fn handoff_question_says_so_when_the_agent_has_no_capabilities() {
+        let store = mem_store();
+        let q = live_handoff_question_for(&store, "squad-none", "/nonexistent-cwd");
+        assert!(q.contains("no MCP servers or skills"), "{q}");
+    }
+
+    #[test]
+    fn inventory_is_capped_per_kind() {
+        use crate::capability_store::{CapabilityKind, UsableCapability};
+        let caps: Vec<_> = (0..15)
+            .map(|i| UsableCapability {
+                kind: CapabilityKind::Skill,
+                name: format!("s{i}"),
+                description: Some("does a thing".to_string()),
+            })
+            .collect();
+        let text = format_live_test_inventory(&caps);
+        assert!(text.contains("s11 (does a thing)"));
+        assert!(!text.contains("s12"));
+        assert!(text.contains("and 3 more"));
     }
 }

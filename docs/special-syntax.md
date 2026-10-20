@@ -523,6 +523,11 @@ tool guidance, but without the waypoint section (`waypoint_context` false). The 
   Cells are asked to put a short title on the marker line and the steps
   below it; the first line becomes the live action's label when no
   deduplication names it.
+  The question ends with what the agent that will run the tests can do: the
+  enabled, non-failing MCP servers and skills (names and descriptions only) of
+  the squad's review's resolver agent, or of the review default agent while no
+  review exists yet, or a statement that it has none (propose shell-only tests).
+  Work-turn prompts never carry this.
   Write them **before** `RALPHUS_GHOST:` in the same reply — the ghost takes everything after its
   marker to the end of the reply. The `(nothing to test live)` answer
   (case-insensitive) records an explicit "no", distinct from no marker at all.

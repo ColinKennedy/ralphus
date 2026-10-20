@@ -5498,6 +5498,11 @@ at `GET /api/squads/{id}/cells/{ti}/{si}/live-handoffs` as
 actions are its member cells' handoffs -- the latest-finished cell of each task
 only -- deduplicated once by the review's resolver agent and then fixed.
 
+The handoff question a cell is asked in its closing turn also lists the review
+resolver agent's enabled, non-failing MCP servers and skills (names and
+descriptions; the review default agent when the squad has no review yet), so
+the cell proposes tests that agent can run.
+
 `live_actions` (boolean, default `true` for reviews created after the default changed; reviews that predate it resolve an unset value to `false`) enables or disables a review: per review (`POST
 /api/guardians/{id}/settings` or `/details`, `[[review]] live_actions`), with a
 project default (`POST /api/projects/{name}/review-settings`, `.ralphus.toml
