@@ -94,6 +94,9 @@ pub struct CapabilityItemView {
     pub status: String,
     pub status_detail: Option<String>,
     pub tool_count: Option<i64>,
+    /// The tool names the last successful probe saw (MCP only); `None` until
+    /// the server has been probed.
+    pub tools: Option<Vec<String>>,
     pub checked_at_ms: Option<i64>,
     pub created_at_ms: i64,
     pub updated_at_ms: i64,
@@ -273,6 +276,7 @@ fn row_to_item(
         status,
         status_detail: detail,
         tool_count,
+        tools: None,
         checked_at_ms: checked,
         created_at_ms: created,
         updated_at_ms: updated,
@@ -302,6 +306,8 @@ pub struct CapabilityPlan {
     pub profile: String,
     pub items: Vec<CapabilityItem>,
     pub delivery: CapabilityDelivery,
+    /// Denied tool names per MCP server name; every other tool is allowed.
+    pub denied_tools: BTreeMap<String, Vec<String>>,
 }
 
 impl CapabilityPlan {
@@ -335,6 +341,7 @@ impl CapabilityPlan {
                         "env": env,
                         "url": config.url,
                         "headers": headers,
+                        "denied_tools": self.denied_tools.get(name).cloned().unwrap_or_default(),
                     }));
                 }
                 CapabilityKind::Skill => {
@@ -389,6 +396,12 @@ impl Store {
                 ))
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
+        let inventory = self.tool_inventories()?;
+        for item in &mut out {
+            if item.kind == CapabilityKind::Mcp {
+                item.tools = inventory.get(&item.name).cloned();
+            }
+        }
         if allow_ralphus_mcp {
             let item = ralphus_mcp_item();
             out.insert(
@@ -402,6 +415,7 @@ impl Store {
                     status: "untested".to_string(),
                     status_detail: None,
                     tool_count: None,
+                    tools: inventory.get(RALPHUS_MCP_NAME).cloned(),
                     checked_at_ms: None,
                     created_at_ms: 0,
                     updated_at_ms: 0,
@@ -492,6 +506,10 @@ impl Store {
         let now = now_ms();
         // Editing the config makes an earlier probe result stale.
         self.conn.execute(
+            "DELETE FROM capability_tool_inventory WHERE name = ? AND ? = 'mcp'",
+            rusqlite::params![name, kind.as_str()],
+        )?;
+        self.conn.execute(
             "INSERT INTO capability_items(kind, name, source, config_json, status, created_at_ms, updated_at_ms)
              VALUES(?,?,?,?, 'untested', ?, ?)
              ON CONFLICT(kind, name) DO UPDATE SET
@@ -522,6 +540,16 @@ impl Store {
             "DELETE FROM agent_capability_enabled WHERE kind = ? AND name = ?",
             rusqlite::params![kind.as_str(), name],
         )?;
+        if kind == CapabilityKind::Mcp {
+            self.conn.execute(
+                "DELETE FROM capability_tool_inventory WHERE name = ?",
+                rusqlite::params![name],
+            )?;
+            self.conn.execute(
+                "DELETE FROM agent_capability_tool_denied WHERE server = ?",
+                rusqlite::params![name],
+            )?;
+        }
         let n = self.conn.execute(
             "DELETE FROM capability_items WHERE kind = ? AND name = ?",
             rusqlite::params![kind.as_str(), name],
@@ -559,6 +587,106 @@ impl Store {
                 "kind": kind.as_str(), "name": name, "status": status,
                 "tool_count": tool_count, "detail": detail,
             }),
+        );
+        Ok(())
+    }
+
+    fn tool_inventories(&self) -> StoreResult<BTreeMap<String, Vec<String>>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT name, tools_json FROM capability_tool_inventory")?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows
+            .into_iter()
+            .map(|(name, json)| (name, serde_json::from_str(&json).unwrap_or_default()))
+            .collect())
+    }
+
+    /// Record the tool names a successful probe of MCP server `name` saw.
+    /// Stored denies are kept, including those naming a tool that is no
+    /// longer listed.
+    ///
+    /// # Errors
+    /// Propagates any SQLite failure.
+    pub fn set_capability_tools(&self, name: &str, tools: &[String]) -> StoreResult<()> {
+        self.conn.execute(
+            "INSERT INTO capability_tool_inventory(name, tools_json) VALUES(?,?)
+             ON CONFLICT(name) DO UPDATE SET tools_json = excluded.tools_json",
+            rusqlite::params![
+                name,
+                serde_json::to_string(tools).unwrap_or_else(|_| "[]".to_string())
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// The tools `profile` denies, per MCP server. A tool absent from this map
+    /// is allowed, so a tool a server adds later is allowed by default.
+    ///
+    /// # Errors
+    /// Propagates any SQLite failure.
+    pub fn list_denied_tools(&self, profile: &str) -> StoreResult<BTreeMap<String, Vec<String>>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT server, tool FROM agent_capability_tool_denied WHERE profile = ?
+             ORDER BY server, tool",
+        )?;
+        let rows = stmt
+            .query_map(rusqlite::params![profile], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let mut out: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for (server, tool) in rows {
+            out.entry(server).or_default().push(tool);
+        }
+        Ok(out)
+    }
+
+    /// Allow or deny one tool of an MCP server for `profile`. Allowing is the
+    /// default, so allowing deletes the deny row. The tool need not appear in
+    /// the server's inventory (a deny for a removed tool stays until cleared).
+    ///
+    /// # Errors
+    /// [`CapabilityError::NotFound`] for an unknown profile or MCP server;
+    /// [`CapabilityError::Invalid`] for an empty or oversized tool name.
+    pub fn set_capability_tool_allowed(
+        &self,
+        profile: &str,
+        server: &str,
+        tool: &str,
+        allowed: bool,
+        allow_ralphus_mcp: bool,
+    ) -> Result<(), CapabilityError> {
+        self.require_capability_profile(profile)?;
+        if tool.trim().is_empty() || tool.len() > 200 {
+            return Err(CapabilityError::Invalid(
+                "tool must be 1-200 characters".to_string(),
+            ));
+        }
+        if self
+            .get_capability_item(CapabilityKind::Mcp, server, allow_ralphus_mcp)?
+            .is_none()
+        {
+            return Err(CapabilityError::NotFound(format!(
+                "no mcp named {server:?} in the catalog"
+            )));
+        }
+        if allowed {
+            self.conn.execute(
+                "DELETE FROM agent_capability_tool_denied WHERE profile = ? AND server = ? AND tool = ?",
+                rusqlite::params![profile, server, tool],
+            )?;
+        } else {
+            self.conn.execute(
+                "INSERT OR IGNORE INTO agent_capability_tool_denied(profile, server, tool) VALUES(?,?,?)",
+                rusqlite::params![profile, server, tool],
+            )?;
+        }
+        self.log_capability_event(
+            "capability tool toggled",
+            json!({"profile": profile, "server": server, "tool": tool, "allowed": allowed}),
         );
         Ok(())
     }
@@ -714,6 +842,10 @@ impl Store {
             rusqlite::params![profile],
         )?;
         self.conn.execute(
+            "DELETE FROM agent_capability_tool_denied WHERE profile = ?",
+            rusqlite::params![profile],
+        )?;
+        self.conn.execute(
             "DELETE FROM agent_capability_delivery WHERE profile = ?",
             rusqlite::params![profile],
         )?;
@@ -741,6 +873,7 @@ impl Store {
             profile: profile.to_string(),
             items,
             delivery: self.get_capability_delivery(profile)?,
+            denied_tools: self.list_denied_tools(profile)?,
         })
     }
 
@@ -1190,5 +1323,81 @@ mod tests {
         assert!(caps_empty(
             &store.resolve_capabilities("pi", false).unwrap()
         ));
+    }
+
+    #[test]
+    fn denied_tools_reach_the_spec_and_survive_a_tool_list_change() {
+        let store = Store::open_in_memory().unwrap();
+        store
+            .upsert_capability_item(
+                CapabilityKind::Mcp,
+                "fs",
+                Some(stdio(vec![])),
+                None,
+                "manual",
+            )
+            .unwrap();
+        store
+            .set_capability_enabled("claude-code", CapabilityKind::Mcp, "fs", true, false)
+            .unwrap();
+        store
+            .set_capability_tools("fs", &["read".to_string(), "write".to_string()])
+            .unwrap();
+        // Every tool is allowed until denied.
+        let caps = store.resolve_capabilities("claude-code", false).unwrap();
+        assert!(
+            caps["mcp_servers"][0]["denied_tools"]
+                .as_array()
+                .is_none_or(Vec::is_empty)
+        );
+        store
+            .set_capability_tool_allowed("claude-code", "fs", "write", false, false)
+            .unwrap();
+        let caps = store.resolve_capabilities("claude-code", false).unwrap();
+        assert_eq!(caps["mcp_servers"][0]["denied_tools"], json!(["write"]));
+        // A server upgrade that adds a tool leaves the new tool allowed and
+        // the stored deny untouched, even when the denied tool disappears.
+        store
+            .set_capability_tools("fs", &["read".to_string(), "search".to_string()])
+            .unwrap();
+        let denied = store.list_denied_tools("claude-code").unwrap();
+        assert_eq!(denied["fs"], vec!["write".to_string()]);
+        let caps = store.resolve_capabilities("claude-code", false).unwrap();
+        assert_eq!(caps["mcp_servers"][0]["denied_tools"], json!(["write"]));
+        store
+            .set_capability_tool_allowed("claude-code", "fs", "write", true, false)
+            .unwrap();
+        assert!(store.list_denied_tools("claude-code").unwrap().is_empty());
+    }
+
+    #[test]
+    fn tool_policy_rejects_unknown_targets_and_clears_with_the_server() {
+        let store = Store::open_in_memory().unwrap();
+        assert!(
+            store
+                .set_capability_tool_allowed("claude-code", "nope", "t", false, false)
+                .is_err()
+        );
+        store
+            .upsert_capability_item(
+                CapabilityKind::Mcp,
+                "fs",
+                Some(stdio(vec![])),
+                None,
+                "manual",
+            )
+            .unwrap();
+        assert!(
+            store
+                .set_capability_tool_allowed("ghost-profile", "fs", "t", false, false)
+                .is_err()
+        );
+        store
+            .set_capability_tool_allowed("codex", "fs", "t", false, false)
+            .unwrap();
+        store
+            .delete_capability_item(CapabilityKind::Mcp, "fs")
+            .unwrap();
+        assert!(store.list_denied_tools("codex").unwrap().is_empty());
     }
 }

@@ -130,5 +130,11 @@ fn execute_capability(cmd: AgentCapabilityCommand, client: &DaemonClient) -> Exe
             mode,
             args,
         } => Ok(client.set_profile_capability_delivery(&profile, &mode, &args)?),
+        C::ToolPolicy {
+            profile,
+            server,
+            tool,
+            allowed,
+        } => Ok(client.set_profile_tool_policy(&profile, &server, &tool, allowed)?),
     }
 }

@@ -11485,6 +11485,47 @@
           }
         }
       }
+    },
+    "/api/agent-profiles/{name}/capabilities/tools": {
+      "post": {
+        "operationId": "postAgentProfilesByNameCapabilitiesTools",
+        "summary": "Backs `ralphus agent capability allow-tool` and `ralphus agent capability deny-tool`.",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/JsonObject"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Success.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/JsonValue"
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
     }
   },
   "components": {

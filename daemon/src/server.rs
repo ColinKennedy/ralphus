@@ -1537,6 +1537,11 @@ fn route_for_user(
                 toggle_profile_capability(daemon, &url_decode(name), body)
             })
         }
+        ("POST", ["api", "agent-profiles", name, "capabilities", "tools"]) => {
+            admin_gated(daemon, user_header, || {
+                set_profile_tool_policy(daemon, &url_decode(name), body)
+            })
+        }
         ("POST", ["api", "agent-profiles", name, "capabilities", "delivery"]) => {
             admin_gated(daemon, user_header, || {
                 set_profile_capability_delivery(daemon, &url_decode(name), body)
@@ -4566,6 +4571,7 @@ fn capability_support(backend: &str) -> serde_json::Value {
     serde_json::json!({
         "backend": backend,
         "supported": supported,
+        "tool_filter": supported && !matches!(backend, "pi"),
         "delivery_configurable": backend == "raw",
     })
 }
@@ -4702,22 +4708,28 @@ fn check_capability(daemon: &Daemon, kind: &str, name: &str) -> Reply {
         }
         Err(e) => return store_error(&e),
     };
-    let (status, detail, tool_count) = match kind {
+    let (status, detail, tool_count, tools) = match kind {
         CapabilityKind::Mcp => {
             let outcome = crate::capability_probe::probe_mcp(&item.mcp.unwrap_or_default());
             (
                 if outcome.ok { "ok" } else { "failing" },
                 outcome.detail,
                 outcome.tool_count,
+                outcome.tools,
             )
         }
         CapabilityKind::Skill => {
             match crate::capability_probe::check_skill(&item.skill.unwrap_or_default().path) {
-                Ok(()) => ("found", None, None),
-                Err(m) => ("missing", Some(m), None),
+                Ok(()) => ("found", None, None, None),
+                Err(m) => ("missing", Some(m), None, None),
             }
         }
     };
+    if let (Some(tools), CapabilityKind::Mcp) = (&tools, kind)
+        && let Err(e) = daemon.lock().set_capability_tools(name, tools)
+    {
+        return store_error(&e);
+    }
     // The built-in ralphus entry is not stored, so there is no row to update.
     let builtin = kind == CapabilityKind::Mcp && name == crate::capability_store::RALPHUS_MCP_NAME;
     if !builtin {
@@ -4735,6 +4747,7 @@ fn check_capability(daemon: &Daemon, kind: &str, name: &str) -> Reply {
             "kind": kind.as_str(), "name": name, "status": status,
             "status_detail": detail.map(|d| crate::redact::redact_all(&d)),
             "tool_count": tool_count,
+            "tools": tools,
         }),
     )
 }
@@ -4802,6 +4815,10 @@ fn profile_capabilities(daemon: &Daemon, name: &str) -> Reply {
         Ok(d) => d,
         Err(e) => return store_error(&e),
     };
+    let denied_tools = match guard.list_denied_tools(name) {
+        Ok(d) => d,
+        Err(e) => return store_error(&e),
+    };
     json(
         200,
         &serde_json::json!({
@@ -4811,6 +4828,7 @@ fn profile_capabilities(daemon: &Daemon, name: &str) -> Reply {
                 .map(|(k, n)| serde_json::json!({"kind": k.as_str(), "name": n}))
                 .collect::<Vec<_>>(),
             "delivery": delivery,
+            "denied_tools": denied_tools,
             "support": capability_support(&backend),
         }),
     )
@@ -4845,6 +4863,65 @@ fn toggle_profile_capability(daemon: &Daemon, profile: &str, body: &str) -> Repl
         allow_ralphus_mcp(),
     ) {
         Ok(()) => json(200, &serde_json::json!({"enabled": req.enabled})),
+        Err(e) => capability_error(e),
+    }
+}
+
+#[derive(Deserialize)]
+struct ToolPolicyBody {
+    server: String,
+    tool: String,
+    allowed: bool,
+}
+
+/// `POST /api/agent-profiles/{name}/capabilities/tools`: allow or deny one
+/// tool of an MCP server. Tools are allowed unless denied, so a tool a server
+/// adds later is allowed. Refused (400 `unsupported`) when the profile's
+/// backend cannot filter tools, instead of storing a filter that would not be
+/// enforced.
+fn set_profile_tool_policy(daemon: &Daemon, profile: &str, body: &str) -> Reply {
+    let Ok(req) = serde_json::from_str::<ToolPolicyBody>(body) else {
+        return error(
+            400,
+            "bad_request",
+            "body must include \"server\", \"tool\" and \"allowed\"",
+            vec![],
+        );
+    };
+    let guard = daemon.lock();
+    let backend = if ralphus_core::schema::RESERVED_AGENT_NAMES.contains(&profile) {
+        profile.to_string()
+    } else {
+        match guard.get_agent_profile(profile) {
+            Ok(Some(p)) => p.backend,
+            Ok(None) => {
+                return error(
+                    404,
+                    "not_found",
+                    &format!("agent profile {profile:?} does not exist"),
+                    vec![],
+                );
+            }
+            Err(e) => return store_error(&e),
+        }
+    };
+    // Re-allowing is always accepted so a filter stored earlier can be cleared.
+    if !req.allowed && capability_support(&backend)["tool_filter"] != true {
+        return error(
+            400,
+            "unsupported",
+            &format!("the {backend} backend cannot filter individual MCP tools"),
+            vec![],
+        );
+    }
+    match guard.set_capability_tool_allowed(
+        profile,
+        &req.server,
+        &req.tool,
+        req.allowed,
+        allow_ralphus_mcp(),
+    ) {
+        Ok(()) => json(200, &serde_json::json!({"allowed": req.allowed})),
         Err(e) => capability_error(e),
     }
 }

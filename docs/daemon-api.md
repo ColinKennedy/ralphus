@@ -1387,6 +1387,18 @@ item is not in the catalog.
 capabilities reach a custom command profile. With `extra_args`, `{mcp_config}`
 and `{skills_dir}` in `args` expand to the generated paths.
 
+#### `POST /api/agent-profiles/{name}/capabilities/tools`
+`{ "server", "tool", "allowed" }` allows or denies one tool of a catalog MCP
+server for the profile (`404` for an unknown profile or server). Tools are
+allowed unless denied, so a tool a server adds in an upgrade is allowed; a
+stored deny survives the server dropping the tool and is listed as "not listed"
+in the board until cleared. Denying is refused with `400 unsupported` when the
+backend cannot filter tools (`support.tool_filter` is false): Claude Code
+enforces it with `--disallowedTools mcp__<server>__<tool>`, Codex with
+`disabled_tools` in the server table; Pi, the native agents and `extra_args`
+delivery cannot. `GET` returns the denies as `denied_tools: {server: [tool]}`,
+and `GET /api/capabilities` lists each checked MCP server's `tools`.
+
 ### `GET /api/machines/targets/health`
 Check every configured `[machine.targets.*]` entry (RAL-355 Phase 9):
 `ralphus check health --all-remotes`'s daemon-side counterpart. Always

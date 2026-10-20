@@ -400,12 +400,20 @@ impl ModelBackend for ClaudeCodeBackend {
             crate::capabilities::write_skills(&dir.join("skills"), &capabilities.skills)?;
             let path = dir.join(crate::capabilities::GENERIC_MCP_FILE);
             crate::capabilities::write_json(&path, &capabilities.mcp_json())?;
+            // Deny rules are checked before any permission mode, so a denied
+            // tool stays uncallable under bypass-permission flags too.
+            let mut args = Vec::new();
+            if let Some(denied) = capabilities.claude_disallowed_tools() {
+                args.push("--disallowedTools".to_string());
+                args.push(denied);
+            }
+            args.extend([
+                "--mcp-config".to_string(),
+                path.display().to_string(),
+                "--strict-mcp-config".to_string(),
+            ]);
             Ok(crate::capabilities::Provisioning {
-                args: vec![
-                    "--mcp-config".to_string(),
-                    path.display().to_string(),
-                    "--strict-mcp-config".to_string(),
-                ],
+                args,
                 temporary_files: vec![path],
             })
         })

@@ -137,6 +137,7 @@ above: users see "Triage", the code says "Arbiter".
 | **capability** | One entry in ralphus's own catalog of MCP servers and skills (`kind` = `mcp` or `skill`), stored in the daemon DB. Not a per-tool permission (that is a separate, later concern) and not to be confused with `thinking_capable` on a profile. |
 | **capability toggle** | An agent profile's (or built-in backend's) enabled/disabled flag for one capability. Default: nothing enabled. A spawned agent receives exactly its enabled capabilities and nothing from the user's personal configs. |
 | **capability delivery** | How a `raw` command profile receives its capabilities: `backend_default`, `extra_args` or `none`. |
+| **tool policy** | A profile's allow/deny choice for one tool of an enabled MCP server. Tools are allowed unless denied, so tools a server adds later are allowed. |
 
 ## Storage and identity
 

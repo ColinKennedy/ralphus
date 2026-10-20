@@ -35,6 +35,9 @@ const STDERR_TAIL_BYTES: usize = 600;
 pub struct ProbeOutcome {
     pub ok: bool,
     pub tool_count: Option<i64>,
+    /// The tool names `tools/list` returned, sorted and de-duplicated; `None`
+    /// when the probe failed (the earlier inventory is then kept).
+    pub tools: Option<Vec<String>>,
     /// The failure reason; redacted against every registered secret.
     pub detail: Option<String>,
 }
@@ -44,9 +47,35 @@ impl ProbeOutcome {
         Self {
             ok: false,
             tool_count: None,
+            tools: None,
             detail: Some(message.into()),
         }
     }
+
+    fn listed(mut names: Vec<String>) -> Self {
+        names.sort();
+        names.dedup();
+        Self {
+            ok: true,
+            tool_count: Some(i64::try_from(names.len()).unwrap_or(i64::MAX)),
+            tools: Some(names),
+            detail: None,
+        }
+    }
+}
+
+/// Append the `name` of every tool in one `tools/list` result page.
+fn collect_tool_names(result: Option<&Value>, out: &mut Vec<String>) {
+    let tools = result
+        .and_then(|r| r.get("tools"))
+        .and_then(Value::as_array);
+    out.extend(
+        tools
+            .into_iter()
+            .flatten()
+            .filter_map(|t| t.get("name").and_then(Value::as_str))
+            .map(str::to_string),
+    );
 }
 
 /// Probe `config` and scrub the outcome of the server's own secret values.
@@ -206,7 +235,7 @@ fn probe_stdio(command: &str, args: &[String], env: &BTreeMap<String, String>) -
         writeln!(stdin, "{}", initialized_notification())
             .and_then(|()| stdin.flush())
             .map_err(|e| format!("the server closed its input: {e}"))?;
-        let mut count = 0i64;
+        let mut names = Vec::new();
         let mut cursor: Option<String> = None;
         for page in 0..20u64 {
             let reply = exchange(
@@ -218,10 +247,7 @@ fn probe_stdio(command: &str, args: &[String], env: &BTreeMap<String, String>) -
                 return Err(format!("tools/list failed: {message}"));
             }
             let result = reply.get("result");
-            count += result
-                .and_then(|r| r.get("tools"))
-                .and_then(Value::as_array)
-                .map_or(0, |t| i64::try_from(t.len()).unwrap_or(i64::MAX));
+            collect_tool_names(result, &mut names);
             cursor = result
                 .and_then(|r| r.get("nextCursor"))
                 .and_then(Value::as_str)
@@ -230,7 +256,7 @@ fn probe_stdio(command: &str, args: &[String], env: &BTreeMap<String, String>) -
                 break;
             }
         }
-        Ok(count)
+        Ok(names)
     })();
 
     drop(stdin);
@@ -238,11 +264,7 @@ fn probe_stdio(command: &str, args: &[String], env: &BTreeMap<String, String>) -
     let _ = child.wait();
 
     match result {
-        Ok(count) => ProbeOutcome {
-            ok: true,
-            tool_count: Some(count),
-            detail: None,
-        },
+        Ok(names) => ProbeOutcome::listed(names),
         Err(message) => {
             let stderr_tail = tail
                 .lock()
@@ -305,7 +327,7 @@ fn probe_http(url: &str, headers: &BTreeMap<String, String>) -> ProbeOutcome {
             return Err(format!("initialize failed: {message}"));
         }
         post(&initialized_notification(), false)?;
-        let mut count = 0i64;
+        let mut names = Vec::new();
         let mut cursor: Option<String> = None;
         for page in 0..20u64 {
             let reply =
@@ -314,10 +336,7 @@ fn probe_http(url: &str, headers: &BTreeMap<String, String>) -> ProbeOutcome {
                 return Err(format!("tools/list failed: {message}"));
             }
             let result = reply.get("result");
-            count += result
-                .and_then(|r| r.get("tools"))
-                .and_then(Value::as_array)
-                .map_or(0, |t| i64::try_from(t.len()).unwrap_or(i64::MAX));
+            collect_tool_names(result, &mut names);
             cursor = result
                 .and_then(|r| r.get("nextCursor"))
                 .and_then(Value::as_str)
@@ -326,14 +345,10 @@ fn probe_http(url: &str, headers: &BTreeMap<String, String>) -> ProbeOutcome {
                 break;
             }
         }
-        Ok(count)
+        Ok(names)
     })();
     match result {
-        Ok(count) => ProbeOutcome {
-            ok: true,
-            tool_count: Some(count),
-            detail: None,
-        },
+        Ok(names) => ProbeOutcome::listed(names),
         Err(message) => ProbeOutcome::failed(message),
     }
 }
@@ -646,6 +661,7 @@ mod tests {
         assert_eq!(outcome.detail, None);
         assert!(outcome.ok);
         assert_eq!(outcome.tool_count, Some(2));
+        assert_eq!(outcome.tools, Some(vec!["a".to_string(), "b".to_string()]));
     }
 
     #[cfg(unix)]

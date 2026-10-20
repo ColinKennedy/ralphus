@@ -236,6 +236,12 @@ pub enum AgentCapabilityCommand {
         mode: String,
         args: Vec<String>,
     },
+    ToolPolicy {
+        profile: String,
+        server: String,
+        tool: String,
+        allowed: bool,
+    },
     UsageError(String),
 }
 
@@ -327,6 +333,18 @@ fn parse_capability(args: &[String]) -> AgentCapabilityCommand {
                     enabled: v == "enable",
                 }),
                 _ => Err(format!("{v} requires <profile> <kind> <name> arguments")),
+            }
+        }
+        Some(v @ ("allow-tool" | "deny-tool")) => {
+            let mut rest = scanner.remaining().into_iter();
+            match (rest.next(), rest.next(), rest.next()) {
+                (Some(profile), Some(server), Some(tool)) => Ok(C::ToolPolicy {
+                    profile,
+                    server,
+                    tool,
+                    allowed: v == "allow-tool",
+                }),
+                _ => Err(format!("{v} requires <profile> <server> <tool> arguments")),
             }
         }
         Some("delivery") => (|| {
@@ -544,6 +562,12 @@ fn dispatch_capability(cmd: AgentCapabilityCommand, opts: &GlobalOpts) -> i32 {
             mode,
             args,
         } => client.set_profile_capability_delivery(&profile, &mode, &args),
+        C::ToolPolicy {
+            profile,
+            server,
+            tool,
+            allowed,
+        } => client.set_profile_tool_policy(&profile, &server, &tool, allowed),
     };
     match reply {
         Ok(payload) => {

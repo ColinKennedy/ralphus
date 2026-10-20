@@ -17,6 +17,7 @@
        * @property {string} status - "untested" | "ok" | "failing" | "found" | "missing".
        * @property {string|null} status_detail
        * @property {number|null} tool_count
+       * @property {string[]|null} [tools] - tool names from the last successful check (MCP servers).
        * @property {number|null} checked_at_ms
        */
       /**
@@ -25,7 +26,8 @@
        * @property {string} profile
        * @property {{kind: string, name: string}[]} enabled
        * @property {{mode: string, args: string[]}} delivery
-       * @property {{backend: string, supported: boolean, delivery_configurable: boolean}} support
+       * @property {{backend: string, supported: boolean, delivery_configurable: boolean, tool_filter: boolean}} support
+       * @property {Object<string, string[]>} denied_tools - denied tool names per MCP server.
        */
       /**
        * The open add/edit form.
@@ -56,6 +58,39 @@
       /** The delivery args draft per raw profile, kept across re-renders. */
       /** @type {Map<string, string>} */
       let capabilityDeliveryArgsDraft = new Map();
+      /** Profile/server pairs whose tool list is expanded, kept across re-renders. */
+      /** @type {Set<string>} */
+      let capabilityToolsOpen = new Set();
+
+      /**
+       * The per-tool allow/deny list of one enabled MCP server for one profile.
+       * Tools are allowed unless denied, so a tool a server adds later is allowed;
+       * a denied tool the server no longer lists stays visible so it can be cleared.
+       * @param {ProfileCapabilityView} pc
+       * @param {CapabilityItemView} it
+       * @returns {string}
+       */
+      function capabilityToolsHtml(pc, it) {
+        const denied = new Set((pc.denied_tools || {})[it.name] || []);
+        const listed = it.tools || [];
+        const stale = [...denied].filter((t) => !listed.includes(t));
+        const key = `${pc.profile}/${it.name}`;
+        if (!pc.support.tool_filter) {
+          return `<div style="margin-left:18px;color:var(--ignored)" data-tip="This backend cannot filter individual MCP tools: every tool of an enabled server is available to the agent.">${esc(it.name)}: per-tool filtering unsupported for ${esc(pc.support.backend)}</div>`;
+        }
+        if (listed.length === 0 && stale.length === 0) {
+          return `<div style="margin-left:18px;color:var(--muted)" data-tip="Run Check on this server in the catalog to list its tools.">${esc(it.name)}: check the server to list its tools</div>`;
+        }
+        const rows = [...listed.map((t) => [t, false]), ...stale.map((t) => [t, true])]
+          .map(
+            ([t, isStale]) =>
+              `<label style="display:block;white-space:nowrap" data-tip="${isStale ? "The server no longer lists this tool; the deny is kept until you clear it." : "Uncheck to stop this profile's agent calling the tool. New tools a server adds are allowed."}">
+                <input type="checkbox" ${denied.has(t) ? "" : "checked"} data-profile="${esc(pc.profile)}" data-server="${esc(it.name)}" data-tool="${esc(t)}" onchange="setProfileToolAllowed(this.dataset.profile, this.dataset.server, this.dataset.tool, this.checked)" /> <span class="mono">${esc(t)}</span>${isStale ? ` <span style="color:var(--ignored)">(not listed)</span>` : ""}</label>`,
+          )
+          .join("");
+        return `<details style="margin-left:18px" ${capabilityToolsOpen.has(key) ? "open" : ""} data-key="${esc(key)}" ontoggle="if (this.open) capabilityToolsOpen.add(this.dataset.key || ''); else capabilityToolsOpen.delete(this.dataset.key || '')">
+            <summary data-tip="Choose which tools of ${esc(it.name)} this profile's agent may call.">${esc(it.name)} tools (${listed.length - [...denied].filter((t) => listed.includes(t)).length}/${listed.length} allowed)</summary>${rows}</details>`;
+      }
 
       /**
        * The names of every profile a toggle row is shown for: the built-ins, then the stored profiles.
@@ -147,6 +182,10 @@
                 <input type="checkbox" ${on.has(key) ? "checked" : ""} ${unsupported ? "disabled" : ""} data-kind="${esc(it.kind)}" data-name="${esc(it.name)}" data-profile="${esc(pc.profile)}" onchange="toggleProfileCapability(this.dataset.profile, this.dataset.kind, this.dataset.name, this.checked)" /> ${esc(it.kind === "mcp" ? "" : "skill: ")}${esc(it.name)}</label>`;
           })
           .join("");
+        const toolLists = capabilityItems
+          .filter((it) => it.kind === "mcp" && on.has(`mcp/${it.name}`) && !unsupported)
+          .map((it) => capabilityToolsHtml(pc, it))
+          .join("");
         let delivery = "";
         if (pc.support.delivery_configurable) {
           const draft = capabilityDeliveryArgsDraft.get(pc.profile) ?? pc.delivery.args.join(" ");
@@ -158,7 +197,7 @@
               <button class="btn" data-click="saveCapabilityDeliveryArgs" data-profile="${esc(pc.profile)}" data-tip="Save these extra arguments with extra_args as the delivery mode.">Save args</button>
             </div>`;
         }
-        return `<tr><td><span class="proj-name">${esc(pc.profile)}</span> ${note}</td><td class="mono">${esc(pc.support.backend)}</td><td>${boxes || `<span style="color:var(--muted)">catalog is empty</span>`}${delivery}</td></tr>`;
+        return `<tr><td><span class="proj-name">${esc(pc.profile)}</span> ${note}</td><td class="mono">${esc(pc.support.backend)}</td><td>${boxes || `<span style="color:var(--muted)">catalog is empty</span>`}${toolLists}${delivery}</td></tr>`;
       }
 
       /**
@@ -427,6 +466,28 @@
             body: JSON.stringify({ kind, name, enabled }),
           });
           capabilityError = r.ok ? "" : await responseError(r, "toggle failed");
+        } catch (e) {
+          capabilityError = "daemon unreachable";
+        }
+        await pollAgentCapabilities();
+      }
+
+      /**
+       * Allows or denies one tool of an MCP server for a profile.
+       * @param {string} profile
+       * @param {string} server
+       * @param {string} tool
+       * @param {boolean} allowed
+       * @returns {Promise<void>}
+       */
+      async function setProfileToolAllowed(profile, server, tool, allowed) {
+        try {
+          const r = await fetch(`/api/agent-profiles/${encodeURIComponent(profile)}/capabilities/tools`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ server, tool, allowed }),
+          });
+          capabilityError = r.ok ? "" : await responseError(r, "tool change failed");
         } catch (e) {
           capabilityError = "daemon unreachable";
         }
