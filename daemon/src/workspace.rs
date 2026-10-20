@@ -630,6 +630,19 @@ impl Workspace {
         }
     }
 
+    /// Whether this workspace's directory exists on its machine: the directory
+    /// itself for a local workspace; the `.git` entry a worktree keeps for a
+    /// remote one, since a provider can read a file but has no verb that
+    /// tests for a directory. Meant for worktree directories.
+    #[must_use]
+    pub fn worktree_present(&self) -> bool {
+        if self.is_local() {
+            self.root.exists()
+        } else {
+            self.exists(".git")
+        }
+    }
+
     /// Copy one selected file or directory from this workspace into an exact
     /// absolute destination on the daemon host.
     pub fn materialize_to_daemon(

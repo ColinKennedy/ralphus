@@ -1378,7 +1378,9 @@ fn regen_from_feature_worktree(
     let wt_str = wt.root_string();
     match find_worktree_for_branch(root, branch) {
         Some(feature_wt) => {
-            let sha = git(&feature_wt, &["rev-parse", "HEAD"])
+            let sha = root
+                .at(&feature_wt)
+                .git(&["rev-parse", "HEAD"])
                 .map(|s| s.trim().to_string())
                 .map_err(|e| {
                     format!(
@@ -1524,7 +1526,7 @@ where
 {
     let wt_str = wt.root_string();
 
-    if !wt.root().exists() {
+    if !wt.worktree_present() {
         // [State 1] Directory missing — fast path.
         // [State 7] Unlock first: a locked tracking entry survives both the
         // `remove` below (single `-f` does not override a lock) and `prune`
@@ -1602,7 +1604,7 @@ where
     // disk, so that `git worktree add` does not reject the path as registered.
     let _ = root.git(&["worktree", "prune"]);
 
-    if !wt.root().exists() {
+    if !wt.worktree_present() {
         // Removal succeeded; add fresh.
         if branch_exists(root, branch) {
             return add_worktree_with_prune_retry(root, rev, &wt_str, branch, faults);
@@ -13185,15 +13187,7 @@ fn claim_post_merge_checkout_with(
             held.push(dir_str);
             continue;
         }
-        // A remote directory is seen through the `.git` file a linked
-        // worktree keeps; a provider can read a file but not test a directory.
-        let present = |ws: &Workspace| {
-            if ws.is_local() {
-                ws.root().exists()
-            } else {
-                ws.exists(".git")
-            }
-        };
+        let present = Workspace::worktree_present;
         if present(&ws) {
             let _ = combined_ws.git(&["worktree", "remove", "--force", &dir_str]);
         }
