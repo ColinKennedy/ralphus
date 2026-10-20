@@ -1027,6 +1027,14 @@ fn recheck_run_result(
             "ralphus [guardian] review {guardian_id} live run {} recheck gave no usable result; keeping the original",
             run.run_id
         );
+        crate::cartographer::Note::new("guardian")
+            .guardian(guardian_id)
+            .scope("live_action")
+            .emit(
+                &store.lock(),
+                "live run recheck kept original result",
+                serde_json::json!({"run_id": run.run_id}),
+            );
         return;
     };
     let calls = recorded_calls_for_run(guardian_id, &outcome.cell_id);
