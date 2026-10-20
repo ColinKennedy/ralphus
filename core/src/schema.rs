@@ -134,7 +134,7 @@ pub struct TaskDef {
     /// like `agent`/`model` — but note that the affinity rules reject a
     /// submission whose cells within one task disagree, so an override is
     /// only meaningful for restating the same value.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_machine")]
     pub machine: Option<String>,
     /// Extra CLI args passed to the agent for every cell; task-level first.
     #[serde(default)]
@@ -344,7 +344,7 @@ pub struct CellDef {
     /// [`TaskDef::machine`] — the affinity rules require every cell within
     /// one task to resolve to the same machine, so this may only restate the
     /// task's value, never diverge from it.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_machine")]
     pub machine: Option<String>,
     /// Subdirectories of a monorepo this cell is scoped to (e.g.
     /// `["packages/foo", "packages/bar"]`). At run time the daemon injects a
@@ -1593,8 +1593,198 @@ pub const LOCAL_MACHINE: &str = "local";
 /// mysterious "provider C is not registered" at submit time.
 pub const MIN_MACHINE_SCHEME_LEN: usize = 2;
 
+/// The `provider` placeholder that lets a machine request be granted by any
+/// configured provider service, tried in declaration order.
+pub const AUTO_PROVIDER: &str = "<<ralphus:auto-provider>>";
+
+/// First character of a provider-service machine request in its normalized
+/// form (see [`MachineRequest::to_canonical`]). Cannot start a scheme or a
+/// path, so the form never collides with `scheme:uri` or a pasted directory.
+pub const MACHINE_REQUEST_PREFIX: char = '@';
+
+/// The operating systems a machine request may ask for (a closed set).
+pub const MACHINE_OS: &[&str] = &["windows", "linux", "macos"];
+
+/// The architectures a machine request may ask for (a closed set).
+pub const MACHINE_ARCH: &[&str] = &["x86_64", "aarch64"];
+
+/// A request for a machine from a provider service (contract v2): which
+/// providers may grant it, and what the machine must be. Written in a task
+/// file as a bare provider name or a `machine = { provider = ..., ... }`
+/// table; stored as [`Self::to_canonical`], so equal requests compare equal
+/// as strings and the "same `machine` value, same machine" affinity rules
+/// keep working on them.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct MachineRequest {
+    /// Providers to ask, in order. Empty means [`AUTO_PROVIDER`]: every
+    /// configured provider service, in declaration order.
+    pub providers: Vec<String>,
+    /// One of [`MACHINE_OS`], when the request cares.
+    pub os: Option<String>,
+    /// One of [`MACHINE_ARCH`], when the request cares.
+    pub arch: Option<String>,
+    /// Provider-defined labels the machine must carry; sorted and unique.
+    pub labels: Vec<String>,
+}
+
+impl MachineRequest {
+    /// Whether any configured provider may grant this request.
+    #[must_use]
+    pub fn is_auto(&self) -> bool {
+        self.providers.is_empty()
+    }
+
+    /// The normalized string form: `@<providers>[?os=..&arch=..&labels=a,b]`,
+    /// with `*` standing for [`AUTO_PROVIDER`]. Labels are sorted, so two
+    /// requests for the same thing produce the same string.
+    #[must_use]
+    pub fn to_canonical(&self) -> String {
+        let providers = if self.is_auto() {
+            "*".to_string()
+        } else {
+            self.providers.join(",")
+        };
+        let mut labels = self.labels.clone();
+        labels.sort();
+        labels.dedup();
+        let mut params = Vec::new();
+        if let Some(os) = &self.os {
+            params.push(format!("os={os}"));
+        }
+        if let Some(arch) = &self.arch {
+            params.push(format!("arch={arch}"));
+        }
+        if !labels.is_empty() {
+            params.push(format!("labels={}", labels.join(",")));
+        }
+        if params.is_empty() {
+            format!("{MACHINE_REQUEST_PREFIX}{providers}")
+        } else {
+            format!("{MACHINE_REQUEST_PREFIX}{providers}?{}", params.join("&"))
+        }
+    }
+
+    /// Parse [`Self::to_canonical`]'s form. `None` when `raw` is not one.
+    #[must_use]
+    pub fn parse_canonical(raw: &str) -> Option<Self> {
+        let body = raw.trim().strip_prefix(MACHINE_REQUEST_PREFIX)?;
+        let (providers, params) = body.split_once('?').unwrap_or((body, ""));
+        let providers = if providers == "*" {
+            Vec::new()
+        } else {
+            providers.split(',').map(str::to_string).collect()
+        };
+        let mut request = Self {
+            providers,
+            ..Self::default()
+        };
+        for param in params.split('&').filter(|p| !p.is_empty()) {
+            let (key, value) = param.split_once('=')?;
+            match key {
+                "os" => request.os = Some(value.to_string()),
+                "arch" => request.arch = Some(value.to_string()),
+                "labels" => request.labels = value.split(',').map(str::to_string).collect(),
+                _ => return None,
+            }
+        }
+        Some(request)
+    }
+}
+
+/// Whether `name` is a valid provider name (`[A-Za-z0-9_-]`, at least
+/// [`MIN_MACHINE_SCHEME_LEN`] characters -- the same rules as a scheme).
+#[must_use]
+pub fn is_valid_provider_name(name: &str) -> bool {
+    name.len() >= MIN_MACHINE_SCHEME_LEN
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+}
+
+/// Whether `label` is a valid machine label (`[A-Za-z0-9_.-]`, non-empty).
+#[must_use]
+pub fn is_valid_machine_label(label: &str) -> bool {
+    !label.is_empty()
+        && label
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.' || c == '-')
+}
+
+/// A `machine` value as written in TOML: a string, or a provider-service
+/// request table.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum RawMachine {
+    Text(String),
+    Table(MachineTable),
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MachineTable {
+    provider: RawProviders,
+    #[serde(default)]
+    os: Option<String>,
+    #[serde(default)]
+    arch: Option<String>,
+    #[serde(default)]
+    labels: Vec<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum RawProviders {
+    One(String),
+    Many(Vec<String>),
+}
+
+/// `machine` text with a bare provider name normalized to its request form
+/// (`"fleet"` becomes `"@fleet"`); `local`, `scheme:uri` and an already
+/// normalized request pass through.
+#[must_use]
+pub fn normalize_machine_text(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty()
+        || trimmed.eq_ignore_ascii_case(LOCAL_MACHINE)
+        || trimmed.contains(':')
+        || trimmed.starts_with(MACHINE_REQUEST_PREFIX)
+    {
+        trimmed.to_string()
+    } else {
+        format!("{MACHINE_REQUEST_PREFIX}{trimmed}")
+    }
+}
+
+/// Serde adapter for every `machine` field: accepts a string or a request
+/// table and stores the normalized string ([`normalize_machine_text`],
+/// [`MachineRequest::to_canonical`]). Structural problems are reported by
+/// [`crate::validate`] with line numbers before deserialization runs.
+fn deserialize_machine<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = Option::<RawMachine>::deserialize(deserializer)?;
+    Ok(raw.map(|raw| match raw {
+        RawMachine::Text(text) => normalize_machine_text(&text),
+        RawMachine::Table(table) => {
+            let providers = match table.provider {
+                RawProviders::One(p) if p.trim() == AUTO_PROVIDER => Vec::new(),
+                RawProviders::One(p) => vec![p.trim().to_string()],
+                RawProviders::Many(list) => list.iter().map(|p| p.trim().to_string()).collect(),
+            };
+            MachineRequest {
+                providers,
+                os: table.os,
+                arch: table.arch,
+                labels: table.labels,
+            }
+            .to_canonical()
+        }
+    }))
+}
+
 /// A parsed `machine` value.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MachineRef<'a> {
     /// The daemon's own host — `machine` unset, or the literal `"local"`.
     Local,
@@ -1607,6 +1797,9 @@ pub enum MachineRef<'a> {
         /// `"https://useful.com/some/website"`.
         uri: &'a str,
     },
+    /// A request to a provider service (contract v2), granted as an
+    /// allocation rather than addressed directly.
+    Service(MachineRequest),
 }
 
 /// Why a `machine` value could not be parsed. Rendered by
@@ -1626,6 +1819,8 @@ pub enum MachineParseError {
     SchemeTooShort,
     /// The scheme contained a character outside `[A-Za-z0-9_-]`.
     InvalidSchemeChar(char),
+    /// An `@...` value that is not a well-formed normalized machine request.
+    InvalidRequest,
 }
 
 /// Parse a `machine` value into a [`MachineRef`].
@@ -1649,7 +1844,19 @@ pub fn parse_machine(machine: &str) -> Result<MachineRef<'_>, MachineParseError>
     if raw.eq_ignore_ascii_case(LOCAL_MACHINE) {
         return Ok(MachineRef::Local);
     }
+    if raw.starts_with(MACHINE_REQUEST_PREFIX) {
+        return MachineRequest::parse_canonical(raw)
+            .map(MachineRef::Service)
+            .ok_or(MachineParseError::InvalidRequest);
+    }
     let Some((scheme, uri)) = raw.split_once(':') else {
+        // A bare name asks the provider service of that name for any machine.
+        if is_valid_provider_name(raw) {
+            return Ok(MachineRef::Service(MachineRequest {
+                providers: vec![raw.to_string()],
+                ..MachineRequest::default()
+            }));
+        }
         return Err(MachineParseError::MissingScheme);
     };
     if scheme.is_empty() {
@@ -1921,7 +2128,7 @@ pub struct ReviewDef {
     ///
     /// Every worktree feeding one review must be on this machine: the stacked
     /// linear rebase needs all of the branches in one repo on one filesystem.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_machine")]
     pub machine: Option<String>,
     /// Max spend cap in USD for this review's own agent cost -- conflict
     /// resolution and prover calls made by the guardian merge machinery,
@@ -2418,7 +2625,7 @@ pub struct ProofStep {
     /// back to the owning cell's resolved machine for a cell-scope step,
     /// or the task's for a task-scope one. See [`TaskDef::machine`] — the
     /// affinity rules require every step under one task to agree.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_machine")]
     pub machine: Option<String>,
     /// Per-proof-step cap on how many tokens a single tool-call output may
     /// inject into the agent's context (RAL-333). Falls back to the owning
@@ -2869,6 +3076,70 @@ impl ResolvedAgent {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn machine_requests_are_normalized_to_one_comparable_string() {
+        let parse = |toml: &str| -> TaskFile {
+            toml::from_str(&format!(
+                "[[task]]\nname=\"t\"\nmachine={toml}\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\n"
+            ))
+            .unwrap()
+        };
+        assert_eq!(
+            parse("\"fleet\"").task[0].machine.as_deref(),
+            Some("@fleet")
+        );
+        assert_eq!(
+            parse("\"ssh:box\"").task[0].machine.as_deref(),
+            Some("ssh:box")
+        );
+        assert_eq!(parse("\"local\"").task[0].machine.as_deref(), Some("local"));
+        // Label order does not matter: equal requests compare equal.
+        let a = parse(
+            "{ provider = [\"fleet\", \"local\"], os = \"linux\", labels = [\"gpu\", \"a\"] }",
+        );
+        let b = parse(
+            "{ provider = [\"fleet\", \"local\"], labels = [\"a\", \"gpu\"], os = \"linux\" }",
+        );
+        assert_eq!(a.task[0].machine, b.task[0].machine);
+        assert_eq!(
+            a.task[0].machine.as_deref(),
+            Some("@fleet,local?os=linux&labels=a,gpu")
+        );
+        assert_eq!(
+            parse("{ provider = \"<<ralphus:auto-provider>>\", arch = \"aarch64\" }").task[0]
+                .machine
+                .as_deref(),
+            Some("@*?arch=aarch64")
+        );
+    }
+
+    #[test]
+    fn a_normalized_request_parses_back_to_the_same_request() {
+        let request = MachineRequest {
+            providers: vec!["fleet".into(), "local".into()],
+            os: Some("windows".into()),
+            arch: None,
+            labels: vec!["gpu".into()],
+        };
+        let canonical = request.to_canonical();
+        assert_eq!(
+            parse_machine(&canonical),
+            Ok(MachineRef::Service(request.clone()))
+        );
+        assert_eq!(
+            parse_machine("fleet"),
+            Ok(MachineRef::Service(MachineRequest {
+                providers: vec!["fleet".into()],
+                ..MachineRequest::default()
+            }))
+        );
+        assert!(MachineRequest::parse_canonical("@*").is_some_and(|r| r.is_auto()));
+        assert_eq!(
+            parse_machine("@fleet?color=red"),
+            Err(MachineParseError::InvalidRequest)
+        );
+    }
 
     fn task_with(agent: Option<&str>, model: Option<&str>, args: &[&str]) -> TaskDef {
         TaskDef {
@@ -3756,8 +4027,10 @@ mod tests {
     fn machine_rejects_malformed_values() {
         assert_eq!(parse_machine(""), Err(MachineParseError::Empty));
         assert_eq!(parse_machine("   "), Err(MachineParseError::Empty));
+        // A bare name is a provider-service request; one that cannot be a
+        // provider name is still missing its scheme.
         assert_eq!(
-            parse_machine("incredibuild"),
+            parse_machine("my box"),
             Err(MachineParseError::MissingScheme)
         );
         assert_eq!(parse_machine(":A"), Err(MachineParseError::EmptyScheme));

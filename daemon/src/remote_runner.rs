@@ -1672,6 +1672,12 @@ pub fn provider_from_store(store: &Store, machine: &str) -> Result<Option<Provid
     let (scheme, uri) = match resolved {
         ResolvedMachine::Local => return Ok(None),
         ResolvedMachine::Provider { scheme, uri } => (scheme, uri),
+        ResolvedMachine::Service(_) => {
+            return Err(format!(
+                "machine {machine:?} asks a provider service for an allocation, and dispatching \
+                 to provider services is not wired into this daemon build yet"
+            ));
+        }
     };
     let Some(provider) = store
         .get_machine_provider(&scheme)
