@@ -31,6 +31,11 @@ use crate::store::{Result, Store, now_ms};
 pub const SECTION_START: &str = "<!-- ralphus:live-test-results:start -->";
 /// Closes the managed section.
 pub const SECTION_END: &str = "<!-- ralphus:live-test-results:end -->";
+/// Opens the managed ralphus-details section (insights and appraisals) of an
+/// adopted PR/MR.
+pub const DETAILS_START: &str = "<!-- ralphus:details:start -->";
+/// Closes the managed ralphus-details section.
+pub const DETAILS_END: &str = "<!-- ralphus:details:end -->";
 /// The marker line a live agent ends its reply with.
 pub const RESULT_MARKER: &str = "RALPHUS_LIVE_RESULT:";
 /// Most runs per action shown in a PR, newest first.
@@ -685,6 +690,38 @@ impl Store {
         Ok(())
     }
 
+    /// Ask for a refresh of every open PR/MR whose body carries the details
+    /// section and whose review has recorded a prophecy since the row was last
+    /// written, so late prophecies (a restarted cell, a review's own conflict
+    /// notes) reach the reviewer.
+    ///
+    /// # Errors
+    ///
+    /// On a database failure.
+    pub fn request_details_refreshes(&self) -> Result<()> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, guardian_id, updated_at_ms FROM guardian_pull_requests
+             WHERE state='open' AND pr_number IS NOT NULL AND superseded_by IS NULL
+               AND instr(description, ?) > 0",
+        )?;
+        let rows: Vec<(String, String, i64)> = stmt
+            .query_map(rusqlite::params![DETAILS_START], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })?
+            .collect::<std::result::Result<_, _>>()?;
+        for (pr_id, guardian_id, updated_at_ms) in rows {
+            let newest = self
+                .list_all_prophecies_for_guardian(&guardian_id)?
+                .iter()
+                .map(|p| p.created_at_ms)
+                .max();
+            if newest.is_some_and(|created| created > updated_at_ms) {
+                self.request_pr_live_refresh(&pr_id, &guardian_id)?;
+            }
+        }
+        Ok(())
+    }
+
     /// Ask for a refresh of every open PR/MR of a review that has live runs.
     ///
     /// # Errors
@@ -1204,9 +1241,48 @@ pub fn render_section(runs: &[SectionRun]) -> Option<String> {
 /// never touched.
 #[must_use]
 pub fn splice_section(current: &str, section: &str) -> String {
-    if let Some(start) = current.find(SECTION_START) {
-        if let Some(end_rel) = current[start..].find(SECTION_END) {
-            let end = start + end_rel + SECTION_END.len();
+    splice_between(current, section, SECTION_START, SECTION_END)
+}
+
+/// [`splice_section`] for the ralphus-details marker pair.
+#[must_use]
+pub fn splice_details_section(current: &str, section: &str) -> String {
+    splice_between(current, section, DETAILS_START, DETAILS_END)
+}
+
+/// The ralphus-details section (markers included) for `prophecies` and
+/// `appraisals`, or `None` when both are empty. The appraisal block is
+/// truncated to fit `max_chars` after the prophecy block.
+#[must_use]
+pub fn render_details_section(
+    prophecies: &[crate::prophecy::ProphecyView],
+    appraisals: &[crate::appraisal::ReviewAppraisal],
+    max_chars: usize,
+) -> Option<String> {
+    let insights = crate::pr::format_prophecy_details_block(prophecies);
+    let used = insights.as_ref().map_or(0, |b| b.chars().count() + 2)
+        + DETAILS_START.len()
+        + DETAILS_END.len()
+        + "\n## Ralphus Details\n\n\n".len();
+    let appraisal_block =
+        crate::appraisal_pr::render_pr_block(appraisals, max_chars.saturating_sub(used));
+    let body = [appraisal_block, insights]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    if body.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "{DETAILS_START}\n## Ralphus Details\n\n{body}\n{DETAILS_END}"
+    ))
+}
+
+fn splice_between(current: &str, section: &str, start_marker: &str, end_marker: &str) -> String {
+    if let Some(start) = current.find(start_marker) {
+        if let Some(end_rel) = current[start..].find(end_marker) {
+            let end = start + end_rel + end_marker.len();
             return format!("{}{}{}", &current[..start], section, &current[end..]);
         }
     }
@@ -1312,19 +1388,83 @@ pub fn refresh_pr_with(
         return Ok(RefreshOutcome::Skipped);
     }
     let runs = section_runs(store, &pr, &guardian).map_err(|e| e.to_string())?;
-    let Some(section) = render_section(&runs) else {
+    let section = render_section(&runs);
+    // A PR whose body carries the details section keeps it current.
+    let has_details = pr.description.contains(DETAILS_START);
+    if section.is_none() && !has_details {
         return Ok(RefreshOutcome::Skipped);
-    };
+    }
     let client = client_for(&pr, &guardian)
         .ok_or_else(|| format!("no forge client for {} on PR #{number}", pr.repo))?;
     let current = client.get_pull_request_description(number)?;
-    let updated = splice_section(&current, &section);
+    let mut updated = match &section {
+        Some(section) => splice_section(&current, section),
+        None => current.clone(),
+    };
+    let mut details_published: (Vec<i64>, Vec<crate::appraisal::ReviewAppraisal>) =
+        (Vec::new(), Vec::new());
+    if has_details || current.contains(DETAILS_START) {
+        let (prophecies, appraisals) = {
+            let guard = store.lock();
+            let prophecies = guard
+                .list_all_prophecies_for_guardian(&guardian.id)
+                .map_err(|e| e.to_string())?
+                .into_iter()
+                .filter(|p| p.pr_id.as_deref().is_none_or(|owner| owner == pr.id))
+                .collect::<Vec<_>>();
+            let appraisals = guard
+                .list_all_appraisals_for_guardian(&guardian.id)
+                .map_err(|e| e.to_string())?
+                .into_iter()
+                .filter(|a| {
+                    a.appraisal
+                        .pr_id
+                        .as_deref()
+                        .is_none_or(|owner| owner == pr.id)
+                })
+                .collect::<Vec<_>>();
+            (prophecies, appraisals)
+        };
+        let prophecies = crate::pr::deterministic_relevant_prophecies(&prophecies);
+        let appraisals = if crate::appraisal_pr::post_appraisals_enabled(&guardian) {
+            appraisals
+        } else {
+            Vec::new()
+        };
+        let outside = splice_details_section(&updated, "").chars().count();
+        if let Some(details) = render_details_section(
+            &prophecies,
+            &appraisals,
+            crate::appraisal_pr::PR_BODY_BUDGET.saturating_sub(outside + 2),
+        ) {
+            updated = splice_details_section(&updated, &details);
+            details_published = (
+                prophecies
+                    .iter()
+                    .filter(|p| p.published_at_ms.is_none())
+                    .map(|p| p.id)
+                    .collect(),
+                appraisals
+                    .into_iter()
+                    .filter(|a| a.appraisal.published_at_ms.is_none())
+                    .collect(),
+            );
+        }
+    }
     if normalize_newlines(&updated) == normalize_newlines(&current) {
         let _ = store.lock().set_pr_description(&pr.id, &current);
         return Ok(RefreshOutcome::Unchanged);
     }
     client.update_pull_request_description(number, &updated)?;
-    let _ = store.lock().set_pr_description(&pr.id, &updated);
+    {
+        let guard = store.lock();
+        let _ = guard.set_pr_description(&pr.id, &updated);
+        let _ = guard.mark_prophecies_published(&details_published.0, &pr.id);
+        for posted in &details_published.1 {
+            let a = &posted.appraisal;
+            let _ = guard.mark_appraisal_published(&a.entity_uri, a.attempt, &pr.id);
+        }
+    }
     crate::cartographer::Note::new("guardian")
         .guardian(&guardian.id)
         .scope("live_action")
@@ -1371,10 +1511,11 @@ pub fn process_pr_refreshes_with(
     store: &crate::store_lock::StoreHandle,
     client_for: ClientFor<'_>,
 ) {
-    let due = store
-        .lock()
-        .due_pr_live_refreshes(now_ms())
-        .unwrap_or_default();
+    let due = {
+        let guard = store.lock();
+        let _ = guard.request_details_refreshes();
+        guard.due_pr_live_refreshes(now_ms()).unwrap_or_default()
+    };
     for (pr_id, guardian_id, requested_at_ms, attempts) in due {
         match refresh_pr_with(store, &pr_id, client_for) {
             Ok(outcome) => {
@@ -1493,6 +1634,51 @@ pub fn record_run_evidence(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn details_and_live_sections_coexist_and_replace_in_place() {
+        let live = format!(
+            "{SECTION_START}
+live
+{SECTION_END}"
+        );
+        let details = format!(
+            "{DETAILS_START}
+one
+{DETAILS_END}"
+        );
+        let body = splice_section("Human text", &live);
+        let body = splice_details_section(&body, &details);
+        assert!(body.starts_with(
+            "Human text
+
+"
+        ));
+        assert!(body.contains(&live) && body.contains(&details));
+        let newer = format!(
+            "{DETAILS_START}
+two
+{DETAILS_END}"
+        );
+        let again = splice_details_section(&body, &newer);
+        assert_eq!(again.matches(DETAILS_START).count(), 1);
+        assert!(again.contains(&live) && again.contains("two") && !again.contains("one"));
+        let live2 = format!(
+            "{SECTION_START}
+live2
+{SECTION_END}"
+        );
+        let both = splice_section(&again, &live2);
+        assert!(
+            both.contains("two")
+                && both.contains("live2")
+                && !both.contains(
+                    "
+live
+"
+                )
+        );
+    }
 
     #[test]
     fn elide_right_cuts_long_multiline_text_to_one_line() {
