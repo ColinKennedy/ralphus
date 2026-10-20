@@ -254,6 +254,23 @@ impl Store {
         self.appraisals_for_cells(&cells, false)
     }
 
+    /// The latest appraisal of every scored proof of review `guardian_id`,
+    /// published or not -- what a managed PR-details section re-renders from.
+    pub fn list_all_appraisals_for_guardian(
+        &self,
+        guardian_id: &str,
+    ) -> Result<Vec<ReviewAppraisal>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT DISTINCT squad_id, task_idx, idx FROM cells WHERE review_guardian_id=?",
+        )?;
+        let cells: Vec<(String, i64, i64)> = stmt
+            .query_map(params![guardian_id], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })?
+            .collect::<std::result::Result<_, _>>()?;
+        self.appraisals_for_cells(&cells, true)
+    }
+
     /// The latest appraisal of every scored proof belonging to review branch
     /// `branch_id` of `guardian_id`, published or not -- the stored source of
     /// truth the board's appraisals tab shows, independent of what the PR body

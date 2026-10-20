@@ -3256,7 +3256,7 @@ fn prophecy_is_reviewer_relevant(prophecy: &crate::prophecy::ProphecyView) -> bo
 /// The deterministic fallback list, wherever `synthesize_pr_text` has no
 /// model turn available to ask (see its doc and
 /// [`prophecy_is_reviewer_relevant`]).
-fn deterministic_relevant_prophecies(
+pub(crate) fn deterministic_relevant_prophecies(
     prophecies: &[crate::prophecy::ProphecyView],
 ) -> Vec<crate::prophecy::ProphecyView> {
     prophecies
@@ -3382,7 +3382,9 @@ fn append_insights_to_review_commit(
 /// get here (`synthesize_pr_text`'s relevance check, or its
 /// [`prophecy_is_reviewer_relevant`] fallback), but nothing rewrites their
 /// wording; this function renders whatever it is given as-is.
-fn format_prophecy_details_block(prophecies: &[crate::prophecy::ProphecyView]) -> Option<String> {
+pub(crate) fn format_prophecy_details_block(
+    prophecies: &[crate::prophecy::ProphecyView],
+) -> Option<String> {
     if prophecies.is_empty() {
         return None;
     }
@@ -8865,7 +8867,7 @@ fn submit_stacked_branch_pr(
     // RAL-575: the appraisals folded into a PR created below; stamped as
     // published once the PR row exists so a resubmit does not repeat them.
     let mut posted_appraisals: Vec<crate::appraisal::ReviewAppraisal> = Vec::new();
-    let (created_pr, base, title, description, adopted) = match route
+    let (created_pr, base, title, mut description, adopted) = match route
         .find_existing_pull_request()?
     {
         Some(existing) => adopt(existing),
@@ -8971,6 +8973,55 @@ fn submit_stacked_branch_pr(
             }
         }
     };
+    // An adopted PR/MR keeps its human title and text; ralphus's insights and
+    // appraisals go into a managed section spliced into the body. They count
+    // as published only once the forge accepted that body.
+    let mut adopted_published: Option<(Vec<i64>, Vec<crate::appraisal::ReviewAppraisal>)> = None;
+    if adopted {
+        let appraisals = if crate::appraisal_pr::post_appraisals_enabled(guardian) {
+            store
+                .lock()
+                .list_unpublished_appraisals_for_guardian(id)
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        let relevant = deterministic_relevant_prophecies(&unpublished_prophecies);
+        let outside = crate::live_results::splice_details_section(&description, "")
+            .chars()
+            .count();
+        if let Some(section) = crate::live_results::render_details_section(
+            &relevant,
+            &appraisals,
+            crate::appraisal_pr::PR_BODY_BUDGET.saturating_sub(outside + 2),
+        ) {
+            let updated = crate::live_results::splice_details_section(&description, &section);
+            match route
+                .client
+                .update_pull_request_description(created_pr.number, &updated)
+            {
+                Ok(()) => {
+                    description = updated;
+                    adopted_published = Some((
+                        unpublished_prophecies.iter().map(|p| p.id).collect(),
+                        appraisals,
+                    ));
+                }
+                Err(e) => crate::rlog!(
+                    WARNING,
+                    "ralphus [pr] review {id} branch {branch_id} could not publish ralphus                      details onto adopted PR/MR #{}; leaving insights unpublished: {e}",
+                    created_pr.number
+                ),
+            }
+        } else {
+            // Nothing relevant to show: the filtered-out insights still
+            // count as handled so they are not re-offered forever.
+            adopted_published = Some((
+                unpublished_prophecies.iter().map(|p| p.id).collect(),
+                Vec::new(),
+            ));
+        }
+    }
     let row_id = store
         .lock()
         .create_pull_request_ex(
@@ -8989,14 +9040,31 @@ fn submit_stacked_branch_pr(
             "parent",
         )
         .map_err(|e| e.to_string())?;
-    if !unpublished_prophecies.is_empty() {
-        let ids = unpublished_prophecies
-            .iter()
-            .map(|prophecy| prophecy.id)
-            .collect::<Vec<_>>();
-        let _ = store.lock().mark_prophecies_published(&ids, &row_id);
-    }
-    if !adopted {
+    if adopted {
+        if let Some((ids, appraisals)) = &adopted_published {
+            let guard = store.lock();
+            if !ids.is_empty() {
+                let _ = guard.mark_prophecies_published(ids, &row_id);
+            }
+            for posted in appraisals {
+                let a = &posted.appraisal;
+                if let Err(e) = guard.mark_appraisal_published(&a.entity_uri, a.attempt, &row_id) {
+                    crate::rlog!(
+                        WARNING,
+                        "ralphus [pr] review {id} could not mark appraisal {} published: {e}",
+                        a.entity_uri
+                    );
+                }
+            }
+        }
+    } else {
+        if !unpublished_prophecies.is_empty() {
+            let ids = unpublished_prophecies
+                .iter()
+                .map(|prophecy| prophecy.id)
+                .collect::<Vec<_>>();
+            let _ = store.lock().mark_prophecies_published(&ids, &row_id);
+        }
         let guard = store.lock();
         for posted in &posted_appraisals {
             let a = &posted.appraisal;
@@ -22442,6 +22510,189 @@ token_env = "RALPHUS_TEST_FORGE_TOKEN"
         mock.finish();
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&remote_dir);
+    }
+
+    /// RAL-698: adopt a human-opened PR/MR while the review holds one
+    /// reviewer-relevant prophecy. Returns the adopted row, every body the
+    /// forge was sent, and how many prophecies are still unpublished.
+    fn adopt_with_one_prophecy(
+        kind: crate::forge::ForgeKind,
+        patch_status: u16,
+    ) -> (PullRequestView, Vec<String>, usize) {
+        let (repo_path, list_prefix, list_json, patch_path) = match kind {
+            crate::forge::ForgeKind::GitHub => (
+                "acme/w",
+                "/repos/acme/w/pulls?",
+                r#"[{"number":21,"html_url":"http://x/21","base":{"ref":"main"},"title":"Human title","body":"Human body"}]"#,
+                "/repos/acme/w/pulls/21",
+            ),
+            crate::forge::ForgeKind::GitLab => (
+                "123",
+                "/projects/123/merge_requests?",
+                r#"[{"iid":21,"web_url":"http://x/21","target_branch":"main","title":"Human title","description":"Human body"}]"#,
+                "/projects/123/merge_requests/21",
+            ),
+        };
+        let mock = MockForge::start(move |server| {
+            let mut bodies = Vec::new();
+            for mut req in server.requests() {
+                let method = req.method().clone();
+                let url = req.url().to_string();
+                if method == tiny_http::Method::Get && url.starts_with(list_prefix) {
+                    req.respond(tiny_http::Response::from_string(list_json).with_status_code(200))
+                        .unwrap();
+                } else if url == patch_path
+                    && (method == tiny_http::Method::Patch || method == tiny_http::Method::Put)
+                {
+                    let mut body = String::new();
+                    req.as_reader().read_to_string(&mut body).unwrap();
+                    bodies.push(body);
+                    req.respond(
+                        tiny_http::Response::from_string("{}").with_status_code(patch_status),
+                    )
+                    .unwrap();
+                } else if url.contains("/actions/runs") {
+                    req.respond(
+                        tiny_http::Response::from_string(r#"{"workflow_runs":[]}"#)
+                            .with_status_code(200),
+                    )
+                    .unwrap();
+                } else {
+                    req.respond(tiny_http::Response::from_string("[]").with_status_code(404))
+                        .unwrap();
+                }
+            }
+            bodies
+        });
+
+        let root = tmp_dir("adopt-details-root");
+        let remote_dir = tmp_dir("adopt-details-remote");
+        let mut init_opts = git2::RepositoryInitOptions::new();
+        init_opts.initial_head("main");
+        let repo = git2::Repository::init_opts(&root, &init_opts).unwrap();
+        let sig = git2::Signature::now("t", "t@t").unwrap();
+        gwrite(
+            &root, "base.txt", "base
+",
+        );
+        let base_oid = git2_commit_all(&repo, &sig, "base", &[]);
+        let base_commit = repo.find_commit(base_oid).unwrap();
+        repo.branch("review-branch", &base_commit, false).unwrap();
+        git2_checkout(&repo, "review-branch");
+        gwrite(
+            &root, "feat.txt", "feat
+",
+        );
+        git2_commit_all(&repo, &sig, "feat", &[&base_commit]);
+        git2::Repository::init_bare(&remote_dir).unwrap();
+        repo.remote("origin", remote_dir.to_str().unwrap()).unwrap();
+
+        let store = Arc::new(crate::store_lock::StoreMutex::new(store()));
+        let gid = store
+            .lock()
+            .create_guardian("demo", "main", root.to_str().unwrap())
+            .unwrap();
+        store
+            .lock()
+            .add_guardian_branch(&gid, "review-branch")
+            .unwrap();
+        let branch_id = store.lock().get_guardian(&gid).unwrap().branches[0]
+            .id
+            .clone();
+        store
+            .lock()
+            .set_branch_review(&gid, &branch_id, "review-branch", root.to_str().unwrap())
+            .unwrap();
+        store
+            .lock()
+            .add_prophecy(
+                &format!("guardian:{gid}"),
+                0,
+                crate::prophecy::ProphecyKind::Decision,
+                "chose the ring buffer",
+                None,
+                None,
+                Some(&gid),
+            )
+            .unwrap();
+        let client = mock.client(kind, repo_path);
+        let guardian = store.lock().get_guardian(&gid).unwrap();
+        let ordered_enabled: Vec<&BranchView> = guardian.branches.iter().collect();
+        let mut alias_by_branch = HashMap::new();
+        let req = PrRequest {
+            branch_id: Some(branch_id.clone()),
+            branch_alias: Some("pr-y".to_string()),
+            title: None,
+            description: None,
+            use_worktree_branch_name: None,
+            draft: None,
+        };
+        let pr = submit_stacked_branch_pr(
+            &store,
+            &NoopRunner,
+            &client,
+            &gid,
+            &root,
+            "origin",
+            &guardian,
+            &ordered_enabled,
+            &mut alias_by_branch,
+            "main",
+            ordered_enabled[0],
+            &req,
+            "{name}-alias",
+            None,
+            "stack-1",
+            None,
+            false,
+        )
+        .expect("adoption must succeed even when the details PATCH fails");
+        let unpublished = store
+            .lock()
+            .list_unpublished_prophecies_for_guardian(&gid)
+            .unwrap()
+            .len();
+        let bodies = mock.finish();
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&remote_dir);
+        (pr, bodies, unpublished)
+    }
+
+    #[test]
+    fn adopting_a_pr_splices_the_details_section_and_keeps_the_human_text() {
+        for kind in [
+            crate::forge::ForgeKind::GitHub,
+            crate::forge::ForgeKind::GitLab,
+        ] {
+            let (pr, bodies, unpublished) = adopt_with_one_prophecy(kind, 200);
+            assert_eq!(pr.title, "Human title");
+            assert_eq!(bodies.len(), 1, "one PATCH carries the section");
+            assert!(bodies[0].contains("chose the ring buffer"), "{}", bodies[0]);
+            assert!(pr.description.starts_with(
+                "Human body
+
+<!-- ralphus:details:start -->"
+            ));
+            assert!(pr.description.ends_with("<!-- ralphus:details:end -->"));
+            assert!(pr.description.contains("chose the ring buffer"));
+            assert_eq!(unpublished, 0);
+        }
+    }
+
+    #[test]
+    fn adopting_a_pr_leaves_prophecies_unpublished_when_the_body_patch_fails() {
+        for kind in [
+            crate::forge::ForgeKind::GitHub,
+            crate::forge::ForgeKind::GitLab,
+        ] {
+            let (pr, bodies, unpublished) = adopt_with_one_prophecy(kind, 500);
+            assert_eq!(bodies.len(), 1);
+            assert_eq!(pr.description, "Human body");
+            assert_eq!(
+                unpublished, 1,
+                "a failed PATCH must not mark them published"
+            );
+        }
     }
 
     /// RAL-568: submit one branch against a mock forge whose create call
