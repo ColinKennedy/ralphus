@@ -21706,10 +21706,12 @@ pub fn serve<A: ToSocketAddrs>(
     // RAL-185: the scheduler holds a router rather than the local runner
     // directly, so a cell carrying a `machine` is dispatched to its provider
     // while every local cell takes exactly the path it always did.
-    let runner: Arc<dyn Runner> = Arc::new(crate::remote_runner::MachineRouter::new(
-        local_runner,
-        daemon.store_handle(),
-    ));
+    let runner: Arc<dyn Runner> = Arc::new(
+        crate::remote_runner::MachineRouter::new(local_runner, daemon.store_handle()).with_halts(
+            daemon.waypoint_halts_handle(),
+            daemon.arbiter_stops_handle(),
+        ),
+    );
     let handle = daemon.store_handle();
     let cancellations = daemon.cancellations_handle();
     let waypoint_halts = daemon.waypoint_halts_handle();

@@ -2154,57 +2154,68 @@ impl SubprocessRunner {
     /// still `NULL`). A no-op when no cartographer store is attached,
     /// mirroring [`Self::check_stall_escalation`].
     fn maximum_timeout_exceeded(&self, spec: &RunnerSpec, elapsed: Duration) -> Option<String> {
-        let caps = spec.maximum_timeout.as_ref()?;
-        if spec.proof {
-            // A proof step has no descendants -- its own cap is a simple
-            // single-attempt deadline, exactly like `timeout_sec` above.
-            if let Some(cap_sec) = caps.self_cap_sec {
-                if elapsed.as_secs() >= cap_sec {
-                    return Some(format!(
-                        "proof step's own maximum_timeout_seconds ({cap_sec}s) exceeded"
-                    ));
-                }
-            }
-        }
-        let store = self.cartographer.as_ref()?;
-        let guard = store.lock();
-        let now = crate::store::now_ms();
-        // For a cell run, its own `maximum_timeout_seconds` (`self_cap_sec`)
-        // is already the cumulative cell+proofs cap; for a cell-scope proof,
-        // it's the owning cell's separate `cell_cap_sec`. Either way this is
-        // "the cell-scope cumulative cap to check", checked the same way.
-        let cell_cap = if spec.proof {
-            caps.cell_cap_sec
-        } else {
-            caps.self_cap_sec
-        };
-        if let (Some(cap_sec), Some(cell_idx)) = (cell_cap, caps.cell_idx) {
-            if let Ok(used_ms) =
-                guard.cell_cumulative_runtime_ms(&caps.squad_id, caps.task_idx, cell_idx, now)
-            {
-                if used_ms >= saturating_cap_ms(cap_sec) {
-                    return Some(format!(
-                        "cell's maximum_timeout_seconds ({cap_sec}s) exceeded (cumulative {}s across the cell and its proofs)",
-                        used_ms / 1000
-                    ));
-                }
-            }
-        }
-        if let Some(cap_sec) = caps.task_cap_sec {
-            if let Ok(used_ms) =
-                guard.task_cumulative_runtime_ms(&caps.squad_id, caps.task_idx, now)
-            {
-                if used_ms >= saturating_cap_ms(cap_sec) {
-                    return Some(format!(
-                        "task's maximum_timeout_seconds ({cap_sec}s) exceeded (cumulative {}s across the task)",
-                        used_ms / 1000
-                    ));
-                }
-            }
-        }
-        None
+        maximum_timeout_reason(self.cartographer.as_ref(), spec, elapsed)
     }
+}
 
+/// [`SubprocessRunner::maximum_timeout_exceeded`] for any runner holding a
+/// store: shared with the remote runner's poll loop so a remote cell's
+/// `maximum_timeout_seconds` caps apply exactly as a local one's do.
+pub(crate) fn maximum_timeout_reason(
+    store: Option<&crate::store_lock::StoreHandle>,
+    spec: &RunnerSpec,
+    elapsed: Duration,
+) -> Option<String> {
+    let caps = spec.maximum_timeout.as_ref()?;
+    if spec.proof {
+        // A proof step has no descendants -- its own cap is a simple
+        // single-attempt deadline, exactly like `timeout_sec` above.
+        if let Some(cap_sec) = caps.self_cap_sec {
+            if elapsed.as_secs() >= cap_sec {
+                return Some(format!(
+                    "proof step's own maximum_timeout_seconds ({cap_sec}s) exceeded"
+                ));
+            }
+        }
+    }
+    let store = store?;
+    let guard = store.lock();
+    let now = crate::store::now_ms();
+    // For a cell run, its own `maximum_timeout_seconds` (`self_cap_sec`)
+    // is already the cumulative cell+proofs cap; for a cell-scope proof,
+    // it's the owning cell's separate `cell_cap_sec`. Either way this is
+    // "the cell-scope cumulative cap to check", checked the same way.
+    let cell_cap = if spec.proof {
+        caps.cell_cap_sec
+    } else {
+        caps.self_cap_sec
+    };
+    if let (Some(cap_sec), Some(cell_idx)) = (cell_cap, caps.cell_idx) {
+        if let Ok(used_ms) =
+            guard.cell_cumulative_runtime_ms(&caps.squad_id, caps.task_idx, cell_idx, now)
+        {
+            if used_ms >= saturating_cap_ms(cap_sec) {
+                return Some(format!(
+                    "cell's maximum_timeout_seconds ({cap_sec}s) exceeded (cumulative {}s across the cell and its proofs)",
+                    used_ms / 1000
+                ));
+            }
+        }
+    }
+    if let Some(cap_sec) = caps.task_cap_sec {
+        if let Ok(used_ms) = guard.task_cumulative_runtime_ms(&caps.squad_id, caps.task_idx, now) {
+            if used_ms >= saturating_cap_ms(cap_sec) {
+                return Some(format!(
+                    "task's maximum_timeout_seconds ({cap_sec}s) exceeded (cumulative {}s across the task)",
+                    used_ms / 1000
+                ));
+            }
+        }
+    }
+    None
+}
+
+impl SubprocessRunner {
     /// RAL-241: check whether `session_name` has shown no activity (pane
     /// growth, per `Store::live_activity_ms`) for at least `threshold`, and
     /// if so, broadcast a `high`-priority mailbox message once for this
