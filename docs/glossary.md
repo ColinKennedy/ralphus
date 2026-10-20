@@ -279,4 +279,5 @@ Already carrying weight; pick something else:
 - [`daemon-api.md`](daemon-api.md) — the wire shapes these names appear in
 - [`colors.md`](colors.md) — the semantic colors, which have their own naming rules
 - [`fork-workflows.md`](fork-workflows.md) — fork registration, routing, and promotion (RAL-338)
+- [`github-token-scopes.md`](github-token-scopes.md) — which classic-token scopes a user token and a poll-pool token need
 - [`special-syntax.md`](special-syntax.md) — the words, sentinels, and markers that trigger behavior, and what isn't parsed

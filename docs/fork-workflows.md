@@ -226,7 +226,9 @@ when you ask (a Check button on the board, or a CLI command), never polled:
   token still authenticates (and as whom) and whether the forge is reachable
   from the daemon's network position. Use it when a fork-routed push or PR
   submission has started failing with auth errors and you suspect a revoked
-  or expired token.
+  or expired token. It does not check scopes; see
+  [`github-token-scopes.md`](github-token-scopes.md) for which ones a GitHub
+  token needs.
 - `ralphus project fork check <project> --url <fork-url> [--user <user>]`
   probes a fork URL's reachability before or instead of saving it — one GET
   of the repository through the forge REST API. With `--user`, the check
