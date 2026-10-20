@@ -469,7 +469,8 @@ impl crate::store::Store {
         Ok(())
     }
 
-    /// Record that a slot's captured file is now on the forge.
+    /// Record that a slot's captured file is now on the forge; its cached
+    /// copy is forgotten (the caller deletes the file).
     ///
     /// # Errors
     ///
@@ -482,7 +483,7 @@ impl crate::store::Store {
         upload_id: Option<&str>,
     ) -> Result<()> {
         self.conn.execute(
-            "UPDATE guardian_exhibit_fills SET url=?, forge_upload_id=?
+            "UPDATE guardian_exhibit_fills SET url=?, forge_upload_id=?, local_path=NULL
              WHERE guardian_id=? AND action_idx=? AND slot_idx=?",
             rusqlite::params![url, upload_id, guardian_id, key.action_idx, key.slot_idx],
         )?;

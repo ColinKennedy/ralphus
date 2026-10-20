@@ -79,6 +79,51 @@ pub fn state_dir() -> PathBuf {
     dir
 }
 
+/// ralphus's per-user cache directory, for files it keeps only until they are
+/// no longer needed and could always do without (captured exhibit media
+/// waiting to be uploaded, for one) -- never in [`state_dir`], which holds
+/// what ralphus must keep. Created if needed.
+///
+/// * Windows: `%LOCALAPPDATA%\ralphus` -- local, not the roaming
+///   `%APPDATA%`, so large media never travels with a roaming profile.
+/// * macOS: `~/Library/Caches/ralphus`.
+/// * Elsewhere: `$XDG_CACHE_HOME/ralphus`, else `~/.cache/ralphus`.
+///
+/// Falls back to `<system temp>/ralphus` when none of those resolve.
+#[must_use]
+pub fn cache_dir() -> PathBuf {
+    let dir = cache_dir_from(
+        std::env::consts::OS,
+        |name| std::env::var_os(name).filter(|v| !v.is_empty()),
+        home_dir(),
+    )
+    .unwrap_or_else(|| std::env::temp_dir().join("ralphus"));
+    let _ = std::fs::create_dir_all(&dir);
+    #[cfg(unix)]
+    tighten_unix_dir_permissions(&dir);
+    dir
+}
+
+/// [`cache_dir`]'s choice for `os` (as in `std::env::consts::OS`), given an
+/// environment lookup and the home directory; `None` when nothing resolves.
+fn cache_dir_from(
+    os: &str,
+    env: impl Fn(&str) -> Option<std::ffi::OsString>,
+    home: Option<PathBuf>,
+) -> Option<PathBuf> {
+    let base = match os {
+        "windows" => env("LOCALAPPDATA")
+            .map(PathBuf::from)
+            .or_else(|| home.map(|h| h.join("AppData").join("Local"))),
+        "macos" => home.map(|h| h.join("Library").join("Caches")),
+        _ => env("XDG_CACHE_HOME")
+            .map(PathBuf::from)
+            .filter(|p| p.is_absolute())
+            .or_else(|| home.map(|h| h.join(".cache"))),
+    }?;
+    Some(base.join("ralphus"))
+}
+
 /// RAL-230: restrict `dir` to owner-only `0o700`. Factored out of
 /// [`state_dir`] so it can be unit-tested against a throwaway directory
 /// instead of the real (and test-order-sensitive) `$HOME/.ralphus`.
@@ -161,6 +206,58 @@ mod tests {
     #[test]
     fn version_is_non_empty() {
         assert!(!version().is_empty());
+    }
+
+    #[test]
+    fn cache_dir_follows_each_platforms_convention() {
+        let env = |pairs: &'static [(&'static str, &'static str)]| {
+            move |name: &str| {
+                pairs
+                    .iter()
+                    .find(|(k, _)| *k == name)
+                    .map(|(_, v)| std::ffi::OsString::from(v))
+            }
+        };
+        let home = || Some(PathBuf::from("/home/u"));
+        assert_eq!(
+            cache_dir_from(
+                "windows",
+                env(&[("LOCALAPPDATA", "C:/Users/u/AppData/Local")]),
+                home()
+            ),
+            Some(PathBuf::from("C:/Users/u/AppData/Local").join("ralphus"))
+        );
+        // Never the roaming %APPDATA%, even when it is the only one set.
+        assert_eq!(
+            cache_dir_from("windows", env(&[("APPDATA", "C:/roam")]), home()),
+            Some(
+                PathBuf::from("/home/u")
+                    .join("AppData")
+                    .join("Local")
+                    .join("ralphus")
+            )
+        );
+        assert_eq!(
+            cache_dir_from("macos", env(&[]), home()),
+            Some(
+                PathBuf::from("/home/u")
+                    .join("Library")
+                    .join("Caches")
+                    .join("ralphus")
+            )
+        );
+        // An absolute path on the platform running the test.
+        const XDG: &str = if cfg!(windows) { "C:/xdg" } else { "/xdg" };
+        assert_eq!(
+            cache_dir_from("linux", env(&[("XDG_CACHE_HOME", XDG)]), home()),
+            Some(PathBuf::from(XDG).join("ralphus"))
+        );
+        // A relative XDG_CACHE_HOME is invalid per the spec and ignored.
+        assert_eq!(
+            cache_dir_from("linux", env(&[("XDG_CACHE_HOME", "rel")]), home()),
+            Some(PathBuf::from("/home/u").join(".cache").join("ralphus"))
+        );
+        assert_eq!(cache_dir_from("linux", env(&[]), None), None);
     }
 
     #[test]

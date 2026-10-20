@@ -20,7 +20,11 @@ use crate::exhibits::{
 /// Longest text an `output` exhibit keeps.
 const MAX_TEXT_CHARS: usize = 4_000;
 
-/// Where exhibits are kept: `state_dir()/exhibits`.
+/// Where captured exhibits wait until they are uploaded: the per-user cache
+/// directory (`ralphus_core::cache_dir()`), never the state directory. Each
+/// file is deleted once its upload succeeds, a run's raw capture directory
+/// once its reports are recorded, and anything older than
+/// [`MAX_CACHE_AGE`] by [`prune_cache`].
 #[must_use]
 pub fn exhibits_root() -> PathBuf {
     #[cfg(test)]
@@ -29,7 +33,43 @@ pub fn exhibits_root() -> PathBuf {
             return root;
         }
     }
-    crate::state_dir().join("exhibits")
+    ralphus_core::cache_dir().join("exhibits")
+}
+
+/// How long a captured exhibit may wait in the cache before it is pruned,
+/// uploaded or not.
+pub const MAX_CACHE_AGE: std::time::Duration = std::time::Duration::from_secs(14 * 24 * 60 * 60);
+
+/// Delete every file under `root` last modified more than `max_age` ago, and
+/// any directory left empty. Best-effort: anything that cannot be read or
+/// removed is skipped. Returns how many files were deleted.
+pub fn prune_cache(root: &Path, max_age: std::time::Duration) -> usize {
+    fn walk(dir: &Path, cutoff: std::time::SystemTime, removed: &mut usize) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Ok(meta) = entry.metadata() else {
+                continue;
+            };
+            if meta.is_dir() {
+                walk(&path, cutoff, removed);
+                // Only succeeds once the directory is empty.
+                let _ = std::fs::remove_dir(&path);
+            } else if meta.modified().is_ok_and(|m| m < cutoff)
+                && std::fs::remove_file(&path).is_ok()
+            {
+                *removed += 1;
+            }
+        }
+    }
+    let Some(cutoff) = std::time::SystemTime::now().checked_sub(max_age) else {
+        return 0;
+    };
+    let mut removed = 0;
+    walk(root, cutoff, &mut removed);
+    removed
 }
 
 #[cfg(test)]
@@ -159,6 +199,11 @@ pub fn record_run_reports(
         }
         let _ = store.lock().set_exhibit_fill(guardian_id, slot.key, &fill);
     }
+    // Everything worth keeping was copied to the kept directory above; the
+    // run's raw captures are not needed any more.
+    if dir.starts_with(root) && dir != root {
+        let _ = std::fs::remove_dir_all(dir);
+    }
     summary
 }
 
@@ -266,6 +311,8 @@ fn upload_one(
     match uploaded {
         Ok((url, upload_id, via)) => {
             let _ = guard.record_exhibit_upload(guardian_id, key, &url, upload_id.as_deref());
+            // The forge has it now; the cached copy is no longer needed.
+            let _ = std::fs::remove_file(local);
             crate::cartographer::Note::new("guardian")
                 .guardian(guardian_id)
                 .scope("live_action")
@@ -448,6 +495,34 @@ mod tests {
     }
 
     #[test]
+    fn pruning_removes_only_old_files_and_empty_folders() {
+        let root = TestDir::new();
+        let old_dir = root.path().join("g").join("kept");
+        std::fs::create_dir_all(&old_dir).unwrap();
+        let old = old_dir.join("old.png");
+        let fresh = root.path().join("g").join("fresh.png");
+        std::fs::write(&old, b"x").unwrap();
+        std::fs::write(&fresh, b"x").unwrap();
+        let long_ago =
+            std::time::SystemTime::now() - std::time::Duration::from_secs(30 * 24 * 3600);
+        std::fs::File::options()
+            .write(true)
+            .open(&old)
+            .unwrap()
+            .set_modified(long_ago)
+            .unwrap();
+        assert_eq!(prune_cache(root.path(), MAX_CACHE_AGE), 1);
+        assert!(!old.exists());
+        assert!(!old_dir.exists(), "the emptied folder goes too");
+        assert!(fresh.exists());
+    }
+
+    #[test]
+    fn the_cache_root_is_never_the_state_directory() {
+        assert!(!ralphus_core::cache_dir().starts_with(crate::state_dir()));
+    }
+
+    #[test]
     fn attachment_urls_are_found_in_markdown_and_bare_lines() {
         let text = "x ![a](https://github.com/user-attachments/assets/1) y\nhttps://github.com/user-attachments/assets/2\n<img src=\"https://github.com/user-attachments/assets/3\">";
         assert_eq!(attachment_urls(text).len(), 3);
@@ -532,6 +607,10 @@ mod tests {
         assert_eq!(
             now[2].fill.as_ref().unwrap().missing_reason.as_deref(),
             Some("the live run did not report it")
+        );
+        assert!(
+            !dir.exists(),
+            "the run's raw capture folder is removed once recorded"
         );
     }
 

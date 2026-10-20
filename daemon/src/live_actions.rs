@@ -1354,6 +1354,9 @@ impl<'a> ExhibitRun<'a> {
         remote: bool,
     ) -> Self {
         let root = crate::exhibit_delivery::exhibits_root();
+        if !req.exhibit_slots.is_empty() {
+            crate::exhibit_delivery::prune_cache(&root, crate::exhibit_delivery::MAX_CACHE_AGE);
+        }
         let mut run = Self {
             guardian_id: req.guardian.id.as_str(),
             run_id: req.run_id,

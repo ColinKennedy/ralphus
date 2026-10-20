@@ -2786,6 +2786,9 @@ live
                 .clone()
                 .unwrap();
             assert_eq!(fill.url.as_deref(), Some(url));
+            // Uploaded: the cached copy is gone and no longer referenced.
+            assert_eq!(fill.local_path, None);
+            assert!(!dir.path().join("shot.png").exists());
         }
     }
 
