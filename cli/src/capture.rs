@@ -23,6 +23,10 @@ use std::time::{Duration, Instant};
 pub enum Target {
     /// The main window of this process.
     Pid(u32),
+    /// The window with this title (an exact match first, then the first
+    /// title containing it). For programs whose windows do not record their
+    /// process id (Tk under X11, for one).
+    Window(String),
     /// The whole primary screen.
     Screen,
 }
@@ -55,8 +59,8 @@ fn require_file(out: &Path) -> Result<(), String> {
 // ---- stills ------------------------------------------------------------------
 
 /// The PowerShell that writes a PNG of `$env:RALPHUS_CAPTURE_PID`'s main
-/// window (or the primary screen when it is empty) to
-/// `$env:RALPHUS_CAPTURE_OUT`.
+/// window, or of the window titled `$env:RALPHUS_CAPTURE_TITLE`, or of the
+/// primary screen when neither is set, to `$env:RALPHUS_CAPTURE_OUT`.
 const WINDOWS_STILL: &str = r#"
 $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Drawing
@@ -73,10 +77,22 @@ public static class RalphusCapture {
 "@
 [RalphusCapture]::SetProcessDPIAware() | Out-Null
 $out = $env:RALPHUS_CAPTURE_OUT
+$h = [IntPtr]::Zero
 if ($env:RALPHUS_CAPTURE_PID) {
   $p = Get-Process -Id ([int]$env:RALPHUS_CAPTURE_PID)
   $h = $p.MainWindowHandle
   if ($h -eq [IntPtr]::Zero) { throw "process $($p.Id) has no visible main window" }
+} elseif ($env:RALPHUS_CAPTURE_TITLE) {
+  $t = $env:RALPHUS_CAPTURE_TITLE
+  $p = Get-Process | Where-Object { $_.MainWindowTitle -eq $t } | Select-Object -First 1
+  if (-not $p) {
+    $like = '*' + [System.Management.Automation.WildcardPattern]::Escape($t) + '*'
+    $p = Get-Process | Where-Object { $_.MainWindowTitle -like $like } | Select-Object -First 1
+  }
+  if (-not $p) { throw "no window is titled `"$t`"" }
+  $h = $p.MainWindowHandle
+}
+if ($h -ne [IntPtr]::Zero) {
   $r = New-Object RalphusCapture+RECT
   [RalphusCapture]::GetWindowRect($h, [ref]$r) | Out-Null
   $w = $r.R - $r.L; $hgt = $r.B - $r.T
@@ -108,16 +124,18 @@ pub fn screenshot(target: &Target, out: &Path) -> Result<(), String> {
         let mut cmd = Command::new("powershell");
         cmd.args(["-NoProfile", "-NonInteractive", "-Command", WINDOWS_STILL])
             .env("RALPHUS_CAPTURE_OUT", out);
+        cmd.env_remove("RALPHUS_CAPTURE_PID")
+            .env_remove("RALPHUS_CAPTURE_TITLE");
         match target {
             Target::Pid(pid) => cmd.env("RALPHUS_CAPTURE_PID", pid.to_string()),
-            Target::Screen => cmd.env_remove("RALPHUS_CAPTURE_PID"),
+            Target::Window(title) => cmd.env("RALPHUS_CAPTURE_TITLE", title),
+            Target::Screen => &mut cmd,
         };
         run(cmd, "PowerShell screen capture")?;
     } else if cfg!(target_os = "macos") {
-        if let Target::Pid(_) = target {
+        if !matches!(target, Target::Screen) {
             return Err(
-                "capturing one window by process id is not supported on macOS yet; use --screen"
-                    .to_string(),
+                "capturing one window is not supported on macOS yet; use --screen".to_string(),
             );
         }
         let mut cmd = Command::new("screencapture");
@@ -129,25 +147,64 @@ pub fn screenshot(target: &Target, out: &Path) -> Result<(), String> {
     require_file(out)
 }
 
+/// The first visible X11 window `xdotool search` finds for `args`.
+fn xdotool_first(args: &[&str]) -> Result<Option<String>, String> {
+    let found = Command::new("xdotool")
+        .arg("search")
+        .arg("--onlyvisible")
+        .args(args)
+        .output()
+        .map_err(|e| format!("could not run xdotool: {e}"))?;
+    Ok(String::from_utf8_lossy(&found.stdout)
+        .lines()
+        .map(str::trim)
+        .find(|w| !w.is_empty())
+        .map(str::to_string))
+}
+
+/// `title` as an extended regular expression matching itself literally.
+fn regex_literal(title: &str) -> String {
+    let mut out = String::new();
+    for c in title.chars() {
+        if "\\.^$|?*+()[]{}".contains(c) {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// The X11 window `target` names: by the `_NET_WM_PID` its toolkit records,
+/// or by title (an exact match first, then a title containing it).
+fn x11_window(target: &Target) -> Result<String, String> {
+    match target {
+        Target::Pid(pid) => xdotool_first(&["--pid", &pid.to_string()])?.ok_or_else(|| {
+            format!(
+                "no visible window records process {pid} (some toolkits, such as Tk, never \
+                 set _NET_WM_PID); capture it by title with --window instead"
+            )
+        }),
+        Target::Window(title) => {
+            let literal = regex_literal(title);
+            match xdotool_first(&["--name", &format!("^{literal}$")])? {
+                Some(w) => Ok(w),
+                None => xdotool_first(&["--name", &literal])?
+                    .ok_or_else(|| format!("no visible window is titled \"{title}\"")),
+            }
+        }
+        Target::Screen => Ok("root".to_string()),
+    }
+}
+
 fn linux_screenshot(target: &Target, out: &Path) -> Result<(), String> {
-    if let Target::Pid(pid) = target {
+    if !matches!(target, Target::Screen) {
         if !(on_path("xdotool") && on_path("import")) {
             return Err(
                 "capturing one window needs xdotool and ImageMagick's import (X11); use --screen"
                     .to_string(),
             );
         }
-        let found = Command::new("xdotool")
-            .args(["search", "--onlyvisible", "--pid", &pid.to_string()])
-            .output()
-            .map_err(|e| format!("could not run xdotool: {e}"))?;
-        let window = String::from_utf8_lossy(&found.stdout)
-            .lines()
-            .next()
-            .map(str::trim)
-            .filter(|w| !w.is_empty())
-            .map(str::to_string)
-            .ok_or_else(|| format!("no visible window belongs to process {pid}"))?;
+        let window = x11_window(target)?;
         let mut cmd = Command::new("import");
         cmd.args(["-window", &window]).arg(out);
         return run(cmd, "import");
@@ -232,12 +289,18 @@ fn ffmpeg_input(target: &Target) -> Result<Option<Vec<String>>, String> {
                     format!("title={title}"),
                 ]
             }
+            Target::Window(title) => vec![
+                "-f".into(),
+                "gdigrab".into(),
+                "-i".into(),
+                format!("title={title}"),
+            ],
         }));
     }
     if cfg!(target_os = "macos") {
         return Ok(match target {
             Target::Screen => Some(v(&["-f", "avfoundation", "-i", "1:none"])),
-            Target::Pid(_) => None,
+            Target::Pid(_) | Target::Window(_) => None,
         });
     }
     Ok(match (target, std::env::var("DISPLAY")) {
@@ -578,10 +641,21 @@ mod tests {
         }
         let gif = dir.join("window.gif");
         let recorded = record_stills(&Target::Pid(child.id()), 1, 2, &gif);
+        let by_title = dir.join("by-title.png");
+        let titled = screenshot(
+            &Target::Window("ralphus capture probe".to_string()),
+            &by_title,
+        );
         let _ = child.kill();
         let _ = child.wait();
         result.unwrap();
         recorded.unwrap();
+        titled.unwrap();
+        let titled_frame = decode_png(&by_title).unwrap();
+        assert!(
+            titled_frame.width < 1000,
+            "the titled window, not the screen"
+        );
         let frame = decode_png(&png).unwrap();
         // The form, not the whole screen.
         assert!(

@@ -84,12 +84,16 @@ ships a portable fallback that needs only the OS's own tools:
 
 ```bash
 ralphus exhibit screenshot --pid <process id> -o view.png     # one window
+ralphus exhibit screenshot --window "My App" -o view.png      # one window, by title
 ralphus exhibit screenshot --screen -o view.png               # the screen
 ralphus exhibit record --pid <process id> --seconds 5 -o drag.gif
 ralphus exhibit record --screen --seconds 5 --fps 10 -o drag.mp4   # needs ffmpeg
 ```
 
-A relative `-o` lands in `$RALPHUS_EXHIBIT_DIR` when that is set.
+A relative `-o` lands in `$RALPHUS_EXHIBIT_DIR` when that is set. On X11,
+`--pid` finds a window through the `_NET_WM_PID` its toolkit records; GTK and
+Qt record it, but some toolkits (Tk, for one) never do, so use `--window`
+with the title for those.
 
 | OS | Stills | Recording |
 |---|---|---|

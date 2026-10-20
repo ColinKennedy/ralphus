@@ -2376,9 +2376,15 @@ const EXHIBIT_CHILDREN: &[HelpNode] = &[
     node(
         "screenshot",
         &[],
-        &["--output [file.png]", "--pid [integer]", "--screen"],
-        "Capture a PNG of one process's main window (--pid) or the whole screen (--screen) on this \
-machine, using the OS's own tools (Windows: PowerShell/.NET, the window need not be in front; \
+        &[
+            "--output [file.png]",
+            "--pid [integer]",
+            "--screen",
+            "--window [title]",
+        ],
+        "Capture a PNG of one process's main window (--pid), the window with a title (--window: an \
+exact match, else the first title containing it -- for toolkits such as Tk that do not record \
+their process id on X11), or the whole screen (--screen) on this machine, using the OS's own tools (Windows: PowerShell/.NET, the window need not be in front; \
 macOS: screencapture, screen only; Linux: grim, ImageMagick import or gnome-screenshot). A \
 relative --output lands in $RALPHUS_EXHIBIT_DIR when set -- a live action's exhibit directory. \
 Prints the written path. Never contacts the daemon.",
@@ -2396,8 +2402,10 @@ Prints the written path. Never contacts the daemon.",
             "--pid [integer]",
             "--screen",
             "--seconds [integer]",
+            "--window [title]",
         ],
-        "Record a short GIF or MP4 of one process's window (--pid) or the screen (--screen): \
+        "Record a short GIF or MP4 of one process's window (--pid), a window by title (--window) \
+or the screen (--screen): \
 ffmpeg when it is on PATH, otherwise timed stills encoded into a GIF (an .mp4 needs ffmpeg). \
 --seconds 1-60 (default 5), --fps 1-30 (default 10). A relative --output lands in \
 $RALPHUS_EXHIBIT_DIR when set. Prints the written path.",

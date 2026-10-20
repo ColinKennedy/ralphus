@@ -28,25 +28,36 @@ const MAX_FPS: u32 = 30;
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CaptureArgs {
     pub pid: Option<u32>,
+    pub window: Option<String>,
     pub screen: bool,
     pub out: Option<String>,
 }
 
 impl CaptureArgs {
     /// The target and output file, when the flags make sense together: one of
-    /// `--pid`/`--screen`, and an output whose type matches (`.png` for a
-    /// still, `.gif`/`.mp4` for a recording).
+    /// `--pid`/`--window`/`--screen`, and an output whose type matches
+    /// (`.png` for a still, `.gif`/`.mp4` for a recording).
     ///
     /// # Errors
     ///
     /// A message saying what to change.
     pub fn check(&self, still: bool) -> Result<(Target, String), String> {
-        let target = match (self.pid, self.screen) {
-            (Some(_), true) => return Err("give --pid or --screen, not both".to_string()),
-            (Some(pid), false) => Target::Pid(pid),
-            (None, true) => Target::Screen,
-            (None, false) => {
-                return Err("say what to capture: --pid <process id> or --screen".to_string());
+        let given = usize::from(self.pid.is_some())
+            + usize::from(self.window.is_some())
+            + usize::from(self.screen);
+        if given > 1 {
+            return Err("give only one of --pid, --window or --screen".to_string());
+        }
+        let target = match (self.pid, &self.window, self.screen) {
+            (Some(pid), _, _) => Target::Pid(pid),
+            (_, Some(title), _) if !title.trim().is_empty() => Target::Window(title.clone()),
+            (_, Some(_), _) => return Err("--window takes a window title".to_string()),
+            (_, _, true) => Target::Screen,
+            _ => {
+                return Err(
+                    "say what to capture: --pid <process id>, --window <title> or --screen"
+                        .to_string(),
+                );
             }
         };
         let Some(out) = self.out.clone() else {
@@ -110,6 +121,7 @@ pub fn parse(args: &[String]) -> ExhibitCommand {
                     .map(|pid| capture.pid = Some(pid))
                     .map_err(|_| format!("--pid takes a process id, got {v:?}"))
             }),
+            "--window" => value("--window").map(|v| capture.window = Some(v)),
             "--screen" => {
                 capture.screen = true;
                 Ok(())
@@ -221,6 +233,7 @@ mod tests {
     fn capture(pid: Option<u32>, screen: bool, out: &str) -> CaptureArgs {
         CaptureArgs {
             pid,
+            window: None,
             screen,
             out: Some(out.to_string()),
         }
@@ -245,12 +258,35 @@ mod tests {
             capture(None, true, "a.PNG").check(true),
             Ok((Target::Screen, "a.PNG".to_string()))
         );
+        assert_eq!(
+            parse(&v(&["screenshot", "--window", "My App", "-o", "a.png"])),
+            ExhibitCommand::Screenshot(CaptureArgs {
+                pid: None,
+                window: Some("My App".to_string()),
+                screen: false,
+                out: Some("a.png".to_string()),
+            })
+        );
+        let titled = CaptureArgs {
+            window: Some("My App".to_string()),
+            ..capture(None, false, "a.png")
+        };
+        assert_eq!(
+            titled.check(true),
+            Ok((Target::Window("My App".to_string()), "a.png".to_string()))
+        );
+        let both = CaptureArgs {
+            window: Some("My App".to_string()),
+            ..capture(Some(1), false, "a.png")
+        };
+        assert!(both.check(true).is_err());
         for bad in [
             CaptureArgs::default(),
             capture(Some(1), true, "a.png"),
             capture(None, true, "a.gif"),
             CaptureArgs {
                 pid: None,
+                window: None,
                 screen: true,
                 out: None,
             },
