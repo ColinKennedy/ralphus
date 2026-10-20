@@ -2269,11 +2269,12 @@ fn resolve_pr_alias(
 
 /// RAL-699: the branch's own name when the forge has an open PR/MR whose head
 /// is exactly that name, so the first submission can push to it and adopt the
-/// PR rather than opening a sibling on `<branch>-review`. `None` when the
+/// PR rather than opening a sibling on `<branch>-review`. `Ok(None)` when the
 /// branch was never pushed (no remote-tracking ref), its name is not a valid
-/// alias as-is, the forge has no such PR, or the lookup failed (a failed
-/// lookup falls back to today's behavior). The head is built exactly as
-/// [`submit_stacked_branch_pr`] builds the push head, fork routing included.
+/// alias as-is, or the forge has no such PR. `Err` when the forge lookup
+/// itself failed; the caller records it and falls back to the derived alias.
+/// The head is built exactly as [`submit_stacked_branch_pr`] builds the push
+/// head, fork routing included.
 #[allow(clippy::too_many_arguments)]
 fn find_branch_own_open_pr_alias(
     client: &crate::forge::ForgeClient,
@@ -2284,13 +2285,15 @@ fn find_branch_own_open_pr_alias(
     base_branch_name: &str,
     branch: &BranchView,
     fork_routing: Option<&ForkRouting>,
-) -> Option<String> {
+) -> std::result::Result<Option<String>, String> {
     let name = branch.branch.as_str();
     if name.is_empty() || sanitize_branch_name(name) != name {
-        return None;
+        return Ok(None);
     }
     let tracking = format!("refs/remotes/{remote_name}/{name}");
-    git(root, &["rev-parse", "--verify", "--quiet", &tracking]).ok()?;
+    if git(root, &["rev-parse", "--verify", "--quiet", &tracking]).is_err() {
+        return Ok(None);
+    }
     let base = stack_base_for(
         ordered_enabled_branches,
         alias_by_branch,
@@ -2298,7 +2301,10 @@ fn find_branch_own_open_pr_alias(
         base_branch_name,
     );
     let route = match fork_routing {
-        Some(routing) => fork_aware_route(routing, name, &base, base_branch_name).ok()?,
+        Some(routing) => match fork_aware_route(routing, name, &base, base_branch_name) {
+            Ok(route) => route,
+            Err(_) => return Ok(None),
+        },
         None => crate::forge::PrRoute {
             client: client.clone(),
             create_client: None,
@@ -2309,15 +2315,9 @@ fn find_branch_own_open_pr_alias(
         },
     };
     match route.find_existing_pull_request() {
-        Ok(Some(_)) => Some(name.to_string()),
-        Ok(None) => None,
-        Err(e) => {
-            crate::rlog!(
-                WARNING,
-                "ralphus [pr] branch {name} own-name PR lookup failed ({e}); using the derived alias"
-            );
-            None
-        }
+        Ok(Some(_)) => Ok(Some(name.to_string())),
+        Ok(None) => Ok(None),
+        Err(e) => Err(e.to_string()),
     }
 }
 
@@ -8760,7 +8760,7 @@ fn submit_stacked_branch_pr(
     // RAL-699: a first submission with no explicit alias adopts a human-opened
     // PR/MR whose head is this branch's own name, by pushing to that name.
     let own_pr_alias = if req.branch_alias.is_none() {
-        find_branch_own_open_pr_alias(
+        match find_branch_own_open_pr_alias(
             client,
             root,
             remote_name,
@@ -8769,7 +8769,33 @@ fn submit_stacked_branch_pr(
             base_branch_name,
             branch,
             fork_routing,
-        )
+        ) {
+            Ok(alias) => alias,
+            Err(e) => {
+                crate::rlog!(
+                    WARNING,
+                    "ralphus [pr] review {id} branch id={branch_id} own-name PR lookup failed \
+                     ({e}); using the derived alias"
+                );
+                let _ = store.lock().cartographer_log(crate::cartographer::CartographerEntry {
+                    level: crate::logging::LogLevel::WARNING,
+                    source: "pr",
+                    message: "own-name PR lookup failed; using the derived alias",
+                    scope: Some("branch"),
+                    squad_id: None,
+                    guardian_id: Some(id),
+                    cell_id: None,
+                    task: None,
+                    log_path: None,
+                    payload: serde_json::json!({
+                        "branch_id": branch_id,
+                        "error": e,
+                    }),
+                    admin_only: false,
+                });
+                None
+            }
+        }
     } else {
         None
     };
