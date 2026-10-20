@@ -1157,6 +1157,7 @@ dependencies = [
  "nix",
  "opentelemetry",
  "opentelemetry_sdk",
+ "png",
  "ralphus-core",
  "serde",
  "serde_json",

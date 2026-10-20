@@ -206,7 +206,8 @@ fn linux_screenshot(target: &Target, out: &Path) -> Result<(), String> {
         }
         let window = x11_window(target)?;
         let mut cmd = Command::new("import");
-        cmd.args(["-window", &window]).arg(out);
+        // `-frame` includes the window manager's frame: the title bar.
+        cmd.args(["-frame", "-window", &window]).arg(out);
         return run(cmd, "import");
     }
     if on_path("grim") && std::env::var_os("WAYLAND_DISPLAY").is_some() {

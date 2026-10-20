@@ -150,6 +150,101 @@ impl Transcoder for Ffmpeg {
     }
 }
 
+/// A still is cropped only when its margin is at least this share of it, so
+/// a screenshot that already shows just the window is left alone.
+const MIN_MARGIN_SHARE: f64 = 0.15;
+
+/// Pixels of the margin colour kept around what a crop keeps.
+const CROP_PADDING: usize = 4;
+
+/// Crop a PNG still's black margin -- the empty root window of a bare X
+/// display (Xvfb) around a window captured with the whole screen -- into
+/// `out` (a PNG path). The margin is the colour most common along the
+/// image's four edges, and only a pure black one is cropped: a window's own
+/// background is just as uniform, so cropping any other colour would cut a
+/// tight window capture down to its widgets, while a real desktop's
+/// wallpaper never reads as one colour. `None` when the file is not a
+/// readable PNG, its margin is not black, it is black throughout, or the
+/// margin is too small to be worth removing.
+#[must_use]
+pub fn crop_margin(source: &Path, out: &Path) -> Option<PathBuf> {
+    let file = std::fs::File::open(source).ok()?;
+    let mut decoder = png::Decoder::new(std::io::BufReader::new(file));
+    decoder.set_transformations(png::Transformations::normalize_to_color8());
+    let mut reader = decoder.read_info().ok()?;
+    let mut buf = vec![0; reader.output_buffer_size()];
+    let info = reader.next_frame(&mut buf).ok()?;
+    let (width, height) = (info.width as usize, info.height as usize);
+    let channels = info.color_type.samples();
+    let stride = info.line_size;
+    if width == 0 || height == 0 {
+        return None;
+    }
+    let pixel =
+        |x: usize, y: usize| &buf[y * stride + x * channels..y * stride + (x + 1) * channels];
+    let mut edge_counts: std::collections::HashMap<&[u8], usize> = std::collections::HashMap::new();
+    for x in 0..width {
+        *edge_counts.entry(pixel(x, 0)).or_default() += 1;
+        *edge_counts.entry(pixel(x, height - 1)).or_default() += 1;
+    }
+    for y in 0..height {
+        *edge_counts.entry(pixel(0, y)).or_default() += 1;
+        *edge_counts.entry(pixel(width - 1, y)).or_default() += 1;
+    }
+    let margin = edge_counts.into_iter().max_by_key(|(_, n)| *n)?.0.to_vec();
+    // Colour channels black; an alpha channel (the last of 2 or 4) is ignored.
+    let colour = if channels % 2 == 0 {
+        &margin[..channels - 1]
+    } else {
+        &margin[..]
+    };
+    if colour.iter().any(|&c| c != 0) {
+        return None;
+    }
+    let (mut left, mut top, mut right, mut bottom) = (width, height, 0, 0);
+    for y in 0..height {
+        for x in 0..width {
+            if pixel(x, y) != margin.as_slice() {
+                left = left.min(x);
+                right = right.max(x);
+                top = top.min(y);
+                bottom = bottom.max(y);
+            }
+        }
+    }
+    if left > right {
+        return None;
+    }
+    let left = left.saturating_sub(CROP_PADDING);
+    let top = top.saturating_sub(CROP_PADDING);
+    let right = (right + CROP_PADDING).min(width - 1);
+    let bottom = (bottom + CROP_PADDING).min(height - 1);
+    let (crop_width, crop_height) = (right - left + 1, bottom - top + 1);
+    #[allow(clippy::cast_precision_loss)]
+    let kept = (crop_width * crop_height) as f64 / (width * height) as f64;
+    if kept > 1.0 - MIN_MARGIN_SHARE {
+        return None;
+    }
+    let mut data = Vec::with_capacity(crop_width * crop_height * channels);
+    for y in top..=bottom {
+        data.extend_from_slice(
+            &buf[y * stride + left * channels..y * stride + (right + 1) * channels],
+        );
+    }
+    let file = std::fs::File::create(out).ok()?;
+    let mut encoder = png::Encoder::new(
+        std::io::BufWriter::new(file),
+        u32::try_from(crop_width).ok()?,
+        u32::try_from(crop_height).ok()?,
+    );
+    encoder.set_color(info.color_type);
+    encoder.set_depth(png::BitDepth::Eight);
+    let mut writer = encoder.write_header().ok()?;
+    writer.write_image_data(&data).ok()?;
+    writer.finish().ok()?;
+    Some(out.to_path_buf())
+}
+
 /// `program` without the forge token an upload run carries.
 fn tool(program: &str) -> std::process::Command {
     let mut command = std::process::Command::new(program);
@@ -209,6 +304,21 @@ pub fn prepare(
             ),
         };
     }
+    // A whole-screen capture of one window is mostly empty desktop: keep
+    // the window.
+    let cropped = (media == MediaType::Image
+        && source
+            .extension()
+            .is_some_and(|e| e.eq_ignore_ascii_case("png")))
+    .then(|| {
+        let name = out_stem.file_name().unwrap_or_default().to_string_lossy();
+        crop_margin(
+            source,
+            &out_stem.with_file_name(format!("{name}-cropped.png")),
+        )
+    })
+    .flatten();
+    let source = cropped.as_deref().unwrap_or(source);
     let has_ffmpeg = ffmpeg.available();
     let allowed = |kind: ExhibitKind| preference.contains(&kind);
     let start = delivered_kind(media).unwrap_or(ExhibitKind::Screenshot);
@@ -435,6 +545,127 @@ pub(crate) mod tests {
         ExhibitKind::Video,
         ExhibitKind::Screenshot,
     ];
+
+    /// An RGB PNG of `width`x`height` in `background`, with a `window`-coloured
+    /// rectangle at `(x, y, w, h)`.
+    fn screen_png(
+        path: &Path,
+        (width, height): (u32, u32),
+        background: [u8; 3],
+        (x, y, w, h): (u32, u32, u32, u32),
+        window: [u8; 3],
+    ) {
+        let mut data = Vec::new();
+        for row in 0..height {
+            for col in 0..width {
+                let inside = col >= x && col < x + w && row >= y && row < y + h;
+                data.extend_from_slice(if inside { &window } else { &background });
+            }
+        }
+        let file = std::fs::File::create(path).unwrap();
+        let mut encoder = png::Encoder::new(std::io::BufWriter::new(file), width, height);
+        encoder.set_color(png::ColorType::Rgb);
+        encoder.set_depth(png::BitDepth::Eight);
+        encoder
+            .write_header()
+            .unwrap()
+            .write_image_data(&data)
+            .unwrap();
+    }
+
+    fn png_size(path: &Path) -> (u32, u32) {
+        let reader = png::Decoder::new(std::fs::File::open(path).unwrap())
+            .read_info()
+            .unwrap();
+        (reader.info().width, reader.info().height)
+    }
+
+    #[test]
+    fn a_whole_screen_capture_is_cropped_to_its_window() {
+        let dir = TestDir::new();
+        let screen = dir.path().join("screen.png");
+        // The capture from a live run: a 380x160 window in the corner of a
+        // black 1280x1024 virtual display.
+        screen_png(
+            &screen,
+            (1280, 1024),
+            [0, 0, 0],
+            (0, 0, 380, 160),
+            [217, 217, 217],
+        );
+        let out = dir.path().join("cropped.png");
+        assert_eq!(crop_margin(&screen, &out), Some(out.clone()));
+        assert_eq!(png_size(&out), (384, 164), "the window plus padding");
+        // Mid-screen, the padding goes on every side.
+        screen_png(
+            &screen,
+            (400, 300),
+            [0, 0, 0],
+            (100, 50, 60, 30),
+            [255, 255, 255],
+        );
+        crop_margin(&screen, &out).unwrap();
+        assert_eq!(png_size(&out), (68, 38));
+    }
+
+    #[test]
+    fn a_capture_of_just_the_window_is_left_alone() {
+        let dir = TestDir::new();
+        let screen = dir.path().join("window.png");
+        screen_png(
+            &screen,
+            (380, 160),
+            [217, 217, 217],
+            (150, 60, 70, 30),
+            [240, 240, 240],
+        );
+        assert_eq!(
+            crop_margin(&screen, &dir.path().join("out.png")),
+            None,
+            "a uniform window background is not a margin"
+        );
+        let desktop = dir.path().join("desktop.png");
+        screen_png(
+            &desktop,
+            (400, 300),
+            [58, 110, 165],
+            (100, 50, 60, 30),
+            [240, 240, 240],
+        );
+        assert_eq!(
+            crop_margin(&desktop, &dir.path().join("out3.png")),
+            None,
+            "only a bare display's black root window is cropped"
+        );
+        let flat = dir.path().join("flat.png");
+        screen_png(&flat, (50, 50), [0, 0, 0], (0, 0, 0, 0), [0, 0, 0]);
+        assert_eq!(crop_margin(&flat, &dir.path().join("out2.png")), None);
+        assert_eq!(
+            crop_margin(&dir.path().join("missing.png"), &dir.path().join("o.png")),
+            None
+        );
+    }
+
+    #[test]
+    fn prepare_delivers_the_cropped_screenshot() {
+        let dir = TestDir::new();
+        let screen = dir.path().join("view.png");
+        screen_png(
+            &screen,
+            (1280, 1024),
+            [0, 0, 0],
+            (0, 0, 380, 160),
+            [217, 217, 217],
+        );
+        let ff = fake(false, 0);
+        match prepare(&screen, &dir.path().join("prepared"), &PREF, 15, 100, &ff) {
+            Prepared::File { path, kind } => {
+                assert_eq!(kind, ExhibitKind::Screenshot);
+                assert_eq!(png_size(&path), (384, 164));
+            }
+            other => panic!("{other:?}"),
+        }
+    }
 
     #[test]
     fn a_fitting_file_is_used_as_is_without_ffmpeg() {

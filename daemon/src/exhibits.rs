@@ -1010,6 +1010,9 @@ pub fn run_prompt_section(
         "## Exhibits for the reviewer\n\
 After testing, capture what a code reviewer must see, one file per item below, \
 saved in {}{}. Capture the final visible result, not the setup. \
+For an app, capture just its window with the title bar, not the whole screen; on a \
+display with no window manager (a bare Xvfb) start one first (`openbox &`, `xfwm4 &` \
+or `twm &`, whichever is installed) so the window has a title bar. \
 For a visual item deliver the first kind of {order} that shows it; keep any video \
 under {} seconds and any GIF short (a few seconds, small window). For an output \
 item save the relevant text as a .txt file. If the steps you ran did not show an \
@@ -1725,6 +1728,7 @@ mod tests {
         assert!(text.contains("video, then gif"));
         assert!(text.contains("under 9 seconds"));
         assert!(text.contains(REPORT_MARKER));
+        assert!(text.contains("just its window with the title bar"));
         assert!(text.contains(ralphus_runner::exhibit_upload::DIR_PLACEHOLDER));
         let env = format!("${DIR_ENV}");
         assert!(text.contains(&env));
