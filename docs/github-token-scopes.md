@@ -120,7 +120,8 @@ For both tokens:
 | Pull requests | Read and write | Opening and updating PRs, comments, labels, PR stacks |
 | Actions | Read and write | Listing and cancelling CI runs, reading job logs |
 | Commit statuses | Read-only | CI status |
-| Checks | Read-only | Check runs |
+
+![The fine-grained token's repository permissions: Actions, Contents and Pull requests set to Read and write, Commit statuses and Metadata set to Read-only](images/github-user-token-fine-grained-permissions.png)
 
 ### Poll-pool token
 
@@ -131,7 +132,6 @@ Private repositories:
 | Metadata | Read-only (set automatically) |
 | Pull requests | Read-only |
 | Commit statuses | Read-only |
-| Checks | Read-only |
 
 Public repositories only: choose "Public Repositories (read-only)" and add no
 permissions.
@@ -140,6 +140,11 @@ Unlike a classic pool token, a fine-grained one is genuinely read-only.
 
 ### Not confirmed
 
+- **Check runs:** fine-grained personal tokens have no *Checks* permission
+  (GitHub offers it to GitHub Apps only), so whether
+  `GET /repos/{r}/commits/{sha}/check-runs` answers for a fine-grained token
+  is unverified. The commit-status half of CI status (*Commit statuses*) is
+  unaffected.
 - **PR stacks:** GitHub's stacks API is new; it is assumed to use the
   *Pull requests* permission.
 - **Exhibit uploads:** these go through an upload endpoint GitHub does not
