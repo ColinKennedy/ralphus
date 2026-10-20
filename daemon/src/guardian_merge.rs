@@ -15909,14 +15909,19 @@ pub fn poll_base_branch_freshness_once(store: &crate::store_lock::StoreHandle) {
 /// tag, or an already-unambiguous ref) -- git resolves those exactly as
 /// before.
 pub(crate) fn qualify_ambiguous_ref(root: &Path, name: &str) -> String {
+    qualify_ambiguous_ref_in(&crate::workspace::Workspace::local(root), name)
+}
+
+/// [`qualify_ambiguous_ref`] for a workspace that may be on another machine.
+pub(crate) fn qualify_ambiguous_ref_in(ws: &crate::workspace::Workspace, name: &str) -> String {
     if name.contains('/') {
         let remote_ref = format!("refs/remotes/{name}");
-        if git(root, &["rev-parse", "--verify", &remote_ref]).is_ok() {
+        if ws.git(&["rev-parse", "--verify", &remote_ref]).is_ok() {
             return remote_ref;
         }
     }
     let local_ref = format!("refs/heads/{name}");
-    if git(root, &["rev-parse", "--verify", &local_ref]).is_ok() {
+    if ws.git(&["rev-parse", "--verify", &local_ref]).is_ok() {
         return local_ref;
     }
     name.to_string()

@@ -61,6 +61,22 @@ struct RemoteBranchSource {
     remote_cwd: String,
 }
 
+/// `remote` joined with the daemon-relative `suffix`: with `/` when `remote`
+/// is a POSIX path (whatever this host's separator is), else as this host
+/// joins paths.
+fn join_on_machine(remote: &Path, suffix: &Path) -> PathBuf {
+    let base = remote.to_string_lossy();
+    if !base.starts_with('/') {
+        return remote.join(suffix);
+    }
+    let mut out = base.trim_end_matches('/').to_string();
+    for part in suffix.components() {
+        out.push('/');
+        out.push_str(&part.as_os_str().to_string_lossy());
+    }
+    PathBuf::from(out)
+}
+
 /// Every branch of `guardian` produced by a cell on some machine, with that
 /// cell's provisioned workspace path. Store reads only.
 fn remote_branch_sources(
@@ -289,11 +305,13 @@ impl Workspace {
 
     /// Translate a daemon-local path under this review's project root to the
     /// same path on the machine (see `path_map`); anything else is unchanged.
+    /// The suffix is joined with `/` when the machine's path is a POSIX one,
+    /// so a Windows daemon never writes `\` into a Linux machine's path.
     fn map_path(&self, path: &Path) -> PathBuf {
         match self.path_map.as_deref() {
             Some((local, remote)) => match path.strip_prefix(local) {
                 Ok(suffix) if suffix.as_os_str().is_empty() => remote.clone(),
-                Ok(suffix) => remote.join(suffix),
+                Ok(suffix) => join_on_machine(remote, suffix),
                 Err(_) => path.to_path_buf(),
             },
             None => path.to_path_buf(),
@@ -837,6 +855,25 @@ fn set_executable(_path: &Path) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_posix_machine_path_is_joined_with_slashes() {
+        let suffix = std::path::Path::new(".git")
+            .join(".ralphus")
+            .join("g")
+            .join("g5");
+        assert_eq!(
+            super::join_on_machine(std::path::Path::new("/srv/repo"), &suffix),
+            std::path::PathBuf::from("/srv/repo/.git/.ralphus/g/g5")
+        );
+        assert_eq!(
+            super::join_on_machine(
+                std::path::Path::new("/srv/repo/"),
+                std::path::Path::new("w")
+            ),
+            std::path::PathBuf::from("/srv/repo/w")
+        );
+    }
+
     use super::*;
 
     #[test]

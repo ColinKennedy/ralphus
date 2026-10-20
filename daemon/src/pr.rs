@@ -2278,7 +2278,7 @@ fn resolve_pr_alias(
 #[allow(clippy::too_many_arguments)]
 fn find_branch_own_open_pr_alias(
     client: &crate::forge::ForgeClient,
-    root: &Path,
+    ws: &crate::workspace::Workspace,
     remote_name: &str,
     ordered_enabled_branches: &[&BranchView],
     alias_by_branch: &HashMap<String, String>,
@@ -2291,7 +2291,10 @@ fn find_branch_own_open_pr_alias(
         return Ok(None);
     }
     let tracking = format!("refs/remotes/{remote_name}/{name}");
-    if git(root, &["rev-parse", "--verify", "--quiet", &tracking]).is_err() {
+    if ws
+        .git(&["rev-parse", "--verify", "--quiet", &tracking])
+        .is_err()
+    {
         return Ok(None);
     }
     let base = stack_base_for(
@@ -2384,7 +2387,7 @@ impl PushLease {
 /// than silently overwriting the reviewer's commits -- the next maintenance
 /// sweep then pulls them in first.
 fn push_ref(
-    root: &Path,
+    ws: &crate::workspace::Workspace,
     remote: &str,
     local: &str,
     alias: &str,
@@ -2394,15 +2397,12 @@ fn push_ref(
         "--force-with-lease=refs/heads/{alias}:{}",
         expected.0.as_deref().unwrap_or_default()
     );
-    git(
-        root,
-        &[
-            "push",
-            remote,
-            &lease,
-            &format!("{local}:refs/heads/{alias}"),
-        ],
-    )
+    ws.git(&[
+        "push",
+        remote,
+        &lease,
+        &format!("{local}:refs/heads/{alias}"),
+    ])
     .map(|_| ())
 }
 
@@ -2518,7 +2518,7 @@ pub(crate) fn cancel_superseded_ci_after_push(
 /// network round-trips, and only the lease makes a reviewer push landing
 /// between them fail the push instead of being overwritten.
 fn guard_against_clobber(
-    root: &Path,
+    ws: &crate::workspace::Workspace,
     remote: &str,
     alias: &str,
     local_ref: &str,
@@ -2527,8 +2527,8 @@ fn guard_against_clobber(
     let fetched = guardian_merge::with_private_fetch(
         alias,
         &["clobber", remote, alias],
-        |refspec| git(root, &["fetch", "--no-write-fetch-head", remote, refspec]),
-        |dest| git(root, &["rev-parse", dest]),
+        |refspec| ws.git(&["fetch", "--no-write-fetch-head", remote, refspec]),
+        |dest| ws.git(&["rev-parse", dest]),
     );
     let remote_sha = match fetched {
         // The fetch failed: the branch doesn't exist yet, or the remote can't
@@ -2536,16 +2536,14 @@ fn guard_against_clobber(
         // so it can create a new branch but never overwrite one this check
         // couldn't see.
         Err(fetch_err) => {
-            let listed = git(
-                root,
-                &[
+            let listed = ws
+                .git(&[
                     "ls-remote",
                     "--heads",
                     remote,
                     &format!("refs/heads/{alias}"),
-                ],
-            )
-            .unwrap_or_default();
+                ])
+                .unwrap_or_default();
             return match listed.split_whitespace().next() {
                 None => Ok(PushLease(None)),
                 Some(sha) => Err(format!(
@@ -2565,11 +2563,9 @@ fn guard_against_clobber(
     if last_pushed == Some(remote_sha) {
         return Ok(tip);
     }
-    if git(
-        root,
-        &["merge-base", "--is-ancestor", remote_sha, local_ref],
-    )
-    .is_ok()
+    if ws
+        .git(&["merge-base", "--is-ancestor", remote_sha, local_ref])
+        .is_ok()
     {
         return Ok(tip);
     }
@@ -2577,7 +2573,7 @@ fn guard_against_clobber(
     // `upstream` already holds a patch-equivalent commit and `+` when it does
     // not, so a `+`-free result means the remote carries no work `local_ref`
     // lacks -- only the pre-restack spelling of work it already has.
-    if let Ok(cherry) = git(root, &["cherry", local_ref, remote_sha]) {
+    if let Ok(cherry) = ws.git(&["cherry", local_ref, remote_sha]) {
         if !cherry.lines().any(|l| l.starts_with('+')) {
             return Ok(tip);
         }
@@ -2635,29 +2631,30 @@ fn truncate_pr_patch(patch: String) -> String {
 /// identical to the range the forge will display for this stacked PR, so no
 /// predecessor or downstream sibling can enter the generated description.
 fn branch_change_context(
-    root: &Path,
+    ws: &crate::workspace::Workspace,
     base_sha: &str,
     guardian: &GuardianView,
     position: i64,
 ) -> Option<(String, String, String)> {
     let (prev, tip) = commit_range_for(base_sha, guardian, position)?;
     let range = format!("{prev}..{tip}");
-    let commits = git(
-        root,
-        &[
+    let commits = ws
+        .git(&[
             "log",
             "--reverse",
             "--format=commit %H%nsubject: %s%n%n%b%n---",
             &range,
-        ],
-    )
-    .unwrap_or_default();
+        ])
+        .unwrap_or_default();
     let commits = strip_bot_trailer(&commits);
     if commits.trim().is_empty() {
         return None;
     }
-    let diff_stat = git(root, &["diff", "--no-ext-diff", "--stat", &range]).unwrap_or_default();
-    let patch = git(root, &["diff", "--no-ext-diff", "--unified=3", &range])
+    let diff_stat = ws
+        .git(&["diff", "--no-ext-diff", "--stat", &range])
+        .unwrap_or_default();
+    let patch = ws
+        .git(&["diff", "--no-ext-diff", "--unified=3", &range])
         .map(truncate_pr_patch)
         .unwrap_or_default();
     Some((commits, diff_stat, patch))
@@ -2665,23 +2662,24 @@ fn branch_change_context(
 
 /// The files `position`'s branch changes (repo-relative), over the same
 /// unique range the PR writer is shown.
-fn branch_changed_paths(root: &Path, guardian: &GuardianView, position: i64) -> Vec<String> {
-    let qualified_base = guardian_merge::qualify_ambiguous_ref(root, &guardian.base_branch);
-    let Ok(base_sha) = git(root, &["rev-parse", &qualified_base]) else {
+fn branch_changed_paths(
+    ws: &crate::workspace::Workspace,
+    guardian: &GuardianView,
+    position: i64,
+) -> Vec<String> {
+    let qualified_base = guardian_merge::qualify_ambiguous_ref_in(ws, &guardian.base_branch);
+    let Ok(base_sha) = ws.git(&["rev-parse", &qualified_base]) else {
         return Vec::new();
     };
     let Some((prev, tip)) = commit_range_for(base_sha.trim(), guardian, position) else {
         return Vec::new();
     };
-    git(
-        root,
-        &[
-            "diff",
-            "--name-only",
-            "--no-renames",
-            &format!("{prev}..{tip}"),
-        ],
-    )
+    ws.git(&[
+        "diff",
+        "--name-only",
+        "--no-renames",
+        &format!("{prev}..{tip}"),
+    ])
     .unwrap_or_default()
     .lines()
     .map(str::trim)
@@ -2703,7 +2701,11 @@ fn apply_exhibit_recipes(
     if !crate::exhibit_settings::resolve(store, guardian).enabled {
         return;
     }
-    let changed = branch_changed_paths(root, guardian, position);
+    let changed = branch_changed_paths(
+        &crate::workspace::Workspace::for_guardian(store, &guardian.id, root),
+        guardian,
+        position,
+    );
     if changed.is_empty() {
         return;
     }
@@ -3132,8 +3134,10 @@ type SynthesizedPr = (
 /// response unparseable) has no model turn to ask, so it falls back to
 /// [`deterministic_relevant_prophecies`] rather than silently keeping
 /// nothing or everything.
+#[allow(clippy::too_many_arguments)]
 fn synthesize_pr_text(
     runner: &dyn Runner,
+    ws: &crate::workspace::Workspace,
     guardian: &GuardianView,
     position: i64,
     template: Option<&str>,
@@ -3141,7 +3145,6 @@ fn synthesize_pr_text(
     prophecies: &[crate::prophecy::ProphecyView],
     exhibit_note: Option<&str>,
 ) -> SynthesizedPr {
-    let root = PathBuf::from(&guardian.git_root);
     let fallback_title = guardian
         .branches
         .iter()
@@ -3157,8 +3160,8 @@ fn synthesize_pr_text(
     // "unique to this branch"). `qualify_ambiguous_ref` is the same
     // consolidated fix `guardian_merge::resolve_base` already uses for this
     // ambiguity class.
-    let qualified_base = guardian_merge::qualify_ambiguous_ref(&root, &guardian.base_branch);
-    let base_sha = match git(&root, &["rev-parse", &qualified_base]) {
+    let qualified_base = guardian_merge::qualify_ambiguous_ref_in(ws, &guardian.base_branch);
+    let base_sha = match ws.git(&["rev-parse", &qualified_base]) {
         Ok(s) => s.trim().to_string(),
         Err(_) => {
             return (
@@ -3170,7 +3173,7 @@ fn synthesize_pr_text(
         }
     };
     let Some((commits, diff_stat, patch)) =
-        branch_change_context(&root, &base_sha, guardian, position)
+        branch_change_context(ws, &base_sha, guardian, position)
     else {
         // ralphus[ignore-rlog-pair]: this low-level helper has no Store; its Store-owning caller records the structured workflow outcome
         crate::rlog!(
@@ -3192,7 +3195,7 @@ fn synthesize_pr_text(
     let resolved = match guardian_merge::resolve_resolver_agent_from_config(
         guardian.resolver_agent.as_deref(),
         guardian.resolver_model.as_deref(),
-        &root,
+        Path::new(&guardian.git_root),
     ) {
         Ok(resolved) => resolved,
         Err(e) => {
@@ -3334,6 +3337,7 @@ fn synthesize_pr_text(
 #[allow(clippy::too_many_arguments)]
 fn resolve_title_description(
     runner: &dyn Runner,
+    ws: &crate::workspace::Workspace,
     guardian: &GuardianView,
     req: &PrRequest,
     position: i64,
@@ -3357,6 +3361,7 @@ fn resolve_title_description(
     let template = client.fetch_pr_template();
     let (synth_title, synth_description, relevant_prophecies, inferred) = synthesize_pr_text(
         runner,
+        ws,
         guardian,
         position,
         template.as_deref(),
@@ -3467,7 +3472,7 @@ fn insights_commit_block(prophecies: &[crate::prophecy::ProphecyView]) -> Option
 ///
 /// Returns `Ok(None)` (no rewrite, no push) when there is nothing to add.
 fn append_insights_to_review_commit(
-    root: &Path,
+    ws: &crate::workspace::Workspace,
     review_ref: &str,
     remote_name: &str,
     alias: &str,
@@ -3487,18 +3492,20 @@ fn append_insights_to_review_commit(
     }
     // `update-ref` (unlike `rev-parse`) does not DWIM-resolve a short branch
     // name -- it needs the fully-qualified ref it will actually write.
-    let full_ref = git(root, &["rev-parse", "--symbolic-full-name", review_ref])?
+    let full_ref = ws
+        .git(&["rev-parse", "--symbolic-full-name", review_ref])?
         .trim()
         .to_string();
-    let old_sha = git(root, &["rev-parse", review_ref])?.trim().to_string();
-    let original_message = git(root, &["log", "-1", "--format=%B", &old_sha])?;
+    let old_sha = ws.git(&["rev-parse", review_ref])?.trim().to_string();
+    let original_message = ws.git(&["log", "-1", "--format=%B", &old_sha])?;
     let new_message = format!("{}\n\n{block}", original_message.trim_end());
-    let tree = git(root, &["rev-parse", &format!("{old_sha}^{{tree}}")])?
+    let tree = ws
+        .git(&["rev-parse", &format!("{old_sha}^{{tree}}")])?
         .trim()
         .to_string();
     // A merge commit has more than one parent; preserve every one of them
     // rather than assuming the linear-stack common case.
-    let parents_raw = git(root, &["log", "-1", "--format=%P", &old_sha])?;
+    let parents_raw = ws.git(&["log", "-1", "--format=%P", &old_sha])?;
     // `commit-tree` falls back to `user.name`/`user.email` (or
     // `GIT_AUTHOR_*`/`GIT_COMMITTER_*`) for the identity on the commit it
     // creates. A machine that already has a global git identity configured
@@ -3508,10 +3515,12 @@ fn append_insights_to_review_commit(
     // the commit's own existing author (the same identity `commit --amend
     // --no-edit` would keep) so this never depends on the environment's git
     // config at all.
-    let author_name = git(root, &["log", "-1", "--format=%an", &old_sha])?
+    let author_name = ws
+        .git(&["log", "-1", "--format=%an", &old_sha])?
         .trim()
         .to_string();
-    let author_email = git(root, &["log", "-1", "--format=%ae", &old_sha])?
+    let author_email = ws
+        .git(&["log", "-1", "--format=%ae", &old_sha])?
         .trim()
         .to_string();
     let mut commit_tree_args: Vec<String> = vec![
@@ -3529,11 +3538,11 @@ fn append_insights_to_review_commit(
     commit_tree_args.push("-m".to_string());
     commit_tree_args.push(new_message);
     let commit_tree_args: Vec<&str> = commit_tree_args.iter().map(String::as_str).collect();
-    let new_sha = git(root, &commit_tree_args)?.trim().to_string();
-    git(root, &["update-ref", &full_ref, &new_sha, &old_sha])?;
+    let new_sha = ws.git(&commit_tree_args)?.trim().to_string();
+    ws.git(&["update-ref", &full_ref, &new_sha, &old_sha])?;
     // The caller has just pushed `old_sha` to `alias`; lease on it so a
     // reviewer push made while the insights were being generated survives.
-    push_ref(root, remote_name, &new_sha, alias, &PushLease::at(&old_sha))?;
+    push_ref(ws, remote_name, &new_sha, alias, &PushLease::at(&old_sha))?;
     Ok(Some(new_sha))
 }
 
@@ -6265,6 +6274,7 @@ pub fn sync_open_pr_branches(store: &crate::store_lock::StoreHandle, id: &str) {
         return;
     }
     let root = PathBuf::from(&guardian.git_root);
+    let ws = crate::workspace::Workspace::for_guardian(store, &guardian.id, &root);
     let forge_cfg = crate::config::resolve_forge(&root);
     // RAL-338: every PR's `branch_alias` lives on whichever remote its own
     // `repo` names -- the fork for every branch in fork mode, including the
@@ -6301,7 +6311,9 @@ pub fn sync_open_pr_branches(store: &crate::store_lock::StoreHandle, id: &str) {
         let Some(local_ref) = local_ref else {
             continue;
         };
-        let Ok(local_sha) = git(&root, &["rev-parse", &local_ref]).map(|s| s.trim().to_string())
+        let Ok(local_sha) = ws
+            .git(&["rev-parse", &local_ref])
+            .map(|s| s.trim().to_string())
         else {
             continue;
         };
@@ -6312,7 +6324,7 @@ pub fn sync_open_pr_branches(store: &crate::store_lock::StoreHandle, id: &str) {
         // or feedback round can move the ref between the check and the push,
         // and the push must publish exactly what the check approved.
         let lease = match guard_against_clobber(
-            &root,
+            &ws,
             remote_name,
             &pr.branch_alias,
             &local_sha,
@@ -6342,7 +6354,7 @@ pub fn sync_open_pr_branches(store: &crate::store_lock::StoreHandle, id: &str) {
                 continue;
             }
         };
-        if let Err(e) = push_ref(&root, remote_name, &local_sha, &pr.branch_alias, &lease) {
+        if let Err(e) = push_ref(&ws, remote_name, &local_sha, &pr.branch_alias, &lease) {
             crate::rlog!(
                 WARNING,
                 "ralphus [pr] review {id} pr branch sync push failed pr={} alias={}: {e}",
@@ -8853,6 +8865,8 @@ fn submit_stacked_branch_pr(
     // default (which is `false` when unset). One value per branch, applied
     // consistently to every PR this submission creates.
     let draft = req.draft.unwrap_or(draft_by_default);
+    // The review branches live where the review was merged: on its machine.
+    let ws = crate::workspace::Workspace::for_guardian(store, id, root);
     let review_ref = branch
         .review_branch
         .clone()
@@ -8869,7 +8883,7 @@ fn submit_stacked_branch_pr(
     let own_pr_alias = if req.branch_alias.is_none() {
         match find_branch_own_open_pr_alias(
             client,
-            root,
+            &ws,
             remote_name,
             ordered_enabled_branches,
             alias_by_branch,
@@ -8957,9 +8971,12 @@ fn submit_stacked_branch_pr(
     // refusing outright. This is the one push site every PR-creation path
     // (whole-stack submit, explicit per-branch submit, resubmission after an
     // unlink) funnels through, so every caller gets the reconciliation.
-    let resolve_local = || git(root, &["rev-parse", &review_ref]).map(|s| s.trim().to_string());
+    let resolve_local = || {
+        ws.git(&["rev-parse", &review_ref])
+            .map(|s| s.trim().to_string())
+    };
     let mut local_sha = resolve_local()?;
-    let lease = match guard_against_clobber(root, remote_name, &alias, &local_sha, None) {
+    let lease = match guard_against_clobber(&ws, remote_name, &alias, &local_sha, None) {
         Ok(lease) => lease,
         Err(clobber_err) => {
             crate::rlog!(
@@ -8982,10 +8999,10 @@ fn submit_stacked_branch_pr(
             local_sha = resolve_local()?;
             // The tip just pulled in is now part of the review branch, even
             // where conflict resolution reshaped its commits.
-            guard_against_clobber(root, remote_name, &alias, &local_sha, pulled.as_deref())?
+            guard_against_clobber(&ws, remote_name, &alias, &local_sha, pulled.as_deref())?
         }
     };
-    push_ref(root, remote_name, &local_sha, &alias, &lease)?;
+    push_ref(&ws, remote_name, &local_sha, &alias, &lease)?;
     // RAL-<new>: re-pushed below (mutated, not re-declared) if the `None`
     // arm folds the reviewer-relevant insight list into the tip commit --
     // that rewrites the commit this sha names, so `pushed_sha`/CI
@@ -9102,6 +9119,7 @@ fn submit_stacked_branch_pr(
             let (title, description, reviewer_relevant_prophecies, inferred_exhibits) =
                 resolve_title_description(
                     runner,
+                    &ws,
                     guardian,
                     req,
                     position,
@@ -9172,7 +9190,7 @@ fn submit_stacked_branch_pr(
             // creation, since the insights already reached the reviewer via
             // the description above.
             match append_insights_to_review_commit(
-                root,
+                &ws,
                 &review_ref,
                 remote_name,
                 &alias,
@@ -12002,6 +12020,7 @@ pub fn pull_pr_commits(
             .ok_or_else(|| "guardian has no enabled branches".to_string())?,
     };
     let root = PathBuf::from(&guardian.git_root);
+    let ws = crate::workspace::Workspace::for_guardian(store, &guardian.id, &root);
     let forge_cfg = crate::config::resolve_forge(&root);
     // RAL-338: pull from whichever remote this PR's own alias actually lives
     // on (the fork in fork mode, including the root's).
@@ -12050,15 +12069,15 @@ pub fn pull_pr_commits(
     // even where conflict resolution reshaped its commits -- otherwise the
     // guard sees "unique" commits on the PR, refuses, and every later pass
     // pulls the same tip again without ever publishing.
-    let local_sha = git(&root, &["rev-parse", &local_ref])?.trim().to_string();
+    let local_sha = ws.git(&["rev-parse", &local_ref])?.trim().to_string();
     let lease = guard_against_clobber(
-        &root,
+        &ws,
         &remote_name,
         &pr.branch_alias,
         &local_sha,
         Some(&pulled_tip),
     )?;
-    push_ref(&root, &remote_name, &local_sha, &pr.branch_alias, &lease)?;
+    push_ref(&ws, &remote_name, &local_sha, &pr.branch_alias, &lease)?;
     {
         let sha = local_sha.as_str();
         let result = store.lock().update_pull_request_ex(
@@ -12371,6 +12390,7 @@ fn action_pr_feedback_inner(
         .get_guardian(&pr.guardian_id)
         .map_err(|e| e.to_string())?;
     let root = PathBuf::from(&guardian.git_root);
+    let ws = crate::workspace::Workspace::for_guardian(store, &guardian.id, &root);
     let forge_cfg = crate::config::resolve_forge(&root);
     // RAL-338: this PR may be filed on either the parent or the fork --
     // resolve both candidates and use whichever matches its own recorded
@@ -12540,9 +12560,9 @@ fn action_pr_feedback_inner(
                 .review_branch
                 .clone()
                 .ok_or_else(|| "no review ref to push after applying feedback".to_string())?;
-            let local_sha = git(&root, &["rev-parse", &local_ref])?.trim().to_string();
+            let local_sha = ws.git(&["rev-parse", &local_ref])?.trim().to_string();
             let lease = guard_against_clobber(
-                &root,
+                &ws,
                 &remote_name,
                 &pr.branch_alias,
                 &local_sha,
@@ -12554,7 +12574,7 @@ fn action_pr_feedback_inner(
                 "ralphus [pr] pr {pr_id} pushing updated branch back alias={} remote={remote_name}",
                 pr.branch_alias
             );
-            push_ref(&root, &remote_name, &local_sha, &pr.branch_alias, &lease)?;
+            push_ref(&ws, &remote_name, &local_sha, &pr.branch_alias, &lease)?;
             {
                 let sha = local_sha.as_str();
                 let result = store.lock().update_pull_request_ex(
@@ -13138,8 +13158,16 @@ mod tests {
             "TITLE: Add x\nRELEVANT_PROPHECY_IDS: 2, 7\n===DESCRIPTION===\nAdds x.".to_string(),
         );
 
-        let (title, description, relevant, _) =
-            synthesize_pr_text(&runner, &guardian, 0, None, None, &prophecies, None);
+        let (title, description, relevant, _) = synthesize_pr_text(
+            &runner,
+            &crate::workspace::Workspace::local(&guardian.git_root),
+            &guardian,
+            0,
+            None,
+            None,
+            &prophecies,
+            None,
+        );
 
         assert_eq!(title, "Add x");
         assert_eq!(description, "Adds x.");
@@ -13217,7 +13245,7 @@ mod tests {
             "kept this one",
         )];
         let new_sha = append_insights_to_review_commit(
-            &root,
+            &crate::workspace::Workspace::local(&root),
             "main",
             remote,
             "pr-x",
@@ -13250,9 +13278,16 @@ mod tests {
 
         // No prophecies and no appraisals -> no rewrite, no push, ref untouched.
         assert!(
-            append_insights_to_review_commit(&root, "main", remote, "pr-x", &[], None)
-                .unwrap()
-                .is_none()
+            append_insights_to_review_commit(
+                &crate::workspace::Workspace::local(&root),
+                "main",
+                remote,
+                "pr-x",
+                &[],
+                None
+            )
+            .unwrap()
+            .is_none()
         );
         assert_eq!(g(&root, &["rev-parse", "main"]).trim(), new_sha);
 
@@ -14710,11 +14745,29 @@ mod tests {
         let remote = remote_dir.to_str().unwrap();
 
         // No remote branch yet -- safe.
-        assert!(guard_against_clobber(&root, remote, "pr-x", "main", None).is_ok());
+        assert!(
+            guard_against_clobber(
+                &crate::workspace::Workspace::local(&root),
+                remote,
+                "pr-x",
+                "main",
+                None
+            )
+            .is_ok()
+        );
 
         g(&root, &["push", remote, "main:refs/heads/pr-x"]);
         // Remote now matches local exactly -- still safe (ancestor of itself).
-        assert!(guard_against_clobber(&root, remote, "pr-x", "main", None).is_ok());
+        assert!(
+            guard_against_clobber(
+                &crate::workspace::Workspace::local(&root),
+                remote,
+                "pr-x",
+                "main",
+                None
+            )
+            .is_ok()
+        );
 
         // A reviewer pushes a unique commit straight to the PR branch.
         let clone_dir = tmp_dir("guard-clone");
@@ -14734,13 +14787,29 @@ mod tests {
         g(&clone_dir, &["push", "origin", "pr-x"]);
 
         // Local `main` no longer contains the remote's unique commit -- blocked.
-        let err = guard_against_clobber(&root, remote, "pr-x", "main", None).unwrap_err();
+        let err = guard_against_clobber(
+            &crate::workspace::Workspace::local(&root),
+            remote,
+            "pr-x",
+            "main",
+            None,
+        )
+        .unwrap_err();
         assert!(err.contains("pr-x"), "{err}");
 
         // Once local has pulled that commit in, it's a safe superset again.
         g(&root, &["fetch", remote, "pr-x"]);
         g(&root, &["merge", "--ff-only", "FETCH_HEAD"]);
-        assert!(guard_against_clobber(&root, remote, "pr-x", "main", None).is_ok());
+        assert!(
+            guard_against_clobber(
+                &crate::workspace::Workspace::local(&root),
+                remote,
+                "pr-x",
+                "main",
+                None
+            )
+            .is_ok()
+        );
 
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&remote_dir);
@@ -14766,7 +14835,14 @@ mod tests {
         gwrite(&root, "daemon.txt", "daemon\n");
         g(&root, &["add", "."]);
         g(&root, &["commit", "--message", "daemon change"]);
-        let lease = guard_against_clobber(&root, remote, "pr-x", "main", None).unwrap();
+        let lease = guard_against_clobber(
+            &crate::workspace::Workspace::local(&root),
+            remote,
+            "pr-x",
+            "main",
+            None,
+        )
+        .unwrap();
 
         // A reviewer pushes before the daemon's push goes out.
         let clone_dir = tmp_dir("lease-clone");
@@ -14787,7 +14863,14 @@ mod tests {
         let reviewer_sha = g(&clone_dir, &["rev-parse", "HEAD"]).trim().to_string();
 
         assert!(
-            push_ref(&root, remote, "main", "pr-x", &lease).is_err(),
+            push_ref(
+                &crate::workspace::Workspace::local(&root),
+                remote,
+                "main",
+                "pr-x",
+                &lease
+            )
+            .is_err(),
             "a push leased on the pre-reviewer tip must be rejected"
         );
         assert_eq!(
@@ -14797,10 +14880,24 @@ mod tests {
         );
 
         // A branch the check saw as absent is leased as "must not exist".
-        let absent = guard_against_clobber(&root, remote, "pr-new", "main", None).unwrap();
+        let absent = guard_against_clobber(
+            &crate::workspace::Workspace::local(&root),
+            remote,
+            "pr-new",
+            "main",
+            None,
+        )
+        .unwrap();
         g(&clone_dir, &["push", "origin", "pr-x:refs/heads/pr-new"]);
         assert!(
-            push_ref(&root, remote, "main", "pr-new", &absent).is_err(),
+            push_ref(
+                &crate::workspace::Workspace::local(&root),
+                remote,
+                "main",
+                "pr-new",
+                &absent
+            )
+            .is_err(),
             "a branch created after the check must not be overwritten"
         );
 
@@ -14866,7 +14963,16 @@ mod tests {
 
         // The real guard writes no FETCH_HEAD either.
         let _ = std::fs::remove_file(&fetch_head);
-        assert!(guard_against_clobber(&root, remote, "branch-a", "main", None).is_ok());
+        assert!(
+            guard_against_clobber(
+                &crate::workspace::Workspace::local(&root),
+                remote,
+                "branch-a",
+                "main",
+                None
+            )
+            .is_ok()
+        );
         assert!(
             !fetch_head.exists(),
             "guard_against_clobber must not write FETCH_HEAD"
@@ -14880,7 +14986,14 @@ mod tests {
                     let root = &root;
                     s.spawn(move || {
                         for _ in 0..10 {
-                            guard_against_clobber(root, remote, alias, "main", None).unwrap();
+                            guard_against_clobber(
+                                &crate::workspace::Workspace::local(root),
+                                remote,
+                                alias,
+                                "main",
+                                None,
+                            )
+                            .unwrap();
                         }
                     })
                 })
@@ -14923,9 +15036,25 @@ mod tests {
         assert_ne!(g(&root, &["rev-parse", "feature"]).trim(), pushed);
 
         // Ancestry says divergence; the recorded tip says it is ours to replace.
-        assert!(guard_against_clobber(&root, remote, "pr-x", "feature", None).is_err());
         assert!(
-            guard_against_clobber(&root, remote, "pr-x", "feature", Some(&pushed)).is_ok(),
+            guard_against_clobber(
+                &crate::workspace::Workspace::local(&root),
+                remote,
+                "pr-x",
+                "feature",
+                None
+            )
+            .is_err()
+        );
+        assert!(
+            guard_against_clobber(
+                &crate::workspace::Workspace::local(&root),
+                remote,
+                "pr-x",
+                "feature",
+                Some(&pushed)
+            )
+            .is_ok(),
             "a remote still sitting on our own last push is safe to overwrite"
         );
 
@@ -14961,7 +15090,14 @@ mod tests {
         g(&root, &["rebase", "main"]);
 
         assert!(
-            guard_against_clobber(&root, remote, "pr-x", "feature", None).is_ok(),
+            guard_against_clobber(
+                &crate::workspace::Workspace::local(&root),
+                remote,
+                "pr-x",
+                "feature",
+                None
+            )
+            .is_ok(),
             "every remote commit was replayed into feature under a new sha"
         );
 
@@ -22327,6 +22463,84 @@ token_env = "RALPHUS_TEST_FORGE_TOKEN"
         resubmit_after_upstream_change_targets_the_new_remote("gitlab");
     }
 
+    /// A review merged on another machine has its review branches there, not
+    /// in the daemon's checkout: submitting its PR must read and push them on
+    /// that machine. An unregistered machine makes the routing visible -- the
+    /// submission fails naming it -- while the daemon-local checkout holds a
+    /// same-named branch the old local-only path would have pushed.
+    #[test]
+    fn submitting_a_remote_reviews_pr_runs_its_git_on_the_reviews_machine() {
+        let mock = MockForge::start(|_server| ());
+        let root = tmp_dir("remote-review-submit-root");
+        let mut init_opts = git2::RepositoryInitOptions::new();
+        init_opts.initial_head("main");
+        let repo = git2::Repository::init_opts(&root, &init_opts).unwrap();
+        let sig = git2::Signature::now("t", "t@t").unwrap();
+        gwrite(&root, "base.txt", "base\n");
+        let base_oid = git2_commit_all(&repo, &sig, "base", &[]);
+        let base_commit = repo.find_commit(base_oid).unwrap();
+        repo.branch("review-branch", &base_commit, false).unwrap();
+
+        let store = Arc::new(crate::store_lock::StoreMutex::new(store()));
+        let gid = store
+            .lock()
+            .create_guardian("demo", "main", root.to_str().unwrap())
+            .unwrap();
+        store
+            .lock()
+            .add_guardian_branch(&gid, "review-branch")
+            .unwrap();
+        let branch_id = store.lock().get_guardian(&gid).unwrap().branches[0]
+            .id
+            .clone();
+        store
+            .lock()
+            .set_branch_review(&gid, &branch_id, "review-branch", root.to_str().unwrap())
+            .unwrap();
+        store
+            .lock()
+            .set_guardian_status(&gid, GuardianStatus::InReview, None)
+            .unwrap();
+        store
+            .lock()
+            .set_guardian_machine(&gid, Some("ghostfarm:A"))
+            .unwrap();
+
+        let client = mock.client(crate::forge::ForgeKind::GitHub, "acme/w");
+        let guardian = store.lock().get_guardian(&gid).unwrap();
+        let ordered_enabled: Vec<&BranchView> = guardian.branches.iter().collect();
+        let req = PrRequest {
+            branch_id: Some(branch_id.clone()),
+            branch_alias: Some("pr-y".to_string()),
+            title: Some("Title".to_string()),
+            description: Some("Description".to_string()),
+            use_worktree_branch_name: None,
+            draft: None,
+        };
+        let err = submit_stacked_branch_pr(
+            &store,
+            &NoopRunner,
+            &client,
+            &gid,
+            &root,
+            "origin",
+            &guardian,
+            &ordered_enabled,
+            &mut HashMap::new(),
+            "main",
+            ordered_enabled[0],
+            &req,
+            "{name}-alias",
+            None,
+            "stack-1",
+            None,
+            false,
+        )
+        .expect_err("the review's branches are on its machine, not in the daemon's checkout");
+        assert!(err.contains("ghostfarm"), "{err}");
+        mock.finish();
+    }
+
     #[test]
     fn submit_stacked_branch_pr_reconciles_a_diverged_remote_alias_instead_of_failing() {
         // A branch whose PR was previously dropped/unlinked (or whose remote
@@ -24702,11 +24916,11 @@ token_env = "RALPHUS_TEST_FORGE_TOKEN"
         }
         let guardian = store.get_guardian(&gid).unwrap();
         assert_eq!(
-            branch_changed_paths(&root, &guardian, 0),
+            branch_changed_paths(&crate::workspace::Workspace::local(&root), &guardian, 0),
             vec!["docs/a.md".to_string()]
         );
         assert_eq!(
-            branch_changed_paths(&root, &guardian, 1),
+            branch_changed_paths(&crate::workspace::Workspace::local(&root), &guardian, 1),
             vec!["website/src/Chart.tsx".to_string()]
         );
         let handle: crate::store_lock::StoreHandle =
@@ -24791,6 +25005,7 @@ token_env = "RALPHUS_TEST_FORGE_TOKEN"
 
         let (title, description, relevant, _) = synthesize_pr_text(
             &runner,
+            &crate::workspace::Workspace::local(&guardian.git_root),
             &guardian,
             1,
             Some("## Summary\n\n<!-- fill this in -->"),
@@ -24885,8 +25100,16 @@ token_env = "RALPHUS_TEST_FORGE_TOKEN"
         let guardian = store.get_guardian(&gid).unwrap();
         let runner = CapturingFailureRunner(Mutex::new(None));
 
-        let (_, description, _, _) =
-            synthesize_pr_text(&runner, &guardian, 0, None, None, &[], None);
+        let (_, description, _, _) = synthesize_pr_text(
+            &runner,
+            &crate::workspace::Workspace::local(&guardian.git_root),
+            &guardian,
+            0,
+            None,
+            None,
+            &[],
+            None,
+        );
 
         assert!(description.contains("add x"), "{description}");
         assert!(
