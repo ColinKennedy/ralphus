@@ -434,6 +434,21 @@ impl Drop for HaltRegistrations<'_> {
     }
 }
 
+/// Clears a remote run's liveness and stall-escalation entries when its poll
+/// loop ends, as the local runner does when a run is final.
+struct LivenessEntry<'a> {
+    store: &'a crate::store_lock::StoreHandle,
+    session_name: &'a str,
+}
+
+impl Drop for LivenessEntry<'_> {
+    fn drop(&mut self) {
+        let memory = self.store.lock_free_memory();
+        memory.clear_live_activity(self.session_name);
+        memory.clear_stall_escalated(self.session_name);
+    }
+}
+
 /// Runs cells on one machine by invoking a registered provider program.
 pub struct ProviderRunner {
     /// Provider program path.
@@ -920,7 +935,24 @@ impl ProviderRunner {
             squad_id: &spec.squad_id,
             arbiter_key: &arbiter_key,
         };
+        // Liveness (fresh streamed output) and stall escalation, as a local
+        // run records them; the entry is cleared when polling ends.
+        let attempt_started_ms = crate::store::now_ms();
+        let stall_threshold = crate::runner::mailbox_stall_threshold();
+        let _liveness = self.cartographer.as_ref().map(|store| LivenessEntry {
+            store,
+            session_name: &session_name,
+        });
         loop {
+            if let Some(store) = &self.cartographer {
+                crate::runner::escalate_stall_if_due(
+                    store,
+                    spec,
+                    &session_name,
+                    attempt_started_ms,
+                    stall_threshold,
+                );
+            }
             if let Some((reason, stopped)) = self.halt_reason(spec, halt_tokens.as_ref(), started) {
                 if let Err(e) = self.invoke_handle(VERB_CANCEL, handle, None, spec) {
                     crate::rlog!(
@@ -1036,6 +1068,11 @@ impl ProviderRunner {
             match self.invoke_handle(VERB_STREAM, handle, cursor, spec) {
                 Ok(resp) => {
                     if let Some(chunk) = resp.output.filter(|c| !c.is_empty()) {
+                        if let Some(store) = &self.cartographer {
+                            store
+                                .lock_free_memory()
+                                .note_live_activity(&session_name, crate::store::now_ms());
+                        }
                         if let Some(sink) = raw_transcript.as_mut() {
                             sink.write(chunk.as_bytes());
                         }
