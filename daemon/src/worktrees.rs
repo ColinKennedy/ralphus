@@ -2256,6 +2256,19 @@ impl ProjectStartupAdapter for GitProjectStartupAdapter {
         // adapter without any equivalent wrap, so this is the one place that
         // reliably preserves which cell and placeholder a resolution failure
         // came from regardless of caller.
+        if upstream == ralphus_core::schema::WORKTREE_UPSTREAM_CURRENT_BRANCH
+            && is_remote_machine(ctx.machine)
+        {
+            return Err(format!(
+                "cell '{}': \"?upstream={upstream}\" names the branch checked out in the \
+                 daemon's own copy of the project, which says nothing about machine \"{}\"; \
+                 name the upstream branch explicitly (e.g. \"?upstream=main\") or use \
+                 \"?upstream={}\"",
+                ctx.cell_id,
+                ctx.machine.unwrap_or_default(),
+                ralphus_core::schema::WORKTREE_UPSTREAM_DEFAULT
+            ));
+        }
         let upstream = resolve_upstream(Path::new(&project.path), upstream).map_err(|e| {
             format!(
                 "cell '{}': could not resolve upstream for \"{placeholder}\": {e}",
@@ -5536,6 +5549,54 @@ mod tests {
             !worktree_dir(&repo, "feat-r").exists(),
             "a remote cell must not materialize a local worktree"
         );
+    }
+
+    #[test]
+    fn a_remote_cell_refuses_the_current_branch_upstream_sentinel() {
+        let repo = init_repo("remote-current-branch");
+        let script = fake_provisioner(
+            "remote-current-branch-p",
+            r#"{"ok":true,"protocol_version":1,"workspace":"/remote/wt/feat-r"}"#,
+        );
+        let store = std::sync::Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
+        store
+            .lock()
+            .register_project_with_clone_url_ex(
+                "proj",
+                "",
+                &repo.to_string_lossy(),
+                "git",
+                Some(&repo.to_string_lossy()),
+                None,
+            )
+            .unwrap();
+        store
+            .lock()
+            .register_machine_provider(
+                "ib",
+                "",
+                &script.to_string_lossy(),
+                &[],
+                crate::machines::PROTOCOL_VERSION,
+                false,
+            )
+            .unwrap();
+        let mut cells = vec![cell_row_on(
+            0,
+            0,
+            "s0",
+            Some("ralphus:new-worktree/feat-r?upstream=<<current_branch>>"),
+            Some("ib:A"),
+        )];
+        let tasks = vec![task_row(0, Some("proj"))];
+        let targets = targets_map(&[target_for("ib:A", "/srv/ralphus")]);
+        let err =
+            resolve_placeholders_with_targets(&store, "squad-1", &mut cells, &tasks, &targets)
+                .expect_err("a remote cell cannot use the daemon checkout's branch");
+        assert!(err.contains("<<current_branch>>"), "{err}");
+        assert!(err.contains("ib:A"), "{err}");
     }
 
     #[test]

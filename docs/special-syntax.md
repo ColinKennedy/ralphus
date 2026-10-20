@@ -34,7 +34,7 @@ validation time — a typo fails fast at submit, before the daemon sees it.
 | `<<task:<name>[/<cell>]>>` | cell `upstream` | the tip of that dependency task's (or cell's) branch — the cell's branch rebases onto it |
 | `<<ralphus:new-worktree/<branch>?upstream=<upstream>>>` | cell `cwd` | a materialized (or reused) git worktree for `<branch>`, created under the owning task's `project`; the stored `cwd` is rewritten to the real path before the cell runs (RAL-100) |
 | `<<default>>` | the `?upstream=` value of a new-worktree placeholder | the repository's default branch — recommended |
-| `<<current_branch>>` | the `?upstream=` value of a new-worktree placeholder | whatever branch the project currently has checked out — riskier, since it can change between runs |
+| `<<current_branch>>` | the `?upstream=` value of a new-worktree placeholder | whatever branch the project currently has checked out — riskier, since it can change between runs. Refused for a cell on a remote machine: the daemon's own checkout says nothing about that machine. |
 | `<<review:<id>>>` | `[[task.cell]].review`, `[[waypoint]].affected` | an existing `[[review]]`'s id in the same submission (RAL-269); also an `affected` entry (RAL-400). Prefer `<<ralphus:review/<id>>>` in a waypoint |
 | `<<ralphus:new-review/<key>>>` | `[[task.cell]].review`, `[[waypoint]].affected` / `roster` | mints a *fresh* review per submission; `<key>` groups the cells that share one new review (RAL-269); in a waypoint it names the same-file `[[review]]` it creates |
 | `<<ralphus:review/<id>>>` | `[[waypoint]].roster`, `[[waypoint]].affected` | an existing review's id (RAL-621) |
