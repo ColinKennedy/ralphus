@@ -923,7 +923,6 @@ fn execute_queued_run(
         },
         &cancel,
     );
-    memory.clear_live_run_cancel(&run.run_id);
     let integration = if outcome.commits.is_empty() || !target.allow_commits {
         "none"
     } else {
@@ -936,6 +935,16 @@ fn execute_queued_run(
         let mut evidence_run = run.clone();
         evidence_run.cwd = Some(cwd.clone());
         crate::live_results::record_run_evidence(store, &guardian.id, &evidence_run, &outcome);
+        recheck_run_result(
+            store,
+            runner.as_ref(),
+            &guardian.id,
+            run,
+            &cwd,
+            &outcome,
+            &cancel,
+        );
+        memory.clear_live_run_cancel(&run.run_id);
         let guard = store.lock();
         // A user-action run was frozen when it was queued; `action_idx` there
         // indexes the review's action hints, not its live actions.
@@ -951,6 +960,93 @@ fn execute_queued_run(
     }
     post_report(store, &guardian, &target.label, &outcome);
     integration == "pending"
+}
+
+/// The one resumed recheck of a finished run whose recipe is not fully backed
+/// by recorded commands. The agent's session is resumed with a table of each
+/// step's match status; a valid revised `RALPHUS_LIVE_RESULT:` replaces the
+/// stored result (the original is kept for audit), and anything else leaves
+/// the original standing. The checkout stays held while the agent may re-run
+/// steps in it.
+fn recheck_run_result(
+    store: &crate::store_lock::StoreHandle,
+    runner: &dyn Runner,
+    guardian_id: &str,
+    run: &LiveRunRow,
+    cwd: &str,
+    outcome: &crate::live_actions::LiveRunOutcome,
+    cancel: &CancelToken,
+) {
+    use crate::live_results::{
+        RECHECK_SYSTEM_PROMPT, final_verdict, match_recipe, needs_recheck, parse_result_line,
+        recheck_prompt, recorded_calls_for_run,
+    };
+    let Some(session) = outcome.session.as_ref() else {
+        return;
+    };
+    if outcome.end != LiveRunEnd::Finished || cancel.is_cancelled() {
+        return;
+    }
+    let evidence = store
+        .lock()
+        .live_run_evidence(&run.run_id)
+        .unwrap_or_default();
+    if !needs_recheck(&evidence) {
+        return;
+    }
+    let _hold = crate::checkout_hold::hold(
+        cwd,
+        &format!("live-run:{guardian_id}:{}", run.run_id),
+        crate::live_actions::LIVE_RUN_HOLD_MAX_AGE,
+    )
+    .ok();
+    let calls = recorded_calls_for_run(guardian_id, &outcome.cell_id);
+    let result = crate::runner::resume_with_focused_prompt(
+        runner,
+        &session.spec,
+        &session.agent_session_id,
+        RECHECK_SYSTEM_PROMPT,
+        recheck_prompt(&evidence, &calls),
+        cancel,
+    );
+    let revised = if result.is_done() {
+        parse_result_line(&result.summary)
+    } else {
+        None
+    };
+    let _ = crate::guardian_merge::record_guardian_call_cost(
+        store,
+        guardian_id,
+        None,
+        "live_action_recheck",
+        &result,
+    );
+    let Some(parsed) = revised else {
+        crate::rlog!(
+            INFO,
+            "ralphus [guardian] review {guardian_id} live run {} recheck gave no usable result; keeping the original",
+            run.run_id
+        );
+        crate::cartographer::Note::new("guardian")
+            .guardian(guardian_id)
+            .scope("live_action")
+            .emit(
+                &store.lock(),
+                "live run recheck kept original result",
+                serde_json::json!({"run_id": run.run_id}),
+            );
+        return;
+    };
+    let calls = recorded_calls_for_run(guardian_id, &outcome.cell_id);
+    let recipe = if parsed.recipe.is_empty() {
+        Vec::new()
+    } else {
+        match_recipe(&parsed.recipe, &calls, cwd)
+    };
+    let verdict = final_verdict(LiveRunEnd::Finished, Some(&parsed));
+    let _ = store
+        .lock()
+        .record_live_run_revision(&run.run_id, verdict, &parsed, &recipe);
 }
 
 /// Most patch text handed to the resolver when a live run's commits do not
@@ -1551,6 +1647,12 @@ mod tests {
     struct Agent {
         reply: String,
         prompts: parking_lot::Mutex<Vec<String>>,
+        /// Session id the first turn reports, when the test wants a resumable run.
+        session: Option<String>,
+        /// Answer to a resumed turn.
+        resume_reply: String,
+        /// The `resume_agent_session_id` of every resumed turn.
+        resumes: parking_lot::Mutex<Vec<String>>,
     }
 
     impl Runner for Agent {
@@ -1561,7 +1663,13 @@ mod tests {
             let mut result = crate::runner::RunnerResult::failure("");
             result.status = "done".to_string();
             result.error = None;
-            result.summary.clone_from(&self.reply);
+            if let Some(id) = spec.resume_agent_session_id.as_ref() {
+                self.resumes.lock().push(id.clone());
+                result.summary.clone_from(&self.resume_reply);
+            } else {
+                result.summary.clone_from(&self.reply);
+                result.agent_session_id.clone_from(&self.session);
+            }
             result
         }
     }
@@ -1659,6 +1767,9 @@ prompt = "first"
         let agent = Arc::new(Agent {
             reply: reply.to_string(),
             prompts: parking_lot::Mutex::new(Vec::new()),
+            session: None,
+            resume_reply: String::new(),
+            resumes: parking_lot::Mutex::new(Vec::new()),
         });
         let shared = Arc::clone(&agent);
         let runners: LiveRunnerFactory = Arc::new(move |_| Arc::clone(&shared) as Arc<dyn Runner>);
@@ -1690,6 +1801,88 @@ prompt = "first"
             );
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
+    }
+
+    /// A fixture whose agent reports a resumable session and answers a resume
+    /// with `resume_reply`.
+    fn resumable_fixture(tag: &str, reply: &str, resume_reply: &str) -> Fixture {
+        let mut f = fixture(tag, reply);
+        let agent = Arc::new(Agent {
+            reply: reply.to_string(),
+            prompts: parking_lot::Mutex::new(Vec::new()),
+            session: Some("sess-1".to_string()),
+            resume_reply: resume_reply.to_string(),
+            resumes: parking_lot::Mutex::new(Vec::new()),
+        });
+        let shared = Arc::clone(&agent);
+        f.runners = Arc::new(move |_| Arc::clone(&shared) as Arc<dyn Runner>);
+        f.agent = agent;
+        f.store
+            .lock()
+            .set_guardian_resolver(&f.gid, Some(Some("claude-code")), None)
+            .unwrap();
+        f.store
+            .lock()
+            .set_live_checkout(&f.gid, &f.dir.to_string_lossy(), None)
+            .unwrap();
+        f
+    }
+
+    const UNBACKED_RESULT: &str =
+        r#"RALPHUS_LIVE_RESULT: {"verdict":"passed","summary":"ok","recipe":["cargo test"]}"#;
+
+    #[test]
+    fn an_unbacked_result_is_rechecked_once_and_the_original_is_kept() {
+        let f = resumable_fixture(
+            "recheck",
+            UNBACKED_RESULT,
+            r#"RALPHUS_LIVE_RESULT: {"verdict":"inconclusive","summary":"could not run it"}"#,
+        );
+        assert_eq!(
+            maybe_start_automatic_run(&f.store, &f.runners, &f.gid),
+            AutoRunDecision::Started
+        );
+        let runs = settle(&f);
+        assert_eq!(f.agent.resumes.lock().as_slice(), ["sess-1"]);
+        let ev = f.store.lock().live_run_evidence(&runs[0].run_id).unwrap();
+        assert_eq!(ev.verdict.as_deref(), Some("inconclusive"));
+        let original = ev.original_result.expect("the first result is kept");
+        assert!(original.contains("\"passed\""), "{original}");
+        assert!(original.contains("cargo test"), "{original}");
+    }
+
+    #[test]
+    fn an_unusable_recheck_reply_keeps_the_original_result() {
+        let f = resumable_fixture("recheck-bad", UNBACKED_RESULT, "no marker here");
+        maybe_start_automatic_run(&f.store, &f.runners, &f.gid);
+        let runs = settle(&f);
+        assert_eq!(f.agent.resumes.lock().len(), 1);
+        let ev = f.store.lock().live_run_evidence(&runs[0].run_id).unwrap();
+        assert_eq!(ev.verdict.as_deref(), Some("passed"));
+        assert!(ev.original_result.is_none());
+    }
+
+    #[test]
+    fn a_run_with_no_session_or_nothing_to_recheck_is_not_resumed() {
+        // No session to resume (e.g. the native backend).
+        let f = fixture("recheck-nosession", UNBACKED_RESULT);
+        f.store
+            .lock()
+            .set_live_checkout(&f.gid, &f.dir.to_string_lossy(), None)
+            .unwrap();
+        maybe_start_automatic_run(&f.store, &f.runners, &f.gid);
+        settle(&f);
+        assert!(f.agent.resumes.lock().is_empty());
+
+        // A session, but no recipe to question.
+        let g = resumable_fixture(
+            "recheck-clean",
+            r#"RALPHUS_LIVE_RESULT: {"verdict":"inconclusive","summary":"ok"}"#,
+            "unused",
+        );
+        maybe_start_automatic_run(&g.store, &g.runners, &g.gid);
+        settle(&g);
+        assert!(g.agent.resumes.lock().is_empty());
     }
 
     #[test]

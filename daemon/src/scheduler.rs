@@ -3228,6 +3228,7 @@ fn run_cell_with_rate_limit_retries<'a>(
                         retry_after_secs: None,
                         prophecies: Vec::new(),
                         appraisal: None,
+                        closing_summary: None,
                         thinking_stall_last_line: None,
                     };
                     return Some((failed, permit));
@@ -3307,6 +3308,7 @@ fn run_cell_with_rate_limit_retries<'a>(
                 retry_after_secs: None,
                 prophecies: Vec::new(),
                 appraisal: None,
+                closing_summary: None,
                 thinking_stall_last_line: None,
             };
             return Some((failed, permit));
@@ -4700,7 +4702,10 @@ fn run_cell_worker(
     // Recorded from every finished prompt cell's final reply; the review the
     // cell lands in turns them into live actions.
     if row.prompt.is_some() && result.is_done() {
-        let handoffs = crate::live_actions::parse_live_handoffs(&result.summary);
+        // The closing turn carries the answer; a cell without one (native backend,
+        // a failed closing turn) answered inline in its work reply.
+        let handoff_reply = result.closing_summary.as_deref().unwrap_or(&result.summary);
+        let handoffs = crate::live_actions::parse_live_handoffs(handoff_reply);
         let guard = store.lock();
         if guard
             .replace_cell_live_handoffs(squad_id, row.task_idx, row.idx, &handoffs)
@@ -7347,6 +7352,7 @@ prompt = "anything"
                     turns: None,
                     prophecies: Vec::new(),
                     appraisal: None,
+                    closing_summary: None,
                 }
             }
         }
@@ -7365,6 +7371,7 @@ prompt = "anything"
             RunnerResult {
                 bearing: None,
                 appraisal: None,
+                closing_summary: None,
                 thinking_stall_last_line: None,
                 status: "done".to_string(),
                 tokens_in: 1,
@@ -7629,6 +7636,7 @@ prompt = "anything"
                 turns: None,
                 prophecies: Vec::new(),
                 appraisal: None,
+                closing_summary: None,
             }
         }
     }
@@ -7806,6 +7814,7 @@ prompt = "anything"
                 turns: Some(1),
                 prophecies: Vec::new(),
                 appraisal: None,
+                closing_summary: None,
             }
         }
     }
@@ -8104,6 +8113,7 @@ prompt = "anything"
                 turns: None,
                 prophecies: Vec::new(),
                 appraisal: None,
+                closing_summary: None,
             }
         }
     }
@@ -8251,6 +8261,7 @@ prompt = "anything"
                 turns: None,
                 prophecies: Vec::new(),
                 appraisal: None,
+                closing_summary: None,
             }
         }
     }
@@ -8369,6 +8380,7 @@ prompt = "anything"
                         turns: None,
                         prophecies: Vec::new(),
                         appraisal: None,
+                        closing_summary: None,
                     }
                 }
             } else {
@@ -8394,6 +8406,7 @@ prompt = "anything"
                     turns: None,
                     prophecies: Vec::new(),
                     appraisal: None,
+                    closing_summary: None,
                 }
             }
         }
@@ -9180,6 +9193,7 @@ prompt = "anything"
                             turns: None,
                             prophecies: Vec::new(),
                             appraisal: None,
+                            closing_summary: None,
                         }
                     }
                 } else {
@@ -9206,6 +9220,7 @@ prompt = "anything"
                         turns: None,
                         prophecies: Vec::new(),
                         appraisal: None,
+                        closing_summary: None,
                     }
                 }
             }
@@ -9336,6 +9351,7 @@ prompt = "anything"
                     turns: None,
                     prophecies: Vec::new(),
                     appraisal: None,
+                    closing_summary: None,
                 };
             }
             if spec.cell_id.starts_with("proof-") {
@@ -9364,6 +9380,7 @@ prompt = "anything"
                     turns: None,
                     prophecies: Vec::new(),
                     appraisal: None,
+                    closing_summary: None,
                 };
             }
             if spec.cell_id == "finalize" {
@@ -9390,6 +9407,7 @@ prompt = "anything"
                 turns: None,
                 prophecies: Vec::new(),
                 appraisal: None,
+                closing_summary: None,
             }
         }
     }
@@ -9532,6 +9550,7 @@ prompt = "anything"
                     turns: None,
                     prophecies: Vec::new(),
                     appraisal: None,
+                    closing_summary: None,
                 };
             }
             if spec.cell_id == "finalize" {
@@ -9561,6 +9580,7 @@ prompt = "anything"
                 turns: None,
                 prophecies: Vec::new(),
                 appraisal: None,
+                closing_summary: None,
             }
         }
     }
@@ -9693,6 +9713,7 @@ prompt = "anything"
                     turns: None,
                     prophecies: Vec::new(),
                     appraisal: None,
+                    closing_summary: None,
                 }
             }
         }
@@ -10131,6 +10152,7 @@ prompt = "anything"
                     turns: None,
                     prophecies: Vec::new(),
                     appraisal: None,
+                    closing_summary: None,
                 }
             }
         }
@@ -10480,6 +10502,7 @@ prompt = "anything"
                 ghost: None,
                 prophecies: Vec::new(),
                 appraisal: None,
+                closing_summary: None,
             }
         }
     }
@@ -10552,6 +10575,7 @@ prompt = "anything"
                 ghost: None,
                 prophecies: Vec::new(),
                 appraisal: None,
+                closing_summary: None,
             }
         }
     }
@@ -10769,6 +10793,7 @@ prompt = "anything"
                 turns: None,
                 prophecies: Vec::new(),
                 appraisal: None,
+                closing_summary: None,
             }
         }
     }
@@ -10845,6 +10870,7 @@ prompt = "anything"
                 turns: None,
                 prophecies: Vec::new(),
                 appraisal: None,
+                closing_summary: None,
             }
         }
     }
@@ -11048,6 +11074,7 @@ prompt = "anything"
                     turns: None,
                     prophecies: Vec::new(),
                     appraisal: None,
+                    closing_summary: None,
                 }
             }
         }
@@ -11176,6 +11203,7 @@ prompt = "anything"
                 turns: None,
                 prophecies: Vec::new(),
                 appraisal: None,
+                closing_summary: None,
             }
         }
     }
@@ -11810,6 +11838,7 @@ prompt = "anything"
                 turns: None,
                 prophecies: Vec::new(),
                 appraisal: None,
+                closing_summary: None,
             }
         }
     }
@@ -12076,6 +12105,7 @@ prompt = "anything"
                 turns: None,
                 prophecies: Vec::new(),
                 appraisal: None,
+                closing_summary: None,
             }
         }
     }
@@ -12248,6 +12278,7 @@ prompt = "anything"
                 turns: None,
                 prophecies: Vec::new(),
                 appraisal: None,
+                closing_summary: None,
             }
         }
     }
@@ -12622,6 +12653,7 @@ prompt = "anything"
                 turns: None,
                 prophecies: Vec::new(),
                 appraisal: None,
+                closing_summary: None,
             }
         }
     }
@@ -12798,6 +12830,7 @@ prompt = "anything"
                 turns: None,
                 prophecies: Vec::new(),
                 appraisal: None,
+                closing_summary: None,
             }
         }
     }

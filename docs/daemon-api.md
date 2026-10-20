@@ -5530,6 +5530,7 @@ recorded call) or `not_run`. Matched steps come first in recorded order, each wi
 recorded invocation (rendered collapsed); unmatched steps follow in proposed order
 with no call, order or result. The recipe is stored as `{"annotated":true,"steps":[…]}`;
 older rows are a bare array of matched steps and are never flagged as unbacked;
+when a finished run on a resumable (non-native) backend has a step that is `not_run` or `variant`, or an unbacked verdict, the agent's session is resumed once with a table of those steps and the closest recorded commands before the report is posted and the PR section refreshed; a valid revised `RALPHUS_LIVE_RESULT:` replaces the stored result (the original is kept in `original_result`), anything else keeps the original;
 a missing or unparseable result, or a run that did not finish, is
 `inconclusive`. Refreshes are durable (`pr_live_result_refresh`): requested on
 run finish, integration end, and PR create/adopt/replace/promote; a failed

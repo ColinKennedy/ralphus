@@ -150,6 +150,7 @@ impl Runner for CapturingRunner {
             turns: None,
             prophecies: Vec::new(),
             appraisal: None,
+            closing_summary: None,
         }
     }
 }

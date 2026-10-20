@@ -30797,6 +30797,7 @@ remediation_attempts = 1
                     ghost: None,
                     prophecies: Vec::new(),
                     appraisal: None,
+                    closing_summary: None,
                 }
             }
         }
@@ -30954,6 +30955,7 @@ remediation_attempts = 1
                     ghost: None,
                     prophecies: Vec::new(),
                     appraisal: None,
+                    closing_summary: None,
                 }
             }
         }

@@ -15,8 +15,8 @@ use rusqlite::{Connection, OpenFlags, OptionalExtension, named_params, params};
 use serde::{Deserialize, Serialize};
 
 use crate::runner::{
-    effective_cell_system_prompt, effective_proof_system_prompt,
-    effective_proof_system_prompt_scored,
+    effective_proof_system_prompt, effective_proof_system_prompt_scored,
+    effective_squad_cell_system_prompt,
 };
 
 /// Ceiling, in bytes, that a checkpoint truncates the `-wal` sidecar back
@@ -2852,6 +2852,7 @@ impl Store {
                 fix_attempted         INTEGER,
                 fix_confirmed         INTEGER,
                 recipe                TEXT,
+                original_result       TEXT,
                 branch_ids            TEXT,
                 integration_branch_id TEXT,
                 integration_pushed    INTEGER
@@ -3376,6 +3377,7 @@ impl Store {
         // existed. Each fails harmlessly (duplicate column) once present.
         for stmt in [
             "ALTER TABLE presets ADD COLUMN prompt TEXT",
+            "ALTER TABLE guardian_live_run_evidence ADD COLUMN original_result TEXT",
             // A scored-proof threshold a preset supplies to an extending
             // proof step's unset `pass_score`.
             "ALTER TABLE presets ADD COLUMN pass_score INTEGER",
@@ -5190,7 +5192,7 @@ impl Store {
                     .maximum_timeout_seconds
                     .map(|s| i64::try_from(s).unwrap_or(i64::MAX));
                 let effective_system_prompt = cell.prompt.as_ref().map(|_| {
-                    effective_cell_system_prompt(
+                    effective_squad_cell_system_prompt(
                         cell.system_prompt.as_deref(),
                         &cell.subprojects,
                         true,
@@ -10209,7 +10211,7 @@ impl Store {
         };
         let effective_system_prompt_touched = system_prompt_touched || prompt_value.is_some();
         let effective_system_prompt = effective_system_prompt_touched.then(|| {
-            effective_cell_system_prompt(effective_authored_system_prompt, &subprojects, true)
+            effective_squad_cell_system_prompt(effective_authored_system_prompt, &subprojects, true)
         });
 
         let n = self.conn.execute(

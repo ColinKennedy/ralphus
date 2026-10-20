@@ -497,6 +497,7 @@ tool guidance, but without the waypoint section (`waypoint_context` false). The 
   attempts hard-fail a normal cell and fail-close a proof step. Only the
   marker and the reason text on its line are parsed — the surrounding
   framing in the prompt is instruction, not contract.
+- **Closing turn** -- after a successful work turn on a Claude Code, Codex or Pi prompt cell, the runner resumes the same agent session once (same system prompt, so the cache stays warm) with a read-only user message asking the live-action and ghost questions. The reply is `CellResult.closing_summary`; it never replaces `summary`. Failed, cancelled and rate-limited cells skip it. `RALPHUS_GHOST:` and `RALPHUS_LIVE_ACTION:` are read from it (falling back to `summary`); `RALPHUS_BEARING:` is still read from the work turn.
 - **`RALPHUS_GHOST: <up to 5 short bullet points>`** (or
   `RALPHUS_GHOST: (nothing to report)`) — the handoff note of a prompt cell
   (RAL-136). Applies to prompt cells; proof steps get the verdict contract
@@ -515,15 +516,14 @@ tool guidance, but without the waypoint section (`waypoint_context` false). The 
 - **`RALPHUS_LIVE_ACTION: <how to test this live>`** (or
   `RALPHUS_LIVE_ACTION: (nothing to test live)`) — a **live handoff**: how a
   prompt cell's agent says it would test its work live. Only prompt cells are
-  asked for it (the question is appended to their system prompt by
-  `RunnerSpec::from_row`; review agents never see it). Parsed daemon-side from
+  asked for it, in the cell's **closing turn** (below) -- a resumed "Finalizing" turn that carries this question and the ghost question; the native backends get both inline in the work turn. Review agents never see it. Parsed daemon-side from
   the cell's final reply (`live_actions::parse_live_handoffs`): every marker
   starts one handoff, whose text runs until the next line that starts with a
   `RALPHUS_` marker, so it may span several lines and a cell may post several.
   Cells are asked to put a short title on the marker line and the steps
   below it; the first line becomes the live action's label when no
   deduplication names it.
-  Write them **before** `RALPHUS_GHOST:` — the ghost takes everything after its
+  Write them **before** `RALPHUS_GHOST:` in the same reply — the ghost takes everything after its
   marker to the end of the reply. The `(nothing to test live)` answer
   (case-insensitive) records an explicit "no", distinct from no marker at all.
   Stored per cell (`cell_live_handoffs`, `GET

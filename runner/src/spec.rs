@@ -117,6 +117,13 @@ pub struct CellSpec {
     /// Defaults to `true` when omitted; the daemon sends `false` for
     /// review/guardian agent runs that no waypoint can reach.
     pub waypoint_context: bool,
+    /// The cell-specific handoff questions (the live-action question) asked in
+    /// a closing "Finalizing" turn once the work turn has completed. `Some`
+    /// opts a squad prompt cell into the closing turn: the runner keeps the
+    /// handoff and ghost instructions out of the system prompt and asks them
+    /// in a resumed turn's user message instead. `None` (the default, and
+    /// every non-cell invocation) keeps single-turn behaviour.
+    pub closing_turn_prompt: Option<String>,
 }
 
 impl CellSpec {
@@ -183,6 +190,7 @@ impl CellSpec {
         let retry_after_unknown_default_seconds =
             opt_uint(obj, "retry_after_unknown_default_seconds")?.unwrap_or(30);
         let waypoint_context = opt_bool(obj, "waypoint_context")?.unwrap_or(true);
+        let closing_turn_prompt = opt_str(obj, "closing_turn_prompt")?;
 
         if prompt.is_some() == command.is_some() {
             return Err(SpecError(
@@ -224,6 +232,7 @@ impl CellSpec {
             retry_attempt,
             retry_after_unknown_default_seconds,
             waypoint_context,
+            closing_turn_prompt,
         })
     }
 }
@@ -385,6 +394,12 @@ pub struct CellResult {
     /// `block`-mode entry is what keeps it held.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bearing: Option<BearingReport>,
+    /// The reply to the closing "Finalizing" turn (the live-action and ghost
+    /// handoff answers), kept apart from `summary` so dependent cells'
+    /// placeholders keep resolving to the work turn's summary. `None` when no
+    /// closing turn ran.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub closing_summary: Option<String>,
 }
 
 impl CellResult {
@@ -410,6 +425,7 @@ impl CellResult {
             prophecies: Vec::new(),
             appraisal: None,
             bearing: None,
+            closing_summary: None,
         }
     }
 
@@ -435,6 +451,7 @@ impl CellResult {
             prophecies: Vec::new(),
             appraisal: None,
             bearing: None,
+            closing_summary: None,
         }
     }
 
@@ -482,6 +499,7 @@ impl CellResult {
             prophecies: Vec::new(),
             appraisal: None,
             bearing: None,
+            closing_summary: None,
         }
     }
 

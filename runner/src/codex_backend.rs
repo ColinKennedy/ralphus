@@ -235,6 +235,10 @@ impl ModelBackend for CodexBackend {
         true
     }
 
+    fn supports_closing_turn(&self) -> bool {
+        true
+    }
+
     fn supports_thinking(&self) -> bool {
         true
     }

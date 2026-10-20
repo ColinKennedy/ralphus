@@ -319,6 +319,14 @@ pub trait ModelBackend {
     fn supports_thinking(&self) -> bool {
         false
     }
+
+    /// Whether a run can be resumed by its `agent_session_id` with a fresh user
+    /// message and the same system prompt, which the closing "Finalizing" turn
+    /// needs. Defaults to `false` (the native backend keeps no resumable session
+    /// and gets its closing questions inline in the work turn instead).
+    fn supports_closing_turn(&self) -> bool {
+        false
+    }
 }
 
 #[cfg(test)]
