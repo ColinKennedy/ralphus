@@ -2267,6 +2267,60 @@ fn resolve_pr_alias(
     })
 }
 
+/// RAL-699: the branch's own name when the forge has an open PR/MR whose head
+/// is exactly that name, so the first submission can push to it and adopt the
+/// PR rather than opening a sibling on `<branch>-review`. `Ok(None)` when the
+/// branch was never pushed (no remote-tracking ref), its name is not a valid
+/// alias as-is, or the forge has no such PR. `Err` when the forge lookup
+/// itself failed; the caller records it and falls back to the derived alias.
+/// The head is built exactly as [`submit_stacked_branch_pr`] builds the push
+/// head, fork routing included.
+#[allow(clippy::too_many_arguments)]
+fn find_branch_own_open_pr_alias(
+    client: &crate::forge::ForgeClient,
+    root: &Path,
+    remote_name: &str,
+    ordered_enabled_branches: &[&BranchView],
+    alias_by_branch: &HashMap<String, String>,
+    base_branch_name: &str,
+    branch: &BranchView,
+    fork_routing: Option<&ForkRouting>,
+) -> std::result::Result<Option<String>, String> {
+    let name = branch.branch.as_str();
+    if name.is_empty() || sanitize_branch_name(name) != name {
+        return Ok(None);
+    }
+    let tracking = format!("refs/remotes/{remote_name}/{name}");
+    if git(root, &["rev-parse", "--verify", "--quiet", &tracking]).is_err() {
+        return Ok(None);
+    }
+    let base = stack_base_for(
+        ordered_enabled_branches,
+        alias_by_branch,
+        branch.position,
+        base_branch_name,
+    );
+    let route = match fork_routing {
+        Some(routing) => match fork_aware_route(routing, name, &base, base_branch_name) {
+            Ok(route) => route,
+            Err(_) => return Ok(None),
+        },
+        None => crate::forge::PrRoute {
+            client: client.clone(),
+            create_client: None,
+            head: client.same_repo_head(name),
+            base,
+            target_project_id: None,
+            repo: client.repo_label().to_string(),
+        },
+    };
+    match route.find_existing_pull_request() {
+        Ok(Some(_)) => Ok(Some(name.to_string())),
+        Ok(None) => Ok(None),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
 /// Applies a `.ralphus.toml` `[forge] pull_request_branch_convention`
 /// template (RAL-244) by substituting every `{name}` placeholder with the
 /// source branch's own name -- literal substring replacement, no other
@@ -8703,10 +8757,55 @@ fn submit_stacked_branch_pr(
         .readable_review_branch
         .then_some(branch.review_branch_name.as_deref())
         .flatten();
+    // RAL-699: a first submission with no explicit alias adopts a human-opened
+    // PR/MR whose head is this branch's own name, by pushing to that name.
+    let own_pr_alias = if req.branch_alias.is_none() {
+        match find_branch_own_open_pr_alias(
+            client,
+            root,
+            remote_name,
+            ordered_enabled_branches,
+            alias_by_branch,
+            base_branch_name,
+            branch,
+            fork_routing,
+        ) {
+            Ok(alias) => alias,
+            Err(e) => {
+                crate::rlog!(
+                    WARNING,
+                    "ralphus [pr] review {id} branch id={branch_id} own-name PR lookup failed \
+                     ({e}); using the derived alias"
+                );
+                let _ = store
+                    .lock()
+                    .cartographer_log(crate::cartographer::CartographerEntry {
+                        level: crate::logging::LogLevel::WARNING,
+                        source: "pr",
+                        message: "own-name PR lookup failed; using the derived alias",
+                        scope: Some("branch"),
+                        squad_id: None,
+                        guardian_id: Some(id),
+                        cell_id: None,
+                        task: None,
+                        log_path: None,
+                        payload: serde_json::json!({
+                            "branch_id": branch_id,
+                            "error": e,
+                        }),
+                        admin_only: false,
+                    });
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let explicit_alias = req.branch_alias.as_deref().or(own_pr_alias.as_deref());
     let alias_is_the_review_branch =
-        !guardian.effective_separate_pr_branch && req.branch_alias.is_none();
+        !guardian.effective_separate_pr_branch && explicit_alias.is_none();
     let desired_alias = resolve_pr_alias(
-        req.branch_alias.as_deref(),
+        explicit_alias,
         req.use_worktree_branch_name,
         guardian.effective_match_pr_branch_name,
         guardian.effective_separate_pr_branch,
@@ -8851,13 +8950,32 @@ fn submit_stacked_branch_pr(
                     ),
                 }
             }
+            // An adopted PR/MR must sit on the branch beneath it in the stack
+            // (or the review's base for the root); retarget it when the
+            // forge has it elsewhere, keeping the forge's base on failure.
+            let mut adopted_base = existing.base.clone();
+            if existing.base != route.base {
+                match route
+                    .client
+                    .update_pull_request_base(existing.number, &route.base)
+                {
+                    Ok(()) => adopted_base = route.base.clone(),
+                    Err(e) => crate::rlog!(
+                        WARNING,
+                        "ralphus [pr] review {id} branch {branch_id} could not retarget adopted                          PR/MR #{} from {} to {}: {e}",
+                        existing.number,
+                        existing.base,
+                        route.base
+                    ),
+                }
+            }
             (
                 crate::forge::CreatedPr {
                     number: existing.number,
                     url: existing.url,
                     draft: adopted_draft,
                 },
-                existing.base,
+                adopted_base,
                 existing.title,
                 existing.description,
                 true,
@@ -22415,7 +22533,7 @@ token_env = "RALPHUS_TEST_FORGE_TOKEN"
             );
             req.respond(
                 tiny_http::Response::from_string(
-                    r#"[{"number":21,"html_url":"http://x/21","base":{"ref":"predecessor-review"},"title":"Existing title","body":"Existing body"}]"#,
+                    r#"[{"number":21,"html_url":"http://x/21","base":{"ref":"main"},"title":"Existing title","body":"Existing body"}]"#,
                 )
                 .with_status_code(200),
             )
@@ -22503,13 +22621,168 @@ token_env = "RALPHUS_TEST_FORGE_TOKEN"
         .expect("submission must adopt the pre-existing open PR instead of erroring");
 
         assert_eq!(pr.pr_number, Some(21));
-        assert_eq!(pr.base_ref, "predecessor-review");
+        assert_eq!(pr.base_ref, "main");
         assert_eq!(pr.title, "Existing title");
         assert_eq!(pr.description, "Existing body");
 
         mock.finish();
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&remote_dir);
+    }
+
+    /// RAL-699: a never-aliased branch whose own name has an open PR/MR is
+    /// pushed under that name and adopted, and the adopted PR is retargeted
+    /// onto the branch beneath it in the stack.
+    fn adopts_own_named_pr_in_the_middle_of_the_stack(kind: crate::forge::ForgeKind) {
+        let (repo_path, list_prefix, list_json, patch_path) = match kind {
+            crate::forge::ForgeKind::GitHub => (
+                "acme/w",
+                "/repos/acme/w/pulls?",
+                r#"[{"number":21,"html_url":"http://x/21","base":{"ref":"main"},"title":"Human title","body":"Human body"}]"#,
+                "/repos/acme/w/pulls/21",
+            ),
+            crate::forge::ForgeKind::GitLab => (
+                "123",
+                "/projects/123/merge_requests?",
+                r#"[{"iid":21,"web_url":"http://x/21","target_branch":"main","title":"Human title","description":"Human body"}]"#,
+                "/projects/123/merge_requests/21",
+            ),
+        };
+        let mock = MockForge::start(move |server| {
+            let mut heads = Vec::new();
+            let mut patches = Vec::new();
+            for mut req in server.requests() {
+                let method = req.method().clone();
+                let url = req.url().to_string();
+                if method == tiny_http::Method::Get && url.starts_with(list_prefix) {
+                    heads.push(url);
+                    req.respond(tiny_http::Response::from_string(list_json).with_status_code(200))
+                        .unwrap();
+                } else if url == patch_path
+                    && (method == tiny_http::Method::Patch || method == tiny_http::Method::Put)
+                {
+                    let mut body = String::new();
+                    req.as_reader().read_to_string(&mut body).unwrap();
+                    patches.push(body);
+                    req.respond(tiny_http::Response::from_string("{}").with_status_code(200))
+                        .unwrap();
+                } else if url.contains("/actions/runs") {
+                    req.respond(
+                        tiny_http::Response::from_string(r#"{"workflow_runs":[]}"#)
+                            .with_status_code(200),
+                    )
+                    .unwrap();
+                } else {
+                    req.respond(tiny_http::Response::from_string("[]").with_status_code(404))
+                        .unwrap();
+                }
+            }
+            (heads, patches)
+        });
+
+        let root = tmp_dir("own-named-pr-root");
+        let remote_dir = tmp_dir("own-named-pr-remote");
+        let mut init_opts = git2::RepositoryInitOptions::new();
+        init_opts.initial_head("main");
+        let repo = git2::Repository::init_opts(&root, &init_opts).unwrap();
+        let sig = git2::Signature::now("t", "t@t").unwrap();
+        gwrite(
+            &root, "base.txt", "base
+",
+        );
+        let base_oid = git2_commit_all(&repo, &sig, "base", &[]);
+        let base_commit = repo.find_commit(base_oid).unwrap();
+        repo.branch("feat-x", &base_commit, false).unwrap();
+        git2_checkout(&repo, "feat-x");
+        gwrite(
+            &root, "feat.txt", "feat
+",
+        );
+        git2_commit_all(&repo, &sig, "feat", &[&base_commit]);
+        git2::Repository::init_bare(&remote_dir).unwrap();
+        repo.remote("origin", remote_dir.to_str().unwrap()).unwrap();
+        // The branch was pushed under its own name (where the human PR's
+        // head lives), which leaves a remote-tracking ref behind.
+        g(&root, &["push", "origin", "feat-x:refs/heads/feat-x"]);
+
+        let store = Arc::new(crate::store_lock::StoreMutex::new(store()));
+        let gid = store
+            .lock()
+            .create_guardian("demo", "main", root.to_str().unwrap())
+            .unwrap();
+        store.lock().add_guardian_branch(&gid, "lower").unwrap();
+        store.lock().add_guardian_branch(&gid, "feat-x").unwrap();
+        let guardian = store.lock().get_guardian(&gid).unwrap();
+        let lower_id = guardian.branches[0].id.clone();
+        let branch_id = guardian.branches[1].id.clone();
+        store
+            .lock()
+            .set_branch_review(&gid, &branch_id, "feat-x", root.to_str().unwrap())
+            .unwrap();
+
+        let client = mock.client(kind, repo_path);
+        let runner = NoopRunner;
+        let guardian = store.lock().get_guardian(&gid).unwrap();
+        let ordered_enabled: Vec<&BranchView> = guardian.branches.iter().collect();
+        let branch = ordered_enabled[1];
+        let mut alias_by_branch = HashMap::new();
+        alias_by_branch.insert(lower_id, "lower-review".to_string());
+        let req = PrRequest {
+            branch_id: Some(branch_id.clone()),
+            branch_alias: None,
+            title: None,
+            description: None,
+            use_worktree_branch_name: None,
+            draft: None,
+        };
+
+        let pr = submit_stacked_branch_pr(
+            &store,
+            &runner,
+            &client,
+            &gid,
+            &root,
+            "origin",
+            &guardian,
+            &ordered_enabled,
+            &mut alias_by_branch,
+            "main",
+            branch,
+            &req,
+            "{name}-review",
+            None,
+            "stack-1",
+            None,
+            false,
+        )
+        .expect("the branch's own open PR must be adopted");
+
+        assert_eq!(pr.pr_number, Some(21));
+        assert_eq!(pr.branch_alias, "feat-x");
+        assert_eq!(pr.base_ref, "lower-review");
+        let (heads, patches) = mock.finish();
+        assert!(
+            heads.iter().all(|u| u.contains("feat-x")),
+            "lookups used the branch's own name: {heads:?}"
+        );
+        assert!(
+            patches.iter().any(|b| b.contains("lower-review")),
+            "adopted PR retargeted onto the branch beneath it: {patches:?}"
+        );
+        let remote = git(&remote_dir, &["branch", "--list"]).unwrap();
+        assert!(!remote.contains("feat-x-review"), "{remote}");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&remote_dir);
+    }
+
+    #[test]
+    fn github_adopts_own_named_pr_in_the_middle_of_the_stack() {
+        adopts_own_named_pr_in_the_middle_of_the_stack(crate::forge::ForgeKind::GitHub);
+    }
+
+    #[test]
+    fn gitlab_adopts_own_named_pr_in_the_middle_of_the_stack() {
+        adopts_own_named_pr_in_the_middle_of_the_stack(crate::forge::ForgeKind::GitLab);
     }
 
     /// RAL-698: adopt a human-opened PR/MR while the review holds one
