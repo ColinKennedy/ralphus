@@ -289,6 +289,7 @@ pub(crate) fn run_ready_checks(store: &StoreHandle, id: &str) {
 
 /// Run one claimed check to completion and report a failure.
 fn run_one(store: &StoreHandle, id: &str, g: &GuardianView, check: &GuardianCheck, at: CheckRef) {
+    let _remote_scope = crate::machine_strict::enter(g.machine.as_deref());
     let label = display_label(check, at);
     // A `prompt` action is agent-run: it goes onto the review's live-run
     // queue (followed in Live View) instead of opening a terminal.

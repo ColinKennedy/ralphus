@@ -3265,6 +3265,7 @@ fn resolve_conflicts_with_agent(
         let marker_id = id.to_string();
         let marker_branch_id = branch_id.to_string();
         let marker_watcher = std::thread::spawn(move || {
+            let _remote_scope = crate::machine_strict::enter(marker_wt.machine());
             while !marker_stop_clone.load(Ordering::Relaxed) {
                 sleep_unless_stopped(&marker_stop_clone, std::time::Duration::from_millis(2000));
                 if marker_stop_clone.load(Ordering::Relaxed) {
@@ -4215,6 +4216,7 @@ pub(crate) fn restack_from_position<F: Fn(GuardianStatus, Option<&str>)>(
     cancel: &CancelToken,
 ) {
     let _git_operation = git_review_operation_guard(root.root(), root.machine());
+    let _remote_scope = crate::machine_strict::enter(root.machine());
     // Queue this restack and try to claim it immediately -- claiming only
     // succeeds once every branch's worktree lease is free (see the
     // `worktree lease` glossary entry), so a restack can never rebase a
@@ -4821,6 +4823,7 @@ fn claim_combined_review_ref(
 /// starts) forces that rebuild to fall back to its from-scratch path and
 /// re-derive every remaining branch purely from its own feature-branch tip.
 pub fn purge_worktrees(store: &crate::store_lock::StoreHandle, git_root: &str, id: &str) {
+    let _remote_scope = crate::machine_strict::enter_for_guardian(store, id);
     let num = id.replace("guardian-", "");
     let root = Workspace::for_guardian(store, id, Path::new(git_root));
     let wt_base = root.at(worktree_dir(git_root, id));
@@ -4961,6 +4964,7 @@ pub(crate) fn kickoff_merge(
     sem: Arc<Semaphore>,
     cancellations: Cancellations,
 ) -> Result<StartMergeOutcome, StartMergeError> {
+    let _remote_scope = crate::machine_strict::enter_for_guardian(&store, id);
     let kickoff_started = std::time::Instant::now();
     // A nonexistent guardian must 404 before any preflight work runs.
     // `sync_remote_pr_commits` below also looks the guardian up, but maps
@@ -5565,6 +5569,7 @@ pub fn stop_actioning(
     cancellations: Cancellations,
     id: &str,
 ) -> Reply {
+    let _remote_scope = crate::machine_strict::enter_for_guardian(&store, id);
     let key = format!("guardian:{id}");
     let (review_status, project_root, active_before, has_leases) = {
         let guard = store.lock();
@@ -6264,6 +6269,7 @@ pub fn run_merge_staged(
     }
     let _git_operation =
         git_review_operation_guard(Path::new(&guardian.git_root), guardian.machine.as_deref());
+    let _remote_scope = crate::machine_strict::enter(guardian.machine.as_deref());
     let set_status = |s: GuardianStatus, detail: Option<&str>| {
         write_merge_status(store, id, s, detail);
     };
@@ -7001,6 +7007,7 @@ pub fn run_merge_cancellable(
     let stored_signature = store.lock().guardian_build_signature(id).unwrap_or(None);
     let _git_operation =
         git_review_operation_guard(Path::new(&guardian.git_root), guardian.machine.as_deref());
+    let _remote_scope = crate::machine_strict::enter(guardian.machine.as_deref());
     // RAL-193: every call is its own merge/rebase attempt -- bump the
     // counter so cost line items recorded during it (conflict resolution,
     // proving) are attributed to this attempt, distinct from the
@@ -8461,6 +8468,7 @@ fn run_feedback_pass(
     }
     let _git_operation =
         git_review_operation_guard(Path::new(&guardian.git_root), guardian.machine.as_deref());
+    let _remote_scope = crate::machine_strict::enter(guardian.machine.as_deref());
     let base = guardian.base_branch.clone();
     let Some(branch) = guardian.branches.iter().find(|b| b.id == branch_id) else {
         fail_message();
@@ -9622,6 +9630,7 @@ pub fn pull_pr_commits(
     alias: &str,
     last_synced_sha: Option<&str>,
 ) -> std::result::Result<Option<String>, String> {
+    let _remote_scope = crate::machine_strict::enter_for_guardian(store, id);
     let guardian = store.lock().get_guardian(id).map_err(|e| e.to_string())?;
     let branch = guardian
         .branches
@@ -10124,6 +10133,7 @@ fn spawn_merge_checks(store: &crate::store_lock::StoreHandle, candidates: &[(Str
     for id in due {
         let store = Arc::clone(store);
         std::thread::spawn(move || {
+            let _remote_scope = crate::machine_strict::enter_for_guardian(&store, &id);
             check_merges_claimed(&store, &id);
         });
     }
@@ -10416,6 +10426,7 @@ fn review_maintenance_staggered(
         std::thread::spawn(move || {
             // Released when this worker exits, by any path.
             let _claim = claim;
+            let _remote_scope = crate::machine_strict::enter_for_guardian(&store, &id);
             let runner = runners(&store);
             // RAL-213: register/remove around the merge this may trigger, same
             // shape as `scheduler::tick`'s squad-level wrapping, so a guardian
@@ -10459,6 +10470,7 @@ fn review_maintenance_staggered(
         let runners = Arc::clone(runners);
         std::thread::spawn(move || {
             let _claim = claim;
+            let _remote_scope = crate::machine_strict::enter_for_guardian(&store, &id);
             let runner = runners(&store);
             // PRs of a still-collecting review are already a stack to label.
             crate::pr::reconcile_ci_deferral_if_stack_changed(&store, &id);
@@ -10491,6 +10503,7 @@ fn review_maintenance_staggered(
             let _claim = claim;
             let _clock = MaintenanceClock::start(&id);
             std::thread::sleep(offset);
+            let _remote_scope = crate::machine_strict::enter_for_guardian(&store, &id);
             let runner = runners(&store);
             // RAL-213: one token covers both the base-shift rebuild and (if
             // that didn't run) the manual-push restack below -- either may
@@ -10836,6 +10849,7 @@ pub fn rebase_on_manual_push(
     id: &str,
     sem: &Semaphore,
 ) -> bool {
+    let _remote_scope = crate::machine_strict::enter_for_guardian(store, id);
     let guardian = match store.lock().get_guardian(id) {
         Ok(g) => g,
         Err(_) => return false,
@@ -11085,6 +11099,7 @@ fn guardian_base_already_has_every_branch(
             .iter()
             .map(|proj| {
                 scope.spawn(move || {
+                    let _remote_scope = crate::machine_strict::enter(guardian.machine.as_deref());
                     let root = Workspace::for_guardian(store, id, Path::new(proj));
                     match resolve_base(&root, &guardian.base_branch) {
                         Ok(sha) => project_already_in_base(&root, guardian, proj, &sha),
@@ -11295,6 +11310,7 @@ pub fn rebuild_on_base_shift_with_debounce(
     cancel: &CancelToken,
     debounce: std::time::Duration,
 ) -> bool {
+    let _remote_scope = crate::machine_strict::enter_for_guardian(store, id);
     let guardian = match store.lock().get_guardian(id) {
         Ok(g) => g,
         Err(_) => return false,
@@ -12251,6 +12267,7 @@ pub fn run_guardian_post_merge_for(
 
     let _review_op =
         git_review_operation_guard(Path::new(&guardian.git_root), guardian.machine.as_deref());
+    let _remote_scope = crate::machine_strict::enter(guardian.machine.as_deref());
     let started_at = match store.lock().start_guardian_post_merge(id) {
         Ok(stamp) => stamp,
         Err(_) => crate::store::now_ms(),
@@ -14705,6 +14722,7 @@ pub fn retire_stale_worktrees(store: &crate::store_lock::StoreHandle) {
             &record.guardian_id,
             PathBuf::from(&record.project_root),
         );
+        let _remote_scope = crate::machine_strict::enter(root.machine());
         let wt_base = root.at(worktree_dir(&record.project_root, &record.guardian_id));
         if !crate::short_paths::worktree_belongs_to_guardian(
             &record.path,
@@ -15821,6 +15839,7 @@ pub fn poll_base_branch_freshness_once(store: &crate::store_lock::StoreHandle) {
         let store = Arc::clone(store);
         std::thread::spawn(move || {
             let _claim = claim;
+            let _remote_scope = crate::machine_strict::enter(target.machine.as_deref());
             let result = fetch_base_branch(&store, &target);
             let outcome = match &result {
                 Ok(()) => crate::poller_health::PollOutcome::Healthy,
@@ -15875,6 +15894,8 @@ pub fn poll_base_branch_freshness_once(store: &crate::store_lock::StoreHandle) {
         let info = info.clone();
         std::thread::spawn(move || {
             let _claim = claim;
+            let _remote_scope =
+                crate::machine_strict::enter_for_guardian(&store, &info.guardian_id);
             crate::pr::refresh_dual_root_upstream_branch(
                 &store,
                 &info.guardian_id,
@@ -16710,6 +16731,7 @@ fn generate_final_summary(
     id: &str,
     signature: &str,
 ) {
+    let _remote_scope = crate::machine_strict::enter_for_guardian(store, id);
     let Ok(guardian) = store.lock().get_guardian(id) else {
         return;
     };
@@ -17640,6 +17662,7 @@ pub(crate) fn resolve_check_input(
     command: &str,
     input: &CheckInput,
 ) {
+    let _remote_scope = crate::machine_strict::enter_for_guardian(store, guardian_id);
     let Some((cwd, stored_agent, stored_model, machine)) = ({
         let guard = store.lock();
         guard.get_guardian(guardian_id).ok().map(|g| {

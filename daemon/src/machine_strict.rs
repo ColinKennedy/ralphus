@@ -167,6 +167,18 @@ pub fn enter(machine: Option<&str>) -> Option<RemoteScope> {
     Some(RemoteScope { _private: () })
 }
 
+/// Enter a scope for guardian `id`'s review machine, for callers that hold
+/// only the id. `None` when the review is local, gone, or unreadable -- a
+/// missing scope only means strict mode does not check this work.
+#[must_use = "the scope ends when the returned guard is dropped"]
+pub fn enter_for_guardian(store: &crate::store_lock::StoreHandle, id: &str) -> Option<RemoteScope> {
+    let machine = store
+        .with_read_snapshot(|conn| crate::store::Store::guardian_machine_conn(conn, id))
+        .ok()
+        .flatten();
+    enter(machine.as_deref())
+}
+
 /// The remote machine the current thread is working for, if any.
 #[must_use]
 pub fn current_machine() -> Option<String> {
@@ -216,6 +228,29 @@ mod tests {
         assert!(enter(Some("local")).is_none());
         assert!(enter(Some("  ")).is_none());
         assert!(check_local("git", || "status".to_string()).is_ok());
+    }
+
+    #[test]
+    fn a_reviews_scope_follows_its_assigned_machine() {
+        let store = std::sync::Arc::new(crate::store_lock::StoreMutex::new(
+            crate::store::Store::open_in_memory().unwrap(),
+        ));
+        let (remote, local) = {
+            let guard = store.lock();
+            let remote = guard.create_guardian("r", "main", "/repo").unwrap();
+            guard
+                .set_guardian_machine(&remote, Some("fleet:box"))
+                .unwrap();
+            let local = guard.create_guardian("l", "main", "/repo").unwrap();
+            (remote, local)
+        };
+        {
+            let _scope = enter_for_guardian(&store, &remote);
+            assert_eq!(current_machine().as_deref(), Some("fleet:box"));
+        }
+        assert!(enter_for_guardian(&store, &local).is_none());
+        assert!(enter_for_guardian(&store, "guardian-missing").is_none());
+        assert_eq!(current_machine(), None);
     }
 
     #[test]

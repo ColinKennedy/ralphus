@@ -2498,6 +2498,19 @@ impl Store {
         Ok(cwd.flatten())
     }
 
+    /// The machine a guardian's review is assigned (`None` when unset or the
+    /// guardian does not exist), without hydrating the whole review.
+    pub(crate) fn guardian_machine_conn(conn: &Connection, id: &str) -> Result<Option<String>> {
+        let machine: Option<Option<String>> = conn
+            .query_row(
+                "SELECT machine FROM guardians WHERE id=?",
+                params![id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(machine.flatten())
+    }
+
     /// Atomically reopen a guardian already out of `collecting` (`in_review` or
     /// `merge_failed`) back to `merging`, to pick up a straggler branch. Since
     /// RAL-108, [`Self::claim_guardian_merge`] also claims `in_review` guardians

@@ -4849,7 +4849,10 @@ pub fn reconcile_ci_deferral_if_stack_changed(store: &crate::store_lock::StoreHa
 /// that has just changed the stack and must not wait on forge calls.
 pub fn start_reconcile_ci_deferral(store: crate::store_lock::StoreHandle, id: &str) {
     let id = id.to_string();
-    std::thread::spawn(move || reconcile_ci_deferral_if_stack_changed(&store, &id));
+    std::thread::spawn(move || {
+        let _remote_scope = crate::machine_strict::enter_for_guardian(&store, &id);
+        reconcile_ci_deferral_if_stack_changed(&store, &id);
+    });
 }
 
 /// Kick off [`resync_pr_bases`] in the background — called after a reorder,
@@ -4869,7 +4872,9 @@ pub fn start_resync_pr_bases(store: crate::store_lock::StoreHandle, id: &str) {
         }
     }
     std::thread::spawn(move || {
+        let remote_scope = crate::machine_strict::enter_for_guardian(&store, &sid);
         let result = resync_pr_bases(&store, &sid);
+        drop(remote_scope);
         RESYNCING.lock().expect("poisoned").remove(&sid);
         match result {
             Ok(n) if n > 0 => {
@@ -6303,6 +6308,7 @@ fn settle_pr_merge_states(
 /// (most likely `guard_against_clobber` tripping because a reviewer pushed
 /// directly to the PR branch) is logged and does not stop the others.
 pub fn sync_open_pr_branches(store: &crate::store_lock::StoreHandle, id: &str) {
+    let _remote_scope = crate::machine_strict::enter_for_guardian(store, id);
     let Ok(guardian) =
         store.with_read_snapshot(|conn| crate::store::Store::get_guardian_conn(conn, id))
     else {
@@ -6504,6 +6510,7 @@ pub fn verify_and_repair_stack_ancestry(
     runner: &dyn Runner,
     id: &str,
 ) -> bool {
+    let _remote_scope = crate::machine_strict::enter_for_guardian(store, id);
     let Ok(guardian) =
         store.with_read_snapshot(|conn| crate::store::Store::get_guardian_conn(conn, id))
     else {
@@ -6816,6 +6823,7 @@ pub fn check_and_apply_forge_reorder(
     sem: &crate::scheduler::Semaphore,
     cancellations: &crate::cancel::Cancellations,
 ) -> bool {
+    let _remote_scope = crate::machine_strict::enter_for_guardian(store, id);
     let drift = match detect_forge_reorder(store, id) {
         Ok(Some(drift)) => drift,
         Ok(None) => return false,
@@ -7851,7 +7859,10 @@ fn run_pr_forge_poll_cycle(store: &crate::store_lock::StoreHandle, cache_enabled
         }
     };
     for id in ids {
-        match poll_pr_base_drift(store, &id) {
+        let remote_scope = crate::machine_strict::enter_for_guardian(store, &id);
+        let drift = poll_pr_base_drift(store, &id);
+        drop(remote_scope);
+        match drift {
             Ok(n) if n > 0 => {
                 let guard = store.lock();
                 let _ = guard.cartographer_log(crate::cartographer::CartographerEntry {
@@ -7911,6 +7922,7 @@ fn run_pr_comment_poll_tick(store: &crate::store_lock::StoreHandle) {
         }
     };
     for id in ids {
+        let _remote_scope = crate::machine_strict::enter_for_guardian(store, &id);
         refresh_pr_forge_cache_for_guardian(store, &id, false);
     }
 }
@@ -8535,6 +8547,7 @@ pub(crate) fn retire_dual_root_branch_for_guardian(
     guardian: &GuardianView,
     reason: &str,
 ) {
+    let _remote_scope = crate::machine_strict::enter(guardian.machine.as_deref());
     // See the matching comment in `settle_pr_merge_states`: bind the owned
     // `Option` before the `if let` so `retire_dual_root_upstream_branch`'s
     // own `store.lock()` below doesn't deadlock against this one.
@@ -8578,6 +8591,7 @@ pub fn sweep_terminal_dual_root_upstream_branches(store: &crate::store_lock::Sto
         }
     };
     for snapshot in &snapshots {
+        let _remote_scope = crate::machine_strict::enter_for_guardian(store, &snapshot.guardian_id);
         retire_dual_root_upstream_branch(store, snapshot, "review reached a terminal state");
     }
 }
@@ -8832,6 +8846,7 @@ pub fn submit_pull_requests(
     user: &str,
     allow_unlinked_fork: bool,
 ) -> std::result::Result<Vec<PullRequestView>, String> {
+    let _remote_scope = crate::machine_strict::enter_for_guardian(store, id);
     let cx = crate::otel::context_from_traceparent(None);
     let span = crate::otel::start_span("pr.submit_pull_requests", &cx, SpanKind::Internal);
     span.set_attribute("guardian_id", id.to_string());
@@ -10650,6 +10665,7 @@ fn auto_submit_terminal_branches(
 /// submitted; they do not prove that its forge-side base and GitHub-native
 /// stack membership still match the review.
 pub fn run_auto_submit_pass(store: &crate::store_lock::StoreHandle, runner: &dyn Runner, id: &str) {
+    let _remote_scope = crate::machine_strict::enter_for_guardian(store, id);
     // Bind the owned `Result` before branching -- a `MutexGuard` temporary in
     // a `match` scrutinee lives for the whole `match`, and the arm below takes
     // `store.lock()` again.
@@ -11975,6 +11991,7 @@ fn compute_sync_status_inner(
     let guardian = store
         .with_read_snapshot(|conn| crate::store::Store::get_guardian_conn(conn, &pr.guardian_id))
         .map_err(|e| e.to_string())?;
+    let _remote_scope = crate::machine_strict::enter(guardian.machine.as_deref());
     let root = PathBuf::from(&guardian.git_root);
 
     let local_ref = local_ref_for_pr(&guardian, &pr);
@@ -12055,6 +12072,7 @@ pub fn pull_pr_commits(
         .lock()
         .get_guardian(&pr.guardian_id)
         .map_err(|e| e.to_string())?;
+    let _remote_scope = crate::machine_strict::enter(guardian.machine.as_deref());
     let branch_id = match &pr.branch_id {
         Some(bid) => bid.clone(),
         None => guardian
@@ -12191,6 +12209,7 @@ pub fn sync_remote_pr_commits(
     let guardian = store
         .with_read_snapshot(|conn| crate::store::Store::get_guardian_conn(conn, id))
         .map_err(|e| e.to_string())?;
+    let _remote_scope = crate::machine_strict::enter(guardian.machine.as_deref());
     if guardian.status.as_str() != "in_review" {
         return Ok(0);
     }
@@ -12225,7 +12244,13 @@ pub fn sync_remote_pr_commits(
         std::thread::scope(|scope| {
             let handles: Vec<_> = pr_ids
                 .iter()
-                .map(|pr| scope.spawn(|| fetch_remote_pr_tip(store, &pr.id)))
+                .map(|pr| {
+                    scope.spawn(|| {
+                        let _remote_scope =
+                            crate::machine_strict::enter(guardian.machine.as_deref());
+                        fetch_remote_pr_tip(store, &pr.id)
+                    })
+                })
                 .collect();
             handles
                 .into_iter()
@@ -12435,6 +12460,7 @@ fn action_pr_feedback_inner(
         .lock()
         .get_guardian(&pr.guardian_id)
         .map_err(|e| e.to_string())?;
+    let _remote_scope = crate::machine_strict::enter(guardian.machine.as_deref());
     let root = PathBuf::from(&guardian.git_root);
     let ws = crate::workspace::Workspace::for_guardian(store, &guardian.id, &root);
     let forge_cfg = crate::config::resolve_forge(&root);

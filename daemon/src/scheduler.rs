@@ -3714,6 +3714,7 @@ fn run_cell_worker(
     worktree_claims: &WorktreeClaims,
 ) {
     let row = &cells[i];
+    let _remote_scope = crate::machine_strict::enter(row.machine.as_deref());
     // Held for the worker's whole lifetime so every early return below still
     // ends the span (RAII), and so the span's own traceparent — not the raw
     // `trace_context` string — becomes the parent of this cell's runner
@@ -4961,6 +4962,7 @@ fn run_proof_only_worker(
     trace_context: Option<&str>,
 ) {
     let row = &cells[i];
+    let _remote_scope = crate::machine_strict::enter(row.machine.as_deref());
     let cx = otel::context_from_traceparent(trace_context);
     let _span = otel::start_span("scheduler.proof_only_cell", &cx, SpanKind::Internal);
     _span.set_attribute("cell_id", row.cell_id.clone());
@@ -5285,6 +5287,8 @@ fn run_task_finalizer(
         // rule), so borrowing the representative cell's value is exact
         // rather than approximate.
         let machine = task_cell.and_then(|s| s.machine.clone());
+        // Ends with this block, before the review hand-off below.
+        let _remote_scope = crate::machine_strict::enter(machine.as_deref());
         // RAL-308: a task-scope proof has no owning cell, so only the task's
         // own cumulative cap applies (alongside the step's own, resolved
         // inside `run_proofs`). Same representative-cell borrow as `machine`
