@@ -777,6 +777,22 @@ fn resolve_squad_branch(
     })?
 }
 
+/// The default branch of `project`'s repository as its forge reports it, from
+/// the registered clone URL -- no git, no checkout. Fails rather than guessing
+/// `main`/`master`, like [`default_branch`].
+fn forge_default_branch(store: &StoreHandle, project: &ProjectView) -> Result<String, String> {
+    let url = project.clone_url.as_deref().ok_or_else(|| {
+        format!(
+            "project {:?} has no registered clone URL to ask its forge for the default branch",
+            project.name
+        )
+    })?;
+    let cfg = crate::config::resolve_forge(Path::new(&project.path));
+    crate::forge::resolve_url_with_store(store, url, &cfg, None)?
+        .default_branch()
+        .ok_or_else(|| format!("the forge for {url} did not report a default branch"))
+}
+
 /// Whether `machine` names a remote machine rather than the daemon's own host
 /// (unset, blank, or `local`).
 fn is_remote_machine(machine: Option<&str>) -> bool {
@@ -2269,7 +2285,17 @@ impl ProjectStartupAdapter for GitProjectStartupAdapter {
                 ralphus_core::schema::WORKTREE_UPSTREAM_DEFAULT
             ));
         }
-        let upstream = resolve_upstream(Path::new(&project.path), upstream).map_err(|e| {
+        // A remote cell's `<<default>>` comes from the forge: the daemon's
+        // checkout's `origin/HEAD` says nothing about the machine (and the
+        // daemon may have no checkout at all).
+        let upstream = if is_remote_machine(ctx.machine)
+            && upstream == ralphus_core::schema::WORKTREE_UPSTREAM_DEFAULT
+        {
+            forge_default_branch(store, project)
+        } else {
+            resolve_upstream(Path::new(&project.path), upstream)
+        }
+        .map_err(|e| {
             format!(
                 "cell '{}': could not resolve upstream for \"{placeholder}\": {e}",
                 ctx.cell_id

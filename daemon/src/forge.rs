@@ -3623,6 +3623,29 @@ impl ForgeClient {
         decode_base64_maybe_wrapped(b64)
     }
 
+    /// The repository's default branch as the forge reports it (GitHub
+    /// `default_branch` of `GET /repos/{repo}`, GitLab `default_branch` of
+    /// `GET /projects/{id}`). `None` when the forge cannot be reached or does
+    /// not say.
+    #[must_use]
+    pub fn default_branch(&self) -> Option<String> {
+        let token = self.token.as_deref();
+        match self.kind {
+            ForgeKind::GitHub => {
+                let url = format!("{}/repos/{}", self.api_base, self.repo_path);
+                let mut req = http_agent()
+                    .get(&url)
+                    .set("Accept", "application/vnd.github+json");
+                if let Some(t) = token {
+                    req = req.set("Authorization", &format!("Bearer {t}"));
+                }
+                let resp = self.get(req).ok()?;
+                resp["default_branch"].as_str().map(str::to_string)
+            }
+            ForgeKind::GitLab => self.gitlab_default_branch(token),
+        }
+    }
+
     fn gitlab_default_branch(&self, token: Option<&str>) -> Option<String> {
         let url = format!("{}/projects/{}", self.api_base, self.repo_path);
         let mut req = http_agent().get(&url);
@@ -5910,8 +5933,32 @@ fn resolve_remote_for_inner(
     let url = root
         .git_at(&["remote", "get-url", remote_name])
         .map_err(|e| format!("could not read remote '{remote_name}': {e}"))?;
-    let (host, path) = parse_remote_url(url.trim())
-        .ok_or_else(|| format!("could not parse remote url: {}", url.trim()))?;
+    client_for_url(url.trim(), cfg, lookup_user, lookup)
+}
+
+/// The forge client for repository `url` (any form [`parse_remote_url`]
+/// accepts), with no git involved -- for a caller that knows the URL from
+/// the project registry rather than a checkout's remote.
+pub(crate) fn resolve_url_with_store(
+    store: &crate::store_lock::StoreHandle,
+    url: &str,
+    cfg: &ForgeConfig,
+    identity: Option<&str>,
+) -> Result<ForgeClient, String> {
+    client_for_url(url, cfg, identity, &|host| {
+        let guard = store.lock();
+        stored_token_for_identity(&guard, identity, host)
+    })
+}
+
+fn client_for_url(
+    url: &str,
+    cfg: &ForgeConfig,
+    lookup_user: Option<&str>,
+    lookup: &dyn Fn(&str) -> Option<StoredToken>,
+) -> Result<ForgeClient, String> {
+    let (host, path) =
+        parse_remote_url(url).ok_or_else(|| format!("could not parse remote url: {url}"))?;
 
     let kind = cfg
         .kind
@@ -6004,6 +6051,38 @@ fn resolve_remote_for_inner(
 mod tests {
     use super::*;
     use crate::mock_forge::MockForge;
+
+    #[test]
+    fn default_branch_reads_the_github_repository() {
+        let mock = MockForge::start(move |server| {
+            let req = server.recv();
+            assert_eq!(req.url(), "/repos/acme/widget");
+            req.respond(
+                tiny_http::Response::from_string(r#"{"default_branch":"trunk"}"#)
+                    .with_status_code(200),
+            )
+            .unwrap();
+        });
+        let client = mock.client(ForgeKind::GitHub, "acme/widget");
+        assert_eq!(client.default_branch().as_deref(), Some("trunk"));
+        mock.finish();
+    }
+
+    #[test]
+    fn default_branch_reads_the_gitlab_project() {
+        let mock = MockForge::start(move |server| {
+            let req = server.recv();
+            assert_eq!(req.url(), "/projects/acme%2Fwidget");
+            req.respond(
+                tiny_http::Response::from_string(r#"{"default_branch":"trunk"}"#)
+                    .with_status_code(200),
+            )
+            .unwrap();
+        });
+        let client = mock.client(ForgeKind::GitLab, "acme%2Fwidget");
+        assert_eq!(client.default_branch().as_deref(), Some("trunk"));
+        mock.finish();
+    }
 
     #[test]
     fn fetch_pr_template_reads_the_github_default_template() {
