@@ -52,12 +52,7 @@ fn hooks_dir(workspace: &Workspace) -> Result<PathBuf, String> {
     if value.is_empty() {
         return Err("git rev-parse --git-path hooks returned empty output".to_string());
     }
-    let path = PathBuf::from(value);
-    Ok(if path.is_absolute() {
-        path
-    } else {
-        workspace.root().join(path)
-    })
+    Ok(workspace.resolve(value))
 }
 
 fn is_ralphus_managed(workspace: &Workspace, path: &std::path::Path) -> bool {

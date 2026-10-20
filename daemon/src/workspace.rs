@@ -388,7 +388,7 @@ impl Workspace {
                 // shell on its own side -- the one place the args-already-split
                 // rule cannot apply, because the author wrote shell syntax.
                 let req = crate::remote_runner::RunRequest {
-                    cwd: self.root.to_string_lossy().into_owned(),
+                    cwd: remote_path_string(&self.root),
                     program: String::new(),
                     args: vec![command.to_string()],
                     env: env.clone(),
@@ -442,7 +442,7 @@ impl Workspace {
         match &self.machine {
             None => std::fs::read_to_string(&full).ok(),
             Some(_) => self
-                .with_provider(|p, spec| p.read_file(&full.to_string_lossy(), spec))
+                .with_provider(|p, spec| p.read_file(&remote_path_string(&full), spec))
                 .ok(),
         }
     }
@@ -463,9 +463,8 @@ impl Workspace {
                 std::fs::write(&full, content)
                     .map_err(|e| format!("could not write {}: {e}", full.display()))
             }
-            Some(_) => {
-                self.with_provider(|p, spec| p.write_file(&full.to_string_lossy(), content, spec))
-            }
+            Some(_) => self
+                .with_provider(|p, spec| p.write_file(&remote_path_string(&full), content, spec)),
         }
     }
 
@@ -489,7 +488,7 @@ impl Workspace {
                 set_executable(&full)
             }
             Some(_) => self.with_provider(|p, spec| {
-                p.write_executable_file(&full.to_string_lossy(), content, spec)
+                p.write_executable_file(&remote_path_string(&full), content, spec)
             }),
         }
     }
@@ -522,7 +521,7 @@ impl Workspace {
             }
             Some(machine) => {
                 if let Err(e) = self.with_provider(|p, spec| {
-                    p.remove_path(&full.to_string_lossy(), recursive, spec)
+                    p.remove_path(&remote_path_string(&full), recursive, spec)
                 }) {
                     // ralphus[ignore-rlog-pair]: callers may already hold the store lock, so locking it here to emit could deadlock
                     crate::rlog!(
@@ -607,7 +606,7 @@ impl Workspace {
             }
             Some(_) => self.with_provider(|provider, spec| {
                 provider.materialize(
-                    &source.to_string_lossy(),
+                    &remote_path_string(&source),
                     &destination.to_string_lossy(),
                     executable,
                     spec,
@@ -634,12 +633,34 @@ impl Workspace {
 
     /// Resolve `path` against this workspace's root when relative, or take it
     /// as-is when already absolute.
-    fn resolve(&self, path: impl AsRef<Path>) -> PathBuf {
+    ///
+    /// "Absolute" follows the machine, not the daemon: on a remote workspace
+    /// `/srv/repo` is absolute even when the daemon runs on Windows, where
+    /// [`Path::is_absolute`] would call it relative and join it onto the root.
+    pub fn resolve(&self, path: impl AsRef<Path>) -> PathBuf {
         let p = path.as_ref();
-        if p.is_absolute() {
+        let absolute = if self.machine.is_some() {
+            is_absolute_anywhere(p)
+        } else {
+            p.is_absolute()
+        };
+        if absolute {
             self.map_path(p)
         } else {
             self.root.join(p)
+        }
+    }
+
+    /// This workspace's root as a string that names it on its own machine:
+    /// the native form for a local workspace, `/`-separated for a remote one
+    /// (see [`remote_path_string`]). Use it wherever the root is stored or
+    /// handed on as text.
+    #[must_use]
+    pub fn root_string(&self) -> String {
+        if self.machine.is_some() {
+            remote_path_string(&self.root)
+        } else {
+            self.root.to_string_lossy().into_owned()
         }
     }
 
@@ -735,7 +756,7 @@ impl Workspace {
     /// it forever.
     fn git_remote(&self, _machine: &str, args: &[&str]) -> Result<String, String> {
         let req = crate::remote_runner::RunRequest {
-            cwd: self.root.to_string_lossy().into_owned(),
+            cwd: remote_path_string(&self.root),
             program: "git".to_string(),
             args: args.iter().map(|a| (*a).to_string()).collect(),
             env: non_interactive_git_env(),
@@ -743,6 +764,32 @@ impl Workspace {
         };
         self.with_provider(|p, spec| p.run_vcs(&req, spec))
     }
+}
+
+/// `path` as text for a remote machine, with every separator a `/`.
+///
+/// A remote path is built with [`Path::join`], which uses the *daemon's*
+/// separator: a Windows daemon joining onto a Linux machine's `/srv/repo`
+/// yields `/srv/repo\.git\worktrees`, which names nothing over there. `/` is
+/// read correctly by POSIX machines and by Windows ones (git and the Win32
+/// file APIs both accept it), so normalising to it works for either. A
+/// backslash inside a POSIX file name is the one casualty, and ralphus never
+/// creates such a name.
+fn remote_path_string(path: &Path) -> String {
+    path.to_string_lossy().replace('\\', "/")
+}
+
+/// Whether `path` is absolute on POSIX (`/x`) or Windows (`C:\x`, `C:/x`,
+/// `\\server\x`), whatever OS the daemon itself runs on.
+fn is_absolute_anywhere(path: &Path) -> bool {
+    let text = path.to_string_lossy();
+    let bytes = text.as_bytes();
+    path.is_absolute()
+        || bytes.first().is_some_and(|b| *b == b'/' || *b == b'\\')
+        || (bytes.len() >= 3
+            && bytes[0].is_ascii_alphabetic()
+            && bytes[1] == b':'
+            && (bytes[2] == b'/' || bytes[2] == b'\\'))
 }
 
 /// The environment every remote `git` invocation runs under, so nothing it
@@ -944,6 +991,67 @@ mod tests {
 
         let local = Workspace::local("/repo");
         assert!(local.join("sub").is_local());
+    }
+
+    #[test]
+    fn remote_paths_are_sent_with_forward_slashes() {
+        assert_eq!(
+            remote_path_string(Path::new(r"/srv/repo\.git\worktrees")),
+            "/srv/repo/.git/worktrees"
+        );
+        assert_eq!(
+            remote_path_string(Path::new(r"C:\work\repo")),
+            "C:/work/repo"
+        );
+    }
+
+    #[test]
+    fn a_subdirectory_of_a_posix_remote_root_is_named_with_forward_slashes() {
+        // On a Windows daemon `Path::join` writes `\`, which a Linux machine
+        // reads as part of a file name.
+        let ws = Workspace::on("/srv/repo", Some("incredibuild:A")).join(".git/worktrees/feat");
+        assert_eq!(ws.root_string(), "/srv/repo/.git/worktrees/feat");
+    }
+
+    #[test]
+    fn a_mapped_review_path_is_named_with_forward_slashes_on_the_machine() {
+        // The review derives `.git/.ralphus/...` from the daemon's own project
+        // root and translates it onto the machine's repository; the suffix
+        // carries the daemon's separators until it is normalised.
+        let local = std::env::temp_dir().join("ralphus-ws-map");
+        let mut ws = Workspace::on(local.clone(), Some("incredibuild:A"));
+        ws.path_map = Some(Arc::new((local.clone(), PathBuf::from("/srv/repo"))));
+        let derived = ws.at(local.join(".git").join(".ralphus").join("g"));
+        assert_eq!(derived.root_string(), "/srv/repo/.git/.ralphus/g");
+    }
+
+    #[test]
+    fn a_remote_workspace_treats_any_os_absolute_path_as_absolute() {
+        // `Path::is_absolute` follows the daemon's OS: on Windows `/srv/x` is
+        // relative and would be joined onto the workspace root.
+        let ws = Workspace::on("/srv/repo", Some("incredibuild:A"));
+        assert_eq!(
+            remote_path_string(&ws.resolve("/srv/repo/.git/hooks")),
+            "/srv/repo/.git/hooks"
+        );
+        assert_eq!(
+            remote_path_string(&ws.resolve(r"C:\work\hooks")),
+            "C:/work/hooks"
+        );
+        assert_eq!(
+            remote_path_string(&ws.resolve(".git/hooks")),
+            "/srv/repo/.git/hooks"
+        );
+    }
+
+    #[test]
+    fn absolute_paths_are_recognised_for_every_os() {
+        for absolute in ["/srv/x", r"\srv\x", r"C:\x", "c:/x", r"\\server\share"] {
+            assert!(is_absolute_anywhere(Path::new(absolute)), "{absolute}");
+        }
+        for relative in ["x", ".git/hooks", r"x\y", "C:x", ""] {
+            assert!(!is_absolute_anywhere(Path::new(relative)), "{relative}");
+        }
     }
 
     #[test]

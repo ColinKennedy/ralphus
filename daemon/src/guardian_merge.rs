@@ -1376,7 +1376,7 @@ fn regen_from_feature_worktree(
     wt: &Workspace,
     branch: &str,
 ) -> std::result::Result<(), String> {
-    let wt_str = wt.root().to_string_lossy().to_string();
+    let wt_str = wt.root_string();
     match find_worktree_for_branch(root, branch) {
         Some(feature_wt) => {
             let sha = git(&feature_wt, &["rev-parse", "HEAD"])
@@ -1523,7 +1523,7 @@ fn worktree_add_or_reset_with_faults<F>(
 where
     F: RecoveryFaults,
 {
-    let wt_str = wt.root().to_string_lossy().to_string();
+    let wt_str = wt.root_string();
 
     if !wt.root().exists() {
         // [State 1] Directory missing — fast path.
@@ -3154,7 +3154,7 @@ fn resolve_conflicts_with_agent(
         // agent resumes its own conversation instead of starting cold. Count
         // only a completed agent pass below: a runner/backend invocation that
         // cannot produce a result is not an attempt to resolve conflicts.
-        let resolver_cwd = wt.root().to_string_lossy().into_owned();
+        let resolver_cwd = wt.root_string();
         // RAL-517: resolve before `cwd: resolver_cwd` moves the string below.
         let retry_after_unknown_default_seconds =
             crate::config::resolve(std::path::Path::new(&resolver_cwd))
@@ -3365,7 +3365,7 @@ fn resolve_conflicts_with_agent(
         // overwriting it, so notes from earlier passes/rebuilds accumulate.
         if let Some(ghost_text) = result.ghost.as_deref().map(str::trim) {
             if !ghost_text.is_empty() {
-                let revision = crate::ghost::current_revision(&wt.root().to_string_lossy());
+                let revision = crate::ghost::current_revision(&wt.root_string());
                 let guard = store.lock();
                 if guard
                     .upsert_ghost(
@@ -3601,7 +3601,7 @@ fn run_final_proof(
             admin_only: false,
         });
     }
-    let proof_cwd = wt.root().to_string_lossy().into_owned();
+    let proof_cwd = wt.root_string();
     // RAL-517: resolve before `cwd: proof_cwd` moves the string below.
     let retry_after_unknown_default_seconds =
         crate::config::resolve(std::path::Path::new(&proof_cwd))
@@ -3816,7 +3816,7 @@ fn run_commit_checks(
             }),
         );
     }
-    let wt_str = wt.root().to_string_lossy().into_owned();
+    let wt_str = wt.root_string();
     if !checks.is_empty() {
         let uri = crate::ghost::review_uri(id, Some(branch_id));
         let note = crate::ghost::proof_outcome_note(checks.len(), checks.len());
@@ -4348,7 +4348,7 @@ pub(crate) fn restack_from_position<F: Fn(GuardianStatus, Option<&str>)>(
             store,
             root,
             id,
-            &root.root().to_string_lossy(),
+            &root.root_string(),
             &ob.id,
             &ob.branch,
             ob.readable_review_branch,
@@ -4361,7 +4361,7 @@ pub(crate) fn restack_from_position<F: Fn(GuardianStatus, Option<&str>)>(
             }
         };
         let wt_j = branch_wt_dir(wt_base, &short_names, &ob.branch);
-        let wt_j_str = wt_j.root().to_string_lossy().to_string();
+        let wt_j_str = wt_j.root_string();
         let old_tip = resolve_commit(root, &rev);
         let old_upstream = restack_branch_upstream(
             store,
@@ -6655,7 +6655,7 @@ fn staged_merge_pass(
                 }
             };
             let wt = branch_wt_dir(&wt_base, &short_names, &bv.branch);
-            let wt_str = wt.root().to_string_lossy().to_string();
+            let wt_str = wt.root_string();
             let old_tip = old_tips.get(&bv.id).cloned();
             let old_upstream = old_tip.as_deref().and_then(|tip| {
                 // A branch that added nothing (empty, or its work landed
@@ -7430,7 +7430,7 @@ pub fn run_merge_cancellable(
                 }
             };
             let wt = branch_wt_dir(&wt_base, &short_names, &ob.branch);
-            let wt_str = wt.root().to_string_lossy().to_string();
+            let wt_str = wt.root_string();
             if let Err(e) = worktree_add_or_reset(&root, &rev, &wt, &ob.branch) {
                 fail_branch(store, id, &ob.id, &ob.branch, &e, &set_status);
                 return;
@@ -7727,7 +7727,7 @@ fn run_merge_shared<F: Fn(GuardianStatus, Option<&str>)>(
         }
     };
     let wt = wt_base.join("review");
-    let wt_str = wt.root().to_string_lossy().to_string();
+    let wt_str = wt.root_string();
     let carried = carry_from.is_some();
     if let Some((old_tip, old_base)) = carry_from {
         if carry_shared_stack(
@@ -9477,7 +9477,7 @@ fn run_feedback_pass(
             }
         };
         let wt_j = branch_wt_dir(&wt_base, &short_names, &ob.branch);
-        let wt_j_str = wt_j.root().to_string_lossy().to_string();
+        let wt_j_str = wt_j.root_string();
         // Reset the review branch to what it replays (its old tip, so its own
         // review-only commits survive, else the feature tip); drive_rebase
         // replays those commits onto the revised upstream (`prev_ref`).
@@ -14370,7 +14370,7 @@ fn rebuild_combined(
 ) -> std::result::Result<String, String> {
     let combined_branch = claim_combined_review_ref_by_id(store, root, id)?;
     let combined_wt = wt_base.join("review");
-    let combined_str = combined_wt.root().to_string_lossy().to_string();
+    let combined_str = combined_wt.root_string();
     worktree_add_or_reset(root, &combined_branch, &combined_wt, prev_ref)?;
     {
         let guard = store.lock();
@@ -16795,7 +16795,7 @@ fn generate_final_summary(
         .collect::<Vec<_>>()
         .join(", ");
 
-    let cwd = ws_root.root().to_string_lossy().into_owned();
+    let cwd = ws_root.root_string();
     let resolved = match resolve_resolver_agent(
         guardian.resolver_agent.as_deref(),
         guardian.resolver_model.as_deref(),
@@ -17304,7 +17304,7 @@ fn generate_manual_commands(
             repository_guidance(wt)
         );
         (
-            wt.root().to_string_lossy().into_owned(),
+            wt.root_string(),
             wt.machine().map(str::to_string),
             manual_commands_prompt(&tail, steering.as_deref()),
         )
@@ -17336,7 +17336,7 @@ fn generate_manual_commands(
             repository_guidance(root)
         );
         (
-            root.root().to_string_lossy().into_owned(),
+            root.root_string(),
             root.machine().map(str::to_string),
             manual_commands_prompt(&tail, steering.as_deref()),
         )
