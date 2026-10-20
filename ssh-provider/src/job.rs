@@ -23,6 +23,33 @@ pub struct Stream {
 
 const CANCEL_REQUESTER: &str = "ralphus-daemon";
 
+/// The shell script that claims a job's dispatch slot under `remote_root` and
+/// writes its protected spec (read from stdin) into `dir`, printing
+/// `created <handle>` or, while an earlier dispatch of the same squad/cell is
+/// still alive, `existing <old handle>`. Creates every directory it writes
+/// into, so it works on a fresh `remote_root`.
+fn setup_script(remote_root: &str, squad: &str, cell: &str, dir: &str, proposed: &str) -> String {
+    let dispatch_key = short_hash(&format!("{squad}\0{cell}"));
+    let dispatches = format!("{remote_root}/jobs/dispatches");
+    let dispatch = format!("{dispatches}/{dispatch_key}");
+    let locks = format!("{remote_root}/jobs/.dispatch-locks");
+    format!(
+        "set -eu; umask 077; mkdir -p {locks} {parent} {dispatches}; exec 9>{lock}; flock 9; if [ -f {dispatch} ]; then old_handle=$(sed -n '1p' {dispatch}); old_dir=$(sed -n '2p' {dispatch}); case \"$old_dir\" in {jobs_prefix}*) ;; *) echo 'invalid existing dispatch path' >&2; exit 1;; esac; old_state=$(cat \"$old_dir/state\" 2>/dev/null || true); if [ \"$old_state\" = starting ] || [ \"$old_state\" = running ]; then pid=$(cat \"$old_dir/supervisor_pid\" 2>/dev/null || true); expected=$(cat \"$old_dir/supervisor_start\" 2>/dev/null || true); actual=$(awk '{{print $22}}' /proc/$pid/stat 2>/dev/null || true); created=$(cat \"$old_dir/created_at\" 2>/dev/null || echo 0); now=$(date +%s); if {{ [ -n \"$pid\" ] && [ \"$expected\" = \"$actual\" ]; }} || {{ [ \"$old_state\" = starting ] && [ $((now-created)) -le 10 ]; }}; then printf 'existing %s\\n' \"$old_handle\"; exit 0; fi; rm -f \"$old_dir/environment\" \"$old_dir/environment.tmp\"; printf 'lost\\n' > \"$old_dir/state.tmp\"; mv \"$old_dir/state.tmp\" \"$old_dir/state\"; fi; fi; mkdir -p {dir}; cat > {dir}/spec.json.tmp; mv {dir}/spec.json.tmp {dir}/spec.json; date +%s > {dir}/created_at; printf '0\\n' > {dir}/output_cursor; printf 'starting\\n' > {dir}/state.tmp; mv {dir}/state.tmp {dir}/state; printf '%s\\n%s\\n' {handle} {dir} > {dispatch}.tmp; mv {dispatch}.tmp {dispatch}; printf 'created %s\\n' {handle}",
+        locks = shell_quote_single(&locks),
+        parent = shell_quote_single(&format!(
+            "{remote_root}/jobs/{}/{}",
+            short_hash(squad),
+            short_hash(cell)
+        )),
+        dispatches = shell_quote_single(&dispatches),
+        lock = shell_quote_single(&format!("{locks}/{dispatch_key}.lock")),
+        dispatch = shell_quote_single(&dispatch),
+        jobs_prefix = shell_quote_single(&format!("{remote_root}/jobs/")),
+        dir = shell_quote_single(dir),
+        handle = shell_quote_single(proposed),
+    )
+}
+
 fn policy(config: &EffectiveConfig) -> Result<RunnerPolicy, String> {
     let policy = runner_install::policy_from_env(config.target_runner_config.as_deref())?
         .ok_or_else(|| {
@@ -111,24 +138,7 @@ pub fn start(uri: &str, spec_json: &str, config: &EffectiveConfig) -> Result<Str
     let protected_environment = environment_file(&environment)?;
     let proposed = new_handle(squad, cell)?;
     let dir = job_dir(&policy.remote_root, &proposed)?;
-    let dispatch_key = short_hash(&format!("{squad}\0{cell}"));
-    let dispatch = format!("{}/jobs/dispatches/{dispatch_key}", policy.remote_root);
-    let locks = format!("{}/jobs/.dispatch-locks", policy.remote_root);
-    let setup = format!(
-        "set -eu; umask 077; mkdir -p {locks} {parent}; exec 9>{lock}; flock 9; if [ -f {dispatch} ]; then old_handle=$(sed -n '1p' {dispatch}); old_dir=$(sed -n '2p' {dispatch}); case \"$old_dir\" in {jobs_prefix}*) ;; *) echo 'invalid existing dispatch path' >&2; exit 1;; esac; old_state=$(cat \"$old_dir/state\" 2>/dev/null || true); if [ \"$old_state\" = starting ] || [ \"$old_state\" = running ]; then pid=$(cat \"$old_dir/supervisor_pid\" 2>/dev/null || true); expected=$(cat \"$old_dir/supervisor_start\" 2>/dev/null || true); actual=$(awk '{{print $22}}' /proc/$pid/stat 2>/dev/null || true); created=$(cat \"$old_dir/created_at\" 2>/dev/null || echo 0); now=$(date +%s); if {{ [ -n \"$pid\" ] && [ \"$expected\" = \"$actual\" ]; }} || {{ [ \"$old_state\" = starting ] && [ $((now-created)) -le 10 ]; }}; then printf 'existing %s\\n' \"$old_handle\"; exit 0; fi; rm -f \"$old_dir/environment\" \"$old_dir/environment.tmp\"; printf 'lost\\n' > \"$old_dir/state.tmp\"; mv \"$old_dir/state.tmp\" \"$old_dir/state\"; fi; fi; mkdir -p {dir}; cat > {dir}/spec.json.tmp; mv {dir}/spec.json.tmp {dir}/spec.json; date +%s > {dir}/created_at; printf '0\\n' > {dir}/output_cursor; printf 'starting\\n' > {dir}/state.tmp; mv {dir}/state.tmp {dir}/state; printf '%s\\n%s\\n' {handle} {dir} > {dispatch}.tmp; mv {dispatch}.tmp {dispatch}; printf 'created %s\\n' {handle}",
-        locks = shell_quote_single(&locks),
-        parent = shell_quote_single(&format!(
-            "{}/jobs/{}/{}",
-            policy.remote_root,
-            short_hash(squad),
-            short_hash(cell)
-        )),
-        lock = shell_quote_single(&format!("{locks}/{dispatch_key}.lock")),
-        dispatch = shell_quote_single(&dispatch),
-        jobs_prefix = shell_quote_single(&(policy.remote_root.clone() + "/jobs/")),
-        dir = shell_quote_single(&dir),
-        handle = shell_quote_single(&proposed),
-    );
+    let setup = setup_script(&policy.remote_root, squad, cell, &dir, &proposed);
     let setup_output = ssh_command(&target, &setup, config, Some(protected_spec.as_bytes()))?;
     let mut words = setup_output.split_whitespace();
     let disposition = words.next().unwrap_or_default();
@@ -454,6 +464,43 @@ mod tests {
         assert!(validate_handle(&first).is_ok());
         let dir = job_dir("/srv/ralphus", &first).unwrap();
         assert!(dir.starts_with("/srv/ralphus/jobs/"), "{dir}");
+    }
+
+    /// The first dispatch on a fresh `remote_root` must create every
+    /// directory it writes into, including `jobs/dispatches/`.
+    #[cfg(unix)]
+    #[test]
+    fn the_setup_script_works_on_a_fresh_remote_root() {
+        let root = std::env::temp_dir().join(format!("ralphus-job-setup-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let root_str = root.to_string_lossy().to_string();
+        let handle = new_handle("squad-a", "cell-a").unwrap();
+        let dir = job_dir(&root_str, &handle).unwrap();
+        let script = setup_script(&root_str, "squad-a", "cell-a", &dir, &handle);
+        let mut child = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&script)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child.stdin.take().unwrap().write_all(b"{}").unwrap();
+        let out = child.wait_with_output().unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout).trim(),
+            format!("created {handle}")
+        );
+        assert_eq!(
+            std::fs::read_to_string(format!("{dir}/spec.json")).unwrap(),
+            "{}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
