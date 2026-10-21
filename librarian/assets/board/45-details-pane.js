@@ -32,7 +32,7 @@
           return "";
         };
         const banner = `<div class="squad-banner selectable ${sel.kind === "squad" ? "sel" : ""}" onclick="pick('squad')">
-            ${sdot(squad.state)}<span class="rid">${esc(squad.label || squad.id)}</span>${copyBtn(squad.label || squad.id)} ${pill(squad.state)}${squadLogsBtn(squad.id)}${squadTimelineBtn(squad.id)}
+            ${sdot(squad.state)}<span class="rid">${esc(squad.label || squad.id)}</span>${copyBtn(squad.label || squad.id)} ${pill(squad.state)}${squad.error ? failLogBtn(squad.error) : ""}${squadLogsBtn(squad.id)}${squadTimelineBtn(squad.id)}
             <span style="flex:1"></span></div>`;
         const tasks = squad.tasks.map((t, ti) => {
           const cells = t.cells.map((s, si) => `
