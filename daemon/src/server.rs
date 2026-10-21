@@ -36373,6 +36373,40 @@ remediation_attempts=1
         );
     }
 
+    /// Deleting a review deletes its live refs in its repository right away
+    /// (not only at the next orphan sweep), and leaves other reviews' alone.
+    #[test]
+    fn delete_review_deletes_its_live_refs() {
+        let repo = tmp_git_repo("delete-live-refs");
+        let d = daemon();
+        let gid = d
+            .lock()
+            .create_guardian("demo", "main", repo.to_str().unwrap())
+            .unwrap();
+        let mine = crate::live_actions::live_ref_name(&gid, "run-1");
+        let other = crate::live_actions::live_ref_name("guardian-other", "run-2");
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(&repo)
+                .status()
+                .expect("git")
+                .success()
+        };
+        assert!(git(&["update-ref", &mine, "HEAD"]));
+        assert!(git(&["update-ref", &other, "HEAD"]));
+
+        let r = route(&d, "DELETE", &format!("/api/guardians/{gid}"), "");
+        assert_eq!(r.status, 200, "{}", r.body);
+
+        assert!(
+            !git(&["rev-parse", "--verify", "--quiet", &mine]),
+            "the deleted review's live ref is gone"
+        );
+        assert!(git(&["rev-parse", "--verify", "--quiet", &other]));
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
     #[test]
     fn delete_review_closes_its_open_github_prs() {
         delete_review_closes_its_open_prs("github");
