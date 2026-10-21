@@ -204,3 +204,9 @@ tag = "agent-preflight-remote"
 [[test]]
 id = "ralphus-daemon remote_runner::tests::an_agent_missing_on_a_provider_machine_fails_its_preflight_with_a_remedy_every_time"
 tag = "agent-preflight-remote"
+
+# A remote-only project's .ralphus.toml read from a machine's clone (`git
+# rev-parse` + `git show` through the provider), cached per commit.
+[[test]]
+id = "ralphus-daemon remote_projects::tests::a_remote_only_projects_config_is_read_from_its_machine_per_commit"
+tag = "remote-project-config"

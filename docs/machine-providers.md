@@ -101,8 +101,15 @@ ralphus project git --name widgets --url https://github.com/acme/widgets.git
 It is shown as **remote only** (`"remote_only": true` in `GET /api/projects`).
 Its machines clone the URL; the daemon keeps only a reserved key
 (`<state dir>/remote-only-projects/<name>`, never created) where a clone's path
-would go, and reads no `.ralphus.toml` for it from its own disk (global config
-applies). Because nothing can run on the daemon's host:
+would go. Its `.ralphus.toml` is read from a machine's clone instead: when a
+cell is provisioned for it, or a review of it builds its workspace on a
+machine, the daemon reads the file at the clone's default branch
+(`origin/HEAD`, re-checked at most once a minute) and keeps a copy per commit
+under `<state dir>/remote-project-configs/<name>/<commit>/`. That copy is
+layered exactly like a local checkout's `.ralphus.toml`, with the same rules
+on what a project file may set; until a machine has been used for the
+project, only the global config applies. Because nothing can run on the
+daemon's host:
 
 - every cell of a task on it must have a remote `machine` (directly or
   inherited), and

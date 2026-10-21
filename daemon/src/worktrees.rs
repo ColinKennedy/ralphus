@@ -2911,6 +2911,7 @@ fn provision_remote_with_targets(
             .with_store(std::sync::Arc::clone(store));
         sync_commit_metadata_hook_best_effort(&workspace, Path::new(&project.path));
         if project.vcs == "git" {
+            crate::remote_projects::refresh_config(Path::new(&project.path), &workspace);
             if let Err(e) = pin_remote_upstream_and_baseline(&workspace, branch, upstream) {
                 crate::rlog!(
                     WARNING,
