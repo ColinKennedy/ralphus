@@ -3,8 +3,9 @@
 //!
 //! * An **exhibit request** asks for one thing to be shown. The agent that
 //!   made a change writes them inside its live handoff as
-//!   `EXHIBIT: <kind> | <what to show>` lines; [`split_handoff`] lifts them
-//!   out of the handoff text, and they follow their handoff through
+//!   `EXHIBIT: <kind> | <what to show>` lines (optionally followed by
+//!   `|| <kind> | <what that kind shows>` fallbacks); [`split_handoff`] lifts
+//!   them out of the handoff text, and they follow their handoff through
 //!   deduplication into exactly one live action.
 //! * Each stored request is an **exhibit slot** of that action. A PR/MR shows
 //!   the slots of the actions attributed to its branch inside a managed
@@ -68,16 +69,40 @@ impl ExhibitOrigin {
     }
 }
 
-/// One thing a reviewer should be shown.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
-pub struct ExhibitRequest {
+/// One kind of exhibit and what that kind should show.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ExhibitAlternative {
     pub kind: ExhibitKind,
     pub describe: String,
 }
 
+/// One thing a reviewer should be shown: a primary kind and description, and
+/// optionally fallback kinds, each with a description written for what that
+/// kind can show.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ExhibitRequest {
+    pub kind: ExhibitKind,
+    pub describe: String,
+    /// Fallbacks after the primary, in order of preference.
+    pub alternatives: Vec<ExhibitAlternative>,
+}
+
+/// The separator between a request's alternatives.
+const ALTERNATIVE_SEPARATOR: &str = "||";
+
 impl ExhibitRequest {
-    /// The identity two requests are duplicates under: same kind, same
-    /// description ignoring case and runs of whitespace.
+    /// A request with no fallbacks.
+    #[must_use]
+    pub fn single(kind: ExhibitKind, describe: impl Into<String>) -> Self {
+        Self {
+            kind,
+            describe: describe.into(),
+            alternatives: Vec::new(),
+        }
+    }
+
+    /// The identity two requests are duplicates under: same primary kind, same
+    /// primary description ignoring case and runs of whitespace.
     fn dedupe_key(&self) -> (ExhibitKind, String) {
         (
             self.kind,
@@ -88,6 +113,65 @@ impl ExhibitRequest {
                 .to_lowercase(),
         )
     }
+
+    /// Every (kind, description) pair, primary first.
+    pub fn pairs(&self) -> impl Iterator<Item = (ExhibitKind, &str)> {
+        std::iter::once((self.kind, self.describe.as_str())).chain(
+            self.alternatives
+                .iter()
+                .map(|a| (a.kind, a.describe.as_str())),
+        )
+    }
+
+    /// The description written for `kind`; the primary's when the request
+    /// lists no such kind (a runner step-down to an unlisted kind).
+    #[must_use]
+    pub fn describe_for(&self, kind: ExhibitKind) -> &str {
+        self.pairs()
+            .find(|(k, _)| *k == kind)
+            .map_or(self.describe.as_str(), |(_, d)| d)
+    }
+
+    /// The request restricted to what a review's kind preference allows.
+    /// Visual kinds outside `preference` are dropped (order and descriptions
+    /// kept); `output` is always allowed. When nothing listed is allowed the
+    /// review's first kind replaces the request, carrying the primary's
+    /// description.
+    #[must_use]
+    pub fn narrowed_to(&self, preference: &[ExhibitKind]) -> Self {
+        let allowed = |k: ExhibitKind| !k.is_visual() || preference.contains(&k);
+        let mut kept = self
+            .pairs()
+            .filter(|(k, _)| allowed(*k))
+            .map(|(k, d)| ExhibitAlternative {
+                kind: k,
+                describe: d.to_string(),
+            });
+        match kept.next() {
+            Some(primary) => Self {
+                kind: primary.kind,
+                describe: primary.describe,
+                alternatives: kept.collect(),
+            },
+            None => match preference.first() {
+                Some(first) => Self::single(*first, self.describe.clone()),
+                None => self.clone(),
+            },
+        }
+    }
+
+    fn alternatives_json(&self) -> Option<String> {
+        (!self.alternatives.is_empty())
+            .then(|| serde_json::to_string(&self.alternatives).ok())
+            .flatten()
+    }
+
+    fn with_stored_alternatives(mut self, json: Option<&str>) -> Self {
+        self.alternatives = json
+            .and_then(|j| serde_json::from_str(j).ok())
+            .unwrap_or_default();
+        self
+    }
 }
 
 /// A handoff with its exhibit requests lifted out.
@@ -97,13 +181,47 @@ pub struct SplitHandoff {
     pub text: String,
     /// The usable requests, in order, at most [`MAX_PER_ACTION`].
     pub requests: Vec<ExhibitRequest>,
-    /// `EXHIBIT:` lines that could not be used (unknown kind, nothing to
-    /// show, over the cap), verbatim, for the log.
+    /// `EXHIBIT:` lines (or single alternatives of a line that had another
+    /// usable one) that could not be used (unknown kind, nothing to show,
+    /// over the cap), verbatim, for the log.
     pub rejected: Vec<String>,
 }
 
+/// Split the text after `EXHIBIT:` into its alternatives. A `||` separates
+/// alternatives only when what follows is a known kind followed by `|` or the
+/// end of the text, so a description may contain `||` (`cmd1 || cmd2`) or `|`.
+fn split_alternatives(rest: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut start = 0;
+    let mut from = 0;
+    while let Some(i) = rest[from..].find(ALTERNATIVE_SEPARATOR) {
+        let at = from + i;
+        let after = &rest[at + ALTERNATIVE_SEPARATOR.len()..];
+        let kind_part = after.split('|').next().unwrap_or_default();
+        if ExhibitKind::parse(kind_part).is_some() {
+            parts.push(&rest[start..at]);
+            start = at + ALTERNATIVE_SEPARATOR.len();
+        }
+        from = at + ALTERNATIVE_SEPARATOR.len();
+    }
+    parts.push(&rest[start..]);
+    parts
+}
+
+fn parse_alternative(part: &str) -> Option<ExhibitAlternative> {
+    let (kind, describe) = part.split_once('|')?;
+    let describe = describe.trim();
+    let kind = ExhibitKind::parse(kind)?;
+    (!describe.is_empty()).then(|| ExhibitAlternative {
+        kind,
+        describe: describe.chars().take(DESCRIBE_MAX_CHARS).collect(),
+    })
+}
+
 /// Separate a live handoff's `EXHIBIT: <kind> | <what to show>` lines from
-/// its test steps.
+/// its test steps. A line may continue with `|| <kind> | <what that kind
+/// shows>` fallbacks, each with its own description; one that is unusable is
+/// dropped (and reported in `rejected`) while the rest of the line is kept.
 #[must_use]
 pub fn split_handoff(text: &str) -> SplitHandoff {
     let mut out = SplitHandoff::default();
@@ -113,16 +231,27 @@ pub fn split_handoff(text: &str) -> SplitHandoff {
             kept.push(line);
             continue;
         };
-        let parsed = rest.split_once('|').and_then(|(kind, describe)| {
-            let describe = describe.trim();
-            let kind = ExhibitKind::parse(kind)?;
-            (!describe.is_empty()).then(|| ExhibitRequest {
-                kind,
-                describe: describe.chars().take(DESCRIBE_MAX_CHARS).collect(),
-            })
+        let mut usable: Vec<ExhibitAlternative> = Vec::new();
+        let mut bad: Vec<String> = Vec::new();
+        for part in split_alternatives(rest) {
+            match parse_alternative(part) {
+                Some(alt) => {
+                    if !usable.iter().any(|u| u.kind == alt.kind) {
+                        usable.push(alt);
+                    }
+                }
+                None => bad.push(format!("{REQUEST_MARKER} {}", part.trim())),
+            }
+        }
+        let mut usable = usable.into_iter();
+        let parsed = usable.next().map(|primary| ExhibitRequest {
+            kind: primary.kind,
+            describe: primary.describe,
+            alternatives: usable.collect(),
         });
         match parsed {
             Some(request) if out.requests.len() < MAX_PER_ACTION => {
+                out.rejected.extend(bad);
                 if !out
                     .requests
                     .iter()
@@ -219,7 +348,7 @@ pub fn guardian_exhibit_slots_conn(
         "SELECT r.action_idx, r.slot_idx, r.kind, r.describe, r.origin, r.why,
                 f.delivered_kind, f.url, f.caption, f.text, f.missing_reason,
                 f.forge_upload_id, f.run_id, f.updated_at_ms, f.local_path,
-                f.stale_upload_ids
+                f.stale_upload_ids, r.alternatives
          FROM guardian_exhibit_requests r
          LEFT JOIN guardian_exhibit_fills f
            ON f.guardian_id = r.guardian_id
@@ -241,6 +370,7 @@ pub fn guardian_exhibit_slots_conn(
             },
             kind,
             r.get::<_, String>(3)?,
+            r.get::<_, Option<String>>(16)?,
             origin,
             r.get::<_, Option<String>>(5)?,
             updated.map(|updated_at_ms| ExhibitFill {
@@ -262,14 +392,15 @@ pub fn guardian_exhibit_slots_conn(
     })?;
     let mut out = Vec::new();
     for row in rows {
-        let (key, kind, describe, origin, why, fill) = row?;
+        let (key, kind, describe, alternatives, origin, why, fill) = row?;
         // A kind this build no longer knows is skipped rather than guessed.
         let Some(kind) = ExhibitKind::parse(&kind) else {
             continue;
         };
         out.push(ExhibitSlot {
             key,
-            request: ExhibitRequest { kind, describe },
+            request: ExhibitRequest::single(kind, describe)
+                .with_stored_alternatives(alternatives.as_deref()),
             origin: ExhibitOrigin::parse(&origin),
             why,
             fill,
@@ -321,8 +452,9 @@ impl crate::store::Store {
             }
             self.conn.execute(
                 "INSERT INTO guardian_exhibit_requests
-                    (guardian_id, action_idx, slot_idx, kind, describe, origin, why, created_at_ms)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (guardian_id, action_idx, slot_idx, kind, describe, origin, why, created_at_ms,
+                     alternatives)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 rusqlite::params![
                     guardian_id,
                     action_idx,
@@ -331,7 +463,8 @@ impl crate::store::Store {
                     request.describe,
                     origin.as_str(),
                     why,
-                    now
+                    now,
+                    request.alternatives_json()
                 ],
             )?;
             keys.push(request.dedupe_key());
@@ -564,7 +697,8 @@ pub fn pr_slots(
         settings.max_per_pr,
     )
     .into_iter()
-    .map(|slot| {
+    .map(|mut slot| {
+        slot.request = slot.request.narrowed_to(&settings.kind_preference);
         let label = labels
             .get(&slot.key.action_idx)
             .cloned()
@@ -709,9 +843,8 @@ pub fn inference_prompt(
             out.push_str(&format!("- {}: {}\n", a.idx, one_line(&a.label)));
             for s in slots.iter().filter(|s| s.key.action_idx == a.idx) {
                 out.push_str(&format!(
-                    "    already requested: {} | {}\n",
-                    s.request.kind.as_str(),
-                    one_line(&s.request.describe)
+                    "    already requested: {}\n",
+                    request_line(&s.request)
                 ));
             }
         }
@@ -752,10 +885,13 @@ pub fn recipe_requests(
             };
             Some(InferredRequest {
                 owner: InferredOwner::New,
-                request: ExhibitRequest {
+                request: ExhibitRequest::single(
                     kind,
-                    describe: describe.chars().take(DESCRIBE_MAX_CHARS).collect(),
-                },
+                    describe
+                        .chars()
+                        .take(DESCRIBE_MAX_CHARS)
+                        .collect::<String>(),
+                ),
                 why: Some(format!(
                     "recipe \"{}\" in {}",
                     m.recipe.name,
@@ -797,10 +933,13 @@ pub fn parse_inferred(reply: &str) -> Vec<InferredRequest> {
                 .map_or(InferredOwner::New, InferredOwner::Action),
             _ => InferredOwner::New,
         };
-        let request = ExhibitRequest {
+        let request = ExhibitRequest::single(
             kind,
-            describe: describe.chars().take(DESCRIBE_MAX_CHARS).collect(),
-        };
+            describe
+                .chars()
+                .take(DESCRIBE_MAX_CHARS)
+                .collect::<String>(),
+        );
         if out
             .iter()
             .any(|r| r.request.dedupe_key() == request.dedupe_key())
@@ -868,8 +1007,9 @@ impl crate::store::Store {
                 None => {
                     self.conn.execute(
                         "INSERT INTO guardian_pending_exhibits
-                            (guardian_id, branch_id, kind, describe, why, origin, created_at_ms)
-                         VALUES (?, ?, ?, ?, ?, ?, ?)",
+                            (guardian_id, branch_id, kind, describe, why, origin, created_at_ms,
+                             alternatives)
+                         VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                         rusqlite::params![
                             guardian_id,
                             branch_id,
@@ -877,7 +1017,8 @@ impl crate::store::Store {
                             r.request.describe,
                             r.why,
                             origin.as_str(),
-                            crate::store::now_ms()
+                            crate::store::now_ms(),
+                            r.request.alternatives_json()
                         ],
                     )?;
                 }
@@ -896,14 +1037,30 @@ impl crate::store::Store {
     ///
     /// On a database failure.
     pub fn assign_pending_exhibits(&self, guardian_id: &str) -> Result<()> {
-        let pending: Vec<(String, String, String, Option<String>, String)> = self
+        type PendingRow = (
+            String,
+            String,
+            String,
+            Option<String>,
+            String,
+            Option<String>,
+        );
+        let pending: Vec<PendingRow> = self
             .conn
             .prepare(
-                "SELECT branch_id, kind, describe, why, origin FROM guardian_pending_exhibits
+                "SELECT branch_id, kind, describe, why, origin, alternatives
+                 FROM guardian_pending_exhibits
                  WHERE guardian_id=? ORDER BY rowid",
             )?
             .query_map(rusqlite::params![guardian_id], |r| {
-                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                ))
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         if pending.is_empty() {
@@ -912,14 +1069,12 @@ impl crate::store::Store {
         type Waiting = Vec<(ExhibitOrigin, ExhibitRequest, Option<String>)>;
         let mut by_branch: std::collections::BTreeMap<String, Waiting> =
             std::collections::BTreeMap::new();
-        for (branch, kind, describe, why, origin) in &pending {
+        for (branch, kind, describe, why, origin, alternatives) in &pending {
             if let Some(kind) = ExhibitKind::parse(kind) {
                 by_branch.entry(branch.clone()).or_default().push((
                     ExhibitOrigin::parse(origin),
-                    ExhibitRequest {
-                        kind,
-                        describe: describe.clone(),
-                    },
+                    ExhibitRequest::single(kind, describe.clone())
+                        .with_stored_alternatives(alternatives.as_deref()),
                     why.clone(),
                 ));
             }
@@ -1032,7 +1187,11 @@ item, run whatever else shows it now. Use the project's own capture tools when i
 them; otherwise, when the `ralphus` command is available, \
 `ralphus exhibit screenshot --pid <process id> -o <dir>/<name>.png` or \
 `ralphus exhibit record --pid <process id> --seconds 5 -o <dir>/<name>.gif` (or --screen \
-instead of --pid) captures a window you started into that directory.\n",
+instead of --pid) captures a window you started into that directory. \
+An item that lists fallbacks is still one item: deliver the first kind you can capture, \
+saved under that item's id, and capture exactly what THAT kind's description says (a \
+fallback has its own target, not just another view of the first one). Make the caption \
+describe the file you delivered, not the first request.\n",
         ralphus_runner::exhibit_upload::DIR_PLACEHOLDER,
         if dir_env {
             format!(" (also in ${DIR_ENV})")
@@ -1046,12 +1205,25 @@ instead of --pid) captures a window you started into that directory.\n",
     out.push_str(&kind_glossary());
     out.push_str("Items:\n");
     for slot in slots {
+        let request = slot.request.narrowed_to(&settings.kind_preference);
+        let mut pairs = request.pairs();
+        let Some((kind, describe)) = pairs.next() else {
+            continue;
+        };
         out.push_str(&format!(
-            "- {} ({}): {}\n",
+            "- {} ({}): {}",
             slot_label(slot.key),
-            slot.request.kind.as_str(),
-            one_line(&slot.request.describe)
+            kind.as_str(),
+            one_line(describe)
         ));
+        for (kind, describe) in pairs {
+            out.push_str(&format!(
+                " -- if that cannot be captured, ({}): {}",
+                kind.as_str(),
+                one_line(describe)
+            ));
+        }
+        out.push('\n');
     }
     out.push_str(&format!(
         "\nFor every item, end your reply with one line `{REPORT_MARKER} ` followed by a \
@@ -1193,6 +1365,15 @@ pub fn slot_end(key: SlotKey) -> String {
 /// The common prefix of every slot start marker.
 const ANY_SLOT_START: &str = "<!-- ralphus:exhibit:start ";
 
+/// A request as one `kind | describe` line, fallbacks joined by ` || `.
+fn request_line(request: &ExhibitRequest) -> String {
+    request
+        .pairs()
+        .map(|(k, d)| format!("{} | {}", k.as_str(), one_line(d)))
+        .collect::<Vec<_>>()
+        .join(" || ")
+}
+
 fn one_line(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
@@ -1236,7 +1417,6 @@ pub fn render_slot(
     forge: crate::forge::ForgeKind,
 ) -> String {
     let requested = slot.request.kind;
-    let describe = one_line(&slot.request.describe);
     let source = if action_label.trim().is_empty() {
         String::new()
     } else {
@@ -1251,6 +1431,7 @@ pub fn render_slot(
     match delivered {
         Some(fill) => {
             let kind = fill.delivered_kind.unwrap_or(requested);
+            let describe = one_line(slot.request.describe_for(kind));
             let note = if kind == requested {
                 String::new()
             } else {
@@ -1271,6 +1452,7 @@ pub fn render_slot(
             }
         }
         None => {
+            let describe = one_line(&slot.request.describe);
             out.push_str(&format!(
                 "- [ ] **{}** — {describe}{source}\n",
                 requested.display()
@@ -1399,10 +1581,7 @@ mod tests {
     use crate::forge::ForgeKind;
 
     fn req(kind: ExhibitKind, describe: &str) -> ExhibitRequest {
-        ExhibitRequest {
-            kind,
-            describe: describe.to_string(),
-        }
+        ExhibitRequest::single(kind, describe)
     }
 
     fn slot(action: i64, idx: i64, kind: ExhibitKind, describe: &str) -> ExhibitSlot {
@@ -1469,6 +1648,147 @@ mod tests {
         let split =
             split_handoff("EXHIBIT: gif | Drag  the slider\nEXHIBIT: GIF | drag the slider");
         assert_eq!(split.requests.len(), 1);
+    }
+
+    fn two_kind(primary: &str, fallback: &str) -> ExhibitRequest {
+        let mut r = req(ExhibitKind::Gif, primary);
+        r.alternatives.push(ExhibitAlternative {
+            kind: ExhibitKind::Screenshot,
+            describe: fallback.to_string(),
+        });
+        r
+    }
+
+    #[test]
+    fn a_two_kind_line_is_one_request_with_each_description() {
+        let split = split_handoff("EXHIBIT: gif | A || screenshot | B || gif | C");
+        assert_eq!(split.requests, vec![two_kind("A", "B")]);
+        assert!(split.rejected.is_empty());
+    }
+
+    #[test]
+    fn a_description_may_contain_pipes_that_are_not_alternatives() {
+        let split = split_handoff("EXHIBIT: output | run a | b || c and a || screenshot | the end");
+        assert_eq!(split.requests.len(), 1);
+        let r = &split.requests[0];
+        assert_eq!(r.describe, "run a | b || c and a");
+        assert_eq!(r.alternatives.len(), 1);
+        assert_eq!(r.alternatives[0].describe, "the end");
+    }
+
+    #[test]
+    fn a_fallback_without_a_description_is_rejected_not_inherited() {
+        for line in [
+            "EXHIBIT: gif | A || screenshot |",
+            "EXHIBIT: gif | A || screenshot",
+        ] {
+            let split = split_handoff(line);
+            assert_eq!(split.requests, vec![req(ExhibitKind::Gif, "A")], "{line}");
+            assert_eq!(split.rejected.len(), 1, "{line}");
+        }
+    }
+
+    #[test]
+    fn a_bad_primary_promotes_the_first_good_fallback() {
+        let split = split_handoff("EXHIBIT: gif |  || screenshot | B");
+        assert_eq!(split.requests, vec![req(ExhibitKind::Screenshot, "B")]);
+        assert_eq!(split.rejected.len(), 1);
+    }
+
+    #[test]
+    fn a_line_of_only_bad_alternatives_is_rejected() {
+        let split = split_handoff("EXHIBIT: gif | || screenshot |");
+        assert!(split.requests.is_empty());
+        assert!(!split.rejected.is_empty());
+    }
+
+    #[test]
+    fn a_request_dedupes_on_its_primary() {
+        let split = split_handoff(
+            "EXHIBIT: gif | A || screenshot | B
+EXHIBIT: gif | a || output | C",
+        );
+        assert_eq!(split.requests.len(), 1);
+    }
+
+    #[test]
+    fn alternatives_round_trip_through_storage_and_old_rows_have_none() {
+        let store = crate::store::Store::open_in_memory().unwrap();
+        let gid = store.create_guardian("r", "main", "/repo").unwrap();
+        store
+            .add_exhibit_requests(
+                &gid,
+                0,
+                ExhibitOrigin::Handoff,
+                &[
+                    (two_kind("A", "B"), None),
+                    (req(ExhibitKind::Output, "log"), None),
+                ],
+            )
+            .unwrap();
+        let slots = store.guardian_exhibit_slots(&gid).unwrap();
+        assert_eq!(slots[0].request, two_kind("A", "B"));
+        assert!(slots[1].request.alternatives.is_empty());
+    }
+
+    #[test]
+    fn a_delivered_fallback_uses_its_own_description_everywhere() {
+        let mut s = slot(0, 0, ExhibitKind::Gif, "A");
+        s.request = two_kind("A", "B");
+        s.fill = Some(ExhibitFill {
+            url: Some("https://x/a.png".to_string()),
+            delivered_kind: Some(ExhibitKind::Screenshot),
+            updated_at_ms: 1,
+            ..ExhibitFill::default()
+        });
+        let text = render_slot(&s, "", ForgeKind::GitHub);
+        assert!(
+            text.contains("- [x] **GIF** (delivered as screenshot) — B"),
+            "{text}"
+        );
+        assert!(text.contains("![B](https://x/a.png)"), "{text}");
+        assert!(!text.contains("— A"), "{text}");
+        s.fill.as_mut().unwrap().delivered_kind = Some(ExhibitKind::Gif);
+        let text = render_slot(&s, "", ForgeKind::GitHub);
+        assert!(text.contains("- [x] **GIF** — A"), "{text}");
+        assert!(!text.contains("delivered as"), "{text}");
+    }
+
+    #[test]
+    fn a_step_down_to_an_unlisted_kind_uses_the_primary_description() {
+        assert_eq!(two_kind("A", "B").describe_for(ExhibitKind::Video), "A");
+    }
+
+    #[test]
+    fn narrowing_follows_the_review_preference() {
+        let shots = [ExhibitKind::Screenshot];
+        assert_eq!(
+            two_kind("A", "B").narrowed_to(&shots),
+            req(ExhibitKind::Screenshot, "B")
+        );
+        assert_eq!(
+            req(ExhibitKind::Gif, "A").narrowed_to(&shots),
+            req(ExhibitKind::Screenshot, "A")
+        );
+        let mut with_output = req(ExhibitKind::Gif, "A");
+        with_output.alternatives.push(ExhibitAlternative {
+            kind: ExhibitKind::Output,
+            describe: "log".into(),
+        });
+        assert_eq!(
+            with_output.narrowed_to(&shots),
+            req(ExhibitKind::Output, "log")
+        );
+    }
+
+    #[test]
+    fn the_run_prompt_lists_each_alternative_with_its_own_description() {
+        let mut s = slot(0, 0, ExhibitKind::Gif, "A");
+        s.request = two_kind("drag motion", "chart at zoom 1");
+        let text = run_prompt_section(&[s], &ExhibitSettings::default(), false);
+        let line = text.lines().find(|l| l.starts_with("- 0.0")).unwrap();
+        assert!(line.contains("(gif): drag motion"), "{line}");
+        assert!(line.contains("(screenshot): chart at zoom 1"), "{line}");
     }
 
     #[test]

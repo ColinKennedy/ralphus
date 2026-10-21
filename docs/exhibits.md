@@ -22,6 +22,19 @@ a Qt desktop app, anything with output a person would look at.
    4,000 characters; the earlier name `output` is still accepted). The agent is
    told to ask only for what a reviewer must *see*.
 
+   A request can list fallbacks after `||`, in order, each with its own
+   description:
+
+   ```
+   EXHIBIT: gif | dragging the zoom slider from 0 to 1 magnifies the chart || screenshot | the chart magnified at zoom 1
+   ```
+
+   It is still one slot. Whatever is delivered is described by the pair that
+   matches the delivered kind (PR checklist, caption fallback, image alt text,
+   board panel). Every fallback needs its own description; one without is
+   dropped and logged. A review's `exhibit_kind_preference` narrows the list,
+   keeping order and descriptions.
+
 2. **Each request becomes a slot in the PR.** When live actions are created,
    every request follows its handoff into exactly one live action. The PR of
    the branch that action covers gets a managed `## Exhibits` section with

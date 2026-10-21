@@ -2939,6 +2939,7 @@ impl Store {
                 origin        TEXT NOT NULL,
                 why           TEXT,
                 created_at_ms INTEGER NOT NULL,
+                alternatives  TEXT,
                 PRIMARY KEY (guardian_id, action_idx, slot_idx)
             );
             -- Exhibit requests the PR writer added before the review had a
@@ -2951,7 +2952,8 @@ impl Store {
                 describe      TEXT NOT NULL,
                 why           TEXT,
                 origin        TEXT NOT NULL DEFAULT 'inferred',
-                created_at_ms INTEGER NOT NULL
+                created_at_ms INTEGER NOT NULL,
+                alternatives  TEXT
             );
             -- What a live run delivered for an exhibit slot; a re-run
             -- replaces the row.
@@ -3483,6 +3485,9 @@ impl Store {
         // existed. Each fails harmlessly (duplicate column) once present.
         for stmt in [
             "ALTER TABLE presets ADD COLUMN prompt TEXT",
+            // Fallback (kind, describe) pairs of an exhibit request, as JSON.
+            "ALTER TABLE guardian_exhibit_requests ADD COLUMN alternatives TEXT",
+            "ALTER TABLE guardian_pending_exhibits ADD COLUMN alternatives TEXT",
             "ALTER TABLE guardian_live_run_evidence ADD COLUMN original_result TEXT",
             // A scored-proof threshold a preset supplies to an extending
             // proof step's unset `pass_score`.

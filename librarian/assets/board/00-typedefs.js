@@ -431,7 +431,8 @@
        * @property {number} slot_idx
        * @property {string|null} action_label
        * @property {"gif"|"video"|"screenshot"|"terminal-text"} kind - What was asked for.
-       * @property {string} describe - What to show.
+       * @property {string} describe - What to show for `kind`.
+       * @property {{kind: "gif"|"video"|"screenshot"|"terminal-text", describe: string}[]} alternatives - Fallback kinds after `kind`, each with the description written for what that kind can show.
        * @property {"handoff"|"recipe"|"inferred"} origin - Who asked: the change's own agent, a config recipe, or the PR writer.
        * @property {string|null} why - Why an inferred request was added.
        * @property {"gif"|"video"|"screenshot"|"terminal-text"|null} delivered_kind - What a run actually delivered, which can be lower in the preference order.
