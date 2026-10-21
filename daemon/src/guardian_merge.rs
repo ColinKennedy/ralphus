@@ -6312,7 +6312,9 @@ pub fn run_merge_staged(
             return;
         }
     };
-    if let Err(error) = preflight_resolver_agent(runner, &resolved, guardian.machine.as_deref()) {
+    let review_machine =
+        crate::allocations::review_machine(store, &guardian.id, guardian.machine.as_deref());
+    if let Err(error) = preflight_resolver_agent(runner, &resolved, review_machine.as_deref()) {
         set_status(GuardianStatus::MergeFailed, Some(&error));
         return;
     }
@@ -7086,7 +7088,9 @@ pub fn run_merge_cancellable(
             return;
         }
     };
-    if let Err(error) = preflight_resolver_agent(runner, &resolved, guardian.machine.as_deref()) {
+    let review_machine =
+        crate::allocations::review_machine(store, &guardian.id, guardian.machine.as_deref());
+    if let Err(error) = preflight_resolver_agent(runner, &resolved, review_machine.as_deref()) {
         set_status(GuardianStatus::MergeFailed, Some(&error));
         return;
     }
@@ -15838,6 +15842,16 @@ fn fetch_base_branch(
                 // Git 2.40+ says "refusing to fetch into branch ... checked
                 // out at"; older git "Refusing to fetch into current branch".
                 Err(e) if e.to_ascii_lowercase().contains("refusing to fetch into") => {
+                    // On a machine the repository is the provider's clone,
+                    // which nobody works in: detach it so the base can move.
+                    if ws.machine().is_some()
+                        && ws.git(&["checkout", "--quiet", "--detach"]).is_ok()
+                        && ws
+                            .git(&["fetch", "--no-write-fetch-head", remote, &refspec])
+                            .is_ok()
+                    {
+                        return Ok(());
+                    }
                     warn_checked_out_base_once(store, target);
                     let tracking = format!("+refs/heads/{branch}:refs/remotes/{remote}/{branch}");
                     ws.git(&["fetch", "--no-write-fetch-head", remote, &tracking])

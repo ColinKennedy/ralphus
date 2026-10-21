@@ -948,6 +948,9 @@ pub fn derive_reviews_with_full_prefetch(
     if let Some(progress) = progress {
         progress("Authenticating remote machines");
     }
+    // A provider-service request becomes a machine before any worktree is
+    // made on it (the scheduler does the same for squads without a review).
+    crate::allocations::bind_squad(store, squad_id, &mut cells).map_err(ReviewError::new)?;
     crate::worktrees::resolve_placeholders_with_full_prefetch(
         store,
         squad_id,

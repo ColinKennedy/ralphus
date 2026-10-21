@@ -111,8 +111,9 @@ An **allocation** is one machine handed to ralphus for a scope of work:
   which keeps the existing affinity rule ("the same `machine` value means the
   same machine": a task's cells together, a review on its cells' machine). A
   walk runs once per scope and its result is pinned.
-- **When.** A squad's requests are granted when the scheduler picks the squad
-  up, before any worktree is made; a review's own request (`[[review]]
+- **When.** A squad's requests are granted before any worktree is made for it:
+  at submit when its cells feed a review, otherwise when the scheduler picks
+  it up. A finished review is never given a machine. A review's own request (`[[review]]
   machine` or the project default) the first time the review is used, reusing
   an allocation one of its squads holds for the same request so the review
   merges where its cells ran. A request no provider grants fails the squad

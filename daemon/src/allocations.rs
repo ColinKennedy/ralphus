@@ -644,6 +644,18 @@ pub fn token_for(
         )
     })?;
     remember_token(row.id, &renewed);
+    // ralphus[ignore-rlog-pair]: called from a Machine API call's token source, which has no Store
+    crate::rlog!(
+        INFO,
+        "ralphus [allocations] renewed the token of allocation {} ({}){}",
+        row.allocation_id,
+        row.machine(),
+        if force {
+            " after the provider refused it"
+        } else {
+            ""
+        }
+    );
     Ok(renewed.token)
 }
 
@@ -841,6 +853,15 @@ pub fn bind_review(
         let guardian = guard
             .get_guardian(guardian_id)
             .map_err(|e| format!("could not load review {guardian_id}: {e}"))?;
+        // A finished review is only ever read (its PR polled, say); asking for
+        // a machine for it would hold one nothing will use.
+        if crate::guardian::GuardianStatus::is_terminal_status(&guardian.status) {
+            return Err(format!(
+                "review {guardian_id} is {}, so it is not given a machine; reopen it to run \
+                 work on one",
+                guardian.status
+            ));
+        }
         let mut squads: Vec<String> = guardian.squad_id.into_iter().collect();
         squads.extend(
             guardian
@@ -879,6 +900,25 @@ pub fn bind_review(
         .set_guardian_machine(guardian_id, Some(&machine))
         .map_err(|e| format!("could not record machine {machine} on review {guardian_id}: {e}"))?;
     Ok(machine)
+}
+
+/// The machine review `guardian_id` runs on, given its stored `machine`: a
+/// provider request with no live allocation is granted first. When nothing
+/// grants it the stored value is returned, and using it fails with that
+/// reason.
+#[must_use]
+pub fn review_machine(
+    store: &crate::store_lock::StoreHandle,
+    guardian_id: &str,
+    machine: Option<&str>,
+) -> Option<String> {
+    let current = machine?;
+    match request_needing_grant(store, current) {
+        Some(request) => bind_review(store, guardian_id, &request)
+            .ok()
+            .or_else(|| Some(current.to_string())),
+        None => Some(current.to_string()),
+    }
 }
 
 /// The request to grant for `machine` when it has no live allocation: an
@@ -1048,6 +1088,12 @@ pub fn maintain(store: &crate::store_lock::StoreHandle) {
         }
         if idle != row.idle && set_idle(service, &row.allocation_id, idle).is_ok() {
             let _ = store.lock().set_machine_allocation_idle(row.id, idle);
+            let message = if idle {
+                "machine marked idle"
+            } else {
+                "machine no longer idle"
+            };
+            note(store, &row, crate::logging::LogLevel::INFO, message);
         }
     }
 }
@@ -1585,6 +1631,33 @@ mod tests {
             .expect_err("no windows machine");
         assert!(err.contains("box runs linux, not windows"), "{err}");
         assert!(err.contains("no_matching_machine"), "{err}");
+    }
+
+    #[test]
+    fn a_finished_review_is_not_given_a_machine() {
+        // Its PR is still polled after it is cancelled; that must not hold a
+        // machine nothing will use.
+        let fleet = FakeFleet::start("finished-review", |_, _, _| (200, granted("alloc-f")));
+        crate::provider_services::set_services_for_test(vec![fleet.service.clone()]);
+        let store = handle(Store::open_in_memory().unwrap());
+        let id = {
+            let guard = store.lock();
+            let id = guard.create_guardian("r", "main", "/srv/p").unwrap();
+            guard
+                .set_guardian_status(&id, crate::guardian::GuardianStatus::Cancelled, None)
+                .unwrap();
+            id
+        };
+
+        let err = bind_review(&store, &id, "@finished-review").expect_err("finished");
+
+        assert!(err.contains("cancelled"), "{err}");
+        assert!(fleet.requests().is_empty(), "no provider was asked");
+        assert_eq!(
+            review_machine(&store, &id, Some("@finished-review")).as_deref(),
+            Some("@finished-review"),
+            "the stored request is kept"
+        );
     }
 
     #[test]
