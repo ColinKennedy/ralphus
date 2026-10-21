@@ -2956,7 +2956,7 @@ fn parse_suggested_pr(text: &str) -> Option<(String, String, Vec<i64>)> {
 
     let marker_at = text.find(MARKER)?;
     let (head, tail) = text.split_at(marker_at);
-    let description = tail[MARKER.len()..]
+    let description = strip_agent_reply_markers(&tail[MARKER.len()..])
         .trim_start_matches(['\n', '\r'])
         .trim_end()
         .to_string();
@@ -2976,6 +2976,51 @@ fn parse_suggested_pr(text: &str) -> Option<(String, String, Vec<i64>)> {
         })
         .unwrap_or_default();
     Some((title, description, relevant_prophecy_ids))
+}
+
+/// Removes the runner's reply markers from a PR-writer reply. Every prompt
+/// run is asked for a `RALPHUS_GHOST:` handoff section and
+/// `RALPHUS_PROPHECY:` lines, and a backend that does not strip them from its
+/// summary would otherwise publish them in the PR body. A prophecy is one
+/// line; a ghost section is its marker line plus the bullets under it. Lines
+/// inside code fences are kept, so a description that quotes the syntax is
+/// left intact.
+fn strip_agent_reply_markers(text: &str) -> String {
+    let mut kept: Vec<&str> = Vec::new();
+    let mut in_fence = false;
+    let mut in_ghost = false;
+    for line in text.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+            in_ghost = false;
+            in_fence = !in_fence;
+            kept.push(line);
+            continue;
+        }
+        if in_fence {
+            kept.push(line);
+            continue;
+        }
+        if in_ghost {
+            let continues = trimmed.is_empty()
+                || trimmed.starts_with("- ")
+                || trimmed.starts_with("* ")
+                || line.starts_with([' ', '\t']);
+            if continues {
+                continue;
+            }
+            in_ghost = false;
+        }
+        if trimmed.starts_with("RALPHUS_GHOST:") {
+            in_ghost = true;
+            continue;
+        }
+        if trimmed.starts_with("RALPHUS_PROPHECY:") {
+            continue;
+        }
+        kept.push(line);
+    }
+    kept.join("\n")
 }
 
 /// The `RunnerSpec` for a one-shot PR-writer turn on `position`'s branch: the
@@ -3079,7 +3124,8 @@ fn attribute_description(
             let spec = pr_writer_spec(guardian, position, resolved, prompt, trace_context);
             let result = runner.run(&spec);
             if result.is_done() {
-                let candidate = result.summary.trim_matches(['\r', '\n']);
+                let candidate = strip_agent_reply_markers(&result.summary);
+                let candidate = candidate.trim_matches(['\r', '\n']);
                 if crate::pr_attribution::agent_placement_is_valid(description, candidate) {
                     return candidate.to_string();
                 }
@@ -24669,6 +24715,35 @@ token_env = "RALPHUS_TEST_FORGE_TOKEN"
             strip_remote_prefix("upstream/main", "origin"),
             "upstream/main"
         );
+    }
+
+    #[test]
+    fn parse_suggested_pr_drops_trailing_prophecy_and_ghost_markers() {
+        let (_, d, _) = parse_suggested_pr(
+            "TITLE: Fix bug\n===DESCRIPTION===\n## Summary\n\nFixes it.\n\n\
+             RALPHUS_PROPHECY: decision: chose X\n\
+             RALPHUS_PROPHECY: unconfirmed: did not run Y\n\
+             RALPHUS_GHOST: (nothing to report)\n",
+        )
+        .unwrap();
+        assert_eq!(d, "## Summary\n\nFixes it.");
+    }
+
+    #[test]
+    fn parse_suggested_pr_drops_a_ghost_section_with_its_bullets() {
+        let (_, d, _) = parse_suggested_pr(
+            "TITLE: Fix bug\n===DESCRIPTION===\nFixes it.\n\nRALPHUS_GHOST: \n\
+             - did not commit\n- note [12] was out of range\n  and left out\n\n## Testing\n\nRan it.",
+        )
+        .unwrap();
+        assert_eq!(d, "Fixes it.\n\n## Testing\n\nRan it.");
+    }
+
+    #[test]
+    fn strip_agent_reply_markers_keeps_fenced_examples_and_mid_line_mentions() {
+        let text = "Documents the `RALPHUS_PROPHECY:` marker:\n\n```\n\
+                    RALPHUS_PROPHECY: hazard: example\nRALPHUS_GHOST: (nothing to report)\n```\n";
+        assert_eq!(strip_agent_reply_markers(text), text.trim_end());
     }
 
     #[test]
