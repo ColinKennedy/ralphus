@@ -11025,7 +11025,11 @@ mod live_exhibit_tests {
             Some(token),
         );
         let up = round_trip(&client, mr.parse().unwrap());
-        assert!(up.url.starts_with("/uploads/"), "{}", up.url);
+        assert!(
+            up.url.starts_with("https://gitlab.com/-/project/"),
+            "{}",
+            up.url
+        );
         let id = up.upload_id.expect("GitLab returns a deletable id");
         client.delete_attachment(&id).expect("delete");
     }
