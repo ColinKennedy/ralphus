@@ -259,6 +259,7 @@ fn parse_capability_save(args: &[String], replace: bool) -> Result<AgentCapabili
     let command = scanner.take_value("--command").map_err(|e| e.0)?;
     let url = scanner.take_value("--url").map_err(|e| e.0)?;
     let path = scanner.take_value("--path").map_err(|e| e.0)?;
+    let description = scanner.take_value("--description").map_err(|e| e.0)?;
     let cmd_args = scanner.take_repeated("--arg").map_err(|e| e.0)?;
     let sets = scanner.take_repeated("--set").map_err(|e| e.0)?;
     let links = scanner.take_repeated("--link").map_err(|e| e.0)?;
@@ -283,6 +284,7 @@ fn parse_capability_save(args: &[String], replace: bool) -> Result<AgentCapabili
             "mcp": {
                 "command": command, "args": cmd_args, "env": env_json(env),
                 "url": url, "headers": env_json(headers),
+                "description": description,
             },
         })
     };

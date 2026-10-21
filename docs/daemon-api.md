@@ -279,6 +279,7 @@ which input(s) failed and why, rather than substituting it.
 | PATCH | `/api/projects/{name}/forks/{user}` | Field-selective update of one user's fork row |
 | DELETE | `/api/projects/{name}/forks/{user}` | Remove one user's fork row |
 | GET | `/api/health/project-forks` | [Advisory health checks](#fork-registration-ral-338) for every registered fork row |
+| GET | `/api/health/mcp` | Live probe of every registered MCP server (admin-only; `used_only=1` filters to servers enabled on a profile) |
 
 **Shell syntax (RAL-644)**
 | Method | Path | What |
@@ -1351,7 +1352,7 @@ only when the global config has `[agents] allow_ralphus_mcp = true` (default
 
 #### `POST /api/capabilities`
 Create an item (`kind`, `name`, `mcp` or `skill`). `409 already_exists` if the
-name is taken, `400` for an invalid definition. Response `{ "kind", "name" }`.
+name is taken, `400` for an invalid definition. Response `{ "kind", "name" }`. An `mcp` definition may carry an optional free-text `description` (trimmed, at most 500 characters; longer is `400`) that `check health` uses to explain what breaks when the server is down.
 
 #### `PATCH /api/capabilities/{kind}/{name}`
 Replace an item's definition. A masked `set` value sent back unchanged keeps
@@ -3235,6 +3236,17 @@ related, no relationship, not visible/confirmable, or cross-instance
 impossible). `status` is `pass`/`warn`/`fail`; a `fail` here is advisory only
 and does not itself block anything — submission's own pre-flight
 (`POST /api/guardians/{id}/pull-requests`, above) is what's authoritative.
+
+`GET /api/health/mcp` (admin-only; `?used_only=1` keeps only servers enabled on
+at least one agent profile) probes every registered MCP server live on the
+daemon host and returns `{"servers": [...]}`. Nothing is cached or stored; the
+hourly sweep never calls it. Each entry is
+`{ "name", "status": "ok"|"warn", "detail", "description", "profiles", "tool_count" }`.
+`warn` covers a spawn failure, a failed `initialize`, an unreachable HTTP
+endpoint, or a server that lists zero tools. `description` is the catalog
+entry's `description`, else the server's own `serverInfo`/`instructions`, else
+a generic fallback. Secrets are never included. The CLI renders these as the
+`mcp` section of `ralphus check health`.
 
 See [`fork-workflows.md`](fork-workflows.md) for topology, promotion, and
 setup guidance.

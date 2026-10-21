@@ -135,6 +135,7 @@ ENDPOINT_TO_CLI: dict[str, list[str]] = {
     "DELETE /api/agent-backend-commands/{backend}": ["agent backend-command reset"],
     "GET /api/agent-backend-commands/{backend}/profiles": ["agent backend-command profiles"],
     "GET /api/health/project-forks": ["check health"],
+    "GET /api/health/mcp": ["check health"],
     "POST /api/health/arbiter": ["check health"],
     "GET /api/health/catalog": ["check catalog"],
     "GET /api/health/threads": ["check health"],

@@ -1832,7 +1832,7 @@ fn persist_default_admin(name: &str) -> Result<(PathBuf, bool), String> {
 fn step_health(opts: &GlobalOpts) -> Vec<CheckResult> {
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     println!("  a passing `ralphus check health` is required before ralphus can run real work.");
-    let results = crate::health::run_checks(&opts.daemon_url, &cwd, false, false, false);
+    let results = crate::health::run_checks(&opts.daemon_url, &cwd, false, false, false, false);
     let _ = crate::commands::misc::report_health(opts, &cwd, &results);
     results
 }

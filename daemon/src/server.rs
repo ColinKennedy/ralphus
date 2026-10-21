@@ -1587,6 +1587,9 @@ fn route_for_user(
         ("GET", ["api", "resources"]) => resources(daemon),
         ("GET", ["api", "health", "agent-profiles"]) => agent_profiles_health(daemon, query),
         ("GET", ["api", "health", "project-forks"]) => project_forks_health(daemon),
+        ("GET", ["api", "health", "mcp"]) => {
+            admin_gated(daemon, user_header, || mcp_health(daemon, query))
+        }
         ("POST", ["api", "health", "arbiter"]) => health_arbiter(daemon),
         // ralphus[ignore-endpoint-cli]: display-only syntax split for the board's agent log (RAL-644); nothing for a CLI user to call
         ("POST", ["api", "shell-syntax", "parse"]) => shell_syntax_parse(body),
@@ -5559,6 +5562,131 @@ fn project_forks_health(daemon: &Daemon) -> Reply {
         checks.extend(fork_checks);
     }
     json(200, &serde_json::json!({ "checks": checks }))
+}
+
+/// `GET /api/health/mcp[?used_only=1]`: probe every registered MCP server
+/// (the built-in `ralphus` entry included) live and report one row each.
+///
+/// Nothing is cached or stored: the probes run on every call, on this daemon's
+/// host, so the result is never staler than the request. Servers are probed in
+/// parallel, each bounded by the probe's own per-step timeout. The store lock
+/// is released before any probe starts -- a probe spawns a process or makes an
+/// HTTP round-trip. The reply carries no env/header values. `used_only=1`
+/// keeps the servers at least one profile has enabled.
+///
+/// A row's `status` is `ok` or `warn`, never a failure: a spawn/`initialize`/
+/// HTTP failure or a server with no tools both become `warn`. `description`
+/// is the catalog entry's own, else what the server said in `initialize`,
+/// else a generic line naming the server.
+fn mcp_health(daemon: &Daemon, query: &str) -> Reply {
+    let used_only = matches!(query_param(query, "used_only"), Some("1" | "true"));
+    let allow = allow_ralphus_mcp();
+    let (names, enabling) = {
+        let store = daemon.lock();
+        let items = match store.list_capability_items(allow) {
+            Ok(items) => items,
+            Err(e) => return store_error(&e),
+        };
+        let enabling = match store.mcp_enabling_profiles() {
+            Ok(m) => m,
+            Err(e) => return store_error(&e),
+        };
+        let names: Vec<String> = items
+            .into_iter()
+            .filter(|i| i.kind == crate::capability_store::CapabilityKind::Mcp)
+            .map(|i| i.name)
+            .collect();
+        (names, enabling)
+    };
+    let mut servers = Vec::new();
+    for name in names {
+        let profiles = enabling.get(&name).cloned().unwrap_or_default();
+        if used_only && profiles.is_empty() {
+            continue;
+        }
+        // The probe needs the real (unmasked) env/headers.
+        let fetched = daemon.lock().get_capability_item(
+            crate::capability_store::CapabilityKind::Mcp,
+            &name,
+            allow,
+        );
+        match fetched {
+            Ok(Some(item)) => servers.push((name, item.mcp.unwrap_or_default(), profiles)),
+            Ok(None) => {}
+            Err(e) => return store_error(&e),
+        }
+    }
+    let probed_on = std::env::var("COMPUTERNAME")
+        .or_else(|_| std::env::var("HOSTNAME"))
+        .ok()
+        .filter(|h| !h.trim().is_empty())
+        .map_or_else(
+            || "the daemon host".to_string(),
+            |h| format!("the daemon host ({h})"),
+        );
+    let rows: Vec<serde_json::Value> = std::thread::scope(|scope| {
+        let handles: Vec<_> = servers
+            .iter()
+            .map(|(_, config, _)| scope.spawn(|| crate::capability_probe::probe_mcp(config)))
+            .collect();
+        servers
+            .iter()
+            .zip(handles)
+            .map(|((name, config, profiles), handle)| {
+                let outcome = handle
+                    .join()
+                    .unwrap_or_else(|_| crate::capability_probe::ProbeOutcome::probe_panicked());
+                mcp_health_row(name, config, profiles, &outcome, &probed_on)
+            })
+            .collect()
+    });
+    json(200, &serde_json::json!({ "servers": rows }))
+}
+
+/// One `GET /api/health/mcp` row from a probe outcome.
+fn mcp_health_row(
+    name: &str,
+    config: &crate::capability_store::McpConfig,
+    profiles: &[String],
+    outcome: &crate::capability_probe::ProbeOutcome,
+    probed_on: &str,
+) -> serde_json::Value {
+    let (status, detail) = if !outcome.ok {
+        let why = outcome
+            .detail
+            .clone()
+            .unwrap_or_else(|| "the probe failed".to_string());
+        ("warn", format!("probed on {probed_on}: {why}"))
+    } else if outcome.tool_count == Some(0) {
+        (
+            "warn",
+            format!(
+                "probed on {probed_on}: the server started and answered `initialize`, but \
+                 `tools/list` returned no tools, so agents get nothing from it"
+            ),
+        )
+    } else {
+        (
+            "ok",
+            format!(
+                "probed on {probed_on}: {} tool(s) available",
+                outcome.tool_count.unwrap_or(0)
+            ),
+        )
+    };
+    let description = config
+        .description
+        .clone()
+        .or_else(|| outcome.server_info.clone())
+        .unwrap_or_else(|| format!("MCP server `{name}`"));
+    serde_json::json!({
+        "name": name,
+        "status": status,
+        "detail": detail,
+        "description": description,
+        "profiles": profiles,
+        "tool_count": outcome.tool_count,
+    })
 }
 
 /// Resolve the current placeholder identity from the request header, falling
@@ -25061,6 +25189,115 @@ triage=true
         let health = route(&d, "GET", "/api/health/project-forks", "");
         assert_eq!(health.status, 200, "{}", health.body);
         assert!(health.body.contains("\"checks\":[]"));
+    }
+
+    fn mcp_outcome(
+        ok: bool,
+        tools: Option<i64>,
+        info: Option<&str>,
+    ) -> crate::capability_probe::ProbeOutcome {
+        crate::capability_probe::ProbeOutcome {
+            ok,
+            tool_count: tools,
+            tools: None,
+            detail: (!ok).then(|| "spawn failed".to_string()),
+            server_info: info.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn mcp_health_row_maps_probe_outcomes_to_status_and_description() {
+        let plain = crate::capability_store::McpConfig::default();
+        let described = crate::capability_store::McpConfig {
+            description: Some("Docs search".to_string()),
+            ..plain.clone()
+        };
+        let profiles = vec!["claude-code".to_string()];
+
+        let ok = mcp_health_row(
+            "docs",
+            &plain,
+            &profiles,
+            &mcp_outcome(true, Some(3), None),
+            "H",
+        );
+        assert_eq!(ok["status"], "ok");
+        assert!(ok["detail"].as_str().unwrap().contains("probed on H"));
+        assert_eq!(ok["description"], "MCP server `docs`");
+        assert_eq!(ok["profiles"][0], "claude-code");
+
+        let failed = mcp_health_row("docs", &plain, &[], &mcp_outcome(false, None, None), "H");
+        assert_eq!(failed["status"], "warn");
+        assert!(failed["detail"].as_str().unwrap().contains("spawn failed"));
+
+        let empty = mcp_health_row("docs", &plain, &[], &mcp_outcome(true, Some(0), None), "H");
+        assert_eq!(empty["status"], "warn");
+        let detail = empty["detail"].as_str().unwrap();
+        assert!(detail.contains("answered `initialize`"), "{detail}");
+        assert!(
+            detail.contains("`tools/list` returned no tools"),
+            "{detail}"
+        );
+        assert!(!detail.contains("  "), "{detail}");
+
+        let from_server = mcp_health_row(
+            "docs",
+            &plain,
+            &[],
+            &mcp_outcome(true, Some(1), Some("srv 1.0: does things")),
+            "H",
+        );
+        assert_eq!(from_server["description"], "srv 1.0: does things");
+        let catalog_wins = mcp_health_row(
+            "docs",
+            &described,
+            &[],
+            &mcp_outcome(true, Some(1), Some("srv 1.0")),
+            "H",
+        );
+        assert_eq!(catalog_wins["description"], "Docs search");
+    }
+
+    #[test]
+    fn mcp_health_route_probes_registered_servers_and_filters_used_only() {
+        let d = daemon();
+        for (name, desc) in [("broken", Some("Broken tool")), ("idle", None)] {
+            let mut mcp = serde_json::json!({"command": "ralphus-no-such-mcp-binary"});
+            if let Some(desc) = desc {
+                mcp["description"] = serde_json::json!(desc);
+            }
+            let body = serde_json::json!({"kind": "mcp", "name": name, "mcp": mcp});
+            let r = route(&d, "POST", "/api/capabilities", &body.to_string());
+            assert_eq!(r.status, 200, "{}", r.body);
+        }
+        let r = route(
+            &d,
+            "POST",
+            "/api/agent-profiles/claude-code/capabilities",
+            r#"{"kind":"mcp","name":"broken","enabled":true}"#,
+        );
+        assert_eq!(r.status, 200, "{}", r.body);
+
+        let all = route(&d, "GET", "/api/health/mcp", "");
+        assert_eq!(all.status, 200, "{}", all.body);
+        let body: serde_json::Value = serde_json::from_str(&all.body).unwrap();
+        let servers = body["servers"].as_array().unwrap();
+        let broken = servers.iter().find(|s| s["name"] == "broken").unwrap();
+        assert_eq!(broken["status"], "warn");
+        assert_eq!(broken["description"], "Broken tool");
+        assert_eq!(broken["profiles"][0], "claude-code");
+        assert!(servers.iter().any(|s| s["name"] == "idle"));
+
+        let used = route(&d, "GET", "/api/health/mcp?used_only=1", "");
+        let body: serde_json::Value = serde_json::from_str(&used.body).unwrap();
+        let names: Vec<_> = body["servers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s["name"].as_str().unwrap().to_string())
+            .collect();
+        assert!(names.contains(&"broken".to_string()), "{names:?}");
+        assert!(!names.contains(&"idle".to_string()), "{names:?}");
     }
 
     #[test]

@@ -158,7 +158,7 @@ list of candidates.
 | `graph [squad_id] [--global] [--all] [--format ascii\|dot]` | Render the task-order dependency graph |
 | `get <selector> [field.path]` | jq-lite field query over any entity's JSON view |
 | `clear [--all\|--status STATES] [--keep-temporary] [--yes]` | Bulk-delete tasks and reviews |
-| `check health [--enable-developer-checks] [--all-remotes] [--enable-live-agent-check]` | System/environment health check, grouped into Core/Harness/Machine sections. See [Check health](#check-health) below |
+| `check health [--enable-developer-checks] [--all-remotes] [--enable-live-agent-check] [--used-mcps-only]` | System/environment health check, grouped into Core/Harness/Machine/MCP servers sections. See [Check health](#check-health) below |
 | `completion bash` | Print a bash tab-completion script |
 | `configuration show [--no-local]` | Show sourced `.ralphus.toml` files and resolved values |
 | `task show-tutor` | Print the Task TOML schema reference |
@@ -260,6 +260,16 @@ than one that ran and passed -- only `FAIL` makes the command exit non-zero.
 completion round-trip against the configured Arbiter agent/model
 (`POST /api/health/arbiter`) -- off by default, since every other check here
 is reachability/config-shape only and free to run.
+
+The `MCP servers` section (RAL-705) has one row per registered MCP server,
+including the built-in `ralphus` entry. Each server is probed live, by the
+daemon on its own host, on every run -- never from a stored status and never
+in the daemon's hourly sweep. A server that fails to start, fails
+`initialize`, is unreachable over HTTP, or lists no tools is a `WARN` (never
+a `FAIL`), with the entry's `description` (else what the server reported in
+`initialize`) and the profiles that enable it in the impact line.
+`--used-mcps-only` keeps only servers some agent profile has enabled. An
+unreachable daemon, or a non-admin caller, yields a single `SKIP` row.
 
 `--json` (the global flag, not a per-subcommand one) emits the same
 `checks`/`file_issues`/`failed` payload as machine-readable JSON, with each
@@ -770,7 +780,7 @@ use; see `READ_ONLY_NOTE`.
         - (read-only-safe) worktree selector [uri]  {Show the worktree/project a cell is using.}
     - check  {System and environment checks.}
         - (read-only-safe) catalog --json  {List every check ralphus_core::health_catalog knows about -- stable id, Core/Harness/Machine section, daemon/remote applicability, Free/OnDemand cost tier, Required/Optional/FallbackOnly requirement level, and impact -- without running any probes (RAL-416). Instant and side-effect-free, unlike `check health`.}
-        - (read-only-safe) health --all-remotes --enable-developer-checks --enable-live-agent-check --json (subagent)  {Check the local ralphus setup, grouped into Core/Harness/Machine sections (daemon, layered config, git, runner, agent backends, gh/glab, resource checks). --all-remotes also checks every configured [machine.targets.*] entry (RAL-355 Phase 9); --enable-live-agent-check additionally performs a live, cost-incurring Arbiter completion round-trip (RAL-415, off by default).}
+        - (read-only-safe) health --all-remotes --enable-developer-checks --enable-live-agent-check --used-mcps-only --json (subagent)  {Check the local ralphus setup, grouped into Core/Harness/Machine/MCP servers sections (daemon, layered config, git, runner, agent backends, gh/glab, resource checks, and a live probe of every registered MCP server). --used-mcps-only limits the MCP servers section to servers enabled on at least one agent profile (RAL-705). --all-remotes also checks every configured [machine.targets.*] entry (RAL-355 Phase 9); --enable-live-agent-check additionally performs a live, cost-incurring Arbiter completion round-trip (RAL-415, off by default).}
         - restart-thread name [str] --json  {Restart a daemon background thread that has panicked or exited (scheduler, health-sweep, pr-base-drift-poller, store-watchdog) without restarting the daemon. `check health` reports each thread's state and names this command for any that is down. Refused for a thread that is still alive.}
     - clear --all --keep-temporary --status [states] --yes (subagent)  {Delete tasks and reviews from the daemon.}
     - (read-only-safe) completion  {Print a shell tab-completion script. (Rust port: not yet implemented -- prints a placeholder message; Python's `shell` argument is not read.)}

@@ -1193,6 +1193,9 @@ pub struct CheckArgs {
     /// against the configured Arbiter agent/model (`check_arbiter`). Off by
     /// default -- every other check here is reachability/config-shape only.
     pub enable_live_agent_check: bool,
+    /// RAL-705: limit the MCP servers section to servers at least one agent
+    /// profile has enabled.
+    pub used_mcps_only: bool,
 }
 
 pub fn parse_check(scanner: &mut Scanner) -> super::Command {
@@ -1214,10 +1217,12 @@ pub fn parse_check(scanner: &mut Scanner) -> super::Command {
     let enable_developer_checks = inner.take_bool("--enable-developer-checks");
     let all_remotes = inner.take_bool("--all-remotes");
     let enable_live_agent_check = inner.take_bool("--enable-live-agent-check");
+    let used_mcps_only = inner.take_bool("--used-mcps-only");
     super::Command::Check(CheckArgs {
         enable_developer_checks,
         all_remotes,
         enable_live_agent_check,
+        used_mcps_only,
     })
 }
 
@@ -1254,6 +1259,7 @@ fn render_health_human(
         (crate::health::CORE, "Core"),
         (crate::health::HARNESS, "Harness"),
         (crate::health::MACHINE, "Machine"),
+        (crate::health::MCP, "MCP servers"),
     ] {
         let section_results: Vec<_> = results.iter().filter(|r| r.section == section).collect();
         if section_results.is_empty() {
@@ -1335,6 +1341,7 @@ pub fn cmd_check(opts: &GlobalOpts, args: CheckArgs) -> i32 {
         args.enable_developer_checks,
         args.all_remotes,
         args.enable_live_agent_check,
+        args.used_mcps_only,
     );
     report_health(opts, &cwd, &results)
 }
@@ -1557,6 +1564,19 @@ mod tests {
         assert!(!args.enable_developer_checks);
         assert!(!args.all_remotes);
         assert!(!args.enable_live_agent_check);
+        assert!(!args.used_mcps_only);
+    }
+
+    #[test]
+    fn parse_check_reads_used_mcps_only() {
+        let cmd = parse_check(&mut Scanner::new(&[
+            "health".to_string(),
+            "--used-mcps-only".to_string(),
+        ]));
+        let super::super::Command::Check(args) = cmd else {
+            panic!("expected Command::Check");
+        };
+        assert!(args.used_mcps_only);
     }
 
     #[test]
@@ -1617,6 +1637,16 @@ mod tests {
                 remediation: "Optional: install NVIDIA drivers/nvidia-smi if you want GPU usage reported.".to_string(),
                 provenance: None,
             },
+            crate::health::CheckResult {
+                name: "mcp:docs".to_string(),
+                status: "warn",
+                detail: "probed on the daemon host: request failed: connection refused".to_string(),
+                section: crate::health::MCP,
+                id: "mcp-server".to_string(),
+                impact: "Searches project docs. Agents using it (profiles: claude-code) may not work as expected.".to_string(),
+                remediation: "Run `ralphus agent capability check mcp docs` or fix its command/url in the capability catalog.".to_string(),
+                provenance: None,
+            },
         ]
     }
 
@@ -1632,7 +1662,7 @@ mod tests {
     /// Durable output fixture (RAL-415): a fixed [`CheckResult`]/file-issue
     /// set rendered through the exact function `cmd_check` uses, asserted
     /// against a hardcoded expected string covering section grouping
-    /// (Core/Harness/Machine), indentation, every status symbol (including
+    /// (Core/Harness/Machine/MCP servers), indentation, every status symbol (including
     /// `SKIP`), the impact/remediation explanation line, and the
     /// `source:` provenance line.
     #[test]
@@ -1654,6 +1684,9 @@ Harness:
 Machine:
   [WARN] nvidia-smi: not found on PATH
         impact: The resource view's GPU column shows N/A instead of live usage; nothing else is affected.; remediation: Optional: install NVIDIA drivers/nvidia-smi if you want GPU usage reported.
+MCP servers:
+  [WARN] mcp:docs: probed on the daemon host: request failed: connection refused
+        impact: Searches project docs. Agents using it (profiles: claude-code) may not work as expected.; remediation: Run `ralphus agent capability check mcp docs` or fix its command/url in the capability catalog.
 
 Configuration file issues:
   /repo/.ralphus.toml  (local)
@@ -1739,7 +1772,7 @@ Configuration file issues:
 
         assert_eq!(parsed["failed"], 2);
         let checks = parsed["checks"].as_array().unwrap();
-        assert_eq!(checks.len(), 4);
+        assert_eq!(checks.len(), 5);
 
         let config_check = checks.iter().find(|c| c["name"] == "config").unwrap();
         assert_eq!(config_check["section"], "core");
@@ -1760,6 +1793,10 @@ Configuration file issues:
         assert!(git_check["provenance"].is_null());
 
         let file_issue = parsed["file_issues"].as_array().unwrap();
+
+        let mcp_check = checks.iter().find(|c| c["name"] == "mcp:docs").unwrap();
+        assert_eq!(mcp_check["section"], "mcp");
+        assert_eq!(mcp_check["status"], "warn");
         assert_eq!(file_issue.len(), 1);
         assert_eq!(file_issue[0]["path"], "/repo/.ralphus.toml");
     }

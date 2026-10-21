@@ -4369,6 +4369,27 @@
         }
       }
     },
+    "/api/health/mcp": {
+      "get": {
+        "operationId": "getHealthMcp",
+        "summary": "Backs `ralphus check health`: probes every registered MCP server live (admin-only; `used_only=1` limits it to servers enabled on a profile).",
+        "responses": {
+          "200": {
+            "description": "Success.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/JsonValue"
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
     "/api/health/project-forks": {
       "get": {
         "operationId": "getHealthProjectForks",

@@ -1374,7 +1374,7 @@
        * @property {string} label
        * @property {string} section - "core" | "harness" | "machine"
        * @property {string} applicability - "daemon_local" | "remote"
-       * @property {string} cost_tier - "free" | "on_demand"
+       * @property {string} cost_tier - "free" | "on_demand" | "per_invocation"
        * @property {string} requirement - "required" | "optional" | "fallback_only"
        * @property {object} probe - `{kind: string, detail?: string}`
        * @property {string} impact

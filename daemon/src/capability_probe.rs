@@ -43,6 +43,39 @@ pub struct ProbeOutcome {
     pub tools: Option<Vec<String>>,
     /// The failure reason; redacted against every registered secret.
     pub detail: Option<String>,
+    /// What the server said about itself in its `initialize` reply: its
+    /// `serverInfo` name/version and `instructions`; redacted like `detail`.
+    pub server_info: Option<String>,
+}
+
+/// A one-line summary of an `initialize` reply's `serverInfo` and
+/// `instructions`, `None` when the server reported neither.
+fn describe_initialize(init: &Value) -> Option<String> {
+    let result = init.get("result")?;
+    let info = result.get("serverInfo");
+    let field = |key: &str| {
+        info.and_then(|i| i.get(key))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+    };
+    let ident = match (field("name"), field("version")) {
+        (Some(n), Some(v)) => Some(format!("{n} {v}")),
+        (Some(n), None) => Some(n.to_string()),
+        (None, _) => None,
+    };
+    let instructions = result
+        .get("instructions")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|v| !v.is_empty());
+    let text = match (ident, instructions) {
+        (Some(i), Some(t)) => format!("{i}: {t}"),
+        (Some(i), None) => i,
+        (None, Some(t)) => t.to_string(),
+        (None, None) => return None,
+    };
+    Some(text)
 }
 
 impl ProbeOutcome {
@@ -52,10 +85,17 @@ impl ProbeOutcome {
             tool_count: None,
             tools: None,
             detail: Some(message.into()),
+            server_info: None,
         }
     }
 
-    fn listed(mut names: Vec<String>) -> Self {
+    /// The outcome recorded when a probe thread panics.
+    #[must_use]
+    pub fn probe_panicked() -> Self {
+        Self::failed("the probe crashed")
+    }
+
+    fn listed(mut names: Vec<String>, server_info: Option<String>) -> Self {
         names.sort();
         names.dedup();
         Self {
@@ -63,6 +103,7 @@ impl ProbeOutcome {
             tool_count: Some(i64::try_from(names.len()).unwrap_or(i64::MAX)),
             tools: Some(names),
             detail: None,
+            server_info,
         }
     }
 }
@@ -95,6 +136,7 @@ pub fn probe_mcp(config: &McpConfig) -> ProbeOutcome {
         ProbeOutcome::failed("the server has neither a command nor a url")
     };
     outcome.detail = outcome.detail.map(|d| crate::redact::redact_all(&d));
+    outcome.server_info = outcome.server_info.map(|d| crate::redact::redact_all(&d));
     outcome
 }
 
@@ -263,7 +305,7 @@ fn probe_stdio(command: &str, args: &[String], env: &BTreeMap<String, String>) -
                 break;
             }
         }
-        Ok(names)
+        Ok((names, describe_initialize(&init)))
     })();
 
     drop(stdin);
@@ -274,7 +316,7 @@ fn probe_stdio(command: &str, args: &[String], env: &BTreeMap<String, String>) -
     let _ = stderr_done_rx.recv_timeout(STDERR_DRAIN_TIMEOUT);
 
     match result {
-        Ok(names) => ProbeOutcome::listed(names),
+        Ok((names, info)) => ProbeOutcome::listed(names, info),
         Err(message) => {
             let stderr_tail = tail
                 .lock()
@@ -355,10 +397,10 @@ fn probe_http(url: &str, headers: &BTreeMap<String, String>) -> ProbeOutcome {
                 break;
             }
         }
-        Ok(names)
+        Ok((names, describe_initialize(&init)))
     })();
     match result {
-        Ok(names) => ProbeOutcome::listed(names),
+        Ok((names, info)) => ProbeOutcome::listed(names, info),
         Err(message) => ProbeOutcome::failed(message),
     }
 }
@@ -413,6 +455,7 @@ fn json_server(value: &Value) -> Option<McpConfig> {
         env: set_entries(obj.get("env")),
         url,
         headers: set_entries(obj.get("headers")),
+        description: None,
     })
 }
 
@@ -552,6 +595,24 @@ pub fn home_dir() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn describe_initialize_combines_server_info_and_instructions() {
+        let both = serde_json::json!({"result":{"serverInfo":{"name":"srv","version":"1.2"},"instructions":" Search docs. "}});
+        assert_eq!(
+            describe_initialize(&both).as_deref(),
+            Some("srv 1.2: Search docs.")
+        );
+        let name_only = serde_json::json!({"result":{"serverInfo":{"name":"srv"}}});
+        assert_eq!(describe_initialize(&name_only).as_deref(), Some("srv"));
+        let instructions_only = serde_json::json!({"result":{"instructions":"Do X"}});
+        assert_eq!(
+            describe_initialize(&instructions_only).as_deref(),
+            Some("Do X")
+        );
+        assert_eq!(describe_initialize(&serde_json::json!({"result":{}})), None);
+        assert_eq!(describe_initialize(&serde_json::json!({})), None);
+    }
 
     fn temp_home(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
