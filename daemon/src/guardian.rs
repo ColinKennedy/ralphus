@@ -970,6 +970,10 @@ pub struct GuardianView {
     /// [`Self::live_actions`] resolved against the project settings and
     /// global config -- `false` when every layer is unset.
     pub effective_live_actions: bool,
+    /// Whether a finished live run gets the final recipe-refinement turn, from
+    /// the project settings and global config (`true` when every layer is
+    /// unset). No per-review override.
+    pub effective_refine_live_recipe: bool,
     /// When this review's one automatic live-action run was started; `None`
     /// until it has run.
     pub live_actions_auto_ran_at_ms: Option<i64>,
@@ -7098,6 +7102,12 @@ impl Store {
             .or(live_global.live_actions)
             .unwrap_or(row.live_actions_default_on);
 
+        let effective_refine_live_recipe = db_settings
+            .refine_live_recipe
+            .or(explicit_project.refine_live_recipe)
+            .or(live_global.refine_live_recipe)
+            .unwrap_or(true);
+
         // Follow-up offers: per-review override > the project's
         // `.ralphus.toml [followup]` > the live global `[followup]` config > on.
         let followup = ctx
@@ -7295,6 +7305,7 @@ impl Store {
             effective_auto_run,
             live_actions: row.live_actions,
             effective_live_actions,
+            effective_refine_live_recipe,
             live_actions_auto_ran_at_ms: row.live_actions_auto_ran_at_ms,
             followup_enabled: row.followup_enabled,
             effective_followup_enabled,

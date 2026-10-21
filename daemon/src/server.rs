@@ -3276,6 +3276,9 @@ struct EffectiveReviewDefaults {
     /// The resolved live-actions default (per-review > database default >
     /// `.ralphus.toml`/global > `false`).
     live_actions: bool,
+    /// The resolved recipe-refinement default (database default >
+    /// `.ralphus.toml`/global > `true`).
+    refine_live_recipe: bool,
     /// The resolved list of events that rebuild a review's prepared build
     /// (per-review override > database default > `.ralphus.toml`/global >
     /// every event).
@@ -3321,6 +3324,7 @@ impl EffectiveReviewDefaults {
             skip_manual_checks: cfg.skip_manual_checks(),
             auto_run: cfg.auto_run(),
             live_actions: cfg.live_actions(),
+            refine_live_recipe: cfg.refine_live_recipe(),
             rebuild_on: cfg.rebuild_on(),
             exhibits_enabled: cfg.exhibits_enabled(),
             exhibits_max_per_pr: cfg.exhibits_max_per_pr(),
@@ -3469,6 +3473,10 @@ struct ProjectReviewSettingsBody {
     /// see [`crate::store::ProjectReviewSettings`].
     #[serde(default)]
     live_actions: Option<bool>,
+    /// Project-level default for whether a finished live run gets the final
+    /// recipe-refinement turn -- see [`crate::store::ProjectReviewSettings`].
+    #[serde(default)]
+    refine_live_recipe: Option<bool>,
     /// Project-level default for which events (`rebase`, `feedback`,
     /// `auto_fix`) tear down and rebuild a review's prepared build -- see
     /// [`crate::store::ProjectReviewSettings`]. Absent leaves the setting
@@ -3780,6 +3788,9 @@ fn set_project_review_settings(daemon: &Daemon, name: &str, body: &str) -> Reply
     }
     if let Some(v) = req.live_actions {
         settings.live_actions = Some(v);
+    }
+    if let Some(v) = req.refine_live_recipe {
+        settings.refine_live_recipe = Some(v);
     }
     if let Some(v) = req.rebuild_on {
         settings.rebuild_on = v;

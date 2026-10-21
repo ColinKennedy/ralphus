@@ -972,6 +972,7 @@ fn execute_queued_run(
             store,
             runner.as_ref(),
             &guardian.id,
+            guardian.effective_refine_live_recipe,
             run,
             &cwd,
             &outcome,
@@ -995,25 +996,32 @@ fn execute_queued_run(
     integration == "pending"
 }
 
-/// The one resumed recheck of a finished run whose recipe is not fully backed
-/// by recorded commands. The agent's session is resumed with a table of each
-/// step's match status; a valid revised `RALPHUS_LIVE_RESULT:` replaces the
-/// stored result (the original is kept for audit), and anything else leaves
-/// the original standing. The checkout stays held while the agent may re-run
-/// steps in it.
+/// The one resumed recipe-refinement turn of a finished run, when the review's
+/// `refine_live_recipe` setting is on (the default). It runs for every finished
+/// run that reported a result, all-exact ones included. The agent's session is
+/// resumed with the recipe's coverage, the verified commands, its recorded
+/// shell calls (capped, secrets masked) and its other tool calls; a valid
+/// revised `RALPHUS_LIVE_RESULT:` replaces the stored result (the original is
+/// kept in `original_result`) and is re-graded against freshly collected calls,
+/// while anything else leaves the original standing. The checkout stays held
+/// while the agent may re-run steps in it.
+#[allow(clippy::too_many_arguments)]
 fn recheck_run_result(
     store: &crate::store_lock::StoreHandle,
     runner: &dyn Runner,
     guardian_id: &str,
+    refine_enabled: bool,
     run: &LiveRunRow,
     cwd: &str,
     outcome: &crate::live_actions::LiveRunOutcome,
     cancel: &CancelToken,
 ) {
     use crate::live_results::{
-        RECHECK_SYSTEM_PROMPT, final_verdict, match_recipe, needs_recheck, parse_result_line,
-        recheck_prompt, recorded_calls_for_run,
+        RECHECK_SYSTEM_PROMPT, final_verdict, match_recipe, other_tool_calls_for_run,
+        parse_result_line, recheck_prompt, recorded_calls_for_run, should_refine,
     };
+    // A backend without a resumable session (the native agent) has nothing to
+    // resume, so its runs skip the refinement turn and keep the original result.
     let Some(session) = outcome.session.as_ref() else {
         return;
     };
@@ -1024,7 +1032,7 @@ fn recheck_run_result(
         .lock()
         .live_run_evidence(&run.run_id)
         .unwrap_or_default();
-    if !needs_recheck(&evidence) {
+    if !should_refine(&evidence, refine_enabled) {
         return;
     }
     let _hold = crate::checkout_hold::hold(
@@ -1039,7 +1047,11 @@ fn recheck_run_result(
         &session.spec,
         &session.agent_session_id,
         RECHECK_SYSTEM_PROMPT,
-        recheck_prompt(&evidence, &calls),
+        recheck_prompt(
+            &evidence,
+            &calls,
+            &other_tool_calls_for_run(guardian_id, &outcome.cell_id),
+        ),
         cancel,
     );
     let revised = if result.is_done() {

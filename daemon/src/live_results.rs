@@ -158,6 +158,16 @@ pub struct RecordedCall {
     pub succeeded: Option<bool>,
     /// The shell tool that ran it, lower-cased (`bash`, `powershell`, ...).
     pub shell: String,
+    /// The tool call's raw input as recorded (a JSON object string for most
+    /// shells): command, cwd, `description`, `timeout`, `run_in_background`...
+    pub input: String,
+}
+
+/// A recorded call to a tool that is not a shell (an MCP or editor tool).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OtherToolCall {
+    pub tool: String,
+    pub input: String,
 }
 
 /// How a proposed recipe command relates to the run's recorded shell calls.
@@ -294,11 +304,11 @@ pub fn extract_shell_calls(transcript: &str) -> Vec<RecordedCall> {
         if !SHELL_TOOLS.contains(&tool.as_str()) || calls.contains_key(id) {
             continue;
         }
-        let Some((command, cwd)) = record
+        let raw_input = record
             .get("input")
             .and_then(|v| v.as_str())
-            .and_then(command_from_input)
-        else {
+            .unwrap_or_default();
+        let Some((command, cwd)) = command_from_input(raw_input) else {
             continue;
         };
         order.push(id.to_string());
@@ -309,6 +319,7 @@ pub fn extract_shell_calls(transcript: &str) -> Vec<RecordedCall> {
                 cwd,
                 succeeded: None,
                 shell: tool,
+                input: raw_input.to_string(),
             },
         );
     }
@@ -320,6 +331,38 @@ pub fn extract_shell_calls(transcript: &str) -> Vec<RecordedCall> {
             Some(call)
         })
         .collect()
+}
+
+/// The non-shell tool calls recorded in a transcript (MCP and editor tools),
+/// in the order they were made. Only the call half is read.
+#[must_use]
+pub fn extract_other_tool_calls(transcript: &str) -> Vec<OtherToolCall> {
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for line in transcript.lines() {
+        let Some(json) = line.trim_start().strip_prefix("RALPHUS_TOOL: ") else {
+            continue;
+        };
+        let Ok(record) = serde_json::from_str::<serde_json::Value>(json) else {
+            continue;
+        };
+        let (Some(id), Some(tool), Some(input)) = (
+            record.get("id").and_then(|v| v.as_str()),
+            record.get("tool").and_then(|v| v.as_str()),
+            record.get("input").and_then(|v| v.as_str()),
+        ) else {
+            continue;
+        };
+        if SHELL_TOOLS.contains(&tool.to_ascii_lowercase().as_str()) || !seen.insert(id.to_string())
+        {
+            continue;
+        }
+        out.push(OtherToolCall {
+            tool: tool.to_string(),
+            input: input.to_string(),
+        });
+    }
+    out
 }
 
 /// Annotate every proposed recipe command against the recorded shell calls
@@ -416,6 +459,23 @@ pub fn recorded_calls_for_run(guardian_id: &str, cell_id: &str) -> Vec<RecordedC
     for attempt in crate::terminal_log::list_attempts(&name) {
         if let Some(text) = crate::terminal_log::read_attempt(&name, attempt.attempt) {
             calls.extend(extract_shell_calls(&text));
+        }
+    }
+    calls
+}
+
+/// The non-shell tool calls a live run's cell recorded, in order.
+#[must_use]
+pub fn other_tool_calls_for_run(guardian_id: &str, cell_id: &str) -> Vec<OtherToolCall> {
+    let name = crate::cell_session::session_name(
+        &crate::live_actions::live_run_squad_id(guardian_id),
+        crate::live_actions::LIVE_ACTION_TASK,
+        cell_id,
+    );
+    let mut calls = Vec::new();
+    for attempt in crate::terminal_log::list_attempts(&name) {
+        if let Some(text) = crate::terminal_log::read_attempt(&name, attempt.attempt) {
+            calls.extend(extract_other_tool_calls(&text));
         }
     }
     calls
@@ -1686,76 +1746,186 @@ pub fn process_pr_refreshes_background(store: &crate::store_lock::StoreHandle) {
 
 // ---- the recheck ------------------------------------------------------------
 
-/// System prompt of the one resumed turn that re-examines a run's result.
+/// System prompt of the one resumed turn that refines a run's recipe.
 pub const RECHECK_SYSTEM_PROMPT: &str = "\
-You are re-examining the result of a live test you just ran. You may re-run commands in this \
-checkout to back your claims, but make no edits and no commits. Reply with a corrected final \
-`RALPHUS_LIVE_RESULT:` line (the same JSON shape as before) whose `recipe` lists only commands \
-you actually ran, exactly as recorded.";
+You are doing a final quality pass over the reproduction recipe of a live test you just ran. \
+This is a chance to refine it, not a correction. You may re-run commands in this checkout to \
+back your claims, but make no edits and no commits. You may add steps you actually ran that the \
+recipe lacks (setup, env assignments, cwd, flags), fix or drop steps you cannot stand behind, \
+or leave the recipe exactly as it is. Reply with a final `RALPHUS_LIVE_RESULT:` line (the same \
+JSON shape as before) whose `recipe` lists only commands you actually ran, exactly as recorded: \
+no `cd`, filters, redirection or wrappers, and keep their env settings.";
 
-/// Whether a finished run's recipe leaves something to recheck: a step not run
-/// or only run as part of a different command, or a verdict no recorded command backs.
+/// Most recorded calls shown to the refinement turn.
+pub const MAX_REFINE_CALLS: usize = 50;
+/// Longest raw call input shown to the refinement turn, in characters.
+pub const MAX_REFINE_INPUT_CHARS: usize = 500;
+
+/// Whether a finished run gets the refinement turn: the setting is on and the
+/// run reported a result to refine. Every such run qualifies -- all-exact,
+/// partly matched and unbacked alike.
 #[must_use]
-pub fn needs_recheck(ev: &RunEvidence) -> bool {
-    verdict_unbacked(ev)
-        || (ev.recipe_annotated
-            && ev
-                .recipe
-                .iter()
-                .any(|s| matches!(s.status, StepMatch::NotRun | StepMatch::Variant)))
+pub fn should_refine(ev: &RunEvidence, enabled: bool) -> bool {
+    enabled && ev.verdict.is_some()
 }
 
-/// The recorded call sharing the most words with `command`, if any shares one.
-fn closest_recorded<'a>(command: &str, calls: &'a [RecordedCall]) -> Option<&'a str> {
-    let words: std::collections::HashSet<&str> = command.split_whitespace().collect();
-    calls
-        .iter()
-        .map(|c| {
-            let shared = c
-                .command
-                .split_whitespace()
-                .filter(|w| words.contains(w))
-                .count();
-            (shared, c.command.as_str())
-        })
-        .filter(|(shared, _)| *shared > 0)
-        .max_by_key(|(shared, _)| *shared)
-        .map(|(_, command)| command)
+/// `input` with secrets masked, cut to [`MAX_REFINE_INPUT_CHARS`].
+fn masked_input(input: &str) -> String {
+    let masked = crate::redact::redact_all(input);
+    let masked = ralphus_core::redact::redact_secrets(&masked);
+    if masked.chars().count() <= MAX_REFINE_INPUT_CHARS {
+        return masked.into_owned();
+    }
+    let kept: String = masked.chars().take(MAX_REFINE_INPUT_CHARS).collect();
+    format!("{kept} [... cut]")
 }
 
-/// The recheck's user prompt: each recipe step, how it matched the recorded
-/// calls, and the recorded command (or, for a step not run, the closest one).
+fn count_noun(n: usize, noun: &str) -> String {
+    format!("{n} {noun}{}", if n == 1 { "" } else { "s" })
+}
+
+/// The refinement turn's user prompt: the coverage of the recipe, the verified
+/// commands, how each step matched, the (capped, masked) shell calls the agent
+/// made, and its other tool calls as context.
 #[must_use]
-pub fn recheck_prompt(ev: &RunEvidence, calls: &[RecordedCall]) -> String {
+pub fn recheck_prompt(
+    ev: &RunEvidence,
+    calls: &[RecordedCall],
+    other_calls: &[OtherToolCall],
+) -> String {
     let mut out = String::from(
-        "Your recorded shell calls do not fully back the recipe you reported. Each step below \
-         shows how it matched what you actually ran.\n\n\
-         | Recipe step | Match | Recorded command |\n|---|---|---|\n",
+        "This is a final quality check on the reproduction recipe you reported, and a chance to \
+         refine it. It is not a correction: you may decline every change, accept some of what \
+         is suggested and reject the rest, or leave the recipe unchanged.\n\n",
     );
-    let cell = |text: &str| text.replace('|', "\\|").replace('\n', " ");
-    for step in &ev.recipe {
-        let (status, recorded) = match step.status {
-            StepMatch::Exact => ("exact", step.recorded_command.clone()),
-            StepMatch::Variant => ("variant", step.recorded_command.clone()),
-            StepMatch::NotRun => (
-                "not run",
-                closest_recorded(&step.command, calls)
-                    .map_or_else(|| "(none)".to_string(), |c| format!("closest: {c}")),
-            ),
+    let total = ev.recipe.len();
+    let exact = ev
+        .recipe
+        .iter()
+        .filter(|s| s.status == StepMatch::Exact)
+        .count();
+    let variant = ev
+        .recipe
+        .iter()
+        .filter(|s| s.status == StepMatch::Variant)
+        .count();
+    if total == 0 {
+        out.push_str("Coverage: no recipe was reported.\n\n");
+    } else {
+        let _ = write!(
+            out,
+            "Coverage: {} of {} were recorded as run ({exact} exactly, {variant} inside a larger \
+             command).\n\n",
+            exact + variant,
+            count_noun(total, "proposed command"),
+        );
+        let cell = |text: &str| text.replace('|', "\\|").replace('\n', " ");
+        out.push_str("Verified commands:\n");
+        let mut any = false;
+        for step in ev.recipe.iter().filter(|s| s.status.ran()) {
+            any = true;
+            let _ = writeln!(out, "- `{}`", cell(&step.command));
+        }
+        if !any {
+            out.push_str("- (none)\n");
+        }
+        out.push_str("\n| Recipe step | Match | Recorded command |\n|---|---|---|\n");
+        for step in &ev.recipe {
+            let (status, recorded) = match step.status {
+                StepMatch::Exact => ("exact", step.recorded_command.as_str()),
+                StepMatch::Variant => ("variant", step.recorded_command.as_str()),
+                StepMatch::NotRun => ("not run", "(none)"),
+            };
+            let _ = writeln!(
+                out,
+                "| {} | {status} | {} |",
+                cell(&step.command),
+                cell(recorded)
+            );
+        }
+        out.push('\n');
+    }
+
+    // Calls that matched a recipe step are always shown; the remaining slots
+    // go to the most recent calls. Newest first.
+    let matched: std::collections::HashSet<usize> = ev
+        .recipe
+        .iter()
+        .filter(|s| s.order > 0)
+        .map(|s| s.order - 1)
+        .collect();
+    let mut shown: Vec<usize> = matched
+        .iter()
+        .copied()
+        .filter(|i| *i < calls.len())
+        .collect();
+    for i in (0..calls.len()).rev() {
+        if shown.len() >= MAX_REFINE_CALLS.max(matched.len()) {
+            break;
+        }
+        if !matched.contains(&i) {
+            shown.push(i);
+        }
+    }
+    shown.sort_unstable_by(|a, b| b.cmp(a));
+    let _ = writeln!(
+        out,
+        "Shell calls you actually made ({} recorded, newest first):",
+        calls.len()
+    );
+    if shown.is_empty() {
+        out.push_str("(none recorded)\n");
+    }
+    for i in &shown {
+        let call = &calls[*i];
+        let result = match call.succeeded {
+            Some(true) => "succeeded",
+            Some(false) => "failed",
+            None => "no result recorded",
         };
-        out.push_str(&format!(
-            "| {} | {status} | {} |\n",
-            cell(&step.command),
-            cell(&recorded)
-        ));
+        let note = if matched.contains(i) {
+            ", matched a recipe step"
+        } else {
+            ""
+        };
+        let _ = writeln!(
+            out,
+            "\n#{} [{}] {result}{note}\n{}",
+            i + 1,
+            call.shell,
+            fenced(&masked_input(&call.input)),
+        );
     }
-    if ev.recipe.is_empty() {
-        out.push_str("| (no recipe reported) | not run | (none) |\n");
+    if calls.len() > shown.len() {
+        let _ = writeln!(
+            out,
+            "\n({} earlier calls omitted)",
+            calls.len() - shown.len()
+        );
     }
+
+    if !other_calls.is_empty() {
+        out.push_str("\nOther tool calls you made (context only; they are not recipe steps):\n");
+        let skip = other_calls.len().saturating_sub(MAX_REFINE_CALLS);
+        for call in other_calls.iter().skip(skip) {
+            let _ = writeln!(
+                out,
+                "- {}: {}",
+                call.tool,
+                masked_input(&call.input).replace('\n', " ")
+            );
+        }
+        if skip > 0 {
+            let _ = writeln!(out, "({skip} earlier calls omitted)");
+        }
+    }
+
     out.push_str(
-        "\nRe-run any step you still stand behind, then end your reply with a corrected \
-         `RALPHUS_LIVE_RESULT:` line. If a step cannot be backed, leave it out and lower the \
-         verdict accordingly.",
+        "\nLook at what you actually ran. Is anything missing from the recipe -- setup steps, \
+         env assignments, the working directory, flags? Additions are welcome when you ran \
+         them. Re-run any step you still stand behind, then end your reply with a final \
+         `RALPHUS_LIVE_RESULT:` line; repeat it unchanged if the recipe is already right. If a \
+         step cannot be backed, leave it out and lower the verdict accordingly.",
     );
     out
 }
@@ -2013,6 +2183,7 @@ live
             cwd: Some("/w".into()),
             succeeded: Some(true),
             shell: "bash".into(),
+            input: String::new(),
         };
         let commands = |proposed: &[&str], recorded: &[&str]| -> Vec<String> {
             let proposed: Vec<String> = proposed.iter().map(|p| (*p).to_string()).collect();
@@ -2043,6 +2214,7 @@ live
             cwd: Some("/w".into()),
             succeeded: Some(true),
             shell: "bash".into(),
+            input: String::new(),
         };
         let run = |proposed: &str, recorded: &str| -> Vec<RecipeStep> {
             match_recipe(&[proposed.to_string()], &[call(recorded)], "/d")
@@ -2073,6 +2245,7 @@ live
             cwd: Some("/w".into()),
             succeeded: Some(true),
             shell: "bash".into(),
+            input: String::new(),
         };
         let run = |proposed: &str, recorded: &str| -> Vec<RecipeStep> {
             match_recipe(&[proposed.to_string()], &[call(recorded)], "/d")
@@ -2110,6 +2283,7 @@ live
             cwd: Some("/w".into()),
             succeeded: Some(true),
             shell: "bash".into(),
+            input: String::new(),
         };
         let run = |proposed: &[&str], recorded: &str| -> Vec<RecipeStep> {
             let p: Vec<String> = proposed.iter().map(|s| (*s).to_string()).collect();
@@ -2859,5 +3033,124 @@ live
         );
         let runs = crate::live_runs::guardian_live_runs_conn(&store.lock().conn, &gid).unwrap();
         assert_eq!(runs[0].state, "finished");
+    }
+
+    fn shell_call(command: &str, input: &str) -> RecordedCall {
+        RecordedCall {
+            command: command.into(),
+            cwd: Some("/w".into()),
+            succeeded: Some(true),
+            shell: "bash".into(),
+            input: input.into(),
+        }
+    }
+
+    #[test]
+    fn refinement_prompt_states_coverage_and_verified_commands() {
+        let ev = evidence_with(
+            vec![
+                step_with("cargo build", StepMatch::Exact),
+                step_with("cargo test", StepMatch::Variant),
+                step_with("cargo run", StepMatch::NotRun),
+            ],
+            true,
+        );
+        let prompt = recheck_prompt(&ev, &[], &[]);
+        assert!(prompt.contains(
+            "2 of 3 proposed commands were recorded as run (1 exactly, 1 inside a larger command)"
+        ));
+        assert!(prompt.contains("- `cargo build`"));
+        assert!(prompt.contains("- `cargo test`"));
+        assert!(!prompt.contains("- `cargo run`"));
+        assert!(prompt.contains("Is anything missing from the recipe"));
+        assert!(prompt.contains("leave the recipe unchanged"));
+    }
+
+    #[test]
+    fn refinement_prompt_masks_secrets_in_raw_input() {
+        let raw = r#"{"command":"API_KEY=sk-ant-abcdefghijklmnopqrstuvwxyz0123 ./run","description":"go","timeout":5000,"run_in_background":true}"#;
+        let ev = evidence_with(vec![step_with("./run", StepMatch::Variant)], true);
+        let prompt = recheck_prompt(&ev, &[shell_call("API_KEY=x ./run", raw)], &[]);
+        assert!(!prompt.contains("sk-ant-abcdefghijklmnopqrstuvwxyz0123"));
+        assert!(prompt.contains("run_in_background"));
+        assert!(prompt.contains("timeout"));
+        assert!(prompt.contains("\"description\":\"go\""));
+    }
+
+    #[test]
+    fn refinement_prompt_caps_calls_and_input_size() {
+        let calls: Vec<RecordedCall> = (0..70)
+            .map(|i| {
+                shell_call(
+                    &format!("echo {i}"),
+                    &format!("{{\"command\":\"echo {i}\"}}"),
+                )
+            })
+            .collect();
+        let mut matched = step_with("echo 0", StepMatch::Exact);
+        matched.order = 1;
+        let ev = evidence_with(vec![matched], true);
+        let prompt = recheck_prompt(&ev, &calls, &[]);
+        assert!(prompt.contains("(20 earlier calls omitted)"));
+        // The oldest call matched a recipe step, so it is kept; the newest is first.
+        assert!(prompt.contains("matched a recipe step"));
+        assert!(prompt.find("#70 ").unwrap() < prompt.find("#1 ").unwrap());
+        assert!(!prompt.contains("#2 ["));
+
+        let long = shell_call("x", &format!("{{\"command\":\"{}\"}}", "a".repeat(2000)));
+        let prompt = recheck_prompt(&evidence_with(Vec::new(), true), &[long], &[]);
+        assert!(prompt.contains("[... cut]"));
+        assert!(!prompt.contains(&"a".repeat(MAX_REFINE_INPUT_CHARS + 1)));
+    }
+
+    #[test]
+    fn refinement_prompt_lists_other_tools_as_context() {
+        let other = [OtherToolCall {
+            tool: "mcp__db__query".into(),
+            input: "{\"sql\":\"select 1\"}".into(),
+        }];
+        let prompt = recheck_prompt(&evidence_with(Vec::new(), true), &[], &other);
+        assert!(prompt.contains("context only"));
+        assert!(prompt.contains("mcp__db__query"));
+    }
+
+    #[test]
+    fn refinement_prompt_handles_an_empty_recipe() {
+        let prompt = recheck_prompt(&evidence_with(Vec::new(), true), &[], &[]);
+        assert!(prompt.contains("no recipe was reported"));
+        assert!(prompt.contains("(none recorded)"));
+    }
+
+    #[test]
+    fn extracts_other_tool_calls_without_shells() {
+        let log = concat!(
+            "RALPHUS_TOOL: {\"id\":\"a\",\"tool\":\"Bash\",\"input\":\"{\\\"command\\\":\\\"ls\\\"}\"}\n",
+            "RALPHUS_TOOL: {\"id\":\"b\",\"tool\":\"mcp__x__y\",\"input\":\"{\\\"k\\\":1}\"}\n",
+            "RALPHUS_TOOL: {\"id\":\"b\",\"tool\":\"mcp__x__y\",\"is_error\":false}\n",
+        );
+        let other = extract_other_tool_calls(log);
+        assert_eq!(other.len(), 1);
+        assert_eq!(other[0].tool, "mcp__x__y");
+        assert_eq!(extract_shell_calls(log)[0].input, "{\"command\":\"ls\"}");
+    }
+
+    #[test]
+    fn refinement_runs_for_exact_partial_and_unbacked_runs_when_enabled() {
+        let exact = evidence_with(vec![step_with("a", StepMatch::Exact)], true);
+        let partial = evidence_with(
+            vec![
+                step_with("a", StepMatch::Exact),
+                step_with("b", StepMatch::NotRun),
+            ],
+            true,
+        );
+        let unbacked = evidence_with(vec![step_with("a", StepMatch::NotRun)], true);
+        for ev in [&exact, &partial, &unbacked] {
+            assert!(should_refine(ev, true));
+            assert!(!should_refine(ev, false));
+        }
+        let mut no_result = exact;
+        no_result.verdict = None;
+        assert!(!should_refine(&no_result, true));
     }
 }
