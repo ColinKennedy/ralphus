@@ -2,6 +2,8 @@
         --bg: #0d1117; --panel: #161b22; --panel-2: #1c2129; --border: #30363d;
         --text: #e6edf3; --muted: #8b949e; --accent: #4aa3ff; --danger: #f85149;
         --running: #4aa3ff; --done: #3fb950; --failed: #f85149; --pending: #8b949e;
+        /* Text and icons drawn on a solid --done fill (the green header bar). */
+        --on-done: #0d1117;
         --queued: #a371f7; --materializing: #58a6ff; --cancelled: #6e7681; --teal: #39c5cf;
         --ignored: #c9a227;
         --halted: var(--ignored);
@@ -50,6 +52,7 @@
         --bg: #ffffff; --panel: #f6f8fa; --panel-2: #eef1f4; --border: #d0d7de;
         --text: #1f2328; --muted: #656d76; --accent: #0969da;
         --faint: #818b98; --border-soft: #e4e8ec;
+        --on-done: #1f2328;
         /* Tints run lighter on a white ground -- the dark-theme alphas read as
            dirty washes rather than as a status. */
         --accent-a: rgba(9,105,218,.08); --accent-b: rgba(9,105,218,.28);
@@ -93,8 +96,19 @@
       :where(button.primary:not(.btn)) { background: var(--accent); color: #fff; border: none; border-radius: 6px; padding: 5px 12px; font-weight: 600; }
       :where(button.primary:not(.btn)):where(:hover) { filter: brightness(1.1); }
 
+      /* The top banner is the board's one green surface. Its text and icons
+         take --on-done (dark on green, ~6-7:1 in both themes); the tab and
+         button chips keep their own dark fills so the active tab still reads. */
       header { display: flex; align-items: center; justify-content: space-between;
-        padding: 9px 16px; border-bottom: 1px solid var(--border); background: var(--panel); }
+        padding: 9px 16px; border-bottom: 1px solid var(--border); background: var(--done); color: var(--on-done); }
+      header .logo { color: var(--on-done); }
+      header .tab, header .status-right { color: var(--on-done); }
+      header .icon-btn { color: var(--on-done); border-color: var(--on-done); }
+      header .dot.on { background: var(--on-done); box-shadow: none; }
+      header .dot.off { box-shadow: 0 0 0 2px var(--on-done); }
+      /* The header's popovers sit inside it, so they reset the inherited
+         on-green text back to the panel text. */
+      header .running-menu, header .notif-panel { color: var(--text); }
       .brand { display: flex; align-items: center; gap: 14px; font-weight: 600; }
       .logo { color: var(--accent); letter-spacing: .5px; }
       .tabs { display: flex; gap: 4px; }

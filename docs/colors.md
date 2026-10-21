@@ -31,6 +31,7 @@ role in the table below, then use it.
 | `--danger` | `#f85149` | *(shared)* | destructive action |
 | `--running` | `#4aa3ff` | *(shared)* | status |
 | `--done` | `#3fb950` | *(shared)* | status |
+| `--on-done` | `#0d1117` | `#1f2328` | chrome (text and icons drawn on a solid `--done` fill, used by the green top header bar; dark-on-green reads ~6-7:1 in both themes, where the light chrome text would not) |
 | `--failed` | `#f85149` | *(shared)* | status |
 | `--pending` | `#8b949e` | *(shared)* | status |
 | `--queued` | `#a371f7` | *(shared)* | status |
