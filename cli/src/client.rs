@@ -843,6 +843,13 @@ impl DaemonClient {
         self.get("/api/health/project-forks")
     }
 
+    /// Every registered MCP server probed live by the daemon (RAL-705);
+    /// `used_only` keeps the servers some agent profile has enabled.
+    pub fn health_mcp(&self, used_only: bool) -> Result<Value, DaemonError> {
+        let qs = query_string(&[("used_only", used_only.then(|| "1".to_string()))]);
+        self.get(&format!("/api/health/mcp{qs}"))
+    }
+
     /// Agents selectable for `cwd` -- built-in backends plus configured
     /// `.ralphus.toml` agent profiles -- plus the effective
     /// `[review].default_resolver_agent`. Backs the board's review-resolver

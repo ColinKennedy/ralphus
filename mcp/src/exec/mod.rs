@@ -440,6 +440,7 @@ fn exec_check(client: &DaemonClient, args: misc::CheckArgs) -> Value {
         args.enable_developer_checks,
         args.all_remotes,
         args.enable_live_agent_check,
+        args.used_mcps_only,
     );
     let checks: Vec<Value> = results
         .iter()

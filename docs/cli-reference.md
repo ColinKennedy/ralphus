@@ -158,7 +158,7 @@ list of candidates.
 | `graph [squad_id] [--global] [--all] [--format ascii\|dot]` | Render the task-order dependency graph |
 | `get <selector> [field.path]` | jq-lite field query over any entity's JSON view |
 | `clear [--all\|--status STATES] [--keep-temporary] [--yes]` | Bulk-delete tasks and reviews |
-| `check health [--enable-developer-checks] [--all-remotes] [--enable-live-agent-check]` | System/environment health check, grouped into Core/Harness/Machine sections. See [Check health](#check-health) below |
+| `check health [--enable-developer-checks] [--all-remotes] [--enable-live-agent-check] [--used-mcps-only]` | System/environment health check, grouped into Core/Harness/Machine/MCP servers sections. See [Check health](#check-health) below |
 | `completion bash` | Print a bash tab-completion script |
 | `configuration show [--no-local]` | Show sourced `.ralphus.toml` files and resolved values |
 | `task show-tutor` | Print the Task TOML schema reference |
@@ -260,6 +260,16 @@ than one that ran and passed -- only `FAIL` makes the command exit non-zero.
 completion round-trip against the configured Arbiter agent/model
 (`POST /api/health/arbiter`) -- off by default, since every other check here
 is reachability/config-shape only and free to run.
+
+The `MCP servers` section (RAL-705) has one row per registered MCP server,
+including the built-in `ralphus` entry. Each server is probed live, by the
+daemon on its own host, on every run -- never from a stored status and never
+in the daemon's hourly sweep. A server that fails to start, fails
+`initialize`, is unreachable over HTTP, or lists no tools is a `WARN` (never
+a `FAIL`), with the entry's `description` (else what the server reported in
+`initialize`) and the profiles that enable it in the impact line.
+`--used-mcps-only` keeps only servers some agent profile has enabled. An
+unreachable daemon, or a non-admin caller, yields a single `SKIP` row.
 
 `--json` (the global flag, not a per-subcommand one) emits the same
 `checks`/`file_issues`/`failed` payload as machine-readable JSON, with each
@@ -736,13 +746,13 @@ use; see `READ_ONLY_NOTE`.
             - reset backend [str]  {Administrative (RAL-473): reset a built-in backend to its compiled-in default command.}
             - set backend [str] --command [argv]  {Administrative (RAL-473): set the global invoked command for a built-in backend (claude-code/codex/pi), e.g. a wrapper/compound command. Takes effect on the next cell/proof run, no daemon restart needed.}
         - capability  {Administrative (RAL-695): the catalog of MCP servers and skills agents can use, and which ones each agent profile (built-ins included) has enabled. Nothing is enabled by default.}
-            - add kind [str] name [str] --arg [value...] --command [cmd] --header [key=value...] --header-link [key=target...] --link [key=target...] --path [folder] --set [key=value...] --url [url]  {RAL-695: add a catalog item. kind is mcp (--command/--arg/--set/--link for a stdio server, or --url/--header/--header-link for an HTTP one) or skill (--path to the skill folder on the daemon host). --set stores a secret value, --link points at a variable name.}
+            - add kind [str] name [str] --arg [value...] --command [cmd] --description [text] --header [key=value...] --header-link [key=target...] --link [key=target...] --path [folder] --set [key=value...] --url [url]  {RAL-695: add a catalog item. kind is mcp (--command/--arg/--set/--link for a stdio server, or --url/--header/--header-link for an HTTP one; --description is an optional note of up to 500 characters shown by `check health`) or skill (--path to the skill folder on the daemon host). --set stores a secret value, --link points at a variable name.}
             - allow-tool profile [str] server [str] tool [str]  {RAL-697: allow one tool of an enabled MCP server for an agent profile (the default for every tool, including ones a server adds later). Clears a deny.}
             - check kind [str] name [str]  {RAL-695: probe an MCP server on the daemon host (spawn it, initialize, list tools, stop it) or check a skill folder, and record the status.}
             - delivery profile [str] --arg [value...] --mode [backend_default|extra_args|none]  {RAL-695: how capabilities reach a custom command profile: the backend default, extra arguments appended to its command ({mcp_config} and {skills_dir} expand to the generated paths), or none.}
             - deny-tool profile [str] server [str] tool [str]  {RAL-697: deny one tool of an MCP server for an agent profile. Claude Code and Codex enforce it; Pi and extra-args delivery refuse.}
             - disable profile [str] kind [str] name [str]  {RAL-695: disable a catalog item for an agent profile or built-in backend.}
-            - edit kind [str] name [str] --arg [value...] --command [cmd] --header [key=value...] --header-link [key=target...] --link [key=target...] --path [folder] --set [key=value...] --url [url]  {RAL-695: replace a catalog item's definition. A masked secret value sent back unchanged keeps the stored secret.}
+            - edit kind [str] name [str] --arg [value...] --command [cmd] --description [text] --header [key=value...] --header-link [key=target...] --link [key=target...] --path [folder] --set [key=value...] --url [url]  {RAL-695: replace a catalog item's definition. A masked secret value sent back unchanged keeps the stored secret.}
             - enable profile [str] kind [str] name [str]  {RAL-695: enable a catalog item for an agent profile or built-in backend.}
             - import  {RAL-695: import MCP servers and skills from the daemon user's own Claude Code, Codex and Pi configs and skill folders. Names already in the catalog are skipped.}
             - (read-only-safe) list  {RAL-695: list the capability catalog with each item's status (ok/failing/untested for MCP servers, found/missing for skills). Secret env values are masked.}
@@ -770,7 +780,7 @@ use; see `READ_ONLY_NOTE`.
         - (read-only-safe) worktree selector [uri]  {Show the worktree/project a cell is using.}
     - check  {System and environment checks.}
         - (read-only-safe) catalog --json  {List every check ralphus_core::health_catalog knows about -- stable id, Core/Harness/Machine section, daemon/remote applicability, Free/OnDemand cost tier, Required/Optional/FallbackOnly requirement level, and impact -- without running any probes (RAL-416). Instant and side-effect-free, unlike `check health`.}
-        - (read-only-safe) health --all-remotes --enable-developer-checks --enable-live-agent-check --json (subagent)  {Check the local ralphus setup, grouped into Core/Harness/Machine sections (daemon, layered config, git, runner, agent backends, gh/glab, resource checks). --all-remotes also checks every configured [machine.targets.*] entry (RAL-355 Phase 9); --enable-live-agent-check additionally performs a live, cost-incurring Arbiter completion round-trip (RAL-415, off by default).}
+        - (read-only-safe) health --all-remotes --enable-developer-checks --enable-live-agent-check --json --used-mcps-only (subagent)  {Check the local ralphus setup, grouped into Core/Harness/Machine/MCP servers sections (daemon, layered config, git, runner, agent backends, gh/glab, resource checks, and a live probe of every registered MCP server). --used-mcps-only limits the MCP servers section to servers enabled on at least one agent profile (RAL-705). --all-remotes also checks every configured [machine.targets.*] entry (RAL-355 Phase 9); --enable-live-agent-check additionally performs a live, cost-incurring Arbiter completion round-trip (RAL-415, off by default).}
         - restart-thread name [str] --json  {Restart a daemon background thread that has panicked or exited (scheduler, health-sweep, pr-base-drift-poller, store-watchdog) without restarting the daemon. `check health` reports each thread's state and names this command for any that is down. Refused for a thread that is still alive.}
     - clear --all --keep-temporary --status [states] --yes (subagent)  {Delete tasks and reviews from the daemon.}
     - (read-only-safe) completion  {Print a shell tab-completion script. (Rust port: not yet implemented -- prints a placeholder message; Python's `shell` argument is not read.)}

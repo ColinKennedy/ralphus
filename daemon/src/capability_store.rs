@@ -73,7 +73,13 @@ pub struct McpConfig {
     pub url: Option<String>,
     #[serde(default)]
     pub headers: Vec<AgentEnvEntry>,
+    /// Free-text note on what the server is for; shown in `check health`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
 }
+
+/// Longest `description` a catalog entry may carry, in characters.
+pub const MCP_DESCRIPTION_MAX_CHARS: usize = 500;
 
 /// A skill folder on the daemon host.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -212,6 +218,24 @@ fn validate_name(name: &str) -> Result<(), CapabilityError> {
             "name must be 1-64 letters, digits, '-', '_' or '.' and not start with '.'".to_string(),
         ))
     }
+}
+
+/// Trim the description; blank becomes absent; over-long is rejected.
+fn normalize_description(config: &mut McpConfig) -> Result<(), CapabilityError> {
+    config.description = config
+        .description
+        .take()
+        .map(|d| d.trim().to_string())
+        .filter(|d| !d.is_empty());
+    if let Some(d) = &config.description {
+        let len = d.chars().count();
+        if len > MCP_DESCRIPTION_MAX_CHARS {
+            return Err(CapabilityError::Invalid(format!(
+                "description is {len} characters; the limit is {MCP_DESCRIPTION_MAX_CHARS}"
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn validate_mcp(config: &McpConfig) -> Result<(), CapabilityError> {
@@ -487,6 +511,7 @@ impl Store {
                     config.env = unmask_entries(config.env, &old.env);
                     config.headers = unmask_entries(config.headers, &old.headers);
                 }
+                normalize_description(&mut config)?;
                 validate_mcp(&config)?;
                 serde_json::to_string(&config)
             }
@@ -711,6 +736,24 @@ impl Store {
             .into_iter()
             .filter_map(|(k, n)| CapabilityKind::parse(&k).map(|k| (k, n)))
             .collect())
+    }
+
+    /// For each MCP server name, the profiles that have it enabled (sorted).
+    ///
+    /// # Errors
+    /// Propagates any SQLite failure.
+    pub fn mcp_enabling_profiles(&self) -> StoreResult<BTreeMap<String, Vec<String>>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT name, profile FROM agent_capability_enabled WHERE kind = 'mcp' ORDER BY name, profile",
+        )?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let mut out: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for (name, profile) in rows {
+            out.entry(name).or_default().push(profile);
+        }
+        Ok(out)
     }
 
     /// Enable or disable one catalog item for `profile` (a built-in backend
@@ -1097,6 +1140,82 @@ mod tests {
             env,
             ..McpConfig::default()
         }
+    }
+
+    fn described(text: &str) -> McpConfig {
+        McpConfig {
+            description: Some(text.to_string()),
+            ..stdio(vec![])
+        }
+    }
+
+    #[test]
+    fn description_is_trimmed_blank_is_dropped_and_cap_is_enforced() {
+        let store = Store::open_in_memory().unwrap();
+        let save = |name: &str, text: &str| {
+            store.upsert_capability_item(
+                CapabilityKind::Mcp,
+                name,
+                Some(described(text)),
+                None,
+                "manual",
+            )
+        };
+        let stored = |name: &str| {
+            store
+                .get_capability_item(CapabilityKind::Mcp, name, false)
+                .unwrap()
+                .unwrap()
+                .mcp
+                .unwrap()
+                .description
+        };
+
+        save("trimmed", "  Docs search \n").unwrap();
+        assert_eq!(stored("trimmed").as_deref(), Some("Docs search"));
+        save("blank", "   ").unwrap();
+        assert_eq!(stored("blank"), None);
+        save("edge", &"x".repeat(MCP_DESCRIPTION_MAX_CHARS)).unwrap();
+        assert!(stored("edge").is_some());
+
+        let err = save("long", &"x".repeat(MCP_DESCRIPTION_MAX_CHARS + 1)).unwrap_err();
+        assert!(
+            err.to_string().contains("limit is 500"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            store
+                .get_capability_item(CapabilityKind::Mcp, "long", false)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn mcp_enabling_profiles_lists_profiles_per_server() {
+        let store = Store::open_in_memory().unwrap();
+        for name in ["a", "b"] {
+            store
+                .upsert_capability_item(
+                    CapabilityKind::Mcp,
+                    name,
+                    Some(stdio(vec![])),
+                    None,
+                    "manual",
+                )
+                .unwrap();
+        }
+        for profile in ["codex", "claude-code"] {
+            store
+                .set_capability_enabled(profile, CapabilityKind::Mcp, "a", true, false)
+                .unwrap();
+        }
+        let map = store.mcp_enabling_profiles().unwrap();
+        assert_eq!(
+            map.get("a").cloned(),
+            Some(vec!["claude-code".to_string(), "codex".to_string()])
+        );
+        assert!(!map.contains_key("b"));
     }
 
     #[test]

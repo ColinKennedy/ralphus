@@ -21,7 +21,7 @@
 //! each crate's own parity tests.
 
 /// Which section of `check health`'s human-facing report a catalog entry
-/// belongs to (`cli/src/health.rs`'s `CORE`/`HARNESS`/`MACHINE` constants --
+/// belongs to (`cli/src/health.rs`'s `CORE`/`HARNESS`/`MACHINE`/`MCP` constants --
 /// duplicated here as string literals, not re-exported, so this
 /// dependency-light crate never has to know about `cli`'s module layout;
 /// each section's meaning is documented in full at `cli/src/health.rs`'s
@@ -30,6 +30,7 @@ pub mod section {
     pub const CORE: &str = "core";
     pub const HARNESS: &str = "harness";
     pub const MACHINE: &str = "machine";
+    pub const MCP: &str = "mcp";
 }
 
 /// Does this check inspect the local/daemon machine, or a configured
@@ -65,6 +66,10 @@ pub enum CostTier {
     /// `--all-remotes`/`--enable-live-agent-check`) or a board "check now"
     /// action. Never included in the background sweep.
     OnDemand,
+    /// Runs on every plain `ralphus check health` (no flag) but is never part
+    /// of the background sweep, because each run does live work -- spawning
+    /// MCP servers -- whose result must be current, not an hour old.
+    PerInvocation,
 }
 
 /// How load-bearing is this check to the system actually working?
@@ -176,6 +181,7 @@ catalog_ids! {
     ID_CODEX_LOGIN => "codex-login",
     ID_CONFIG => "config",
     ID_DAEMON_MAX_CONCURRENT => "daemon-max-concurrent",
+    ID_MCP_SERVER => "mcp-server",
     ID_TOOL_ARG_TRUNCATE_CHARS => "tool-arg-truncate-chars",
     ID_THRASH_MAX_COMPACTIONS => "thrash-max-compactions",
     ID_THRASH_MIN_TURN_GAP => "thrash-min-turn-gap",
@@ -571,6 +577,17 @@ pub const CATALOG: &[CatalogEntry] = &[
         remediation: "See the check's own detail for the underlying agent/model error, and fix the Arbiter's configuration or credentials.",
     },
     CatalogEntry {
+        id: ID_MCP_SERVER,
+        label: "MCP server",
+        section: section::MCP,
+        applicability: Applicability::DaemonLocal,
+        cost_tier: CostTier::PerInvocation,
+        requirement: RequirementLevel::Optional,
+        probe: Probe::DaemonApi("GET /api/health/mcp"),
+        impact: "Agent profiles that enable a broken MCP server run without its tools, so they may not work as expected.",
+        remediation: "Run `ralphus agent capability check mcp <name>`, then fix the server's command/url in the capability catalog.",
+    },
+    CatalogEntry {
         id: ID_NVIDIA_SMI,
         label: "nvidia-smi",
         section: section::MACHINE,
@@ -769,7 +786,13 @@ mod tests {
     fn every_entry_has_a_known_section() {
         for entry in CATALOG {
             assert!(
-                [section::CORE, section::HARNESS, section::MACHINE].contains(&entry.section),
+                [
+                    section::CORE,
+                    section::HARNESS,
+                    section::MACHINE,
+                    section::MCP
+                ]
+                .contains(&entry.section),
                 "{} has an unrecognized section {:?}",
                 entry.id,
                 entry.section
@@ -801,6 +824,7 @@ mod tests {
         let free: Vec<&str> = free_daemon_local_entries().map(|e| e.id).collect();
         assert!(!free.contains(&ID_ARBITER));
         assert!(!free.contains(&ID_CARGO));
+        assert!(!free.contains(&ID_MCP_SERVER));
         assert!(!free.contains(&ID_REMOTE_SSH_REACHABLE));
         assert!(free.contains(&ID_DAEMON));
         assert!(free.contains(&ID_GIT));

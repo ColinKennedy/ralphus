@@ -1,7 +1,7 @@
 //! `ralphus check health` -- check that the local setup can actually run
 //! tasks, ported from `cli/src/ralphus/health.py`.
 //!
-//! Checks are grouped into three human-facing sections (RAL-415):
+//! Checks are grouped into four human-facing sections (RAL-415, RAL-705):
 //! - [`CORE`]: daemon reachability, layered configuration provenance, every
 //!   registered project's on-disk path/git-repo validity, and every
 //!   `.ralphus.toml`-driven setting (timeouts, concurrency, forge/PR
@@ -16,6 +16,9 @@
 //!   gracefully rather than blocking task execution -- `nvidia-smi` (GPU
 //!   sampling), the opt-in developer toolchain (`cargo`), and opt-in
 //!   `--all-remotes` target inventory health.
+//! - [`MCP`]: one row per registered MCP server, probed live by the daemon on
+//!   every run (see [`check_mcp_servers`]); `--used-mcps-only` keeps the
+//!   servers some agent profile has enabled. Never worse than `warn`.
 //!
 //! Every [`CheckResult`] states three things: `detail` (the observation --
 //! what was found), `impact` (what's at stake if this isn't a clean pass),
@@ -41,6 +44,7 @@ use crate::client::DaemonClient;
 pub const CORE: &str = "core";
 pub const HARNESS: &str = "harness";
 pub const MACHINE: &str = "machine";
+pub const MCP: &str = "mcp";
 
 const PASS: &str = "pass";
 const WARN: &str = "warn";
@@ -134,6 +138,16 @@ impl CheckResult {
         remediation: impl Into<String>,
     ) -> Self {
         Self::build(name, status, detail, MACHINE, impact, remediation)
+    }
+
+    fn mcp(
+        name: &str,
+        status: &'static str,
+        detail: impl Into<String>,
+        impact: impl Into<String>,
+        remediation: impl Into<String>,
+    ) -> Self {
+        Self::build(name, status, detail, MCP, impact, remediation)
     }
 
     #[must_use]
@@ -710,6 +724,105 @@ fn check_project_forks(daemon_url: &str) -> Vec<CheckResult> {
             )
         })
         .collect()
+}
+
+/// RAL-705: one row per registered MCP server, probed live by the daemon on
+/// this very call (`GET /api/health/mcp`) -- never from a stored status. An
+/// unreachable daemon, or one that refuses a non-admin caller, becomes a
+/// single `skip` row with remediation rather than a failure.
+fn check_mcp_servers(daemon_url: &str, used_only: bool) -> Vec<CheckResult> {
+    let client = DaemonClient::new(daemon_url);
+    match client.health_mcp(used_only) {
+        Ok(response) => mcp_rows_from_response(&response),
+        Err(e) => vec![mcp_unavailable_row(&e)],
+    }
+}
+
+fn mcp_unavailable_row(e: &crate::client::DaemonError) -> CheckResult {
+    let (detail, remediation) = if e.status_code == Some(403) {
+        (
+            format!("the daemon refused the MCP server probe: {e}"),
+            "Run this as an admin user, then re-run `ralphus check health`.",
+        )
+    } else {
+        (
+            format!("could not reach the daemon to probe MCP servers: {e}"),
+            "Ensure the daemon is reachable, then re-run `ralphus check health`.",
+        )
+    };
+    CheckResult::mcp(
+        "mcp-servers",
+        SKIP,
+        detail,
+        "MCP servers were not probed, so a broken one would go unnoticed.",
+        remediation,
+    )
+    .with_id(ralphus_core::health_catalog::ID_MCP_SERVER)
+}
+
+/// Maps the daemon's `GET /api/health/mcp` reply to rows: `ok` -> pass, every
+/// other status -> warn (an MCP problem is never a failure). A reply with no
+/// servers yields one `skip` row.
+fn mcp_rows_from_response(response: &serde_json::Value) -> Vec<CheckResult> {
+    let servers = response["servers"].as_array().cloned().unwrap_or_default();
+    if servers.is_empty() {
+        return vec![
+            CheckResult::mcp(
+                "mcp-servers",
+                SKIP,
+                "no MCP servers are registered in the capability catalog",
+                "Nothing to probe.",
+                "Add one with `ralphus agent capability add mcp <name>` if agents need MCP tools.",
+            )
+            .with_id(ralphus_core::health_catalog::ID_MCP_SERVER),
+        ];
+    }
+    servers.iter().map(mcp_row).collect()
+}
+
+fn mcp_row(server: &serde_json::Value) -> CheckResult {
+    let name = server["name"].as_str().unwrap_or("unknown");
+    let detail = server["detail"].as_str().unwrap_or_default();
+    let row_name = format!("mcp:{name}");
+    let result = if server["status"].as_str() == Some("ok") {
+        CheckResult::mcp(
+            &row_name,
+            PASS,
+            detail,
+            "Agents that enable this server can use its tools.",
+            "No action needed.",
+        )
+    } else {
+        let description = server["description"]
+            .as_str()
+            .map(str::trim)
+            .filter(|d| !d.is_empty())
+            .map_or_else(|| format!("MCP server `{name}`"), str::to_string);
+        let profiles: Vec<&str> = server["profiles"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(serde_json::Value::as_str)
+            .collect();
+        let who = if profiles.is_empty() {
+            "Agents using it".to_string()
+        } else {
+            format!("Agents using it (profiles: {})", profiles.join(", "))
+        };
+        CheckResult::mcp(
+            &row_name,
+            WARN,
+            detail,
+            format!(
+                "{}. {who} may not work as expected.",
+                description.trim_end_matches('.')
+            ),
+            format!(
+                "Run `ralphus agent capability check mcp {name}` or fix its command/url in the capability catalog."
+            ),
+        )
+    };
+    result.with_id(ralphus_core::health_catalog::ID_MCP_SERVER)
 }
 
 fn check_runner() -> CheckResult {
@@ -2096,6 +2209,7 @@ pub fn run_checks(
     enable_developer_checks: bool,
     enable_remote_checks: bool,
     enable_live_agent_checks: bool,
+    used_mcps_only: bool,
 ) -> Vec<CheckResult> {
     use ralphus_core::health_catalog::*;
 
@@ -2182,12 +2296,63 @@ pub fn run_checks(
     if enable_remote_checks {
         results.extend(check_remote_targets(daemon_url));
     }
+    results.extend(check_mcp_servers(daemon_url, used_mcps_only));
     results
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mcp_rows_map_status_to_pass_or_warn_and_carry_profiles() {
+        let response = serde_json::json!({"servers":[
+            {"name":"good","status":"ok","detail":"3 tool(s)","description":"Good","profiles":[]},
+            {"name":"bad","status":"warn","detail":"spawn failed","description":"Docs search.","profiles":["codex","claude-code"]},
+            {"name":"bare","status":"warn","detail":"x","description":"  ","profiles":[]}
+        ]});
+        let rows = mcp_rows_from_response(&response);
+        assert_eq!(rows.len(), 3);
+        assert!(
+            rows.iter()
+                .all(|r| r.section == MCP && r.id == "mcp-server")
+        );
+        assert_eq!(rows[0].name, "mcp:good");
+        assert_eq!(rows[0].status, PASS);
+        assert_eq!(rows[1].status, WARN);
+        assert_eq!(
+            rows[1].impact,
+            "Docs search. Agents using it (profiles: codex, claude-code) may not work as expected."
+        );
+        assert!(
+            rows[1]
+                .remediation
+                .contains("`ralphus agent capability check mcp bad`")
+        );
+        assert!(rows[2].impact.starts_with("MCP server `bare`."));
+        assert!(rows[2].impact.contains("Agents using it may not work"));
+    }
+
+    #[test]
+    fn mcp_rows_are_one_skip_row_when_nothing_is_registered() {
+        let rows = mcp_rows_from_response(&serde_json::json!({"servers":[]}));
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].status, SKIP);
+        assert!(!rows[0].remediation.is_empty());
+    }
+
+    #[test]
+    fn mcp_unavailable_daemon_or_forbidden_is_a_skip_with_remediation() {
+        for (code, needle) in [(Some(403), "admin"), (None, "reachable")] {
+            let row = mcp_unavailable_row(&crate::client::DaemonError {
+                message: "nope".to_string(),
+                status_code: code,
+            });
+            assert_eq!(row.status, SKIP);
+            assert!(row.remediation.contains(needle), "{}", row.remediation);
+            assert_eq!(row.section, MCP);
+        }
+    }
     use std::path::PathBuf;
 
     #[test]
