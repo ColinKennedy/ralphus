@@ -13444,7 +13444,11 @@ fn guardian_branch_diff_summary(daemon: &Daemon, id: &str, branch_id: &str) -> R
     if !guardian.branches.iter().any(|b| b.id == branch_id) {
         return error(404, "not_found", "no such branch", vec![]);
     }
-    match crate::guardian_merge::branch_diff_summary(&guardian, branch_id) {
+    // The worktree is on the review's machine, so every git call goes there.
+    let store = daemon.store_handle();
+    match crate::guardian_merge::branch_diff_summary(&guardian, branch_id, |worktree| {
+        crate::workspace::Workspace::for_guardian(&store, id, worktree)
+    }) {
         Ok(d) => json(200, &d),
         Err(e) => error(409, "diff_summary_unavailable", &e, vec![]),
     }

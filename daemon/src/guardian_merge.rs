@@ -700,21 +700,19 @@ pub(crate) fn branch_diff_base(
 
 /// The git revision in `worktree` that `base` names, if it resolves.
 fn resolve_branch_diff_rev(
-    worktree: &Path,
+    worktree: &Workspace,
     guardian: &crate::guardian::GuardianView,
     base: &BranchDiffBase,
 ) -> Option<String> {
     let resolves = |rev: &str| {
-        git(
-            worktree,
-            &[
+        worktree
+            .git(&[
                 "rev-parse",
                 "--verify",
                 "--quiet",
                 &format!("{rev}^{{commit}}"),
-            ],
-        )
-        .is_ok_and(|s| !s.trim().is_empty())
+            ])
+            .is_ok_and(|s| !s.trim().is_empty())
     };
     match base {
         BranchDiffBase::Review { git_ref, .. } => resolves(git_ref).then(|| git_ref.clone()),
@@ -753,10 +751,13 @@ pub(crate) struct BranchDiffSummary {
     pub lines_removed: u64,
 }
 
-/// Compute [`BranchDiffSummary`] for `branch_id`. `Err` is a user-facing message.
+/// Compute [`BranchDiffSummary`] for `branch_id`, whose worktree path
+/// `workspace_for` turns into a [`Workspace`] on the review's machine. `Err`
+/// is a user-facing message.
 pub(crate) fn branch_diff_summary(
     guardian: &crate::guardian::GuardianView,
     branch_id: &str,
+    workspace_for: impl FnOnce(&str) -> Workspace,
 ) -> std::result::Result<BranchDiffSummary, String> {
     let base = branch_diff_base(guardian, branch_id)
         .ok_or_else(|| "this branch is disabled, so it has no diff summary".to_string())?;
@@ -765,13 +766,26 @@ pub(crate) fn branch_diff_summary(
         .iter()
         .find(|b| b.id == branch_id)
         .and_then(|b| b.worktree.as_deref())
-        .map(PathBuf::from)
-        .filter(|p| p.is_dir())
-        .ok_or_else(|| "no review worktree on this host yet".to_string())?;
+        .map(workspace_for)
+        .filter(|ws| !ws.is_local() || ws.root().is_dir())
+        .ok_or_else(|| "no review worktree yet".to_string())?;
     let base_rev = resolve_branch_diff_rev(&worktree, guardian, &base)
         .ok_or_else(|| "the diff base does not resolve in this worktree".to_string())?;
-    let counts = ralphus_runner::worktree_diff::summarize(&worktree, &base_rev)
-        .ok_or_else(|| "git could not diff this worktree".to_string())?;
+    let counts = if worktree.is_local() {
+        ralphus_runner::worktree_diff::summarize(worktree.root(), &base_rev)
+    } else {
+        ralphus_runner::worktree_diff::summarize_via(
+            |args| worktree.git(args),
+            |rel| {
+                worktree.read_file(rel).map_or(0, |text| {
+                    ralphus_runner::worktree_diff::count_text_lines(&text)
+                })
+            },
+            &base_rev,
+        )
+        .ok()
+    }
+    .ok_or_else(|| "git could not diff this worktree".to_string())?;
     let (base_kind, base_branch_id) = match &base {
         BranchDiffBase::Remote => ("remote", None),
         BranchDiffBase::Review { branch_id, .. } => ("review", Some(branch_id.clone())),
@@ -25479,7 +25493,7 @@ mod branch_diff_tests {
         guardian.base_branch = "main".to_string();
         guardian.branches[0].worktree = Some(dir.to_string_lossy().to_string());
 
-        let none = branch_diff_summary(&guardian, &ids[0]).unwrap();
+        let none = branch_diff_summary(&guardian, &ids[0], |wt| Workspace::local(wt)).unwrap();
         assert_eq!(
             (none.files_changed, none.lines_added, none.lines_removed),
             (0, 0, 0)
@@ -25487,12 +25501,103 @@ mod branch_diff_tests {
 
         std::fs::write(dir.join("a.txt"), "two\nthree\n").unwrap();
         std::fs::write(dir.join("new.txt"), "x\n").unwrap();
-        let some = branch_diff_summary(&guardian, &ids[0]).unwrap();
+        let some = branch_diff_summary(&guardian, &ids[0], |wt| Workspace::local(wt)).unwrap();
         assert_eq!(some.files_changed, 2);
         assert_eq!(some.files_added, 1);
         assert_eq!(some.lines_added, 3);
         assert_eq!(some.lines_removed, 1);
         assert_eq!(some.base_kind, "remote");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A machine provider whose `run` verb runs the program in `real` when
+    /// asked for the machine path `/remote/wt`, and whose `read-file` reads
+    /// under `real` the same way: a remote worktree that exists only "over
+    /// there".
+    fn proxy_git_provider(dir: &Path, real: &Path) -> PathBuf {
+        let py = dir.join("provider.py");
+        std::fs::write(
+            &py,
+            format!(
+                r#"import json, os, subprocess, sys
+verb = sys.argv[1]
+real = {real:?}
+req = json.load(sys.stdin)
+def local(p):
+    p = p.replace("\\", "/")
+    assert p.startswith("/remote/wt"), p
+    return os.path.join(real, p[len("/remote/wt"):].lstrip("/"))
+if verb == "run":
+    out = subprocess.run([req["program"]] + req["args"], cwd=local(req["cwd"]), capture_output=True, text=True)
+    print(json.dumps({{"ok": True, "protocol_version": 1, "exit_code": out.returncode, "stdout": out.stdout}}))
+elif verb == "read-file":
+    print(json.dumps({{"ok": True, "protocol_version": 1, "stdout": open(local(req["path"])).read()}}))
+else:
+    print(json.dumps({{"ok": False, "protocol_version": 1, "error": "unexpected verb " + verb}}))
+"#,
+                real = real.to_string_lossy(),
+            ),
+        )
+        .unwrap();
+        py
+    }
+
+    #[test]
+    fn diff_summary_of_a_remote_review_runs_on_its_machine() {
+        let dir = ralphus_test_support::scratch(format!(
+            "ralphus-remote-branch-diff-{}",
+            std::process::id()
+        ));
+        let repo = dir.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let g = |args: &[&str]| {
+            git(&repo, args).unwrap();
+        };
+        g(&["init", "--initial-branch", "main"]);
+        g(&["config", "user.email", "t@example.com"]);
+        g(&["config", "user.name", "t"]);
+        g(&["config", "commit.gpgsign", "false"]);
+        std::fs::write(repo.join("a.txt"), "one\n").unwrap();
+        g(&["add", "."]);
+        g(&["commit", "-m", "base"]);
+        std::fs::write(repo.join("a.txt"), "two\nthree\n").unwrap();
+        std::fs::write(repo.join("new.txt"), "x\ny\n").unwrap();
+
+        let py = proxy_git_provider(&dir, &repo);
+        let store = Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
+        store
+            .lock()
+            .register_machine_provider(
+                "difftest",
+                "",
+                "python",
+                &[py.to_string_lossy().into_owned()],
+                crate::machines::PROTOCOL_VERSION,
+                false,
+            )
+            .unwrap();
+
+        let (mut guardian, ids) = review_with_branches(&[true]);
+        guardian.base_branch = "main".to_string();
+        // A path on the machine only: nothing exists at it on this host.
+        guardian.branches[0].worktree = Some("/remote/wt".to_string());
+
+        let summary = branch_diff_summary(&guardian, &ids[0], |wt| {
+            Workspace::on(wt, Some("difftest:A")).with_store(Arc::clone(&store))
+        })
+        .unwrap();
+        assert_eq!(
+            (
+                summary.files_changed,
+                summary.files_added,
+                summary.lines_added,
+                summary.lines_removed
+            ),
+            (2, 1, 4, 1)
+        );
+        assert_eq!(summary.base_ref, "main");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
