@@ -175,7 +175,11 @@ terminal, or lines from a log it wrote). For terminal-text, name the command and
 the lines that matter. Ask only for what is visible and matters to the change; a \
 change with nothing to see asks for nothing, or for terminal-text. Examples: \
 'EXHIBIT: gif | dragging the zoom slider from 0 to 1 magnifies the chart', \
-'EXHIBIT: terminal-text | `mytool check` prints the new WARN row and its impact line'.";
+'EXHIBIT: terminal-text | `mytool check` prints the new WARN row and its impact line'. \
+If a kind may not be capturable, add fallbacks after '||', each with its own \
+description written for what that kind can show, tried in order: \
+'EXHIBIT: gif | dragging the zoom slider from 0 to 1 magnifies the chart || \
+screenshot | the chart magnified at zoom 1'.";
 
 /// Most capabilities named per kind in the handoff question; the rest are
 /// counted.
@@ -2067,26 +2071,23 @@ prompt = "second"
     #[test]
     fn exhibit_requests_follow_their_handoff_numbers_through_dedupe() {
         let mut a = handoff("c1", "open the zoom tool");
-        a.exhibits = vec![crate::exhibits::ExhibitRequest {
-            kind: crate::exhibits::ExhibitKind::Gif,
-            describe: "drag zoom".into(),
-        }];
+        a.exhibits = vec![crate::exhibits::ExhibitRequest::single(
+            crate::exhibits::ExhibitKind::Gif,
+            "drag zoom",
+        )];
         let mut b = handoff("c2", "open the zoom tool again");
         b.exhibits = vec![
-            crate::exhibits::ExhibitRequest {
-                kind: crate::exhibits::ExhibitKind::Gif,
-                describe: "Drag zoom".into(),
-            },
-            crate::exhibits::ExhibitRequest {
-                kind: crate::exhibits::ExhibitKind::Screenshot,
-                describe: "final view".into(),
-            },
+            crate::exhibits::ExhibitRequest::single(crate::exhibits::ExhibitKind::Gif, "Drag zoom"),
+            crate::exhibits::ExhibitRequest::single(
+                crate::exhibits::ExhibitKind::Screenshot,
+                "final view",
+            ),
         ];
         let mut c = handoff("c3", "run the CLI");
-        c.exhibits = vec![crate::exhibits::ExhibitRequest {
-            kind: crate::exhibits::ExhibitKind::TerminalText,
-            describe: "help text".into(),
-        }];
+        c.exhibits = vec![crate::exhibits::ExhibitRequest::single(
+            crate::exhibits::ExhibitKind::TerminalText,
+            "help text",
+        )];
         // The agent merged 1 and 2 and dropped every EXHIBIT word from its
         // prompts; the requests still land on the right actions.
         let reply = r#"{"live_actions": [
@@ -2143,17 +2144,17 @@ prompt = "second"
                 crate::exhibits::ExhibitOrigin::Handoff,
                 &[
                     (
-                        crate::exhibits::ExhibitRequest {
-                            kind: crate::exhibits::ExhibitKind::Screenshot,
-                            describe: "the greeting".into(),
-                        },
+                        crate::exhibits::ExhibitRequest::single(
+                            crate::exhibits::ExhibitKind::Screenshot,
+                            "the greeting",
+                        ),
                         None,
                     ),
                     (
-                        crate::exhibits::ExhibitRequest {
-                            kind: crate::exhibits::ExhibitKind::Gif,
-                            describe: "the greeting animating".into(),
-                        },
+                        crate::exhibits::ExhibitRequest::single(
+                            crate::exhibits::ExhibitKind::Gif,
+                            "the greeting animating",
+                        ),
                         None,
                     ),
                 ],
@@ -2260,10 +2261,10 @@ prompt = "second"
                 0,
                 crate::exhibits::ExhibitOrigin::Handoff,
                 &[(
-                    crate::exhibits::ExhibitRequest {
-                        kind: crate::exhibits::ExhibitKind::Gif,
-                        describe: "it moving".into(),
-                    },
+                    crate::exhibits::ExhibitRequest::single(
+                        crate::exhibits::ExhibitKind::Gif,
+                        "it moving",
+                    ),
                     None,
                 )],
             )
@@ -2385,10 +2386,10 @@ prompt = "second"
                 0,
                 crate::exhibits::ExhibitOrigin::Handoff,
                 &[(
-                    crate::exhibits::ExhibitRequest {
-                        kind: crate::exhibits::ExhibitKind::Gif,
-                        describe: "it moving".into(),
-                    },
+                    crate::exhibits::ExhibitRequest::single(
+                        crate::exhibits::ExhibitKind::Gif,
+                        "it moving",
+                    ),
                     None,
                 )],
             )
@@ -2543,10 +2544,10 @@ prompt = "second"
             label: "a".into(),
             prompt: "do a".into(),
             source_cells: vec!["c1".into()],
-            exhibits: vec![crate::exhibits::ExhibitRequest {
-                kind: crate::exhibits::ExhibitKind::Gif,
-                describe: "the thing moving".into(),
-            }],
+            exhibits: vec![crate::exhibits::ExhibitRequest::single(
+                crate::exhibits::ExhibitKind::Gif,
+                "the thing moving",
+            )],
         }];
         assert!(store.insert_guardian_live_actions(&gid, &first).unwrap());
         assert!(

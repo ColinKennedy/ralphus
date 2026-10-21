@@ -540,7 +540,11 @@ tool guidance, but without the waypoint section (`waypoint_context` false). The 
   not end the handoff). `<kind>` is `gif`, `video`, `screenshot` or
   `terminal-text` (`output` is accepted as its earlier name)
   (case-insensitive; anything else is ignored and logged). At most four per
-  handoff. Lifted out of the handoff text by `exhibits::split_handoff` before
+  handoff. Fallback kinds follow `||`, each with its own description:
+  `EXHIBIT: gif | <what> || screenshot | <what>`; the pair actually delivered
+  supplies the description shown. A `||` not followed by `<kind> |` stays part
+  of the description, and a fallback without a description is dropped and
+  logged. An alternative list is one slot. Lifted out of the handoff text by `exhibits::split_handoff` before
   deduplication and carried to the merged live action by handoff number, so
   dedupe can neither drop nor reassign one; each becomes an **exhibit slot**.
 - **`RALPHUS_EXHIBIT: {json}`** — one line per exhibit slot in a live run

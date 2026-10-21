@@ -677,20 +677,30 @@
             ? `added by the PR writer${s.why ? `: ${s.why}` : ""}`
             : s.origin === "recipe" ? "from a .ralphus.toml recipe" : "asked for by the agent that made the change";
           const kind = s.delivered_kind && s.delivered_kind !== s.kind ? `${s.kind} → ${s.delivered_kind}` : s.kind;
+          // The description written for the delivered kind; the primary's
+          // when the slot lists no such kind.
+          const deliveredAlt = s.delivered_kind ? (s.alternatives || []).find((a) => a.kind === s.delivered_kind) : undefined;
+          const describe = deliveredAlt ? deliveredAlt.describe : s.describe;
           const preview = exhibitPreviews[key];
           const media = preview
             ? (preview.startsWith("data:video/")
               ? `<video class="exhibit-preview" src="${esc(preview)}" controls muted data-tip="The captured recording, as kept by the daemon."></video>`
-              : `<img class="exhibit-preview" src="${esc(preview)}" alt="${esc(s.caption || s.describe)}" data-tip="The captured image, as kept by the daemon.">`)
+              : `<img class="exhibit-preview" src="${esc(preview)}" alt="${esc(s.caption || describe)}" data-tip="The captured image, as kept by the daemon.">`)
             : "";
           const previewBtn = s.has_file && !preview
             ? `<button class="btn" data-click="previewExhibit" data-guardian-id="${esc(gid)}" data-action="${s.action_idx}" data-slot="${s.slot_idx}" data-tip="Load the captured file here to see what the PR will show.">Preview</button>`
             : "";
+          // Each `||` fallback keeps its own kind and description, so the
+          // reviewer sees every alternative the agent wrote, not one merged text.
+          const fallbacks = (s.alternatives || []).map((a) => `<div class="exhibit-row exhibit-fallback">
+              <span class="cmd-label" data-tip="A fallback kind, used when the kind above cannot be captured.">or ${esc(a.kind)}</span>
+              <span class="cmd-text" data-tip="${esc(a.describe)}">${esc(a.describe)}</span>
+            </div>`).join("");
           return `<div class="exhibit-row">
               <span class="cmd-label" data-tip="${esc(`Kind of exhibit: what was asked for${s.delivered_kind && s.delivered_kind !== s.kind ? ", then what was delivered" : ""}.`)}">${esc(kind)}</span>
-              <span class="cmd-text" data-tip="${esc(`${s.describe}\n\nWho asked: ${asked}.${s.caption ? `\nCaption: ${s.caption}` : ""}`)}">${esc(s.describe)}</span>
+              <span class="cmd-text" data-tip="${esc(`${describe}\n\nWho asked: ${asked}.${s.caption ? `\nCaption: ${s.caption}` : ""}`)}">${esc(describe)}</span>
               ${state}${previewBtn}
-            </div>${s.text && delivered ? `<div class="run-out" data-tip="The captured output, as the PR shows it.">${esc(s.text)}</div>` : ""}${media}`;
+            </div>${fallbacks}${s.text && delivered ? `<div class="run-out" data-tip="The captured output, as the PR shows it.">${esc(s.text)}</div>` : ""}${media}`;
         }).join("");
         return `<div class="exhibits" data-tip="What a reviewer should see in this action's PR descriptions: pictures, recordings or output its runs capture.">${rows}</div>`;
       }

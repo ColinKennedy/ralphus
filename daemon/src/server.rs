@@ -13837,6 +13837,7 @@ fn guardian_exhibits(daemon: &Daemon, id: &str) -> Reply {
                 "action_label": labels.get(&s.key.action_idx),
                 "kind": s.request.kind,
                 "describe": s.request.describe,
+                "alternatives": s.request.alternatives,
                 "origin": s.origin,
                 "why": s.why,
                 "delivered_kind": s.fill.as_ref().and_then(|f| f.delivered_kind),

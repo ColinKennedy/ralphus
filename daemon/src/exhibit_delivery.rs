@@ -424,15 +424,7 @@ https://github.com/user-attachments/assets/2
         let gid = store.create_guardian("r", "main", "/repo").unwrap();
         let requests: Vec<_> = kinds
             .iter()
-            .map(|kind| {
-                (
-                    ExhibitRequest {
-                        kind: *kind,
-                        describe: kind.as_str().into(),
-                    },
-                    None,
-                )
-            })
+            .map(|kind| (ExhibitRequest::single(*kind, kind.as_str()), None))
             .collect();
         store
             .add_exhibit_requests(&gid, 0, ExhibitOrigin::Handoff, &requests)
@@ -484,10 +476,7 @@ https://github.com/user-attachments/assets/2
                 1,
                 ExhibitOrigin::Handoff,
                 &[(
-                    ExhibitRequest {
-                        kind: ExhibitKind::Screenshot,
-                        describe: "another action's".into(),
-                    },
+                    ExhibitRequest::single(ExhibitKind::Screenshot, "another action's"),
                     None,
                 )],
             )

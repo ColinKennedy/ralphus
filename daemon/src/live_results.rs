@@ -2829,10 +2829,10 @@ live
                 0,
                 crate::exhibits::ExhibitOrigin::Handoff,
                 &[(
-                    crate::exhibits::ExhibitRequest {
-                        kind: crate::exhibits::ExhibitKind::Screenshot,
-                        describe: "the greeting".into(),
-                    },
+                    crate::exhibits::ExhibitRequest::single(
+                        crate::exhibits::ExhibitKind::Screenshot,
+                        "the greeting",
+                    ),
                     None,
                 )],
             )
