@@ -71,6 +71,48 @@ the fleet -- decides where ralphus may write.
 | `labels`, `max_allocations`, `agents` | as for SSH machines |
 | `host`, `user`, `[machine.runner]` | not used (a runner table is an error) |
 
+### When the machine cannot reach the fleet: an SSH reverse tunnel
+
+An outpost connects *to* the fleet, so the fleet host must accept that
+connection. When an inbound firewall on the fleet host blocks it (a Windows
+PC on a "Public" network, say) and you would rather not change firewall
+rules on either side, but you can SSH from the fleet host to the machine,
+carry the outpost's connection back over one SSH session instead. Nothing
+then listens on the fleet host beyond loopback, and the only connection
+crossing the network is your outgoing SSH.
+
+1. Run the fleet on loopback (`listen = "127.0.0.1:7931"`), with the
+   machine's pairing secret in its environment as above.
+2. Copy `ralphus-outpost` to the machine (`scp`), for example to
+   `C:\ralphus\bin\ralphus-outpost.exe`.
+3. From the fleet host, open one long-lived session that forwards the
+   machine's `127.0.0.1:7931` back to the fleet and runs the outpost in its
+   foreground, connecting to that forwarded port:
+
+   ```bash
+   ssh -o ExitOnForwardFailure=yes -o ServerAliveInterval=15 \
+       -R 7931:127.0.0.1:7931 me@winbox \
+       powershell -NoProfile -NonInteractive -Command -
+   ```
+
+   and write one line to that session's stdin (from a program, not typed
+   into a terminal that logs it):
+
+   ```powershell
+   $env:RALPHUS_OUTPOST_TOKEN = '<the secret>'; & 'C:\ralphus\bin\ralphus-outpost.exe' connect http://127.0.0.1:7931 --name winbox --token-env RALPHUS_OUTPOST_TOKEN --remote-root C:/ralphus/fleet
+   ```
+
+   The secret travels only on that encrypted session's stdin: it is never on
+   a command line or on either machine's disk.
+
+Keep the tunnel and the outpost in the same session: a process the machine's
+OpenSSH server starts with `Start-Process` from a session that then ends is
+stopped with it, while one in the session's foreground lives exactly as long
+as the session. Closing the session (stopping that `ssh`) takes the outpost
+down; jobs it started keep running and are picked up when a new session
+connects. One session is also much gentler on a Windows OpenSSH server than
+the SSH transport's one connection per Machine API call.
+
 ## What runs where
 
 Every verb runs inside the outpost process through the machine-side verbs in
