@@ -83,3 +83,57 @@ the directories for debugging. The first use sweeps dead runs' leftovers (about
 every 10 minutes) and legacy flat `ral<N>-*`/`ralphus-*` dirs in `%TEMP%` older
 than 24 h. `ralphus-test-support/tests/source_scan.rs` enforces this for
 `daemon/src` and `daemon/tests`.
+
+## Windows: `%TEMP%` size is logon time (RAL-691)
+
+At every interactive logon, before the shell starts, the User Profile Service
+walks **every file under `%LOCALAPPDATA%\Temp`** (Storage Reserve is on:
+`HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\ReserveManager\ShippedWithReserves = 1`):
+
+```
+ProfSvc.dll!CUserProfile::Load
+ └ CreateTempDirectoryForUser
+    └ StorageReserveHelper::SetReserveAreaOnFileTree
+       └ Internal::RecursiveScanDirectory
+          ├ GetHandle -> CreateFileW -> NtCreateFile (through every minifilter: WdFilter, luafv, wcifs, ...)
+          ├ GetFileLinkCnt
+          ├ SetAreaID (NTFS storage-reserve FSCTL)
+          └ GetFileAttributesW / FindFirstFileW
+```
+
+Measured on one machine (Windows 10 Pro 19045, SSD, Defender + VirtualBox
+filter drivers) with `wpr -start CPU` traces: 99.8-99.9% of the service's
+samples are in that chain, the hosting `svchost.exe` sits at ~100% of one core
+with no read/write I/O, throughput ~1,400 files/s. Windows logs the stall as
+Application event 6006 ("winlogon notification subscriber <Profiles> took N
+second(s)"). These are one machine's numbers, not constants:
+
+| Date | `%TEMP%` entries | Logon stall |
+|---|---|---|
+| 2025-12 | unknown | ~2 min |
+| 2026-10-11 | ~1.7 M | 76 min |
+| 2026-10-15 | 1,696,074 | 23 min |
+| 2026-10-18 | 941,258 | 12 min |
+
+Rule of thumb: **logon stall ~ Temp entries / 1,400 per second; keep `%TEMP%`
+under ~50k entries (~35 s).** Check the last stall:
+`Get-WinEvent -FilterHashtable @{LogName='Application'; Id=6006} -MaxEvents 1 | fl TimeCreated,Message`
+
+Producers seen in `%TEMP%` (2026-10-18 census): daemon test fixtures
+(`ral<N>-wt-*`, `ral<N>-scheduler-*`, `ralphus-guardian-*`, `ralphus-races-*`, ...;
++246k entries in 48 h before RAL-690); `ralphus-exercises.<rand>` from
+`scripts/check-initialize-exercises.sh`; `ralphus-{kind}-exercise-{pid}` from
+`ralphus initialize` (`cli/src/commands/initialize/exercise.rs` defaults its
+root under `%TEMP%`; its `Drop` stops the daemon but never removes the root);
+manual `ralphus-fetch-live-<date>` dirs. Not ralphus: `node-compile-cache`
+(~35k entries), `pytest-of-<user>`, GUID-named installer dirs, random
+`xxxxxxxx.xxx` .NET dirs, loose `.toml`/`.log` files.
+
+Defences: tests use `ralphus-test-support` (RAL-690), which puts scratch dirs in
+`%LOCALAPPDATA%\ralphus\test-tmp\<pid>-<start-secs>\`, **outside** `%TEMP%`
+(`RALPHUS_TEST_TMP` relocates, `RALPHUS_KEEP_TEST_TMP=1` keeps), cleans as it
+goes, and sweeps old leftovers (including legacy flat `%TEMP%` dirs > 24 h)
+during normal runs. For a backlog, run `scripts/sweep-temp.ps1 -DryRun`, then
+without `-DryRun` in a background window (~20 min per 1.6 M entries). It is
+documented, not wired into nextest (CI also runs on Linux). Pointing the whole
+account's `TEMP` at another drive also works, but that is a machine decision.

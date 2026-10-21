@@ -19,6 +19,7 @@ set -u
 repo_root=$(cd "$(dirname "$0")/.." && pwd)
 bin_dir="$repo_root/target/debug"
 state_root=""
+owned_root=""
 only=""
 modes="local remote"
 while [ $# -gt 0 ]; do
@@ -44,8 +45,15 @@ for binary in ralphus ralphus-daemon ralphus-runner; do
 done
 if [ -z "$state_root" ]; then
     state_root=$(mktemp -d "${TMPDIR:-/tmp}/ralphus-exercises.XXXXXX")
+    owned_root=1
 fi
 mkdir -p "$state_root"
+# A root this script created is removed on success (a failure keeps it for
+# inspection); a caller-supplied --state-root is never deleted.
+cleanup_root() {
+    if [ -n "$owned_root" ] && [ -z "${failed:-}" ]; then rm -rf "$state_root"; fi
+}
+trap cleanup_root EXIT
 
 exercises="machine mailbox triage review waypoint"
 # `followup` is exempt from the exercise rules (cli/src/commands/initialize/
@@ -100,4 +108,4 @@ if [ -n "$failed" ]; then
     echo "failed exercises:$failed (state kept under $state_root)"
     exit 1
 fi
-echo "all exercises passed (state under $state_root)"
+echo "all exercises passed"

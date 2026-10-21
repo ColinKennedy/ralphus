@@ -127,3 +127,9 @@ Use `ralphus-test-support` (`TestDir`, `scratch`) for test fixtures, never
 `std::env::temp_dir()`. `RALPHUS_TEST_TMP` relocates them (point it at a
 non-Temp drive on Windows); `RALPHUS_KEEP_TEST_TMP=1` keeps them. Details:
 `.agent/gotchas.md`.
+
+Why it matters: on Windows the profile service scans all of `%TEMP%` at every
+logon, so leftovers there cost minutes per boot. To pay down an existing
+backlog run `scripts/sweep-temp.ps1 -DryRun`, then without `-DryRun` (it only
+deletes allow-listed ralphus directories). Mechanism and numbers: the
+"`%TEMP%` size is logon time" entry in `.agent/gotchas.md`.

@@ -63,6 +63,13 @@ stores, squad submission -- is real. It is local only: the review merge it
 drives is a git fast-forward in the daemon's own checkout. Because of both,
 it is a documented exemption from the exercise rules, not one of `EXERCISES`.
 
+**Temp sweep — `pwsh scripts/sweep-temp.ps1 [-DryRun] [-OlderThanHours 24] [-Root <dir>] [-IncludeThirdParty]`.**
+Windows-only one-shot cleanup of stale ralphus test leftovers in `%TEMP%` and
+`%LOCALAPPDATA%\ralphus\test-tmp` (a large `%TEMP%` stalls every logon; see
+`.agent/gotchas.md`). Allow-list only; never `Temp\claude`, `Temp\ralphus`, or
+anything modified in the last 2 h; prints failures and `deleted=N failed=M`.
+Run `-DryRun` first; exercise it only on a scratch `-Root`.
+
 **Documentation site.** `scripts/docs-build.sh` / `.cmd` renders
 `docs/site/pages/*.md` into `docs/site/_site/` via MkDocs + Material —
 fast, no Playwright, safe to re-run on every doc edit.
