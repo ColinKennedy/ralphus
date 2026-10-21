@@ -1182,6 +1182,19 @@ const FALLBACK_GIT_EMAIL: &str = "ralphus@ralphus.invalid";
 /// name one itself (see [`Workspace::machine_has_git_identity`]).
 const FALLBACK_GIT_NAME: &str = "ralphus";
 
+/// Whether `error`, a failed git command's message, is git refusing to make a
+/// commit because it cannot name the committer or author -- no `user.name` /
+/// `user.email` and nothing it can derive one from.
+pub(crate) fn is_git_identity_error(error: &str) -> bool {
+    [
+        "Please tell me who you are",
+        "unable to auto-detect email address",
+        "empty ident name",
+    ]
+    .iter()
+    .any(|sign| error.contains(sign))
+}
+
 /// Git subcommands that may create commits.
 const COMMITTING_GIT_COMMANDS: [&str; 7] = [
     "commit",

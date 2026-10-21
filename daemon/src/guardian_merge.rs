@@ -2027,13 +2027,34 @@ fn rebase_head_sha(wt: &Workspace) -> Option<String> {
     (!sha.is_empty()).then(|| sha.to_string())
 }
 
-/// The branch-failure detail for an [`advance_rebase`] error.
-fn rebase_stuck_detail(branch: &str, error: &str) -> String {
+/// The branch-failure detail for an [`advance_rebase`] error in a worktree on
+/// `machine` (`None`: the daemon's host).
+fn rebase_stuck_detail(branch: &str, machine: Option<&str>, error: &str) -> String {
+    if crate::workspace::is_git_identity_error(error) {
+        return git_identity_detail(branch, machine, error);
+    }
     format!(
         "git rebase --continue failed for branch {branch} with every conflict already resolved, \
          so retrying cannot help: {error}. The rebase is left paused in the review worktree. \
          Check that git can commit there (user.name/user.email configured on that machine, \
          commit hooks succeed), then restart this review."
+    )
+}
+
+/// The branch-failure detail for a git step in a review worktree on `machine`
+/// (`None`: the daemon's host) that could not commit because git there has no
+/// identity. Not a conflict: no resolver can fix it, only configuring git.
+fn git_identity_detail(branch: &str, machine: Option<&str>, error: &str) -> String {
+    let place = machine.map_or_else(
+        || "the daemon's host".to_string(),
+        |machine| format!("machine {machine}"),
+    );
+    format!(
+        "git on {place} has no committer identity, so branch {branch} could not be committed \
+         (not a merge conflict): {error}. Set user.name and user.email in git's config there \
+         (git config --global user.name ...; git config --global user.email ...), then restart \
+         this review. A remote machine whose git has no identity when ralphus first reaches it \
+         commits as \"ralphus\" instead."
     )
 }
 
@@ -3050,7 +3071,7 @@ fn resolve_conflicts_with_agent(
                 // conflict was resolved correctly, or because whatever resolved
                 // it made the diff disappear entirely.
                 guard_against_rebase_step_content_loss(store, id, branch, wt)?;
-                advance_rebase(wt).map_err(|e| rebase_stuck_detail(branch, &e))?;
+                advance_rebase(wt).map_err(|e| rebase_stuck_detail(branch, wt.machine(), &e))?;
                 // RAL-144: advancing to the next commit -- nothing was found or
                 // committed for it yet.
                 committed = 0;
@@ -3115,7 +3136,7 @@ fn resolve_conflicts_with_agent(
             }
             wt.git(&["add", "--all"])?;
             guard_against_rebase_step_content_loss(store, id, branch, wt)?;
-            advance_rebase(wt).map_err(|e| rebase_stuck_detail(branch, &e))?;
+            advance_rebase(wt).map_err(|e| rebase_stuck_detail(branch, wt.machine(), &e))?;
             // RAL-144: advancing to the next commit -- nothing committed for it yet.
             committed = 0;
             commit_attempts = 0;
@@ -3446,7 +3467,7 @@ fn resolve_conflicts_with_agent(
                 });
             }
             guard_against_rebase_step_content_loss(store, id, branch, wt)?;
-            advance_rebase(wt).map_err(|e| rebase_stuck_detail(branch, &e))?;
+            advance_rebase(wt).map_err(|e| rebase_stuck_detail(branch, wt.machine(), &e))?;
             // RAL-144: advancing to the next commit -- nothing committed for it yet.
             committed = 0;
             commit_attempts = 0;
@@ -3537,7 +3558,7 @@ fn resolve_conflicts_with_agent(
         // Either way the loop re-checks and resolves any further conflicting
         // commits.
         guard_against_rebase_step_content_loss(store, id, branch, wt)?;
-        advance_rebase(wt).map_err(|e| rebase_stuck_detail(branch, &e))?;
+        advance_rebase(wt).map_err(|e| rebase_stuck_detail(branch, wt.machine(), &e))?;
         // RAL-144: advancing to the next commit -- nothing committed for it yet.
         committed = 0;
         commit_attempts = 0;
@@ -16331,6 +16352,13 @@ fn drive_rebase(
                 log_merge_cancelled(store, id);
                 return Err("cancelled".to_string());
             }
+            if crate::workspace::is_git_identity_error(&e) {
+                // The rebase paused because git could not commit a step, not
+                // on a conflict: a resolver has nothing to resolve, and its
+                // own `--continue` would fail the same way.
+                let _ = wt.git(&["rebase", "--abort"]);
+                return Err(git_identity_detail(feature, wt.machine(), &e));
+            }
             let conflicts = conflicted_files(wt);
             if conflicts.is_empty() && !rebase_in_progress(wt) {
                 // Genuine failure with no conflict to resolve (e.g. a bad ref): abort clean.
@@ -20297,7 +20325,110 @@ mod tests {
             rebase_in_progress(&wt),
             "the rebase stays paused for inspection"
         );
-        assert!(rebase_stuck_detail("side", &error).contains("user.name/user.email"));
+        assert!(rebase_stuck_detail("side", None, &error).contains("user.name/user.email"));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_stuck_continue_without_a_git_identity_names_the_identity_not_a_conflict() {
+        let stderr = "Committer identity unknown\n\n*** Please tell me who you are.\n\n\
+                      Run\n\n  git config --global user.email \"you@example.com\"\n\n\
+                      fatal: unable to auto-detect email address (got 'me@box.(none)')";
+        for error in [stderr, "fatal: empty ident name (for <me@box>) not allowed"] {
+            assert!(crate::workspace::is_git_identity_error(error), "{error}");
+            let detail = rebase_stuck_detail("side", Some("ssh:box"), error);
+            assert!(detail.contains("no committer identity"), "{detail}");
+            assert!(detail.contains("machine ssh:box"), "{detail}");
+            assert!(detail.contains("user.name and user.email"), "{detail}");
+            assert!(
+                !detail.contains("every conflict already resolved"),
+                "{detail}"
+            );
+        }
+        for error in [
+            "CONFLICT (content): Merge conflict in base.txt",
+            "fatal: Unable to create '.git/index.lock': File exists.",
+        ] {
+            assert!(!crate::workspace::is_git_identity_error(error), "{error}");
+        }
+    }
+
+    #[test]
+    fn a_rebase_that_cannot_commit_for_want_of_an_identity_is_not_a_conflict() {
+        // The rebase stops because git cannot commit a cleanly-applied pick,
+        // which pauses it with nothing conflicted -- the shape the resolver
+        // path takes for a rerere-staged conflict. It must fail the branch
+        // with the identity named instead, without a resolver or any
+        // conflict bookkeeping.
+        if ["GIT_COMMITTER_NAME", "GIT_AUTHOR_NAME"]
+            .iter()
+            .any(|key| std::env::var_os(key).is_some())
+        {
+            eprintln!("skipped: the environment names a git identity");
+            return;
+        }
+        let (base, repo, fwt) = make_repo("drive-rebase-no-identity");
+        std::fs::write(repo.join("main.txt"), "main\n").unwrap();
+        g(&repo, &["add", "main.txt"]);
+        g(&repo, &["commit", "--message", "main edit"]);
+        let old_base = git(&repo, &["rev-parse", "main~1"])
+            .unwrap()
+            .trim()
+            .to_string();
+        let new_base = git(&repo, &["rev-parse", "main"])
+            .unwrap()
+            .trim()
+            .to_string();
+        g(&repo, &["config", "user.name", ""]);
+        let store = Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
+        let id = {
+            let guard = store.lock();
+            let id = guard
+                .create_guardian("r", "main", repo.to_str().unwrap())
+                .unwrap();
+            guard.add_guardian_branch(&id, "feature/a").unwrap();
+            id
+        };
+        let branch_id = store.lock().get_guardian(&id).unwrap().branches[0]
+            .id
+            .clone();
+        struct MustNotRunRunner;
+        impl Runner for MustNotRunRunner {
+            fn run(&self, _: &RunnerSpec) -> RunnerResult {
+                panic!("no resolver may run for a missing git identity")
+            }
+        }
+        let gate = ProofGate {
+            scope: "nothing".to_string(),
+            skip_auto_clean: false,
+            is_final_branch: false,
+        };
+        let wt = Workspace::local(&fwt);
+        let error = drive_rebase(
+            &store,
+            &id,
+            &branch_id,
+            &MustNotRunRunner,
+            "feature/a",
+            &wt,
+            &new_base,
+            &old_base,
+            "feature/a",
+            &gate,
+            &CancelToken::never(),
+        )
+        .err()
+        .expect("the rebase cannot commit without an identity");
+
+        assert!(error.contains("no committer identity"), "{error}");
+        assert!(error.contains("not a merge conflict"), "{error}");
+        assert!(!rebase_in_progress(&wt), "the rebase is aborted: {error}");
+        let view = store.lock().get_guardian(&id).unwrap();
+        assert_eq!(view.conflicts_found, None, "no conflict bookkeeping");
+        assert_eq!(view.branches[0].conflicts_found, None);
+
         let _ = std::fs::remove_dir_all(&base);
     }
 
