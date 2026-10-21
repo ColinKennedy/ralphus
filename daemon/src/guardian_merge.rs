@@ -22323,6 +22323,112 @@ mod tests {
             .unwrap();
     }
 
+    /// A fake machine provider answering every verb with a successful command
+    /// whose output is a fixed sha, appending each request it receives to
+    /// `requests.log` beside it. Returns the script and the log path.
+    fn recording_provider(dir: &Path) -> (PathBuf, PathBuf) {
+        std::fs::create_dir_all(dir).unwrap();
+        let log = dir.join("requests.log");
+        let json = r#"{"ok":true,"protocol_version":1,"exit_code":0,"stdout":"0123456789012345678901234567890123456789"}"#;
+        let (script, body) = if cfg!(windows) {
+            (
+                dir.join("p.cmd"),
+                format!(
+                    "@echo off\r\nmore >> \"{}\"\r\necho {json}\r\n",
+                    log.display()
+                ),
+            )
+        } else {
+            (
+                dir.join("p.sh"),
+                format!("#!/bin/sh\ncat >> '{}'\necho '{json}'\n", log.display()),
+            )
+        };
+        std::fs::write(&script, body).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        (script, log)
+    }
+
+    /// The `run` requests (one per remote command) `log` has recorded so far.
+    fn recorded_run_calls(log: &Path) -> usize {
+        std::fs::read_to_string(log)
+            .unwrap_or_default()
+            .lines()
+            .filter(|l| l.contains("\"program\""))
+            .count()
+    }
+
+    #[test]
+    fn polling_a_collecting_remote_review_does_not_recompute_its_summary_each_time() {
+        // The review page (and the fleet harness) polls GET /api/guardians/{id}
+        // every couple of seconds. On a collecting review each poll promoted
+        // its preliminary summary, which for a remote review is git commands
+        // on the machine -- one SSH session apiece, every poll, for as long as
+        // the review stayed collecting.
+        let dir = ralphus_test_support::scratch(format!("summary-poll-{}", std::process::id()));
+        let (script, log) = recording_provider(&dir);
+        let daemon = crate::server::Daemon::new(Store::open_in_memory().unwrap(), 4);
+        let store = daemon.store_handle();
+        let id = {
+            let guard = store.lock();
+            guard
+                .register_machine_provider(
+                    "ib",
+                    "",
+                    &script.to_string_lossy(),
+                    &[],
+                    crate::machines::PROTOCOL_VERSION,
+                    false,
+                )
+                .unwrap();
+            let id = guard.create_guardian("r", "main", "/srv/repo").unwrap();
+            guard.add_guardian_branch(&id, "feature/a").unwrap();
+            guard.set_guardian_machine(&id, Some("ib:A")).unwrap();
+            insert_done_cell(&guard, "squad-a", Path::new("/srv/wt-a"), "feature/a");
+            guard
+                .conn
+                .execute("UPDATE cells SET machine='ib:A'", [])
+                .unwrap();
+            let branch = guard.get_guardian(&id).unwrap().branches[0].id.clone();
+            guard
+                .set_branch_status(&id, &branch, MergeStatus::Ready, None)
+                .unwrap();
+            id
+        };
+        assert_eq!(store.lock().get_guardian(&id).unwrap().status, "collecting");
+        let queue = daemon.summary_queue_handle();
+        let workers = crate::summary_worker::spawn_workers(&queue, &store, 1);
+
+        for _ in 0..10 {
+            let reply = crate::server::route(&daemon, "GET", &format!("/api/guardians/{id}"), "");
+            assert_eq!(reply.status, 200);
+            std::thread::sleep(std::time::Duration::from_millis(600));
+        }
+        queue.shutdown();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+
+        let summaries = std::fs::read_to_string(&log)
+            .unwrap_or_default()
+            .lines()
+            .filter(|l| l.contains(r#""args":["log","#))
+            .count();
+        assert!(
+            recorded_run_calls(&log) > 0,
+            "the first poll computes the summary on the machine"
+        );
+        assert_eq!(
+            summaries, 1,
+            "polls within the promote interval must compute the summary once, not once per poll"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn a_remote_review_dispatches_to_its_machine_rather_than_merging_here() {
         // The failure this guards against is the worst kind: a merge that

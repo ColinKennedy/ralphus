@@ -210,3 +210,7 @@ tag = "agent-preflight-remote"
 [[test]]
 id = "ralphus-daemon remote_projects::tests::a_remote_only_projects_config_is_read_from_its_machine_per_commit"
 tag = "remote-project-config"
+# A collecting remote review's preliminary summary while its page is polled.
+[[test]]
+id = "ralphus-daemon guardian_merge::tests::polling_a_collecting_remote_review_does_not_recompute_its_summary_each_time"
+tag = "review-summary-poll-remote"
