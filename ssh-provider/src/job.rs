@@ -76,6 +76,17 @@ fn short_hash(value: &str) -> String {
     format!("{:x}", Sha256::digest(value.as_bytes()))[..16].to_string()
 }
 
+/// What names one cell's job within its squad: the cell id qualified by its
+/// task, since cell ids (`cell-0`, `proof-cell-0`) repeat in every task of a
+/// squad. A retried dispatch of the same cell finds its earlier job by this;
+/// two tasks' cells on one machine must never share it.
+fn job_identity(spec: &serde_json::Value, cell: &str) -> String {
+    match spec.get("task").and_then(serde_json::Value::as_str) {
+        Some(task) if !task.is_empty() => format!("{task}\0{cell}"),
+        _ => cell.to_string(),
+    }
+}
+
 fn new_handle(squad: &str, cell: &str) -> Result<String, String> {
     let mut random = [0_u8; 16];
     getrandom::getrandom(&mut random)
@@ -130,7 +141,8 @@ pub fn start(uri: &str, spec_json: &str, config: &EffectiveConfig) -> Result<Str
     let environment = take_execution_environment(&mut spec)?;
     let spec = serde_json::Value::Object(spec);
     let squad = required_string(&spec, "squad_id")?;
-    let cell = required_string(&spec, "cell_id")?;
+    let cell = job_identity(&spec, required_string(&spec, "cell_id")?);
+    let cell = cell.as_str();
     let cwd = required_string(&spec, "cwd")?;
     require_under_root(cwd, &policy.remote_root)?;
     let protected_spec = serde_json::to_string(&spec)
@@ -444,6 +456,19 @@ fn ssh_command_bytes(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_same_cell_id_in_two_tasks_is_two_dispatches() {
+        let a = serde_json::json!({"task": "on-b", "cell_id": "cell-0"});
+        let b = serde_json::json!({"task": "agent-on-b", "cell_id": "cell-0"});
+        let (a, b) = (job_identity(&a, "cell-0"), job_identity(&b, "cell-0"));
+        assert_ne!(a, b);
+        assert_ne!(
+            setup_script("/r", "squad-1", &a, "/r/jobs/x", "h"),
+            setup_script("/r", "squad-1", &b, "/r/jobs/x", "h")
+        );
+        assert_eq!(job_identity(&serde_json::json!({}), "cell-0"), "cell-0");
+    }
 
     #[test]
     fn handles_are_opaque_unguessable_and_namespaced() {

@@ -57,6 +57,17 @@ fn short_hash(value: &str) -> String {
     format!("{:x}", Sha256::digest(value.as_bytes()))[..16].to_string()
 }
 
+/// What names one cell's job within its squad: the cell id qualified by its
+/// task, since cell ids (`cell-0`, `proof-cell-0`) repeat in every task of a
+/// squad. A retried dispatch of the same cell finds its earlier job by this;
+/// two tasks' cells on one machine must never share it.
+fn job_identity(spec: &Value, cell: &str) -> String {
+    match spec.get("task").and_then(Value::as_str) {
+        Some(task) if !task.is_empty() => format!("{task}\0{cell}"),
+        _ => cell.to_string(),
+    }
+}
+
 fn new_handle(squad: &str, cell: &str) -> Result<String, String> {
     let mut random = [0_u8; 16];
     getrandom_fill(&mut random)?;
@@ -156,7 +167,11 @@ pub fn exec(
     )?;
     let spec = Value::Object(spec);
     let squad = super::required_str(&spec, "squad_id", "the cell spec")?;
-    let cell = super::required_str(&spec, "cell_id", "the cell spec")?;
+    let cell = job_identity(
+        &spec,
+        super::required_str(&spec, "cell_id", "the cell spec")?,
+    );
+    let cell = cell.as_str();
     let cwd = super::required_str(&spec, "cwd", "the cell spec")?;
     root.contain(cwd)?;
     if context.runner.is_empty() {
@@ -519,6 +534,18 @@ fn run_job(dir: &Path, environment: &BTreeMap<String, String>) -> Result<Outcome
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_same_cell_id_in_two_tasks_is_two_jobs() {
+        let a = json!({"task": "on-b", "cell_id": "cell-0"});
+        let b = json!({"task": "agent-on-b", "cell_id": "cell-0"});
+        assert_ne!(job_identity(&a, "cell-0"), job_identity(&b, "cell-0"));
+        assert_eq!(
+            job_identity(&a, "cell-0"),
+            job_identity(&a.clone(), "cell-0")
+        );
+        assert_eq!(job_identity(&json!({}), "cell-0"), "cell-0");
+    }
 
     #[test]
     fn handles_are_unguessable_and_name_their_directory() {
