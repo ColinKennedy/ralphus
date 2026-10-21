@@ -11,7 +11,13 @@
 
 pub mod allocations;
 pub mod config;
+pub mod fleet_identity;
 pub mod machine_api;
+pub mod outpost_keys;
+pub mod outpost_registry;
 pub mod outpost_wire;
 pub mod outposts;
+pub mod readiness;
+pub mod runner_artifacts;
+pub mod secret_store;
 pub mod server;

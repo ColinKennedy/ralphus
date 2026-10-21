@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 
 use serde_json::{Value, json};
 
-use crate::allocations::{Allocations, Platform, Requirements, choose, constant_time_eq};
+use crate::allocations::{Allocations, NotReady, Platform, Requirements, choose, constant_time_eq};
 use crate::config::{FleetConfig, MachineConfig};
 use crate::machine_api::{self, PROTOCOL_VERSION, Reach, refusal};
 use crate::outposts::Outposts;
@@ -59,6 +59,19 @@ impl Service {
         secret_of: impl Fn(&str) -> Option<String>,
     ) -> Self {
         let outposts = Outposts::new(&config, secret_of);
+        Self::with_outposts(config, base_url, token, allocations, outposts)
+    }
+
+    /// A service whose outpost machines are served by `outposts` (built for
+    /// `config`, with its registry and identity when it pairs).
+    #[must_use]
+    pub fn with_outposts(
+        config: FleetConfig,
+        base_url: String,
+        token: String,
+        allocations: Allocations,
+        outposts: Outposts,
+    ) -> Self {
         let platforms = config
             .machines
             .iter()
@@ -195,8 +208,9 @@ impl Service {
         }
         self.probe_platforms();
         let platforms = self.platforms.lock().expect("poisoned").clone();
+        let not_ready = self.not_ready();
         let mut allocations = self.allocations.lock().expect("poisoned");
-        let machine = match choose(&self.config, &platforms, &allocations, &wanted) {
+        let machine = match choose(&self.config, &platforms, &allocations, &wanted, &not_ready) {
             Ok(machine) => machine,
             Err(r) => return (409, refusal(r.reason_code, &r.error, &r.remediation)),
         };
@@ -223,6 +237,46 @@ impl Service {
             200,
             self.allocation_json(&allocation.id, machine, Some(token)),
         )
+    }
+
+    /// Outpost machines whose latest readiness report has a blocking
+    /// problem, with the reasons and fixes.
+    fn not_ready(&self) -> BTreeMap<String, NotReady> {
+        let mut blocked = BTreeMap::new();
+        for machine in self.config.machines.iter().filter(|m| m.is_outpost()) {
+            let name = machine.display_name();
+            let Some(report) = self.outposts.readiness(name) else {
+                continue;
+            };
+            let problems = report.blocking(&machine.required_agents);
+            if problems.is_empty() {
+                continue;
+            }
+            blocked.insert(
+                name.to_string(),
+                NotReady {
+                    reason: format!(
+                        "{name} is not ready: {}",
+                        problems
+                            .iter()
+                            .map(|c| c.detail.as_str())
+                            .collect::<Vec<_>>()
+                            .join("; ")
+                    ),
+                    remedy: problems
+                        .iter()
+                        .map(|c| {
+                            format!(
+                                "on {name}: {}",
+                                c.remedy.as_deref().unwrap_or("see `ralphus-fleet list`")
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join("; "),
+                },
+            );
+        }
+        blocked
     }
 
     fn renewed(&self, id: &str, machine: &MachineConfig) -> Reply {
@@ -376,6 +430,9 @@ impl Service {
                 result
             }
             "reply" => self.outposts.reply(body),
+            "pair" => self.outposts.pair(body),
+            "runner" => self.outposts.runner(body),
+
             _ => Err((
                 404,
                 refusal(

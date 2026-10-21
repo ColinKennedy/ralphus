@@ -4,9 +4,11 @@
 //! ralphus-fleet serve [--config PATH]
 //! ralphus-fleet list  [--config PATH]
 //! ralphus-fleet add <host> --remote-root PATH [--user U] [--name N]
-//!                   [--os OS] [--arch ARCH] [--label L]... [--config PATH]
-//! ralphus-fleet add --outpost --name N --token-env VAR --remote-root PATH
-//!                   [--os OS] [--arch ARCH] [--label L]... [--config PATH]
+//!                   [--os OS] [--arch ARCH] [--label L]... [--require-agent A]... [--config PATH]
+//! ralphus-fleet add --outpost --name N --remote-root PATH [--token-env VAR]
+//!                   [--os OS] [--arch ARCH] [--label L]... [--require-agent A]... [--config PATH]
+//! ralphus-fleet pair <machine> [--config PATH]
+//! ralphus-fleet revoke <machine> [--config PATH]
 //! ```
 //!
 //! The configuration defaults to `ralphus-fleet.toml` in the current
@@ -14,20 +16,28 @@
 //! names; it is never written to the configuration.
 
 use std::io::Write as _;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use ralphus_fleet::allocations::Allocations;
 use ralphus_fleet::config::{FleetConfig, MachineConfig, RunnerConfig};
+use ralphus_fleet::outpost_keys;
+use ralphus_fleet::outpost_registry::Registry;
+use ralphus_fleet::outposts::Outposts;
+use ralphus_fleet::secret_store::OsStore;
 use ralphus_fleet::server::{Service, run};
+use ralphus_fleet::{fleet_identity, readiness};
 
-const USAGE: &str = "usage: ralphus-fleet <serve|list|add> [--config PATH]\n\
+const USAGE: &str = "usage: ralphus-fleet <serve|list|add|pair|revoke> [--config PATH]\n\
     \x20 serve                 serve the allocation API and Machine API\n\
-    \x20 list                  show the configured machines and current allocations\n\
+    \x20 list                  show the machines, their readiness and current allocations\n\
     \x20 add <host> --remote-root PATH [--user U] [--name N] [--os OS] [--arch ARCH] [--label L]...\n\
-    \x20                       add a machine reachable over SSH\n\
-    \x20 add --outpost --name N --token-env VAR --remote-root PATH [--os OS] [--arch ARCH] [--label L]...\n\
-    \x20                       add a machine that connects with ralphus-outpost";
+    \x20                       [--require-agent A]...  add a machine reachable over SSH\n\
+    \x20 add --outpost --name N --remote-root PATH [--token-env VAR] [--os OS] [--arch ARCH]\n\
+    \x20                       [--label L]... [--require-agent A]...\n\
+    \x20                       add a machine that connects with ralphus-outpost\n\
+    \x20 pair <machine>        print a one-time code for `ralphus-outpost install --code`\n\
+    \x20 revoke <machine>      forget a paired machine's credential; it can no longer connect";
 
 /// Pull `--name value` out of `args`.
 fn take(args: &mut Vec<String>, name: &str) -> Result<Option<String>, String> {
@@ -44,6 +54,15 @@ fn take(args: &mut Vec<String>, name: &str) -> Result<Option<String>, String> {
 
 fn config_path(args: &mut Vec<String>) -> Result<PathBuf, String> {
     Ok(take(args, "--config")?.map_or_else(|| PathBuf::from("ralphus-fleet.toml"), PathBuf::from))
+}
+
+/// Where the fleet keeps its identity key when the OS store is unreachable.
+fn identity_fallback_dir(config_path: &Path) -> PathBuf {
+    config_path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."))
+        .join(".ralphus-fleet-secrets")
 }
 
 fn serve(mut args: Vec<String>) -> Result<(), String> {
@@ -64,7 +83,34 @@ fn serve(mut args: Vec<String>) -> Result<(), String> {
         .public_url
         .clone()
         .unwrap_or_else(|| default_base_url(&config.listen));
-    run(Service::new(config, base_url, token, allocations))
+    let registry = Registry::new(config.registry_path(&path));
+    let mut outposts = Outposts::new(&config, |variable| std::env::var(variable).ok())
+        .with_registry(registry.clone());
+    if config.machines.iter().any(|m| m.is_outpost()) {
+        let has_pairings = registry
+            .load()?
+            .machines
+            .values()
+            .any(|e| e.public_key.is_some());
+        let identity = fleet_identity::load_or_create(
+            &OsStore::new(fleet_identity::SERVICE),
+            &identity_fallback_dir(&path),
+            &fleet_identity::key_for(registry.path()),
+            has_pairings,
+        )?;
+        eprintln!(
+            "ralphus-fleet: identity {} (outposts pair with this key)",
+            outpost_keys::fingerprint(&identity.public_key())
+        );
+        outposts = outposts.with_identity(identity);
+    }
+    run(Service::with_outposts(
+        config,
+        base_url,
+        token,
+        allocations,
+        outposts,
+    ))
 }
 
 /// `http://<listen>`, except that a wildcard address (`0.0.0.0`, `[::]`),
@@ -88,11 +134,19 @@ fn list(mut args: Vec<String>) -> Result<(), String> {
     let path = config_path(&mut args)?;
     let config = FleetConfig::load(&path)?;
     let allocations = Allocations::load(config.state_path(&path))?;
+    let registry = Registry::new(config.registry_path(&path)).load()?;
     let mut out = std::io::stdout().lock();
     for machine in &config.machines {
         let name = machine.display_name();
+        let entry = registry.machines.get(name);
         let reach = if machine.is_outpost() {
-            "outpost".to_string()
+            match entry.and_then(|e| e.public_key.as_deref()) {
+                Some(key) => format!("outpost, paired {}", outpost_keys::fingerprint(key)),
+                None if machine.outpost_token_env.is_some() => {
+                    "outpost, pairing secret".to_string()
+                }
+                None => "outpost, NOT PAIRED (run `ralphus-fleet pair`)".to_string(),
+            }
         } else {
             format!("ssh {}", machine.ssh_uri())
         };
@@ -104,6 +158,9 @@ fn list(mut args: Vec<String>) -> Result<(), String> {
             machine.labels.join(", "),
             allocations.load_of(name)
         );
+        if machine.is_outpost() {
+            write_readiness(&mut out, machine, entry.and_then(|e| e.readiness.as_ref()));
+        }
         for allocation in allocations.all().into_iter().filter(|a| a.machine == name) {
             let _ = writeln!(
                 out,
@@ -118,6 +175,31 @@ fn list(mut args: Vec<String>) -> Result<(), String> {
         let _ = writeln!(out, "no machines; add one with `ralphus-fleet add <host>`");
     }
     Ok(())
+}
+
+fn write_readiness(
+    out: &mut impl std::io::Write,
+    machine: &MachineConfig,
+    report: Option<&readiness::Report>,
+) {
+    let Some(report) = report else {
+        let _ = writeln!(
+            out,
+            "    readiness: not reported yet (it reports on connecting)"
+        );
+        return;
+    };
+    let _ = writeln!(
+        out,
+        "    readiness: {}",
+        report.summary(&machine.required_agents)
+    );
+    for check in report.problems() {
+        let _ = writeln!(out, "      {} {}: {}", check.status, check.id, check.detail);
+        if let Some(remedy) = &check.remedy {
+            let _ = writeln!(out, "        fix: {remedy}");
+        }
+    }
 }
 
 fn add(mut args: Vec<String>) -> Result<(), String> {
@@ -140,14 +222,16 @@ fn add(mut args: Vec<String>) -> Result<(), String> {
     while let Some(label) = take(&mut args, "--label")? {
         labels.push(label);
     }
+    let mut required_agents = Vec::new();
+    while let Some(agent) = take(&mut args, "--require-agent")? {
+        required_agents.push(agent);
+    }
     let host = if outpost {
         if !args.is_empty() {
             return Err(format!("add --outpost takes no <host>\n{USAGE}"));
         }
-        if name.is_none() || token_env.is_none() {
-            return Err(format!(
-                "add --outpost needs --name and --token-env\n{USAGE}"
-            ));
+        if name.is_none() {
+            return Err(format!("add --outpost needs --name\n{USAGE}"));
         }
         String::new()
     } else {
@@ -160,6 +244,7 @@ fn add(mut args: Vec<String>) -> Result<(), String> {
         host.clone()
     };
     let shown = name.clone().unwrap_or_else(|| host.clone());
+    let paired = outpost && token_env.is_none();
     let mut config = if path.exists() {
         FleetConfig::load(&path)?
     } else {
@@ -178,12 +263,85 @@ fn add(mut args: Vec<String>) -> Result<(), String> {
         max_allocations: None,
         runner: RunnerConfig::default(),
         agents: std::collections::BTreeMap::new(),
+        required_agents,
     });
     // Validate the result before writing it.
     let text = toml::to_string_pretty(&config).map_err(|e| e.to_string())?;
     FleetConfig::parse(&text, &path.display().to_string())?;
     config.save(&path)?;
     eprintln!("ralphus-fleet: added {shown} to {}", path.display());
+    if paired {
+        eprintln!(
+            "ralphus-fleet: pair it with `ralphus-fleet pair {shown}` (restart `ralphus-fleet \
+             serve` first so it serves the new machine)"
+        );
+    }
+    Ok(())
+}
+
+/// The outpost machine `name` in `config`.
+fn outpost_machine<'a>(config: &'a FleetConfig, name: &str) -> Result<&'a MachineConfig, String> {
+    let machine = config
+        .machines
+        .iter()
+        .find(|m| m.display_name() == name)
+        .ok_or_else(|| format!("no machine {name:?} in the configuration"))?;
+    if !machine.is_outpost() {
+        return Err(format!(
+            "{name:?} is reached over SSH; only outpost machines pair (add one with \
+             `ralphus-fleet add --outpost --name {name} --remote-root <path>`)"
+        ));
+    }
+    Ok(machine)
+}
+
+#[allow(clippy::print_stdout)] // the code is this command's product
+fn pair(mut args: Vec<String>) -> Result<(), String> {
+    let path = config_path(&mut args)?;
+    let [name] = args.as_slice() else {
+        return Err(format!("pair needs exactly one <machine>\n{USAGE}"));
+    };
+    let config = FleetConfig::load(&path)?;
+    let machine = outpost_machine(&config, name)?;
+    let registry = Registry::new(config.registry_path(&path));
+    let code = registry.start_pairing(machine.display_name())?;
+    let url = config.public_url.clone().unwrap_or_else(|| {
+        let port = config.listen.rsplit_once(':').map_or("7900", |(_, p)| p);
+        format!("http://<this host's address>:{port}")
+    });
+    let mut out = std::io::stdout().lock();
+    let _ = writeln!(
+        out,
+        "Pairing code for {name} (single use, valid for {} minutes):\n\n    {code}\n\n\
+         On {name}, run:\n\n    ralphus-outpost install --fleet {url} --code {code}\n",
+        outpost_keys::PAIRING_TTL_MS / 60_000
+    );
+    if config.public_url.is_none() {
+        let _ = writeln!(
+            out,
+            "(use the URL {name} reaches this fleet at; set public_url in {} to print it here)",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+fn revoke(mut args: Vec<String>) -> Result<(), String> {
+    let path = config_path(&mut args)?;
+    let [name] = args.as_slice() else {
+        return Err(format!("revoke needs exactly one <machine>\n{USAGE}"));
+    };
+    let config = FleetConfig::load(&path)?;
+    let machine = outpost_machine(&config, name)?;
+    let registry = Registry::new(config.registry_path(&path));
+    if registry.revoke(machine.display_name())? {
+        eprintln!(
+            "ralphus-fleet: revoked {name}; its outpost is refused from its next poll. Pair it \
+             again with `ralphus-fleet pair {name}`"
+        );
+    } else {
+        eprintln!("ralphus-fleet: {name} was not paired");
+    }
     Ok(())
 }
 
@@ -198,6 +356,8 @@ fn main() -> ExitCode {
         "serve" => serve(args),
         "list" => list(args),
         "add" => add(args),
+        "pair" => pair(args),
+        "revoke" => revoke(args),
         "help" | "--help" | "-h" => {
             eprintln!("{USAGE}");
             return ExitCode::SUCCESS;
@@ -215,12 +375,39 @@ fn main() -> ExitCode {
 
 #[cfg(test)]
 mod tests {
-    use super::default_base_url;
+    use super::*;
 
     #[test]
     fn a_wildcard_listen_address_is_advertised_as_loopback() {
         assert_eq!(default_base_url("0.0.0.0:7900"), "http://127.0.0.1:7900");
         assert_eq!(default_base_url("[::]:7900"), "http://127.0.0.1:7900");
         assert_eq!(default_base_url("10.0.0.5:7900"), "http://10.0.0.5:7900");
+    }
+
+    #[test]
+    fn list_shows_what_to_fix_on_a_machine_that_is_not_ready() {
+        let config = FleetConfig::parse(
+            "token_env = \"T\"\n[[machine]]\nname = \"winbox\"\ntransport = \"outpost\"\n\
+             remote_root = \"C:/r\"\nrequired_agents = [\"claude-code\"]\n",
+            "f",
+        )
+        .unwrap();
+        let report = readiness::Report {
+            checked_at_ms: 1,
+            checks: vec![
+                readiness::Check::new("git", readiness::PASS, "git 2.45"),
+                readiness::Check::new("agent-login:claude-code", readiness::FAIL, "not logged in")
+                    .with_remedy("run `claude auth login` on the machine"),
+            ],
+        };
+        let mut out = Vec::new();
+        write_readiness(&mut out, &config.machines[0], Some(&report));
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("NOT READY (1 blocking)"), "{text}");
+        assert!(text.contains("fix: run `claude auth login`"), "{text}");
+        assert!(
+            !text.contains("git 2.45"),
+            "passing checks stay quiet: {text}"
+        );
     }
 }

@@ -48,6 +48,14 @@ pub struct Platform {
     pub arch: Option<String>,
 }
 
+/// Why an otherwise-matching machine cannot take work now (its readiness
+/// report has a blocking problem), and what fixes it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NotReady {
+    pub reason: String,
+    pub remedy: String,
+}
+
 /// A refusal to allocate.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Refusal {
@@ -259,16 +267,18 @@ pub fn mismatch(
     None
 }
 
-/// Pick the machine to serve `wanted`: the least loaded one that matches and
-/// has room, in configuration order on a tie.
+/// Pick the machine to serve `wanted`: the least loaded one that matches, is
+/// not in `not_ready`, and has room, in configuration order on a tie.
 ///
 /// # Errors
-/// Why no machine can, listing each one's reason.
+/// Why no machine can, listing each one's reason (and, for machines that
+/// are not ready, what fixes them).
 pub fn choose<'a>(
     config: &'a FleetConfig,
     platforms: &BTreeMap<String, Platform>,
     allocations: &Allocations,
     wanted: &Requirements,
+    not_ready: &BTreeMap<String, NotReady>,
 ) -> Result<&'a MachineConfig, Refusal> {
     if config.machines.is_empty() {
         return Err(Refusal {
@@ -278,6 +288,7 @@ pub fn choose<'a>(
         });
     }
     let mut reasons = Vec::new();
+    let mut remedies = Vec::new();
     let mut matching = Vec::new();
     for machine in &config.machines {
         let platform = platforms
@@ -286,16 +297,25 @@ pub fn choose<'a>(
             .unwrap_or_default();
         match mismatch(machine, &platform, wanted) {
             Some(reason) => reasons.push(reason),
-            None => matching.push(machine),
+            None => match not_ready.get(machine.display_name()) {
+                Some(blocked) => {
+                    reasons.push(blocked.reason.clone());
+                    remedies.push(blocked.remedy.clone());
+                }
+                None => matching.push(machine),
+            },
         }
     }
     if matching.is_empty() {
         return Err(Refusal {
             reason_code: "no_matching_machine",
             error: format!("no machine matches: {}", reasons.join("; ")),
-            remediation:
+            remediation: if remedies.is_empty() {
                 "relax the request's os/arch/labels, or add a matching machine to the fleet"
-                    .to_string(),
+                    .to_string()
+            } else {
+                remedies.join("; ")
+            },
         });
     }
     let with_room: Vec<&MachineConfig> = matching
@@ -364,9 +384,16 @@ mod tests {
             &platforms,
             &allocations,
             &wants(Some("windows"), &[]),
+            &BTreeMap::new(),
         );
         assert_eq!(windows.unwrap().host, "win");
-        let gpu = choose(&config, &platforms, &allocations, &wants(None, &["gpu"]));
+        let gpu = choose(
+            &config,
+            &platforms,
+            &allocations,
+            &wants(None, &["gpu"]),
+            &BTreeMap::new(),
+        );
         assert_eq!(gpu.unwrap().host, "gpu");
 
         let first = choose(
@@ -374,6 +401,7 @@ mod tests {
             &platforms,
             &allocations,
             &wants(Some("linux"), &[]),
+            &BTreeMap::new(),
         )
         .unwrap();
         assert_eq!(first.host, "lin");
@@ -384,6 +412,7 @@ mod tests {
             &platforms,
             &allocations,
             &wants(Some("linux"), &[]),
+            &BTreeMap::new(),
         )
         .unwrap();
         assert_eq!(second.host, "gpu");
@@ -397,6 +426,7 @@ mod tests {
             &platforms(&config),
             &Allocations::default(),
             &wants(Some("macos"), &[]),
+            &BTreeMap::new(),
         )
         .expect_err("no mac");
         assert_eq!(refusal.reason_code, "no_matching_machine");
@@ -405,6 +435,28 @@ mod tests {
             "{}",
             refusal.error
         );
+    }
+
+    #[test]
+    fn a_machine_that_is_not_ready_is_refused_with_its_fix() {
+        let config = config();
+        let not_ready = BTreeMap::from([(
+            "win".to_string(),
+            NotReady {
+                reason: "win is not ready: Claude Code is not logged in".to_string(),
+                remedy: "run `claude auth login` on win".to_string(),
+            },
+        )]);
+        let refusal = choose(
+            &config,
+            &platforms(&config),
+            &Allocations::default(),
+            &wants(Some("windows"), &[]),
+            &not_ready,
+        )
+        .expect_err("win is not ready");
+        assert!(refusal.error.contains("not logged in"), "{}", refusal.error);
+        assert_eq!(refusal.remediation, "run `claude auth login` on win");
     }
 
     #[test]

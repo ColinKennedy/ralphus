@@ -271,7 +271,8 @@ fn through_outpost(
             "unreachable",
             &e,
             &format!(
-                "start (or restart) `ralphus-outpost connect` on {:?} and check it can reach                  this service",
+                "check `ralphus-outpost status` on {:?} (it must be installed, running and able to \
+                 reach this service)",
                 machine.display_name()
             ),
         ),
@@ -509,7 +510,7 @@ mod tests {
             reply["error"]
                 .as_str()
                 .unwrap()
-                .contains("ralphus-outpost connect")
+                .contains("ralphus-outpost install")
         );
     }
 

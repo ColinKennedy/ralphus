@@ -25,6 +25,9 @@ tiny_http = { workspace = true }
 base64 = { workspace = true }
 getrandom = { workspace = true }
 ring = { workspace = true }
+# The OS's encrypted per-user secret store: Credential Manager (DPAPI) on
+# Windows, the Keychain on macOS, the Secret Service (pure-Rust D-Bus) on Linux.
+keyring = { version = "3.6", default-features = false, features = ["windows-native", "apple-native", "async-secret-service", "async-io", "crypto-rust"] }
 
 [dev-dependencies]
 ralphus-test-support = { path = "../test-support" }

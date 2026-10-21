@@ -18,15 +18,18 @@
 //! codex = "/home/me/.local/bin/codex"
 //!
 //! [[machine]]
-//! name              = "winbox"            # reached through ralphus-outpost
-//! transport         = "outpost"
-//! outpost_token_env = "WINBOX_OUTPOST_TOKEN"
-//! remote_root       = "C:/ralphus/fleet"
+//! name            = "winbox"              # reached through ralphus-outpost,
+//! transport       = "outpost"             # paired with `ralphus-fleet pair`
+//! remote_root     = "C:/ralphus/fleet"
+//! required_agents = ["claude-code"]
+//!
+//! [outpost_runners]
+//! "windows-x86_64" = "C:/ralphus/win/ralphus-runner.exe"
 //! ```
 //!
 //! `transport` picks how the service reaches a machine: `ssh` (the default,
 //! through `ralphus-ssh-provider`) or `outpost` (the machine runs
-//! `ralphus-outpost connect`, which connects out to this service; see
+//! `ralphus-outpost`, which connects out to this service; see
 //! `docs/outpost.md`).
 
 use std::collections::BTreeMap;
@@ -60,6 +63,17 @@ pub struct FleetConfig {
     /// `<config>.state.json` when omitted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub state_file: Option<String>,
+    /// Where paired outposts' public keys, pending pairing codes and
+    /// readiness reports are kept (`docs/outpost.md`);
+    /// `<config>.outposts.json` when omitted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outpost_registry: Option<String>,
+    /// `<os>-<arch>` -> a `ralphus-runner` binary on this host that outposts
+    /// of that platform keep a verified copy of and run jobs with. A
+    /// platform without one runs jobs with the runner built into
+    /// `ralphus-outpost`.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub outpost_runners: BTreeMap<String, String>,
     #[serde(default, rename = "machine")]
     pub machines: Vec<MachineConfig>,
 }
@@ -84,7 +98,8 @@ pub struct MachineConfig {
     pub transport: Option<String>,
     /// `outpost` only: the environment variable (in this service's
     /// environment) holding the pairing secret the machine's outpost
-    /// presents. The secret itself is never written to this file.
+    /// presents. The secret itself is never written to this file. Omitted
+    /// for a machine paired with `ralphus-fleet pair`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub outpost_token_env: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -107,6 +122,11 @@ pub struct MachineConfig {
     /// Agent name → executable path on the machine.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub agents: BTreeMap<String, String>,
+    /// Agents (`claude-code`, `codex`, ...) the machine must be able to run,
+    /// logged in. An outpost machine whose readiness report says one cannot
+    /// is not allocated, with the fix in the refusal.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub required_agents: Vec<String>,
 }
 
 impl MachineConfig {
@@ -247,14 +267,14 @@ impl FleetConfig {
                             "{origin}: an outpost [[machine]] needs a name (its outpost connects with --name)"
                         ));
                     }
-                    if !machine
+                    if machine
                         .outpost_token_env
                         .as_deref()
-                        .is_some_and(valid_env_name)
+                        .is_some_and(|v| !valid_env_name(v))
                     {
                         return Err(format!(
-                            "{origin}: outpost machine {name:?} needs outpost_token_env naming the \
-                             environment variable that holds its pairing secret"
+                            "{origin}: outpost machine {name:?} outpost_token_env must name an \
+                             environment variable (or be omitted to pair with `ralphus-fleet pair`)"
                         ));
                     }
                     if machine.runner != RunnerConfig::default() {
@@ -298,6 +318,17 @@ impl FleetConfig {
                     machine.remote_root
                 ));
             }
+            if let Some(agent) = machine.required_agents.iter().find(|a| {
+                a.is_empty()
+                    || !a
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
+            }) {
+                return Err(format!(
+                    "{origin}: machine {name:?} required_agents entry {agent:?} must be an agent \
+                     name such as \"claude-code\" or \"codex\""
+                ));
+            }
             if !["upload", "installed"].contains(&machine.runner.mode.as_str()) {
                 return Err(format!(
                     "{origin}: machine {name:?} runner mode {:?} must be \"upload\" or \"installed\"",
@@ -305,7 +336,37 @@ impl FleetConfig {
                 ));
             }
         }
+        for (platform, path) in &self.outpost_runners {
+            let valid = platform
+                .split_once('-')
+                .is_some_and(|(os, arch)| OSES.contains(&os) && ARCHES.contains(&arch));
+            if !valid {
+                return Err(format!(
+                    "{origin}: outpost_runners key {platform:?} must be <os>-<arch>, e.g. \
+                     \"windows-x86_64\" (os one of {OSES:?}, arch one of {ARCHES:?})"
+                ));
+            }
+            if path.trim().is_empty() {
+                return Err(format!(
+                    "{origin}: outpost_runners {platform:?} needs a path"
+                ));
+            }
+        }
         Ok(())
+    }
+
+    /// Where the outpost registry for a configuration read from
+    /// `config_path` lives.
+    #[must_use]
+    pub fn registry_path(&self, config_path: &Path) -> PathBuf {
+        self.outpost_registry.as_ref().map_or_else(
+            || {
+                let mut name = config_path.as_os_str().to_owned();
+                name.push(".outposts.json");
+                PathBuf::from(name)
+            },
+            PathBuf::from,
+        )
     }
 
     /// Write the configuration back to `path`.
@@ -366,6 +427,23 @@ mod tests {
     }
 
     #[test]
+    fn a_paired_outpost_machine_needs_no_token_env() {
+        let config = FleetConfig::parse(
+            "token_env = \"T\"\n[outpost_runners]\n\"windows-x86_64\" = \"C:/r/ralphus-runner.exe\"\n\
+             [[machine]]\nname = \"winbox\"\ntransport = \"outpost\"\nremote_root = \"C:/r\"\n\
+             required_agents = [\"claude-code\"]\n",
+            "fleet.toml",
+        )
+        .unwrap();
+        assert!(config.machines[0].outpost_token_env.is_none());
+        assert_eq!(config.machines[0].required_agents, ["claude-code"]);
+        assert_eq!(
+            config.registry_path(Path::new("x/fleet.toml")),
+            PathBuf::from("x/fleet.toml.outposts.json")
+        );
+    }
+
+    #[test]
     fn bad_values_are_configuration_errors() {
         for (text, needle) in [
             ("token_env = \"T\"\ncolour = 1\n", "unknown field"),
@@ -382,8 +460,16 @@ mod tests {
                 "remote_root",
             ),
             (
-                "token_env = \"T\"\n[[machine]]\nname = \"w\"\ntransport = \"outpost\"\nremote_root = \"/r\"\n",
+                "token_env = \"T\"\n[[machine]]\nname = \"w\"\ntransport = \"outpost\"\noutpost_token_env = \"1BAD\"\nremote_root = \"/r\"\n",
                 "outpost_token_env",
+            ),
+            (
+                "token_env = \"T\"\n[[machine]]\nhost = \"a\"\nremote_root = \"/r\"\nrequired_agents = [\"claude code\"]\n",
+                "required_agents",
+            ),
+            (
+                "token_env = \"T\"\n[outpost_runners]\n\"windows\" = \"r.exe\"\n",
+                "<os>-<arch>",
             ),
             (
                 "token_env = \"T\"\n[[machine]]\ntransport = \"outpost\"\noutpost_token_env = \"W\"\nremote_root = \"/r\"\n",
