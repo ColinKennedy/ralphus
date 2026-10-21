@@ -2984,7 +2984,11 @@ fn provision_request(
     // uses, rather than letting the provider discover the gap at its own
     // runtime and report a less actionable error.
     let target = crate::machine_targets::find_by_machine(targets, machine);
-    let remote_root = if project.vcs == "git" {
+    // A provider service's machine carries its own storage root and runner
+    // policy: the service fills both in, so the daemon sends neither.
+    let remote_root = if crate::allocations::parse_bound(machine).is_some() {
+        None
+    } else if project.vcs == "git" {
         let target = target.ok_or_else(|| {
             format!(
                 "{who}: machine {machine:?} has no [machine.targets.*] entry configured with a remote_root; register one before provisioning a git project there"

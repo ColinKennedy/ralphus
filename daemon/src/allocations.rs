@@ -610,12 +610,17 @@ fn remember_token(row_id: i64, allocation: &Allocation) {
 }
 
 /// A current token for allocation row `row`, renewed from `service` when
-/// there is none or it is about to expire.
+/// there is none, it is about to expire, or `force` says the provider refused
+/// the last one.
 ///
 /// # Errors
 /// The provider's refusal to renew, with its remediation.
-pub fn token_for(row: &AllocationRow, service: &ProviderService) -> Result<String, String> {
-    {
+pub fn token_for(
+    row: &AllocationRow,
+    service: &ProviderService,
+    force: bool,
+) -> Result<String, String> {
+    if !force {
         let tokens = TOKENS.lock().expect("poisoned");
         if let Some(cached) = tokens.get(&row.id) {
             let fresh = cached
@@ -1476,6 +1481,47 @@ mod tests {
                 "POST /v1/m/alloc-1/ping",
                 "POST /v1/allocations/alloc-1/renew",
                 "POST /v1/m/alloc-1/ping",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_refused_token_is_renewed_and_the_call_made_once_more() {
+        let refused_once = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let seen = std::sync::Arc::clone(&refused_once);
+        let fleet = FakeFleet::start("renew-401", move |method, path, _| match (method, path) {
+            ("POST", "/v1/allocations") => (200, granted("alloc-r")),
+            ("POST", "/v1/allocations/alloc-r/renew") => (200, granted("alloc-r")),
+            ("POST", "/v1/m/alloc-r/ping") => {
+                if seen.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                    (
+                        200,
+                        json!({"ok": true, "protocol_version": 2, "detail": "pong"}),
+                    )
+                } else {
+                    (401, json!({"ok": false, "reason_code": "unauthorized"}))
+                }
+            }
+            _ => (404, json!({})),
+        });
+        crate::provider_services::set_services_for_test(vec![fleet.service.clone()]);
+        let store = handle(Store::open_in_memory().unwrap());
+        let machine = grant(&store, "@renew-401", Scope::Squad("s")).unwrap();
+        let runner = crate::remote_runner::provider_from_store(&store.lock(), &machine)
+            .unwrap()
+            .expect("remote");
+        let spec = crate::runner::RunnerSpec::for_command_proof(
+            "s", "c", &machine, ".", "", "claude", None,
+        );
+
+        assert_eq!(runner.ping(&spec).unwrap().as_deref(), Some("pong"));
+        assert_eq!(
+            fleet.requests(),
+            [
+                "POST /v1/allocations",
+                "POST /v1/m/alloc-r/ping",
+                "POST /v1/allocations/alloc-r/renew",
+                "POST /v1/m/alloc-r/ping",
             ]
         );
     }

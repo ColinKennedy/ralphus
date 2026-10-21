@@ -465,8 +465,9 @@ enum Transport {
     },
 }
 
-/// Where a Machine API call gets its bearer token.
-pub type TokenSource = Arc<dyn Fn() -> Result<String, String> + Send + Sync>;
+/// Where a Machine API call gets its bearer token; `true` asks for a fresh one
+/// because the provider refused the last.
+pub type TokenSource = Arc<dyn Fn(bool) -> Result<String, String> + Send + Sync>;
 
 /// The agent for Machine API calls. `exec` may run a whole cell
 /// synchronously when the machine does not hand back a handle, so a reply is
@@ -671,7 +672,7 @@ impl ProviderRunner {
             provider,
             allocation_id,
             endpoint,
-            Arc::new(move || Ok(token.clone())),
+            Arc::new(move |_| Ok(token.clone())),
         )
     }
 
@@ -894,7 +895,6 @@ impl ProviderRunner {
                 self.scheme
             )
         })?;
-        let token = token()?;
         let url = format!("{endpoint}/{verb}");
         // ralphus[ignore-rlog-pair]: this low-level helper has no Store; its Store-owning caller records the structured workflow outcome
         crate::rlog!(
@@ -905,12 +905,21 @@ impl ProviderRunner {
             spec.squad_id,
             spec.cell_id
         );
-        let reply = machine_api_agent()
-            .post(&url)
-            .set("Authorization", &format!("Bearer {token}"))
-            .set("Content-Type", "application/json")
-            .send_string(&body.to_string());
-        let (status, reply) = match reply {
+        let send = |token: &str| {
+            machine_api_agent()
+                .post(&url)
+                .set("Authorization", &format!("Bearer {token}"))
+                .set("Content-Type", "application/json")
+                .send_string(&body.to_string())
+                .map_err(Box::new)
+        };
+        // A token the provider no longer accepts (it restarted, say) is
+        // renewed and the call made once more.
+        let reply = match send(&token(false)?) {
+            Err(e) if matches!(*e, ureq::Error::Status(401, _)) => send(&token(true)?),
+            other => other,
+        };
+        let (status, reply) = match reply.map_err(|e| *e) {
             Ok(resp) => (resp.status(), resp),
             Err(ureq::Error::Status(code, resp)) => (code, resp),
             Err(e) => {
@@ -2057,7 +2066,7 @@ fn allocation_runner(store: &Store, machine: &str, row_id: i64) -> Result<Provid
         provider,
         allocation_id,
         endpoint,
-        Arc::new(move || crate::allocations::token_for(&row, &service)),
+        Arc::new(move |renew| crate::allocations::token_for(&row, &service, renew)),
     ))
 }
 
