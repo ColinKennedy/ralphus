@@ -178,6 +178,8 @@ pub enum ResolveError {
     },
     /// `<<ralphus:auto-provider>>` with no provider service configured.
     NoProviderServices,
+    /// A request only `local` may serve, which the daemon host cannot.
+    LocalCannotServe(String),
     /// The `[machine.providers.*]` configuration itself is invalid.
     ProviderConfig(String),
 }
@@ -227,6 +229,11 @@ impl std::fmt::Display for ResolveError {
                 ralphus_core::schema::AUTO_PROVIDER
             ),
             Self::ProviderConfig(e) => write!(f, "invalid provider service configuration: {e}"),
+            Self::LocalCannotServe(reason) => write!(
+                f,
+                "only provider \"local\" may serve this machine request, and {reason}; drop the \
+                 os/arch/labels it cannot meet or add a provider service to the list"
+            ),
         }
     }
 }
@@ -257,6 +264,17 @@ pub fn resolve_service_request(
                 provider: provider.clone(),
                 configured,
             });
+        }
+    }
+    // The daemon host is known now, so a request only it may serve and that
+    // it cannot is refused at submit rather than when the squad starts.
+    if request
+        .providers
+        .iter()
+        .all(|p| p.eq_ignore_ascii_case(LOCAL_SCHEME))
+    {
+        if let Some(reason) = crate::allocations::local_refusal(&request) {
+            return Err(ResolveError::LocalCannotServe(reason));
         }
     }
     Ok(ResolvedMachine::Service(request))
@@ -784,6 +802,26 @@ mod tests {
         let message = err.to_string();
         assert!(message.contains("local, fleet"), "{message}");
         assert!(message.contains("[machine.providers.farm]"), "{message}");
+    }
+
+    #[test]
+    fn a_request_only_local_may_serve_must_fit_the_daemon_host() {
+        let other_os = if std::env::consts::OS == "linux" {
+            "windows"
+        } else {
+            "linux"
+        };
+        let mut wrong_os = request(&["local"]);
+        wrong_os.os = Some(other_os.to_string());
+        let err = resolve_service_request(wrong_os.clone(), &[]).expect_err("host cannot serve");
+        assert!(matches!(err, ResolveError::LocalCannotServe(_)));
+        assert!(err.to_string().contains(other_os), "{err}");
+        // Another provider in the list may still grant it.
+        wrong_os.providers.insert(0, "fleet".to_string());
+        assert!(resolve_service_request(wrong_os, &[service("fleet")]).is_ok());
+        let mut host = request(&["local"]);
+        host.os = Some(std::env::consts::OS.to_string());
+        assert!(resolve_service_request(host, &[]).is_ok());
     }
 
     #[test]
