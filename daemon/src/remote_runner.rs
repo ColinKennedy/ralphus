@@ -897,7 +897,7 @@ impl ProviderRunner {
                 if stderr_tail.trim().is_empty() {
                     String::new()
                 } else {
-                    format!("; stderr: {}", stderr_tail.trim())
+                    format!("; stderr: {}", redact_stderr_tail(stderr_tail.trim(), spec))
                 }
             ));
         }
@@ -1109,6 +1109,20 @@ fn truncate(s: &str, max: usize) -> String {
 fn redact_remote_text(text: &str) -> String {
     let registered = crate::redact::redact_all(text);
     ralphus_core::redact::redact_secrets(&registered).into_owned()
+}
+
+/// A provider's stderr tail, quoted in an error that is logged and stored:
+/// [`redact_remote_text`] plus the value of every secret-named variable in
+/// the request's environment, which a provider echoing its stdin payload
+/// would otherwise repeat verbatim.
+fn redact_stderr_tail(tail: &str, spec: &RunnerSpec) -> String {
+    let request_secrets: std::collections::BTreeSet<String> = spec
+        .env_overrides
+        .iter()
+        .filter(|(key, _)| ralphus_core::redact::is_secret_env_key(key))
+        .map(|(_, value)| value.clone())
+        .collect();
+    redact_remote_text(&crate::redact::redact(tail, &request_secrets))
 }
 
 fn redact_provider_response(response: &mut ProviderResponse) {
@@ -3003,6 +3017,45 @@ else:
             err.contains("no ssh key"),
             "stderr must be quoted so the failure is diagnosable: {err}"
         );
+    }
+
+    #[test]
+    fn a_provider_that_echoes_a_secret_to_stderr_has_it_redacted() {
+        // Built at run time and obviously fake, so secret scanners do not flag it.
+        let registered = format!("not-a-real-registered-{}", "stderr");
+        let request = format!("not-a-real-request-{}", "stderr");
+        crate::redact::register(&registered);
+        let script = fake_provider(
+            "stderr-secret",
+            "",
+            &[&format!("payload {registered} and {request}")],
+        );
+        let s = store();
+        s.lock()
+            .register_machine_provider(
+                "ib",
+                "",
+                &script.to_string_lossy(),
+                &[],
+                PROTOCOL_VERSION,
+                false,
+            )
+            .unwrap();
+        let (router, _local) = router(Arc::clone(&s));
+        let mut spec = spec(Some("ib:A"));
+        spec.env_overrides
+            .insert("GH_TOKEN".to_string(), request.clone());
+        let r = router.run(&spec);
+        assert_eq!(r.status, "failed");
+        let err = r.error.unwrap_or_default();
+        assert!(err.contains("payload"), "stderr is still quoted: {err}");
+        assert!(
+            !err.contains(&registered),
+            "registered secret leaked: {err}"
+        );
+        assert!(!err.contains(&request), "request credential leaked: {err}");
+        let stored = all_stored_text(&s);
+        assert!(!stored.contains(&registered) && !stored.contains(&request));
     }
 
     /// Every text value in every table of `store`, for a leak scan.
