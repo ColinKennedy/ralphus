@@ -63,6 +63,19 @@ pub struct Workspace {
     /// calls are logged and recorded under that review (see
     /// [`machine_call_spec`]). `None` for a workspace no review owns.
     guardian_id: Option<String>,
+    /// The cell this workspace belongs to, when it does: its machine calls
+    /// are logged under that cell's squad, task and id. `None` for a
+    /// workspace no cell owns.
+    cell: Option<Arc<CellCallOwner>>,
+}
+
+/// The cell a workspace's machine calls are made for (see
+/// [`Workspace::for_cell`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CellCallOwner {
+    squad_id: String,
+    task: String,
+    cell_id: String,
 }
 
 /// The [`crate::runner::RunnerSpec`] a machine call that belongs to no cell
@@ -382,6 +395,7 @@ impl Workspace {
             path_map: None,
             forge_credentials: None,
             guardian_id: None,
+            cell: None,
         }
     }
 
@@ -404,6 +418,7 @@ impl Workspace {
             path_map: None,
             forge_credentials: None,
             guardian_id: None,
+            cell: None,
         }
     }
 
@@ -543,6 +558,19 @@ impl Workspace {
         self
     }
 
+    /// Mark this workspace as cell `cell_id`'s (of `task` in squad
+    /// `squad_id`), so its machine calls are logged under that squad rather
+    /// than as unowned workspace calls.
+    #[must_use]
+    pub fn for_cell(mut self, squad_id: &str, task: &str, cell_id: &str) -> Self {
+        self.cell = Some(Arc::new(CellCallOwner {
+            squad_id: squad_id.to_string(),
+            task: task.to_string(),
+            cell_id: cell_id.to_string(),
+        }));
+        self
+    }
+
     /// Attach the store handle a remote workspace needs to resolve its
     /// provider. A no-op in effect for a local workspace, which never looks.
     #[must_use]
@@ -596,6 +624,7 @@ impl Workspace {
             local_root,
             forge_credentials: self.forge_credentials.clone(),
             guardian_id: self.guardian_id.clone(),
+            cell: self.cell.clone(),
         }
     }
 
@@ -1016,10 +1045,21 @@ impl Workspace {
         f(&provider, &self.machine_call_spec(machine))
     }
 
-    /// The spec this workspace's machine calls are made with: these
-    /// operations belong to no cell, so it carries only their owner (see
-    /// [`machine_call_spec`]).
-    fn machine_call_spec(&self, machine: &str) -> crate::runner::RunnerSpec {
+    /// The spec this workspace's machine calls are made with. A cell's
+    /// workspace carries that cell's identity; any other carries only its
+    /// owner (see [`machine_call_spec`]).
+    pub(crate) fn machine_call_spec(&self, machine: &str) -> crate::runner::RunnerSpec {
+        if let Some(cell) = &self.cell {
+            return crate::runner::RunnerSpec::for_command_proof(
+                &cell.squad_id,
+                &cell.task,
+                &cell.cell_id,
+                ".",
+                "",
+                "claude",
+                None,
+            );
+        }
         let task = if self.guardian_id.is_some() {
             "review-merge"
         } else {
@@ -1953,6 +1993,19 @@ echo {json}
         let unowned = Workspace::on("/remote/repo", Some("ib:A")).machine_call_spec("ib:A");
         assert_eq!(unowned.squad_id, "workspace");
         assert_ne!(unowned.task, "review-merge");
+    }
+
+    #[test]
+    fn a_cells_machine_calls_are_logged_under_its_squad() {
+        let cell = Workspace::on("/remote/wt", Some("ib:A")).for_cell("squad-7", "build", "c1");
+        for spec in [
+            cell.machine_call_spec("ib:A"),
+            cell.at("/remote/wt/sub").machine_call_spec("ib:A"),
+        ] {
+            assert_eq!(spec.squad_id, "squad-7");
+            assert_eq!(spec.task, "build");
+            assert_eq!(spec.cell_id, "c1");
+        }
     }
 
     /// A fake provider that answers every verb with `json` and appends each

@@ -3663,6 +3663,7 @@ static REMOTE_INIT: LazyLock<parking_lot::Mutex<HashMap<String, Arc<parking_lot:
 pub(crate) fn initialize_remote_worktree(
     store: &StoreHandle,
     squad_id: &str,
+    cell: &crate::store::CellRow,
     cwd: &str,
     machine: Option<&str>,
 ) -> Result<(), String> {
@@ -3678,7 +3679,9 @@ pub(crate) fn initialize_remote_worktree(
     if !spec.rerun_existing {
         return Ok(());
     }
-    let ws = crate::workspace::Workspace::on(cwd, machine).with_store(Arc::clone(store));
+    let ws = crate::workspace::Workspace::on(cwd, machine)
+        .with_store(Arc::clone(store))
+        .for_cell(squad_id, &cell.task_name, &cell.cell_id);
     crate::worktree_init::run_in(&ws, &spec).map(|_| ())
 }
 
