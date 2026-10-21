@@ -882,6 +882,15 @@ fn execute_queued_run(
     runners: &LiveRunnerFactory,
     run: &LiveRunRow,
 ) -> bool {
+    // A preparation resets (or removes and re-adds) the prepared checkout
+    // while it holds this gate, and it skips a checkout that is held. Taking
+    // the gate here means the run either waits for an in-flight preparation
+    // and gets the checkout it recorded, or holds its checkout before the
+    // next preparation looks -- never a directory being rebuilt under it.
+    let preparation_gate = store
+        .lock_free_memory()
+        .guardian_preparation_gate(&run.guardian_id);
+    let preparation = preparation_gate.lock();
     let (guardian, target, checkout) = {
         let guard = store.lock();
         let Ok(g) = guard.get_guardian(&run.guardian_id) else {
@@ -908,6 +917,7 @@ fn execute_queued_run(
     }) {
         Some(cwd) => cwd,
         None => {
+            drop(preparation);
             let _ = store.lock().fail_queued_live_run(
                 &run.run_id,
                 "the review's build has not been prepared yet; run it after preparation finishes",
@@ -915,6 +925,13 @@ fn execute_queued_run(
             return false;
         }
     };
+    let _checkout_hold = crate::checkout_hold::hold(
+        &cwd,
+        &format!("live-run:{}:{}", run.guardian_id, run.run_id),
+        crate::live_actions::LIVE_RUN_HOLD_MAX_AGE,
+    )
+    .ok();
+    drop(preparation);
     let prompt = match &checkout.preparation_failure {
         Some(failure) => format!(
             "{}\n\nNote: ralphus's preparation of this checkout reported a failure, so the build \
