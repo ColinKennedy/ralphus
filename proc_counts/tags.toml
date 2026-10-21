@@ -188,3 +188,8 @@ tag = "ssh-windows"
 [[test]]
 id = "ralphus-outpost::loopback an_outpost_serves_an_allocations_machine_api_over_its_outbound_connection"
 tag = "outpost-loopback"
+
+# A collecting remote review's preliminary summary while its page is polled.
+[[test]]
+id = "ralphus-daemon guardian_merge::tests::polling_a_collecting_remote_review_does_not_recompute_its_summary_each_time"
+tag = "review-summary-poll-remote"
