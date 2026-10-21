@@ -199,7 +199,7 @@ class Fleet:
     """A ralphus-fleet process serving a copy of the user's fleet config."""
 
     def __init__(self, root: Path, bin_dir: Path, source: Path, token: str, listen: str | None = None,
-                 external_url: str | None = None):
+                 external_url: str | None = None, agents: tuple[str, dict[str, str]] | None = None):
         self.root = root
         self.bin_dir = bin_dir
         self.process: subprocess.Popen[bytes] | None = None
@@ -239,7 +239,10 @@ class Fleet:
             f'token_env = "{FLEET_TOKEN_ENV}"\n'
             f"state_file = {json.dumps(str(root / 'fleet.state.json'))}\n"
         )
-        self.config_path.write_text(prefix + "\n".join(kept) + (sep + rest if sep else ""))
+        text = prefix + "\n".join(kept) + (sep + rest if sep else "")
+        if agents:
+            text = with_machine_agents(text, *agents)
+        self.config_path.write_text(text)
         self.config = tomllib.loads(self.config_path.read_text())
         self.start()
 
@@ -297,10 +300,66 @@ class Fleet:
         raise RuntimeError(f"no machine in {self.config_path} has label {label!r}")
 
 
+def prompt_task(project: str, run: str, label_b: str, base: str, machine_b: dict, review: str,
+                prompt_cell: str) -> str:
+    """A task on machine B whose cell is a real prompt for `prompt_cell`
+    (`AGENT:MODEL`), run with the machine's own agent installation and login."""
+    agent, _, model = prompt_cell.partition(":")
+    file = f"fleet-e2e-agent-{run}.txt"
+    prompt = (
+        f"Run the `hostname` command. Then create a file named {file} in the current directory "
+        "whose only line is `written by an agent on HOST`, with HOST replaced by that output. "
+        "Then stage it and commit it with `git -c user.email=fleet-e2e@example.invalid "
+        f"-c user.name=Fleet-E2E commit -m {file}`. Do nothing else."
+    )
+    model_line = f'model = "{model}"\n' if model else ""
+    return f"""
+[[task]]
+name = "agent-on-b"
+project = "{project}"
+machine = {{ provider = "fleet", labels = ["{label_b}"] }}
+agent = "{agent}"
+{model_line}
+[[task.cell]]
+cwd = "<<ralphus:new-worktree/fleet-e2e-agent-{run}?upstream={base}>>"
+prompt = {json.dumps(prompt)}
+review = "{review}"
+
+[[task.cell.proof]]
+command = "git log -1 --format=%s"
+mode = "raw"
+shell = "{live.shell_for(machine_b)}"
+"""
+
+
+def with_machine_agents(text: str, label: str, agents: dict[str, str]) -> str:
+    """`text` (a ralphus-fleet.toml) with `agents` added to the `[machine.agents]`
+    of the machine labelled `label`: the fleet then hands each agent its path
+    on that machine (an agent profile's own executable is a daemon-local path,
+    which ralphus refuses for a remote machine)."""
+    parts = re.split(r"(?m)^(?=\[\[machine\]\]\s*$)", text)
+    for i, part in enumerate(parts):
+        if not part.startswith("[[machine]]"):
+            continue
+        machine = tomllib.loads(part.replace("[[machine]]", "[machine]", 1)).get("machine", {})
+        if label not in machine.get("labels", []):
+            continue
+        if machine.get("agents"):
+            raise RuntimeError(f"the machine labelled {label!r} already has [machine.agents]; "
+                               "add the stand-in agent there yourself")
+        lines = "".join(f"{name} = {json.dumps(path)}\n" for name, path in agents.items())
+        parts[i] = part.rstrip("\n") + "\n[machine.agents]\n" + lines + "\n"
+        merged = "".join(parts)
+        tomllib.loads(merged)
+        return merged
+    raise RuntimeError(f"no machine in the fleet config has label {label!r}")
+
+
 def squad_toml(project: str, run: str, label_a: str, label_b: str, base: str, machine_a: dict,
-               machine_b: dict, live_actions: bool = False) -> str:
+               machine_b: dict, live_actions: bool = False, prompt_cell: str | None = None) -> str:
     """Two tasks on two machines feeding one review on the first. With
-    `live_actions`, task A also hands off a live action the review runs."""
+    `live_actions`, task A also hands off a live action the review runs; with
+    `prompt_cell`, a third task on machine B runs a real agent."""
     cwd_a = f"<<ralphus:new-worktree/fleet-e2e-a-{run}?upstream={base}>>"
     review = "<<ralphus:new-review/fleet-e2e>>"
     if live.is_windows(machine_a):
@@ -344,7 +403,7 @@ review = "{review}"
 command = "git log -1 --format=%s"
 mode = "raw"
 shell = "{shell_b}"
-
+{prompt_task(project, run, label_b, base, machine_b, review, prompt_cell) if prompt_cell else ""}
 [[review]]
 id = "ralphus:new-review/fleet-e2e"
 upstream = "{base}"
@@ -401,7 +460,14 @@ def run(args: argparse.Namespace) -> int:
             args.restart_fleet = False
     else:
         token = secrets.token_hex(32)
-    fleet = Fleet(root, bin_dir, Path(args.fleet_config), token, args.fleet_listen, args.fleet_url)
+    agents = None
+    if args.live_actions and not args.fleet_url:
+        source = tomllib.loads(Path(args.fleet_config).read_text())
+        machine = next((m for m in source.get("machine", []) if args.label_a in m.get("labels", [])), None)
+        if machine:
+            agents = (args.label_a, {"raw": live.agent_path(machine, run_id)})
+    fleet = Fleet(root, bin_dir, Path(args.fleet_config), token, args.fleet_listen, args.fleet_url,
+                  agents)
     daemon = None
     try:
         outposts = sorted(fleet.outpost_names())
@@ -453,12 +519,16 @@ def run(args: argparse.Namespace) -> int:
         daemon.post("/api/secret-env-names", {"name": SECRET_NAME})
         if args.live_actions:
             # A `raw` profile: the stand-in agent a cell installs on machine A.
+            # A raw profile needs an executable, and the daemon refuses a
+            # path-shaped one for a remote machine; the fleet replaces this
+            # bare name with the machine's [machine.agents] raw path (with
+            # --fleet-url, add `raw = <agent path>` there yourself).
             daemon.post("/api/agent-profiles", {"name": live.AGENT_PROFILE, "backend": "raw",
-                                                "executable": live.agent_path(machine_a, run_id)})
+                                                "executable": live.AGENT_PROFILE})
 
         # The squad env is where a registered secret normally comes from.
         text = squad_toml(project, run_id, args.label_a, args.label_b, args.base, machine_a,
-                          machine_b, args.live_actions)
+                          machine_b, args.live_actions, args.prompt_cell)
         (root / "squad.toml").write_text(text)
         squad = str(daemon.post("/api/squads", {"toml": text, "hold": True})["squad_id"])
         daemon.post(f"/api/squads/{squad}/env", {"set": {SECRET_NAME: secret_value}})
@@ -586,6 +656,12 @@ def run(args: argparse.Namespace) -> int:
         checks.record("the secret reached the cell and is not on the machine's disk",
                       task_a["cells"][0]["state"] == "done",
                       f"checking cell {task_a['cells'][0]['state']}")
+        if args.prompt_cell:
+            agent_task = next(t for t in daemon.get(f"/api/squads/{squad}")["tasks"]
+                              if t["name"] == "agent-on-b")
+            checks.record(f"a {args.prompt_cell} prompt cell ran on machine B",
+                          agent_task["cells"][0]["state"] == "done",
+                          f"agent cell {agent_task['cells'][0]['state']}")
     except (RuntimeError, TimeoutError, subprocess.CalledProcessError, KeyError) as e:
         checks.record("harness ran to the end", False, str(e))
     finally:
@@ -630,6 +706,10 @@ def main() -> int:
     parser.add_argument("--local-clone", action="store_true",
                         help="also clone the repository on the daemon host and register that path "
                              "(default: a remote-only project with no clone here)")
+    parser.add_argument("--prompt-cell", metavar="AGENT:MODEL",
+                        help="also run a real prompt cell with this agent (e.g. claude-code:haiku) on "
+                             "machine B, using the machine's own agent installation and login; "
+                             "costs model usage")
     args = parser.parse_args()
     if args.pr and not args.forge_token_env:
         parser.error("--pr needs --forge-token-env")
