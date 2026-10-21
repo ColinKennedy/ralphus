@@ -3492,9 +3492,12 @@ fn walk_project_configs(start: &Path) -> Vec<PathBuf> {
 /// than `ttl` and whose files all still exist.
 fn project_configs_on_path(start: &Path, ttl: std::time::Duration) -> Vec<PathBuf> {
     // A remote-only project has no files on this host; its reserved root is
-    // a key, and walking up from it would find unrelated configs.
+    // a key, and walking up from it would find unrelated configs. Its own
+    // `.ralphus.toml` is the copy last read from a machine's clone.
     if crate::remote_projects::is_remote_only_root(start) {
-        return Vec::new();
+        return crate::remote_projects::fetched_config(start)
+            .into_iter()
+            .collect();
     }
     {
         let cache = discovery_cache()

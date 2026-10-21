@@ -508,6 +508,10 @@ impl Workspace {
             )
             .map(Arc::new);
             workspace.root = workspace.map_path(&workspace.root);
+            // A remote-only project's settings live only in the machine's clone.
+            if workspace.path_map.is_some() {
+                crate::remote_projects::refresh_config(Path::new(&review.git_root), &workspace);
+            }
             // Pushes and fetches on the machine authenticate as the review's
             // owner when the project is cloned over HTTPS.
             let clone_url = {
@@ -556,6 +560,13 @@ impl Workspace {
     #[must_use]
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// The store handle this workspace resolves its provider through, when it
+    /// was given one.
+    #[must_use]
+    pub fn store(&self) -> Option<&crate::store_lock::StoreHandle> {
+        self.store.as_ref()
     }
 
     /// The machine this workspace lives on, or `None` for the daemon's host.
