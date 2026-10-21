@@ -33,7 +33,10 @@ const USAGE: &str = "usage: ralphus-outpost <install|status|uninstall|serve|conn
     \x20           --service   Windows: start at boot whether or not you are logged on (elevated);\n\
     \x20                       Linux: also `loginctl enable-linger` (start at boot)\n\
     \x20           --dry-run   write the autostart definition to <dir> and change nothing\n\
-    \x20 status    show the installed outpost: settings, credential, autostart, connection, log\n\
+    \x20 install [--service]\n\
+    \x20           already paired: register the autostart again, keeping the pairing\n\
+    \x20           (--service switches it to start at boot)\n\
+    \x20 status   show the installed outpost: settings, credential, autostart, connection, log\n\
     \x20 uninstall stop it, remove the autostart and forget the credential\n\
     \x20 serve     run the installed outpost (what the autostart runs)\n\
     \x20 connect <fleet-url> --name <machine> --token-env <VAR> --remote-root <path>\n\
@@ -108,14 +111,21 @@ fn builtin_runner() -> Result<Vec<String>, String> {
 fn install_command(mut args: Vec<String>) -> Result<(), String> {
     refuse_secret_flags(&args)?;
     let home = home(&mut args)?;
-    let fleet_url = take(&mut args, "--fleet")?.ok_or("install needs --fleet <url>")?;
-    let code = take(&mut args, "--code")?.ok_or(
-        "install needs --code <code> (run `ralphus-fleet pair <machine>` on the fleet host)",
-    )?;
+    let fleet_url = take(&mut args, "--fleet")?;
+    let code = take(&mut args, "--code")?;
     let remote_root = take(&mut args, "--remote-root")?;
     let dry_run = take(&mut args, "--dry-run")?.map(PathBuf::from);
     let service = take_switch(&mut args, "--service");
     no_more(&args, "install")?;
+    if fleet_url.is_none() && code.is_none() && remote_root.is_none() && dry_run.is_none() {
+        // An outpost that is already paired: register its autostart again
+        // (`--service`: switch it to start at boot), keeping its credential.
+        return install::reregister(&home, service);
+    }
+    let fleet_url = fleet_url.ok_or("install needs --fleet <url>")?;
+    let code = code.ok_or(
+        "install needs --code <code> (run `ralphus-fleet pair <machine>` on the fleet host)",
+    )?;
     install::install(&install::InstallOptions {
         fleet_url,
         code,

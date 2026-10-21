@@ -648,6 +648,45 @@ pub fn install(options: &InstallOptions) -> Result<(), String> {
     Ok(())
 }
 
+/// `ralphus-outpost install [--service]` with no `--fleet`/`--code` on a
+/// machine that is already paired: register the autostart again, keeping
+/// the pairing and the credential -- with `--service`, switch it to start at
+/// boot whether or not anyone logs on.
+///
+/// # Errors
+/// Not installed, the credential cannot be read here, or registering failed.
+pub fn reregister(home: &Home, service: bool) -> Result<(), String> {
+    let settings = home.load()?.ok_or_else(|| {
+        format!(
+            "not installed (no {}); pair it first with `ralphus-outpost install --fleet <url> \
+             --code <code>`",
+            home.settings_file().display()
+        )
+    })?;
+    home.load_credential(&OsStore::new(CREDENTIAL_SERVICE), settings.credential_store)
+        .map_err(|e| {
+            format!("{e}\nthe paired credential must be readable here to keep it; nothing changed")
+        })?;
+    let exe = install_executable(home)?;
+    register(
+        Platform::current(),
+        service,
+        &exe,
+        home,
+        &UserDirs::current()?,
+    )?;
+    say(&format!(
+        "{:?} keeps its pairing and now starts {}",
+        settings.name,
+        if service {
+            "at boot, whether or not anyone is logged on"
+        } else {
+            "when you log on"
+        }
+    ));
+    Ok(())
+}
+
 /// Write the autostart definition and run its commands; on Linux without a
 /// user systemd, fall back to an XDG autostart entry and start it now.
 fn register(
@@ -938,6 +977,16 @@ mod tests {
             "{lines:?}"
         );
         assert!(!lines.iter().any(|l| l.contains("/RU")), "{lines:?}");
+    }
+
+    #[test]
+    fn reregistering_needs_an_existing_pairing_and_changes_nothing_without_one() {
+        let dir = ralphus_test_support::TestDir::new("install-reregister");
+        let home = Home::new(dir.join("home"));
+        let err = reregister(&home, true).unwrap_err();
+        assert!(err.contains("not installed"), "{err}");
+        assert!(err.contains("--code"), "{err}");
+        assert!(!home.dir.join(format!("{SERVICE_NAME}-task.xml")).exists());
     }
 
     #[test]

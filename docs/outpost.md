@@ -75,6 +75,11 @@ sleep/wake or network change, and keeps itself on the fleet's runner.
 | Linux | a `systemd --user` unit (`Restart=always`); with no user systemd, an XDG autostart entry (starts with your desktop session) | the same unit plus `loginctl enable-linger`, so it starts at boot |
 | macOS | a launchd agent (`com.ralphus.outpost`, `KeepAlive`) | not supported yet: a launchd daemon cannot read your Keychain |
 
+On a machine that is already paired, `ralphus-outpost install` with neither
+`--fleet` nor `--code` registers the autostart again and keeps the pairing:
+`install --service` switches it to start at boot (from an elevated prompt,
+as above), plain `install` switches it back to starting at logon.
+
 `install --dry-run <dir>` writes the definition it would register into
 `<dir>` and prints the commands it would run, pairing and changing nothing.
 
