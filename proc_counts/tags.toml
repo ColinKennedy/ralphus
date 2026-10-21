@@ -36,6 +36,12 @@ tag = "command-shell"
 id = "ralphus-daemon guardian_merge::branch_diff_tests::diff_summary_counts_worktree_edits_against_the_base"
 tag = "branch-diff-summary"
 
+# The same summary for a remote review: every git call and untracked-file read
+# goes to the review's machine provider.
+[[test]]
+id = "ralphus-daemon guardian_merge::branch_diff_tests::diff_summary_of_a_remote_review_runs_on_its_machine"
+tag = "branch-diff-summary-remote"
+
 # Prompt cells (runner-side `run_with_backend`, scripted backend).
 [[test]]
 id = "ralphus-runner execute::tests::run_with_backend_succeeds_normally_when_no_thrash_is_reported"
