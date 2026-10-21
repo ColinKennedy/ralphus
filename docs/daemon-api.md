@@ -2440,15 +2440,19 @@ HTTP status for the whole request:
 
 ### `DELETE /api/guardians/{id}`
 Deletes the guardian row, then defers the worktree/branch/terminal-log
-cleanup (`purge_worktrees`, dual-root upstream branch retirement, durable
-terminal logs) to a background thread instead of running it synchronously
+cleanup (closing the review's still-open PRs/MRs on GitHub or GitLab,
+`purge_worktrees`, dual-root upstream branch retirement, durable terminal
+logs) to a background thread instead of running it synchronously
 before the response returns. The cleanup shells out to git with no timeout
 and delete has no eligibility gate (unlike Cancel/Reopen/Merge), so it can be
 invoked on a review whose worktree is actively held by an in-progress merge
 — running it inline used to block the response for as long as that merge
 held the worktree lease (RAL-549). Returns `200` with `{ "state": "deleted"
 }` as soon as the row itself is gone; the cleanup finishing is not
-observable through this response.
+observable through this response. The PRs' remote branches are kept. A PR/MR
+that cannot be closed (forge error, no client for its repository) gets a
+mailbox message asking the user to close it by hand; the delete itself still
+succeeds.
 
 ### `POST /api/guardians/delete-batch` (RAL-549)
 Batch form of `DELETE /api/guardians/{id}` — the board's multi-select

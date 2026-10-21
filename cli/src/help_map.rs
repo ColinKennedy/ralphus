@@ -597,7 +597,7 @@ const REVIEW_CHILDREN: &[HelpNode] = &[
         "delete",
         &["selector [str]"],
         &["--yes"],
-        "Delete a review and its worktrees.",
+        "Delete a review and its worktrees, closing its open PRs/MRs.",
         false,
         false,
         &[],

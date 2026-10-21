@@ -8622,6 +8622,152 @@ pub(crate) fn retire_dual_root_branch_for_guardian(
     }
 }
 
+/// The PRs/MRs of `guardian` still open on the forge, each paired with the
+/// root of the project it belongs to. Snapshotted before a review is deleted,
+/// since its PR rows go with it.
+pub(crate) fn open_prs_for_review_delete(
+    store: &crate::store_lock::StoreHandle,
+    guardian: &GuardianView,
+) -> Vec<(PullRequestView, String)> {
+    let prs = store
+        .lock()
+        .list_pull_requests_for_guardian(&guardian.id)
+        .unwrap_or_default();
+    prs.into_iter()
+        .filter(|pr| pr.state == "open" && pr.pr_number.is_some())
+        .map(|pr| {
+            let root = pr
+                .branch_id
+                .as_deref()
+                .and_then(|branch_id| guardian.branches.iter().find(|b| b.id == branch_id))
+                .and_then(|branch| branch.project.clone())
+                .unwrap_or_else(|| guardian.git_root.clone());
+            (pr, root)
+        })
+        .collect()
+}
+
+/// Close every PR/MR a deleted review left open (see
+/// [`open_prs_for_review_delete`]), resolving each one's forge client the
+/// same way [`check_pr_merges`] does. `workspaces` holds each project's
+/// workspace, resolved while the review row still existed. The PRs' remote
+/// branches are left in place.
+pub(crate) fn close_prs_of_deleted_review(
+    store: &crate::store_lock::StoreHandle,
+    guardian: &GuardianView,
+    prs: Vec<(PullRequestView, String)>,
+    workspaces: &[(String, crate::workspace::Workspace)],
+) {
+    if prs.is_empty() {
+        return;
+    }
+    let _remote_scope = crate::machine_strict::enter(guardian.machine.as_deref());
+    let jobs = prs
+        .into_iter()
+        .map(|(pr, root)| {
+            let client = workspaces
+                .iter()
+                .find(|(r, _)| *r == root)
+                .and_then(|(_, workspace)| {
+                    let forge_cfg = crate::config::resolve_forge(Path::new(&root));
+                    resolve_pr_repo_routing(
+                        store,
+                        workspace,
+                        &guardian.base_branch,
+                        &forge_cfg,
+                        guardian.owner.as_deref(),
+                    )
+                    .client_for(&pr.repo)
+                    .cloned()
+                });
+            (pr, client)
+        })
+        .collect();
+    close_prs_with_clients(store, &guardian.id, jobs);
+}
+
+/// Close each PR/MR through its forge client. A PR/MR that has no client for
+/// its own repository, or whose close call fails, gets a mailbox message
+/// telling the user to close it by hand. A client for any other repository is
+/// never used: PR/MR numbers are per-repository, so it would close an
+/// unrelated PR/MR.
+fn close_prs_with_clients(
+    store: &crate::store_lock::StoreHandle,
+    guardian_id: &str,
+    jobs: Vec<(PullRequestView, Option<crate::forge::ForgeClient>)>,
+) {
+    for (pr, client) in jobs {
+        let Some(number) = pr.pr_number else {
+            continue;
+        };
+        let result = match client {
+            Some(client)
+                if client.kind().as_str() == pr.forge && client.repo_label() == pr.repo =>
+            {
+                client.close_pull_request(number)
+            }
+            _ => Err(format!(
+                "no forge client is configured for {} repository {}",
+                pr.forge, pr.repo
+            )),
+        };
+        let label = format!("{} {}#{number}", pr.forge, pr.repo);
+        let guard = store.lock();
+        match result {
+            Ok(()) => {
+                crate::cartographer::Note::new("pr")
+                    .scope("guardian")
+                    .guardian(guardian_id)
+                    .emit(
+                        &guard,
+                        format!("review {guardian_id} deleted: closed its PR {label}"),
+                        serde_json::json!({"pr_id": pr.id, "pr_number": number}),
+                    );
+            }
+            Err(e) => {
+                crate::cartographer::Note::new("pr")
+                    .level(crate::logging::LogLevel::WARNING)
+                    .scope("guardian")
+                    .guardian(guardian_id)
+                    .emit(
+                        &guard,
+                        format!(
+                            "review {guardian_id} deleted but its PR {label} could not be closed: {e}"
+                        ),
+                        serde_json::json!({"pr_id": pr.id, "pr_number": number, "error": e}),
+                    );
+                let target = pr.pr_url.clone().unwrap_or_else(|| label.clone());
+                if let Err(enqueue_error) = guard.enqueue_error_mailbox_message(
+                    crate::mailbox::MailboxPriority::High,
+                    &format!(
+                        "Review {guardian_id} was deleted, but its PR {label} could not be \
+                         closed and is still open: {e}"
+                    ),
+                    &crate::mailbox::Remediation::ManualInterventionRequired {
+                        guidance: format!(
+                            "close {target} on the forge yourself (the review no longer exists, \
+                             so ralphus will not retry), and check the forge token and network \
+                             access if other PRs fail the same way"
+                        ),
+                    },
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some("review"),
+                ) {
+                    // ralphus[ignore-rlog-pair]: the store write itself failed; the cartographer row above records the close failure
+                    crate::rlog!(
+                        WARNING,
+                        "ralphus [pr] review {guardian_id} could not enqueue the PR close \
+                         failure notice for {label}: {enqueue_error}"
+                    );
+                }
+            }
+        }
+    }
+}
+
 /// Retire the transient fork-side upstream branch of every review in a
 /// terminal state (`merged`/`approved`/`cancelled`/`deployed`) that still records one
 /// (RAL-<new>). This is only the backstop for whatever

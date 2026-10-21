@@ -19153,6 +19153,12 @@ fn delete_guardian_and_defer_cleanup(daemon: &Daemon, id: &str) -> Result<(), St
     // exists.
     let dual_root_branch = store.guardian_dual_root_stack_branch(id).ok().flatten();
     drop(store);
+    // Its still-open PRs/MRs, closed once the row is gone: the PR rows are
+    // deleted with the review.
+    let open_prs = snapshot
+        .as_ref()
+        .map(|g| crate::pr::open_prs_for_review_delete(&store_handle, g))
+        .unwrap_or_default();
     // Each project's workspace, resolved while the review still records its
     // machine: once the row is gone, cleanup could only fall back to the
     // daemon's host and would leave a remote review's worktrees behind.
@@ -19174,6 +19180,7 @@ fn delete_guardian_and_defer_cleanup(daemon: &Daemon, id: &str) -> Result<(), St
     let id = id.to_string();
     daemon.background().spawn(move || {
         if let Some(g) = snapshot {
+            crate::pr::close_prs_of_deleted_review(&store_handle, &g, open_prs, &workspaces);
             if let Some(branch) = dual_root_branch {
                 crate::pr::retire_dual_root_upstream_branch(
                     &store_handle,
@@ -19198,7 +19205,8 @@ fn delete_guardian_and_defer_cleanup(daemon: &Daemon, id: &str) -> Result<(), St
     Ok(())
 }
 
-/// Delete a review and purge its review worktrees/branches from every project.
+/// Delete a review, close its still-open PRs/MRs (their remote branches are
+/// kept), and purge its review worktrees/branches from every project.
 fn guardian_delete(daemon: &Daemon, id: &str) -> Reply {
     match delete_guardian_and_defer_cleanup(daemon, id) {
         Ok(()) => json(200, &StateResponse { state: "deleted" }),
@@ -36145,6 +36153,173 @@ remediation_attempts=1
                 None,
             )
             .unwrap()
+    }
+
+    /// A mock forge recording `(method, url, body)` per request.
+    type CloseMock = crate::mock_forge::MockForge<Vec<(String, String, String)>>;
+
+    /// A review over a git repo whose `origin` is `acme/widget` on `kind`'s
+    /// forge, reached through a mock that answers every request with
+    /// `status` and records `(method, url, body)` for each.
+    fn review_with_close_mock(tag: &str, kind: &str, status: u16) -> (Daemon, String, CloseMock) {
+        let repo = tmp_git_repo(tag);
+        let host = if kind == "gitlab" {
+            "gitlab.com"
+        } else {
+            "github.com"
+        };
+        let ok = std::process::Command::new("git")
+            .args([
+                "remote",
+                "add",
+                "origin",
+                &format!("https://{host}/acme/widget.git"),
+            ])
+            .current_dir(&repo)
+            .status()
+            .expect("git")
+            .success();
+        assert!(ok, "git remote add failed");
+        let mock = crate::mock_forge::MockForge::start(move |server| {
+            let mut seen = Vec::new();
+            for mut req in server.requests() {
+                let mut body = String::new();
+                let _ = std::io::Read::read_to_string(req.as_reader(), &mut body);
+                seen.push((req.method().to_string(), req.url().to_string(), body));
+                req.respond(tiny_http::Response::from_string("{}").with_status_code(status))
+                    .unwrap();
+            }
+            seen
+        });
+        let addr = mock.addr();
+        std::fs::write(
+            repo.join(".ralphus.toml"),
+            format!(
+                "[forge]\nkind = \"{kind}\"\napi_base = \"http://{addr}\"\ntoken_env = \"RALPHUS_TEST_FORGE_TOKEN\"\n"
+            ),
+        )
+        .unwrap();
+        let d = daemon();
+        d.lock()
+            .register_project("demo", "orchestrator", repo.to_str().unwrap(), "git")
+            .unwrap();
+        let gid = d
+            .lock()
+            .create_guardian("demo", "origin/main", repo.to_str().unwrap())
+            .unwrap();
+        (d, gid, mock)
+    }
+
+    /// Deleting a review closes its still-open PR/MR through the forge's
+    /// REST API (GitHub: `PATCH .../pulls/N {"state":"closed"}`; GitLab:
+    /// `PUT .../merge_requests/N {"state_event":"close"}`), leaves an
+    /// already-closed one alone, and never deletes the remote branch.
+    fn delete_review_closes_its_open_prs(kind: &str) {
+        let (d, gid, mock) = review_with_close_mock("delete-closes-prs", kind, 200);
+        let repo = if kind == "gitlab" {
+            "acme%2Fwidget"
+        } else {
+            "acme/widget"
+        };
+        add_pr(&d, &gid, kind, repo, 7);
+        let closed = add_pr(&d, &gid, kind, repo, 8);
+        d.lock()
+            .update_pull_request(&closed, None, None, None, Some("closed"))
+            .unwrap();
+
+        let r = route(&d, "DELETE", &format!("/api/guardians/{gid}"), "");
+        assert_eq!(r.status, 200, "{}", r.body);
+
+        let seen = mock.finish();
+        assert_eq!(seen.len(), 1, "exactly one close call, saw {seen:?}");
+        let (method, url, body) = &seen[0];
+        let body: serde_json::Value = serde_json::from_str(body).unwrap();
+        if kind == "gitlab" {
+            assert_eq!(method, "PUT");
+            assert!(
+                url.ends_with("/projects/acme%2Fwidget/merge_requests/7"),
+                "{url}"
+            );
+            assert_eq!(body["state_event"], "close");
+        } else {
+            assert_eq!(method, "PATCH");
+            assert!(url.ends_with("/repos/acme/widget/pulls/7"), "{url}");
+            assert_eq!(body["state"], "closed");
+        }
+        assert!(
+            d.lock()
+                .list_pull_requests_for_guardian(&gid)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn delete_review_closes_its_open_github_prs() {
+        delete_review_closes_its_open_prs("github");
+    }
+
+    #[test]
+    fn delete_review_closes_its_open_gitlab_mrs() {
+        delete_review_closes_its_open_prs("gitlab");
+    }
+
+    /// A forge refusing the close does not fail the delete; it leaves a
+    /// mailbox message with remediation naming the PR/MR to close by hand.
+    fn delete_review_reports_a_pr_it_could_not_close(kind: &str) {
+        let (d, gid, mock) = review_with_close_mock("delete-close-fails", kind, 500);
+        let repo = if kind == "gitlab" {
+            "acme%2Fwidget"
+        } else {
+            "acme/widget"
+        };
+        d.lock()
+            .create_pull_request(
+                &gid,
+                None,
+                kind,
+                repo,
+                "feature/foo",
+                "main",
+                "Add foo",
+                "",
+                Some(7),
+                Some("https://forge.example/acme/widget/7"),
+            )
+            .unwrap();
+        let client_id = d.lock().register_mailbox_client().unwrap();
+
+        let r = route(&d, "DELETE", &format!("/api/guardians/{gid}"), "");
+        assert_eq!(r.status, 200, "{}", r.body);
+        assert!(d.lock().get_guardian(&gid).is_err(), "the review is gone");
+
+        let seen = mock.finish();
+        assert!(!seen.is_empty(), "the close was attempted");
+        let messages = d
+            .lock()
+            .mailbox_messages_for_client(&client_id, true, None)
+            .unwrap();
+        let notice = messages
+            .iter()
+            .find(|m| m.message.contains("could not be closed"))
+            .unwrap_or_else(|| panic!("no close-failure notice in {messages:?}"));
+        assert!(
+            notice.message.contains(
+                "Manual intervention required: close https://forge.example/acme/widget/7"
+            ),
+            "{}",
+            notice.message
+        );
+    }
+
+    #[test]
+    fn delete_review_reports_a_github_pr_it_could_not_close() {
+        delete_review_reports_a_pr_it_could_not_close("github");
+    }
+
+    #[test]
+    fn delete_review_reports_a_gitlab_mr_it_could_not_close() {
+        delete_review_reports_a_pr_it_could_not_close("gitlab");
     }
 
     /// Regression (RAL-668): a fork PR's number means nothing in the parent

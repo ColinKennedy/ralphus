@@ -886,7 +886,7 @@ use; see `READ_ONLY_NOTE`.
             - (read-only-safe) run selector [uri] --all --index [integer...] --input [name=value...]  {Print the command(s) + cwd to run one/some/all manual checks yourself.}
             - terminal selector [uri] --mode [open|readonly]  {Print the command to resume the manual-checks-generation agent conversation locally.}
         - create name [str] base_branch [str] git_root [str] --checks [list] --review-type [label] --skip-worktrees  {Create a new review.}
-        - delete selector [uri] --yes  {Delete a review and its worktrees.}
+        - delete selector [uri] --yes  {Delete a review and its worktrees, closing its open PRs/MRs.}
         - dismiss-reenable selector [uri]  {Dismiss the 're-enable' notification for a branch.}
         - (read-only-safe) env selector [uri] --scope [build|tests|manual-checks|worktree]  {List a review surface's resolved environment variables, read-only (RAL-324): the auto-build step, the check gates, manual checks, or one branch's review worktree.}
         - extract-branch selector [uri]  {Move a branch into a new review of its own, then rebuild both.}
