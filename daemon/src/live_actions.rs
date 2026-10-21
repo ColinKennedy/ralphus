@@ -169,11 +169,13 @@ live (a pure refactor, documentation only), write \
 Inside a test, you may add up to four lines of the form \
 'EXHIBIT: <kind> | <what to show>' naming what a code reviewer must SEE to \
 believe the change works -- the final state of the screen, frame, render or \
-output, not the setup. <kind> is one of gif (motion or interaction), video, \
-screenshot (a still result) or output (text from a terminal or log). Ask only \
-for what is visible and matters to the change; a change with nothing to see \
-asks for nothing, or for output. Example: \
-'EXHIBIT: gif | dragging the zoom slider from 0 to 1 magnifies the chart'.";
+command, not the setup. <kind> is one of gif (motion or interaction), video, \
+screenshot (a still result) or terminal-text (the text a command printed in a \
+terminal, or lines from a log it wrote). For terminal-text, name the command and \
+the lines that matter. Ask only for what is visible and matters to the change; a \
+change with nothing to see asks for nothing, or for terminal-text. Examples: \
+'EXHIBIT: gif | dragging the zoom slider from 0 to 1 magnifies the chart', \
+'EXHIBIT: terminal-text | `mytool check` prints the new WARN row and its impact line'.";
 
 /// Most capabilities named per kind in the handoff question; the rest are
 /// counted.
@@ -2082,7 +2084,7 @@ prompt = "second"
         ];
         let mut c = handoff("c3", "run the CLI");
         c.exhibits = vec![crate::exhibits::ExhibitRequest {
-            kind: crate::exhibits::ExhibitKind::Output,
+            kind: crate::exhibits::ExhibitKind::TerminalText,
             describe: "help text".into(),
         }];
         // The agent merged 1 and 2 and dropped every EXHIBIT word from its

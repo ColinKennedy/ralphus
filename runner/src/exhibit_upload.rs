@@ -24,7 +24,8 @@ pub const TOKEN_ENV: &str = "RALPHUS_EXHIBIT_UPLOAD_TOKEN";
 /// runner replaces it with the directory it created on its own machine.
 pub const DIR_PLACEHOLDER: &str = "<<RALPHUS_EXHIBIT_DIR>>";
 
-/// Longest text an `output` exhibit keeps.
+/// Longest text a `terminal-text` exhibit shows; one character more is kept
+/// when the capture is longer, so the PR can say the text was cut.
 pub const MAX_TEXT_CHARS: usize = 4_000;
 
 /// How long a capture may stay in the cache before it is pruned, uploaded or
@@ -284,8 +285,8 @@ fn deliver_one(
         return outcome;
     };
     let stem = dir.join(format!("prepared-{}-{}", file.action_idx, file.slot_idx));
-    let preference = if file.requested == ExhibitKind::Output {
-        vec![ExhibitKind::Output]
+    let preference = if file.requested == ExhibitKind::TerminalText {
+        vec![ExhibitKind::TerminalText]
     } else {
         request.kind_preference.clone()
     };
@@ -298,7 +299,7 @@ fn deliver_one(
         transcoder,
     ) {
         Prepared::Text { text } => {
-            outcome.delivered_kind = Some(ExhibitKind::Output);
+            outcome.delivered_kind = Some(ExhibitKind::TerminalText);
             outcome.text = Some(text);
         }
         Prepared::Undeliverable { reason } => outcome.missing_reason = Some(reason),
@@ -856,13 +857,13 @@ mod tests {
         let req = request(
             None,
             vec![
-                file(0, ExhibitKind::Output, "out.txt"),
+                file(0, ExhibitKind::TerminalText, "out.txt"),
                 file(1, ExhibitKind::Screenshot, "../../../secret.png"),
             ],
         );
         let got = deliver(&req, None, root.path(), &NoFfmpeg);
         assert_eq!(got[0].text.as_deref(), Some("hello"));
-        assert_eq!(got[0].delivered_kind, Some(ExhibitKind::Output));
+        assert_eq!(got[0].delivered_kind, Some(ExhibitKind::TerminalText));
         assert!(
             got[1]
                 .missing_reason

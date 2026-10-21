@@ -25,11 +25,16 @@ use std::path::{Path, PathBuf};
 use serde::Deserialize;
 
 /// The kinds a recipe may ask for.
-pub const RECIPE_KINDS: &[&str] = &["gif", "video", "screenshot", "output"];
+pub const RECIPE_KINDS: &[&str] = &["gif", "video", "screenshot", "terminal-text"];
+
+/// The earlier name of [`ExhibitKind::TerminalText`], still accepted wherever
+/// a kind is parsed so stored slots, recipes and handoffs that use it keep
+/// working.
+pub const TERMINAL_TEXT_ALIAS: &str = "output";
 
 /// What a slot asks to show. `Gif`, `Video` and `Screenshot` are visual and
-/// are delivered in the review's preference order; `Output` is text, shown
-/// inline and never uploaded.
+/// are delivered in the review's preference order; `TerminalText` is the text
+/// a command printed (or a log it wrote), shown inline and never uploaded.
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, Deserialize,
 )]
@@ -38,12 +43,14 @@ pub enum ExhibitKind {
     Gif,
     Video,
     Screenshot,
-    Output,
+    #[serde(rename = "terminal-text", alias = "output")]
+    TerminalText,
 }
 
 impl ExhibitKind {
     /// Every kind, in declaration order.
-    pub const ALL: [ExhibitKind; 4] = [Self::Gif, Self::Video, Self::Screenshot, Self::Output];
+    pub const ALL: [ExhibitKind; 4] =
+        [Self::Gif, Self::Video, Self::Screenshot, Self::TerminalText];
 
     /// The stored/config lowercase name.
     #[must_use]
@@ -52,23 +59,42 @@ impl ExhibitKind {
             Self::Gif => "gif",
             Self::Video => "video",
             Self::Screenshot => "screenshot",
-            Self::Output => "output",
+            Self::TerminalText => "terminal-text",
         }
     }
 
-    /// Parse a kind name, ignoring case and surrounding space.
+    /// Parse a kind name, ignoring case and surrounding space. Also accepts
+    /// [`TERMINAL_TEXT_ALIAS`].
     #[must_use]
     pub fn parse(name: &str) -> Option<Self> {
         let name = name.trim();
+        if name.eq_ignore_ascii_case(TERMINAL_TEXT_ALIAS) {
+            return Some(Self::TerminalText);
+        }
         Self::ALL
             .into_iter()
             .find(|k| k.as_str().eq_ignore_ascii_case(name))
     }
 
-    /// Whether this kind is a picture or recording (everything but `output`).
+    /// Whether this kind is a picture or recording (everything but
+    /// `terminal-text`).
     #[must_use]
     pub fn is_visual(self) -> bool {
-        self != Self::Output
+        self != Self::TerminalText
+    }
+
+    /// What the kind is, in the words an agent that asks for or captures one
+    /// is given.
+    #[must_use]
+    pub fn gloss(self) -> &'static str {
+        match self {
+            Self::Gif => "a short recording of motion or an interaction",
+            Self::Video => "a longer screen recording",
+            Self::Screenshot => "a still image of the final visible result",
+            Self::TerminalText => {
+                "the text a command printed in a terminal, or lines from a log it wrote"
+            }
+        }
     }
 
     /// How the kind is named in a PR/MR description.
@@ -78,7 +104,7 @@ impl ExhibitKind {
             Self::Gif => "GIF",
             Self::Video => "Video",
             Self::Screenshot => "Screenshot",
-            Self::Output => "Output",
+            Self::TerminalText => "Terminal text",
         }
     }
 }
@@ -141,7 +167,8 @@ pub fn parse_exhibit_recipes(text: &str) -> Result<Vec<ExhibitRecipe>, String> {
                 r.name
             ));
         }
-        if !RECIPE_KINDS.contains(&r.kind.trim().to_ascii_lowercase().as_str()) {
+        let kind = r.kind.trim().to_ascii_lowercase();
+        if !RECIPE_KINDS.contains(&kind.as_str()) && kind != TERMINAL_TEXT_ALIAS {
             return Err(format!(
                 "exhibit recipe \"{}\" has kind \"{}\"; expected one of {}",
                 r.name,
@@ -296,6 +323,12 @@ paths = ["**/*.tsx"]
     fn recipes_parse_and_validate() {
         assert_eq!(parse_exhibit_recipes(ROOT).unwrap().len(), 2);
         assert!(parse_exhibit_recipes("[review]\nx = 1").unwrap().is_empty());
+        for kind in ["terminal-text", "output"] {
+            let text = format!(
+                "[[exhibit.recipe]]\nname = \"a\"\nkind = \"{kind}\"\ndescribe = \"d\"\npaths = [\"a\"]"
+            );
+            assert_eq!(parse_exhibit_recipes(&text).unwrap().len(), 1, "{kind}");
+        }
         for (bad, why) in [
             (
                 "[[exhibit.recipe]]\nname = \"\"\nkind = \"gif\"\ndescribe = \"d\"\npaths = [\"a\"]",

@@ -445,7 +445,7 @@ https://github.com/user-attachments/assets/2
 
     #[test]
     fn only_reported_files_are_sent_for_delivery() {
-        let (handle, gid) = review_with_slots(&[ExhibitKind::Gif, ExhibitKind::Output]);
+        let (handle, gid) = review_with_slots(&[ExhibitKind::Gif, ExhibitKind::TerminalText]);
         let slots = handle.lock().guardian_exhibit_slots(&gid).unwrap();
         let reports = vec![
             SlotReport::File {
@@ -473,7 +473,7 @@ https://github.com/user-attachments/assets/2
     fn a_runs_outcomes_fill_its_slots_and_unreported_ones_are_missing() {
         let (handle, gid) = review_with_slots(&[
             ExhibitKind::Gif,
-            ExhibitKind::Output,
+            ExhibitKind::TerminalText,
             ExhibitKind::Screenshot,
             ExhibitKind::Video,
         ]);
@@ -516,7 +516,7 @@ https://github.com/user-attachments/assets/2
             SlotOutcome {
                 action_idx: 0,
                 slot_idx: 1,
-                delivered_kind: Some(ExhibitKind::Output),
+                delivered_kind: Some(ExhibitKind::TerminalText),
                 text: Some("hello".into()),
                 ..SlotOutcome::default()
             },

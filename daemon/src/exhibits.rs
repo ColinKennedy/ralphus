@@ -31,8 +31,8 @@ pub const MAX_PER_ACTION: usize = 4;
 /// Longest `describe` text kept for one request.
 const DESCRIBE_MAX_CHARS: usize = 300;
 
-/// Longest text excerpt an `output` slot shows.
-const OUTPUT_MAX_CHARS: usize = 4_000;
+/// Longest text excerpt a `terminal-text` slot shows.
+const TERMINAL_TEXT_MAX_CHARS: usize = ralphus_runner::exhibit_upload::MAX_TEXT_CHARS;
 
 pub use ralphus_core::exhibit_recipes::ExhibitKind;
 
@@ -175,7 +175,7 @@ pub struct ExhibitFill {
     pub url: Option<String>,
     /// What the reviewer should look at.
     pub caption: Option<String>,
-    /// An `output` slot's text.
+    /// A `terminal-text` slot's text.
     pub text: Option<String>,
     /// Why nothing was delivered.
     pub missing_reason: Option<String>,
@@ -687,11 +687,13 @@ pub fn inference_prompt(
     drop(guard);
     let mut out = String::from(
         "\n\nREVIEWER EXHIBITS. A separate agent will run this change live and capture \
-         pictures, recordings or output for the reviewer. Decide whether a reviewer needs \
-         to SEE anything beyond what is already requested below -- the final visible \
+         pictures, recordings or terminal text for the reviewer. Decide whether a reviewer \
+         needs to SEE anything beyond what is already requested below -- the final visible \
          result of a UI, render or command this diff changes. Ask for nothing when the \
          change has nothing visible, and never repeat a request that is already listed.",
     );
+    out.push_str("\n\nExhibit kinds:\n");
+    out.push_str(&kind_glossary());
     if !prompts.is_empty() {
         out.push_str("\n\nWhat the work on this branch was asked to do:\n");
         for p in &prompts {
@@ -717,9 +719,14 @@ pub fn inference_prompt(
     out.push_str(&format!(
         "\nFor each additional exhibit (at most {MAX_INFERRED_PER_PR}), add one line BEFORE \
          the ===DESCRIPTION=== line: {INFER_MARKER} {{\"owner\": <live test id, or \"new\">, \
-         \"kind\": \"gif\" | \"video\" | \"screenshot\" | \"output\", \"describe\": \"<what \
-         to show>\", \"why\": \"<why the reviewer needs it>\"}}. Prefer the live test that \
-         already exercises that part of the program."
+         \"kind\": {}, \"describe\": \"<what to show; for terminal-text, the command and \
+         the lines that matter>\", \"why\": \"<why the reviewer needs it>\"}}. Prefer the \
+         live test that already exercises that part of the program.",
+        ExhibitKind::ALL
+            .iter()
+            .map(|k| format!("\"{}\"", k.as_str()))
+            .collect::<Vec<_>>()
+            .join(" | ")
     ));
     Some(out)
 }
@@ -1016,8 +1023,11 @@ or `twm &`, whichever is installed) so the window has a title bar. On X11, \
 `import -frame -window <id>` keeps the title bar (plain `-window` drops it), and a \
 whole-screen shot of a bare display is cropped to its window automatically. \
 For a visual item deliver the first kind of {order} that shows it; keep any video \
-under {} seconds and any GIF short (a few seconds, small window). For an output \
-item save the relevant text as a .txt file. If the steps you ran did not show an \
+under {} seconds and any GIF short (a few seconds, small window). For a terminal-text \
+item run the command and save the text it printed (stdout and stderr, as a terminal \
+shows it) as a .txt file, not a picture of the terminal. Keep the lines that show the \
+result and cut unrelated ones: the PR shows at most {} characters and anything past \
+that is dropped. If the steps you ran did not show an \
 item, run whatever else shows it now. Use the project's own capture tools when it has \
 them; otherwise, when the `ralphus` command is available, \
 `ralphus exhibit screenshot --pid <process id> -o <dir>/<name>.png` or \
@@ -1030,7 +1040,11 @@ instead of --pid) captures a window you started into that directory.\n",
             String::new()
         },
         settings.max_video_seconds,
+        TERMINAL_TEXT_MAX_CHARS,
     );
+    out.push_str("Exhibit kinds:\n");
+    out.push_str(&kind_glossary());
+    out.push_str("Items:\n");
     for slot in slots {
         out.push_str(&format!(
             "- {} ({}): {}\n",
@@ -1186,13 +1200,22 @@ fn one_line(text: &str) -> String {
 fn fenced(text: &str) -> String {
     let longest = text.split(|c| c != '`').map(str::len).max().unwrap_or(0);
     let fence = "`".repeat(longest.max(2) + 1);
-    let clipped: String = text.chars().take(OUTPUT_MAX_CHARS).collect();
-    let more = if text.chars().count() > OUTPUT_MAX_CHARS {
-        "\n…"
+    let clipped: String = text.chars().take(TERMINAL_TEXT_MAX_CHARS).collect();
+    let more = if text.chars().count() > TERMINAL_TEXT_MAX_CHARS {
+        format!("\n… (cut at {TERMINAL_TEXT_MAX_CHARS} characters)")
     } else {
-        ""
+        String::new()
     };
     format!("{fence}text\n{}{more}\n{fence}", clipped.trim_end())
+}
+
+/// One line per exhibit kind, naming it and saying what it is, for a prompt
+/// that asks an agent to request or capture exhibits.
+fn kind_glossary() -> String {
+    ExhibitKind::ALL
+        .iter()
+        .map(|k| format!("- {}: {}\n", k.as_str(), k.gloss()))
+        .collect()
 }
 
 /// Markdown for an uploaded file. GitHub plays a video whose URL stands alone
@@ -1457,8 +1480,8 @@ mod tests {
         let b = vec![
             req(ExhibitKind::Gif, "ONE"),
             req(ExhibitKind::Video, "three"),
-            req(ExhibitKind::Output, "four"),
-            req(ExhibitKind::Output, "five"),
+            req(ExhibitKind::TerminalText, "four"),
+            req(ExhibitKind::TerminalText, "five"),
         ];
         let merged = merge_requests([a.as_slice(), b.as_slice()]);
         assert_eq!(
@@ -1471,13 +1494,42 @@ mod tests {
     }
 
     #[test]
-    fn kinds_round_trip_and_only_output_is_not_visual() {
+    fn kinds_round_trip_and_only_terminal_text_is_not_visual() {
         for kind in ExhibitKind::ALL {
             assert_eq!(ExhibitKind::parse(kind.as_str()), Some(kind));
         }
         assert_eq!(ExhibitKind::parse(" GIF "), Some(ExhibitKind::Gif));
-        assert!(!ExhibitKind::Output.is_visual());
+        assert!(!ExhibitKind::TerminalText.is_visual());
         assert!(ExhibitKind::Video.is_visual());
+    }
+
+    #[test]
+    fn the_earlier_output_name_still_means_terminal_text() {
+        assert_eq!(
+            ExhibitKind::parse("Output"),
+            Some(ExhibitKind::TerminalText)
+        );
+        let split = split_handoff("Run it.\nEXHIBIT: output | the summary line");
+        assert!(split.rejected.is_empty(), "{:?}", split.rejected);
+        assert_eq!(split.requests[0].kind, ExhibitKind::TerminalText);
+        let stored: ExhibitKind = serde_json::from_str("\"output\"").unwrap();
+        assert_eq!(stored, ExhibitKind::TerminalText);
+        assert_eq!(
+            serde_json::to_string(&ExhibitKind::TerminalText).unwrap(),
+            "\"terminal-text\""
+        );
+    }
+
+    #[test]
+    fn terminal_text_past_the_limit_says_it_was_cut() {
+        let long = "x".repeat(TERMINAL_TEXT_MAX_CHARS + 1);
+        let block = fenced(&long);
+        assert!(
+            block.contains(&format!("cut at {TERMINAL_TEXT_MAX_CHARS} characters")),
+            "{block}"
+        );
+        let exact = "y".repeat(TERMINAL_TEXT_MAX_CHARS);
+        assert!(!fenced(&exact).contains("cut at"));
     }
 
     #[test]
@@ -1531,7 +1583,7 @@ mod tests {
 
     #[test]
     fn output_is_fenced_with_a_fence_longer_than_any_backtick_run() {
-        let mut s = slot(0, 0, ExhibitKind::Output, "the cli");
+        let mut s = slot(0, 0, ExhibitKind::TerminalText, "the cli");
         s.fill = Some(ExhibitFill {
             text: Some("a ```` b".to_string()),
             updated_at_ms: 1,
@@ -1595,7 +1647,7 @@ mod tests {
     #[test]
     fn splicing_the_same_blocks_twice_is_a_no_op() {
         let a = slot(0, 0, ExhibitKind::Gif, "one");
-        let b = slot(1, 0, ExhibitKind::Output, "two");
+        let b = slot(1, 0, ExhibitKind::TerminalText, "two");
         let once = splice_exhibits("Intro", &[block(&a), block(&b)]).body;
         let twice = splice_exhibits(&once, &[block(&a), block(&b)]).body;
         assert_eq!(once, twice);
@@ -1681,7 +1733,7 @@ mod tests {
     fn a_run_only_fills_its_own_actions_slots_and_the_last_report_wins() {
         let slots = vec![
             slot(7, 0, ExhibitKind::Gif, "a"),
-            slot(7, 1, ExhibitKind::Output, "b"),
+            slot(7, 1, ExhibitKind::TerminalText, "b"),
         ];
         let reply = "report\n\
             RALPHUS_EXHIBIT: {\"slot\": \"7.0\", \"file\": \"first.gif\"}\n\
@@ -1717,7 +1769,7 @@ mod tests {
     fn the_run_prompt_names_every_slot_the_order_and_the_report_format() {
         let slots = vec![
             slot(3, 0, ExhibitKind::Gif, "drag it"),
-            slot(3, 1, ExhibitKind::Output, "the log"),
+            slot(3, 1, ExhibitKind::TerminalText, "the log"),
         ];
         let settings = ExhibitSettings {
             kind_preference: vec![ExhibitKind::Video, ExhibitKind::Gif],
@@ -1726,7 +1778,15 @@ mod tests {
         };
         let text = run_prompt_section(&slots, &settings, true);
         assert!(text.contains("- 3.0 (gif): drag it"));
-        assert!(text.contains("- 3.1 (output): the log"));
+        assert!(text.contains("- 3.1 (terminal-text): the log"));
+        assert!(
+            text.contains(&format!(
+                "- terminal-text: {}",
+                ExhibitKind::TerminalText.gloss()
+            )),
+            "the capture prompt says what terminal-text is: {text}"
+        );
+        assert!(text.contains(&format!("at most {TERMINAL_TEXT_MAX_CHARS} characters")));
         assert!(text.contains("video, then gif"));
         assert!(text.contains("under 9 seconds"));
         assert!(text.contains(REPORT_MARKER));
@@ -1936,8 +1996,8 @@ mod tests {
                 ExhibitOrigin::Inferred,
                 &[
                     (req(ExhibitKind::Video, "three"), Some("motion".to_string())),
-                    (req(ExhibitKind::Output, "four"), None),
-                    (req(ExhibitKind::Output, "five"), None),
+                    (req(ExhibitKind::TerminalText, "four"), None),
+                    (req(ExhibitKind::TerminalText, "five"), None),
                 ],
             )
             .unwrap();
