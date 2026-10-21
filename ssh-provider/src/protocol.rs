@@ -105,6 +105,16 @@ pub fn reply_capabilities(capabilities: Value) {
     reply(json!({ "ok": true, "capabilities": capabilities }));
 }
 
+/// Reply to `preflight`: `answer` carries `available` and, when the agent
+/// cannot start, the reason in `detail`.
+pub fn reply_preflight(answer: Value) {
+    let mut fields = json!({ "ok": true });
+    if let (Some(fields), Value::Object(answer)) = (fields.as_object_mut(), answer) {
+        fields.extend(answer);
+    }
+    reply(fields);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

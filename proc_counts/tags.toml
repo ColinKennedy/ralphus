@@ -194,3 +194,13 @@ tag = "ssh-windows"
 [[test]]
 id = "ralphus-outpost::loopback an_outpost_serves_an_allocations_machine_api_over_its_outbound_connection"
 tag = "outpost-loopback"
+
+# Agent preflight on a provider machine: the `preflight` verb asked through the
+# provider, once per machine and agent while it passes, again after a failure.
+[[test]]
+id = "ralphus-daemon remote_runner::tests::a_passing_preflight_is_asked_once_per_machine_and_agent"
+tag = "agent-preflight-remote"
+
+[[test]]
+id = "ralphus-daemon remote_runner::tests::an_agent_missing_on_a_provider_machine_fails_its_preflight_with_a_remedy_every_time"
+tag = "agent-preflight-remote"

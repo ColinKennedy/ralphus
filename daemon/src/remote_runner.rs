@@ -106,6 +106,12 @@ pub const VERB_CLEANUP: &str = "cleanup";
 /// provider nobody has taught about automatic retirement yet.
 pub const VERB_RETIRE: &str = "retire";
 
+/// The `preflight` verb: whether an agent backend can be started on the
+/// machine, answered by the machine's own `ralphus-runner preflight`.
+/// Optional -- a provider that does not implement it reads as "cannot
+/// check" ([`AgentPreflight::Unknown`]), never as a refusal.
+pub const VERB_PREFLIGHT: &str = "preflight";
+
 /// How often an async `exec` handle is polled for status/output.
 ///
 /// Fast enough that Live View feels live, slow enough not to hammer a provider
@@ -422,6 +428,10 @@ struct ProviderResponse {
     /// Display-only -- see [`RetirementOutcome::Deferred`].
     #[serde(default)]
     retry_at_ms: Option<i64>,
+    /// `preflight` only: whether the agent can be started (`detail` says why
+    /// not).
+    #[serde(default)]
+    available: Option<bool>,
     /// Machine API replies only (contract v2): what kind of refusal an
     /// `ok: false` reply is, e.g. `unreachable` or `unknown_allocation`.
     #[serde(default)]
@@ -1767,6 +1777,123 @@ impl ProviderRunner {
     }
 }
 
+/// The `preflight` verb's request body.
+#[derive(Debug, Clone, Serialize)]
+pub struct PreflightRequest {
+    /// The resolved backend name (`claude-code`, `codex`, ...).
+    pub agent: String,
+    /// The launcher override, when the agent profile sets one. A provider
+    /// service may replace it with the path it has configured for the
+    /// machine, as it does for `exec`.
+    pub executable: Option<String>,
+}
+
+/// What a machine said about starting an agent there.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AgentPreflight {
+    /// The agent's launcher is there and runnable.
+    Available,
+    /// It is not; the machine's reason.
+    Unavailable(String),
+    /// The provider does not implement `preflight`, so nothing is known.
+    Unknown,
+}
+
+impl ProviderRunner {
+    /// Ask the machine whether `req`'s agent can be started there.
+    ///
+    /// # Errors
+    /// A transport failure reaching the machine, or a malformed reply.
+    pub fn preflight_agent(
+        &self,
+        req: &PreflightRequest,
+        spec: &RunnerSpec,
+    ) -> Result<AgentPreflight, String> {
+        let payload = serde_json::to_string(req)
+            .map_err(|e| format!("could not serialize preflight request: {e}"))?;
+        match self.invoke(VERB_PREFLIGHT, &payload, spec) {
+            Ok(resp) => match resp.available {
+                Some(true) => Ok(AgentPreflight::Available),
+                Some(false) => Ok(AgentPreflight::Unavailable(
+                    resp.detail
+                        .unwrap_or_else(|| "the machine gave no reason".to_string()),
+                )),
+                None => Err("provider's preflight reply is missing \"available\"".to_string()),
+            },
+            Err(e) if is_unimplemented_verb(&e) => Ok(AgentPreflight::Unknown),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// What identifies this machine for caching an answer about it: the
+    /// allocation for a provider service, the machine for a program provider.
+    fn identity(&self) -> String {
+        format!("{}:{}", self.scheme, self.uri)
+    }
+}
+
+/// Whether `error`, a provider call's failure, is the provider not knowing the
+/// verb at all: an optional verb's "cannot tell" rather than a failure.
+fn is_unimplemented_verb(error: &str) -> bool {
+    error.contains("does not implement")
+        || error.contains("unknown verb")
+        || error.contains("[unsupported]")
+}
+
+/// A machine (by [`ProviderRunner::identity`]), agent and launcher.
+type PreflightKey = (String, String, Option<String>);
+
+/// Every [`PreflightKey`] whose preflight passed. Only a pass is remembered,
+/// so an agent that was missing is asked about again on the next cell, after
+/// someone may have installed it.
+static AGENT_PREFLIGHT_PASSED: std::sync::LazyLock<Mutex<std::collections::HashSet<PreflightKey>>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// [`ProviderRunner::preflight_agent`] for `machine`, once per machine, agent
+/// and launcher while it keeps passing. `Ok` unless the machine said the agent
+/// cannot start; a provider that cannot check, or cannot be reached to ask,
+/// lets the cell go ahead and report its own failure.
+fn preflight_on_provider(
+    provider: &ProviderRunner,
+    machine: &str,
+    agent: &str,
+    executable: Option<&str>,
+) -> Result<(), String> {
+    let key = (
+        provider.identity(),
+        agent.to_string(),
+        executable.map(str::to_string),
+    );
+    if AGENT_PREFLIGHT_PASSED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .contains(&key)
+    {
+        return Ok(());
+    }
+    let req = PreflightRequest {
+        agent: agent.to_string(),
+        executable: executable.map(str::to_string),
+    };
+    let spec = crate::workspace::machine_call_spec(None, "agent-preflight", machine);
+    match provider.preflight_agent(&req, &spec) {
+        Ok(AgentPreflight::Available) => {
+            AGENT_PREFLIGHT_PASSED
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(key);
+            Ok(())
+        }
+        Ok(AgentPreflight::Unavailable(detail)) => Err(format!(
+            "agent {agent:?} cannot start on machine {machine:?}: {detail}. Install it on that \
+             machine (on the PATH the provider's sessions see), or point the provider at it -- \
+             for ralphus-fleet, `[machine.agents] {agent} = \"<path>\"` in ralphus-fleet.toml -- \
+             then restart the cell."
+        )),
+        Ok(AgentPreflight::Unknown) | Err(_) => Ok(()),
+    }
+}
+
 impl ProviderRunner {
     /// Run one VCS command in a workspace on this machine and return its
     /// stdout (RAL-185 D7).
@@ -2390,11 +2517,8 @@ impl Runner for MachineRouter {
             return self.local.preflight_agent(agent, executable, None);
         };
         match self.provider_for(machine)? {
-            Some(_) => {
-                // A provider executes on a different host, so its PATH and
-                // custom agent mappings cannot be inspected from this daemon.
-                Ok(())
-            }
+            // The machine checks its own PATH and agent mappings.
+            Some(provider) => preflight_on_provider(&provider, machine, agent, executable),
             None => self.local.preflight_agent(agent, executable, Some(machine)),
         }
     }
@@ -2404,9 +2528,8 @@ impl Runner for MachineRouter {
             return self.local.preflight_runner_executable(None);
         };
         match self.provider_for(machine)? {
-            // A provider executes on a different host, so its PATH cannot be
-            // inspected from this daemon -- same rationale as
-            // `preflight_agent` above.
+            // The provider readies its own runner (installing or uploading
+            // it) when a verb needs it, so there is nothing to check here.
             Some(_) => Ok(()),
             None => self.local.preflight_runner_executable(Some(machine)),
         }
@@ -4318,5 +4441,114 @@ else:
             assert!(err.contains("not a plain relative path"), "{path}: {err}");
         }
         assert!(!dest.exists());
+    }
+
+    /// A program provider answering `preflight` with `reply` and counting
+    /// its calls in `calls.txt` beside it; any other verb is unknown.
+    fn fake_preflight_provider(tag: &str, reply: &str) -> std::path::PathBuf {
+        let dir = ralphus_test_support::scratch(format!("preflight-{tag}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let py = dir.join("provider.py");
+        std::fs::write(
+            &py,
+            format!(
+                r#"import json, os, sys
+verb = sys.argv[1]
+req = sys.stdin.read()
+with open(os.path.join(os.path.dirname(__file__), "calls.txt"), "a") as f:
+    f.write(verb + " " + req + "\n")
+if verb == "preflight":
+    print({reply:?})
+else:
+    print(json.dumps({{"ok": False, "protocol_version": 1, "error": "unknown verb " + verb}}))
+"#
+            ),
+        )
+        .unwrap();
+        py
+    }
+
+    fn preflight_router(scheme: &str, py: &std::path::Path) -> MachineRouter {
+        let s = store();
+        s.lock()
+            .register_machine_provider(
+                scheme,
+                "",
+                "python",
+                &[py.to_string_lossy().into_owned()],
+                PROTOCOL_VERSION,
+                false,
+            )
+            .unwrap();
+        router(s).0
+    }
+
+    fn preflight_calls(py: &std::path::Path) -> Vec<String> {
+        std::fs::read_to_string(py.with_file_name("calls.txt"))
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_string)
+            .collect()
+    }
+
+    #[test]
+    fn an_agent_missing_on_a_provider_machine_fails_its_preflight_with_a_remedy_every_time() {
+        let py = fake_preflight_provider(
+            "missing",
+            r#"{"ok":true,"protocol_version":1,"available":false,"detail":"program \"codex\" is not resolvable on PATH"}"#,
+        );
+        let router = preflight_router("pfmissing", &py);
+        let err = router
+            .preflight_agent("codex", Some("/opt/codex"), Some("pfmissing:A"))
+            .unwrap_err();
+        assert!(err.contains("not resolvable on PATH"), "{err}");
+        assert!(err.contains("[machine.agents]"), "{err}");
+        assert!(
+            router
+                .preflight_agent("codex", Some("/opt/codex"), Some("pfmissing:A"))
+                .is_err()
+        );
+        let calls = preflight_calls(&py);
+        assert_eq!(calls.len(), 2, "a failure is asked again: {calls:?}");
+        assert!(
+            calls[0].contains(r#""agent":"codex""#) && calls[0].contains("/opt/codex"),
+            "{calls:?}"
+        );
+    }
+
+    #[test]
+    fn a_passing_preflight_is_asked_once_per_machine_and_agent() {
+        let py =
+            fake_preflight_provider("ok", r#"{"ok":true,"protocol_version":1,"available":true}"#);
+        let router = preflight_router("pfok", &py);
+        router
+            .preflight_agent("claude-code", None, Some("pfok:A"))
+            .unwrap();
+        router
+            .preflight_agent("claude-code", None, Some("pfok:A"))
+            .unwrap();
+        assert_eq!(preflight_calls(&py).len(), 1);
+        router
+            .preflight_agent("codex", None, Some("pfok:A"))
+            .unwrap();
+        router
+            .preflight_agent("claude-code", None, Some("pfok:B"))
+            .unwrap();
+        assert_eq!(preflight_calls(&py).len(), 3);
+    }
+
+    #[test]
+    fn a_provider_without_preflight_cannot_check_and_lets_the_cell_run() {
+        let py = fake_preflight_provider("old", "unused");
+        // Answer every verb, preflight included, as unknown.
+        let text = std::fs::read_to_string(&py)
+            .unwrap()
+            .replace("if verb == \"preflight\":", "if False:");
+        std::fs::write(&py, text).unwrap();
+        let router = preflight_router("pfold", &py);
+        router
+            .preflight_agent("claude-code", None, Some("pfold:A"))
+            .unwrap();
+        assert_eq!(preflight_calls(&py).len(), 1);
     }
 }

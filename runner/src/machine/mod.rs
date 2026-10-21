@@ -46,6 +46,7 @@ pub const SUPPORTED_OPS: &[&str] = &[
     "materialize",
     "cleanup",
     "capabilities",
+    "preflight",
 ];
 
 /// The provider contract version replies carry (the v1 verb shape).
@@ -190,6 +191,7 @@ fn run_verb(
         "stream" => jobs::stream(request, &root, events),
         "cancel" => jobs::cancel(request, &root, events).map(|()| json!({})),
         "job-cleanup" => jobs::cleanup(request, &root).map(|()| json!({})),
+        "preflight" => preflight(request),
         "retire" => Err(
             "this machine does not implement \"retire\"; see docs/machine-providers.md for its \
              supported verbs"
@@ -197,6 +199,24 @@ fn run_verb(
         ),
         other => Err(format!("unknown verb {other:?}")),
     }
+}
+
+/// `preflight`: whether the agent backend `agent` (launched through
+/// `executable` when given) can be started on this machine, checked exactly
+/// as `ralphus-runner preflight` checks it. An unavailable agent is a normal
+/// answer (`available: false` with the reason in `detail`), not a refusal.
+fn preflight(request: &Value) -> Result<Value, String> {
+    let agent = required_str(request, "agent", "a preflight request")?;
+    let executable = request
+        .get("executable")
+        .and_then(Value::as_str)
+        .filter(|s| !s.trim().is_empty());
+    Ok(
+        match crate::execute::preflight_agent(agent, executable, false) {
+            Ok(()) => json!({"available": true}),
+            Err(detail) => json!({"available": false, "detail": detail}),
+        },
+    )
 }
 
 /// `capabilities`: what this machine is and serves.
@@ -305,6 +325,33 @@ mod tests {
             "{}",
             reply.body
         );
+    }
+
+    #[test]
+    fn preflight_answers_whether_the_agent_can_start_here() {
+        let dir = ralphus_test_support::TestDir::new("machine-preflight");
+        let missing = execute(
+            "preflight",
+            &json!({"agent": "codex", "executable": null}),
+            &context(&dir),
+        );
+        // `codex` resolves on some hosts, so only the reply shape is fixed:
+        // an answer, never a refusal.
+        assert_eq!(missing.body["ok"], true, "{}", missing.body);
+        assert!(missing.body["available"].is_boolean(), "{}", missing.body);
+        let unknown = execute("preflight", &json!({"agent": "no-such"}), &context(&dir));
+        assert_eq!(unknown.body["ok"], true, "{}", unknown.body);
+        assert_eq!(unknown.body["available"], false);
+        assert!(
+            unknown.body["detail"]
+                .as_str()
+                .unwrap()
+                .contains("unknown backend"),
+            "{}",
+            unknown.body
+        );
+        let no_agent = execute("preflight", &json!({}), &context(&dir));
+        assert_eq!(no_agent.body["ok"], false);
     }
 
     #[test]

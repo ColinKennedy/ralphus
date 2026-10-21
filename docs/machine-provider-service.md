@@ -164,6 +164,20 @@ of that name takes on stdin, and the same reply fields:
 | `materialize` | `MaterializeRequest` | streams the file back in the reply body |
 | `capabilities` / `ping` | `{}` | `capabilities.os` decides path flavour and shell syntax |
 | `cleanup` / `retire` | `CleanupRequest` / `RetireRequest` | as v1 |
+| `preflight` | `PreflightRequest` (`{"agent", "executable"?}`) | optional; see below |
+
+**`preflight`.** Before the first prompt cell of an agent runs on an
+allocation, ralphus asks whether that agent can start there. Answer with
+`{"available": true}`, or `{"available": false, "detail": "<why>"}` when it
+cannot -- the machine's own `ralphus-runner preflight --agent <agent>
+[--executable <path>]` is the reference check. An unavailable agent is an
+answer (`ok: true`), not a refusal; ralphus fails the cell at once with the
+`detail` and how to fix it. ralphus remembers a pass per allocation, agent
+and launcher, and asks again after a failure. A provider that does not serve
+`preflight` (an `unsupported` refusal, or a v1 `does not implement` /
+`unknown verb` error) means "cannot check": the cell runs and reports its own
+failure. As for `exec`, a provider replaces `executable` with the path it
+has configured for the machine (`ralphus-fleet`: `[machine.agents]`).
 
 **Events.** A program provider surfaces the runner's `RALPHUS_EVENT:` lines on
 stderr. Over HTTP, `exec`, `status` and `stream` replies carry them instead as
