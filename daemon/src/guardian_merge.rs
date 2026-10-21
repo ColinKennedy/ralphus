@@ -6276,6 +6276,15 @@ enum StagedPassOutcome {
 /// waits for the next task completion (see [`run_merge_staged`]).
 const MAX_UNBUILT_PASSES: u32 = 3;
 
+#[cfg(test)]
+thread_local! {
+    /// Run on this thread after each staged pass that finished, before the
+    /// merge decides whether to look again -- a test's stand-in for a task
+    /// completing while the review is merging.
+    static AFTER_STAGED_PASS: std::cell::RefCell<Option<Box<dyn FnMut()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 pub fn run_merge_staged(
     store: &crate::store_lock::StoreHandle,
     runner: &dyn Runner,
@@ -6373,6 +6382,12 @@ pub fn run_merge_staged(
             StagedPassOutcome::Cancelled => return,
             StagedPassOutcome::Failed => return,
             StagedPassOutcome::Ok { built_any } => {
+                #[cfg(test)]
+                AFTER_STAGED_PASS.with(|hook| {
+                    if let Some(hook) = hook.borrow_mut().as_mut() {
+                        hook();
+                    }
+                });
                 if built_any {
                     built_any_total = true;
                 }
@@ -22539,6 +22554,101 @@ mod tests {
         assert!(
             fetch_branch_for_remote_cell(&store, &id, &b).is_ok(),
             "a local branch must not attempt any fetch"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A review over task A's branch then task B's, where B finishes first:
+    /// the merge B's completion starts builds nothing (A is still pending),
+    /// and A finishes while that merge is running, so A's own trigger is
+    /// dropped (the review is already merging). The merge must look again
+    /// and build both rather than settle in `collecting` with nothing left to
+    /// wake it.
+    #[test]
+    fn a_staged_merge_builds_the_stack_when_the_lower_task_finishes_mid_merge() {
+        let (base, repo, _fwt) = make_repo("out-of-order");
+        let bwt = base.join("bwt");
+        g(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "feature/b",
+                bwt.to_str().unwrap(),
+                "main",
+            ],
+        );
+        std::fs::write(
+            bwt.join("b.txt"),
+            "b
+",
+        )
+        .unwrap();
+        g(&bwt, &["add", "."]);
+        g(&bwt, &["commit", "--message", "b"]);
+        let store = Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
+        let id = {
+            let guard = store.lock();
+            let id = guard
+                .create_guardian("r", "main", repo.to_str().unwrap())
+                .unwrap();
+            guard.add_guardian_branch(&id, "feature/a").unwrap();
+            guard.add_guardian_branch(&id, "feature/b").unwrap();
+            id
+        };
+        let branch_id = |name: &str| {
+            store
+                .lock()
+                .get_guardian(&id)
+                .unwrap()
+                .branches
+                .into_iter()
+                .find(|b| b.branch == name)
+                .unwrap()
+                .id
+        };
+        let (a, b) = (branch_id("feature/a"), branch_id("feature/b"));
+        // Task B finished first: its branch is ready, A's is still pending.
+        store
+            .lock()
+            .set_branch_status(&id, &b, MergeStatus::Ready, None)
+            .unwrap();
+        assert!(store.lock().claim_guardian_merge(&id).unwrap());
+
+        // Task A finishes after the first pass read the stack, while the
+        // review is merging: its own claim loses, so nothing re-triggers.
+        let hook_store = Arc::clone(&store);
+        let (hook_id, hook_a) = (id.clone(), a.clone());
+        let mut fired = false;
+        AFTER_STAGED_PASS.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                if fired {
+                    return;
+                }
+                fired = true;
+                let guard = hook_store.lock();
+                guard
+                    .set_branch_status(&hook_id, &hook_a, MergeStatus::Ready, None)
+                    .unwrap();
+                assert!(
+                    !guard.claim_guardian_merge(&hook_id).unwrap(),
+                    "A's completion must find the review already merging"
+                );
+            }));
+        });
+        run_merge_staged(&store, &CapturingRunner::new(), &id, &CancelToken::never());
+        AFTER_STAGED_PASS.with(|hook| *hook.borrow_mut() = None);
+
+        let view = store.lock().get_guardian(&id).unwrap();
+        assert_eq!(view.status, "in_review", "detail: {:?}", view.detail);
+        assert!(
+            view.branches.iter().all(|b| b.merge_status == "done"),
+            "both branches built: {:?}",
+            view.branches
         );
 
         let _ = std::fs::remove_dir_all(&base);
