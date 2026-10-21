@@ -1561,6 +1561,17 @@ impl ProviderRunner {
                     }
                 }
                 let result = self.poll_to_completion(&handle, &spec, cancel);
+                // The attempt's durable terminal log, as a local run writes
+                // when it ends: from the raw transcript the poll streamed
+                // into, else the Live View snapshot.
+                let session_name =
+                    crate::cell_session::session_name(&spec.squad_id, &spec.task, &spec.cell_id);
+                crate::runner::write_terminal_log_preferring_raw_transcript(
+                    &session_name,
+                    0,
+                    &crate::cell_session::read_pane_snapshot(&session_name).unwrap_or_default(),
+                    crate::config::load_terminal_log_config().max_lines_per_attempt(),
+                );
                 if let Some(store) = &self.cartographer {
                     let guard = store.lock();
                     if let Err(e) = guard.clear_remote_exec_handle(&spec.squad_id, &spec.cell_id) {
@@ -3081,6 +3092,44 @@ else:
         assert_eq!(r.summary, "remote async ok");
         assert_eq!(r.tokens_in, 11);
         assert!(local.seen.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_remote_cells_attempt_is_kept_as_a_terminal_log() {
+        let root = ralphus_test_support::scratch(format!(
+            "ralphus-remote-terminal-log-{}-{}",
+            std::process::id(),
+            crate::store::now_ms()
+        ));
+        crate::terminal_log::set_test_root(root.join("terminal_logs"));
+        crate::cell_session::set_pane_snapshot_test_root(root.join("pane_snapshots"));
+        let script = fake_async_provider(
+            "async-terminal-log",
+            &[
+                ("exec", r#"{"ok":true,"protocol_version":1,"handle":"h1"}"#),
+                (
+                    "stream",
+                    r#"{"ok":true,"protocol_version":1,"output":"remote build output","next":1}"#,
+                ),
+                (
+                    "status",
+                    r#"{"ok":true,"protocol_version":1,"state":"done","result":{"status":"done","summary":"ok"}}"#,
+                ),
+            ],
+        );
+        let s = store();
+        register(&s, "ib", &script);
+        let (router, _local) = router(Arc::clone(&s));
+        let remote = spec(Some("ib:A"));
+        assert_eq!(router.run(&remote).status, "done");
+
+        let session =
+            crate::cell_session::session_name(&remote.squad_id, &remote.task, &remote.cell_id);
+        let attempts = crate::terminal_log::list_attempts(&session);
+        assert_eq!(attempts.len(), 1, "{attempts:?}");
+        let log = crate::terminal_log::read_attempt(&session, attempts[0].attempt).unwrap();
+        assert!(log.contains("remote build output"), "{log}");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
