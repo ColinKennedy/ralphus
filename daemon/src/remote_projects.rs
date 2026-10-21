@@ -200,10 +200,13 @@ fn note(
     payload: serde_json::Value,
 ) {
     match ws.store() {
-        Some(store) => crate::cartographer::Note::new("remote_projects")
-            .level(level)
-            .scope("project")
-            .emit(&store.lock(), message, payload),
+        Some(store) => {
+            let guard = store.lock();
+            crate::cartographer::Note::new("remote_projects")
+                .level(level)
+                .scope("project")
+                .emit(&guard, message, payload);
+        }
         None => {
             // A workspace built without a store handle cannot reach Cartographer.
             crate::logging::write_line(level, &format!("ralphus [remote_projects] {message}"));

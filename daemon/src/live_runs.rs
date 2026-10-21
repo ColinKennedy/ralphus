@@ -2702,7 +2702,12 @@ prompt = "second"
             let script = dir.join("p.sh");
             std::fs::write(
                 &script,
-                format!("#!/bin/sh\ncat >> '{}'\necho '{json}'\n", log.display()),
+                // `printf %s`, not `echo`: dash's `echo` turns the JSON's `\n`
+                // escapes into real newlines, which breaks the reply.
+                format!(
+                    "#!/bin/sh\ncat >> '{}'\nprintf '%s\\n' '{json}'\n",
+                    log.display()
+                ),
             )
             .unwrap();
             #[cfg(unix)]
