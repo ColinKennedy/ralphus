@@ -1098,6 +1098,7 @@
        * @property {boolean|null|undefined} skip_manual_checks
        * @property {boolean|null|undefined} auto_run
        * @property {boolean|null|undefined} live_actions
+       * @property {boolean|null|undefined} refine_live_recipe - Whether a finished live run gets one recipe-refinement turn; null/absent = inherit.
        * @property {string[]|null|undefined} rebuild_on - Which events rebuild a review's prepared build: any of "rebase", "feedback", "auto_fix". `[]` = manual only; null/absent = inherit.
        * @property {boolean|null|undefined} exhibits_enabled - Whether reviews show exhibits in their PRs/MRs; null/absent = inherit.
        * @property {number|null|undefined} exhibits_max_per_pr - The most exhibits one PR/MR shows (at least 1); null/absent = inherit.
@@ -1135,6 +1136,7 @@
        * @property {boolean} skip_manual_checks
        * @property {boolean} auto_run
        * @property {boolean} live_actions
+       * @property {boolean} refine_live_recipe - The resolved recipe-refinement default for a live run.
        * @property {string[]|undefined} rebuild_on - The resolved file-config/global rebuild triggers a review inherits when neither it nor its project sets any.
        * @property {boolean|undefined} exhibits_enabled - The resolved exhibit on/off default.
        * @property {number|undefined} exhibits_max_per_pr - The resolved per-PR exhibit cap.
