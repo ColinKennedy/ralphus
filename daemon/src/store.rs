@@ -1146,6 +1146,10 @@ pub struct ProjectReviewSettings {
     /// actions. Defaults to `false` when unset.
     #[serde(default)]
     pub live_actions: Option<bool>,
+    /// Project-level default for whether a finished live run gets the final
+    /// recipe-refinement turn. Unset resolves to `true`.
+    #[serde(default)]
+    pub refine_live_recipe: Option<bool>,
     /// Project-level default for which events (`rebase`, `feedback`,
     /// `auto_fix`) tear down and rebuild a review's prepared build. Unset
     /// resolves to all three; an empty list never rebuilds automatically.
@@ -1239,6 +1243,7 @@ impl ProjectReviewSettings {
             skip_manual_checks: self.skip_manual_checks,
             auto_run: self.auto_run,
             live_actions: self.live_actions,
+            refine_live_recipe: self.refine_live_recipe,
             rebuild_on: self.rebuild_on,
             auto_fix_max_attempts: None,
             auto_fix_weak_progress_refunds: None,
@@ -20707,6 +20712,7 @@ command = "e"
             skip_manual_checks: Some(true),
             auto_run: Some(true),
             live_actions: Some(true),
+            refine_live_recipe: Some(false),
             rebuild_on: Some(vec!["feedback".to_string(), "auto_fix".to_string()]),
             base_shift_maximum_rebuilds: Some(5),
             exhibits_enabled: Some(false),

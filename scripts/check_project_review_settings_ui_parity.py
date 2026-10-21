@@ -54,6 +54,7 @@ MAPPING = {
     "skip_manual_checks": "skip_manual_checks",
     "auto_run": "auto_run",
     "live_actions": "live_actions",
+    "refine_live_recipe": "refine_live_recipe",
     "rebuild_on": "rebuild_on",
     "exhibits_enabled": "exhibits_enabled",
     "exhibits_max_per_pr": "exhibits_max_per_pr",

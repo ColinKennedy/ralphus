@@ -322,6 +322,13 @@ pub struct ReviewConfig {
     /// `live_actions` wins over this.
     #[serde(default)]
     pub live_actions: Option<bool>,
+    /// Whether a finished live run gets one last resumed agent turn that shows
+    /// it its recorded shell calls and asks whether the reproduction recipe is
+    /// missing anything it actually ran. `None` resolves to `true` (see
+    /// [`Self::refine_live_recipe`]); layered like [`Self::live_actions`].
+    /// Plain boolean, type-checked only.
+    #[serde(default)]
+    pub refine_live_recipe: Option<bool>,
     /// Which events tear down and rebuild a review's prepared build (any of
     /// `ralphus_core::schema::REBUILD_ON_VALUES`). `None` means unset, which
     /// resolves to all three values (see [`Self::rebuild_on`]); the project
@@ -758,6 +765,13 @@ impl ReviewConfig {
         self.live_actions.unwrap_or(true)
     }
 
+    /// Whether a finished live run gets the final recipe-refinement turn when
+    /// no layer sets it (`true`).
+    #[must_use]
+    pub fn refine_live_recipe(&self) -> bool {
+        self.refine_live_recipe.unwrap_or(true)
+    }
+
     /// The events that rebuild a review's prepared build when neither the
     /// review nor this config narrows them: the configured list, or every
     /// `REBUILD_ON_VALUES` entry when unset. An entry outside that set (a
@@ -998,6 +1012,7 @@ impl ReviewConfig {
             skip_manual_checks: over.skip_manual_checks.or(self.skip_manual_checks),
             auto_run: over.auto_run.or(self.auto_run),
             live_actions: over.live_actions.or(self.live_actions),
+            refine_live_recipe: over.refine_live_recipe.or(self.refine_live_recipe),
             rebuild_on: over.rebuild_on.or(self.rebuild_on),
             auto_fix_prompt_template: over
                 .auto_fix_prompt_template
@@ -1227,6 +1242,12 @@ pub const REVIEW_FIELD_PARITY: &[(&str, ReviewFieldDefault)] = &[
         ReviewFieldDefault::ProjectDefault(|c| {
             c.discourage_tests_during_auto_pull_request_fixes.is_some()
         }),
+    ),
+    // The recipe-refinement turn is not a `[[review]]` key either: it is a
+    // project/global default only.
+    (
+        "refine_live_recipe",
+        ReviewFieldDefault::ProjectDefault(|c| c.refine_live_recipe.is_some()),
     ),
     // The exhibit settings are not `[[review]]` keys: they are set per
     // review through the settings API, or as project/global defaults. They

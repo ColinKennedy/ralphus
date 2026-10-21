@@ -5560,6 +5560,20 @@ project default (`POST /api/projects/{name}/review-settings`, `.ralphus.toml
 [review] live_actions`). `GuardianView` carries `live_actions` (the review's own
 value or `null`), `effective_live_actions`, and `live_actions_auto_ran_at_ms`.
 
+*Recipe refinement.* After every finished run that reported a result, the
+agent's session is resumed once for a final quality pass over its recipe: the
+prompt gives the "N of M" coverage, the verified commands, the run's recorded
+shell calls with their raw (secret-masked) inputs -- the 50 most recent plus
+every call that matched a step, each cut to about 500 characters -- and its
+other tool calls as context. The agent may add steps, change them, or leave the
+recipe alone; a revised `RALPHUS_LIVE_RESULT:` is re-graded against the recorded
+calls and the first result is kept as `original_result`. Backends without a
+resumable session (the native agent) skip it. `refine_live_recipe` (boolean,
+default `true`) turns it off, as a project default (`POST
+/api/projects/{name}/review-settings`, `.ralphus.toml [review]
+refine_live_recipe`); `GuardianView.effective_refine_live_recipe` is the
+resolved value.
+
 *One automatic run.* An opted-in review runs its live actions once, by itself,
 the first time its initial stacked rebase has settled every enabled branch (`first_ready_at_ms`) and it has a prepared checkout while every member cell has finished
 (done, failed, cancelled or ignored), it is not stopped or finished, and its
