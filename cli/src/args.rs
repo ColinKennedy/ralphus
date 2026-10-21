@@ -34,6 +34,37 @@ impl std::fmt::Debug for Secret {
     }
 }
 
+/// Repeated `KEY=VALUE` flags whose values may be secrets, such as a review's
+/// build environment. `Debug` shows each key with its value redacted.
+#[derive(Clone, Default, PartialEq, Eq)]
+pub struct SecretAssignments(Vec<String>);
+
+impl SecretAssignments {
+    #[must_use]
+    pub fn new(assignments: Vec<String>) -> Self {
+        Self(assignments)
+    }
+}
+
+impl std::ops::Deref for SecretAssignments {
+    type Target = [String];
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for SecretAssignments {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_list()
+            .entries(self.0.iter().map(|assignment| {
+                let key = assignment.split_once('=').map_or("", |(key, _)| key);
+                format!("{key}=<redacted>")
+            }))
+            .finish()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct GlobalOpts {
     pub daemon_url: String,
