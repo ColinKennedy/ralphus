@@ -1221,6 +1221,8 @@ mod tests {
 
     #[test]
     fn isolated_codex_home_is_some_when_either_opt_in_is_off() {
+        let isolation_root = ralphus_test_support::TestDir::new("isolation-root");
+        crate::agent_isolation::set_test_isolation_root(isolation_root.path());
         let ws = test_workspace();
         assert!(isolated_codex_home(&RunOptions::default(), &ws).is_some());
         let settings_only = RunOptions {

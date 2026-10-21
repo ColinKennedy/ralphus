@@ -32,11 +32,16 @@ pub fn isolated_config_dir(workspace_root: &Path, backend: &str) -> PathBuf {
         .file_name()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| "workspace".to_string());
-    std::env::temp_dir()
-        .join("ralphus")
-        .join("agent_isolation")
-        .join(backend)
-        .join(basename)
+    isolation_root().join(backend).join(basename)
+}
+
+/// The directory every backend's isolated config directories live under.
+fn isolation_root() -> PathBuf {
+    #[cfg(test)]
+    if let Some(root) = test_hooks::ISOLATION_ROOT.with(|r| r.borrow().clone()) {
+        return root;
+    }
+    std::env::temp_dir().join("ralphus").join("agent_isolation")
 }
 
 /// Best-effort: copy `filename` from `real_dir` into `isolated_dir` (creating
@@ -112,6 +117,14 @@ const LEASE_MARKER_PREFIX: &str = ".ralphus-lease-";
 /// behind; the next lease taken for the same backend on the same machine
 /// sweeps them ([`IsolationLease::acquire`]).
 ///
+/// Every check-then-act step on a directory runs under its [`DirLock`]:
+/// acquire's marker write, each preserve copy, release's "remove own marker,
+/// look for a live one, delete the copies", and the sweep's per-directory
+/// "look for a live marker, delete the copies". A newcomer's marker is
+/// therefore either visible to a concurrent release/sweep before it decides
+/// to delete, or written only after that deletion finished -- never in
+/// between, where the deletion would take the newcomer's fresh login.
+///
 /// Rule shared by release and the sweep: copies in a directory are removed
 /// only while no *live* lease marker remains in it. A marker is live when the
 /// process whose pid it names is still running, so a concurrently running
@@ -138,7 +151,12 @@ impl IsolationLease {
     /// copies in; those are what release and the sweep remove.
     pub fn acquire(isolated_dir: &Path, preserved_names: &'static [&'static str]) -> Self {
         let marker = match create_private_dir(isolated_dir) {
-            Ok(()) => write_lease_marker(isolated_dir),
+            Ok(()) => {
+                // Without the lock the marker is still written: a login
+                // left unprotected beats a run with no login at all.
+                let _lock = DirLock::acquire(isolated_dir);
+                write_lease_marker(isolated_dir)
+            }
             Err(e) => {
                 emit_isolation_warning(
                     "could not create isolated config directory",
@@ -170,6 +188,7 @@ impl IsolationLease {
     /// [`preserve_auth_file`]. Only a `filename` among the lease's preserved
     /// names is removed when the run ends; any other copy stays.
     pub fn preserve(&self, real_dir: Option<&Path>, filename: &str) {
+        let _lock = DirLock::acquire(&self.dir);
         preserve_auth_file(real_dir, &self.dir, filename);
     }
 
@@ -181,12 +200,17 @@ impl IsolationLease {
             return;
         }
         self.released = true;
+        // Without the lock the copies stay: a later sweep removes them once
+        // no live lease holds the directory.
+        let lock = DirLock::acquire(&self.dir);
         if let Some(marker) = self.marker.take() {
             let _ = remove_file_retrying(&marker);
         }
-        if has_live_lease(&self.dir) {
+        if lock.is_none() || has_live_lease(&self.dir) {
             return;
         }
+        #[cfg(test)]
+        test_hooks::before_delete(&self.dir);
         remove_preserved_files(&self.dir, self.preserved_names);
     }
 }
@@ -270,10 +294,120 @@ fn sweep_stale_isolation_dirs(backend_root: &Path, own_dir: &Path, names: &[&str
     };
     for entry in entries.flatten() {
         let dir = entry.path();
-        if dir == own_dir || !dir.is_dir() || has_live_lease(&dir) {
+        if dir == own_dir || !dir.is_dir() {
             continue;
         }
+        let Some(_lock) = DirLock::acquire(&dir) else {
+            continue;
+        };
+        if has_live_lease(&dir) {
+            continue;
+        }
+        #[cfg(test)]
+        test_hooks::before_delete(&dir);
         remove_preserved_files(&dir, names);
+    }
+}
+
+/// Name of the lock file inside each isolated directory. It is never
+/// deleted: on Unix a deleted-and-recreated lock file would let two holders
+/// lock different inodes.
+const DIR_LOCK_NAME: &str = ".ralphus-isolation.lock";
+
+/// How long [`DirLock::acquire`] waits for another holder. Holders keep the
+/// lock only for a few file operations, never while an agent runs.
+const DIR_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// An exclusive, cross-process lock on one isolated directory, released on
+/// drop.
+///
+/// The OS owns the lock and drops it when the holding process exits, so a
+/// runner that dies while holding it never leaves a stale lock behind:
+/// - Unix: `flock(LOCK_EX)` on [`DIR_LOCK_NAME`].
+/// - Windows: [`DIR_LOCK_NAME`] opened with a share mode of 0, so every other
+///   open of it fails with a sharing violation until the handle closes.
+struct DirLock {
+    #[cfg(unix)]
+    _file: nix::fcntl::Flock<std::fs::File>,
+    #[cfg(not(unix))]
+    _file: std::fs::File,
+}
+
+impl DirLock {
+    /// Lock `dir`, waiting up to [`DIR_LOCK_WAIT`]. `None` (with a warning
+    /// recorded) when the lock could not be taken.
+    fn acquire(dir: &Path) -> Option<Self> {
+        let path = dir.join(DIR_LOCK_NAME);
+        let deadline = std::time::Instant::now() + DIR_LOCK_WAIT;
+        let mut contended = false;
+        loop {
+            let error = match Self::try_lock(&path) {
+                Ok(Some(lock)) => return Some(lock),
+                Ok(None) => std::io::Error::new(
+                    std::io::ErrorKind::WouldBlock,
+                    "isolation directory lock is held by another run",
+                ),
+                Err(e) => e,
+            };
+            if std::time::Instant::now() >= deadline {
+                emit_isolation_warning("could not lock isolated config directory", dir, "", &error);
+                return None;
+            }
+            if !contended {
+                contended = true;
+                #[cfg(test)]
+                test_hooks::on_contended();
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    /// One attempt: `Ok(None)` when another holder has the lock.
+    #[cfg(unix)]
+    fn try_lock(path: &Path) -> std::io::Result<Option<Self>> {
+        use nix::fcntl::{Flock, FlockArg};
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .open(path)?;
+        match Flock::lock(file, FlockArg::LockExclusiveNonblock) {
+            Ok(file) => Ok(Some(Self { _file: file })),
+            Err((_, nix::errno::Errno::EWOULDBLOCK | nix::errno::Errno::EINTR)) => Ok(None),
+            Err((_, errno)) => Err(std::io::Error::from(errno)),
+        }
+    }
+
+    /// One attempt: `Ok(None)` when another holder has the lock.
+    #[cfg(not(unix))]
+    fn try_lock(path: &Path) -> std::io::Result<Option<Self>> {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        const ERROR_ACCESS_DENIED: i32 = 5;
+        const ERROR_SHARING_VIOLATION: i32 = 32;
+        match std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .share_mode(0)
+            .open(path)
+        {
+            Ok(file) => Ok(Some(Self { _file: file })),
+            // Access denied also shows up transiently while another opener
+            // is mid-create on the same file.
+            Err(e)
+                if matches!(
+                    e.raw_os_error(),
+                    Some(ERROR_SHARING_VIOLATION | ERROR_ACCESS_DENIED)
+                ) =>
+            {
+                Ok(None)
+            }
+            Err(e) => Err(e),
+        }
     }
 }
 
@@ -371,6 +505,50 @@ fn emit_isolation_warning(message: &str, isolated_dir: &Path, filename: &str, e:
     );
 }
 
+/// Test-only, per-thread hooks: they fire only on the thread that set them,
+/// so parallel tests never see each other's.
+#[cfg(test)]
+mod test_hooks {
+    use std::cell::RefCell;
+    use std::path::{Path, PathBuf};
+
+    type DirHook = Box<dyn FnMut(&Path)>;
+    type Hook = Box<dyn FnMut()>;
+
+    thread_local! {
+        /// Overrides [`super::isolation_root`].
+        pub(super) static ISOLATION_ROOT: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
+        /// Runs under a directory's lock, after the live-lease check and just
+        /// before its preserved files are deleted.
+        pub(super) static BEFORE_DELETE: RefCell<Option<DirHook>> = const { RefCell::new(None) };
+        /// Runs the first time a lock attempt finds the lock held.
+        pub(super) static ON_CONTENDED: RefCell<Option<Hook>> = const { RefCell::new(None) };
+    }
+
+    pub(super) fn before_delete(dir: &Path) {
+        BEFORE_DELETE.with(|h| {
+            if let Some(hook) = h.borrow_mut().as_mut() {
+                hook(dir);
+            }
+        });
+    }
+
+    pub(super) fn on_contended() {
+        ON_CONTENDED.with(|h| {
+            if let Some(hook) = h.borrow_mut().as_mut() {
+                hook();
+            }
+        });
+    }
+}
+
+/// Point [`isolated_config_dir`] at `root` for the rest of the calling
+/// thread, so a test never touches the real temp-dir isolation tree.
+#[cfg(test)]
+pub(crate) fn set_test_isolation_root(root: &Path) {
+    test_hooks::ISOLATION_ROOT.with(|r| *r.borrow_mut() = Some(root.to_path_buf()));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -396,10 +574,9 @@ mod tests {
     #[test]
     fn a_preserved_login_is_readable_only_by_its_owner() {
         use std::os::unix::fs::PermissionsExt as _;
-        let real =
-            std::env::temp_dir().join(format!("ralphus-auth-mode-real-{}", std::process::id()));
-        let isolated =
-            std::env::temp_dir().join(format!("ralphus-auth-mode-iso-{}", std::process::id()));
+        let root = ralphus_test_support::TestDir::new("auth-mode");
+        let real = root.path().join("real");
+        let isolated = root.path().join("isolated");
         std::fs::create_dir_all(&real).unwrap();
         std::fs::write(real.join("auth.json"), "{}").unwrap();
         std::fs::set_permissions(
@@ -413,15 +590,13 @@ mod tests {
         let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode(&isolated), 0o700);
         assert_eq!(mode(&isolated.join("auth.json")), 0o600);
-        let _ = std::fs::remove_dir_all(&real);
-        let _ = std::fs::remove_dir_all(&isolated);
     }
 
     #[test]
     fn preserve_auth_file_copies_when_present() {
-        let real = std::env::temp_dir().join(format!("ralphus-auth-real-{}", std::process::id()));
-        let isolated =
-            std::env::temp_dir().join(format!("ralphus-auth-isolated-{}", std::process::id()));
+        let root = ralphus_test_support::TestDir::new("auth-copy");
+        let real = root.path().join("real");
+        let isolated = root.path().join("isolated");
         std::fs::create_dir_all(&real).unwrap();
         std::fs::write(real.join("auth.json"), "{\"token\":\"secret\"}").unwrap();
 
@@ -431,25 +606,18 @@ mod tests {
             std::fs::read_to_string(isolated.join("auth.json")).unwrap(),
             "{\"token\":\"secret\"}"
         );
-
-        let _ = std::fs::remove_dir_all(&real);
-        let _ = std::fs::remove_dir_all(&isolated);
     }
 
     #[test]
     fn preserve_auth_file_is_a_no_op_when_source_is_missing() {
-        let real = std::env::temp_dir().join(format!("ralphus-auth-empty-{}", std::process::id()));
-        let isolated = std::env::temp_dir().join(format!(
-            "ralphus-auth-empty-isolated-{}",
-            std::process::id()
-        ));
+        let root = ralphus_test_support::TestDir::new("auth-empty");
+        let real = root.path().join("real");
+        let isolated = root.path().join("isolated");
         std::fs::create_dir_all(&real).unwrap();
 
         preserve_auth_file(Some(&real), &isolated, "auth.json");
 
         assert!(!isolated.exists());
-
-        let _ = std::fs::remove_dir_all(&real);
     }
 
     const NAMES: &[&str] = &[".credentials.json", "settings.json"];
@@ -560,17 +728,134 @@ mod tests {
         assert!(!busy.join(".credentials.json").exists());
     }
 
+    /// Run `newcomer` on its own thread once `before_delete` fires on this
+    /// thread for `target`, and hold that deletion until the newcomer is
+    /// waiting on `target`'s lock -- the ordering in which an unlocked
+    /// check-then-delete took the newcomer's fresh login.
+    fn interleave_newcomer(
+        target: &Path,
+        newcomer: impl FnOnce() -> IsolationLease + Send + 'static,
+    ) -> (
+        std::thread::JoinHandle<IsolationLease>,
+        std::rc::Rc<std::cell::Cell<bool>>,
+    ) {
+        use std::sync::mpsc;
+        let (start_tx, start_rx) = mpsc::channel::<()>();
+        let (waiting_tx, waiting_rx) = mpsc::channel::<()>();
+        let handle = std::thread::spawn(move || {
+            start_rx.recv().unwrap();
+            test_hooks::ON_CONTENDED.with(|h| {
+                *h.borrow_mut() = Some(Box::new(move || {
+                    let _ = waiting_tx.send(());
+                }));
+            });
+            newcomer()
+        });
+        let interleaved = std::rc::Rc::new(std::cell::Cell::new(false));
+        let flag = std::rc::Rc::clone(&interleaved);
+        let target = target.to_path_buf();
+        let mut start_tx = Some(start_tx);
+        test_hooks::BEFORE_DELETE.with(|h| {
+            *h.borrow_mut() = Some(Box::new(move |dir: &Path| {
+                if dir != target {
+                    return;
+                }
+                let Some(start) = start_tx.take() else {
+                    return;
+                };
+                start.send(()).unwrap();
+                waiting_rx
+                    .recv_timeout(std::time::Duration::from_secs(10))
+                    .expect("the newcomer must wait for the directory lock");
+                flag.set(true);
+            }));
+        });
+        (handle, interleaved)
+    }
+
+    #[test]
+    fn a_release_never_deletes_the_login_of_a_lease_taken_during_it() {
+        let (root, real, backend_root) = lease_fixture("lease-race-release");
+        let fresh = root.path().join("fresh");
+        std::fs::create_dir_all(&fresh).unwrap();
+        std::fs::write(fresh.join(".credentials.json"), "fresh").unwrap();
+        let dir = backend_root.join("ws-race");
+
+        let mut first = IsolationLease::acquire(&dir, NAMES);
+        first.preserve(Some(&real), ".credentials.json");
+        let newcomer_dir = dir.clone();
+        let (newcomer, interleaved) = interleave_newcomer(&dir, move || {
+            let lease = IsolationLease::acquire(&newcomer_dir, NAMES);
+            lease.preserve(Some(&fresh), ".credentials.json");
+            lease
+        });
+        first.release();
+        let newcomer = newcomer.join().unwrap();
+
+        assert!(interleaved.get(), "the release reached its deletion");
+        assert_eq!(
+            std::fs::read_to_string(dir.join(".credentials.json")).unwrap(),
+            "fresh"
+        );
+        drop(newcomer);
+        assert!(!dir.join(".credentials.json").exists());
+    }
+
+    #[test]
+    fn a_sweep_never_deletes_the_login_of_a_lease_taken_during_it() {
+        let (root, _real, backend_root) = lease_fixture("lease-race-sweep");
+        let fresh = root.path().join("fresh");
+        std::fs::create_dir_all(&fresh).unwrap();
+        std::fs::write(fresh.join(".credentials.json"), "fresh").unwrap();
+
+        // A crashed run's directory, which a new run is about to reuse.
+        let stale = backend_root.join("ws-stale");
+        std::fs::create_dir_all(&stale).unwrap();
+        std::fs::write(stale.join(".credentials.json"), "old").unwrap();
+        std::fs::write(
+            stale.join(format!("{LEASE_MARKER_PREFIX}{}-0", u32::MAX)),
+            "",
+        )
+        .unwrap();
+
+        let newcomer_dir = stale.clone();
+        let (newcomer, interleaved) = interleave_newcomer(&stale, move || {
+            let lease = IsolationLease::acquire(&newcomer_dir, NAMES);
+            lease.preserve(Some(&fresh), ".credentials.json");
+            lease
+        });
+        let sweeper = IsolationLease::acquire(&backend_root.join("ws-sweeper"), NAMES);
+        let newcomer = newcomer.join().unwrap();
+
+        assert!(interleaved.get(), "the sweep reached its deletion");
+        assert_eq!(
+            std::fs::read_to_string(stale.join(".credentials.json")).unwrap(),
+            "fresh"
+        );
+        drop(sweeper);
+        drop(newcomer);
+    }
+
+    #[test]
+    fn isolated_config_dir_honours_the_test_isolation_root() {
+        let root = ralphus_test_support::TestDir::new("isolation-root");
+        set_test_isolation_root(root.path());
+        let dir = isolated_config_dir(Path::new("/tmp/ws"), "codex");
+        assert_eq!(dir, root.path().join("codex").join("ws"));
+    }
+
     #[test]
     fn lease_marker_pid_parses_only_lease_markers() {
         assert_eq!(lease_marker_pid(".ralphus-lease-42-7"), Some(42));
         assert_eq!(lease_marker_pid(".credentials.json"), None);
         assert_eq!(lease_marker_pid(".ralphus-lease-x-1"), None);
+        assert_eq!(lease_marker_pid(DIR_LOCK_NAME), None);
     }
 
     #[test]
     fn preserve_auth_file_is_a_no_op_when_real_dir_is_none() {
-        let isolated =
-            std::env::temp_dir().join(format!("ralphus-auth-none-isolated-{}", std::process::id()));
+        let root = ralphus_test_support::TestDir::new("auth-none");
+        let isolated = root.path().join("isolated");
         preserve_auth_file(None, &isolated, "auth.json");
         assert!(!isolated.exists());
     }

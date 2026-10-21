@@ -2681,6 +2681,8 @@ mod tests {
     #[test]
     fn isolated_claude_config_dir_is_some_when_personal_memory_is_isolated() {
         let options = RunOptions::default();
+        let isolation_root = ralphus_test_support::TestDir::new("isolation-root");
+        crate::agent_isolation::set_test_isolation_root(isolation_root.path());
         let ws = test_workspace();
         let lease = isolated_claude_config_dir(&options, &ws).expect("isolated dir");
         assert!(lease.dir().to_string_lossy().contains("claude-code"));
