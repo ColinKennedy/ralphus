@@ -114,7 +114,7 @@ fn execute_capability(cmd: AgentCapabilityCommand, client: &DaemonClient) -> Exe
             name,
             body,
             replace,
-        } => Ok(client.save_capability(&kind, &name, body, replace)?),
+        } => Ok(client.save_capability(&kind, &name, body.into_value(), replace)?),
         C::Remove { kind, name } => Ok(client.remove_capability(&kind, &name)?),
         C::Check { kind, name } => Ok(client.check_capability(&kind, &name)?),
         C::Import => Ok(client.import_capabilities()?),

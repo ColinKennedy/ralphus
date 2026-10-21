@@ -137,11 +137,7 @@ pub fn parse(args: &[String]) -> AgentCommand {
 /// the `(key, kind, value)` triple `DaemonClient::create_agent_profile`/
 /// `update_agent_profile` expect. `kind` is `"set"`/`"link"`, matching
 /// `AgentEnvKind`'s `serde(rename_all = "snake_case")`.
-fn parse_env_pairs(
-    raw: Vec<String>,
-    kind: &str,
-    flag: &str,
-) -> Result<Vec<(String, String, String)>, String> {
+fn parse_env_pairs(raw: Vec<String>, kind: &str, flag: &str) -> Result<EnvPairs, String> {
     raw.into_iter()
         .map(|entry| match entry.split_once('=') {
             Some((key, value)) if !key.is_empty() => {
@@ -149,7 +145,72 @@ fn parse_env_pairs(
             }
             _ => Err(format!("{flag} expects KEY=VALUE, got '{entry}'")),
         })
-        .collect()
+        .collect::<Result<Vec<_>, _>>()
+        .map(EnvPairs)
+}
+
+/// `--set`/`--link` (and `--header`/`--header-link`) pairs as `(key, kind,
+/// value)`. A `set` value is a literal, often an API key, so `Debug` prints
+/// it as `<redacted>` -- the CLI logs every parsed command whole. A `link`
+/// value names another variable and is printed as is.
+#[derive(Clone, Default, PartialEq, Eq)]
+pub struct EnvPairs(Vec<(String, String, String)>);
+
+impl EnvPairs {
+    fn extend(&mut self, other: EnvPairs) {
+        self.0.extend(other.0);
+    }
+}
+
+impl std::ops::Deref for EnvPairs {
+    type Target = [(String, String, String)];
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for EnvPairs {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_list()
+            .entries(self.0.iter().map(|(key, kind, value)| {
+                let shown = if kind == "set" { "<redacted>" } else { value };
+                (key, kind, shown)
+            }))
+            .finish()
+    }
+}
+
+/// An `agent capability add/edit` request body. Its `mcp.env` and
+/// `mcp.headers` carry literal secrets (an MCP server's API key or auth
+/// header), so `Debug` prints the body with every `set` value redacted.
+#[derive(Clone, PartialEq)]
+pub struct CapabilityBody(Value);
+
+impl CapabilityBody {
+    /// The body to send to the daemon.
+    #[must_use]
+    pub fn into_value(self) -> Value {
+        self.0
+    }
+}
+
+impl std::fmt::Debug for CapabilityBody {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut shown = self.0.clone();
+        for field in ["env", "headers"] {
+            let entries = shown
+                .get_mut("mcp")
+                .and_then(|mcp| mcp.get_mut(field))
+                .and_then(Value::as_array_mut);
+            for entry in entries.into_iter().flatten() {
+                if entry["kind"] == "set" {
+                    entry["value"] = Value::from("<redacted>");
+                }
+            }
+        }
+        write!(f, "{shown}")
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -164,7 +225,7 @@ pub enum AgentProfileCommand {
         backend: String,
         executable: Option<String>,
         model: Option<String>,
-        env: Vec<(String, String, String)>,
+        env: EnvPairs,
         thinking_capable: Option<bool>,
     },
     Update {
@@ -172,7 +233,7 @@ pub enum AgentProfileCommand {
         backend: String,
         executable: Option<String>,
         model: Option<String>,
-        env: Vec<(String, String, String)>,
+        env: EnvPairs,
         thinking_capable: Option<bool>,
     },
     Delete {
@@ -210,7 +271,7 @@ pub enum AgentCapabilityCommand {
     Save {
         kind: String,
         name: String,
-        body: Value,
+        body: CapabilityBody,
         replace: bool,
     },
     Remove {
@@ -245,9 +306,10 @@ pub enum AgentCapabilityCommand {
     UsageError(String),
 }
 
-fn env_json(pairs: Vec<(String, String, String)>) -> Value {
+fn env_json(pairs: EnvPairs) -> Value {
     Value::Array(
         pairs
+            .0
             .into_iter()
             .map(|(key, kind, value)| serde_json::json!({"key": key, "kind": kind, "value": value}))
             .collect(),
@@ -291,7 +353,7 @@ fn parse_capability_save(args: &[String], replace: bool) -> Result<AgentCapabili
     Ok(AgentCapabilityCommand::Save {
         kind,
         name,
-        body,
+        body: CapabilityBody(body),
         replace,
     })
 }
@@ -548,7 +610,7 @@ fn dispatch_capability(cmd: AgentCapabilityCommand, opts: &GlobalOpts) -> i32 {
             name,
             body,
             replace,
-        } => client.save_capability(&kind, &name, body, replace),
+        } => client.save_capability(&kind, &name, body.into_value(), replace),
         C::Remove { kind, name } => client.remove_capability(&kind, &name),
         C::Check { kind, name } => client.check_capability(&kind, &name),
         C::Import => client.import_capabilities(),
@@ -1051,8 +1113,8 @@ backend = "codex"
                 );
                 assert_eq!(model.as_deref(), Some("opus"));
                 assert_eq!(
-                    env,
-                    vec![
+                    *env,
+                    [
                         ("FOO".to_string(), "set".to_string(), "bar".to_string()),
                         (
                             "API_KEY".to_string(),
@@ -1065,6 +1127,56 @@ backend = "codex"
             }
             other => panic!("unexpected: {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_profiles_literal_env_values_are_redacted_when_logged() {
+        let cmd = parse(&v(&[
+            "profile",
+            "update",
+            "--backend",
+            "claude-code",
+            "--set",
+            "API_KEY=not-a-real-key-profile",
+            "--link",
+            "OTHER=SOURCE_VAR",
+            "p",
+        ]));
+        let logged = format!("{cmd:?}");
+        assert!(!logged.contains("not-a-real-key-profile"), "{logged}");
+        assert!(logged.contains("<redacted>"), "{logged}");
+        assert!(
+            logged.contains("SOURCE_VAR"),
+            "a link names a variable: {logged}"
+        );
+    }
+
+    #[test]
+    fn a_capabilitys_literal_env_and_header_values_are_redacted_when_logged() {
+        let cmd = parse(&v(&[
+            "capability",
+            "add",
+            "mcp",
+            "search",
+            "--command",
+            "search-server",
+            "--set",
+            "TOKEN=not-a-real-key-env",
+            "--header",
+            "Authorization=not-a-real-key-header",
+            "--header-link",
+            "X-Key=HEADER_SOURCE",
+        ]));
+        let logged = format!("{cmd:?}");
+        assert!(!logged.contains("not-a-real-key-env"), "{logged}");
+        assert!(!logged.contains("not-a-real-key-header"), "{logged}");
+        assert!(logged.contains("HEADER_SOURCE"), "{logged}");
+        let AgentCommand::Capability(AgentCapabilityCommand::Save { body, .. }) = cmd else {
+            panic!("unexpected: {logged}");
+        };
+        let sent = body.into_value();
+        assert_eq!(sent["mcp"]["env"][0]["value"], "not-a-real-key-env");
+        assert_eq!(sent["mcp"]["headers"][0]["value"], "not-a-real-key-header");
     }
 
     #[test]
