@@ -5013,10 +5013,10 @@ initialization_timeout_sec = 30
             ),
             (
                 ReviewConfig {
-                    exhibit_kind_preference: Some(vec!["output".into()]),
+                    exhibit_kind_preference: Some(vec!["terminal-text".into()]),
                     ..ReviewConfig::default()
                 },
-                "\"output\"",
+                "\"terminal-text\"",
             ),
         ] {
             let err = c.validate().unwrap_err();
@@ -5027,7 +5027,7 @@ initialization_timeout_sec = 30
     #[test]
     fn exhibit_kinds_or_default_drops_unknown_and_falls_back_when_empty() {
         use crate::exhibits::ExhibitKind;
-        let names = vec!["output".to_string(), "video".into(), "video".into()];
+        let names = vec!["terminal-text".to_string(), "video".into(), "video".into()];
         assert_eq!(
             exhibit_kinds_or_default(Some(&names)),
             vec![ExhibitKind::Video]

@@ -1,6 +1,6 @@
 # Exhibits: what a reviewer sees in a PR
 
-An **exhibit** is a GIF, video, screenshot or text output of a change working,
+An **exhibit** is a GIF, video, screenshot or terminal text of a change working,
 put into the PR/MR description automatically. Exhibits come from a review's
 **live actions** -- the agent-run live tests that already start the real
 program -- so they work for any project ralphus can run: a web app, a CLI,
@@ -17,7 +17,9 @@ a Qt desktop app, anything with output a person would look at.
    EXHIBIT: screenshot | the chart at 50% zoom
    ```
 
-   Kinds are `gif`, `video`, `screenshot` and `output` (text). The agent is
+   Kinds are `gif`, `video`, `screenshot` and `terminal-text` (the text a
+   command printed, or lines from a log, shown as a text block of at most
+   4,000 characters; the earlier name `output` is still accepted). The agent is
    told to ask only for what a reviewer must *see*.
 
 2. **Each request becomes a slot in the PR.** When live actions are created,
@@ -45,7 +47,7 @@ a Qt desktop app, anything with output a person would look at.
    ```toml
    [[exhibit.recipe]]
    name = "flow-recording"
-   kind = "gif"                      # gif | video | screenshot | output
+   kind = "gif"                      # gif | video | screenshot | terminal-text
    describe = "the checkout flow in tests/e2e/smoke.spec.ts"
    paths = ["src/**", "*.tsx"]      # relative to this .ralphus.toml's folder
    command = "node tools/record_flow.js --out <<RALPHUS_EXHIBIT_DIR>>"

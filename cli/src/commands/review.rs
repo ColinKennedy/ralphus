@@ -4052,7 +4052,10 @@ mod tests {
                 &["--exhibit-kind-preference", "gif,gif"][..],
                 "more than once",
             ),
-            (&["--exhibit-kind-preference", "output"][..], "\"output\""),
+            (
+                &["--exhibit-kind-preference", "terminal-text"][..],
+                "\"terminal-text\"",
+            ),
             (&["--exhibit-kind-preference", ","][..], "at least one"),
             (
                 &["--exhibit-kind-preference", "inherit,gif"][..],

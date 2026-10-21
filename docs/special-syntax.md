@@ -537,7 +537,8 @@ tool guidance, but without the waypoint section (`waypoint_context` false). The 
   them.
 - **`EXHIBIT: <kind> | <what to show>`** — an **exhibit request** inside a live
   handoff (a line of the handoff's text, not a `RALPHUS_` marker, so it does
-  not end the handoff). `<kind>` is `gif`, `video`, `screenshot` or `output`
+  not end the handoff). `<kind>` is `gif`, `video`, `screenshot` or
+  `terminal-text` (`output` is accepted as its earlier name)
   (case-insensitive; anything else is ignored and logged). At most four per
   handoff. Lifted out of the handoff text by `exhibits::split_handoff` before
   deduplication and carried to the merged live action by handoff number, so

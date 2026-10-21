@@ -81,7 +81,7 @@ pub fn delivered_kind(media: MediaType) -> Option<ExhibitKind> {
         MediaType::Image | MediaType::OtherImage => Some(ExhibitKind::Screenshot),
         MediaType::Gif => Some(ExhibitKind::Gif),
         MediaType::Video | MediaType::OtherVideo => Some(ExhibitKind::Video),
-        MediaType::Text => Some(ExhibitKind::Output),
+        MediaType::Text => Some(ExhibitKind::TerminalText),
         MediaType::Unknown => None,
     }
 }
@@ -272,7 +272,8 @@ fn p(path: &Path) -> String {
 /// (`<out_stem>.<ext>`). Visual files step down `preference` -- e.g. a GIF
 /// that cannot be shrunk under the image limit becomes a video, then a
 /// still -- skipping kinds the preference leaves out. Videos are trimmed to
-/// `max_video_seconds`.
+/// `max_video_seconds`. Text keeps one character past `max_text_chars` when
+/// the file is longer, so whoever renders it can tell the text was cut.
 #[must_use]
 pub fn prepare(
     source: &Path,
@@ -288,7 +289,7 @@ pub fn prepare(
             Ok(bytes) => Prepared::Text {
                 text: String::from_utf8_lossy(&bytes)
                     .chars()
-                    .take(max_text_chars)
+                    .take(max_text_chars.saturating_add(1))
                     .collect(),
             },
             Err(e) => Prepared::Undeliverable {
@@ -800,6 +801,16 @@ pub(crate) mod tests {
         let txt = dir.path().join("out.txt");
         std::fs::write(&txt, "abcdef").unwrap();
         let out = prepare(&txt, &dir.path().join("o"), &PREF, 15, 3, &fake(false, 0));
+        // One character past the limit survives so the cut stays detectable.
+        assert_eq!(
+            out,
+            Prepared::Text {
+                text: "abcd".to_string()
+            }
+        );
+        let exact = dir.path().join("exact.txt");
+        std::fs::write(&exact, "abc").unwrap();
+        let out = prepare(&exact, &dir.path().join("e"), &PREF, 15, 3, &fake(false, 0));
         assert_eq!(
             out,
             Prepared::Text {

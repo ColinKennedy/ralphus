@@ -430,11 +430,11 @@
        * @property {number} action_idx - The owning live action's `idx`.
        * @property {number} slot_idx
        * @property {string|null} action_label
-       * @property {"gif"|"video"|"screenshot"|"output"} kind - What was asked for.
+       * @property {"gif"|"video"|"screenshot"|"terminal-text"} kind - What was asked for.
        * @property {string} describe - What to show.
        * @property {"handoff"|"recipe"|"inferred"} origin - Who asked: the change's own agent, a config recipe, or the PR writer.
        * @property {string|null} why - Why an inferred request was added.
-       * @property {"gif"|"video"|"screenshot"|"output"|null} delivered_kind - What a run actually delivered, which can be lower in the preference order.
+       * @property {"gif"|"video"|"screenshot"|"terminal-text"|null} delivered_kind - What a run actually delivered, which can be lower in the preference order.
        * @property {string|null} url - The uploaded file's URL on the forge.
        * @property {string|null} caption
        * @property {string|null} text - An `output` slot's text.
