@@ -3,8 +3,8 @@
 > **Status:** the daemon side is implemented -- configuration, request
 > validation, allocation, the Machine API transport, re-attach after restart,
 > release and idle hints, and the read-only allocations view (board, CLI,
-> MCP). `ralphus-fleet` reaches machines over SSH; `ralphus-outpost`, for
-> machines without SSH (native Windows), is not built yet. Program providers
+> MCP). `ralphus-fleet` reaches Linux and Windows machines over SSH, and any
+> machine through `ralphus-outpost` ([`outpost.md`](outpost.md)). Program providers
 > ([`machine-providers.md`](machine-providers.md), contract v1) keep working
 > unchanged; this page describes the service form that sits alongside them.
 
@@ -189,11 +189,17 @@ A refusal is `{"ok": false, "protocol_version": 2, "error": "...",
 
 ## Running `ralphus-fleet`
 
-`ralphus-fleet` (`fleet/`) is the built-in provider service. It reaches each
-of its machines over SSH through `ralphus-ssh-provider` (found next to its
-executable, or set `ssh_provider`), so a machine needs only an SSH login:
-a Linux box, a WSL distribution with `sshd`, or a container running OpenSSH
-(`scripts/ssh-target.sh`).
+`ralphus-fleet` (`fleet/`) is the built-in provider service. Each machine in
+its configuration names a **transport**:
+
+- `ssh` (the default): the fleet runs `ralphus-ssh-provider` (found next to
+  its executable, or set `ssh_provider`) against the machine, so it needs only
+  an SSH login -- a Linux box, a WSL distribution with `sshd`, a container
+  running OpenSSH (`scripts/ssh-target.sh`), or a Windows machine with the
+  built-in OpenSSH Server (see [Windows over SSH](#windows-over-ssh)).
+- `outpost`: the machine runs `ralphus-outpost connect`, which connects out to
+  the fleet and runs its requests; nothing listens on the machine. See
+  [`outpost.md`](outpost.md).
 
 ```bash
 ralphus-fleet add wslbox --user me --remote-root /home/me/ralphus-fleet --label gpu
@@ -217,10 +223,75 @@ remote_root = "/home/me/ralphus-fleet"
 max_allocations = 4                           # optional
 [machine.runner]
 mode      = "upload"                          # or "installed" (default)
-artifacts = { "linux-x86_64" = "C:/ralphus/linux/ralphus-runner" }
+artifacts = { "x86_64-unknown-linux-musl" = "C:/ralphus/linux/ralphus-runner" }
 [machine.agents]
 codex = "/home/me/.local/bin/codex"           # agent executables on that machine
+
+[[machine]]
+name              = "winbox"                  # reached through ralphus-outpost
+transport         = "outpost"
+outpost_token_env = "WINBOX_OUTPOST_TOKEN"
+remote_root       = "C:/ralphus/fleet"
+labels            = ["windows"]
 ```
+
+### Configuration reference
+
+Top level:
+
+| Key | Default | Meaning |
+|---|---|---|
+| `listen` | `127.0.0.1:7900` | `host:port` to listen on (outposts must reach it) |
+| `public_url` | `http://<listen>` | the URL the daemon reaches the service at |
+| `token_env` | required | variable holding the service token the daemon presents |
+| `ssh_provider` | next to `ralphus-fleet`, then `PATH` | the `ralphus-ssh-provider` program |
+| `ssh_config_file` | OpenSSH default | `ssh -F` file for every SSH machine |
+| `state_file` | `<config>.state.json` | where allocations (never tokens) are kept |
+
+Each `[[machine]]`:
+
+| Key | Transport | Meaning |
+|---|---|---|
+| `name` | both (required for `outpost`) | how allocations name it; `host` when omitted |
+| `transport` | -- | `ssh` (default) or `outpost` |
+| `host`, `user` | `ssh` | SSH destination: hostname, `user@host`, or a `~/.ssh/config` alias |
+| `outpost_token_env` | `outpost` | variable in the fleet's environment holding the machine's pairing secret |
+| `os`, `arch` | both | `linux`/`windows`/`macos`, `x86_64`/`aarch64`; probed (SSH) or reported (outpost) when omitted |
+| `labels` | both | opaque labels a request can ask for |
+| `remote_root` | both | durable storage root on the machine |
+| `max_allocations` | both | at most this many allocations at once |
+| `[machine.runner]` | `ssh` | `mode` (`installed`/`upload`), `command`, `artifacts` (target triple to runner binary on the fleet host) |
+| `[machine.agents]` | both | agent name to executable path on the machine |
+
+Validation is strict: unknown keys, an `ssh` machine without `host`, an
+`outpost` machine without `name` or `outpost_token_env` (or with a
+`[machine.runner]`), and a Windows SSH machine whose `remote_root` contains
+anything but letters, digits and `. _ - \ /` are errors.
+
+### Windows over SSH
+
+A Windows machine with the built-in OpenSSH Server works over the `ssh`
+transport with every verb the Linux path supports. Declare `os = "windows"`
+(or leave it out: a machine without `uname` that answers `echo %OS%` with
+`Windows_NT` is probed as Windows). The fleet passes the machine's os and
+arch to `ralphus-ssh-provider`, which then runs each verb on the machine as
+`<runner> machine <verb> --remote-root <root>` with the request on the
+session's stdin, instead of POSIX shell scripts:
+
+- the session's default shell must be `cmd.exe` (OpenSSH's default);
+- `remote_root` (and an `installed` runner's path) must be a drive path of
+  letters, digits and `. _ - \ /` -- it goes on the command line unquoted;
+- in `upload` mode the runner (`ralphus-runner.exe`, artifact key
+  `x86_64-pc-windows-msvc` or `aarch64-pc-windows-msvc`) is copied on the
+  first verb that finds it missing, to
+  `<remote_root>\runners\<triple>\<sha256>\ralphus-runner.exe`, by a
+  PowerShell script passed as `-EncodedCommand` that reads it from stdin and
+  checks its SHA-256;
+- `exec` starts a detached job supervisor outside the session's job object;
+  if Windows refuses that, the job runs in the foreground of the `exec` call
+  and its result comes back directly (bounded by the daemon's HTTP timeout);
+- credentials travel on the session's stdin and reach only the job's process
+  environment; agents use the machine's own installation and login.
 
 - A request is granted on the least-loaded machine that matches its
   `os`/`arch`/`labels` and has room; a refusal lists why each machine did not
@@ -233,6 +304,8 @@ codex = "/home/me/.local/bin/codex"           # agent executables on that machin
   paths; the daemon needs no `[machine.targets]` entry for it.
 - `materialize` copies the selected files to the fleet host and returns them
   in the reply, so the daemon may run elsewhere.
+- `GET /v1/outposts` (service token) lists outpost machines and whether each
+  is connected.
 
 To check a set of machines end to end (strict mode, two machines, a review,
 secrets, restarts, release), run [`scripts/fleet_e2e.py`](fleet-e2e.md). To

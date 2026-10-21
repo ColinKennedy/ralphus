@@ -38,7 +38,6 @@ pub mod config;
 pub mod exec;
 pub mod fileops;
 pub mod job;
-pub mod layout;
 pub mod materialize;
 pub mod ping;
 pub mod protocol;
@@ -47,6 +46,11 @@ pub mod runner_install;
 pub mod ssh;
 pub mod transport;
 pub mod uri;
+pub mod windows;
+
+/// The deterministic storage layout under a machine's `remote_root`, shared
+/// with the machine-side verbs in `ralphus-runner`.
+pub use ralphus_core::machine_layout as layout;
 
 /// Prefix a structured event line carries on stderr before its JSON body, so
 /// the daemon's stderr-scraping (`daemon/src/runner.rs::EVENT_MARKER`) can

@@ -1,6 +1,8 @@
 //! The HTTP side of the service: the allocation API ralphus calls with the
-//! service token, and each allocation's Machine API it calls with that
-//! allocation's token (`docs/machine-provider-service.md`).
+//! service token, each allocation's Machine API it calls with that
+//! allocation's token (`docs/machine-provider-service.md`), and the outpost
+//! channel (`/v1/outpost/*`) outposts call with their sealed session
+//! (`docs/outpost.md`).
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
@@ -9,7 +11,8 @@ use serde_json::{Value, json};
 
 use crate::allocations::{Allocations, Platform, Requirements, choose, constant_time_eq};
 use crate::config::{FleetConfig, MachineConfig};
-use crate::machine_api::{self, PROTOCOL_VERSION, refusal};
+use crate::machine_api::{self, PROTOCOL_VERSION, Reach, refusal};
+use crate::outposts::Outposts;
 
 /// One running service.
 pub struct Service {
@@ -20,6 +23,7 @@ pub struct Service {
     allocations: Mutex<Allocations>,
     /// Probed os/arch per machine name; configured values win.
     platforms: Mutex<BTreeMap<String, Platform>>,
+    outposts: Outposts,
 }
 
 /// A reply: status and JSON body.
@@ -30,6 +34,8 @@ fn log(message: &str) {
 }
 
 impl Service {
+    /// A service whose outposts' pairing secrets come from this process's
+    /// environment.
     #[must_use]
     pub fn new(
         config: FleetConfig,
@@ -37,6 +43,22 @@ impl Service {
         token: String,
         allocations: Allocations,
     ) -> Self {
+        Self::with_outpost_secrets(config, base_url, token, allocations, |variable| {
+            std::env::var(variable).ok()
+        })
+    }
+
+    /// A service whose outposts' pairing secrets come from `secret_of`
+    /// (given each machine's `outpost_token_env`).
+    #[must_use]
+    pub fn with_outpost_secrets(
+        config: FleetConfig,
+        base_url: String,
+        token: String,
+        allocations: Allocations,
+        secret_of: impl Fn(&str) -> Option<String>,
+    ) -> Self {
+        let outposts = Outposts::new(&config, secret_of);
         let platforms = config
             .machines
             .iter()
@@ -56,7 +78,24 @@ impl Service {
             token,
             allocations: Mutex::new(allocations),
             platforms: Mutex::new(platforms),
+            outposts,
         }
+    }
+
+    fn reach(&self) -> Reach<'_> {
+        Reach {
+            config: &self.config,
+            outposts: &self.outposts,
+        }
+    }
+
+    fn platform(&self, name: &str) -> Platform {
+        self.platforms
+            .lock()
+            .expect("poisoned")
+            .get(name)
+            .cloned()
+            .unwrap_or_default()
     }
 
     fn machine(&self, name: &str) -> Option<&MachineConfig> {
@@ -81,7 +120,13 @@ impl Service {
                 .collect()
         };
         for machine in unknown {
-            let reply = machine_api::serve(&self.config, machine, "capabilities", json!({}));
+            if machine.is_outpost() && !self.outposts.connected(machine.display_name()) {
+                // Learned when it connects; asking now would only fail.
+                continue;
+            }
+            let platform = self.platform(machine.display_name());
+            let reply =
+                machine_api::serve(&self.reach(), machine, &platform, "capabilities", json!({}));
             let caps = &reply["capabilities"];
             let mut platforms = self.platforms.lock().expect("poisoned");
             let platform = platforms
@@ -205,6 +250,9 @@ impl Service {
         if let ["v1", "m", id, verb] = segments.as_slice() {
             return self.machine_api(id, verb, auth, body.clone());
         }
+        if let ("POST", ["v1", "outpost", op]) = (method, segments.as_slice()) {
+            return self.outpost(op, body);
+        }
         if !auth.is_some_and(|t| constant_time_eq(t.as_bytes(), self.token.as_bytes())) {
             return (
                 401,
@@ -221,6 +269,10 @@ impl Service {
                 json!({"protocol_version": PROTOCOL_VERSION, "version": env!("CARGO_PKG_VERSION")}),
             ),
             ("POST", ["v1", "allocations"]) => self.allocate(body),
+            ("GET", ["v1", "outposts"]) => (
+                200,
+                json!({"protocol_version": PROTOCOL_VERSION, "outposts": self.outposts.list()}),
+            ),
             ("GET", ["v1", "allocations", id]) => {
                 let found = self.allocations.lock().expect("poisoned").get(id).cloned();
                 match found.and_then(|a| self.machine(&a.machine).map(|m| (a, m))) {
@@ -305,7 +357,56 @@ impl Service {
                 ),
             );
         };
-        (200, machine_api::serve(&self.config, machine, verb, body))
+        let platform = self.platform(machine.display_name());
+        (
+            200,
+            machine_api::serve(&self.reach(), machine, &platform, verb, body),
+        )
+    }
+
+    /// The outpost channel: `hello`, `poll` and `reply`.
+    fn outpost(&self, op: &str, body: &Value) -> Reply {
+        let result = match op {
+            "hello" => self.outposts.hello(body),
+            "poll" => {
+                let result = self.outposts.poll(body);
+                if result.is_ok() {
+                    self.learn_outpost_platforms();
+                }
+                result
+            }
+            "reply" => self.outposts.reply(body),
+            _ => Err((
+                404,
+                refusal(
+                    "unsupported",
+                    &format!("no outpost operation {op:?}"),
+                    "see docs/outpost.md",
+                ),
+            )),
+        };
+        match result {
+            Ok(reply) => (200, reply),
+            Err((status, reply)) => (status, reply),
+        }
+    }
+
+    /// Record the os/arch connected outposts reported, where the
+    /// configuration does not say.
+    fn learn_outpost_platforms(&self) {
+        let mut platforms = self.platforms.lock().expect("poisoned");
+        for machine in self.config.machines.iter().filter(|m| m.is_outpost()) {
+            let info = self.outposts.info(machine.display_name());
+            let platform = platforms
+                .entry(machine.display_name().to_string())
+                .or_default();
+            if platform.os.is_none() {
+                platform.os = info["os"].as_str().map(str::to_string);
+            }
+            if platform.arch.is_none() {
+                platform.arch = info["arch"].as_str().map(str::to_string);
+            }
+        }
     }
 }
 

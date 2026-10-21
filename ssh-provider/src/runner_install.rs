@@ -20,6 +20,15 @@ pub struct RunnerPolicy {
     #[serde(default)]
     pub artifacts: BTreeMap<String, String>,
     pub remote_root: String,
+    /// The machine's OS when its owner knows it (`ralphus-fleet` passes its
+    /// configured or probed value); `windows` routes verbs through
+    /// [`crate::windows`].
+    #[serde(default)]
+    pub os: Option<String>,
+    /// The machine's architecture when known, so a Windows upload need not
+    /// probe for it.
+    #[serde(default)]
+    pub arch: Option<String>,
 }
 
 pub fn policy_from_env(raw: Option<&str>) -> Result<Option<RunnerPolicy>, String> {

@@ -1105,6 +1105,8 @@ version = "0.1.0"
 dependencies = [
  "base64",
  "getrandom 0.2.17",
+ "ralphus-test-support",
+ "ring",
  "serde",
  "serde_json",
  "tiny_http",
@@ -1162,10 +1164,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "ralphus-outpost"
+version = "0.1.0"
+dependencies = [
+ "ralphus-fleet",
+ "ralphus-runner",
+ "ralphus-test-support",
+ "serde_json",
+ "tiny_http",
+ "ureq",
+]
+
+[[package]]
 name = "ralphus-runner"
 version = "0.1.0"
 dependencies = [
  "base64",
+ "getrandom 0.2.17",
  "gif",
  "git2",
  "nix",
@@ -1173,6 +1188,7 @@ dependencies = [
  "opentelemetry_sdk",
  "png",
  "ralphus-core",
+ "ralphus-test-support",
  "serde",
  "serde_json",
  "sha2",
@@ -1196,8 +1212,10 @@ dependencies = [
 name = "ralphus-ssh-provider"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "getrandom 0.2.17",
  "ralphus-core",
+ "ralphus-test-support",
  "serde",
  "serde_json",
  "sha2",

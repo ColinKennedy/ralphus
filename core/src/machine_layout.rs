@@ -1,5 +1,8 @@
-//! Deterministic remote storage layout for persistent Git provisioning
-//! (RAL-355 Phase 2/4).
+//! Deterministic storage layout for persistent Git provisioning on a remote
+//! machine (RAL-355 Phase 2/4). Shared by every place that lays projects out
+//! under a machine's `remote_root`: `ralphus-ssh-provider`'s shell scripts
+//! and the machine-side verbs in `ralphus-runner` (`runner/src/machine/`),
+//! so a workspace path derived by one is the path the other expects.
 //!
 //! ```text
 //! <remote_root>/
@@ -30,12 +33,38 @@
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 
-use crate::config::sanitize_slug;
-
 fn hash_hex(value: &str) -> String {
     let mut hasher = DefaultHasher::new();
     value.hash(&mut hasher);
     format!("{:016x}", hasher.finish())
+}
+
+/// Reduce an arbitrary path or name to a short, shell-safe slug: its final
+/// path component, with anything that is not alphanumeric/`-`/`_` collapsed
+/// to `_`, capped to a reasonable length so it stays readable.
+#[must_use]
+pub fn sanitize_slug(value: &str) -> String {
+    let last = value
+        .rsplit(['/', '\\'])
+        .find(|s| !s.is_empty())
+        .unwrap_or("workspace");
+    let cleaned: String = last
+        .chars()
+        .map(|c| {
+            if c.is_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let trimmed = cleaned.trim_matches('_');
+    let trimmed = if trimmed.is_empty() {
+        "workspace"
+    } else {
+        trimmed
+    };
+    trimmed.chars().take(48).collect()
 }
 
 /// The deterministic project directory under `remote_root`, derived from the

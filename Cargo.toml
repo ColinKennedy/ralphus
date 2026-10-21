@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["core", "daemon", "librarian", "auth", "keygen", "bench-types", "bench-macros", "bench-harness", "ssh-provider", "fleet", "runner", "cli", "mcp", "shell-syntax", "shell-syntax/grammars", "stress", "test-support"]
+members = ["core", "daemon", "librarian", "auth", "keygen", "bench-types", "bench-macros", "bench-harness", "ssh-provider", "fleet", "outpost", "runner", "cli", "mcp", "shell-syntax", "shell-syntax/grammars", "stress", "test-support"]
 # Vendored, patched dependencies (wired in by `[patch.crates-io]` below) are
 # not workspace members: the workspace lints are not theirs to meet.
 exclude = ["vendor/tiny_http"]
@@ -60,6 +60,10 @@ sha2 = "0.10"
 # dependency-light crate (already resolved transitively via the TLS stack)
 # rather than pulling in the full `rand` ecosystem for one `getrandom()` call.
 getrandom = "0.2"
+# The ralphus-fleet <-> ralphus-outpost channel's mutual authentication and
+# encryption (HMAC-SHA256, HKDF, ChaCha20-Poly1305; docs/outpost.md). Already
+# in the tree through rustls, so this adds no crate to the lock file.
+ring = "0.17"
 # UTC wall-clock parsing only (RAL-122 scheduler down-time windows) — no other
 # crate in the workspace needs date/time handling, so this is deliberately
 # minimal: no "clock"-derived local-time features beyond `Utc::now`.

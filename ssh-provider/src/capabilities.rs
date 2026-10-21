@@ -48,16 +48,30 @@ const SUPPORTED_OPS: &[&str] = &[
 pub fn run(uri: &str, config: &EffectiveConfig) -> Value {
     let (os, arch) = uri::parse(uri)
         .ok()
-        .and_then(|target| ssh_command(&target, "uname -s; uname -m", config, None).ok())
-        .map(|output| {
-            let mut lines = output
-                .lines()
-                .map(str::trim)
-                .filter(|line| !line.is_empty());
-            (
-                lines.next().map(str::to_lowercase),
-                lines.next().map(str::to_lowercase),
-            )
+        .and_then(|target| {
+            ssh_command(&target, "uname -s; uname -m", config, None)
+                .ok()
+                .filter(|output| !output.trim().is_empty())
+                .map(|output| {
+                    let mut lines = output
+                        .lines()
+                        .map(str::trim)
+                        .filter(|line| !line.is_empty());
+                    // Git for Windows' `uname` (on PATH when its usr\bin
+                    // is) names the MSYS layer, not the OS.
+                    let os = lines.next().map(str::to_lowercase).map(|os| {
+                        if ["mingw", "msys", "cygwin"]
+                            .iter()
+                            .any(|p| os.starts_with(p))
+                        {
+                            "windows".to_string()
+                        } else {
+                            os
+                        }
+                    });
+                    (os, lines.next().map(str::to_lowercase))
+                })
+                .or_else(|| windows_platform(&target, config))
         })
         .unwrap_or((None, None));
 
@@ -93,6 +107,30 @@ pub fn run(uri: &str, config: &EffectiveConfig) -> Value {
     })
 }
 
+/// A machine without `uname` may be Windows, whose OpenSSH runs commands
+/// through `cmd.exe`: `echo %OS% %PROCESSOR_ARCHITECTURE%` there prints
+/// `Windows_NT AMD64`.
+fn windows_platform(
+    target: &uri::SshTarget,
+    config: &EffectiveConfig,
+) -> Option<(Option<String>, Option<String>)> {
+    let output = ssh_command(target, "echo %OS% %PROCESSOR_ARCHITECTURE%", config, None).ok()?;
+    parse_windows_platform(&output)
+}
+
+fn parse_windows_platform(output: &str) -> Option<(Option<String>, Option<String>)> {
+    let mut words = output.split_whitespace();
+    if words.next()? != "Windows_NT" {
+        return None;
+    }
+    let arch = words.next().map(|a| match a.to_ascii_lowercase().as_str() {
+        "amd64" | "x64" => "x86_64".to_string(),
+        "arm64" => "aarch64".to_string(),
+        other => other.to_string(),
+    });
+    Some((Some("windows".to_string()), arch))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -120,6 +158,18 @@ mod tests {
         assert!(ops.iter().any(|v| v == "run"));
         assert!(ops.iter().any(|v| v == "materialize"));
         assert!(ops.iter().any(|v| v == "channel"));
+    }
+
+    #[test]
+    fn a_cmd_exe_platform_echo_reads_as_windows() {
+        assert_eq!(
+            parse_windows_platform("Windows_NT AMD64\r\n"),
+            Some((Some("windows".to_string()), Some("x86_64".to_string())))
+        );
+        assert_eq!(
+            parse_windows_platform("%OS% %PROCESSOR_ARCHITECTURE%"),
+            None
+        );
     }
 
     #[test]

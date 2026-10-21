@@ -3,11 +3,15 @@
 //!
 //! Ralphus asks it for a machine that satisfies a request; it picks one of
 //! the machines in its own configuration, hands back an allocation, and
-//! serves that allocation's Machine API by driving the machine over SSH
-//! through `ralphus-ssh-provider`. Which machines exist and how they are
-//! reached is entirely this service's business.
+//! serves that allocation's Machine API -- by driving the machine over SSH
+//! through `ralphus-ssh-provider`, or by handing the request to the
+//! machine's own `ralphus-outpost`, which connects out to this service.
+//! Which machines exist and how they are reached is entirely this service's
+//! business.
 
 pub mod allocations;
 pub mod config;
 pub mod machine_api;
+pub mod outpost_wire;
+pub mod outposts;
 pub mod server;
