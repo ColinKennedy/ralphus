@@ -193,9 +193,22 @@ class Daemon:
 class Fleet:
     """A ralphus-fleet process serving a copy of the user's fleet config."""
 
-    def __init__(self, root: Path, bin_dir: Path, source: Path, token: str, listen: str | None = None):
+    def __init__(self, root: Path, bin_dir: Path, source: Path, token: str, listen: str | None = None,
+                 external_url: str | None = None):
         self.root = root
         self.bin_dir = bin_dir
+        self.process: subprocess.Popen[bytes] | None = None
+        if external_url:
+            # A fleet the user runs (somewhere outposts can reach): read its
+            # machines, never start or stop it.
+            self.external = True
+            self.url = external_url.rstrip("/")
+            self.listen = self.url
+            self.token = token
+            self.log_path = source
+            self.config = tomllib.loads(source.read_text())
+            return
+        self.external = False
         if listen:
             self.listen = listen
             self.port = int(listen.rsplit(":", 1)[1])
@@ -223,10 +236,11 @@ class Fleet:
         )
         self.config_path.write_text(prefix + "\n".join(kept) + (sep + rest if sep else ""))
         self.config = tomllib.loads(self.config_path.read_text())
-        self.process: subprocess.Popen[bytes] | None = None
         self.start()
 
     def start(self) -> None:
+        if self.external:
+            return
         env = dict(os.environ)
         env[FLEET_TOKEN_ENV] = self.token
         log_file = open(self.log_path, "ab")  # noqa: SIM115 -- owned by the process
@@ -251,6 +265,8 @@ class Fleet:
         raise RuntimeError(f"ralphus-fleet did not answer; see {self.log_path}")
 
     def stop(self) -> None:
+        if self.external:
+            return
         if self.process and self.process.poll() is None:
             self.process.terminate()
             try:
@@ -372,7 +388,17 @@ def run(args: argparse.Namespace) -> int:
     run_id = secrets.token_hex(3)
     secret_value = f"fleet-e2e-value-{secrets.token_hex(8)}"
 
-    fleet = Fleet(root, bin_dir, Path(args.fleet_config), secrets.token_hex(32), args.fleet_listen)
+    if args.fleet_url:
+        token = os.environ.get(FLEET_TOKEN_ENV, "").strip()
+        if not token:
+            log(f"--fleet-url needs the fleet's service token in {FLEET_TOKEN_ENV}")
+            return 2
+        if args.restart_fleet:
+            log("--fleet-url: the harness does not restart a fleet it did not start")
+            args.restart_fleet = False
+    else:
+        token = secrets.token_hex(32)
+    fleet = Fleet(root, bin_dir, Path(args.fleet_config), token, args.fleet_listen, args.fleet_url)
     daemon = None
     try:
         outposts = sorted(fleet.outpost_names())
@@ -557,6 +583,9 @@ def main() -> int:
     parser.add_argument("--keep", action="store_true", help="leave the daemon and ralphus-fleet running")
     parser.add_argument("--fleet-listen", help="HOST:PORT for ralphus-fleet to listen on (default a free "
                         "loopback port); outposts connect to it, so fix it when any machine is an outpost")
+    parser.add_argument("--fleet-url", help="use a ralphus-fleet you run yourself at this URL (its "
+                        f"service token in ${FLEET_TOKEN_ENV}, --fleet-config describing its machines) "
+                        "instead of starting one, e.g. where outposts can reach it; it is not restarted")
     parser.add_argument("--outpost-timeout", type=float, default=120,
                         help="seconds to wait for outpost machines to connect")
     parser.add_argument("--local-clone", action="store_true",

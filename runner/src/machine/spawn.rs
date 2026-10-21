@@ -9,6 +9,7 @@ pub enum DetachError {
     /// Windows refused to let the process leave the job object this one
     /// runs in (an SSH session's job, which kills everything in it when the
     /// session ends), so a detached process would not survive the request.
+    #[cfg_attr(not(windows), allow(dead_code))]
     BreakawayRefused,
     /// Any other start failure.
     Other(String),

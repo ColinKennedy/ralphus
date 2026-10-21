@@ -63,8 +63,24 @@ fn serve(mut args: Vec<String>) -> Result<(), String> {
     let base_url = config
         .public_url
         .clone()
-        .unwrap_or_else(|| format!("http://{}", config.listen));
+        .unwrap_or_else(|| default_base_url(&config.listen));
     run(Service::new(config, base_url, token, allocations))
+}
+
+/// `http://<listen>`, except that a wildcard address (`0.0.0.0`, `[::]`),
+/// which no client can connect to, is given as loopback: set `public_url`
+/// when ralphus runs on another host.
+fn default_base_url(listen: &str) -> String {
+    let (host, port) = listen.rsplit_once(':').unwrap_or((listen, ""));
+    let host = match host {
+        "0.0.0.0" | "[::]" | "::" => "127.0.0.1",
+        other => other,
+    };
+    if port.is_empty() {
+        format!("http://{host}")
+    } else {
+        format!("http://{host}:{port}")
+    }
 }
 
 #[allow(clippy::print_stdout)] // the listing is this command's product
@@ -194,5 +210,17 @@ fn main() -> ExitCode {
             eprintln!("ralphus-fleet: {e}");
             ExitCode::FAILURE
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::default_base_url;
+
+    #[test]
+    fn a_wildcard_listen_address_is_advertised_as_loopback() {
+        assert_eq!(default_base_url("0.0.0.0:7900"), "http://127.0.0.1:7900");
+        assert_eq!(default_base_url("[::]:7900"), "http://127.0.0.1:7900");
+        assert_eq!(default_base_url("10.0.0.5:7900"), "http://10.0.0.5:7900");
     }
 }

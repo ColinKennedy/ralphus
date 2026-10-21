@@ -242,7 +242,7 @@ Top level:
 | Key | Default | Meaning |
 |---|---|---|
 | `listen` | `127.0.0.1:7900` | `host:port` to listen on (outposts must reach it) |
-| `public_url` | `http://<listen>` | the URL the daemon reaches the service at |
+| `public_url` | `http://<listen>` (loopback for `0.0.0.0`) | the URL the daemon reaches the service at; set it when the daemon is on another host |
 | `token_env` | required | variable holding the service token the daemon presents |
 | `ssh_provider` | next to `ralphus-fleet`, then `PATH` | the `ralphus-ssh-provider` program |
 | `ssh_config_file` | OpenSSH default | `ssh -F` file for every SSH machine |

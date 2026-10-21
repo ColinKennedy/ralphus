@@ -75,7 +75,11 @@ Because outposts connect to the fleet, give the fleet a fixed address with
 `--fleet-listen` (`0.0.0.0:7931` to let a WSL distribution or a container
 reach it; the daemon still uses loopback). The harness waits up to
 `--outpost-timeout` seconds for every outpost to connect, and they reconnect
-by themselves when the harness restarts the fleet.
+by themselves when the harness restarts the fleet. When the machines cannot
+reach this host at all (an inbound firewall), run `ralphus-fleet serve`
+yourself somewhere they can, with its service token in
+`$RALPHUS_E2E_FLEET_TOKEN`, and pass `--fleet-url` (the harness then neither
+starts nor restarts it).
 
 An outpost running on the daemon's own host (with its own `remote_root`) is
 useful for testing the transport, but it does not prove remote execution:

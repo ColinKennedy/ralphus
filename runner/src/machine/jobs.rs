@@ -119,15 +119,15 @@ fn read_ms(path: &Path) -> Option<u128> {
 }
 
 /// Whether the job in `dir` (in `starting` or `running`) still has a live
-/// supervisor.
+/// supervisor: a fresh heartbeat, or none yet within the start-up grace
+/// period after the job was created.
 fn alive(dir: &Path) -> bool {
     let now = now_ms();
     if let Some(beat) = read_ms(&dir.join("heartbeat")) {
         return now.saturating_sub(beat) <= HEARTBEAT_STALE_MS;
     }
-    read_text(&dir.join("state")).as_deref() == Some("starting")
-        && read_ms(&dir.join("created_at"))
-            .is_some_and(|created| now.saturating_sub(created) <= STARTING_GRACE_MS)
+    read_ms(&dir.join("created_at"))
+        .is_some_and(|created| now.saturating_sub(created) <= STARTING_GRACE_MS)
 }
 
 fn mark_lost(dir: &Path) {
@@ -400,6 +400,8 @@ pub fn supervise(dir: &Path) {
 }
 
 fn supervise_with_env(dir: &Path, environment: &BTreeMap<String, String>) {
+    // Beat once before anything can read the job as running.
+    let _ = write_text(&dir.join("heartbeat"), &now_ms().to_string());
     let (stop, stopped) = std::sync::mpsc::channel::<()>();
     let heartbeat = {
         let path = dir.join("heartbeat");
@@ -546,6 +548,12 @@ mod tests {
         write_text(&dir.join("state"), "starting").unwrap();
         write_text(&dir.join("created_at"), &now_ms().to_string()).unwrap();
         assert!(alive(&dir), "a job still starting gets a grace period");
+        // A supervisor that has marked the job running but not yet beaten
+        // its first heartbeat is not lost.
+        write_text(&dir.join("state"), "running").unwrap();
+        assert!(alive(&dir));
+        write_text(&dir.join("created_at"), "1").unwrap();
+        assert!(!alive(&dir), "no heartbeat long after creation is lost");
     }
 
     #[test]
