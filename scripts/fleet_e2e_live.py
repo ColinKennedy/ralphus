@@ -373,7 +373,9 @@ def secret_check_command(machine: dict, variable: str, with_cache: bool = False)
 
 def handoff_cells(machine: dict, run: str, cwd: str, review: str) -> str:
     """The cells added to task A: install the stand-in agent, then a prompt
-    cell (run by it) whose reply is the live handoff."""
+    cell (run by it) whose reply is the live handoff. The handoff cell runs
+    last in its task -- a review collects only the latest-finished cell's
+    handoff per task -- so it waits for task A's first cell ("work") too."""
     return f"""
 [[task.cell]]
 id = "install-agent"
@@ -386,7 +388,7 @@ review = "{review}"
 [[task.cell]]
 id = "handoff"
 cwd = "{cwd}"
-depends_on = ["install-agent"]
+depends_on = ["install-agent", "work"]
 agent = "{AGENT_PROFILE}"
 prompt = "Hand off a live check for this change. FLEET_E2E_HANDOFF {run}"
 review = "{review}"

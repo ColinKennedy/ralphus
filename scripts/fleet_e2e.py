@@ -376,6 +376,7 @@ project = "{project}"
 machine = {{ provider = "fleet", labels = ["{label_a}"] }}
 
 [[task.cell]]
+{'id = "work"' if live_actions else ""}
 cwd = "{cwd_a}"
 command = {json.dumps(work_a)}
 mode = "raw"
