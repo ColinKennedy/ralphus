@@ -55,12 +55,20 @@ fn isolation_root() -> PathBuf {
 /// on a file that does exist is recorded as a warning, since it is the likely
 /// cause of an unexpected re-login prompt under isolation.
 pub fn preserve_auth_file(real_dir: Option<&Path>, isolated_dir: &Path, filename: &str) {
-    let Some(real_dir) = real_dir else {
-        return;
-    };
+    let _ = copy_into_isolation(real_dir, isolated_dir, filename);
+}
+
+/// [`preserve_auth_file`], returning the original's path and the exact bytes
+/// written into the copy when the copy was made.
+fn copy_into_isolation(
+    real_dir: Option<&Path>,
+    isolated_dir: &Path,
+    filename: &str,
+) -> Option<(PathBuf, Vec<u8>)> {
+    let real_dir = real_dir?;
     let source = real_dir.join(filename);
     if !source.is_file() {
-        return;
+        return None;
     }
     if let Err(e) = create_private_dir(isolated_dir) {
         emit_isolation_warning(
@@ -69,27 +77,53 @@ pub fn preserve_auth_file(real_dir: Option<&Path>, isolated_dir: &Path, filename
             filename,
             &e,
         );
-        return;
+        return None;
     }
     let copy = isolated_dir.join(filename);
-    match std::fs::copy(source, &copy).and_then(|_| make_owner_only(&copy)) {
-        Ok(()) => crate::cartographer::emit(
-            "runner",
-            "preserved file into isolated config directory",
-            "debug",
-            crate::cartographer::EventContext::default(),
-            serde_json::json!({
-                "isolated_dir": isolated_dir.display().to_string(),
-                "file": filename,
-            }),
-        ),
-        Err(e) => emit_isolation_warning(
-            "could not preserve file into isolated config directory",
-            isolated_dir,
-            filename,
-            &e,
-        ),
+    let copied = std::fs::read(&source).and_then(|bytes| {
+        write_owner_only(&copy, &bytes)?;
+        Ok(bytes)
+    });
+    match copied {
+        Ok(bytes) => {
+            crate::cartographer::emit(
+                "runner",
+                "preserved file into isolated config directory",
+                "debug",
+                crate::cartographer::EventContext::default(),
+                serde_json::json!({
+                    "isolated_dir": isolated_dir.display().to_string(),
+                    "file": filename,
+                }),
+            );
+            Some((source, bytes))
+        }
+        Err(e) => {
+            emit_isolation_warning(
+                "could not preserve file into isolated config directory",
+                isolated_dir,
+                filename,
+                &e,
+            );
+            None
+        }
     }
+}
+
+/// Write `bytes` to `path`, leaving it readable only by its owner.
+fn write_owner_only(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write as _;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path)?;
+    file.write_all(bytes)?;
+    drop(file);
+    make_owner_only(path)
 }
 
 /// The filenames a Claude Code isolated config directory receives from the
@@ -132,6 +166,12 @@ const LEASE_MARKER_PREFIX: &str = ".ralphus-lease-";
 /// stripped. A dead runner's pid that has since been reused by an unrelated
 /// process keeps its directory spared until that process exits -- the sweep
 /// errs on the side of not deleting.
+///
+/// Before a login copy is removed -- by release or by the sweep -- a refresh
+/// the agent made inside it is written back to the original
+/// ([`sync_back`]), and a copy that cannot be written back is kept rather
+/// than deleted: OAuth refresh tokens rotate, so the copy may hold the only
+/// valid one.
 ///
 /// The directory itself stays: it also holds the agent's own session
 /// transcripts, which a later resume of the same cell reads.
@@ -187,9 +227,32 @@ impl IsolationLease {
     /// Copy `filename` from `real_dir` into the leased directory -- see
     /// [`preserve_auth_file`]. Only a `filename` among the lease's preserved
     /// names is removed when the run ends; any other copy stays.
+    ///
+    /// A login ([`SYNC_BACK_NAMES`]) is recorded with its original's path and
+    /// the hash of what was copied, so a refresh the agent makes inside the
+    /// copy is written back to the original before the copy is removed. A
+    /// copy already in the directory (a still-running or crashed run's) is
+    /// synced back first rather than overwritten; if that fails the existing
+    /// copy is kept as is, since it may hold the only valid token.
     pub fn preserve(&self, real_dir: Option<&Path>, filename: &str) {
-        let _lock = DirLock::acquire(&self.dir);
-        preserve_auth_file(real_dir, &self.dir, filename);
+        let lock = DirLock::acquire(&self.dir);
+        let is_login = SYNC_BACK_NAMES.contains(&filename);
+        if is_login
+            && self.dir.join(filename).is_file()
+            && (lock.is_none() || sync_back(&self.dir, filename).is_err())
+        {
+            return;
+        }
+        let copied = copy_into_isolation(real_dir, &self.dir, filename);
+        if !is_login {
+            return;
+        }
+        match copied {
+            Some((source, bytes)) => write_origin(&self.dir, filename, &source, &bytes),
+            None => {
+                let _ = remove_file_retrying(&origin_path(&self.dir, filename));
+            }
+        }
     }
 
     /// Drop this run's marker and, unless another live lease still holds the
@@ -411,9 +474,19 @@ impl DirLock {
     }
 }
 
+/// Remove `names` from `dir`; the caller holds `dir`'s [`DirLock`]. A login
+/// ([`SYNC_BACK_NAMES`]) is first synced back to its original
+/// ([`sync_back`]); when that fails the copy is kept, because it may hold the
+/// only valid token -- a later release or sweep retries.
 fn remove_preserved_files(dir: &Path, names: &[&str]) {
     for name in names {
         let path = dir.join(name);
+        if SYNC_BACK_NAMES.contains(name) {
+            if path.is_file() && sync_back(dir, name).is_err() {
+                continue;
+            }
+            let _ = remove_file_retrying(&origin_path(dir, name));
+        }
         if !path.exists() {
             continue;
         }
@@ -447,6 +520,282 @@ fn remove_file_retrying(path: &Path) -> std::io::Result<()> {
         match std::fs::remove_file(path) {
             Ok(()) => return Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => {
+                attempt += 1;
+                if !cfg!(windows) || attempt >= ATTEMPTS {
+                    return Err(e);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+        }
+    }
+}
+
+/// The preserved logins an agent may refresh in place: OAuth refresh tokens
+/// rotate, so after a refresh inside the copy the original's token is
+/// retired and the copy holds the only valid one. These are written back to
+/// the original ([`sync_back`]) before the copy is removed.
+const SYNC_BACK_NAMES: &[&str] = &[".credentials.json", "auth.json"];
+
+/// Prefix of the provenance file recorded next to a preserved login:
+/// `<prefix><login file name>`, holding the original's path and the SHA-256
+/// of the bytes copied in (never the contents).
+const ORIGIN_PREFIX: &str = ".ralphus-origin-";
+
+fn origin_path(dir: &Path, name: &str) -> PathBuf {
+    dir.join(format!("{ORIGIN_PREFIX}{name}"))
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest as _, Sha256};
+    Sha256::digest(bytes)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+fn write_origin(dir: &Path, name: &str, source: &Path, copied: &[u8]) {
+    let record = serde_json::json!({
+        "source": source.display().to_string(),
+        "sha256": sha256_hex(copied),
+    });
+    if let Err(e) = write_owner_only(&origin_path(dir, name), record.to_string().as_bytes()) {
+        emit_isolation_warning(
+            "could not record where a preserved login came from",
+            dir,
+            name,
+            &e,
+        );
+    }
+}
+
+/// The original's path and the hash of what was copied from it.
+fn read_origin(dir: &Path, name: &str) -> Option<(PathBuf, String)> {
+    let text = std::fs::read_to_string(origin_path(dir, name)).ok()?;
+    let record: serde_json::Value = serde_json::from_str(&text).ok()?;
+    Some((
+        PathBuf::from(record.get("source")?.as_str()?),
+        record.get("sha256")?.as_str()?.to_string(),
+    ))
+}
+
+/// What [`sync_back`] did with a preserved login.
+#[derive(Debug, PartialEq, Eq)]
+enum SyncBack {
+    /// The copy is what was copied in, or the original already holds it.
+    Unchanged,
+    /// No provenance record: a copy from before provenance was recorded, so
+    /// there is no known original to write to.
+    NoOrigin,
+    /// The refreshed copy replaced the original.
+    WroteBack,
+    /// The copy changed, but the original changed too and is kept -- see
+    /// [`sync_back`].
+    KeptOriginal,
+}
+
+/// Write a preserved login that the agent refreshed back to the original it
+/// was copied from, so removing the copy never loses the only valid token.
+/// The caller holds `dir`'s [`DirLock`]. `Err` means the copy must be kept.
+///
+/// The rule, judged by content hash rather than mtime:
+/// - copy unchanged since it was copied in: nothing to do;
+/// - original still holds exactly what was copied in: the copy replaces it
+///   (compare-and-swap on the original's hash);
+/// - original changed meanwhile (another run synced back first, or the
+///   operator's own CLI refreshed it): the copy replaces it only when the
+///   freshness timestamp inside the JSON ([`login_freshness`]) is strictly
+///   newer in the copy; with no comparable timestamp the original is kept;
+/// - original deleted: the operator logged out, and the copy is not
+///   resurrected.
+///
+/// Concurrent sync-backs of the same backend serialize on the backend root's
+/// lock (every isolated dir of a backend shares that parent), so the
+/// compare-and-swap holds between ralphus runs. A refresh the operator's own
+/// CLI makes in the instant between reading the original and replacing it
+/// cannot be excluded: that CLI takes no lock ralphus could share.
+fn sync_back(dir: &Path, name: &str) -> Result<SyncBack, ()> {
+    let copy_path = dir.join(name);
+    let Some((source, copied_hash)) = read_origin(dir, name) else {
+        return Ok(SyncBack::NoOrigin);
+    };
+    let copy = match std::fs::read(&copy_path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(SyncBack::Unchanged),
+        Err(e) => {
+            emit_isolation_warning("could not read preserved login", dir, name, &e);
+            return Err(());
+        }
+    };
+    let copy_hash = sha256_hex(&copy);
+    if copy_hash == copied_hash {
+        return Ok(SyncBack::Unchanged);
+    }
+    let backend_root = dir.parent().unwrap_or(dir);
+    let Some(_sync_lock) = DirLock::acquire(backend_root) else {
+        return Err(());
+    };
+    let original = match std::fs::read(&source) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            emit_sync_back(
+                dir,
+                name,
+                &source,
+                "original removed; refreshed copy not restored",
+            );
+            return Ok(SyncBack::KeptOriginal);
+        }
+        Err(e) => {
+            emit_isolation_warning("could not read the original login", dir, name, &e);
+            return Err(());
+        }
+    };
+    let original_hash = sha256_hex(&original);
+    if original_hash == copy_hash {
+        return Ok(SyncBack::Unchanged);
+    }
+    if original_hash != copied_hash {
+        let newer = match (login_freshness(&copy), login_freshness(&original)) {
+            (Some(copy), Some(original)) => copy > original,
+            _ => false,
+        };
+        if !newer {
+            emit_sync_back(dir, name, &source, "original changed meanwhile and is kept");
+            return Ok(SyncBack::KeptOriginal);
+        }
+    }
+    #[cfg(test)]
+    test_hooks::before_write_back(&source);
+    match replace_file_atomically(&source, &copy) {
+        Ok(()) => {
+            emit_sync_back(dir, name, &source, "refreshed login written back");
+            Ok(SyncBack::WroteBack)
+        }
+        Err(e) => {
+            emit_isolation_warning(
+                "could not write a refreshed login back; keeping the copy",
+                dir,
+                name,
+                &e,
+            );
+            Err(())
+        }
+    }
+}
+
+fn emit_sync_back(dir: &Path, name: &str, source: &Path, outcome: &str) {
+    crate::cartographer::emit(
+        "runner",
+        "synced preserved login back to its original",
+        "info",
+        crate::cartographer::EventContext::default(),
+        serde_json::json!({
+            "isolated_dir": dir.display().to_string(),
+            "file": name,
+            "original": source.display().to_string(),
+            "outcome": outcome,
+        }),
+    );
+}
+
+/// The newest token timestamp in a login file, in milliseconds since the
+/// epoch: the largest of every `expiresAt`/`expires_at`/`expires`/`expiry`
+/// (Claude Code's `.credentials.json`, Pi's per-provider `auth.json`) and
+/// `last_refresh`/`lastRefresh` (Codex's `auth.json`) value anywhere in the
+/// document. Numbers below 10^11 are read as seconds; strings as RFC 3339.
+/// `None` when the file is not JSON or carries none of them.
+fn login_freshness(bytes: &[u8]) -> Option<i64> {
+    const KEYS: &[&str] = &[
+        "expiresAt",
+        "expires_at",
+        "expires",
+        "expiry",
+        "last_refresh",
+        "lastRefresh",
+    ];
+    fn as_millis(value: &serde_json::Value) -> Option<i64> {
+        match value {
+            serde_json::Value::Number(n) => {
+                let n = n.as_i64().or_else(|| n.as_f64().map(|f| f as i64))?;
+                Some(if n < 100_000_000_000 { n * 1000 } else { n })
+            }
+            serde_json::Value::String(s) => chrono::DateTime::parse_from_rfc3339(s)
+                .ok()
+                .map(|t| t.timestamp_millis()),
+            _ => None,
+        }
+    }
+    fn walk(value: &serde_json::Value, best: &mut Option<i64>) {
+        match value {
+            serde_json::Value::Object(map) => {
+                for (key, child) in map {
+                    if KEYS.contains(&key.as_str())
+                        && let Some(ms) = as_millis(child)
+                    {
+                        *best = Some(best.map_or(ms, |b| b.max(ms)));
+                    }
+                    walk(child, best);
+                }
+            }
+            serde_json::Value::Array(items) => items.iter().for_each(|i| walk(i, best)),
+            _ => {}
+        }
+    }
+    let value: serde_json::Value = serde_json::from_slice(bytes).ok()?;
+    let mut best = None;
+    walk(&value, &mut best);
+    best
+}
+
+/// Replace `target` with `bytes` atomically: write a temp file in the same
+/// directory, then rename it over `target` (on Windows `std::fs::rename`
+/// replaces an existing file, retried briefly while the file is held open).
+/// The temp file takes `target`'s permissions on Unix (owner-only for every
+/// login the agent CLIs write); on Windows it inherits the directory's ACL
+/// like any new file there.
+fn replace_file_atomically(target: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let dir = target
+        .parent()
+        .ok_or_else(|| std::io::Error::other("login file has no parent directory"))?;
+    let name = target
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let temp = dir.join(format!(".{name}.ralphus-{}-{seq}.tmp", std::process::id()));
+    let result = (|| {
+        use std::io::Write as _;
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&temp)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        drop(file);
+        #[cfg(unix)]
+        if let Ok(meta) = std::fs::metadata(target) {
+            std::fs::set_permissions(&temp, meta.permissions())?;
+        }
+        rename_retrying(&temp, target)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temp);
+    }
+    result
+}
+
+fn rename_retrying(from: &Path, to: &Path) -> std::io::Result<()> {
+    const ATTEMPTS: u32 = 10;
+    let mut attempt = 0;
+    loop {
+        match std::fs::rename(from, to) {
+            Ok(()) => return Ok(()),
             Err(e) => {
                 attempt += 1;
                 if !cfg!(windows) || attempt >= ATTEMPTS {
@@ -523,6 +872,17 @@ mod test_hooks {
         pub(super) static BEFORE_DELETE: RefCell<Option<DirHook>> = const { RefCell::new(None) };
         /// Runs the first time a lock attempt finds the lock held.
         pub(super) static ON_CONTENDED: RefCell<Option<Hook>> = const { RefCell::new(None) };
+        /// Runs under the backend root's lock, just before a refreshed login
+        /// replaces its original.
+        pub(super) static BEFORE_WRITE_BACK: RefCell<Option<DirHook>> = const { RefCell::new(None) };
+    }
+
+    pub(super) fn before_write_back(original: &Path) {
+        BEFORE_WRITE_BACK.with(|h| {
+            if let Some(hook) = h.borrow_mut().as_mut() {
+                hook(original);
+            }
+        });
     }
 
     pub(super) fn before_delete(dir: &Path) {
@@ -850,6 +1210,299 @@ mod tests {
         assert_eq!(lease_marker_pid(".credentials.json"), None);
         assert_eq!(lease_marker_pid(".ralphus-lease-x-1"), None);
         assert_eq!(lease_marker_pid(DIR_LOCK_NAME), None);
+    }
+
+    fn creds(expires_at: i64, token: &str) -> String {
+        format!("{{\"claudeAiOauth\":{{\"refreshToken\":\"{token}\",\"expiresAt\":{expires_at}}}}}")
+    }
+
+    /// A real config dir holding a Claude login that expires at `expires_at`.
+    fn sync_fixture(
+        tag: &str,
+        expires_at: i64,
+    ) -> (ralphus_test_support::TestDir, PathBuf, PathBuf) {
+        let (root, real, backend_root) = lease_fixture(tag);
+        std::fs::write(real.join(".credentials.json"), creds(expires_at, "r0")).unwrap();
+        (root, real, backend_root)
+    }
+
+    /// The runner holding `lease` dies: no release, and its marker names a
+    /// process that no longer exists.
+    fn crash(mut lease: IsolationLease) {
+        let marker = lease.marker.take().unwrap();
+        std::fs::rename(
+            &marker,
+            lease
+                .dir
+                .join(format!("{LEASE_MARKER_PREFIX}{}-0", u32::MAX)),
+        )
+        .unwrap();
+        std::mem::forget(lease);
+    }
+
+    fn read(path: &Path) -> String {
+        std::fs::read_to_string(path).unwrap()
+    }
+
+    #[test]
+    fn a_login_refreshed_during_the_run_is_written_back_then_removed() {
+        let (_root, real, backend_root) = sync_fixture("sync-refreshed", 1_000);
+        let dir = backend_root.join("ws");
+        let lease = IsolationLease::acquire(&dir, NAMES);
+        lease.preserve(Some(&real), ".credentials.json");
+        // The agent refreshes inside the copy; the original's r0 is retired.
+        std::fs::write(dir.join(".credentials.json"), creds(2_000, "r1")).unwrap();
+
+        drop(lease);
+
+        assert_eq!(read(&real.join(".credentials.json")), creds(2_000, "r1"));
+        assert!(!dir.join(".credentials.json").exists());
+        assert!(!origin_path(&dir, ".credentials.json").exists());
+        let leftovers: Vec<_> = std::fs::read_dir(&real)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name())
+            .collect();
+        assert_eq!(
+            leftovers.len(),
+            1,
+            "no temp file left beside the original: {leftovers:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_written_back_login_keeps_the_original_permissions() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let (_root, real, backend_root) = sync_fixture("sync-mode", 1_000);
+        let original = real.join(".credentials.json");
+        std::fs::set_permissions(&original, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let dir = backend_root.join("ws");
+        let lease = IsolationLease::acquire(&dir, NAMES);
+        lease.preserve(Some(&real), ".credentials.json");
+        std::fs::write(dir.join(".credentials.json"), creds(2_000, "r1")).unwrap();
+        drop(lease);
+        assert_eq!(read(&original), creds(2_000, "r1"));
+        let mode = std::fs::metadata(&original).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+
+    #[test]
+    fn an_unchanged_login_is_only_removed() {
+        let (_root, real, backend_root) = sync_fixture("sync-unchanged", 1_000);
+        let original = real.join(".credentials.json");
+        let dir = backend_root.join("ws");
+        let lease = IsolationLease::acquire(&dir, NAMES);
+        lease.preserve(Some(&real), ".credentials.json");
+        let before = std::fs::metadata(&original).unwrap().modified().unwrap();
+        // Same bytes, newer mtime: mtime alone never triggers a write-back.
+        std::fs::write(dir.join(".credentials.json"), creds(1_000, "r0")).unwrap();
+        test_hooks::BEFORE_WRITE_BACK.with(|h| {
+            *h.borrow_mut() = Some(Box::new(|_: &Path| panic!("nothing to write back")));
+        });
+
+        drop(lease);
+
+        test_hooks::BEFORE_WRITE_BACK.with(|h| *h.borrow_mut() = None);
+        assert_eq!(read(&original), creds(1_000, "r0"));
+        assert_eq!(
+            std::fs::metadata(&original).unwrap().modified().unwrap(),
+            before
+        );
+        assert!(!dir.join(".credentials.json").exists());
+    }
+
+    /// The original changed after it was copied in (the operator's own CLI or
+    /// another run refreshed it): the copy wins only when its token
+    /// timestamp is strictly newer; otherwise, or without timestamps, the
+    /// original is kept. Either way the copy is removed.
+    #[test]
+    fn an_original_changed_meanwhile_is_kept_unless_the_copy_is_newer() {
+        for (tag, original_now, copy_now, expected) in [
+            (
+                "sync-orig-newer",
+                creds(3_000, "user"),
+                creds(2_000, "run"),
+                creds(3_000, "user"),
+            ),
+            (
+                "sync-copy-newer",
+                creds(2_000, "user"),
+                creds(3_000, "run"),
+                creds(3_000, "run"),
+            ),
+            (
+                "sync-no-stamp",
+                "{\"a\":1}".to_string(),
+                "{\"a\":2}".to_string(),
+                "{\"a\":1}".to_string(),
+            ),
+        ] {
+            let (_root, real, backend_root) = sync_fixture(tag, 1_000);
+            let dir = backend_root.join("ws");
+            let lease = IsolationLease::acquire(&dir, NAMES);
+            lease.preserve(Some(&real), ".credentials.json");
+            std::fs::write(dir.join(".credentials.json"), &copy_now).unwrap();
+            std::fs::write(real.join(".credentials.json"), &original_now).unwrap();
+
+            drop(lease);
+
+            assert_eq!(read(&real.join(".credentials.json")), expected, "{tag}");
+            assert!(!dir.join(".credentials.json").exists(), "{tag}");
+        }
+    }
+
+    #[test]
+    fn a_deleted_original_is_not_resurrected() {
+        let (_root, real, backend_root) = sync_fixture("sync-logged-out", 1_000);
+        let dir = backend_root.join("ws");
+        let lease = IsolationLease::acquire(&dir, NAMES);
+        lease.preserve(Some(&real), ".credentials.json");
+        std::fs::write(dir.join(".credentials.json"), creds(2_000, "r1")).unwrap();
+        std::fs::remove_file(real.join(".credentials.json")).unwrap();
+        drop(lease);
+        assert!(!real.join(".credentials.json").exists());
+        assert!(!dir.join(".credentials.json").exists());
+    }
+
+    #[test]
+    fn a_copy_that_cannot_be_written_back_is_kept() {
+        let (_root, real, backend_root) = sync_fixture("sync-fail", 1_000);
+        let dir = backend_root.join("ws");
+        let lease = IsolationLease::acquire(&dir, NAMES);
+        lease.preserve(Some(&real), ".credentials.json");
+        std::fs::write(dir.join(".credentials.json"), creds(2_000, "r1")).unwrap();
+        // The original can neither be read nor replaced: the write-back
+        // cannot land, so the only valid token must not be deleted.
+        std::fs::remove_file(real.join(".credentials.json")).unwrap();
+        std::fs::create_dir(real.join(".credentials.json")).unwrap();
+        drop(lease);
+        assert_eq!(read(&dir.join(".credentials.json")), creds(2_000, "r1"));
+        assert!(origin_path(&dir, ".credentials.json").is_file());
+    }
+
+    #[test]
+    fn the_sweep_writes_back_a_crashed_runs_refreshed_login() {
+        let (_root, real, backend_root) = sync_fixture("sync-sweep", 1_000);
+        let crashed = backend_root.join("ws-crashed");
+        let lease = IsolationLease::acquire(&crashed, NAMES);
+        lease.preserve(Some(&real), ".credentials.json");
+        std::fs::write(crashed.join(".credentials.json"), creds(2_000, "r1")).unwrap();
+        crash(lease);
+
+        let next = IsolationLease::acquire(&backend_root.join("ws-next"), NAMES);
+
+        assert_eq!(read(&real.join(".credentials.json")), creds(2_000, "r1"));
+        assert!(!crashed.join(".credentials.json").exists());
+        drop(next);
+    }
+
+    #[test]
+    fn preserving_over_a_refreshed_leftover_writes_it_back_first() {
+        let (_root, real, backend_root) = sync_fixture("sync-reuse", 1_000);
+        let dir = backend_root.join("ws");
+        let crashed = IsolationLease::acquire(&dir, NAMES);
+        crashed.preserve(Some(&real), ".credentials.json");
+        std::fs::write(dir.join(".credentials.json"), creds(2_000, "r1")).unwrap();
+        crash(crashed);
+
+        let next = IsolationLease::acquire(&dir, NAMES);
+        next.preserve(Some(&real), ".credentials.json");
+
+        assert_eq!(read(&real.join(".credentials.json")), creds(2_000, "r1"));
+        assert_eq!(read(&dir.join(".credentials.json")), creds(2_000, "r1"));
+        drop(next);
+        assert!(!dir.join(".credentials.json").exists());
+    }
+
+    /// Two runs copied the same login and both refreshed it; whichever
+    /// releases first, the newest refresh ends up in the original.
+    #[test]
+    fn concurrent_sync_backs_keep_the_newest_refresh() {
+        for (tag, a_first) in [("sync-race-a", true), ("sync-race-b", false)] {
+            let (_root, real, backend_root) = sync_fixture(tag, 1_000);
+            let a_dir = backend_root.join("ws-a");
+            let b_dir = backend_root.join("ws-b");
+            let a = IsolationLease::acquire(&a_dir, NAMES);
+            a.preserve(Some(&real), ".credentials.json");
+            let b = IsolationLease::acquire(&b_dir, NAMES);
+            b.preserve(Some(&real), ".credentials.json");
+            std::fs::write(a_dir.join(".credentials.json"), creds(3_000, "a")).unwrap();
+            std::fs::write(b_dir.join(".credentials.json"), creds(2_000, "b")).unwrap();
+
+            let (first, second) = if a_first { (a, b) } else { (b, a) };
+            let other = std::thread::spawn(move || drop(second));
+            drop(first);
+            other.join().unwrap();
+
+            assert_eq!(
+                read(&real.join(".credentials.json")),
+                creds(3_000, "a"),
+                "{tag}"
+            );
+            assert!(!a_dir.join(".credentials.json").exists());
+            assert!(!b_dir.join(".credentials.json").exists());
+        }
+    }
+
+    /// A second sync-back that starts while the first is mid-write waits for
+    /// the backend lock and then sees the first's result, not the stale
+    /// original it would otherwise compare against.
+    #[test]
+    fn a_sync_back_waits_for_one_in_progress() {
+        use std::sync::mpsc;
+        let (_root, real, backend_root) = sync_fixture("sync-serial", 1_000);
+        let a_dir = backend_root.join("ws-a");
+        let b_dir = backend_root.join("ws-b");
+        let a = IsolationLease::acquire(&a_dir, NAMES);
+        a.preserve(Some(&real), ".credentials.json");
+        let b = IsolationLease::acquire(&b_dir, NAMES);
+        b.preserve(Some(&real), ".credentials.json");
+        std::fs::write(a_dir.join(".credentials.json"), creds(2_000, "a")).unwrap();
+        std::fs::write(b_dir.join(".credentials.json"), creds(3_000, "b")).unwrap();
+
+        let (start_tx, start_rx) = mpsc::channel::<()>();
+        let (waiting_tx, waiting_rx) = mpsc::channel::<()>();
+        let other = std::thread::spawn(move || {
+            start_rx.recv().unwrap();
+            test_hooks::ON_CONTENDED.with(|h| {
+                *h.borrow_mut() = Some(Box::new(move || {
+                    let _ = waiting_tx.send(());
+                }));
+            });
+            drop(b);
+        });
+        let mut start_tx = Some(start_tx);
+        test_hooks::BEFORE_WRITE_BACK.with(|h| {
+            *h.borrow_mut() = Some(Box::new(move |_: &Path| {
+                if let Some(start) = start_tx.take() {
+                    start.send(()).unwrap();
+                    waiting_rx
+                        .recv_timeout(std::time::Duration::from_secs(10))
+                        .expect("the second sync-back must wait for the backend lock");
+                }
+            }));
+        });
+        drop(a);
+        test_hooks::BEFORE_WRITE_BACK.with(|h| *h.borrow_mut() = None);
+        other.join().unwrap();
+
+        assert_eq!(read(&real.join(".credentials.json")), creds(3_000, "b"));
+    }
+
+    #[test]
+    fn login_freshness_reads_each_backends_timestamp() {
+        assert_eq!(
+            login_freshness(creds(1_700_000_000_000, "t").as_bytes()),
+            Some(1_700_000_000_000)
+        );
+        let codex =
+            br#"{"tokens":{"refresh_token":"x"},"last_refresh":"2026-01-02T03:04:05.123456Z"}"#;
+        assert_eq!(login_freshness(codex), Some(1_767_323_045_123));
+        let pi = br#"{"anthropic":{"type":"oauth","expires":1700000000000},"openai":{"expires":1800000000}}"#;
+        assert_eq!(login_freshness(pi), Some(1_800_000_000_000));
+        assert_eq!(login_freshness(b"not json"), None);
+        assert_eq!(login_freshness(b"{\"a\":1}"), None);
     }
 
     #[test]

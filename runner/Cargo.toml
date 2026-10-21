@@ -28,6 +28,7 @@ png = { workspace = true }
 opentelemetry = { workspace = true }
 opentelemetry_sdk = { workspace = true }
 sha2 = { workspace = true }
+chrono = { workspace = true }
 getrandom = { workspace = true }
 sysinfo = { workspace = true }
 git2 = { workspace = true }
