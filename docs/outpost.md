@@ -44,6 +44,15 @@ the `ralphus-outpost` executable for the machine's platform.
    ./ralphus-outpost install --fleet http://fleet-host:7900 --code K7QM-2XRD-9FHT-B4WN
    ```
 
+   On Windows, run it at the machine's desktop (or over Remote Desktop): a
+   session signed in over SSH with a key cannot use the Credential Manager,
+   so `install` there pairs but cannot keep the credential. From SSH, start
+   it in your logon session through a one-time Scheduled Task instead
+   (`schtasks /create /tn ralphus-outpost-once /sc once /st 00:00 /it /tr
+   "<the install command>"`, `schtasks /run /tn ralphus-outpost-once`, then
+   `schtasks /delete /tn ralphus-outpost-once /f`); `install` says so when
+   it hits this.
+
 That is all. `install` pairs with the fleet, keeps the machine's credential in
 the operating system's encrypted per-user store, copies itself into the
 outpost's home directory, registers itself to start automatically, and starts.

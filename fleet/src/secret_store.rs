@@ -67,7 +67,27 @@ impl OsStore {
 
 fn describe_keyring_error(error: &keyring::Error) -> String {
     // keyring's errors never carry the secret itself.
-    format!("the OS credential store refused: {error}")
+    describe_store_failure(&error.to_string())
+}
+
+/// The message for an OS-store failure, with what to do about the one a
+/// user is likely to hit: Windows has no Credential Manager in a session
+/// signed in over SSH with a key (`ERROR_NO_SUCH_LOGON_SESSION`), so the
+/// store refuses there even though it works at the desktop.
+fn describe_store_failure(error: &str) -> String {
+    let mut message = format!("the OS credential store refused: {error}");
+    if error.contains("ERROR_NO_SUCH_LOGON_SESSION") {
+        message.push_str(
+            ". This session cannot use the Windows Credential Manager -- a session signed \
+             in over SSH with a key has no access to it, even when the credential is there. \
+             Run this at the machine's desktop (or over Remote Desktop), or from SSH through \
+             a one-time Scheduled Task that runs in your logon session: `schtasks /create \
+             /tn ralphus-outpost-once /sc once /st 00:00 /it /tr \"<this command>\"`, then \
+             `schtasks /run /tn ralphus-outpost-once` and `schtasks /delete /tn \
+             ralphus-outpost-once /f`",
+        );
+    }
+    message
 }
 
 /// The name of this platform's OS store, for messages.
@@ -277,6 +297,20 @@ pub fn open(kind: StoreKind, service: &str, fallback_dir: &Path) -> Box<dyn Secr
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_session_without_the_credential_manager_says_where_to_run_instead() {
+        let message = describe_store_failure(
+            "Couldn't access platform secure storage: Windows ERROR_NO_SUCH_LOGON_SESSION",
+        );
+        assert!(
+            message.contains("signed in over SSH with a key"),
+            "{message}"
+        );
+        assert!(message.contains("schtasks /create"), "{message}");
+        let other = describe_store_failure("no such entry");
+        assert_eq!(other, "the OS credential store refused: no such entry");
+    }
 
     struct Refusing;
 
