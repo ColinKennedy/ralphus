@@ -1225,13 +1225,11 @@ pub fn integrate_run(store: &crate::store_lock::StoreHandle, runner: &dyn Runner
         &CancelToken::never(),
     );
     if !outcome.committed {
-        fail_integration(
-            store,
-            &g,
-            &run,
+        let reason = outcome.failure.as_deref().unwrap_or(
             "the commits could not be applied to the top branch (the cherry-pick conflicted and \
              the resolver made no change)",
         );
+        fail_integration(store, &g, &run, reason);
         return;
     }
     let head = ws

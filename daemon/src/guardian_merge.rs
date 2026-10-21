@@ -8049,6 +8049,10 @@ pub struct FeedbackOutcome {
     /// covers both an explicit `RALPHUS_PROOF: FAIL` and an agent run that
     /// errored or reported no verdict at all.
     pub proof_passed: Option<bool>,
+    /// Why nothing could be applied, when the pass failed for a reason its
+    /// caller should report as-is (a live run's commits that git could not
+    /// commit for want of an identity); `None` otherwise.
+    pub failure: Option<String>,
 }
 
 /// Outcome of [`run_commit_step`]: whether it produced a real commit, and
@@ -8415,27 +8419,45 @@ pub fn run_live_action_integration(
     outcome
 }
 
+/// What [`cherry_pick_live_commits`] made of a live run's commits.
+#[derive(Debug, PartialEq, Eq)]
+enum LivePick {
+    /// Every commit applied (or was already on the branch); how many applied.
+    Applied(usize),
+    /// A commit conflicted with the branch: the resolver applies the change.
+    Conflict,
+    /// Git could not commit a pick because it has no committer identity on
+    /// the worktree's machine -- not a conflict, so no resolver can help.
+    /// Carries git's error.
+    NoIdentity(String),
+}
+
 /// Cherry-pick `commits` (oldest first) onto `wt`'s HEAD, one at a time. A
 /// commit whose change is already on the branch (feedback or an auto-fix made
-/// the same fix) is skipped rather than failing the pick. On a real conflict
-/// the pick is aborted and the worktree reset to `start`, so whatever handles
-/// the change next sees the branch exactly as it was. Returns how many commits
-/// were applied, or `None` on a conflict.
-fn cherry_pick_live_commits(wt: &Workspace, commits: &[String], start: &str) -> Option<usize> {
+/// the same fix) is skipped rather than failing the pick. On a real conflict,
+/// or when git cannot commit for want of an identity, the pick is aborted and
+/// the worktree reset to `start`, so whatever handles the change next sees the
+/// branch exactly as it was.
+fn cherry_pick_live_commits(wt: &Workspace, commits: &[String], start: &str) -> LivePick {
     let mut applied = 0;
     for commit in commits {
-        if wt
-            .git(&[
-                "-c",
-                "core.editor=true",
-                "cherry-pick",
-                "--allow-empty-message",
-                commit,
-            ])
-            .is_ok()
-        {
-            applied += 1;
-            continue;
+        let error = match wt.git(&[
+            "-c",
+            "core.editor=true",
+            "cherry-pick",
+            "--allow-empty-message",
+            commit,
+        ]) {
+            Ok(_) => {
+                applied += 1;
+                continue;
+            }
+            Err(error) => error,
+        };
+        if crate::workspace::is_git_identity_error(&error) {
+            let _ = wt.git(&["cherry-pick", "--abort"]);
+            let _ = wt.git(&["reset", "--hard", start]);
+            return LivePick::NoIdentity(error);
         }
         let conflicted = wt
             .git(&["diff", "--name-only", "--diff-filter=U"])
@@ -8451,9 +8473,9 @@ fn cherry_pick_live_commits(wt: &Workspace, commits: &[String], start: &str) -> 
         }
         let _ = wt.git(&["cherry-pick", "--abort"]);
         let _ = wt.git(&["reset", "--hard", start]);
-        return None;
+        return LivePick::Conflict;
     }
-    Some(applied)
+    LivePick::Applied(applied)
 }
 
 /// Persist [`run_feedback`]'s outcome on the branch's open PR rows. A branch
@@ -8855,8 +8877,16 @@ fn run_feedback_pass(
     record_action_baseline(id, branch_id, before_resolver_sha.as_deref());
     // Live actions: a live run's commits are cherry-picked first; only a
     // conflict hands the change (carried in `feedback`) to the resolver.
-    let cleanly_picked = match (live_commits, before_resolver_sha.as_deref()) {
+    let pick = match (live_commits, before_resolver_sha.as_deref()) {
         (Some(commits), Some(start)) => cherry_pick_live_commits(&wt, commits, start),
+        _ => LivePick::Conflict,
+    };
+    let cleanly_picked = match pick {
+        LivePick::Applied(applied) => Some(applied),
+        _ => None,
+    };
+    let identity_failure = match &pick {
+        LivePick::NoIdentity(error) => Some(git_identity_detail(&feature, wt.machine(), error)),
         _ => None,
     };
     if live_commits.is_some() {
@@ -8870,7 +8900,8 @@ fn run_feedback_pass(
                     "branch_id": branch_id,
                     "commits": live_commits.map(<[String]>::len),
                     "cherry_picked": cleanly_picked,
-                    "resolver_fallback": cleanly_picked.is_none(),
+                    "resolver_fallback": cleanly_picked.is_none() && identity_failure.is_none(),
+                    "identity_failure": identity_failure,
                 }),
             );
     }
@@ -8880,6 +8911,9 @@ fn run_feedback_pass(
         picked.error = None;
         picked.summary = format!("cherry-picked {applied} live-action commit(s)");
         picked
+    } else if let Some(detail) = &identity_failure {
+        // The resolver would commit on the same machine and fail the same way.
+        crate::runner::RunnerResult::failure(detail)
     } else {
         let result = run_agent_with_stall_recovery(
             store,
@@ -9223,7 +9257,9 @@ fn run_feedback_pass(
     // reported as an explicit failure, surfaced on the branch/PR status
     // rather than silently consuming the single-attempt-per-failure budget
     // while looking like success (the bug `run_commit_step` exists to fix).
-    let (branch_status, detail) = if !result.is_done() {
+    let (branch_status, detail) = if let Some(detail) = &identity_failure {
+        (MergeStatus::Failed, detail.clone())
+    } else if !result.is_done() {
         (
             MergeStatus::Failed,
             format!(
@@ -9321,6 +9357,7 @@ fn run_feedback_pass(
         pushed,
         pushed_sha,
         proof_passed,
+        failure: identity_failure,
     };
     crate::rlog!(
         INFO,
@@ -20431,6 +20468,99 @@ mod tests {
         let view = store.lock().get_guardian(&id).unwrap();
         assert_eq!(view.conflicts_found, None, "no conflict bookkeeping");
         assert_eq!(view.branches[0].conflicts_found, None);
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn live_commits_that_cannot_be_committed_for_want_of_an_identity_are_not_a_conflict() {
+        // A live run's commits apply cleanly to the review's top branch, but
+        // git there has no committer identity: the integration must fail with
+        // the identity named, with no resolver run and the branch untouched.
+        if ["GIT_COMMITTER_NAME", "GIT_AUTHOR_NAME"]
+            .iter()
+            .any(|key| std::env::var_os(key).is_some())
+        {
+            eprintln!("skipped: the environment names a git identity");
+            return;
+        }
+        let (base, repo, _fwt) = make_repo("live-pick-no-identity");
+        g(&repo, &["checkout", "-b", "live", "main"]);
+        std::fs::write(repo.join("live.txt"), "live\n").unwrap();
+        g(&repo, &["add", "live.txt"]);
+        g(&repo, &["commit", "--message", "live fix"]);
+        let live_commit = git(&repo, &["rev-parse", "HEAD"])
+            .unwrap()
+            .trim()
+            .to_string();
+        g(&repo, &["checkout", "main"]);
+        let store = Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
+        let id = {
+            let guard = store.lock();
+            let id = guard
+                .create_guardian("r", "main", repo.to_str().unwrap())
+                .unwrap();
+            guard.add_guardian_branch(&id, "feature/a").unwrap();
+            id
+        };
+        struct MustNotRunRunner;
+        impl Runner for MustNotRunRunner {
+            fn run(&self, _: &RunnerSpec) -> RunnerResult {
+                panic!("no resolver may run for a missing git identity")
+            }
+        }
+        struct NoProofRunner;
+        impl Runner for NoProofRunner {
+            fn run(&self, _: &RunnerSpec) -> RunnerResult {
+                RunnerResult::failure("no agent in this test")
+            }
+        }
+        run_merge(&store, &NoProofRunner, &id);
+        let branch = store.lock().get_guardian(&id).unwrap().branches[0].clone();
+        let worktree = PathBuf::from(branch.worktree.expect("run_merge builds a worktree"));
+        let head_before = git(&worktree, &["rev-parse", "HEAD"]).unwrap();
+        g(&repo, &["config", "user.name", ""]);
+
+        let outcome = run_live_action_integration(
+            &store,
+            &MustNotRunRunner,
+            &id,
+            &branch.id,
+            "carry the live fix",
+            std::slice::from_ref(&live_commit),
+            &CancelToken::never(),
+        );
+
+        assert!(!outcome.committed);
+        let failure = outcome.failure.expect("the identity is reported");
+        assert!(failure.contains("no committer identity"), "{failure}");
+        assert!(failure.contains("not a merge conflict"), "{failure}");
+        assert!(failure.contains("user.email"), "{failure}");
+        assert!(failure.contains("\"ralphus\""), "{failure}");
+        assert_eq!(
+            git(&worktree, &["rev-parse", "HEAD"]).unwrap(),
+            head_before,
+            "the branch is left as it was"
+        );
+        assert!(
+            git(&worktree, &["status", "--porcelain"])
+                .unwrap()
+                .trim()
+                .is_empty(),
+            "the pick is aborted"
+        );
+        let view = store.lock().get_guardian(&id).unwrap();
+        assert_eq!(view.branches[0].merge_status, "failed");
+        assert!(
+            view.branches[0]
+                .detail
+                .as_deref()
+                .is_some_and(|d| d.contains("no committer identity")),
+            "{:?}",
+            view.branches[0].detail
+        );
 
         let _ = std::fs::remove_dir_all(&base);
     }
