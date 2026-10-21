@@ -189,12 +189,46 @@ fn write_readiness(
         );
         return;
     };
-    let _ = writeln!(
-        out,
-        "    readiness: {}",
-        report.summary(&machine.required_agents)
+    let name = machine.display_name();
+    let required: Vec<String> = machine
+        .required_agents
+        .iter()
+        .filter_map(|a| readiness::canonical_agent(a).ok())
+        .map(str::to_string)
+        .collect();
+    let _ = writeln!(out, "    readiness: {}", report.summary(name, &required));
+    let agents = report.agents();
+    if !agents.is_empty() {
+        let states: Vec<String> = agents
+            .iter()
+            .map(|(agent, state)| {
+                let state = match state {
+                    readiness::AgentState::Ready => "ready",
+                    readiness::AgentState::LoginUnclear => "installed, login unclear",
+                    readiness::AgentState::NotInstalled(_) => "not installed",
+                    readiness::AgentState::NotLoggedIn => "NOT LOGGED IN",
+                    readiness::AgentState::NotChecked => "not checked",
+                };
+                format!("{agent} {state}")
+            })
+            .collect();
+        let _ = writeln!(out, "      agents: {}", states.join(", "));
+    }
+    // Fixes for what blocks the required agents, and for any installed
+    // agent that is not logged in.
+    let mut fix_for: Vec<String> = required;
+    fix_for.extend(
+        agents
+            .iter()
+            .filter(|(_, s)| *s == readiness::AgentState::NotLoggedIn)
+            .map(|(a, _)| a.clone()),
     );
-    for check in report.problems() {
+    fix_for.sort();
+    fix_for.dedup();
+    for blocker in report.blockers(name, &fix_for) {
+        let _ = writeln!(out, "      fix: {}", blocker.fix);
+    }
+    for check in report.machine_problems() {
         let _ = writeln!(out, "      {} {}: {}", check.status, check.id, check.detail);
         if let Some(remedy) = &check.remedy {
             let _ = writeln!(out, "        fix: {remedy}");
@@ -396,6 +430,7 @@ mod tests {
             checked_at_ms: 1,
             checks: vec![
                 readiness::Check::new("git", readiness::PASS, "git 2.45"),
+                readiness::Check::new("agent:claude-code", readiness::PASS, "claude can start"),
                 readiness::Check::new("agent-login:claude-code", readiness::FAIL, "not logged in")
                     .with_remedy("run `claude auth login` on the machine"),
             ],
@@ -404,7 +439,15 @@ mod tests {
         write_readiness(&mut out, &config.machines[0], Some(&report));
         let text = String::from_utf8(out).unwrap();
         assert!(text.contains("NOT READY (1 blocking)"), "{text}");
-        assert!(text.contains("fix: run `claude auth login`"), "{text}");
+        assert!(text.contains("agents: claude-code NOT LOGGED IN"), "{text}");
+        assert!(
+            text.contains(
+                "fix: Claude Code on winbox isn't logged in — on that machine run `claude`, then \
+                 `/login`"
+            ),
+            "{text}"
+        );
+
         assert!(
             !text.contains("git 2.45"),
             "passing checks stay quiet: {text}"

@@ -37,7 +37,17 @@ pub fn check(remote_root: &str, agents: Map<String, Value>) -> Report {
     ))];
     for (agent, path) in &agents {
         let executable = path.as_str().filter(|p| !p.trim().is_empty());
-        let launcher = ralphus_runner::execute::preflight_agent(agent, executable, false);
+        // A configured program is taken on trust by the runner's preflight;
+        // here a single-word one must also exist.
+        let launcher = match executable {
+            Some(program)
+                if !program.trim().contains(char::is_whitespace)
+                    && ralphus_runner::shellcmd::find_program(program.trim()).is_none() =>
+            {
+                Err(format!("the configured program {program} does not exist"))
+            }
+            _ => ralphus_runner::execute::preflight_agent(agent, executable, false),
+        };
         let can_start = launcher.is_ok();
         checks.push(agent_check(agent, launcher));
         if can_start {
@@ -115,8 +125,8 @@ fn login_probe_for(agent: &str) -> Option<&'static dyn LoginProbe> {
 fn login_check(agent: &str, probe: &dyn LoginProbe, run: StatusRun) -> Check {
     let id = format!("{CHECK_AGENT_LOGIN}{agent}");
     let remedy = format!(
-        "run `{}` on the machine as the user running ralphus-outpost",
-        probe.login_command()
+        "on this machine, as the user running ralphus-outpost, {}",
+        ralphus_fleet::readiness::login_instructions(probe.backend_name())
     );
     let status = match run {
         StatusRun::Finished { exit_ok, output } => {
@@ -270,7 +280,13 @@ mod tests {
             },
         );
         assert_eq!(logged_out.status, FAIL);
-        assert!(logged_out.remedy.unwrap().contains("claude auth login"));
+        assert!(
+            logged_out
+                .remedy
+                .unwrap()
+                .contains("run `claude`, then `/login`")
+        );
+
         let timed_out = login_check("claude-code", probe, StatusRun::TimedOut);
         assert_eq!(timed_out.status, WARN);
         assert!(login_probe_for("ollama").is_none());

@@ -551,7 +551,7 @@ fn act_on_expectation(
             std::thread::spawn(move || {
                 let report =
                     readiness::check(&root, agents.as_object().cloned().unwrap_or_default());
-                let problems = report.problems();
+                let problems: Vec<_> = report.checks.iter().filter(|c| !c.passed()).collect();
                 if problems.is_empty() {
                     log("readiness: every check passed");
                 } else {

@@ -154,13 +154,22 @@ impl Outposts {
                     ),
                 }
             }
+            // Every CLI agent is checked, so a request naming one can be
+            // judged; configured paths and required agents are added by
+            // their backend name.
             let mut wanted = serde_json::Map::new();
-            for (agent, path) in &machine.agents {
-                wanted.insert(agent.clone(), path.clone().into());
+            for agent in crate::readiness::CLI_AGENTS {
+                wanted.insert(agent.to_string(), Value::Null);
             }
             for agent in &machine.required_agents {
-                wanted.entry(agent.clone()).or_insert(Value::Null);
+                let agent = crate::readiness::canonical_agent(agent).unwrap_or(agent);
+                wanted.entry(agent.to_string()).or_insert(Value::Null);
             }
+            for (agent, path) in &machine.agents {
+                let agent = crate::readiness::canonical_agent(agent).unwrap_or(agent);
+                wanted.insert(agent.to_string(), path.clone().into());
+            }
+
             agents.insert(name.clone(), Value::Object(wanted));
             remote_roots.insert(name.clone(), machine.remote_root.clone());
             slots.insert(name, Slot::default());

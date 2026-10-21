@@ -105,17 +105,26 @@ Each time it connects, the outpost checks its machine and sends the fleet a
 | Check | Fails / warns when | Fix it shows |
 |---|---|---|
 | `git` | git is not on `PATH` (fails) | install Git (for Windows) and restart the outpost |
-| `agent:<name>` | an agent from `[machine.agents]` or `required_agents` cannot start (fails) | install it for the outpost's user, or set its path in `[machine.agents]` |
-| `agent-login:<name>` | Claude Code or Codex is not logged in (fails), or its status is unclear (warns) | `claude auth login` / `codex login` on the machine |
+| `agent:<name>` | a CLI agent (`claude-code`, `codex`, `pi` -- always checked) or one from `[machine.agents]` / `required_agents` cannot start, or its configured path does not exist (fails) | install it for the outpost's user, or set its path in `[machine.agents]` |
+| `agent-login:<name>` | Claude Code or Codex is installed but not logged in (fails), or its status is unclear (warns) | Claude Code: run `claude`, then `/login`; Codex: `codex login` -- on the machine, as the outpost's user |
 | `long-paths` | Windows `LongPathsEnabled` is not 1 (warns) | the `reg add` and `git config core.longpaths` commands |
 | `disk` | under 5 GB free on `remote_root`'s volume (warns) | free space, or move `remote_root` |
 
 The login check runs the agent's own status command (`claude auth status`,
 `codex login status`) and keeps only "logged in or not": no account, email
 or token reaches the report, the log or the fleet. `ralphus-fleet list` shows
-the problems with their fixes; a machine with a failing `git` check, or a
-failing check of an agent in its `required_agents`, is not allocated, and the
-allocation is refused at once with the fix as its remediation.
+each machine's agents (ready, not installed, NOT LOGGED IN) and the fixes.
+
+The daemon tells the fleet which agents a squad's work needs on the machine
+(`requirements.agents`, see
+[the provider API](machine-provider-service.md#provider-service-api)), and
+the machine's `required_agents` add a floor. A machine whose git check fails,
+or that has one of those agents not installed or not logged in, is not
+allocated: the request is refused before any work reaches a machine, with a
+remediation in plain words -- "Claude Code on winbox isn't logged in — on
+that machine run `claude`, then `/login`". A login status that could not be
+told does not block; the cell's own preflight still runs.
+
 
 ## The runner
 

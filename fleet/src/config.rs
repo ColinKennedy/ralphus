@@ -318,17 +318,11 @@ impl FleetConfig {
                     machine.remote_root
                 ));
             }
-            if let Some(agent) = machine.required_agents.iter().find(|a| {
-                a.is_empty()
-                    || !a
-                        .chars()
-                        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
-            }) {
-                return Err(format!(
-                    "{origin}: machine {name:?} required_agents entry {agent:?} must be an agent \
-                     name such as \"claude-code\" or \"codex\""
-                ));
+            for agent in &machine.required_agents {
+                crate::readiness::canonical_agent(agent)
+                    .map_err(|e| format!("{origin}: machine {name:?} required_agents: {e}"))?;
             }
+
             if !["upload", "installed"].contains(&machine.runner.mode.as_str()) {
                 return Err(format!(
                     "{origin}: machine {name:?} runner mode {:?} must be \"upload\" or \"installed\"",

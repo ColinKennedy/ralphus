@@ -193,6 +193,22 @@ impl Service {
     fn allocate(&self, body: &Value) -> Reply {
         let wanted: Requirements =
             serde_json::from_value(body["requirements"].clone()).unwrap_or_default();
+        let mut agents = Vec::new();
+        for agent in &wanted.agents {
+            match crate::readiness::canonical_agent(agent) {
+                Ok(canonical) => agents.push(canonical.to_string()),
+                Err(e) => {
+                    return (
+                        400,
+                        refusal(
+                            "invalid_request",
+                            &format!("requirements.agents: {e}"),
+                            "name agents by their backend",
+                        ),
+                    );
+                }
+            }
+        }
         let scope = body["scope"].clone();
         // A repeated request for the same scope gets the same machine.
         let existing = self
@@ -208,7 +224,7 @@ impl Service {
         }
         self.probe_platforms();
         let platforms = self.platforms.lock().expect("poisoned").clone();
-        let not_ready = self.not_ready();
+        let not_ready = self.not_ready(&agents);
         let mut allocations = self.allocations.lock().expect("poisoned");
         let machine = match choose(&self.config, &platforms, &allocations, &wanted, &not_ready) {
             Ok(machine) => machine,
@@ -239,17 +255,29 @@ impl Service {
         )
     }
 
-    /// Outpost machines whose latest readiness report has a blocking
-    /// problem, with the reasons and fixes.
-    fn not_ready(&self) -> BTreeMap<String, NotReady> {
+    /// Outpost machines whose latest readiness report says they cannot
+    /// serve work needing `agents` (plus each machine's own
+    /// `required_agents`), with the reasons and plain-language fixes. A
+    /// machine that has not reported yet is not judged.
+    fn not_ready(&self, agents: &[String]) -> BTreeMap<String, NotReady> {
         let mut blocked = BTreeMap::new();
         for machine in self.config.machines.iter().filter(|m| m.is_outpost()) {
             let name = machine.display_name();
             let Some(report) = self.outposts.readiness(name) else {
                 continue;
             };
-            let problems = report.blocking(&machine.required_agents);
-            if problems.is_empty() {
+            let mut needed = agents.to_vec();
+            needed.extend(
+                machine
+                    .required_agents
+                    .iter()
+                    .filter_map(|a| crate::readiness::canonical_agent(a).ok())
+                    .map(str::to_string),
+            );
+            needed.sort();
+            needed.dedup();
+            let blockers = report.blockers(name, &needed);
+            if blockers.is_empty() {
                 continue;
             }
             blocked.insert(
@@ -257,20 +285,15 @@ impl Service {
                 NotReady {
                     reason: format!(
                         "{name} is not ready: {}",
-                        problems
+                        blockers
                             .iter()
-                            .map(|c| c.detail.as_str())
+                            .map(|b| b.reason.as_str())
                             .collect::<Vec<_>>()
                             .join("; ")
                     ),
-                    remedy: problems
+                    remedy: blockers
                         .iter()
-                        .map(|c| {
-                            format!(
-                                "on {name}: {}",
-                                c.remedy.as_deref().unwrap_or("see `ralphus-fleet list`")
-                            )
-                        })
+                        .map(|b| b.fix.as_str())
                         .collect::<Vec<_>>()
                         .join("; "),
                 },

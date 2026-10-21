@@ -323,10 +323,19 @@ fn a_paired_outpost_keeps_the_fleets_runner_and_rolls_forward_when_it_changes() 
 }
 
 #[test]
-fn a_machine_missing_a_required_agent_is_refused_with_the_fix() {
+fn an_allocation_needing_an_agent_the_machine_lacks_is_refused_up_front_with_the_fix() {
     let dir = ralphus_test_support::TestDir::new("outpost-readiness");
     let root = root_of(&dir.join("root"));
-    let (fleet, registry) = paired_fleet(&dir, &root, "", "required_agents = [\"no-such-agent\"]");
+    // Point every CLI agent at a missing program, so the check never runs
+    // a real agent on this computer.
+    let missing = |agent: &str| root_of(&dir.join("missing").join(agent));
+    let machine = format!(
+        "[machine.agents]\n\"claude-code\" = {:?}\ncodex = {:?}\npi = {:?}\n",
+        missing("claude"),
+        missing("codex"),
+        missing("pi")
+    );
+    let (fleet, registry) = paired_fleet(&dir, &root, "", &machine);
     let paired =
         ralphus_outpost::pairing::pair(&fleet.url, &registry.start_pairing("box").unwrap())
             .unwrap();
@@ -348,11 +357,28 @@ fn a_machine_missing_a_required_agent_is_refused_with_the_fix() {
         .iter()
         .filter_map(|c| c["id"].as_str())
         .collect();
-    assert!(ids.contains(&"git"), "{report}");
-    assert!(ids.contains(&"agent:no-such-agent"), "{report}");
-    assert!(ids.contains(&"disk"), "{report}");
+    for id in [
+        "git",
+        "agent:claude-code",
+        "agent:codex",
+        "agent:pi",
+        "disk",
+    ] {
+        assert!(ids.contains(&id), "{id}: {report}");
+    }
 
-    let (status, refusal) = try_allocate(&fleet, "another-squad");
+    let ask = |squad: &str, agents: Value| {
+        call(
+            "POST",
+            &format!("{}/v1/allocations", fleet.url),
+            SERVICE_TOKEN,
+            &json!({
+                "requirements": {"labels": ["outpost"], "agents": agents},
+                "scope": {"squad_id": squad, "key": "k"},
+            }),
+        )
+    };
+    let (status, refusal) = ask("needs-claude", json!(["claude-code"]));
     assert_eq!(status, 409, "{refusal}");
     assert!(
         refusal["error"]
@@ -365,9 +391,18 @@ fn a_machine_missing_a_required_agent_is_refused_with_the_fix() {
         refusal["remediation"]
             .as_str()
             .unwrap()
-            .contains("[machine.agents]"),
+            .contains("Claude Code isn't installed on box"),
         "{refusal}"
     );
+    let (status, refusal) = ask("typo", json!(["claude code"]));
+    assert_eq!(status, 400, "{refusal}");
+    assert!(
+        refusal["error"].as_str().unwrap().contains("claude-code"),
+        "the valid names are listed: {refusal}"
+    );
+    let (status, granted) = ask("no-agents", json!([]));
+    assert_eq!(status, 200, "work needing no agent still runs: {granted}");
+
     let saved = registry.load().unwrap();
     assert!(
         saved.machines["box"].readiness.is_some(),

@@ -26,6 +26,10 @@ pub struct Requirements {
     pub arch: Option<String>,
     #[serde(default)]
     pub labels: Vec<String>,
+    /// Agent backends the work needs installed and logged in on the machine
+    /// (`claude-code`, `codex`, ...). Optional.
+    #[serde(default)]
+    pub agents: Vec<String>,
 }
 
 /// One allocation, as stored.
@@ -371,6 +375,7 @@ mod tests {
             os: os.map(str::to_string),
             arch: None,
             labels: labels.iter().map(|l| (*l).to_string()).collect(),
+            agents: Vec::new(),
         }
     }
 
