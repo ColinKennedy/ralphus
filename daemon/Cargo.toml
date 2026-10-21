@@ -62,6 +62,7 @@ sha2.workspace = true
 git2 = { workspace = true }
 
 [dev-dependencies]
+ralphus-test-support = { path = "../test-support" }
 ureq = { workspace = true }
 # Builds the GIF fixture `exhibit_media`'s real-ffmpeg conversion test reads.
 gif = { workspace = true }

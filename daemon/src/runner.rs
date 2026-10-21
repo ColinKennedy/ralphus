@@ -3303,7 +3303,9 @@ mod tests {
             squad_id: "squad-000000000001".to_string(),
             task: "build".to_string(),
             cell_id: "cell-1".to_string(),
-            cwd: std::env::temp_dir().to_string_lossy().into_owned(),
+            cwd: ralphus_test_support::scratch_root()
+                .to_string_lossy()
+                .into_owned(),
             prompt: Some("do something".to_string()),
             command: None,
             shell: None,
@@ -4472,7 +4474,7 @@ prompt = "make it build"
             .duration_since(std::time::UNIX_EPOCH)
             .expect("time")
             .as_nanos();
-        std::env::temp_dir().join(format!("ralphus-tailer-{tag}-{nanos}.raw"))
+        ralphus_test_support::scratch(format!("ralphus-tailer-{tag}-{nanos}.raw"))
     }
 
     fn append(path: &std::path::Path, bytes: &[u8]) {

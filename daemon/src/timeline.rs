@@ -521,7 +521,7 @@ prompt = "make it build"
         let _guard = TIMELINE_FILE_TEST_LOCK.lock().unwrap();
         let (store, squad_id) = seeded_squad();
         let dir =
-            std::env::temp_dir().join(format!("ralphus-timeline-test-{}", std::process::id()));
+            ralphus_test_support::scratch(format!("ralphus-timeline-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let log_file = dir.join("attempt.log");
         std::fs::write(&log_file, "hello from the pane\nsecond line").unwrap();
@@ -683,7 +683,7 @@ prompt = "make it build"
     #[test]
     fn entity_debug_timeline_inlines_terminal_log_excerpt() {
         let (store, squad_id) = seeded_squad();
-        let dir = std::env::temp_dir().join(format!(
+        let dir = ralphus_test_support::scratch(format!(
             "ralphus-entity-timeline-test-{}",
             std::process::id()
         ));

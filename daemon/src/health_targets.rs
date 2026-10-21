@@ -458,8 +458,10 @@ mod tests {
 
     #[test]
     fn ssh_unreachable_short_circuits_the_rest() {
-        let dir =
-            std::env::temp_dir().join(format!("ral355-health-unreachable-{}", std::process::id()));
+        let dir = ralphus_test_support::scratch(format!(
+            "ral355-health-unreachable-{}",
+            std::process::id()
+        ));
         let py = fake_provider(
             &dir,
             &[(
@@ -490,7 +492,7 @@ mod tests {
 
     #[test]
     fn a_fully_healthy_target_reports_no_failures() {
-        let dir = std::env::temp_dir().join(format!("ral355-health-ok-{}", std::process::id()));
+        let dir = ralphus_test_support::scratch(format!("ral355-health-ok-{}", std::process::id()));
         let py = fake_provider(
             &dir,
             &[
@@ -541,7 +543,8 @@ mod tests {
 
     #[test]
     fn check_all_targets_runs_every_configured_target_and_is_bounded_by_thread_scope() {
-        let dir = std::env::temp_dir().join(format!("ral355-health-many-{}", std::process::id()));
+        let dir =
+            ralphus_test_support::scratch(format!("ral355-health-many-{}", std::process::id()));
         let py = fake_provider(
             &dir,
             &[(

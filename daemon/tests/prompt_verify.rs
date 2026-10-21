@@ -72,7 +72,7 @@ fn find_runner() -> Option<String> {
 
 /// A fresh temp directory to use as a session's `cwd`.
 fn temp_base(tag: &str) -> std::path::PathBuf {
-    let dir = std::env::temp_dir().join(format!(
+    let dir = ralphus_test_support::scratch(format!(
         "ralphus-prompt-verify-{tag}-{}",
         std::process::id()
     ));

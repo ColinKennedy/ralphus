@@ -555,7 +555,8 @@ mod tests {
     fn repo() -> PathBuf {
         static N: AtomicU32 = AtomicU32::new(0);
         let n = N.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!("ralphus-ingest-{}-{n}", std::process::id()));
+        let dir =
+            ralphus_test_support::scratch(format!("ralphus-ingest-{}-{n}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         git(&dir, &["init", "--initial-branch", "main"]);

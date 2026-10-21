@@ -587,7 +587,7 @@ mod tests {
     #[test]
     fn the_claim_is_durable_across_a_reopened_store() {
         let dir =
-            std::env::temp_dir().join(format!("ralphus-auto-run-claim-{}", std::process::id()));
+            ralphus_test_support::scratch(format!("ralphus-auto-run-claim-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("tasks.db");

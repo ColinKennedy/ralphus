@@ -89,7 +89,7 @@ fn simple_tab_generated_toml_is_accepted_by_submit() {
     assert_eq!(status, 200, "register user: {text}");
 
     // The generator targets project "demo"; submit refuses unregistered ones.
-    let repo = std::env::temp_dir().join(format!("ralphus-simple-tab-{}", std::process::id()));
+    let repo = ralphus_test_support::scratch(format!("ralphus-simple-tab-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&repo);
     std::fs::create_dir_all(&repo).expect("mkdir repo");
     let init = Command::new("git")

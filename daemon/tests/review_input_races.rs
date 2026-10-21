@@ -43,7 +43,8 @@ fn ensure_hermetic_environment() {
     if std::env::var_os("RALPHUS_RACE_HERMETIC").is_some() {
         return;
     }
-    let home = std::env::temp_dir().join(format!("ralphus-races-hermetic-{}", std::process::id()));
+    let home =
+        ralphus_test_support::scratch(format!("ralphus-races-hermetic-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&home);
     std::fs::create_dir_all(&home).expect("mkdir hermetic config home");
     let status = std::process::Command::new(std::env::current_exe().expect("test binary"))
@@ -66,7 +67,7 @@ fn temp_dir() -> PathBuf {
     ensure_hermetic_environment();
     static N: AtomicU32 = AtomicU32::new(0);
     let n = N.fetch_add(1, Ordering::Relaxed);
-    let dir = std::env::temp_dir().join(format!("ralphus-races-{}-{n}", std::process::id()));
+    let dir = ralphus_test_support::scratch(format!("ralphus-races-{}-{n}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("mkdir");
     dir

@@ -14887,7 +14887,7 @@ mod tests {
     /// unexplained latency -- worth asserting rather than trusting.
     #[test]
     fn writer_connection_applies_the_performance_pragmas() {
-        let dir = std::env::temp_dir().join(format!(
+        let dir = ralphus_test_support::scratch(format!(
             "ralphus-pragma-{}-{}",
             std::process::id(),
             now_ms()
@@ -14933,7 +14933,7 @@ mod tests {
     /// surfaces as slow pooled reads.
     #[test]
     fn pooled_readers_apply_the_shared_pragmas() {
-        let dir = std::env::temp_dir().join(format!(
+        let dir = ralphus_test_support::scratch(format!(
             "ralphus-pragma-pool-{}-{}",
             std::process::id(),
             now_ms()
@@ -20664,7 +20664,7 @@ command = "e"
     fn temp_review_settings_dir() -> std::path::PathBuf {
         static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!(
+        let dir = ralphus_test_support::scratch(format!(
             "ralphus-review-settings-{}-{n}",
             std::process::id()
         ));
@@ -21148,7 +21148,8 @@ command = "e"
         // Must be an on-disk store: an in-memory database has no `-wal`
         // sidecar for `journal_size_limit` to bound, so `open_in_memory` would
         // prove nothing here.
-        let dir = std::env::temp_dir().join(format!("ralphus-wal-limit-{}", std::process::id()));
+        let dir =
+            ralphus_test_support::scratch(format!("ralphus-wal-limit-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("mkdir");
         let store = Store::open(&dir.join("tasks.db")).expect("open store");
@@ -21191,7 +21192,7 @@ command = "e"
     #[test]
     fn writer_autocheckpoint_is_disabled_and_a_truncate_checkpoint_shrinks_the_wal() {
         let dir =
-            std::env::temp_dir().join(format!("ralphus-wal-checkpoint-{}", std::process::id()));
+            ralphus_test_support::scratch(format!("ralphus-wal-checkpoint-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("mkdir");
         let db_path = dir.join("tasks.db");
@@ -21282,7 +21283,7 @@ command = "e"
             WalCheckpointMode::Truncate
         );
         assert_eq!(
-            wal_file_size(&std::env::temp_dir().join("ralphus-no-such-wal-file")),
+            wal_file_size(&ralphus_test_support::scratch("ralphus-no-such-wal-file")),
             0
         );
     }
@@ -21301,7 +21302,7 @@ command = "e"
     fn truncate_checkpoint_blocks_writers_while_a_reader_pins_the_wal_but_passive_does_not() {
         use std::time::{Duration, Instant};
 
-        let dir = std::env::temp_dir().join(format!(
+        let dir = ralphus_test_support::scratch(format!(
             "ralphus-wal-checkpoint-blocking-{}",
             std::process::id()
         ));
@@ -21398,7 +21399,7 @@ command = "e"
     fn a_blocked_truncate_checkpoint_stalls_writers_only_briefly() {
         use std::time::{Duration, Instant};
 
-        let dir = std::env::temp_dir().join(format!(
+        let dir = ralphus_test_support::scratch(format!(
             "ralphus-wal-checkpoint-brief-{}",
             std::process::id()
         ));
@@ -21472,7 +21473,7 @@ command = "e"
         // test would exercise table locking instead of the semantics
         // production actually runs on.
         let dir =
-            std::env::temp_dir().join(format!("ralphus-board-snapshot-{}", std::process::id()));
+            ralphus_test_support::scratch(format!("ralphus-board-snapshot-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("mkdir");
         let store = Store::open(&dir.join("tasks.db")).expect("open store");
@@ -21559,7 +21560,7 @@ command = "e"
 
     #[test]
     fn auto_submit_requests_survive_store_reopen() {
-        let dir = std::env::temp_dir().join(format!(
+        let dir = ralphus_test_support::scratch(format!(
             "ralphus-auto-submit-durability-{}",
             std::process::id()
         ));
@@ -21616,7 +21617,7 @@ command = "e"
     fn open_sets_owner_only_permissions_on_the_db_file() {
         use std::os::unix::fs::PermissionsExt;
 
-        let dir = std::env::temp_dir().join(format!("ral230-db-{}", std::process::id()));
+        let dir = ralphus_test_support::scratch(format!("ral230-db-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("create dir");
         let db_path = dir.join("tasks.db");
@@ -21799,7 +21800,7 @@ initialization_commands = ""
 
     #[test]
     fn init_falls_back_to_the_project_config_and_squad_overrides_it() {
-        let root = std::env::temp_dir().join(format!("ral615-proj-{}", std::process::id()));
+        let root = ralphus_test_support::scratch(format!("ral615-proj-{}", std::process::id()));
         std::fs::create_dir_all(&root).unwrap();
         std::fs::write(
             root.join(".ralphus.toml"),

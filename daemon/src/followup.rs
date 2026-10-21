@@ -1548,7 +1548,7 @@ mod tests {
     }
 
     fn temp_root(tag: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!(
+        let dir = ralphus_test_support::scratch(format!(
             "ralphus-followup-{tag}-{}-{}",
             std::process::id(),
             now_ms()

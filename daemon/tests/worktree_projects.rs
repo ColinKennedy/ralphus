@@ -56,7 +56,8 @@ fn git(root: &Path, args: &[&str]) -> String {
 fn temp_base(tag: &str) -> PathBuf {
     static N: AtomicU32 = AtomicU32::new(0);
     let n = N.fetch_add(1, Ordering::Relaxed);
-    let dir = std::env::temp_dir().join(format!("ralphus-ral100-{tag}-{}-{n}", std::process::id()));
+    let dir =
+        ralphus_test_support::scratch(format!("ralphus-ral100-{tag}-{}-{n}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("mkdir");
     dir

@@ -57,7 +57,7 @@ const MIN_BATCHED_WRITES_PER_SEC: f64 = 10_000.0;
 fn temp_db(tag: &str) -> PathBuf {
     static N: AtomicU32 = AtomicU32::new(0);
     let n = N.fetch_add(1, Ordering::Relaxed);
-    let dir = std::env::temp_dir().join(format!(
+    let dir = ralphus_test_support::scratch(format!(
         "ralphus-writebench-{tag}-{}-{n}",
         std::process::id()
     ));

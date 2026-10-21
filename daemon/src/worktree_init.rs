@@ -189,7 +189,7 @@ mod tests {
     fn tmp() -> PathBuf {
         static N: AtomicU32 = AtomicU32::new(0);
         let n = N.fetch_add(1, Ordering::SeqCst);
-        let dir = std::env::temp_dir().join(format!("ral615-init-{}-{n}", std::process::id()));
+        let dir = ralphus_test_support::scratch(format!("ral615-init-{}-{n}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }

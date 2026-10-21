@@ -11434,7 +11434,7 @@ mod gone_pr_branch_tests {
                 String::from_utf8_lossy(&out.stderr)
             );
         };
-        let base = std::env::temp_dir().join(format!(
+        let base = ralphus_test_support::scratch(format!(
             "ralphus-gone-pr-branch-real-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
@@ -12951,8 +12951,10 @@ mod tests {
     fn tmp_dir(tag: &str) -> PathBuf {
         static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let dir =
-            std::env::temp_dir().join(format!("ralphus-pr-test-{tag}-{}-{n}", std::process::id()));
+        let dir = ralphus_test_support::scratch(format!(
+            "ralphus-pr-test-{tag}-{}-{n}",
+            std::process::id()
+        ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir

@@ -973,7 +973,7 @@ mod health_tests {
     fn tmp_dir(tag: &str) -> std::path::PathBuf {
         static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!(
+        let dir = ralphus_test_support::scratch(format!(
             "ralphus-fork-health-test-{tag}-{}-{n}",
             std::process::id()
         ));

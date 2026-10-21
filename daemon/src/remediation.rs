@@ -865,7 +865,7 @@ mod tests {
 
     #[test]
     fn vcs_restore_undoes_a_failed_repairs_edits_before_the_next_pass() {
-        let dir = std::env::temp_dir().join("ral488-remediation-vcs-restore");
+        let dir = ralphus_test_support::scratch("ral488-remediation-vcs-restore");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         assert!(
@@ -948,7 +948,7 @@ mod tests {
 
     impl TestRootGuard {
         fn new(unique: &str) -> Self {
-            let dir = std::env::temp_dir().join(format!("ralphus-test-remediation-{unique}"));
+            let dir = ralphus_test_support::scratch(format!("ralphus-test-remediation-{unique}"));
             let _ = std::fs::remove_dir_all(&dir);
             std::fs::create_dir_all(&dir).unwrap();
             crate::terminal_log::set_test_root(dir.clone());

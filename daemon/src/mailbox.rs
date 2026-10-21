@@ -1209,7 +1209,7 @@ mod tests {
     /// row nor un-dismisses the original; a changed message is a new row.
     #[test]
     fn dismissal_survives_store_reopen_and_deduped_failure_is_not_reenqueued() {
-        let dir = std::env::temp_dir().join(format!(
+        let dir = ralphus_test_support::scratch(format!(
             "ralphus-mailbox-dismissal-durability-{}",
             std::process::id()
         ));

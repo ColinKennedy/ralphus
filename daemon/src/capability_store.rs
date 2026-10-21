@@ -1376,7 +1376,7 @@ mod tests {
 
     #[test]
     fn skill_folder_travels_as_bytes_and_missing_is_reported() {
-        let dir = std::env::temp_dir().join(format!("ral695-skill-{}", now_ms()));
+        let dir = ralphus_test_support::scratch(format!("ral695-skill-{}", now_ms()));
         std::fs::create_dir_all(dir.join("sub")).unwrap();
         std::fs::write(dir.join("SKILL.md"), "hello").unwrap();
         std::fs::write(dir.join("sub").join("a.txt"), "a").unwrap();

@@ -134,6 +134,7 @@ Twelve Rust workspace members; `cli-py/` is a Python project kept only for `docs
 | `ralphus-bench-types` | `bench-types/` | Rust lib | `BenchMeta` only — kept dependency-free to avoid a cyclic dependency between bench-tagged crates and the harness (RAL-94). | `bench-harness/AGENTS.md` |
 | `ralphus-bench-macros` | `bench-macros/` | Rust proc-macro | `#[ralphus_bench(patience = N)]` attribute (RAL-94). | `bench-harness/AGENTS.md` |
 | `ralphus-bench-harness` | `bench-harness/` | Rust lib+bin | Durable-minimum loop, stats/git/storage, `ralphus-bench-rs` opt-in entry point (RAL-94). | `bench-harness/AGENTS.md` |
+| `ralphus-test-support` | `test-support/` | Rust lib (dev-dependency only) | RAII test scratch directories under one known run root, retrying cleanup, stale-run sweep (RAL-690). | `test-support/AGENTS.md` |
 
 `cli` and `runner` were ported from Python to Rust as one project (module-for-module mirrors, shared `shellcmd.rs`/`agent_resume.rs`, the disclosed `ralphus author` gap) — see [`.agent/cli-runner-port.md`](.agent/cli-runner-port.md) for the full detail; it's cross-cutting so it isn't owned by either crate's own `AGENTS.md`.
 

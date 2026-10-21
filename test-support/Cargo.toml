@@ -1,0 +1,13 @@
+[package]
+name = "ralphus-test-support"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Test-only helper: RAII scratch directories rooted in one known place, with retrying cleanup and a stale-run sweep."
+
+[lints]
+workspace = true
+
+[dependencies]
+sysinfo = { workspace = true }

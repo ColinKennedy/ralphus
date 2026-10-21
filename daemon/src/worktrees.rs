@@ -3904,7 +3904,7 @@ mod tests {
     static TEST_N: AtomicU32 = AtomicU32::new(0);
 
     fn planning_test_root(label: &str) -> PathBuf {
-        std::env::temp_dir().join(format!(
+        ralphus_test_support::scratch(format!(
             "ralphus-plan-lock-{label}-{}-{}",
             std::process::id(),
             TEST_N.fetch_add(1, Ordering::Relaxed)
@@ -4078,7 +4078,7 @@ mod tests {
 
     #[test]
     fn remove_dir_all_retrying_removes_a_populated_tree_and_tolerates_a_missing_one() {
-        let dir = std::env::temp_dir().join(format!(
+        let dir = ralphus_test_support::scratch(format!(
             "ralphus-rm-retry-{}-{}",
             std::process::id(),
             TEST_N.fetch_add(1, Ordering::Relaxed)
@@ -4144,7 +4144,8 @@ mod tests {
 
     fn tmp_dir(tag: &str) -> PathBuf {
         let n = TEST_N.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!("ral100-wt-{tag}-{}-{n}", std::process::id()));
+        let dir =
+            ralphus_test_support::scratch(format!("ral100-wt-{tag}-{}-{n}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("mkdir tmp_dir");
         dir

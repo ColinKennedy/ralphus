@@ -588,7 +588,8 @@ mod tests {
 
     #[test]
     fn current_revision_none_for_non_git_dir() {
-        let dir = std::env::temp_dir().join(format!("ralphus-ghost-test-{}", std::process::id()));
+        let dir =
+            ralphus_test_support::scratch(format!("ralphus-ghost-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         assert_eq!(current_revision(dir.to_str().unwrap()), None);
         let _ = std::fs::remove_dir_all(&dir);

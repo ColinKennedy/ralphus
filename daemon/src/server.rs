@@ -23224,7 +23224,7 @@ mod tests {
     /// exists. `project` is what the review's `project` column holds.
     fn merged_review_with_an_offer(d: &Daemon, id: &str, project: Option<&str>) {
         let store = d.lock();
-        let root = std::env::temp_dir().join(format!("ralphus-route-followup-{id}"));
+        let root = ralphus_test_support::scratch(format!("ralphus-route-followup-{id}"));
         std::fs::create_dir_all(&root).unwrap();
         store
             .conn
@@ -23518,7 +23518,7 @@ mod tests {
     fn isolated_terminal_root() -> std::path::PathBuf {
         use std::sync::atomic::{AtomicUsize, Ordering};
         static N: AtomicUsize = AtomicUsize::new(0);
-        let dir = std::env::temp_dir().join(format!(
+        let dir = ralphus_test_support::scratch(format!(
             "ralphus-server-tlog-{}-{}",
             std::process::id(),
             N.fetch_add(1, Ordering::Relaxed)
@@ -23612,7 +23612,7 @@ mod tests {
 
     /// A private scratch directory for one test's marker/log/result files.
     fn check_run_scratch(label: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!(
+        let dir = ralphus_test_support::scratch(format!(
             "ralphus-check-run-{label}-{}-{:?}",
             std::process::id(),
             std::thread::current().id()
@@ -24853,7 +24853,7 @@ triage=true
 
     /// A fresh temp git repo with one commit, for project-registration tests.
     fn tmp_git_repo(tag: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!(
+        let dir = ralphus_test_support::scratch(format!(
             "ral100-server-{tag}-{}-{}",
             std::process::id(),
             PROJ_TEST_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
@@ -26004,7 +26004,7 @@ triage=true
     #[test]
     fn register_project_rejects_non_git_path() {
         let d = daemon();
-        let dir = std::env::temp_dir().join(format!(
+        let dir = ralphus_test_support::scratch(format!(
             "ral100-server-not-git-{}-{}",
             std::process::id(),
             PROJ_TEST_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
@@ -26680,7 +26680,7 @@ triage=true
     #[test]
     fn agent_profiles_health_route_reports_unresolved_from_env() {
         let d = daemon();
-        let dir = std::env::temp_dir().join(format!(
+        let dir = ralphus_test_support::scratch(format!(
             "ral-agent-profiles-health-route-{}-{}",
             std::process::id(),
             PROJ_TEST_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
@@ -37219,7 +37219,7 @@ remediation_attempts=1
     #[test]
     fn force_drain_triage_pool_route_resolves_a_project_path_to_its_registered_name() {
         let d = daemon();
-        let dir = std::env::temp_dir().join(format!(
+        let dir = ralphus_test_support::scratch(format!(
             "ral449-server-drain-by-path-{}-{}",
             std::process::id(),
             PROJ_TEST_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
@@ -37250,7 +37250,7 @@ remediation_attempts=1
     #[test]
     fn triage_pool_threshold_route_resolves_a_project_path_to_its_registered_name() {
         let d = daemon();
-        let dir = std::env::temp_dir().join(format!(
+        let dir = ralphus_test_support::scratch(format!(
             "ral374-server-threshold-by-path-{}-{}",
             std::process::id(),
             PROJ_TEST_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)

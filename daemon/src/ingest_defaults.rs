@@ -238,7 +238,7 @@ mod tests {
     }
 
     fn repo(tag: &str, init_branch: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("ral703-{tag}-{}", std::process::id()));
+        let dir = ralphus_test_support::scratch(format!("ral703-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         run(&dir, &["init", "-q", "-b", init_branch]);

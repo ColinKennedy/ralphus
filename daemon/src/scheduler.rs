@@ -8377,7 +8377,8 @@ prompt = "anything"
     /// same worktree-safety concern it is guarding against.
     fn remediation_test_cwd(tag: &str) -> std::path::PathBuf {
         let seq = TEST_DIR_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!("ral488-scheduler-remediation-{tag}-{seq}"));
+        let dir =
+            ralphus_test_support::scratch(format!("ral488-scheduler-remediation-{tag}-{seq}"));
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }
@@ -11643,8 +11644,10 @@ prompt = "anything"
         use std::sync::atomic::{AtomicU32, Ordering};
         static N: AtomicU32 = AtomicU32::new(0);
         let n = N.fetch_add(1, Ordering::Relaxed);
-        let root =
-            std::env::temp_dir().join(format!("ralphus-up-conflict-{}-{n}", std::process::id()));
+        let root = ralphus_test_support::scratch(format!(
+            "ralphus-up-conflict-{}-{n}",
+            std::process::id()
+        ));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).expect("mkdir temp root");
 
@@ -11762,7 +11765,7 @@ prompt = "anything"
         static N: AtomicU32 = AtomicU32::new(0);
         let n = N.fetch_add(1, Ordering::Relaxed);
         let root =
-            std::env::temp_dir().join(format!("ralphus-up-ignored-{}-{n}", std::process::id()));
+            ralphus_test_support::scratch(format!("ralphus-up-ignored-{}-{n}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).expect("mkdir temp root");
 
@@ -11993,7 +11996,7 @@ prompt = "anything"
     // ── Worktree placeholder cwd (RAL-100) ───────────────────────────────────
 
     fn wt_test_repo(tag: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!(
+        let dir = ralphus_test_support::scratch(format!(
             "ral100-scheduler-{tag}-{}-{}",
             std::process::id(),
             TEST_DIR_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
@@ -12593,7 +12596,7 @@ prompt = "anything"
 
     #[test]
     fn registered_but_non_git_project_is_not_subject_to_the_guard() {
-        let dir = std::env::temp_dir().join(format!(
+        let dir = ralphus_test_support::scratch(format!(
             "ral156-nonvcs-{}-{}",
             std::process::id(),
             TEST_DIR_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)

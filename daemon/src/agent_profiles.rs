@@ -1143,7 +1143,7 @@ mod tests {
     use std::path::PathBuf;
 
     fn tempdir(label: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
+        let dir = ralphus_test_support::scratch(format!(
             "ralphus-agent-profiles-{label}-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
