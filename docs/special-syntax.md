@@ -43,6 +43,7 @@ validation time — a typo fails fast at submit, before the daemon sees it.
 | `<<ralphus:new-squad>>` | `[[waypoint]].roster`, `[[waypoint]].affected` | the squad this same submission itself creates — no `<key>`, since one submission file always produces exactly one squad (RAL-400) |
 | `<<ralphus:linked-field/<path>>>` | `environment` value (task, cell, proof step, or `[[default]]`) | the field `<path>` addresses relative to where this value is declared — `cwd`/`id`, or a same-table sibling `environment.<key>` (RAL-460) |
 | `<<ralphus:presets/<name>>>` | `extends` (an array, on `[[task]]`, `[[task.cell]]`, or any `[[*.proof]]` block) | stamps a registered **preset**'s field values into any of that entity's own fields still unset; the name may be hierarchical (`roles/judge/reviewer`) |
+| `<<ralphus:auto-provider>>` | `machine` table's `provider` (task, cell, proof step, `[[review]]`) — never inside a `provider` list | any configured provider service, tried in declaration order until one grants the request; does **not** include `local` (list `local` explicitly for that). Needs at least one `[machine.providers.*]` at submit |
 
 Rules and risks:
 

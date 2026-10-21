@@ -1,6 +1,9 @@
 # Machine provider services (provider contract v2)
 
-> **Status:** design, being implemented on `fleet-phase2`. Program providers
+> **Status:** the daemon side is implemented -- configuration, request
+> validation, allocation, the Machine API transport, re-attach after restart,
+> release and idle hints. `ralphus-fleet`, the built-in service, is not built
+> yet, and the board does not show allocations yet. Program providers
 > ([`machine-providers.md`](machine-providers.md), contract v1) keep working
 > unchanged; this page describes the service form that sits alongside them.
 
