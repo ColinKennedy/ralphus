@@ -284,9 +284,12 @@ session's stdin, instead of POSIX shell scripts:
 - in `upload` mode the runner (`ralphus-runner.exe`, artifact key
   `x86_64-pc-windows-msvc` or `aarch64-pc-windows-msvc`) is copied on the
   first verb that finds it missing, to
-  `<remote_root>\runners\<triple>\<sha256>\ralphus-runner.exe`, by a
-  PowerShell script passed as `-EncodedCommand` that reads it from stdin and
-  checks its SHA-256;
+  `<remote_root>\runners\<triple>\<sha256>\ralphus-runner.exe`: `scp` (the
+  SFTP subsystem Windows' OpenSSH Server ships with) copies it to a
+  temporary name, and a PowerShell script passed as `-EncodedCommand` checks
+  its SHA-256 before moving it into place (Windows PowerShell 5.1 does not
+  read more than a few bytes of binary stdin under sshd, so the runner never
+  travels on stdin);
 - `exec` starts a detached job supervisor outside the session's job object;
   if Windows refuses that, the job runs in the foreground of the `exec` call
   and its result comes back directly (bounded by the daemon's HTTP timeout);

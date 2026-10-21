@@ -179,7 +179,7 @@ id = "ralphus-runner machine::command::tests::an_authored_command_runs_in_the_wo
 tag = "machine-run"
 
 # The SSH provider's Windows path, with `cmd.exe /c` standing in for the
-# session shell: runner upload through PowerShell, then verbs (Windows only).
+# session shell: runner upload (copy, then a PowerShell digest check), then verbs (Windows only).
 [[test]]
 id = "ralphus-ssh-provider windows::tests::the_whole_flow_runs_through_cmd_exe_with_the_real_runner"
 tag = "ssh-windows"

@@ -16,12 +16,19 @@
 //!
 //! The only shell syntax involved is the command line above -- bare tokens
 //! that mean the same to `cmd.exe` and PowerShell -- plus, in `upload` mode,
-//! one existence check (`if exist`, cmd) and the upload itself: a PowerShell
+//! one existence check (`if exist`, cmd) and the upload itself: `mkdir` (cmd)
+//! for the destination directory, `scp` of the runner to a temporary name next
+//! to `<root>\runners\<triple>\<sha256>\ralphus-runner.exe`, and a PowerShell
 //! script passed as `-EncodedCommand` (so no quoting reaches either shell)
-//! that copies the runner from the session's stdin to
-//! `<root>\runners\<triple>\<sha256>\ralphus-runner.exe` and checks its
-//! digest. The runner is uploaded when a verb finds it missing, so the first
-//! call pays for the copy and later ones do not.
+//! that checks the copy's digest and moves it into place. The runner is
+//! uploaded when a verb finds it missing, so the first call pays for the copy
+//! and later ones do not.
+//!
+//! The runner does not travel on the session's stdin: Windows PowerShell 5.1
+//! reading `[Console]::OpenStandardInput()` under OpenSSH's sshd blocks
+//! forever on anything beyond a few bytes (the same stdin reaches a native
+//! program such as `git hash-object --stdin` intact), so the copy goes
+//! through the SFTP subsystem Windows' OpenSSH Server ships with.
 //!
 //! Because nothing is quoted, `remote_root` and an installed runner's path
 //! must be made only of letters, digits and `. _ - : \ /` (no spaces).
@@ -51,6 +58,13 @@ pub trait RemoteShell {
     /// # Errors
     /// The command could not be delivered (the transport failed).
     fn run(&self, command_line: &str, stdin: &[u8]) -> Result<Output, String>;
+
+    /// Copy the local file `local` to `remote_path` (a drive path with `/`
+    /// separators) on the machine.
+    ///
+    /// # Errors
+    /// The copy failed.
+    fn copy_in(&self, local: &std::path::Path, remote_path: &str) -> Result<(), String>;
 }
 
 /// [`RemoteShell`] over a non-interactive `ssh` session.
@@ -95,6 +109,50 @@ impl RemoteShell for Ssh<'_> {
             code: output.status.code(),
         })
     }
+
+    fn copy_in(&self, local: &std::path::Path, remote_path: &str) -> Result<(), String> {
+        let target = uri::parse(self.uri).map_err(|e| e.to_string())?;
+        let output = Command::new("scp")
+            .args(scp_args(
+                &target.target_string(),
+                self.config.connect_timeout_secs,
+                self.config.ssh_config_file.as_deref(),
+                local,
+                remote_path,
+            ))
+            .stdin(Stdio::null())
+            .output()
+            .map_err(|e| format!("could not run scp to reach {target}: {e}"))?;
+        if output.status.success() {
+            return Ok(());
+        }
+        Err(ssh::interpret_failure(
+            "scp",
+            output.status.code(),
+            &String::from_utf8_lossy(&output.stderr),
+        ))
+    }
+}
+
+/// `scp` arguments copying `local` to `remote_path` on `target`, with the
+/// same non-interactive options as every `ssh` call (less `-T`, which means
+/// something else to `scp`).
+#[must_use]
+pub fn scp_args(
+    target: &str,
+    connect_timeout_secs: u32,
+    config_file: Option<&str>,
+    local: &std::path::Path,
+    remote_path: &str,
+) -> Vec<String> {
+    let mut args: Vec<String> = ssh::non_interactive_args(connect_timeout_secs, config_file)
+        .into_iter()
+        .filter(|a| a != "-T")
+        .collect();
+    args.push("-q".to_string());
+    args.push(local.to_string_lossy().into_owned());
+    args.push(format!("{target}:{remote_path}"));
+    args
 }
 
 /// Verbs this module serves for a Windows machine.
@@ -282,8 +340,9 @@ fn windows_root(policy: &RunnerPolicy) -> Result<String, String> {
 struct Runner {
     /// Its path or command, safe to put on a command line unquoted.
     program: String,
-    /// The runner bytes and digest to upload when missing (`upload` mode).
-    upload: Option<(Vec<u8>, String)>,
+    /// The runner artifact on this host and its digest, to upload when
+    /// missing (`upload` mode).
+    upload: Option<(std::path::PathBuf, String)>,
     root: String,
 }
 
@@ -329,7 +388,7 @@ impl Runner {
                 let digest = format!("{:x}", Sha256::digest(&bytes));
                 Ok(Self {
                     program: format!("{root}\\runners\\{triple}\\{digest}\\ralphus-runner.exe"),
-                    upload: Some((bytes, digest)),
+                    upload: Some((std::path::PathBuf::from(artifact), digest)),
                     root,
                 })
             }
@@ -354,13 +413,13 @@ impl Runner {
         if let Some(reply) = reply_of(&output) {
             return Ok(reply);
         }
-        let Some((bytes, digest)) = &self.upload else {
+        let Some((artifact, digest)) = &self.upload else {
             return Err(no_reply(verb, &output));
         };
         if !may_upload || self.present(shell)? {
             return Err(no_reply(verb, &output));
         }
-        self.upload(shell, bytes, digest)?;
+        self.upload(shell, artifact, digest)?;
         let output = shell.run(&command_line, body.as_bytes())?;
         reply_of(&output).ok_or_else(|| no_reply(verb, &output))
     }
@@ -381,13 +440,32 @@ impl Runner {
         }
     }
 
-    fn upload(&self, shell: &dyn RemoteShell, bytes: &[u8], digest: &str) -> Result<(), String> {
+    fn upload(
+        &self,
+        shell: &dyn RemoteShell,
+        artifact: &std::path::Path,
+        digest: &str,
+    ) -> Result<(), String> {
         crate::emit_event(
             "uploading runner to windows machine",
             "info",
-            json!({"path": self.program, "bytes": bytes.len()}),
+            json!({"path": self.program, "artifact": artifact.to_string_lossy()}),
         );
-        let output = shell.run(&upload_command(&self.program, digest), bytes)?;
+        let (directory, _) = self
+            .program
+            .rsplit_once('\\')
+            .ok_or_else(|| format!("runner path {} has no directory", self.program))?;
+        let output = shell.run(&mkdir_command(directory), b"")?;
+        if output.code != Some(0) {
+            return Err(format!(
+                "could not create {directory} on the machine (exit {}): {}",
+                output.code.unwrap_or(-1),
+                output.stderr.trim()
+            ));
+        }
+        let temporary = format!("{}.upload-{}", self.program, upload_nonce());
+        shell.copy_in(artifact, &temporary.replace('\\', "/"))?;
+        let output = shell.run(&upload_command(&self.program, &temporary, digest), b"")?;
         let said = String::from_utf8_lossy(&output.stdout);
         if output.code == Some(0)
             && said
@@ -418,10 +496,29 @@ pub fn exists_command(program: &str) -> String {
     format!("if exist {program} (echo ralphus-runner-present) else (echo ralphus-runner-missing)")
 }
 
-/// The PowerShell upload script for a runner at `destination` whose bytes
-/// arrive on stdin and must hash to `digest`.
+/// A cmd.exe command creating `directory` (a [`safe_token`]) if missing.
 #[must_use]
-pub fn upload_script(destination: &str, digest: &str) -> String {
+pub fn mkdir_command(directory: &str) -> String {
+    format!("if not exist {directory} mkdir {directory}")
+}
+
+/// A random suffix for an upload's temporary name, so concurrent uploads of
+/// the same runner never write the same file.
+fn upload_nonce() -> String {
+    let mut bytes = [0_u8; 8];
+    if getrandom::getrandom(&mut bytes).is_err() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        bytes = (nanos as u64 ^ u64::from(std::process::id())).to_le_bytes();
+    }
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// The PowerShell script moving an uploaded runner from `temporary` to
+/// `destination` once it hashes to `digest`.
+#[must_use]
+pub fn upload_script(destination: &str, temporary: &str, digest: &str) -> String {
     let quote = |s: &str| format!("'{}'", s.replace('\'', "''"));
     format!(
         "$ErrorActionPreference = 'Stop'\n\
@@ -432,12 +529,7 @@ pub fn upload_script(destination: &str, digest: &str) -> String {
          \x20 ([BitConverter]::ToString($hash) -replace '-', '').ToLower()\n\
          }}\n\
          $dest = {dest}\n\
-         $dir = Split-Path -Parent $dest\n\
-         New-Item -ItemType Directory -Force -Path $dir | Out-Null\n\
-         $tmp = \"$dest.tmp.$PID\"\n\
-         $in = [Console]::OpenStandardInput()\n\
-         $out = [IO.File]::Open($tmp, 'Create', 'Write', 'None')\n\
-         try {{ $in.CopyTo($out) }} finally {{ $out.Close() }}\n\
+         $tmp = {tmp}\n\
          $actual = Get-Sha256 $tmp\n\
          if ($actual -ne {digest}) {{ Remove-Item -Force -LiteralPath $tmp; [Console]::Error.WriteLine('runner checksum mismatch after upload'); exit 1 }}\n\
          if (Test-Path -LiteralPath $dest) {{\n\
@@ -448,6 +540,7 @@ pub fn upload_script(destination: &str, digest: &str) -> String {
          & $dest --version\n\
          exit $LASTEXITCODE\n",
         dest = quote(destination),
+        tmp = quote(temporary),
         digest = quote(digest),
     )
 }
@@ -455,8 +548,8 @@ pub fn upload_script(destination: &str, digest: &str) -> String {
 /// `powershell ... -EncodedCommand <script as base64 UTF-16LE>`: a command
 /// line of bare tokens, read the same by `cmd.exe` and PowerShell.
 #[must_use]
-pub fn upload_command(destination: &str, digest: &str) -> String {
-    let script = upload_script(destination, digest);
+pub fn upload_command(destination: &str, temporary: &str, digest: &str) -> String {
+    let script = upload_script(destination, temporary, digest);
     let utf16: Vec<u8> = script.encode_utf16().flat_map(u16::to_le_bytes).collect();
     format!(
         "powershell -NoProfile -NonInteractive -EncodedCommand {}",
@@ -570,6 +663,14 @@ mod tests {
                 .push((command_line.to_string(), stdin.to_vec()));
             Ok((self.answer)(command_line, n))
         }
+
+        fn copy_in(&self, local: &std::path::Path, remote_path: &str) -> Result<(), String> {
+            let bytes = std::fs::read(local).map_err(|e| e.to_string())?;
+            self.seen
+                .borrow_mut()
+                .push((format!("scp {remote_path}"), bytes));
+            Ok(())
+        }
     }
 
     fn out(stdout: &str, stderr: &str, code: i32) -> Output {
@@ -630,11 +731,21 @@ mod tests {
         assert_eq!(reply["stdout"], "hi", "{reply}");
         let seen = shell.seen.borrow();
         let lines: Vec<&str> = seen.iter().map(|(l, _)| l.as_str()).collect();
-        assert_eq!(lines.len(), 4, "{lines:?}");
+        assert_eq!(lines.len(), 6, "{lines:?}");
         assert!(lines[0].contains("\\runners\\x86_64-pc-windows-msvc\\"));
         assert!(lines[0].ends_with("machine run --remote-root C:\\ralphus\\fleet"));
-        assert!(lines[2].starts_with("powershell -NoProfile -NonInteractive -EncodedCommand "));
-        assert_eq!(seen[2].1, b"runner-bytes", "the runner travels on stdin");
+        assert!(lines[2].starts_with("if not exist C:\\ralphus\\fleet\\runners\\"));
+        assert!(lines[3].starts_with("scp C:/ralphus/fleet/runners/x86_64-pc-windows-msvc/"));
+        assert!(
+            lines[3].contains("/ralphus-runner.exe.upload-"),
+            "{lines:?}"
+        );
+        assert_eq!(seen[3].1, b"runner-bytes", "the runner is copied over scp");
+        assert!(lines[4].starts_with("powershell -NoProfile -NonInteractive -EncodedCommand "));
+        assert!(
+            seen[4].1.is_empty(),
+            "nothing travels on PowerShell's stdin"
+        );
     }
 
     #[test]
@@ -688,7 +799,11 @@ mod tests {
 
     #[test]
     fn the_upload_script_is_encoded_utf16_and_checks_the_digest() {
-        let line = upload_command("C:\\r\\runners\\t\\abc\\ralphus-runner.exe", "abc");
+        let line = upload_command(
+            "C:\\r\\runners\\t\\abc\\ralphus-runner.exe",
+            "C:\\r\\runners\\t\\abc\\ralphus-runner.exe.upload-1",
+            "abc",
+        );
         let encoded = line.rsplit(' ').next().unwrap();
         let bytes = base64::engine::general_purpose::STANDARD
             .decode(encoded)
@@ -700,6 +815,11 @@ mod tests {
         let script = String::from_utf16(&units).unwrap();
         assert!(script.contains("SHA256]::Create()"), "{script}");
         assert!(script.contains("$actual -ne 'abc'"), "{script}");
+        assert!(
+            script.contains("$tmp = 'C:\\r\\runners\\t\\abc\\ralphus-runner.exe.upload-1'"),
+            "{script}"
+        );
+        assert!(!script.contains("OpenStandardInput"), "{script}");
         assert!(safe_token("C:\\r\\x.exe"));
         assert!(!safe_token("C:\\Program Files\\x.exe"));
     }
@@ -734,6 +854,12 @@ mod tests {
                     stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
                     code: output.status.code(),
                 })
+            }
+
+            fn copy_in(&self, local: &std::path::Path, remote_path: &str) -> Result<(), String> {
+                std::fs::copy(local, remote_path)
+                    .map(|_| ())
+                    .map_err(|e| e.to_string())
             }
         }
         let Some(runner) = std::env::current_exe().ok().and_then(|exe| {
