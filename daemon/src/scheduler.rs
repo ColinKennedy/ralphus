@@ -5292,6 +5292,27 @@ fn publish_remote_task_branches(
     cells: &[crate::store::CellRow],
 ) -> bool {
     let mut published = std::collections::HashSet::new();
+    // The push authenticates as the squad's submitter when the project is
+    // cloned over HTTPS; over SSH the machine's own keys are used.
+    let credentials = {
+        let guard = store.lock();
+        guard
+            .tasks_of(squad_id)
+            .ok()
+            .and_then(|tasks| tasks.into_iter().find(|t| t.idx == task_idx))
+            .and_then(|task| task.project)
+            .and_then(|name| guard.get_project(&name).ok().flatten())
+            .and_then(|project| {
+                let owner = guard.resolve_review_owner(&project.path, Some(squad_id));
+                let identity = crate::forge::effective_forge_identity(None, owner.as_deref());
+                crate::workspace::ForgeCredentials::for_clone_url(
+                    project.clone_url.as_deref()?,
+                    identity.as_deref(),
+                    Path::new(&project.path),
+                )
+            })
+            .map(Arc::new)
+    };
     for cell in cells.iter().filter(|c| c.task_idx == task_idx) {
         let (Some(machine), Some(cwd)) =
             (remote_machine(cell.machine.as_deref()), cell.cwd.as_deref())
@@ -5301,7 +5322,9 @@ fn publish_remote_task_branches(
         if !published.insert((machine.to_string(), cwd.to_string())) {
             continue;
         }
-        let ws = crate::workspace::Workspace::on(cwd, Some(machine)).with_store(Arc::clone(store));
+        let ws = crate::workspace::Workspace::on(cwd, Some(machine))
+            .with_store(Arc::clone(store))
+            .with_forge_credentials(credentials.clone());
         let Ok(branch) = ws
             .git(&["rev-parse", "--abbrev-ref", "HEAD"])
             .map(|b| b.trim().to_string())

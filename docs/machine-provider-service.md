@@ -248,9 +248,19 @@ The daemon owns secrets; a provider never stores them. They reach a job only in
 the `exec` request body and live only in that job's process environment -- never
 in a file on the machine, a command line, a log or a transcript. A provider that
 proxies sees them in transit; that is inherent, since whoever controls a
-machine can read a running process's memory. Short-lived git and forge
-credentials requested by a job on demand are part of the credential phase and
-will be added here.
+machine can read a running process's memory.
+
+### Git pushes from a machine
+
+The daemon pushes a review's branches and a remote cell's published branch by
+running `git push` on the machine. When the project's clone URL is HTTPS, that
+one git process (and any `fetch`, `pull` or `ls-remote`) gets the forge token
+of the review's owner (or the squad's submitter, or the daemon's default user)
+in its environment, with an inline `credential.helper` that answers only for
+the clone URL's host. Nothing is written to the machine's git config or disk,
+and the value never appears in a process listing. Over SSH the machine's own
+keys are used, as before. Git run by an agent inside a cell is not given a
+credential.
 
 ### Logging an agent in on a remote machine
 

@@ -55,6 +55,127 @@ pub struct Workspace {
     /// the registered project path config and project lookups are keyed by.
     /// Equal to `root` for every workspace that was not translated.
     local_root: PathBuf,
+    /// For a remote workspace whose project is cloned over HTTPS: where its
+    /// network git commands get a forge credential. `None` otherwise, and
+    /// the machine's own git credentials are used.
+    forge_credentials: Option<Arc<ForgeCredentials>>,
+}
+
+/// Where a remote workspace's network git commands (`push`, `fetch`, ...)
+/// get a forge credential: the project's clone URL and the identity whose
+/// token to use. The token is looked up once, on the first command that
+/// needs it, and handed to that command only through its environment and an
+/// inline `credential.helper` that answers for the clone URL's host alone --
+/// never written to the machine's disk or a git config file.
+pub struct ForgeCredentials {
+    clone_url: String,
+    identity: Option<String>,
+    config_root: PathBuf,
+    resolved: std::sync::OnceLock<Option<GitCredential>>,
+}
+
+/// A resolved credential for one forge host.
+struct GitCredential {
+    host: String,
+    username: &'static str,
+    token: String,
+}
+
+/// Git subcommands that may talk to a remote and so need a credential.
+const NETWORK_GIT_COMMANDS: [&str; 4] = ["push", "fetch", "pull", "ls-remote"];
+
+/// The `credential.helper` a remote network git command gets: answers only
+/// a `get` for the host in `$RALPHUS_GIT_HOST`, from the environment.
+const INLINE_CREDENTIAL_HELPER: &str = "!f() { test \"$1\" = get || exit 0; h=; \
+     while IFS== read -r k v; do [ \"$k\" = host ] && h=$v; done; \
+     [ \"$h\" = \"$RALPHUS_GIT_HOST\" ] || exit 0; \
+     printf 'username=%s\\npassword=%s\\n' \"$RALPHUS_GIT_USERNAME\" \"$RALPHUS_GIT_PASSWORD\"; }; f";
+
+impl ForgeCredentials {
+    /// Credentials for `clone_url` as `identity` (`None`: the daemon's
+    /// default), when the URL is HTTPS -- git's credential protocol never
+    /// fires for SSH, which keeps using the machine's own keys.
+    #[must_use]
+    pub fn for_clone_url(
+        clone_url: &str,
+        identity: Option<&str>,
+        config_root: &Path,
+    ) -> Option<Self> {
+        let url = clone_url.trim();
+        (url.starts_with("https://") || url.starts_with("http://")).then(|| Self {
+            clone_url: url.to_string(),
+            identity: identity.map(str::to_string),
+            config_root: config_root.to_path_buf(),
+            resolved: std::sync::OnceLock::new(),
+        })
+    }
+
+    fn resolve(&self, store: &crate::store_lock::StoreHandle) -> Option<&GitCredential> {
+        self.resolved
+            .get_or_init(|| {
+                let (host, _) = crate::forge::parse_remote_url(&self.clone_url)?;
+                let cfg = crate::config::resolve_forge(&self.config_root);
+                let client = crate::forge::resolve_url_with_store(
+                    store,
+                    &self.clone_url,
+                    &cfg,
+                    self.identity.as_deref(),
+                )
+                .ok()?;
+                let token = client.token_for_remote_git()?.to_string();
+                crate::redact::register(&token);
+                let username = match client.kind() {
+                    crate::forge::ForgeKind::GitHub => "x-access-token",
+                    crate::forge::ForgeKind::GitLab => "oauth2",
+                };
+                Some(GitCredential {
+                    host,
+                    username,
+                    token,
+                })
+            })
+            .as_ref()
+    }
+
+    /// Credentials already resolved to `token` for `host`, for tests that do
+    /// not stand up a forge.
+    #[cfg(test)]
+    fn resolved_for_test(host: &str, token: &str) -> Self {
+        let resolved = std::sync::OnceLock::new();
+        let _ = resolved.set(Some(GitCredential {
+            host: host.to_string(),
+            username: "x-access-token",
+            token: token.to_string(),
+        }));
+        Self {
+            clone_url: format!("https://{host}/o/r.git"),
+            identity: None,
+            config_root: PathBuf::new(),
+            resolved,
+        }
+    }
+
+    /// The environment that lets one git command authenticate.
+    fn env(&self, store: &crate::store_lock::StoreHandle) -> Vec<(String, String)> {
+        let Some(credential) = self.resolve(store) else {
+            return Vec::new();
+        };
+        [
+            // An empty helper first resets any the machine configures, so
+            // this one is asked.
+            ("GIT_CONFIG_COUNT", "2"),
+            ("GIT_CONFIG_KEY_0", "credential.helper"),
+            ("GIT_CONFIG_VALUE_0", ""),
+            ("GIT_CONFIG_KEY_1", "credential.helper"),
+            ("GIT_CONFIG_VALUE_1", INLINE_CREDENTIAL_HELPER),
+            ("RALPHUS_GIT_HOST", credential.host.as_str()),
+            ("RALPHUS_GIT_USERNAME", credential.username),
+            ("RALPHUS_GIT_PASSWORD", credential.token.as_str()),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect()
+    }
 }
 
 /// One remote-produced branch of a review: the daemon-local project root it
@@ -238,6 +359,7 @@ impl Workspace {
             machine: None,
             store: None,
             path_map: None,
+            forge_credentials: None,
         }
     }
 
@@ -258,7 +380,17 @@ impl Workspace {
             machine,
             store: None,
             path_map: None,
+            forge_credentials: None,
         }
+    }
+
+    /// Give this workspace's network git commands a forge credential (see
+    /// [`ForgeCredentials`]). Only a remote workspace uses it: a local one
+    /// keeps the daemon's own credential helper wiring.
+    #[must_use]
+    pub fn with_forge_credentials(mut self, credentials: Option<Arc<ForgeCredentials>>) -> Self {
+        self.forge_credentials = credentials;
+        self
     }
 
     /// The workspace a guardian's review work happens in, honouring the
@@ -285,9 +417,9 @@ impl Workspace {
                 projects: g.projects,
                 base_branch: g.base_branch,
             };
-            Ok((g.machine, sources, review))
+            Ok((g.machine, sources, review, g.owner))
         });
-        let (machine, sources, review) = {
+        let (machine, sources, review, owner) = {
             match loaded {
                 Ok(found) => found,
                 Err(e) => {
@@ -311,7 +443,7 @@ impl Workspace {
                             ),
                             serde_json::json!({ "error": e.to_string() }),
                         );
-                    (None, Vec::new(), ReviewProjects::default())
+                    (None, Vec::new(), ReviewProjects::default(), None)
                 }
             }
         };
@@ -351,6 +483,25 @@ impl Workspace {
             )
             .map(Arc::new);
             workspace.root = workspace.map_path(&workspace.root);
+            // Pushes and fetches on the machine authenticate as the review's
+            // owner when the project is cloned over HTTPS.
+            let clone_url = {
+                let guard = store.lock();
+                guard
+                    .project_name_for_path(&review.git_root)
+                    .and_then(|name| guard.get_project(&name).ok().flatten())
+                    .and_then(|project| project.clone_url)
+            };
+            let identity = crate::forge::effective_forge_identity(None, owner.as_deref());
+            workspace.forge_credentials = clone_url
+                .and_then(|url| {
+                    ForgeCredentials::for_clone_url(
+                        &url,
+                        identity.as_deref(),
+                        &workspace.local_root,
+                    )
+                })
+                .map(Arc::new);
         }
         workspace
     }
@@ -399,6 +550,7 @@ impl Workspace {
             store: self.store.clone(),
             path_map: self.path_map.clone(),
             local_root,
+            forge_credentials: self.forge_credentials.clone(),
         }
     }
 
@@ -875,11 +1027,20 @@ impl Workspace {
     /// machine opens an editor with no terminal, fails, and the merge retries
     /// it forever.
     fn git_remote(&self, _machine: &str, args: &[&str]) -> Result<String, String> {
+        let mut env = non_interactive_git_env();
+        let needs_credential = args
+            .first()
+            .is_some_and(|verb| NETWORK_GIT_COMMANDS.contains(verb));
+        if let (true, Some(credentials), Some(store)) =
+            (needs_credential, &self.forge_credentials, &self.store)
+        {
+            env.extend(credentials.env(store));
+        }
         let req = crate::remote_runner::RunRequest {
             cwd: remote_path_string(&self.root),
             program: "git".to_string(),
             args: args.iter().map(|a| (*a).to_string()).collect(),
-            env: non_interactive_git_env(),
+            env,
             shell: None,
         };
         self.with_provider(|p, spec| p.run_vcs(&req, spec))
@@ -1482,6 +1643,82 @@ echo {json}
 
         assert_eq!(remote, "machine-remote");
         assert_eq!(GitAt::local_path(&ws), Path::new("/srv/repo"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_inline_credential_helper_answers_real_git_for_its_host_only() {
+        let store = Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
+        let env = ForgeCredentials::resolved_for_test("github.com", "tok-for-test").env(&store);
+        let fill = |host: &str| {
+            let mut command = std::process::Command::new("git");
+            command
+                .args(["credential", "fill"])
+                .env("GIT_TERMINAL_PROMPT", "0")
+                .env("GIT_ASKPASS", "")
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::null());
+            for (k, v) in &env {
+                command.env(k, v);
+            }
+            let mut child = command.spawn().unwrap();
+            std::io::Write::write_all(
+                &mut child.stdin.take().unwrap(),
+                format!("protocol=https\nhost={host}\n\n").as_bytes(),
+            )
+            .unwrap();
+            String::from_utf8_lossy(&child.wait_with_output().unwrap().stdout).into_owned()
+        };
+
+        let answered = fill("github.com");
+        assert!(answered.contains("username=x-access-token"), "{answered}");
+        assert!(answered.contains("password=tok-for-test"), "{answered}");
+        let other = fill("evil.example");
+        assert!(
+            !other.contains("tok-for-test"),
+            "another host got the token: {other}"
+        );
+    }
+
+    #[test]
+    fn only_network_git_commands_on_a_machine_carry_the_credential() {
+        let dir = std::env::temp_dir().join(format!("ral-cred-run-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let script = write_script(
+            &dir,
+            r#"{"ok":true,"protocol_version":1,"exit_code":0,"stdout":""}"#,
+        );
+        let store = Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
+        store
+            .lock()
+            .register_machine_provider(
+                "ib",
+                "",
+                &script.to_string_lossy(),
+                &[],
+                crate::machines::PROTOCOL_VERSION,
+                false,
+            )
+            .unwrap();
+        let ws = Workspace::on("/m/repo", Some("ib:A"))
+            .with_store(Arc::clone(&store))
+            .with_forge_credentials(Some(Arc::new(ForgeCredentials::resolved_for_test(
+                "github.com",
+                "tok-for-test",
+            ))));
+
+        ws.git(&["status"]).unwrap();
+        let after_status = std::fs::read_to_string(dir.join("requests.log")).unwrap();
+        ws.git(&["push", "origin", "main"]).unwrap();
+        let all = std::fs::read_to_string(dir.join("requests.log")).unwrap();
+
+        assert!(!after_status.contains("tok-for-test"), "{after_status}");
+        assert!(all[after_status.len()..].contains("tok-for-test"), "{all}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
