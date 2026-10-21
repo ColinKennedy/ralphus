@@ -193,3 +193,8 @@ tag = "outpost-loopback"
 [[test]]
 id = "ralphus-daemon guardian_merge::tests::polling_a_collecting_remote_review_does_not_recompute_its_summary_each_time"
 tag = "review-summary-poll-remote"
+
+# An idle remote review's background maintenance and base-branch fetch.
+[[test]]
+id = "ralphus-daemon guardian_merge::tests::an_idle_remote_review_is_maintained_on_the_remote_cadence"
+tag = "review-maintenance-remote-cadence"

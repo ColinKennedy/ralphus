@@ -10334,6 +10334,58 @@ fn filter_by_idle_cadence(candidates: &[(String, String)]) -> Vec<String> {
         .collect()
 }
 
+/// Last full maintenance pass per review on a remote machine -- see
+/// `scheduler::REMOTE_REVIEW_MAINT_INTERVAL`. Pruned on every pass to the
+/// remote reviews that still exist.
+static REMOTE_MAINT_LAST: LazyLock<Mutex<HashMap<String, std::time::Instant>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Whether `machine` names somewhere other than the daemon's own host.
+fn is_remote_machine(machine: Option<&str>) -> bool {
+    machine.map(str::trim).is_some_and(|m| {
+        !m.is_empty() && !m.eq_ignore_ascii_case(ralphus_core::schema::LOCAL_MACHINE)
+    })
+}
+
+/// Ids of every review declared on a remote machine.
+fn remote_guardian_ids(store: &crate::store_lock::StoreHandle) -> HashSet<String> {
+    store
+        .with_read_snapshot(Store::list_guardian_base_fetch_rows_conn)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|g| is_remote_machine(g.machine.as_deref()))
+        .map(|g| g.guardian_id)
+        .collect()
+}
+
+/// Keeps a review on a remote machine (one in `remote`) to at most one full
+/// maintenance pass per [`crate::scheduler::REMOTE_REVIEW_MAINT_INTERVAL`];
+/// every other id passes through.
+fn filter_by_remote_cadence(ids: Vec<String>, remote: &HashSet<String>) -> Vec<String> {
+    let now = std::time::Instant::now();
+    let mut last = REMOTE_MAINT_LAST.lock().expect("poisoned");
+    last.retain(|id, _| remote.contains(id));
+    ids.into_iter()
+        .filter(|id| {
+            if !remote.contains(id) {
+                return true;
+            }
+            match last.get(id) {
+                Some(prev)
+                    if now.duration_since(*prev)
+                        < crate::scheduler::REMOTE_REVIEW_MAINT_INTERVAL =>
+                {
+                    false
+                }
+                _ => {
+                    last.insert(id.clone(), now);
+                    true
+                }
+            }
+        })
+        .collect()
+}
+
 /// Releases a claim from one of the in-flight sets on drop, so an early
 /// `return` inside a worker cannot strand an id and lock that guardian out of
 /// all future passes.
@@ -10563,8 +10615,12 @@ fn review_maintenance_staggered(
     let candidates: Vec<(String, String)> = full_maintenance_candidates(all_status_pairs);
     spawn_merge_checks(store, &candidates);
     // Store lock released. Now apply the per-status cadence: an idle-tier
-    // guardian is visited at most once per `REVIEW_IDLE_MAINT_INTERVAL`.
-    let ids = filter_by_idle_cadence(&candidates);
+    // guardian is visited at most once per `REVIEW_IDLE_MAINT_INTERVAL`, and
+    // one on a remote machine at most once per `REMOTE_REVIEW_MAINT_INTERVAL`.
+    let ids = filter_by_remote_cadence(
+        filter_by_idle_cadence(&candidates),
+        &remote_guardian_ids(store),
+    );
     for id in ids {
         let Some(claim) = InFlightClaim::acquire(&MAINTAINING, &id) else {
             crate::rlog!(
@@ -15963,6 +16019,12 @@ fn warn_checked_out_base_once(store: &crate::store_lock::StoreHandle, target: &B
 static BASE_FETCH_IN_FLIGHT: LazyLock<Mutex<HashSet<String>>> =
     LazyLock::new(|| Mutex::new(HashSet::new()));
 
+/// When each base-branch fetch target on a remote machine was last fetched,
+/// keyed like [`BASE_FETCH_IN_FLIGHT`], for
+/// `scheduler::REMOTE_BASE_BRANCH_FRESHNESS_POLL_INTERVAL`.
+static REMOTE_BASE_FETCH_LAST: LazyLock<Mutex<HashMap<String, std::time::Instant>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
 /// RAL-<new>: dual-root fork-side upstream refreshes currently running,
 /// keyed by guardian id -- mirrors [`BASE_FETCH_IN_FLIGHT`] so one slow
 /// fork push never piles up a new thread for the same review every poll
@@ -15986,16 +16048,40 @@ pub fn poll_base_branch_freshness_once(store: &crate::store_lock::StoreHandle) {
     let inputs: Vec<GuardianBaseFetchInfo> = store
         .with_read_snapshot(Store::list_guardian_base_fetch_rows_conn)
         .unwrap_or_default();
-    for target in collect_base_fetch_targets(&inputs) {
+    let now = std::time::Instant::now();
+    let targets = collect_base_fetch_targets(&inputs);
+    REMOTE_BASE_FETCH_LAST
+        .lock()
+        .expect("poisoned")
+        .retain(|_, at| {
+            now.duration_since(*at) < crate::scheduler::REMOTE_BASE_BRANCH_FRESHNESS_POLL_INTERVAL
+        });
+    for target in targets {
         let key = format!(
             "{}|{}|{}",
             target.root.display(),
             target.machine.as_deref().unwrap_or(""),
             target.base_branch
         );
+        // A remote target is fetched on the machine, one provider call per
+        // git command, so it is refreshed on the longer remote cadence.
+        if is_remote_machine(target.machine.as_deref())
+            && REMOTE_BASE_FETCH_LAST
+                .lock()
+                .expect("poisoned")
+                .contains_key(&key)
+        {
+            continue;
+        }
         let Some(claim) = InFlightClaim::acquire(&BASE_FETCH_IN_FLIGHT, &key) else {
             continue;
         };
+        if is_remote_machine(target.machine.as_deref()) {
+            REMOTE_BASE_FETCH_LAST
+                .lock()
+                .expect("poisoned")
+                .insert(key.clone(), now);
+        }
         let guardian_ids = guardian_ids_for_target(&inputs, &target);
         let store = Arc::clone(store);
         std::thread::spawn(move || {
@@ -22413,6 +22499,120 @@ mod tests {
             "polls within the promote interval must compute the summary once, not once per poll"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Wait until no maintenance, merge-check or base-fetch work is in flight.
+    fn wait_for_background_review_work() {
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+        while std::time::Instant::now() < deadline {
+            let busy = !MAINTAINING.lock().unwrap().is_empty()
+                || !MERGE_CHECKING.lock().unwrap().is_empty()
+                || !BASE_FETCH_IN_FLIGHT.lock().unwrap().is_empty();
+            if !busy {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        panic!("background review work did not finish");
+    }
+
+    #[test]
+    fn an_idle_remote_review_is_maintained_on_the_remote_cadence() {
+        // An idle in_review review on a remote machine: every scheduler tick
+        // (maintenance every 5 s, base freshness every 10 s) re-ran its whole
+        // pass there -- about a dozen git commands, each its own provider
+        // call. Within `REMOTE_REVIEW_MAINT_INTERVAL` only the first tick may
+        // reach the machine.
+        let dir = ralphus_test_support::scratch(format!("remote-cadence-{}", std::process::id()));
+        let (script, log) = recording_provider(&dir);
+        let store = Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
+        let id = {
+            let guard = store.lock();
+            guard
+                .register_machine_provider(
+                    "ib",
+                    "",
+                    &script.to_string_lossy(),
+                    &[],
+                    crate::machines::PROTOCOL_VERSION,
+                    false,
+                )
+                .unwrap();
+            let id = guard.create_guardian("r", "main", "/srv/repo").unwrap();
+            guard.add_guardian_branch(&id, "feature/a").unwrap();
+            guard.set_guardian_machine(&id, Some("ib:A")).unwrap();
+            let branch = guard.get_guardian(&id).unwrap().branches[0].id.clone();
+            guard
+                .set_branch_review(&id, &branch, "feature/a-review", "/srv/wt-a")
+                .unwrap();
+            guard
+                .set_branch_status(&id, &branch, MergeStatus::Done, None)
+                .unwrap();
+            guard
+                .create_pull_request(
+                    &id,
+                    Some(&branch),
+                    "github",
+                    "acme/w",
+                    "feature/a-review",
+                    "main",
+                    "t",
+                    "d",
+                    Some(1),
+                    Some("http://x/1"),
+                )
+                .unwrap();
+            guard
+                .set_guardian_status(&id, GuardianStatus::InReview, None)
+                .unwrap();
+            id
+        };
+        let runners: RunnerFactory = Arc::new(|_: &crate::store_lock::StoreHandle| {
+            Arc::new(CapturingRunner::new()) as Arc<dyn Runner>
+        });
+        let sem = Arc::new(Semaphore::new(4));
+        let cancellations = crate::cancel::Cancellations::new();
+        let tick = || {
+            review_maintenance_with(&store, &sem, &cancellations, &runners);
+            poll_base_branch_freshness_once(&store);
+            wait_for_background_review_work();
+            recorded_run_calls(&log)
+        };
+
+        let first = tick();
+        assert!(
+            first > 0,
+            "the first tick maintains the review on its machine"
+        );
+        let mut after = first;
+        for _ in 0..4 {
+            after = tick();
+        }
+        assert_eq!(
+            after - first,
+            0,
+            "ticks within the remote cadence must not reach the machine again ({first} \
+             commands on the first tick, {} more after it) for review {id}",
+            after - first
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_remote_cadence_throttles_only_remote_reviews() {
+        let remote: HashSet<String> = ["remote-r".to_string()].into_iter().collect();
+        let ids = || vec!["local-r".to_string(), "remote-r".to_string()];
+        assert_eq!(filter_by_remote_cadence(ids(), &remote), ids());
+        assert_eq!(
+            filter_by_remote_cadence(ids(), &remote),
+            vec!["local-r".to_string()]
+        );
+        assert!(is_remote_machine(Some("ib:A")));
+        assert!(!is_remote_machine(Some("local")));
+        assert!(!is_remote_machine(None));
     }
 
     #[test]

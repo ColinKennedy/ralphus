@@ -129,6 +129,14 @@ An **allocation** is one machine handed to ralphus for a scope of work:
   in-progress rebase live there) and marks it **idle** while it waits on a
   human, so the provider can act on that (power the machine down, say) as long
   as it resumes on the next call.
+- **Background calls from an open review.** Each git command of a review on a
+  machine is its own Machine API call. An open review's background
+  maintenance (base-shift and manual-push checks, PR branch sync) and its
+  base-branch fetch run every **30 s** for a review on a machine, against 5 s
+  and 10 s for a review on the daemon's host, so a review merely waiting on a
+  human costs its machine roughly two dozen short commands a minute. A
+  collecting review's change summary is recomputed at most every 30 s while
+  its page is being polled.
 
 ## Provider service API
 
