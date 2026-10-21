@@ -996,7 +996,9 @@ struct TaskIndexCell {
     /// view carries, and it is the only field that lookup needs beyond what
     /// this index already had.
     cwd: Option<String>,
-    agent: String,
+    /// Omitted for a command cell, which runs no agent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    agent: Option<String>,
     model: Option<String>,
     state: String,
     duration_ms: i64,

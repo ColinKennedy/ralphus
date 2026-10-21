@@ -282,7 +282,7 @@ fn render_squad_detail(squad: &Value) {
             println!(
                 "    [{si}] cell {name}  {}  agent={} model={}",
                 s["state"],
-                s["agent"],
+                s["agent"].as_str().unwrap_or("-"),
                 s["model"].as_str().unwrap_or("-")
             );
             if let Some(error) = non_empty_str(&s["error"]) {

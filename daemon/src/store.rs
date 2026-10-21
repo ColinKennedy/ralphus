@@ -494,8 +494,10 @@ pub struct CellView {
     pub name: Option<String>,
     /// Working directory.
     pub cwd: Option<String>,
-    /// Resolved agent program.
-    pub agent: String,
+    /// Resolved agent program. Omitted for a command cell, which runs no
+    /// agent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
     /// RAL-516: whether `agent` can emit thinking output the Live View's
     /// "Show Thinking" control has anything to fold -- see
     /// `agent_profiles::thinking_capable_for_agent` for how this is derived.
@@ -7139,9 +7141,15 @@ impl Store {
                     .get(&(task_idx, idx))
                     .cloned()
                     .unwrap_or_default();
-                let agent: String = r.get(5)?;
-                let thinking_capable =
-                    crate::agent_profiles::thinking_capable_for_agent(&agent, db_profiles);
+                // The stored `agent` is the resolved one even for a command
+                // cell, whose proof steps inherit it; the cell itself runs
+                // no agent, so its view names none.
+                let runs_agent = r.get::<_, Option<String>>(12)?.is_some()
+                    || r.get::<_, Option<String>>(13)?.is_none();
+                let agent: Option<String> = runs_agent.then(|| r.get(5)).transpose()?;
+                let thinking_capable = agent.as_deref().is_some_and(|a| {
+                    crate::agent_profiles::thinking_capable_for_agent(a, db_profiles)
+                });
                 Ok((
                     task_idx,
                     idx,
@@ -15722,7 +15730,7 @@ prompt = "legacy cell, no review_guardian_id"
         assert!(task.model.is_none());
         assert_eq!(task.cells.len(), 1);
         assert_eq!(task.cells[0].id, "worker");
-        assert_eq!(task.cells[0].agent, "claude");
+        assert_eq!(task.cells[0].agent.as_deref(), Some("claude"));
         assert_eq!(task.cells[0].state, "pending");
         assert!(
             task.cells[0]
@@ -15962,8 +15970,36 @@ prompt = "go"
         let task = &squad.tasks[0];
         assert_eq!(task.agent.as_deref(), Some("codex"));
         assert_eq!(task.model.as_deref(), Some("gpt-5-codex"));
-        assert_eq!(task.cells[0].agent, "codex");
+        assert_eq!(task.cells[0].agent.as_deref(), Some("codex"));
         assert_eq!(task.cells[0].model.as_deref(), Some("gpt-5-codex"));
+    }
+
+    #[test]
+    fn command_cell_view_names_no_agent() {
+        let src = r#"
+[[task]]
+name = "build"
+[[task.cell]]
+id = "compile"
+cwd = "/repo"
+command = "cargo build"
+[[task.cell]]
+id = "worker"
+cwd = "/repo"
+prompt = "go"
+"#;
+        let mut store = Store::open_in_memory().unwrap();
+        let id = store.insert_squad(&parse(src), None, false).unwrap();
+        let squad = store.get_squad(&id).unwrap();
+        let cells = &squad.tasks[0].cells;
+        assert_eq!(cells[0].agent, None);
+        assert!(!cells[0].thinking_capable);
+        let json = serde_json::to_value(&cells[0]).unwrap();
+        assert!(json.get("agent").is_none(), "{json}");
+        assert_eq!(cells[1].agent.as_deref(), Some("claude"));
+        // The stored agent is unchanged: proof steps inherit it.
+        let rows = store.cells_of(&id).unwrap();
+        assert_eq!(rows[0].agent, "claude");
     }
 
     #[test]

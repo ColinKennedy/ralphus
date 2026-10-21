@@ -485,7 +485,7 @@ fn render_cell_detail(s: &Value) {
         ("name", s["name"].as_str().unwrap_or_default().to_string()),
         ("state", s["state"].as_str().unwrap_or_default().to_string()),
         ("cwd", s["cwd"].as_str().unwrap_or_default().to_string()),
-        ("agent", s["agent"].as_str().unwrap_or_default().to_string()),
+        ("agent", s["agent"].as_str().unwrap_or("—").to_string()),
         ("model", s["model"].as_str().unwrap_or_default().to_string()),
         ("tokens_in", s["tokens_in"].to_string()),
         ("tokens_out", s["tokens_out"].to_string()),

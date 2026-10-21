@@ -106,7 +106,7 @@
        * @property {string} id
        * @property {string} [name]
        * @property {string} cwd
-       * @property {string} agent
+       * @property {string} [agent] - Resolved agent program; absent for a command cell, which runs no agent.
        * @property {boolean} [thinking_capable] - RAL-516: whether `agent` can emit thinking output at all (backend capability folded with any per-profile override, computed server-side). The Live View hides its "Show Thinking" checkbox entirely when this is `false`.
        * @property {string|null} model
        * @property {string} state
