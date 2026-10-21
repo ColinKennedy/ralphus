@@ -61,9 +61,9 @@ pub(crate) enum WorktreeMode {
     /// The branch is ralphus's own: created from `?upstream=`, allocated a
     /// `-2`/`-3` name when taken, tracked and resynced against `?upstream=`.
     Fresh,
-    /// The branch already holds someone's work (`&existing=1`): checked out at
-    /// its current tip under its own name, never renamed, re-pointed or
-    /// rebased. The "upstream" is the review base, used only to freeze the
+    /// The branch already holds someone's work (`ralphus ingest`, through
+    /// [`ensure_existing_branch_worktree`]): checked out at its current tip
+    /// under its own name, never renamed, re-pointed or rebased. The "upstream" is the review base, used only to freeze the
     /// commit baseline.
     Existing,
 }
@@ -2251,25 +2251,10 @@ impl ProjectStartupAdapter for GitProjectStartupAdapter {
                 .borrow_mut()
                 .insert(root_key.clone(), snapshot);
         }
-        let mode = if ralphus_core::schema::parse_worktree_placeholder_existing(placeholder) {
-            WorktreeMode::Existing
-        } else {
-            WorktreeMode::Fresh
-        };
-        // Existing-branch mode names the branch exactly: no per-squad
-        // `-2`/`-3` allocation, and an occupied branch is refused at
-        // materialization instead.
-        let branch = match mode {
-            WorktreeMode::Existing => {
-                let all = ctx.on_disk_worktrees.borrow();
-                let on_disk = all.get(&root_key).expect("populated just above");
-                refuse_branch_checked_out_elsewhere(branch, on_disk).map(|()| branch.to_string())
-            }
-            WorktreeMode::Fresh => {
-                let all = ctx.on_disk_worktrees.borrow();
-                let on_disk = all.get(&root_key).expect("populated just above");
-                resolve_squad_branch(store, project, branch, ctx.squad_id, on_disk)
-            }
+        let branch = {
+            let all = ctx.on_disk_worktrees.borrow();
+            let on_disk = all.get(&root_key).expect("populated just above");
+            resolve_squad_branch(store, project, branch, ctx.squad_id, on_disk)
         }
         .map_err(|e| {
             format!(
@@ -2279,13 +2264,6 @@ impl ProjectStartupAdapter for GitProjectStartupAdapter {
         })?;
         let branch = branch.as_str();
         let resolved = match ctx.machine {
-            Some(machine) if mode == WorktreeMode::Existing && !machine.trim().is_empty() => {
-                return Err(format!(
-                    "cell '{}': \"{placeholder}\" cannot run on machine \"{machine}\": \
-                     existing-branch worktrees are local-only; remove `machine` from the cell",
-                    ctx.cell_id
-                ));
-            }
             Some(machine) if !machine.trim().is_empty() => provision_remote_with_targets(
                 store,
                 machine,
@@ -2319,11 +2297,10 @@ impl ProjectStartupAdapter for GitProjectStartupAdapter {
                         &upstream,
                     )?,
                 };
-                let materialized = ensure_worktree_tracked_as(
+                let materialized = ensure_worktree_tracked(
                     Path::new(&project.path),
                     branch,
                     &upstream,
-                    mode,
                 )
                 .map(|m| m.path)
                 .map_err(|e| {
@@ -3610,13 +3587,6 @@ pub(crate) fn plan_local_worktree_jobs(
         let Ok(Some(branch)) = classify_placeholder(placeholder) else {
             continue;
         };
-        if ralphus_core::schema::parse_worktree_placeholder_existing(placeholder) {
-            skip(
-                cell,
-                "existing-branch worktrees are created live, never claimed ahead",
-            );
-            continue;
-        }
         // Keyed on the unwrapped text: that is what the live resolution's
         // cache is keyed on for a wrapped cwd, so the claimed path is found
         // there instead of being created again.

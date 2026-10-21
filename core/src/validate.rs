@@ -1377,6 +1377,21 @@ fn validate_cells(
                             }
                             Some(_) => {}
                         }
+                        let names_existing = placeholder.split_once('?').is_some_and(|(_, q)| {
+                            q.split('&')
+                                .any(|p| p.split('=').next() == Some("existing"))
+                        });
+                        if names_existing {
+                            ctx.error(
+                                &format!("{path}.cwd"),
+                                ErrorKind::InvalidValue,
+                                "a \"ralphus:new-worktree/<branch>\" placeholder takes no \
+                                 \"existing\" parameter: to work on a branch that already \
+                                 exists, attach it with `ralphus ingest <branch>` instead of \
+                                 a task file",
+                                line,
+                            );
+                        }
                     }
                 }
             }
@@ -4580,6 +4595,25 @@ shell=\"bash\"
                 r.errors
             );
         }
+    }
+
+    #[test]
+    fn placeholder_cwd_rejects_an_existing_parameter_and_points_at_ingest() {
+        let src = "[[task]]
+name=\"t\"
+project=\"my-project\"
+[[task.cell]]
+cwd=\"<<ralphus:new-worktree/feat?upstream=main&existing=1>>\"
+prompt=\"p\"
+";
+        let r = validate_toml(src);
+        let e = r
+            .errors
+            .iter()
+            .find(|e| e.message.contains("\"existing\" parameter"))
+            .expect("an existing= parameter must be rejected");
+        assert_eq!(e.kind, ErrorKind::InvalidValue);
+        assert!(e.message.contains("ralphus ingest"), "{}", e.message);
     }
 
     #[test]
