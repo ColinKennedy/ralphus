@@ -1774,7 +1774,9 @@ Work submitted against it will fail — fix the machine or deregister the provid
         return `<tr class="${err ? "proj-error" : ""}">
             <td>${nameCell}</td>
             <td><span class="proj-field" data-name="${esc(p.name)}" ondblclick="startProjectEdit(this.dataset.name)" data-tip="Double-click to edit the description.">${esc(p.description) || "—"}</span></td>
-            <td><span class="proj-field mono" data-name="${esc(p.name)}" ondblclick="startProjectEdit(this.dataset.name)" data-tip="Double-click to edit the path.\nMust exist on-disk and be a git working tree.">${esc(p.path)}</span></td>
+            <td>${p.remote_only
+              ? `<span class="proj-field" style="color:var(--muted)" data-tip="Remote only: registered with a clone URL and no clone on the daemon's host.\nAll of this project's cells and reviews run on remote machines, which clone the URL.\nTo give it a local clone, register it again with a path.">remote only</span>`
+              : `<span class="proj-field mono" data-name="${esc(p.name)}" ondblclick="startProjectEdit(this.dataset.name)" data-tip="Double-click to edit the path.\nMust exist on-disk and be a git working tree.">${esc(p.path)}</span>`}</td>
             <td><span class="proj-field mono" data-name="${esc(p.name)}" ondblclick="startProjectEdit(this.dataset.name)" data-tip="Double-click to edit. Clone URL a machine provider uses to provision this project on another machine (RAL-355).\nBlank means remote work on this project will fail until one is set.">${p.clone_url ? esc(p.clone_url) : `<span style="color:var(--muted)">(none)</span>`}</span></td>
             <td><span class="proj-field" data-name="${esc(p.name)}" ondblclick="startProjectEdit(this.dataset.name)" data-tip="Double-click to edit. Only \"git\" is implemented today.">${esc(p.vcs)}</span></td>
             <td style="color:var(--muted)">${fmtProjCreated(p.created_at_ms)}</td>

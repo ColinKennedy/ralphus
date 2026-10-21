@@ -1084,6 +1084,7 @@
        * @property {string} name
        * @property {string} description
        * @property {string} path
+       * @property {boolean} [remote_only] - No clone on the daemon's host; `path` is only a key.
        * @property {string|undefined} clone_url
        * @property {string} vcs
        * @property {number} created_at_ms

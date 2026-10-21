@@ -3491,6 +3491,11 @@ fn walk_project_configs(start: &Path) -> Vec<PathBuf> {
 /// [`walk_project_configs`], reusing a result for `start` that is younger
 /// than `ttl` and whose files all still exist.
 fn project_configs_on_path(start: &Path, ttl: std::time::Duration) -> Vec<PathBuf> {
+    // A remote-only project has no files on this host; its reserved root is
+    // a key, and walking up from it would find unrelated configs.
+    if crate::remote_projects::is_remote_only_root(start) {
+        return Vec::new();
+    }
     {
         let cache = discovery_cache()
             .lock()

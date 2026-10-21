@@ -573,6 +573,10 @@ struct RegisterProjectBody {
     name: String,
     #[serde(default)]
     description: String,
+    /// The daemon host's clone. Omitted (or empty) registers a remote-only
+    /// project, which needs a `clone_url` and runs all its work on remote
+    /// machines ([`crate::remote_projects`]).
+    #[serde(default)]
     path: String,
     /// Authoritative clone URL for provisioning this project on another
     /// machine. `url` is accepted as the user-facing API alias.
@@ -2915,6 +2919,66 @@ fn validate_projects_registered(
     Ok(())
 }
 
+/// A remote-only project has no clone on this host, so every cell of a task on
+/// it, and every review those cells feed, must run on a machine.
+fn validate_remote_only_projects(
+    store: &Store,
+    file: &ralphus_core::schema::TaskFile,
+) -> std::result::Result<(), String> {
+    let is_remote = |machine: Option<&str>| {
+        machine.map(str::trim).is_some_and(|m| {
+            !m.is_empty() && !m.eq_ignore_ascii_case(ralphus_core::schema::LOCAL_MACHINE)
+        })
+    };
+    let bare = |id: &str| {
+        id.trim()
+            .trim_start_matches("<<")
+            .trim_end_matches(">>")
+            .to_string()
+    };
+    for task in &file.task {
+        let Some(project_name) = task.project.as_deref() else {
+            continue;
+        };
+        let Some(project) = store
+            .resolve_project(project_name)
+            .map_err(|e| e.to_string())?
+        else {
+            continue;
+        };
+        if !project.remote_only {
+            continue;
+        }
+        for (index, cell) in task.cell.iter().enumerate() {
+            let machine = ralphus_core::schema::resolve_cell_machine(task, cell);
+            if !is_remote(machine.as_deref()) {
+                return Err(format!(
+                    "task \"{}\" cell {index} would run on the daemon's host, but project \
+                     \"{}\" has no clone here (it was registered with a clone URL only); give \
+                     the task or cell a remote `machine`",
+                    task.name, project.name
+                ));
+            }
+            let Some(review) = cell.review.as_deref() else {
+                continue;
+            };
+            let declared = file
+                .review
+                .iter()
+                .find(|r| r.id.as_deref().map(bare) == Some(bare(review)));
+            if !declared.is_some_and(|r| is_remote(r.machine.as_deref())) {
+                return Err(format!(
+                    "task \"{}\" feeds review {review:?}, which would merge on the daemon's host, \
+                     but project \"{}\" has no clone here; declare that [[review]] with a remote \
+                     `machine`",
+                    task.name, project.name
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Require the declarative inputs a remote-fed review needs, before anything is
 /// provisioned (RAL-185 Phase 3b).
 ///
@@ -3119,21 +3183,68 @@ fn validate_project_location(path: &str, kind: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Why a project registered without a `path` (remote-only) cannot be: it
+/// must be git with a clone URL its machines clone from, and its name keys
+/// its reserved root, so it must be a plain path segment.
+fn validate_remote_only_project(req: &RegisterProjectBody) -> Result<(), String> {
+    if req.vcs != "git" {
+        return Err(format!(
+            "a project without a 'path' must be git (remote machines clone it from its \
+             'clone_url'); got vcs {:?}",
+            req.vcs
+        ));
+    }
+    let has_url = req
+        .clone_url
+        .as_deref()
+        .is_some_and(|url| !url.trim().is_empty());
+    if !has_url || req.clear_clone_url {
+        return Err(
+            "give 'path' (a clone on the daemon's host) or 'clone_url' (a remote-only project \
+             whose work all runs on remote machines)"
+                .to_string(),
+        );
+    }
+    let plain = std::path::Path::new(&req.name)
+        .components()
+        .map(|c| matches!(c, std::path::Component::Normal(_)))
+        .eq([true]);
+    if !plain {
+        return Err(format!(
+            "a remote-only project's name must be a single path segment; got {:?}",
+            req.name
+        ));
+    }
+    Ok(())
+}
+
 fn register_project(daemon: &Daemon, body: &str) -> Reply {
     let Ok(req) = serde_json::from_str::<RegisterProjectBody>(body) else {
         return error(
             400,
             "bad_request",
-            "body must include \"name\" and \"path\" strings",
+            "body must include a \"name\" string, and \"path\" or \"clone_url\"",
             vec![],
         );
     };
     if req.name.trim().is_empty() {
         return error(400, "invalid_value", "'name' must not be empty", vec![]);
     }
-    if let Err(msg) = validate_project_location(&req.path, &req.vcs) {
+    let remote_only = req.path.trim().is_empty();
+    if remote_only {
+        if let Err(msg) = validate_remote_only_project(&req) {
+            return error(400, "invalid_value", &msg, vec![]);
+        }
+    } else if let Err(msg) = validate_project_location(&req.path, &req.vcs) {
         return error(400, "invalid_value", &msg, vec![]);
     }
+    let path = if remote_only {
+        crate::remote_projects::root_for(&req.name)
+            .to_string_lossy()
+            .into_owned()
+    } else {
+        req.path.clone()
+    };
     let clone_url = req
         .clone_url
         .as_deref()
@@ -3184,7 +3295,7 @@ fn register_project(daemon: &Daemon, body: &str) -> Reply {
     match guard.register_project_with_clone_url_ex(
         &req.name,
         &req.description,
-        &req.path,
+        &path,
         &req.vcs,
         clone_url,
         req.match_pr_branch_name,
@@ -3201,7 +3312,8 @@ fn register_project(daemon: &Daemon, body: &str) -> Reply {
             // (`worktrees::sync_commit_metadata_hook_best_effort`), but doing it at
             // registration too covers a cell whose `cwd` is the project root
             // itself rather than a `ralphus:new-worktree/...` placeholder.
-            if req.vcs == "git" {
+            // A remote-only project has no clone here to hook.
+            if req.vcs == "git" && !remote_only {
                 let enabled =
                     crate::config::load_commit_config(Path::new(&req.path)).add_coauthor();
                 let workspace = crate::workspace::Workspace::local(&req.path);
@@ -7510,6 +7622,17 @@ fn validate_project(daemon: &Daemon, name: &str) -> Reply {
     // handler never touches the writer lock at all.
     let project = daemon.with_read_snapshot(|c| Store::get_project_conn(c, name));
     match project {
+        // No clone on this host to check: its machines clone the URL.
+        Ok(Some(p)) if p.remote_only => json(
+            200,
+            &ProjectValidateResponse {
+                valid: p.clone_url.is_some(),
+                message: p
+                    .clone_url
+                    .is_none()
+                    .then(|| "remote-only project has no clone URL".to_string()),
+            },
+        ),
         Ok(Some(p)) => match validate_project_location(&p.path, &p.vcs) {
             Ok(()) => json(
                 200,
@@ -7937,6 +8060,9 @@ fn prepare_submitted_file(
     // that field to be set (core has no DB access), so this preflight only
     // needs the registry lookup itself (RAL-100).
     if let Err(msg) = validate_projects_registered(&guard, file) {
+        return Err(error(400, "project_validation_failed", &msg, vec![]));
+    }
+    if let Err(msg) = validate_remote_only_projects(&guard, file) {
         return Err(error(400, "project_validation_failed", &msg, vec![]));
     }
 
@@ -26326,6 +26452,101 @@ triage=true
             &register_body("proj", "C:/definitely/does/not/exist/anywhere", ""),
         );
         assert_eq!(r.status, 400);
+    }
+
+    #[test]
+    fn a_project_registered_with_a_clone_url_alone_is_remote_only() {
+        let d = daemon();
+        let r = route(
+            &d,
+            "POST",
+            "/api/projects",
+            r#"{"name":"widgets","clone_url":"https://github.com/acme/widgets.git"}"#,
+        );
+        assert_eq!(r.status, 201, "{}", r.body);
+
+        let r = route(&d, "GET", "/api/projects/widgets", "");
+        let project: serde_json::Value = serde_json::from_str(&r.body).unwrap();
+        assert_eq!(project["remote_only"], true, "{project}");
+        let root = project["path"].as_str().unwrap();
+        assert!(
+            crate::remote_projects::is_remote_only_root(Path::new(root)),
+            "{root}"
+        );
+        assert!(
+            !Path::new(root).exists(),
+            "the reserved root is never created"
+        );
+        let r = route(&d, "GET", "/api/projects/widgets/validate", "");
+        assert!(r.body.contains("\"valid\":true"), "{}", r.body);
+    }
+
+    #[test]
+    fn a_project_needs_a_path_or_a_clone_url() {
+        let d = daemon();
+        let r = route(&d, "POST", "/api/projects", r#"{"name":"nothing"}"#);
+        assert_eq!(r.status, 400);
+        assert!(r.body.contains("clone_url"), "{}", r.body);
+        let r = route(
+            &d,
+            "POST",
+            "/api/projects",
+            r#"{"name":"a/b","clone_url":"https://github.com/acme/widgets.git"}"#,
+        );
+        assert_eq!(r.status, 400);
+        assert!(r.body.contains("single path segment"), "{}", r.body);
+    }
+
+    #[test]
+    fn a_remote_only_projects_work_must_all_run_on_machines() {
+        let d = daemon();
+        route(
+            &d,
+            "POST",
+            "/api/projects",
+            r#"{"name":"widgets","clone_url":"https://github.com/acme/widgets.git"}"#,
+        );
+        let cell = "[[task.cell]]\ncwd = \"<<ralphus:new-worktree/w-1?upstream=main>>\"\n\
+                    command = \"true\"\nmode = \"raw\"\nshell = \"sh\"\n";
+        let submit = |toml: &str| {
+            route(
+                &d,
+                "POST",
+                "/api/squads",
+                &serde_json::json!({ "toml": toml }).to_string(),
+            )
+        };
+
+        let local = submit(&format!(
+            "no_review = true\n[[task]]\nname = \"t\"\nproject = \"widgets\"\n{cell}"
+        ));
+        assert_eq!(local.status, 400, "{}", local.body);
+        assert!(local.body.contains("has no clone here"), "{}", local.body);
+
+        let unplaced_review = submit(&format!(
+            "[[task]]\nname = \"t\"\nproject = \"widgets\"\nmachine = \"ssh:box\"\n{cell}\
+             review = \"<<ralphus:new-review/r>>\"\n\
+             [[review]]\nid = \"ralphus:new-review/r\"\nupstream = \"main\"\n"
+        ));
+        assert_eq!(unplaced_review.status, 400, "{}", unplaced_review.body);
+        assert!(
+            unplaced_review
+                .body
+                .contains("declare that [[review]] with a remote `machine`"),
+            "{}",
+            unplaced_review.body
+        );
+
+        let placed = submit(&format!(
+            "[[task]]\nname = \"t\"\nproject = \"widgets\"\nmachine = \"ssh:box\"\n{cell}\
+             review = \"<<ralphus:new-review/r>>\"\n\
+             [[review]]\nid = \"ralphus:new-review/r\"\nupstream = \"main\"\nmachine = \"ssh:box\"\n"
+        ));
+        assert!(
+            !placed.body.contains("project_validation_failed"),
+            "{}",
+            placed.body
+        );
     }
 
     #[test]

@@ -1030,8 +1030,14 @@ pub struct ProjectView {
     pub name: String,
     /// Human-readable description (also searched by fuzzy lookup).
     pub description: String,
-    /// Absolute filesystem path to the project's root.
+    /// Absolute filesystem path to the project's root -- for a remote-only
+    /// project, a reserved key that names no directory
+    /// ([`crate::remote_projects`]).
     pub path: String,
+    /// Registered with a clone URL alone: there is no clone on the daemon's
+    /// host, so all of its work runs on remote machines.
+    #[serde(default)]
+    pub remote_only: bool,
     /// Canonical clone URL used when a provider provisions this project on a
     /// different machine. Kept separate from `path`, which names this
     /// daemon host's existing checkout.
@@ -1041,6 +1047,21 @@ pub struct ProjectView {
     pub vcs: String,
     /// Registration time (Unix epoch milliseconds).
     pub created_at_ms: i64,
+}
+
+/// A [`ProjectView`] from a `SELECT name, description, path, clone_url, vcs,
+/// created_at_ms FROM projects` row.
+fn project_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<ProjectView> {
+    let path: String = r.get(2)?;
+    Ok(ProjectView {
+        name: r.get(0)?,
+        description: r.get(1)?,
+        remote_only: crate::remote_projects::is_remote_only_root(std::path::Path::new(&path)),
+        path,
+        clone_url: r.get(3)?,
+        vcs: r.get(4)?,
+        created_at_ms: r.get(5)?,
+    })
 }
 
 /// RAL-408: a project's DEFAULT review settings, editable any time from the
@@ -8042,16 +8063,7 @@ impl Store {
             .query_row(
                 "SELECT name, description, path, clone_url, vcs, created_at_ms FROM projects WHERE name=?",
                 params![name],
-                |r| {
-                    Ok(ProjectView {
-                        name: r.get(0)?,
-                        description: r.get(1)?,
-                        path: r.get(2)?,
-                        clone_url: r.get(3)?,
-                        vcs: r.get(4)?,
-                        created_at_ms: r.get(5)?,
-                    })
-                },
+                project_from_row,
             )
             .optional()
             .map_err(Into::into)
@@ -8112,16 +8124,7 @@ impl Store {
             "SELECT name, description, path, clone_url, vcs, created_at_ms FROM projects ORDER BY created_at_ms DESC, name",
         )?;
         let rows = stmt
-            .query_map([], |r| {
-                Ok(ProjectView {
-                    name: r.get(0)?,
-                    description: r.get(1)?,
-                    path: r.get(2)?,
-                    clone_url: r.get(3)?,
-                    vcs: r.get(4)?,
-                    created_at_ms: r.get(5)?,
-                })
-            })?
+            .query_map([], project_from_row)?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(rows)
     }

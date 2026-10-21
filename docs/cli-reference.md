@@ -846,7 +846,7 @@ use; see `READ_ONLY_NOTE`.
             - remove project [str] --user [name]  {Remove a fork registration (defaults to the project-wide fallback row when --user is omitted).}
             - set project [str] --owner [owner] --remote-name [name] --url [url] --user [name]  {Update fields on an existing fork registration (defaults to the project-wide fallback row when --user is omitted).}
         - (read-only-safe) get name [str]  {Show one registered project's details by exact name.}
-        - git --clear-url --description [text] --match-pr-branch-name/--no-match-pr-branch-name --name [name] --path [path] --url [url]  {Register a git repository as a project the daemon can resolve placeholder cell cwds against.}
+        - git --clear-url --description [text] --match-pr-branch-name/--no-match-pr-branch-name --name [name] --path [path] --url [url]  {Register a git repository as a project the daemon can resolve placeholder cell cwds against. --path names a clone on the daemon's host; --url alone registers a remote-only project whose cells and reviews must all run on remote machines.}
         - (read-only-safe) list --short  {List every project registered with the daemon.}
         - remove name [str]  {Unregister a project by exact name. Existing squads/tasks/reviews that reference it are unaffected; project-scoped settings (forks, Triage thresholds, review-settings defaults) are left in place as orphaned rows.}
         - review-settings  {Manage a project's database-backed DEFAULT review settings (RAL-408) -- resolver agent/model, machine, budget, proof scope, and the project-level equivalents of every `ralphus review settings` opt-out flag.}

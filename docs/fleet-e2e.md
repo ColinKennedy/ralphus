@@ -9,6 +9,7 @@ first, and prints a pass/fail line for each check:
 
 | Check | How |
 |---|---|
+| the project needs no clone on the daemon host | registered remote-only (unless `--local-clone`) |
 | the squad finished `done` | squad state |
 | each task ran on the machine its labels asked for | `GET /api/machine-allocations` |
 | the review reached `in_review` on its machine | review status |
@@ -36,7 +37,8 @@ only machine time. It never touches a running dev stack; everything lives under
   be the same physical host (a WSL distribution and a container on it, say).
   The harness replaces the file's `listen`, `token_env` and `state_file`.
 - A test repository both machines can clone, with a `main` branch (or pass
-  `--base`). It is cloned on the daemon host too, to register the project.
+  `--base`). It is registered as a remote-only project (no clone on the daemon
+  host); `--local-clone` clones it here and registers that path instead.
 - For an HTTPS repository, or with `--pr`: a forge token in an environment
   variable (`--forge-token-env`). Pushes from the machines then authenticate
   with it; over SSH the machines' own keys are used.

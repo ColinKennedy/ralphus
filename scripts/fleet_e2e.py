@@ -359,13 +359,18 @@ def run(args: argparse.Namespace) -> int:
         daemon = Daemon(root, bin_dir, fleet.url, fleet.token)
         log(f"daemon {daemon.url} (log {daemon.log_path}), fleet {fleet.url} (log {fleet.log_path})")
 
-        project_dir = root / "project"
-        subprocess.run(["git", "clone", "-q", args.repo_url, str(project_dir)], check=True)
         project = f"fleet-e2e-{run_id}"
-        daemon.post(
-            "/api/projects",
-            {"name": project, "path": str(project_dir), "description": "fleet e2e", "vcs": "git",
-             "clone_url": args.repo_url},
+        registration = {"name": project, "description": "fleet e2e", "vcs": "git",
+                        "clone_url": args.repo_url}
+        if args.local_clone:
+            project_dir = root / "project"
+            subprocess.run(["git", "clone", "-q", args.repo_url, str(project_dir)], check=True)
+            registration["path"] = str(project_dir)
+        daemon.post("/api/projects", registration)
+        checks.record(
+            "the project needs no clone on the daemon host",
+            args.local_clone or daemon.get(f"/api/projects/{project}").get("remote_only") is True,
+            "registered with a clone URL only" if not args.local_clone else "--local-clone",
         )
         daemon.post("/api/users", {"name": USER})
         if args.forge_token_env:
@@ -518,6 +523,9 @@ def main() -> int:
     parser.add_argument("--timeout", type=float, default=1800, help="seconds to wait for the squad and the review")
     parser.add_argument("--release-timeout", type=float, default=300, help="seconds to wait for machines to be handed back")
     parser.add_argument("--keep", action="store_true", help="leave the daemon and ralphus-fleet running")
+    parser.add_argument("--local-clone", action="store_true",
+                        help="also clone the repository on the daemon host and register that path "
+                             "(default: a remote-only project with no clone here)")
     args = parser.parse_args()
     if args.pr and not args.forge_token_env:
         parser.error("--pr needs --forge-token-env")

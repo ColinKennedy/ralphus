@@ -89,6 +89,29 @@ placeholder (`ralphus:new-worktree/<branch>`) and the entity URI
 
 Attempting to register a provider under either name is rejected.
 
+## Projects with no clone on the daemon's host
+
+A project whose work runs entirely on remote machines does not need a clone on
+the daemon's host. Register it with its clone URL alone:
+
+```bash
+ralphus project git --name widgets --url https://github.com/acme/widgets.git
+```
+
+It is shown as **remote only** (`"remote_only": true` in `GET /api/projects`).
+Its machines clone the URL; the daemon keeps only a reserved key
+(`<state dir>/remote-only-projects/<name>`, never created) where a clone's path
+would go, and reads no `.ralphus.toml` for it from its own disk (global config
+applies). Because nothing can run on the daemon's host:
+
+- every cell of a task on it must have a remote `machine` (directly or
+  inherited), and
+- every `[[review]]` those cells feed must declare a remote `machine`,
+
+or the submission is refused with which task, cell or review needs one.
+`ralphus check health` and `GET /api/projects/{name}/validate` do not look for
+a local path for it.
+
 ## Machine strict mode (development only)
 
 > **You probably do not want this on a production server.** Strict mode

@@ -84,6 +84,7 @@ pub mod provider_services;
 pub mod redact;
 pub mod remediation;
 pub mod remote_failure;
+pub mod remote_projects;
 pub mod remote_runner;
 pub mod resources;
 pub(crate) mod response_cache;

@@ -1949,7 +1949,8 @@ actionable diagnostic.",
             "--url [url]",
         ],
         "Register a git repository as a project the daemon can resolve placeholder cell \
-cwds against.",
+cwds against. --path names a clone on the daemon's host; --url alone registers a remote-only \
+project whose cells and reviews must all run on remote machines.",
         false,
         false,
         &[],
