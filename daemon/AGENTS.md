@@ -120,3 +120,10 @@ Ollama-backed test that runs unconditionally. Keep the same runtime guard too
 (skip/return early with a clear message if Ollama isn't reachable on
 `127.0.0.1:11434` or the required model isn't pulled), so even an explicit
 opt-in run degrades gracefully without live infra.
+
+## Test scratch directories (RAL-690)
+
+Use `ralphus-test-support` (`TestDir`, `scratch`) for test fixtures, never
+`std::env::temp_dir()`. `RALPHUS_TEST_TMP` relocates them (point it at a
+non-Temp drive on Windows); `RALPHUS_KEEP_TEST_TMP=1` keeps them. Details:
+`.agent/gotchas.md`.

@@ -878,7 +878,7 @@ mod tests {
 
     #[test]
     fn local_artifact_materialization_publishes_an_exact_directory() {
-        let root = std::env::temp_dir().join(format!(
+        let root = ralphus_test_support::scratch(format!(
             "ralphus-artifact-copy-{}-{:?}",
             std::process::id(),
             std::thread::current().id()
@@ -905,7 +905,7 @@ mod tests {
     #[test]
     fn local_workspace_reports_the_action_platform() {
         assert_eq!(
-            Workspace::local(std::env::temp_dir())
+            Workspace::local(ralphus_test_support::scratch_root())
                 .target_platform()
                 .unwrap(),
             (
@@ -949,7 +949,7 @@ mod tests {
     #[test]
     fn a_local_workspace_actually_runs_git() {
         // Proves the local path is a real passthrough, not a stub.
-        let ws = Workspace::local(std::env::temp_dir());
+        let ws = Workspace::local(ralphus_test_support::scratch_root());
         let out = ws.git(&["--version"]).expect("git --version");
         assert!(out.contains("git version"), "{out}");
     }
@@ -981,7 +981,7 @@ mod tests {
     fn a_remote_workspace_dispatches_to_its_providers_run_verb() {
         // End-to-end through a real provider program: proves the remote path
         // actually reaches the machine rather than erroring somewhere earlier.
-        let dir = std::env::temp_dir().join(format!("ral185-ws-{}", std::process::id()));
+        let dir = ralphus_test_support::scratch(format!("ral185-ws-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let json = r#"{"ok":true,"protocol_version":1,"exit_code":0,"stdout":"deadbeef"}"#;
         let (script, body) = if cfg!(windows) {
@@ -1028,7 +1028,7 @@ echo {json}
     fn a_failing_remote_command_reports_the_command_not_just_the_exit_code() {
         // A merge failure has to say which git command failed, or debugging it
         // means guessing.
-        let dir = std::env::temp_dir().join(format!("ral185-wsfail-{}", std::process::id()));
+        let dir = ralphus_test_support::scratch(format!("ral185-wsfail-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let json =
             r#"{"ok":true,"protocol_version":1,"exit_code":1,"stdout":"not a git repository"}"#;
@@ -1095,7 +1095,7 @@ echo {json}
         // retirement goes through -- proves it actually reaches the
         // machine's provider via `retire` rather than attempting a local
         // `git worktree remove` against a path that isn't on this host.
-        let dir = std::env::temp_dir().join(format!("ral386-ws-retire-{}", std::process::id()));
+        let dir = ralphus_test_support::scratch(format!("ral386-ws-retire-{}", std::process::id()));
         let script = write_script(
             &dir,
             r#"{"ok":true,"protocol_version":1,"outcome":"deferred","reason":"still in use","retry_at_ms":99}"#,

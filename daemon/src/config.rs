@@ -4137,7 +4137,7 @@ mod tests {
 
     #[test]
     fn project_shared_store_root_uses_logical_name() {
-        let project = std::env::temp_dir().join(format!(
+        let project = ralphus_test_support::scratch(format!(
             "ralphus-shared-store-config-{}",
             std::process::id()
         ));
@@ -4423,8 +4423,8 @@ default_base_branch = \"develop\"
 
     #[test]
     fn preset_paths_resolve_relative_to_the_config_directory() {
-        let base = std::env::temp_dir().join("ralphus-cfg");
-        let absolute = std::env::temp_dir().join("ralphus-shared");
+        let base = ralphus_test_support::scratch("ralphus-cfg");
+        let absolute = ralphus_test_support::scratch("ralphus-shared");
         let toml = format!(
             "preset_paths = [\"presets\", {:?}]\n",
             absolute.to_string_lossy()
@@ -4604,7 +4604,8 @@ initialization_timeout_sec = 30
 
     #[test]
     fn load_commit_config_reads_per_project_override() {
-        let base = std::env::temp_dir().join(format!("ralphus-cfg-commits-{}", std::process::id()));
+        let base =
+            ralphus_test_support::scratch(format!("ralphus-cfg-commits-{}", std::process::id()));
         let nested = base.join("a").join("b");
         std::fs::create_dir_all(&nested).unwrap();
         std::fs::write(
@@ -4633,7 +4634,8 @@ initialization_timeout_sec = 30
 
     #[test]
     fn project_followup_fields_win_over_global_field_by_field() {
-        let dir = std::env::temp_dir().join(format!("ralphus-cfg-followup-{}", std::process::id()));
+        let dir =
+            ralphus_test_support::scratch(format!("ralphus-cfg-followup-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
             dir.join(".ralphus.toml"),
@@ -5210,7 +5212,8 @@ initialization_timeout_sec = 30
     /// edit is visible on the very next read.
     #[test]
     fn read_config_file_cached_sees_edits_immediately() {
-        let dir = std::env::temp_dir().join(format!("ralphus-cfg-cache-{}", std::process::id()));
+        let dir =
+            ralphus_test_support::scratch(format!("ralphus-cfg-cache-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("config.toml");
         std::fs::write(&path, "[daemon]\n").unwrap();
@@ -5240,7 +5243,8 @@ initialization_timeout_sec = 30
     #[test]
     fn project_config_discovery_reuse_window() {
         use std::time::Duration;
-        let base = std::env::temp_dir().join(format!("ralphus-cfg-disc-{}", std::process::id()));
+        let base =
+            ralphus_test_support::scratch(format!("ralphus-cfg-disc-{}", std::process::id()));
         let nested = base.join("a").join("b");
         std::fs::create_dir_all(&nested).unwrap();
         let config = base.join(".ralphus.toml");
@@ -5277,7 +5281,7 @@ initialization_timeout_sec = 30
 
     #[test]
     fn find_project_config_walks_up() {
-        let base = std::env::temp_dir().join(format!("ralphus-cfg-{}", std::process::id()));
+        let base = ralphus_test_support::scratch(format!("ralphus-cfg-{}", std::process::id()));
         let nested = base.join("a").join("b").join("c");
         std::fs::create_dir_all(&nested).unwrap();
         std::fs::write(
@@ -5291,7 +5295,7 @@ initialization_timeout_sec = 30
         assert!(load_file(&found).skip_worktrees());
 
         // No config anywhere above a fresh, unrelated temp dir.
-        let empty = std::env::temp_dir().join(format!("ralphus-empty-{}", std::process::id()));
+        let empty = ralphus_test_support::scratch(format!("ralphus-empty-{}", std::process::id()));
         std::fs::create_dir_all(&empty).unwrap();
         // (may still find one if the temp root has a stray file; assert only our positive case)
 
@@ -5301,7 +5305,7 @@ initialization_timeout_sec = 30
 
     #[test]
     fn load_daemon_config_with_reads_configuration_path_entries() {
-        let config_dir = std::env::temp_dir().join(format!(
+        let config_dir = ralphus_test_support::scratch(format!(
             "ralphus-cfg-path-source-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
@@ -5320,7 +5324,7 @@ initialization_timeout_sec = 30
         // `cwd` is unrelated to `config_dir` -- no ancestor `.ralphus.toml`, so
         // the only way `default_user` can resolve here is through the
         // `$RALPHUS_CONFIGURATION_PATH` entry.
-        let cwd = std::env::temp_dir().join(format!(
+        let cwd = ralphus_test_support::scratch(format!(
             "ralphus-cfg-path-unrelated-cwd-{}",
             std::process::id()
         ));
@@ -5335,7 +5339,7 @@ initialization_timeout_sec = 30
 
     #[test]
     fn load_daemon_config_with_project_local_wins_over_configuration_path() {
-        let config_dir = std::env::temp_dir().join(format!(
+        let config_dir = ralphus_test_support::scratch(format!(
             "ralphus-cfg-path-loser-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
@@ -5351,7 +5355,7 @@ initialization_timeout_sec = 30
         )
         .unwrap();
 
-        let project_root = std::env::temp_dir().join(format!(
+        let project_root = ralphus_test_support::scratch(format!(
             "ralphus-cfg-path-project-local-winner-{}",
             std::process::id()
         ));
@@ -6060,7 +6064,8 @@ fail_after_minutes = 5
         // A project `.ralphus.toml` explicitly setting `draft_by_default`
         // must beat the global config regardless of what the test machine's
         // global file says (the global file can't be controlled here).
-        let dir = std::env::temp_dir().join(format!("ralphus-cfg-draft-{}", std::process::id()));
+        let dir =
+            ralphus_test_support::scratch(format!("ralphus-cfg-draft-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
             dir.join(".ralphus.toml"),
@@ -6098,8 +6103,10 @@ fail_after_minutes = 5
     }
 
     fn env_layer_dir(tag: &str) -> PathBuf {
-        let dir =
-            std::env::temp_dir().join(format!("ralphus-envlayers-{tag}-{}", std::process::id()));
+        let dir = ralphus_test_support::scratch(format!(
+            "ralphus-envlayers-{tag}-{}",
+            std::process::id()
+        ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
@@ -6190,7 +6197,7 @@ fail_after_minutes = 5
     #[test]
     fn find_all_project_configs_returns_empty_when_none_exist() {
         let dir =
-            std::env::temp_dir().join(format!("ralphus-configs-empty-{}", std::process::id()));
+            ralphus_test_support::scratch(format!("ralphus-configs-empty-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let configs = find_all_project_configs(&dir);
@@ -6200,7 +6207,8 @@ fail_after_minutes = 5
 
     #[test]
     fn find_all_project_configs_collects_parent_and_child() {
-        let base = std::env::temp_dir().join(format!("ralphus-hierarchy-{}", std::process::id()));
+        let base =
+            ralphus_test_support::scratch(format!("ralphus-hierarchy-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         let root_config = base.join(".ralphus.toml");
         let subdir = base.join("a").join("b");
@@ -6219,7 +6227,7 @@ fail_after_minutes = 5
 
     #[test]
     fn find_all_project_configs_root_first_order() {
-        let base = std::env::temp_dir().join(format!("ralphus-order-{}", std::process::id()));
+        let base = ralphus_test_support::scratch(format!("ralphus-order-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         let root = base.join(".ralphus.toml");
         let level1 = base.join("x").join(".ralphus.toml");
@@ -6240,7 +6248,8 @@ fail_after_minutes = 5
 
     #[test]
     fn env_overrides_parent_plus_subfolder_layering() {
-        let base = std::env::temp_dir().join(format!("ralphus-parent-sub-{}", std::process::id()));
+        let base =
+            ralphus_test_support::scratch(format!("ralphus-parent-sub-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         let root = base.join(".ralphus.toml");
         let subdir = base.join("subdir");
@@ -6293,7 +6302,7 @@ shell = \"pwsh\"
     #[test]
     fn resolve_command_shell_prefers_the_project_over_global() {
         let base =
-            std::env::temp_dir().join(format!("ralphus-command-shell-{}", std::process::id()));
+            ralphus_test_support::scratch(format!("ralphus-command-shell-{}", std::process::id()));
         std::fs::create_dir_all(&base).unwrap();
         std::fs::write(
             base.join(".ralphus.toml"),
@@ -6359,8 +6368,10 @@ allow_ralphus_mcp = true
 
     #[test]
     fn resolve_agent_isolation_layers_global_under_project() {
-        let base =
-            std::env::temp_dir().join(format!("ralphus-agent-isolation-{}", std::process::id()));
+        let base = ralphus_test_support::scratch(format!(
+            "ralphus-agent-isolation-{}",
+            std::process::id()
+        ));
         std::fs::create_dir_all(&base).unwrap();
         std::fs::write(
             base.join(".ralphus.toml"),

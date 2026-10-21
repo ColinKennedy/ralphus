@@ -336,7 +336,7 @@ mod tests {
     use std::fs;
 
     fn tempdir(label: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
+        let dir = ralphus_test_support::scratch(format!(
             "ralphus-machine-targets-{label}-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()

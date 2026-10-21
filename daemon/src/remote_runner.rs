@@ -1946,7 +1946,7 @@ mod tests {
     /// one JSON envelope to stdout", which a two-line script satisfies exactly
     /// as well as a build farm does.
     fn fake_provider(tag: &str, stdout_json: &str, stderr_lines: &[&str]) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("ral185-{tag}-{}", std::process::id()));
+        let dir = ralphus_test_support::scratch(format!("ral185-{tag}-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("mkdir");
         // An empty `stdout_json` must produce genuinely no stdout. A bare
         // `echo` in cmd prints "ECHO is off." rather than nothing, which would
@@ -2034,7 +2034,7 @@ else:
 
     #[test]
     fn probe_remote_root_round_trips_create_read_rename_delete() {
-        let dir = std::env::temp_dir().join(format!("ral355-probe-ok-{}", std::process::id()));
+        let dir = ralphus_test_support::scratch(format!("ral355-probe-ok-{}", std::process::id()));
         let py = fake_filesystem_provider(&dir, false);
         let provider = ProviderRunner::new(
             "python",
@@ -2059,7 +2059,8 @@ else:
 
     #[test]
     fn probe_remote_root_reports_which_step_failed() {
-        let dir = std::env::temp_dir().join(format!("ral355-probe-fail-{}", std::process::id()));
+        let dir =
+            ralphus_test_support::scratch(format!("ral355-probe-fail-{}", std::process::id()));
         let py = fake_filesystem_provider(&dir, true);
         let provider = ProviderRunner::new(
             "python",
@@ -2279,7 +2280,7 @@ else:
     /// async `exec` → `status`/`stream`/`cancel` flow can be exercised for
     /// real. `$1` is the verb (the args are `<verb> --uri <uri> ...`).
     fn fake_async_provider(tag: &str, arms: &[(&str, &str)]) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("ral185-{tag}-{}", std::process::id()));
+        let dir = ralphus_test_support::scratch(format!("ral185-{tag}-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("mkdir");
         if cfg!(windows) {
             let mut b = String::from("@echo off\r\n");
@@ -2349,7 +2350,8 @@ else:
 
     #[test]
     fn execution_environment_is_payload_not_local_provider_environment() {
-        let dir = std::env::temp_dir().join(format!("ral185-provider-env-{}", std::process::id()));
+        let dir =
+            ralphus_test_support::scratch(format!("ral185-provider-env-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let py = dir.join("provider.py");
@@ -2408,7 +2410,7 @@ else:
     #[test]
     fn an_async_starting_state_is_polled_instead_of_treated_as_terminal() {
         let dir =
-            std::env::temp_dir().join(format!("ral185-async-starting-{}", std::process::id()));
+            ralphus_test_support::scratch(format!("ral185-async-starting-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let py = dir.join("provider.py");
@@ -2621,7 +2623,7 @@ else:
         // even though the usage itself still reached the DB via
         // `forward_runner_event` -- this asserts the in-flight kill itself,
         // not just that the usage was recorded.
-        let dir = std::env::temp_dir().join(format!("ral185-rrcost-{}", std::process::id()));
+        let dir = ralphus_test_support::scratch(format!("ral185-rrcost-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let py = dir.join("cost.py");
@@ -2694,7 +2696,7 @@ else:
     fn a_channel_capable_provider_serves_many_run_commands_from_one_process() {
         // The point of the channel: N commands, one spawn. Each reply carries
         // the serving process's pid, so re-spawning would show up as a change.
-        let dir = std::env::temp_dir().join(format!("ral185-rrchan-{}", std::process::id()));
+        let dir = ralphus_test_support::scratch(format!("ral185-rrchan-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let py = dir.join("chan.py");
@@ -2745,7 +2747,7 @@ else:
         // A provider that rejects a request over the channel (a `cwd` outside
         // its remote root, say) gets the same treatment as a one-shot spawn
         // that rejects it: the command fails, with the provider's reason.
-        let dir = std::env::temp_dir().join(format!("ral185-rrchanerr-{}", std::process::id()));
+        let dir = ralphus_test_support::scratch(format!("ral185-rrchanerr-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let py = dir.join("reject.py");
@@ -2788,7 +2790,7 @@ else:
         // A transport problem must never fail work that would otherwise
         // succeed. This provider exits immediately in channel mode but answers
         // a normal `run` invocation, so the command must still complete.
-        let dir = std::env::temp_dir().join(format!("ral185-rrfall-{}", std::process::id()));
+        let dir = ralphus_test_support::scratch(format!("ral185-rrfall-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let ok = r#"{"ok":true,"protocol_version":1,"exit_code":0,"stdout":"fell back"}"#;

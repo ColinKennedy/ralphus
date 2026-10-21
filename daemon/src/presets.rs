@@ -1493,7 +1493,7 @@ extends = ["<<ralphus:presets/roles/judge/reviewer>>"]
     }
 
     fn temp_dir(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
+        let dir = ralphus_test_support::scratch(format!(
             "ralphus-presets-{tag}-{}-{}",
             std::process::id(),
             now_ms()

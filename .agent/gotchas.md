@@ -70,3 +70,16 @@ marker for exactly this reason.
   keep running.
 
 - **`Cancellations::register` hands every concurrent registrant of a key the same token, so a tripped one is inherited (RAL-626).** The waypoint-halt registry is keyed per squad; while any earlier cell worker of that squad is still unwinding, a restarted cell registered into the *already cancelled* token and the runner returned `waypoint_halted` before spawning anything, leaving the cell `running` with no runner. Per-trip signals register with `register_fresh`, which swaps in a new token when the current one has tripped (a squad cancel still wants the shared `register`). Root cause is from code reading, not a live repro. The runner watchdog (`scheduler::runner_watchdog_sweep`, `[runner_watchdog]` config) is the backstop for any other way a `running` cell loses its runner.
+
+## Test scratch directories (RAL-690)
+
+Tests must not build fixtures from `std::env::temp_dir()`; use
+`ralphus-test-support` (`TestDir`, `scratch`). Directories live under
+`<location>/<pid>-<start-secs>/` and are removed on drop (panic included, with
+retry for Windows sharing violations). Location: `RALPHUS_TEST_TMP` if set
+(point it at a non-Temp drive on Windows), else `%LOCALAPPDATA%\ralphus\test-tmp`
+on Windows, else `<system temp>/ralphus-tests`. `RALPHUS_KEEP_TEST_TMP=1` keeps
+the directories for debugging. The first use sweeps dead runs' leftovers (about
+every 10 minutes) and legacy flat `ral<N>-*`/`ralphus-*` dirs in `%TEMP%` older
+than 24 h. `ralphus-test-support/tests/source_scan.rs` enforces this for
+`daemon/src` and `daemon/tests`.

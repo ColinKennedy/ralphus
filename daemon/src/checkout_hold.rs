@@ -155,7 +155,7 @@ mod tests {
 
     /// A fresh, empty directory unique to one test.
     fn scratch(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
+        let dir = ralphus_test_support::scratch(format!(
             "ralphus-checkout-hold-{tag}-{}-{}",
             std::process::id(),
             crate::store::now_ms()

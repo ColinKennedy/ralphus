@@ -1744,7 +1744,7 @@ mod tests {
     }
 
     fn repo(tag: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!(
+        let dir = ralphus_test_support::scratch(format!(
             "ralphus-live-run-{tag}-{}-{}",
             std::process::id(),
             crate::store::now_ms()

@@ -307,7 +307,8 @@ mod tests {
     struct TempSnapshotDir(PathBuf);
     impl TempSnapshotDir {
         fn new(unique: &str) -> Self {
-            let dir = std::env::temp_dir().join(format!("ralphus-test-pane-snapshots-{unique}"));
+            let dir =
+                ralphus_test_support::scratch(format!("ralphus-test-pane-snapshots-{unique}"));
             let _ = std::fs::remove_dir_all(&dir);
             Self(dir)
         }

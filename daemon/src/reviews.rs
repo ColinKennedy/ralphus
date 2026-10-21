@@ -3308,7 +3308,8 @@ mod tests {
     fn temp_repo() -> PathBuf {
         static N: AtomicU32 = AtomicU32::new(0);
         let n = N.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!("ralphus-rebase-{}-{n}", std::process::id()));
+        let dir =
+            ralphus_test_support::scratch(format!("ralphus-rebase-{}-{n}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("mkdir");
         dir
@@ -4204,7 +4205,8 @@ print(json.dumps(result))
         // cell's workspace the same way it reads a local one -- proven here
         // end-to-end through a real registered provider program, not just by
         // trusting `Workspace::git`'s local branch (already covered above).
-        let dir = std::env::temp_dir().join(format!("ral355-guard-ahead-{}", std::process::id()));
+        let dir =
+            ralphus_test_support::scratch(format!("ral355-guard-ahead-{}", std::process::id()));
         let py = fake_baseline_check_provider(&dir, 2);
         let store = std::sync::Arc::new(crate::store_lock::StoreMutex::new(
             Store::open_in_memory().unwrap(),
@@ -4232,7 +4234,7 @@ print(json.dumps(result))
     #[test]
     fn any_workspace_ahead_of_upstream_is_false_when_no_workspace_has_progress() {
         let dir =
-            std::env::temp_dir().join(format!("ral355-guard-no-ahead-{}", std::process::id()));
+            ralphus_test_support::scratch(format!("ral355-guard-no-ahead-{}", std::process::id()));
         let py = fake_baseline_check_provider(&dir, 0);
         let store = std::sync::Arc::new(crate::store_lock::StoreMutex::new(
             Store::open_in_memory().unwrap(),

@@ -127,7 +127,7 @@ mod tests {
     use crate::store::Store;
 
     fn temp_dir(label: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!(
+        let dir = ralphus_test_support::scratch(format!(
             "ralphus-worktree-transcript-retirement-test-{label}-{:?}",
             std::thread::current().id()
         ));

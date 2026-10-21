@@ -373,31 +373,16 @@ fn gh_attach(
 
 /// A scratch directory removed when dropped, for tests.
 #[cfg(test)]
-pub(crate) struct TestDir(PathBuf);
+pub(crate) struct TestDir(ralphus_test_support::TestDir);
 
 #[cfg(test)]
 impl TestDir {
     pub(crate) fn new() -> Self {
-        static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let dir = std::env::temp_dir().join(format!(
-            "ralphus-exhibits-{}-{}-{}",
-            std::process::id(),
-            crate::store::now_ms(),
-            N.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        Self(dir)
+        Self(ralphus_test_support::TestDir::new("ralphus-exhibits"))
     }
 
     pub(crate) fn path(&self) -> &Path {
-        &self.0
-    }
-}
-
-#[cfg(test)]
-impl Drop for TestDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
+        self.0.path()
     }
 }
 

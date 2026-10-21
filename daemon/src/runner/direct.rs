@@ -627,8 +627,10 @@ mod tests {
     /// <path>`, prints one line, optionally lingers, then writes a `done`
     /// result. Returns the runner built around it.
     fn stub_runner(tag: &str, linger_secs: u32) -> (SubprocessRunner, std::path::PathBuf) {
-        let dir =
-            std::env::temp_dir().join(format!("ralphus-direct-stub-{tag}-{}", std::process::id()));
+        let dir = ralphus_test_support::scratch(format!(
+            "ralphus-direct-stub-{tag}-{}",
+            std::process::id()
+        ));
         std::fs::create_dir_all(&dir).unwrap();
         let result_json = r#"{\"status\":\"done\",\"tokens_in\":1,\"tokens_out\":2}"#;
         let (path, body) = if cfg!(windows) {
@@ -758,7 +760,8 @@ mod tests {
 
     #[test]
     fn capped_sink_stops_at_the_cap_and_marks_once() {
-        let dir = std::env::temp_dir().join(format!("ralphus-direct-sink-{}", std::process::id()));
+        let dir =
+            ralphus_test_support::scratch(format!("ralphus-direct-sink-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("t.raw");
         let _ = std::fs::remove_file(&path);
@@ -785,7 +788,8 @@ mod tests {
 
     #[test]
     fn transcript_tail_returns_the_trailing_lines_without_ansi() {
-        let dir = std::env::temp_dir().join(format!("ralphus-direct-tail-{}", std::process::id()));
+        let dir =
+            ralphus_test_support::scratch(format!("ralphus-direct-tail-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("t.raw");
         std::fs::write(&path, "one\r\n\u{1b}[31mtwo\u{1b}[0m\r\nthree\r\n").unwrap();

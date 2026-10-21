@@ -17855,7 +17855,7 @@ mod tests {
 
     #[test]
     fn repository_guidance_reads_agents_then_falls_back_to_claude_md() {
-        let dir = std::env::temp_dir().join(format!(
+        let dir = ralphus_test_support::scratch(format!(
             "ralphus-guidance-{}-{}",
             std::process::id(),
             crate::runner::generate_agent_session_id()
@@ -17917,7 +17917,7 @@ mod tests {
 
     #[test]
     fn local_shared_store_root_is_namespaced_by_store_and_path() {
-        let project = std::env::temp_dir().join(format!(
+        let project = ralphus_test_support::scratch(format!(
             "ralphus-shared-store-root-test-{}",
             std::process::id()
         ));
@@ -17958,7 +17958,7 @@ mod tests {
 
     #[test]
     fn shared_store_publication_has_manifest_digest_size_and_ready_marker() {
-        let root = std::env::temp_dir().join(format!(
+        let root = ralphus_test_support::scratch(format!(
             "ralphus-shared-manifest-test-{}-{}",
             std::process::id(),
             crate::store::now_ms()
@@ -18900,7 +18900,7 @@ mod tests {
         if CLEANUP_DONE.swap(true, Ordering::Relaxed) {
             return; // Already done in this process
         }
-        let temp_dir = std::env::temp_dir();
+        let temp_dir = ralphus_test_support::scratch_root();
         let pid = std::process::id().to_string();
         if let Ok(entries) = std::fs::read_dir(&temp_dir) {
             for entry in entries.flatten() {
@@ -18922,7 +18922,7 @@ mod tests {
     fn tmp_dir(tag: &str) -> PathBuf {
         cleanup_old_test_dirs();
         let n = TEST_N.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!("wt-rec-{tag}-{}-{n}", std::process::id()));
+        let dir = ralphus_test_support::scratch(format!("wt-rec-{tag}-{}-{n}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("mkdir tmp_dir");
         dir
@@ -19622,7 +19622,7 @@ mod tests {
 
     #[test]
     fn relative_executable_is_anchored_to_the_prepared_directory() {
-        let dir = std::env::temp_dir().join(format!("ralphus-anchor-{}", std::process::id()));
+        let dir = ralphus_test_support::scratch(format!("ralphus-anchor-{}", std::process::id()));
         let bin = dir.join("target").join("debug");
         std::fs::create_dir_all(&bin).unwrap();
         std::fs::write(bin.join("app.exe"), b"").unwrap();
@@ -19671,7 +19671,7 @@ mod tests {
             ..GuardianCheck::default()
         };
         assert_eq!(anchor_check_command(&check, "/no/such/dir", true), Ok(None));
-        let here = std::env::temp_dir();
+        let here = ralphus_test_support::scratch_root();
         assert_eq!(
             anchor_check_command(&check, &here.to_string_lossy(), false),
             Ok(None)
@@ -21774,7 +21774,8 @@ mod tests {
         use std::sync::atomic::{AtomicU32, Ordering};
         static N: AtomicU32 = AtomicU32::new(0);
         let n = N.fetch_add(1, Ordering::Relaxed);
-        let root = std::env::temp_dir().join(format!("ralphus-relink-{}-{n}", std::process::id()));
+        let root =
+            ralphus_test_support::scratch(format!("ralphus-relink-{}-{n}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).expect("mkdir temp root");
 
@@ -24961,7 +24962,8 @@ mod branch_diff_tests {
 
     #[test]
     fn diff_summary_counts_worktree_edits_against_the_base() {
-        let dir = std::env::temp_dir().join(format!("ralphus-branch-diff-{}", std::process::id()));
+        let dir =
+            ralphus_test_support::scratch(format!("ralphus-branch-diff-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let g = |args: &[&str]| {

@@ -598,7 +598,7 @@ mod tests {
     #[test]
     fn a_project_registered_with_an_unimplemented_kind_errors_instead_of_using_git() {
         let store = crate::store::Store::open_in_memory().unwrap();
-        let dir = std::env::temp_dir().join("ral185-vcs-kind");
+        let dir = ralphus_test_support::scratch("ral185-vcs-kind");
         std::fs::create_dir_all(&dir).unwrap();
         store
             .register_project("p4proj", "", &dir.to_string_lossy(), "perforce")
@@ -612,7 +612,7 @@ mod tests {
 
     #[test]
     fn is_repository_distinguishes_a_checkout_from_a_plain_directory() {
-        let dir = std::env::temp_dir().join("ral213-vcs-is-repo");
+        let dir = ralphus_test_support::scratch("ral213-vcs-is-repo");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         assert!(
@@ -633,7 +633,7 @@ mod tests {
 
     #[test]
     fn git_ops_run_returns_stdout_and_a_readable_error_on_failure() {
-        let dir = std::env::temp_dir().join("ral213-vcs-gitops-run");
+        let dir = ralphus_test_support::scratch("ral213-vcs-gitops-run");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         assert!(
@@ -680,8 +680,8 @@ mod tests {
 
     #[test]
     fn snapshot_and_restore_round_trips_tracked_and_untracked_changes() {
-        let dir = std::env::temp_dir().join("ral488-vcs-snapshot-restore");
-        let snapshot_dir = std::env::temp_dir().join("ral488-vcs-snapshot-restore-snap");
+        let dir = ralphus_test_support::scratch("ral488-vcs-snapshot-restore");
+        let snapshot_dir = ralphus_test_support::scratch("ral488-vcs-snapshot-restore-snap");
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&snapshot_dir);
         std::fs::create_dir_all(&dir).unwrap();

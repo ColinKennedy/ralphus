@@ -1086,6 +1086,7 @@ dependencies = [
  "ralphus-core",
  "ralphus-runner",
  "ralphus-shell-syntax",
+ "ralphus-test-support",
  "rusqlite",
  "serde",
  "serde_json",
@@ -1199,6 +1200,13 @@ dependencies = [
  "sysinfo",
  "toml 0.8.23",
  "ureq",
+]
+
+[[package]]
+name = "ralphus-test-support"
+version = "0.1.0"
+dependencies = [
+ "sysinfo",
 ]
 
 [[package]]

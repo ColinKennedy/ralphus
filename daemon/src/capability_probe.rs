@@ -615,7 +615,7 @@ mod tests {
     }
 
     fn temp_home(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
+        let dir = ralphus_test_support::scratch(format!(
             "ral695-home-{tag}-{}-{}",
             std::process::id(),
             crate::store::now_ms()

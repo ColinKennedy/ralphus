@@ -648,7 +648,7 @@ mod tests {
     static NEXT_DIR: AtomicU64 = AtomicU64::new(0);
 
     fn temp_dir() -> PathBuf {
-        let path = std::env::temp_dir().join(format!(
+        let path = ralphus_test_support::scratch(format!(
             "ralphus-ark-{}-{}",
             std::process::id(),
             NEXT_DIR.fetch_add(1, Ordering::Relaxed)

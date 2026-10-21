@@ -1747,7 +1747,7 @@ mod tests {
     /// A review with one finished member cell that posted two handoffs, a
     /// prepared checkout (a real git repo), and live actions opted in.
     fn fixture(tag: &str, reply: &str) -> Fixture {
-        let dir = std::env::temp_dir().join(format!(
+        let dir = ralphus_test_support::scratch(format!(
             "ralphus-live-runs-{tag}-{}-{}",
             std::process::id(),
             crate::store::now_ms()

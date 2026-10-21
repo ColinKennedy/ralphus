@@ -102,8 +102,10 @@ mod tests {
     }
 
     fn temp_repo(name: &str) -> PathBuf {
-        let dir =
-            std::env::temp_dir().join(format!("ralphus-git-hooks-{name}-{}", std::process::id()));
+        let dir = ralphus_test_support::scratch(format!(
+            "ralphus-git-hooks-{name}-{}",
+            std::process::id()
+        ));
         let _ = std::fs::remove_dir_all(&dir);
         init_repo(&dir);
         dir

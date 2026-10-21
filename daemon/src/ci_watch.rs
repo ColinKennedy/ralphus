@@ -2431,7 +2431,8 @@ mod tests {
     /// case-only differences) must still get distinct log files.
     #[test]
     fn ci_failure_log_path_keeps_alike_check_names_apart() {
-        let root = std::env::temp_dir().join(format!("ralphus-ci-log-path-{}", std::process::id()));
+        let root =
+            ralphus_test_support::scratch(format!("ralphus-ci-log-path-{}", std::process::id()));
         std::fs::create_dir_all(root.join(".git")).unwrap();
         let wt = root.to_str().unwrap();
         let paths: Vec<PathBuf> = ["build", "build", "test (a.b)", "test (a/b)", "Build"]
@@ -2453,7 +2454,7 @@ mod tests {
     #[test]
     fn ci_failure_log_is_never_written_into_the_working_tree() {
         let root =
-            std::env::temp_dir().join(format!("ralphus-ci-log-nogit-{}", std::process::id()));
+            ralphus_test_support::scratch(format!("ralphus-ci-log-nogit-{}", std::process::id()));
         std::fs::create_dir_all(&root).unwrap();
         assert_eq!(
             ci_failure_log_path(root.to_str().unwrap(), "build", None),
@@ -2540,7 +2541,7 @@ mod tests {
         let store = Arc::new(crate::store_lock::StoreMutex::new(
             Store::open_in_memory().unwrap(),
         ));
-        let root = std::env::temp_dir();
+        let root = ralphus_test_support::scratch_root();
         let guardian_id = {
             let guard = store.lock();
             guard
@@ -2921,7 +2922,11 @@ mod tests {
     fn exhausted_pr(store: &crate::store_lock::StoreHandle) -> String {
         let guard = store.lock();
         let gid = guard
-            .create_guardian("r", "main", &std::env::temp_dir().to_string_lossy())
+            .create_guardian(
+                "r",
+                "main",
+                &ralphus_test_support::scratch_root().to_string_lossy(),
+            )
             .unwrap();
         guard.add_guardian_branch(&gid, "a").unwrap();
         let bid = guard.get_guardian(&gid).unwrap().branches[0].id.clone();

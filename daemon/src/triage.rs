@@ -1591,7 +1591,7 @@ mod tests {
     /// A real, existing directory for tests that need `std::fs::canonicalize`
     /// to succeed (pool-key resolution normalizes via canonicalization).
     fn real_tempdir(label: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!(
+        let dir = ralphus_test_support::scratch(format!(
             "ralphus-triage-pool-key-{label}-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()

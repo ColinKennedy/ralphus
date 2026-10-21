@@ -224,7 +224,8 @@ mod tests {
     /// A provider script that echoes each request back with a marker, proving
     /// the same process served every request.
     fn echo_channel_script(tag: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("ral185-chan-{tag}-{}", std::process::id()));
+        let dir =
+            ralphus_test_support::scratch(format!("ral185-chan-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("mkdir");
         // Python is already a hard test dependency elsewhere in this crate.
@@ -304,7 +305,7 @@ mod tests {
             println!("SKIP: python not on PATH");
             return;
         }
-        let dir = std::env::temp_dir().join(format!("ral185-chan-die-{}", std::process::id()));
+        let dir = ralphus_test_support::scratch(format!("ral185-chan-die-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let py = dir.join("die.py");
         std::fs::write(&py, "import sys; sys.exit(0)\n").unwrap();

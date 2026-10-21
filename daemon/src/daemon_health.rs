@@ -512,7 +512,7 @@ mod tests {
 
     #[test]
     fn volume_lookup_prefers_the_longest_mount_prefix() {
-        let root = std::env::temp_dir();
+        let root = ralphus_test_support::scratch_root();
         let nested = root.join("ralphus_volume_lookup_probe");
         std::fs::create_dir_all(&nested).unwrap();
         let canonical = nested.canonicalize().unwrap();

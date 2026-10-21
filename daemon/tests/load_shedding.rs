@@ -53,7 +53,7 @@ fn users(base: &str) -> String {
 }
 
 fn temp_db(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!(
+    let dir = ralphus_test_support::scratch(format!(
         "ralphus-load-shedding-{name}-{}",
         std::process::id()
     ));
