@@ -226,15 +226,19 @@ its configuration names a **transport**:
   an SSH login -- a Linux box, a WSL distribution with `sshd`, a container
   running OpenSSH (`scripts/ssh-target.sh`), or a Windows machine with the
   built-in OpenSSH Server (see [Windows over SSH](#windows-over-ssh)).
-- `outpost`: the machine runs `ralphus-outpost connect`, which connects out to
-  the fleet and runs its requests; nothing listens on the machine. See
-  [`outpost.md`](outpost.md).
+- `outpost`: the machine runs `ralphus-outpost`, which connects out to the
+  fleet and runs its requests; nothing listens on the machine. Set one up
+  once with `ralphus-fleet pair <machine>` here and `ralphus-outpost install
+  --code` there. See [`outpost.md`](outpost.md).
 
 ```bash
 ralphus-fleet add wslbox --user me --remote-root /home/me/ralphus-fleet --label gpu
 export RALPHUS_FLEET_TOKEN=$(openssl rand -hex 32)   # the daemon gets the same value
 ralphus-fleet serve                                  # reads ./ralphus-fleet.toml
-ralphus-fleet list                                   # machines and their allocations
+ralphus-fleet list                                   # machines, readiness, allocations
+ralphus-fleet add --outpost --name winbox --remote-root C:/ralphus/fleet --require-agent claude-code
+ralphus-fleet pair winbox                            # one-time code for the machine
+ralphus-fleet revoke winbox                          # forget its credential
 ```
 
 ```toml
@@ -257,11 +261,14 @@ artifacts = { "x86_64-unknown-linux-musl" = "C:/ralphus/linux/ralphus-runner" }
 codex = "/home/me/.local/bin/codex"           # agent executables on that machine
 
 [[machine]]
-name              = "winbox"                  # reached through ralphus-outpost
-transport         = "outpost"
-outpost_token_env = "WINBOX_OUTPOST_TOKEN"
+name              = "winbox"                  # reached through ralphus-outpost,
+transport         = "outpost"                 # paired with `ralphus-fleet pair`
 remote_root       = "C:/ralphus/fleet"
 labels            = ["windows"]
+required_agents   = ["claude-code"]           # not allocated until it is logged in
+
+[outpost_runners]                             # optional: runners outposts keep
+"windows-x86_64" = "C:/ralphus/win/ralphus-runner.exe"
 ```
 
 ### Configuration reference
@@ -276,6 +283,8 @@ Top level:
 | `ssh_provider` | next to `ralphus-fleet`, then `PATH` | the `ralphus-ssh-provider` program |
 | `ssh_config_file` | OpenSSH default | `ssh -F` file for every SSH machine |
 | `state_file` | `<config>.state.json` | where allocations (never tokens) are kept |
+| `outpost_registry` | `<config>.outposts.json` | paired outposts' public keys, pending pairing codes (as derived keys) and readiness reports |
+| `[outpost_runners]` | none | `<os>-<arch>` (`windows-x86_64`, ...) to a `ralphus-runner` on the fleet host that outposts of that platform download, verify and run jobs with; a platform without one uses the runner built into `ralphus-outpost` |
 
 Each `[[machine]]`:
 
@@ -284,17 +293,20 @@ Each `[[machine]]`:
 | `name` | both (required for `outpost`) | how allocations name it; `host` when omitted |
 | `transport` | -- | `ssh` (default) or `outpost` |
 | `host`, `user` | `ssh` | SSH destination: hostname, `user@host`, or a `~/.ssh/config` alias |
-| `outpost_token_env` | `outpost` | variable in the fleet's environment holding the machine's pairing secret |
+| `outpost_token_env` | `outpost` | optional: variable in the fleet's environment holding a shared pairing secret; omit it for a machine paired with `ralphus-fleet pair` |
 | `os`, `arch` | both | `linux`/`windows`/`macos`, `x86_64`/`aarch64`; probed (SSH) or reported (outpost) when omitted |
 | `labels` | both | opaque labels a request can ask for |
 | `remote_root` | both | durable storage root on the machine |
 | `max_allocations` | both | at most this many allocations at once |
 | `[machine.runner]` | `ssh` | `mode` (`installed`/`upload`), `command`, `artifacts` (target triple to runner binary on the fleet host) |
-| `[machine.agents]` | both | agent name to executable path on the machine |
+| `[machine.agents]` | both | agent name to executable path on the machine; an outpost checks each one when it connects |
+| `required_agents` | both | agents (`claude-code`, `codex`, ...) the machine must be able to start, logged in; an outpost machine whose readiness report says one cannot is refused with the fix |
 
 Validation is strict: unknown keys, an `ssh` machine without `host`, an
-`outpost` machine without `name` or `outpost_token_env` (or with a
-`[machine.runner]`), and a Windows SSH machine whose `remote_root` contains
+`outpost` machine without `name` (or with a `[machine.runner]`, or an
+`outpost_token_env` that is not a variable name), a `required_agents` entry
+that is not an agent name, an `[outpost_runners]` key that is not
+`<os>-<arch>`, and a Windows SSH machine whose `remote_root` contains
 anything but letters, digits and `. _ - \ /` are errors.
 
 ### Windows over SSH
@@ -336,8 +348,15 @@ session's stdin, instead of POSIX shell scripts:
   paths; the daemon needs no `[machine.targets]` entry for it.
 - `materialize` copies the selected files to the fleet host and returns them
   in the reply, so the daemon may run elsewhere.
-- `GET /v1/outposts` (service token) lists outpost machines and whether each
-  is connected.
+- `GET /v1/outposts` (service token) lists outpost machines: whether each is
+  connected, paired (with its key's fingerprint) and its latest readiness
+  report.
+- An outpost machine whose readiness report has a blocking problem (git
+  missing, or a `required_agents` agent that cannot start or is not logged
+  in) is not allocated; the refusal (`no_matching_machine`) says what is
+  wrong and its remediation says how to fix it. `ralphus-fleet list` shows
+  the same.
+
 
 To check a set of machines end to end (strict mode, two machines, a review,
 secrets, restarts, release), run [`scripts/fleet_e2e.py`](fleet-e2e.md). To
