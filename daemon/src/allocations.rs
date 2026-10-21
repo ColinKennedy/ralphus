@@ -1060,7 +1060,10 @@ pub fn maintain(store: &crate::store_lock::StoreHandle) {
                 }
             }
         }
-        let (needed, idle) = allocation_use(&store.lock(), &row);
+        let (needed, idle) = {
+            let guard = store.lock();
+            allocation_use(&guard, &row)
+        };
         if !needed {
             match release(service, &row.allocation_id) {
                 Ok(()) => {}
@@ -1519,9 +1522,12 @@ mod tests {
             "claude",
             None,
         );
-        let runner = crate::remote_runner::provider_from_store(&store.lock(), &machines[0])
-            .unwrap()
-            .expect("remote");
+        let runner = {
+            let guard = store.lock();
+            crate::remote_runner::provider_from_store(&guard, &machines[0])
+        }
+        .unwrap()
+        .expect("remote");
         assert_eq!(runner.ping(&spec).unwrap().as_deref(), Some("pong"));
         TOKENS.lock().unwrap().clear();
         assert_eq!(runner.ping(&spec).unwrap().as_deref(), Some("pong"));
@@ -1618,9 +1624,12 @@ mod tests {
             "claude",
             None,
         );
-        let runner = crate::remote_runner::provider_from_store(&store.lock(), &machine)
-            .unwrap()
-            .expect("remote");
+        let runner = {
+            let guard = store.lock();
+            crate::remote_runner::provider_from_store(&guard, &machine)
+        }
+        .unwrap()
+        .expect("remote");
         assert_eq!(
             runner.ping(&spec).unwrap().as_deref(),
             Some("pong from me@box"),
@@ -1682,9 +1691,12 @@ mod tests {
         crate::provider_services::set_services_for_test(vec![fleet.service.clone()]);
         let store = handle(Store::open_in_memory().unwrap());
         let machine = grant(&store, "@renew-401", Scope::Squad("s")).unwrap();
-        let runner = crate::remote_runner::provider_from_store(&store.lock(), &machine)
-            .unwrap()
-            .expect("remote");
+        let runner = {
+            let guard = store.lock();
+            crate::remote_runner::provider_from_store(&guard, &machine)
+        }
+        .unwrap()
+        .expect("remote");
         let spec = crate::runner::RunnerSpec::for_command_proof(
             "s", "c", &machine, ".", "", "claude", None,
         );
