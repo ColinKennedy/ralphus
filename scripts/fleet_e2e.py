@@ -407,9 +407,11 @@ def run(args: argparse.Namespace) -> int:
         )
         checks.record("squad finished done", state == "done", f"state {state}")
 
-        active = allocations(daemon)
-        mine = [a for a in active if a.get("squad_id") == squad]
-        names = sorted(str(a.get("description")) for a in mine)
+        # Released ones too: a task's machine is handed back once its branch
+        # is published and the squad is done, which can beat this check.
+        granted = allocations(daemon, all_states=True)
+        mine = [a for a in granted if a.get("squad_id") == squad]
+        names = sorted({str(a.get("description")) for a in mine})
         expected = sorted({str(machine_a.get("name") or machine_a["host"]),
                            str(machine_b.get("name") or machine_b["host"])})
         checks.record("each task ran on the machine its labels asked for", names == expected,
