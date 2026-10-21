@@ -45,6 +45,10 @@ struct Inner {
     /// When each guardian's last recompute finished, for
     /// [`LOW_PRIORITY_MIN_INTERVAL`].
     last_done: HashMap<String, Instant>,
+    /// Guardian ids a worker has popped and is recomputing right now; a
+    /// [`SummaryQueue::promote`] for one of them is dropped, since the
+    /// running recompute already answers it.
+    in_flight: HashSet<String>,
     shutdown: bool,
 }
 
@@ -65,6 +69,7 @@ impl SummaryQueue {
                 low: VecDeque::new(),
                 queued: HashSet::new(),
                 last_done: HashMap::new(),
+                in_flight: HashSet::new(),
                 shutdown: false,
             }),
             cv: Condvar::new(),
@@ -112,7 +117,8 @@ impl SummaryQueue {
     /// picked up next rather than waiting behind other High entries). If it
     /// isn't queued at all (never enqueued, or already finished), wakes it up
     /// by enqueueing fresh at High — never runs synchronously on the caller's
-    /// thread — unless it finished within [`PROMOTE_MIN_INTERVAL`].
+    /// thread — unless it is being recomputed right now or finished within
+    /// [`PROMOTE_MIN_INTERVAL`].
     pub fn promote(&self, id: &str) {
         let mut inner = self.inner.lock().expect("summary queue mutex poisoned");
         if let Some(pos) = inner.low.iter().position(|x| x == id) {
@@ -127,10 +133,11 @@ impl SummaryQueue {
             self.cv.notify_all();
             return;
         }
-        if inner
-            .last_done
-            .get(id)
-            .is_some_and(|at| at.elapsed() < PROMOTE_MIN_INTERVAL)
+        if inner.in_flight.contains(id)
+            || inner
+                .last_done
+                .get(id)
+                .is_some_and(|at| at.elapsed() < PROMOTE_MIN_INTERVAL)
         {
             return;
         }
@@ -147,6 +154,7 @@ impl SummaryQueue {
         loop {
             if let Some(id) = inner.high.pop_front().or_else(|| inner.low.pop_front()) {
                 inner.queued.remove(&id);
+                inner.in_flight.insert(id.clone());
                 return Some(id);
             }
             if inner.shutdown {
@@ -164,6 +172,7 @@ impl SummaryQueue {
             .last_done
             .retain(|_, at| now.duration_since(*at) < PROMOTE_MIN_INTERVAL);
         inner.last_done.insert(id.to_string(), now);
+        inner.in_flight.remove(id);
     }
 
     /// Stop the queue once everything already queued has been popped — lets
@@ -240,6 +249,21 @@ mod tests {
         );
         q.shutdown();
         assert_eq!(q.pop(), None, "no recompute was queued for the recent one");
+    }
+
+    #[test]
+    fn promotes_while_a_recompute_is_running_are_dropped() {
+        // A slow remote recompute outlasts several page polls; each poll's
+        // promote must not queue a second recompute behind the running one.
+        let q = SummaryQueue::new();
+        q.promote("a");
+        assert_eq!(q.pop().as_deref(), Some("a"));
+        q.promote("a");
+        q.promote("b");
+        assert_eq!(q.pop().as_deref(), Some("b"));
+        q.mark_done("a");
+        q.shutdown();
+        assert_eq!(q.pop(), None, "no second recompute was queued for a");
     }
 
     #[test]
