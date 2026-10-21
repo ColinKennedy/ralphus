@@ -156,7 +156,7 @@ impl ForgeCredentials {
     }
 
     /// The environment that lets one git command authenticate.
-    fn env(&self, store: &crate::store_lock::StoreHandle) -> Vec<(String, String)> {
+    pub(crate) fn env(&self, store: &crate::store_lock::StoreHandle) -> Vec<(String, String)> {
         let Some(credential) = self.resolve(store) else {
             return Vec::new();
         };

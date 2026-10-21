@@ -227,6 +227,12 @@ pub struct ProvisionRequest {
     /// manage runner deployment may ignore this field.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub runner: Option<TargetRunnerConfig>,
+    /// Environment for the provisioning git commands (clone, fetch): a forge
+    /// credential when the clone URL is HTTPS
+    /// ([`crate::workspace::ForgeCredentials`]). Never written to the
+    /// machine's disk by the provider.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub env: BTreeMap<String, String>,
 }
 
 /// The payload sent to a provider's `cleanup` verb (RAL-355 Phase 2

@@ -2868,7 +2868,7 @@ fn provision_remote_with_targets(
 ) -> Result<String, String> {
     let who = format!("cell '{}'", cell.cell_id);
     let provider = remote_provider(store, machine, &who)?;
-    let req = provision_request(
+    let mut req = provision_request(
         &who,
         machine,
         project,
@@ -2878,6 +2878,7 @@ fn provision_remote_with_targets(
         &cell.cell_id,
         targets,
     )?;
+    req.env = provision_env(store, project, Some(squad_id));
     let spec = crate::runner::RunnerSpec::from_row(squad_id, cell);
     let result = provider
         .provision(&req, &spec)
@@ -3019,7 +3020,32 @@ fn provision_request(
             artifacts: target.runner_artifacts.clone(),
             remote_root: target.remote_root.clone(),
         }),
+        env: std::collections::BTreeMap::new(),
     })
+}
+
+/// The environment a provision's git clone/fetch of `project` needs: the
+/// forge credential of the squad's submitter (or the project's or daemon's
+/// default user) when the project is cloned over HTTPS, else nothing.
+fn provision_env(
+    store: &StoreHandle,
+    project: &crate::store::ProjectView,
+    squad_id: Option<&str>,
+) -> std::collections::BTreeMap<String, String> {
+    let owner = store.lock().resolve_review_owner(&project.path, squad_id);
+    let identity = crate::forge::effective_forge_identity(None, owner.as_deref());
+    project
+        .clone_url
+        .as_deref()
+        .and_then(|url| {
+            crate::workspace::ForgeCredentials::for_clone_url(
+                url,
+                identity.as_deref(),
+                Path::new(&project.path),
+            )
+        })
+        .map(|credentials| credentials.env(store).into_iter().collect())
+        .unwrap_or_default()
 }
 
 /// The branch a review provisions on its machine when none of its cells ran
@@ -3062,7 +3088,7 @@ pub(crate) fn provision_review_repository(
         .map_err(|e| format!("{who}: could not load machine targets: {e}"))?;
     let provider = remote_provider(store, machine, &who)?;
     let branch = review_anchor_branch(guardian_id);
-    let req = provision_request(
+    let mut req = provision_request(
         &who,
         machine,
         &project,
@@ -3072,6 +3098,13 @@ pub(crate) fn provision_review_repository(
         "review-anchor",
         &targets,
     )?;
+    // The review's owner, falling back to the project's and daemon's default.
+    let owner_squad = store
+        .lock()
+        .get_guardian(guardian_id)
+        .ok()
+        .and_then(|g| g.squad_id);
+    req.env = provision_env(store, &project, owner_squad.as_deref());
     let spec = crate::runner::RunnerSpec::for_command_proof(
         "review-merge",
         "review-merge",

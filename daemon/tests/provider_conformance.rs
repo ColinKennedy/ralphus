@@ -68,6 +68,7 @@ fn run_conformance_suite(provider: &ProviderRunner) {
         cell_id: spec.cell_id.clone(),
         remote_root: None,
         runner: None,
+        env: std::collections::BTreeMap::new(),
     };
     let workspace = provider
         .provision(&req, &spec)
