@@ -2978,14 +2978,52 @@ fn parse_suggested_pr(text: &str) -> Option<(String, String, Vec<i64>)> {
     Some((title, description, relevant_prophecy_ids))
 }
 
-/// Removes the runner's reply markers from a PR-writer reply. Every prompt
-/// run is asked for a `RALPHUS_GHOST:` handoff section and
-/// `RALPHUS_PROPHECY:` lines, and a backend that does not strip them from its
-/// summary would otherwise publish them in the PR body. A prophecy is one
-/// line; a ghost section is its marker line plus the bullets under it. Lines
-/// inside code fences are kept, so a description that quotes the syntax is
-/// left intact.
-fn strip_agent_reply_markers(text: &str) -> String {
+/// Reply markers ralphus parses out of an agent's reply. None of them is
+/// meant for a human reader.
+const AGENT_REPLY_MARKERS: [&str; 6] = [
+    "RALPHUS_GHOST:",
+    "RALPHUS_PROPHECY:",
+    "RALPHUS_PROOF:",
+    "RALPHUS_STILL_WORKING:",
+    "RALPHUS_LIVE_ACTION:",
+    "RALPHUS_APPRAISAL:",
+];
+
+/// Byte offset of a `RALPHUS_GHOST:` or `RALPHUS_STILL_WORKING:` marker
+/// written after other text on `line`. Both are end-of-reply markers the
+/// runner finds anywhere in the reply, so one appended to a sentence is
+/// still a marker. A mention inside an inline code span is not one.
+fn trailing_end_marker_at(line: &str) -> Option<usize> {
+    ["RALPHUS_GHOST:", "RALPHUS_STILL_WORKING:"]
+        .iter()
+        .filter_map(|marker| line.find(marker))
+        .filter(|&at| line[..at].matches('`').count() % 2 == 0)
+        .min()
+}
+
+/// Whether `line` (`trimmed` is it without indentation) continues a ghost
+/// section's list.
+fn continues_ghost_section(line: &str, trimmed: &str) -> bool {
+    let numbered = trimmed.split_once(['.', ')']).is_some_and(|(n, rest)| {
+        !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()) && rest.starts_with(' ')
+    });
+    trimmed.is_empty()
+        || trimmed.starts_with("- ")
+        || trimmed.starts_with("* ")
+        || numbered
+        || line.starts_with([' ', '\t'])
+}
+
+/// Removes the runner's reply markers from an agent reply bound for a human
+/// reader (a PR description, a review's change summary). Every prompt run is
+/// asked for a `RALPHUS_GHOST:` handoff section and `RALPHUS_PROPHECY:`
+/// lines, and may end with `RALPHUS_STILL_WORKING:`; a backend that does not
+/// strip them would otherwise publish them. A line starting with any of
+/// [`AGENT_REPLY_MARKERS`] is dropped; a ghost section is its marker line
+/// plus the list under it; a ghost or still-working marker written after
+/// other text drops the rest of its line. Lines inside code fences are kept,
+/// so a description that quotes the syntax is left intact.
+pub(crate) fn strip_agent_reply_markers(text: &str) -> String {
     let mut kept: Vec<&str> = Vec::new();
     let mut in_fence = false;
     let mut in_ghost = false;
@@ -3002,11 +3040,7 @@ fn strip_agent_reply_markers(text: &str) -> String {
             continue;
         }
         if in_ghost {
-            let continues = trimmed.is_empty()
-                || trimmed.starts_with("- ")
-                || trimmed.starts_with("* ")
-                || line.starts_with([' ', '\t']);
-            if continues {
+            if continues_ghost_section(line, trimmed) {
                 continue;
             }
             in_ghost = false;
@@ -3015,7 +3049,15 @@ fn strip_agent_reply_markers(text: &str) -> String {
             in_ghost = true;
             continue;
         }
-        if trimmed.starts_with("RALPHUS_PROPHECY:") {
+        if AGENT_REPLY_MARKERS.iter().any(|m| trimmed.starts_with(m)) {
+            continue;
+        }
+        if let Some(at) = trailing_end_marker_at(line) {
+            in_ghost = line[at..].starts_with("RALPHUS_GHOST:");
+            let before = line[..at].trim_end();
+            if !before.is_empty() {
+                kept.push(before);
+            }
             continue;
         }
         kept.push(line);
@@ -24798,6 +24840,20 @@ token_env = "RALPHUS_TEST_FORGE_TOKEN"
         )
         .unwrap();
         assert_eq!(d, "Fixes it.\n\n## Testing\n\nRan it.");
+    }
+
+    #[test]
+    fn parse_suggested_pr_drops_every_marker_kind_and_a_ghost_appended_to_a_line() {
+        let (_, d, _) = parse_suggested_pr(
+            "TITLE: Fix bug\n===DESCRIPTION===\nFixes it.\n\
+             RALPHUS_STILL_WORKING: waiting on CI\n\
+             RALPHUS_PROOF: PASS\n\
+             RALPHUS_LIVE_ACTION: (Nothing to test live)\n\
+             Ran the tests. RALPHUS_GHOST: (nothing to report)\n\
+             1. a numbered handoff note\n\n## Testing\n\nRan it.",
+        )
+        .unwrap();
+        assert_eq!(d, "Fixes it.\nRan the tests.\n## Testing\n\nRan it.");
     }
 
     #[test]

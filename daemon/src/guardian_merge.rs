@@ -17097,11 +17097,12 @@ fn generate_final_summary(
     };
     let result = runner.run(&spec);
     let _ = record_guardian_call_cost(store, id, None, "summary", &result);
-    if result.is_done() && !result.summary.trim().is_empty() {
+    let summary = crate::pr::strip_agent_reply_markers(&result.summary);
+    let summary = summary.trim();
+    if result.is_done() && !summary.is_empty() {
         // RAL-88: record which resolved agent/model produced this summary.
         let guard = store.lock();
-        let _ =
-            guard.set_guardian_summary(id, &result.summary, Some(agent.as_str()), model.as_deref());
+        let _ = guard.set_guardian_summary(id, summary, Some(agent.as_str()), model.as_deref());
         guard.mark_final_summary_generated(id, signature);
     } else {
         // RAL-303: the review is left showing its git-log preliminary summary,
@@ -23934,12 +23935,18 @@ mod tests {
 
     struct CapturingRunner {
         last_prompt: Mutex<Option<String>>,
+        reply: String,
     }
 
     impl CapturingRunner {
         fn new() -> Self {
+            Self::replying("captured")
+        }
+
+        fn replying(reply: &str) -> Self {
             Self {
                 last_prompt: Mutex::new(None),
+                reply: reply.to_string(),
             }
         }
     }
@@ -23959,7 +23966,7 @@ mod tests {
                 compaction_count: 0,
                 cost_usd: 0.0,
                 cost_is_estimated: false,
-                summary: "captured".to_string(),
+                summary: self.reply.clone(),
                 error: None,
                 proofed: None,
                 agent_session_id: None,
@@ -24143,6 +24150,34 @@ mod tests {
                 .lock()
                 .take_due_final_summary_requests(crate::store::now_ms() + 60_000, 0)
                 .is_empty()
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn generate_final_summary_strips_agent_reply_markers() {
+        let (base, repo, _fwt) = make_repo("gensum-markers");
+        let base_sha = git(&repo, &["rev-parse", "main"])
+            .unwrap()
+            .trim()
+            .to_string();
+        let store = Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
+        let id = setup_final_summary_guardian(&store, &repo, &base_sha, "feature/a", "feature/a");
+        let runner = CapturingRunner::replying(
+            "- feature/a: adds the widget\n\
+             RALPHUS_PROPHECY: decision: kept the old API\n\
+             RALPHUS_GHOST:\n- could not run the slow suite\n",
+        );
+
+        generate_final_summary(&store, &runner, &id, "sig");
+
+        let g = store.lock().get_guardian(&id).unwrap();
+        assert_eq!(
+            g.change_summary.as_deref(),
+            Some("- feature/a: adds the widget")
         );
 
         let _ = std::fs::remove_dir_all(&base);
