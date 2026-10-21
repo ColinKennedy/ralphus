@@ -1722,7 +1722,7 @@ echo {json}
 
     #[test]
     fn removing_a_remote_workspaces_own_root_sends_the_root_itself() {
-        let dir = std::env::temp_dir().join(format!("ral-rm-root-{}", std::process::id()));
+        let dir = ralphus_test_support::scratch(format!("ral-rm-root-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let script = write_script(&dir, r#"{"ok":true,"protocol_version":1}"#);
         let store = Arc::new(crate::store_lock::StoreMutex::new(
@@ -1787,7 +1787,7 @@ echo {json}
 
     #[test]
     fn only_network_git_commands_on_a_machine_carry_the_credential() {
-        let dir = std::env::temp_dir().join(format!("ral-cred-run-{}", std::process::id()));
+        let dir = ralphus_test_support::scratch(format!("ral-cred-run-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let script = write_script(
             &dir,

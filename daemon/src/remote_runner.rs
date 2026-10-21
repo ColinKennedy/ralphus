@@ -4221,7 +4221,7 @@ else:
         });
         let (endpoint, server) = machine_api(vec![(VERB_MATERIALIZE, 200, reply.to_string())]);
         let provider = ProviderRunner::over_http("fleet", "alloc-1", endpoint, "t");
-        let dest = std::env::temp_dir().join(format!("ral-fleet-mat-{}", std::process::id()));
+        let dest = ralphus_test_support::scratch(format!("ral-fleet-mat-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dest);
 
         provider
@@ -4247,7 +4247,7 @@ else:
 
     #[test]
     fn a_machine_api_materialize_refuses_paths_outside_the_destination() {
-        let dest = std::env::temp_dir().join(format!("ral-fleet-esc-{}", std::process::id()));
+        let dest = ralphus_test_support::scratch(format!("ral-fleet-esc-{}", std::process::id()));
         for path in ["../escape.txt", "/etc/escape.txt", "a/../../escape.txt"] {
             let files = [MaterializedFile {
                 path: path.to_string(),

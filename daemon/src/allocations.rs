@@ -1546,7 +1546,7 @@ mod tests {
     /// machine (`me@box`, linux) through a fake SSH provider that answers
     /// every verb and names the machine it was pointed at.
     fn start_ralphus_fleet(tag: &str) -> ProviderService {
-        let dir = std::env::temp_dir().join(format!("fleet-e2e-{tag}-{}", std::process::id()));
+        let dir = ralphus_test_support::scratch(format!("fleet-e2e-{tag}-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let event = r#"RALPHUS_EVENT:{"source":"llm-invoke","message":"m","payload":{}}"#;
         let (script, body) = if cfg!(windows) {
