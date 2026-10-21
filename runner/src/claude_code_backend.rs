@@ -242,7 +242,9 @@ impl ModelBackend for ClaudeCodeBackend {
             options.auto_compact_threshold,
             options.maximum_tool_output_tokens,
             options.effort.is_some(),
-            claude_config_dir.as_deref(),
+            claude_config_dir
+                .as_ref()
+                .map(crate::agent_isolation::IsolationLease::dir),
         )
         .map_err(|e| {
             crate::cli_agent_common::emit_child_lifecycle(
@@ -588,10 +590,11 @@ fn apply_claude_config_dir_env(cmd: &mut Command, claude_config_dir: Option<&std
 /// it regardless of where `CLAUDE_CONFIG_DIR` points. A stored
 /// `.credentials.json` login is preserved unconditionally: isolating
 /// personal config/memory is not the same decision as forcing a re-login.
+/// Every preserved copy is removed when the returned lease drops.
 fn isolated_claude_config_dir(
     options: &RunOptions<'_>,
     workspace: &Workspace,
-) -> Option<std::path::PathBuf> {
+) -> Option<crate::agent_isolation::IsolationLease> {
     // RAL-695: a capability set is the only source of skills, and skills live
     // in the config directory, so the directory is isolated even when
     // personal memory is allowed.
@@ -601,15 +604,18 @@ fn isolated_claude_config_dir(
     let real_dir = std::env::var_os("CLAUDE_CONFIG_DIR")
         .map(std::path::PathBuf::from)
         .or_else(|| crate::agent_isolation::home_dir().map(|h| h.join(".claude")));
-    let isolated = crate::agent_isolation::isolated_config_dir(workspace.root(), "claude-code");
-    crate::agent_isolation::preserve_auth_file(real_dir.as_deref(), &isolated, ".credentials.json");
+    let lease = crate::agent_isolation::IsolationLease::acquire(
+        &crate::agent_isolation::isolated_config_dir(workspace.root(), "claude-code"),
+        crate::agent_isolation::CLAUDE_CODE_PRESERVED_FILES,
+    );
+    lease.preserve(real_dir.as_deref(), ".credentials.json");
     if options.allow_personal_settings {
-        crate::agent_isolation::preserve_auth_file(real_dir.as_deref(), &isolated, "settings.json");
+        lease.preserve(real_dir.as_deref(), "settings.json");
     }
     if options.allow_personal_memory {
-        crate::agent_isolation::preserve_auth_file(real_dir.as_deref(), &isolated, "CLAUDE.md");
+        lease.preserve(real_dir.as_deref(), "CLAUDE.md");
     }
-    Some(isolated)
+    Some(lease)
 }
 
 /// Writes the cell's prompt as the first stream-json user turn on the
@@ -2669,15 +2675,15 @@ mod tests {
             ..Default::default()
         };
         let ws = test_workspace();
-        assert_eq!(isolated_claude_config_dir(&options, &ws), None);
+        assert!(isolated_claude_config_dir(&options, &ws).is_none());
     }
 
     #[test]
     fn isolated_claude_config_dir_is_some_when_personal_memory_is_isolated() {
         let options = RunOptions::default();
         let ws = test_workspace();
-        let dir = isolated_claude_config_dir(&options, &ws).expect("isolated dir");
-        assert!(dir.to_string_lossy().contains("claude-code"));
+        let lease = isolated_claude_config_dir(&options, &ws).expect("isolated dir");
+        assert!(lease.dir().to_string_lossy().contains("claude-code"));
     }
 }
 
