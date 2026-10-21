@@ -428,17 +428,32 @@ def run(args: argparse.Namespace) -> int:
 
         if args.pr:
             try:
-                reply = daemon.post(f"/api/guardians/{review}/pull-requests", {})
-                checks.record("pull request opened from the machine", True, json.dumps(reply)[:200])
-            except RuntimeError as e:
+                # One whole-stack request; submission runs in the background,
+                # so wait for a row with a URL for every enabled branch.
+                daemon.post(f"/api/guardians/{review}/pull-requests", {"prs": [{}]})
+                branches = [b for b in daemon.get(f"/api/guardians/{review}").get("branches", [])
+                            if b.get("enabled", True)]
+                rows = wait_for(
+                    f"{len(branches)} pull request(s)",
+                    lambda: (r := daemon.get(f"/api/guardians/{review}/pull-requests"))
+                    and len(r) >= len(branches) and all(p.get("pr_url") for p in r) and r,
+                    600,
+                    every=5,
+                )
+                checks.record("pull request opened from the machine", True,
+                              ", ".join(str(p.get("pr_url")) for p in rows))
+            except (RuntimeError, TimeoutError) as e:
                 checks.record("pull request opened from the machine", False, str(e))
 
         windows_or_mac = "macos" if any(
             m.get("os") == "windows" for m in fleet.config.get("machine", [])) else "windows"
         bad = daemon.post("/api/squads", {"toml": (
+            "no_review = true\n\n"
             f'[[task]]\nname = "nowhere"\nproject = "{project}"\n'
             f'machine = {{ provider = "fleet", os = "{windows_or_mac}" }}\n'
-            '[[task.cell]]\ncommand = "true"\nmode = "raw"\n')})
+            '[[task.cell]]\n'
+            f'cwd = "<<ralphus:new-worktree/fleet-e2e-nowhere-{run_id}?upstream={args.base}>>"\n'
+            'command = "true"\nmode = "raw"\n')})
         bad_squad = str(bad["squad_id"])
         bad_state = wait_for(f"{bad_squad} to fail",
                              lambda: (s := squad_state(daemon, bad_squad)) in ("done", "failed") and s, 300)
@@ -450,14 +465,18 @@ def run(args: argparse.Namespace) -> int:
         )
 
         daemon.post(f"/api/guardians/{review}/cancel")
-        remaining = wait_for(
-            "the machines to be handed back",
-            lambda: not [a for a in allocations(daemon) if a.get("squad_id") == squad
-                         or a.get("guardian_id") == review] or "released",
-            args.release_timeout,
-            every=5,
-        )
-        checks.record("machines handed back after the review was cancelled", remaining == "released")
+        try:
+            remaining = wait_for(
+                "the machines to be handed back",
+                lambda: "released" if not [a for a in allocations(daemon) if a.get("squad_id") == squad
+                                           or a.get("guardian_id") == review] else None,
+                args.release_timeout,
+                every=5,
+            )
+        except TimeoutError as e:
+            remaining = str(e)
+        checks.record("machines handed back after the review was cancelled", remaining == "released",
+                      "" if remaining == "released" else remaining[:300])
 
         daemon_log = daemon.log_path.read_text(errors="replace")
         refusals = [line for line in daemon_log.splitlines() if STRICT_REFUSAL in line]
@@ -467,7 +486,7 @@ def run(args: argparse.Namespace) -> int:
         task_a = next(t for t in daemon.get(f"/api/squads/{squad}")["tasks"] if t["name"] == "on-a")
         checks.record("the secret reached the cell and is not on the machine's disk",
                       task_a["cells"][0]["state"] == "done",
-                      f"checking cell {task_a['cells'][1]['state']}")
+                      f"checking cell {task_a['cells'][0]['state']}")
     except (RuntimeError, TimeoutError, subprocess.CalledProcessError, KeyError) as e:
         checks.record("harness ran to the end", False, str(e))
     finally:

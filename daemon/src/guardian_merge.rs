@@ -6259,9 +6259,11 @@ enum StagedPassOutcome {
 ///   tail). Otherwise it returns to `Collecting` so a later task completion
 ///   re-triggers a further pass via `try_start_ready_reviews_for_task`.
 /// - The residual race — a branch becoming `ready` *while* a pass is already
-///   building, so `try_start_ready_reviews_for_task`'s claim loses to the
+///   running, so `try_start_ready_reviews_for_task`'s claim loses to the
 ///   running merge — is closed by the pass-level loop below coalescing
-///   consecutive completions instead of dropping them.
+///   consecutive completions instead of dropping them, including after a
+///   pass that built nothing (an earlier branch was not ready yet) and right
+///   after returning to `Collecting`.
 ///
 /// `claim_guardian_merge` (collecting→merging) already guarantees a single
 /// merge runs at a time, so concurrent task completions can never double-trigger
@@ -6270,6 +6272,10 @@ enum StagedPassOutcome {
 /// `skip_worktrees` reviews (shared worktree, no per-branch worktrees) are not
 /// incremental in this design: they fall back to the legacy all-or-nothing
 /// `run_merge_cancellable`, once every enabled branch's cells are done.
+/// Passes in a row that may build nothing before a staged merge gives up and
+/// waits for the next task completion (see [`run_merge_staged`]).
+const MAX_UNBUILT_PASSES: u32 = 3;
+
 pub fn run_merge_staged(
     store: &crate::store_lock::StoreHandle,
     runner: &dyn Runner,
@@ -6357,6 +6363,7 @@ pub fn run_merge_staged(
     }
 
     let mut built_any_total = false;
+    let mut unbuilt_passes = 0;
     loop {
         if cancel.is_cancelled() {
             log_merge_cancelled(store, id);
@@ -6377,14 +6384,25 @@ pub fn run_merge_staged(
                     finish_staged_merge(store, id, cancel, &set_status);
                     return;
                 }
-                if !built_any || !next_not_built_is_ready(store, id) {
-                    // Nothing more can build right now: return to Collecting so
-                    // the next task completion re-triggers a further pass.
-                    set_status(GuardianStatus::Collecting, None);
-                    return;
+                // A task that finished while this merge ran had its trigger
+                // dropped (the review was already merging), so its branch
+                // becoming ready is only seen by looking again -- here, and
+                // once more after returning to Collecting, which closes the
+                // window between this check and the status change. Bounded:
+                // a pass that keeps building nothing stops.
+                if !built_any {
+                    unbuilt_passes += 1;
                 }
-                // A `pending` branch became `ready` while we were building;
-                // coalesce it into this same merge rather than waiting.
+                let ready = next_not_built_is_ready(store, id);
+                if !ready || unbuilt_passes > MAX_UNBUILT_PASSES {
+                    set_status(GuardianStatus::Collecting, None);
+                    if unbuilt_passes > MAX_UNBUILT_PASSES || !next_not_built_is_ready(store, id) {
+                        return;
+                    }
+                    set_status(GuardianStatus::Merging, None);
+                }
+                // A `pending` branch became `ready`; coalesce it into this
+                // same merge rather than waiting.
             }
         }
     }

@@ -1032,16 +1032,29 @@ impl Workspace {
     /// sets (`crate::vcs::GitVcs`): without them `rebase --continue` on the
     /// machine opens an editor with no terminal, fails, and the merge retries
     /// it forever.
-    fn git_remote(&self, _machine: &str, args: &[&str]) -> Result<String, String> {
+    fn git_remote(&self, machine: &str, args: &[&str]) -> Result<String, String> {
         let mut env = non_interactive_git_env();
-        let needs_credential = args
-            .first()
-            .is_some_and(|verb| NETWORK_GIT_COMMANDS.contains(verb));
-        if let (true, Some(credentials), Some(store)) =
-            (needs_credential, &self.forge_credentials, &self.store)
-        {
+        let verb = args.first().copied().unwrap_or_default();
+        if let (true, Some(credentials), Some(store)) = (
+            NETWORK_GIT_COMMANDS.contains(&verb),
+            &self.forge_credentials,
+            &self.store,
+        ) {
             env.extend(credentials.env(store));
         }
+        if COMMITTING_GIT_COMMANDS.contains(&verb) && !self.machine_has_git_identity(machine) {
+            for key in ["GIT_COMMITTER_NAME", "GIT_AUTHOR_NAME"] {
+                env.insert(key.to_string(), FALLBACK_GIT_NAME.to_string());
+            }
+        }
+        self.run_git_remote(args, env)
+    }
+
+    fn run_git_remote(
+        &self,
+        args: &[&str],
+        env: std::collections::BTreeMap<String, String>,
+    ) -> Result<String, String> {
         let req = crate::remote_runner::RunRequest {
             cwd: remote_path_string(&self.root),
             program: "git".to_string(),
@@ -1050,6 +1063,27 @@ impl Workspace {
             shell: None,
         };
         self.with_provider(|p, spec| p.run_vcs(&req, spec))
+    }
+
+    /// Whether git on `machine` can name a committer by itself (its own
+    /// `user.name`, or a full name in the account's record), asked once per
+    /// machine. A machine that cannot gets [`FALLBACK_GIT_NAME`] for the
+    /// commands that make commits; one that can keeps its own identity.
+    fn machine_has_git_identity(&self, machine: &str) -> bool {
+        static KNOWN: std::sync::LazyLock<
+            std::sync::Mutex<std::collections::HashMap<String, bool>>,
+        > = std::sync::LazyLock::new(Default::default);
+        if let Some(known) = KNOWN.lock().expect("poisoned").get(machine) {
+            return *known;
+        }
+        let has = self
+            .run_git_remote(&["var", "GIT_COMMITTER_IDENT"], non_interactive_git_env())
+            .is_ok();
+        KNOWN
+            .lock()
+            .expect("poisoned")
+            .insert(machine.to_string(), has);
+        has
     }
 }
 
@@ -1143,6 +1177,21 @@ impl GitAt for Workspace {
 /// `user.email` of its own (git reads `EMAIL` only then). A review's rebase
 /// keeps each commit's author; only the committer is set from this.
 const FALLBACK_GIT_EMAIL: &str = "ralphus@ralphus.invalid";
+
+/// The committer (and new-commit author) name for a machine whose git cannot
+/// name one itself (see [`Workspace::machine_has_git_identity`]).
+const FALLBACK_GIT_NAME: &str = "ralphus";
+
+/// Git subcommands that may create commits.
+const COMMITTING_GIT_COMMANDS: [&str; 7] = [
+    "commit",
+    "rebase",
+    "cherry-pick",
+    "merge",
+    "am",
+    "revert",
+    "pull",
+];
 
 /// The environment every remote `git` invocation runs under, so nothing it
 /// does can wait on an interactive editor, and a machine with no git
