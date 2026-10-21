@@ -368,7 +368,7 @@ session's stdin, instead of POSIX shell scripts:
   `required_agents` that is not installed or not logged in -- is not
   allocated; the refusal (`no_matching_machine`) says what is wrong and its
   remediation says, in plain words, how to fix it (e.g. "Claude Code on
-  winbox isn't logged in — on that machine run `claude`, then `/login`").
+  winbox isn't logged in" / "on winbox, run `claude`, then `/login`").
   `ralphus-fleet list` shows each machine's agents and the same fixes. A
   machine that has not reported yet (never connected) is not judged.
 

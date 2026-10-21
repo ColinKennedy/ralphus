@@ -441,10 +441,7 @@ mod tests {
         assert!(text.contains("NOT READY (1 blocking)"), "{text}");
         assert!(text.contains("agents: claude-code NOT LOGGED IN"), "{text}");
         assert!(
-            text.contains(
-                "fix: Claude Code on winbox isn't logged in — on that machine run `claude`, then \
-                 `/login`"
-            ),
+            text.contains("fix: on winbox, run `claude`, then `/login`"),
             "{text}"
         );
 

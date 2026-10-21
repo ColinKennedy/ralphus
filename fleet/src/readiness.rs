@@ -195,17 +195,16 @@ impl Report {
                 AgentState::Ready | AgentState::LoginUnclear => {}
                 AgentState::NotLoggedIn => blockers.push(Blocker {
                     reason: format!("{name} on {machine} isn't logged in"),
-                    fix: format!(
-                        "{name} on {machine} isn't logged in — on that machine {}",
-                        login_instructions(agent)
-                    ),
+                    // The reason already says what is wrong; the fix only
+                    // says what to do, so the two read well side by side.
+                    fix: format!("on {machine}, {}", login_instructions(agent)),
                 }),
                 AgentState::NotInstalled(detail) => blockers.push(Blocker {
                     reason: format!("{name} isn't installed on {machine} ({detail})"),
                     fix: format!(
-                        "{name} isn't installed on {machine} — install it there for the user \
-                         running ralphus-outpost (or set its path in the fleet's \
-                         [machine.agents]), then restart ralphus-outpost"
+                        "install {name} on {machine} for the user running ralphus-outpost (or \
+                         set its path in the fleet's [machine.agents]), then restart \
+                         ralphus-outpost"
                     ),
                 }),
                 AgentState::NotChecked => blockers.push(Blocker {
@@ -289,10 +288,7 @@ mod tests {
         assert!(r.blockers("winbox", &[]).is_empty(), "no agent needed");
         let blockers = r.blockers("winbox", &agents(&["claude-code"]));
         assert_eq!(blockers.len(), 1);
-        assert_eq!(
-            blockers[0].fix,
-            "Claude Code on winbox isn't logged in — on that machine run `claude`, then `/login`"
-        );
+        assert_eq!(blockers[0].fix, "on winbox, run `claude`, then `/login`");
         assert_eq!(r.agent_state("claude-code"), AgentState::NotLoggedIn);
         assert!(matches!(
             r.agent_state("codex"),
@@ -303,7 +299,7 @@ mod tests {
         assert!(
             r.blockers("winbox", &agents(&["codex"]))[0]
                 .fix
-                .contains("isn't installed on winbox")
+                .starts_with("install Codex on winbox")
         );
         assert_eq!(r.summary("winbox", &[]), "ready, 1 warning(s)");
         assert_eq!(

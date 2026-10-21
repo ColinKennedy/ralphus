@@ -129,9 +129,10 @@ The daemon tells the fleet which agents a squad's work needs on the machine
 [the provider API](machine-provider-service.md#provider-service-api)), and
 the machine's `required_agents` add a floor. A machine whose git check fails,
 or that has one of those agents not installed or not logged in, is not
-allocated: the request is refused before any work reaches a machine, with a
-remediation in plain words -- "Claude Code on winbox isn't logged in — on
-that machine run `claude`, then `/login`". A login status that could not be
+allocated: the request is refused before any work reaches a machine, saying
+what is wrong and how to fix it in plain words -- "Claude Code on winbox
+isn't logged in", "on winbox, run `claude`, then `/login`" -- and the squad
+shows both. A login status that could not be
 told does not block; the cell's own preflight still runs.
 
 

@@ -6327,6 +6327,15 @@ fn finalize_all_failed(
             guard.set_task_error(squad_id, task.idx, Some(reason)),
         );
     }
+    // The squad itself carries the reason too (with any remediation it
+    // includes, e.g. a machine provider's "on winbox, run `claude`, then
+    // `/login`"), so the squad view and the board say why it never started.
+    store_ok(
+        &guard,
+        squad_id,
+        "set_squad_error",
+        guard.set_squad_error(squad_id, Some(reason)),
+    );
     store_ok(
         &guard,
         squad_id,
@@ -10626,6 +10635,10 @@ prompt = "anything"
                 .is_some_and(|e| !e.is_empty()),
             "expected task.error to carry the same reason as the Cartographer entry: {:?}",
             squad.tasks[0].error
+        );
+        assert_eq!(
+            squad.error, squad.tasks[0].error,
+            "the squad's own error carries the reason too, so the squad view shows it"
         );
     }
 
