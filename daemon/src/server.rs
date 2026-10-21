@@ -21565,7 +21565,7 @@ pub fn serve<A: ToSocketAddrs>(
     crate::thread_health::spawn_supervised(
         crate::thread_health::ThreadSpec {
             name: crate::scheduler::SCHEDULER_THREAD,
-            description: "Squad scheduling, review rebase/base-shift rebuilds, PR auto-submit,                           base-branch fetch polling and waypoint sweeps all stop while it is down.",
+            description: "Squad scheduling, review rebase/base-shift rebuilds, PR auto-submit, base-branch fetch polling and waypoint sweeps all stop while it is down.",
             max_silence: Some(crate::scheduler::SCHEDULER_MAX_SILENCE),
         },
         daemon.store_handle(),
