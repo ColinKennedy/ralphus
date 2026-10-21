@@ -21,9 +21,11 @@ first, and prints a pass/fail line for each check:
 | the machines are handed back once the review is cancelled | allocations released within `--release-timeout` |
 | the review's pull request opens from the machine | only with `--pr` |
 | outpost machines connected | only when a machine has `transport = "outpost"` |
+| live actions and exhibits work on the review's machine | only with `--live-actions`; see [below](#live-actions-and-exhibits---live-actions) |
 
-No model is called: every cell and proof is a raw `sh` command, so a run costs
-only machine time. It never touches a running dev stack; everything lives under
+No model is called: every cell and proof is a raw command (`sh` on a Linux or
+macOS machine, Windows PowerShell on a machine whose `os` is `windows`), so a
+run costs only machine time. It never touches a running dev stack; everything lives under
 `--state-root` (a fresh directory each run).
 
 ## What you need
@@ -34,8 +36,9 @@ only machine time. It never touches a running dev stack; everything lives under
 - Two machines reachable over SSH, described in a `ralphus-fleet.toml` (see
   [Running `ralphus-fleet`](machine-provider-service.md#running-ralphus-fleet)),
   each with a label the harness can ask for, a `remote_root`, a runner
-  (`[machine.runner]`) and `git`, `sh`, `grep`, `uname`, `hostname`. They can
-  be the same physical host (a WSL distribution and a container on it, say).
+  (`[machine.runner]`) and `git`, `sh`, `grep`, `uname`, `hostname` (a
+  Windows machine needs `git` and Windows PowerShell instead). They can be the
+  same physical host (a WSL distribution and a container on it, say).
   The harness replaces the file's `listen`, `token_env` and `state_file`.
 - A test repository both machines can clone, with a `main` branch (or pass
   `--base`). It is registered as a remote-only project (no clone on the daemon
@@ -86,8 +89,49 @@ useful for testing the transport, but it does not prove remote execution:
 strict mode still shows the daemon did no machine work itself, while the work
 ran on the same computer through the outpost.
 
+## Live actions and exhibits (`--live-actions`)
+
+`--live-actions` (needs `--pr`) also proves that a review's
+[live actions](daemon-api.md#live-actions) and [exhibits](exhibits.md) happen
+on the review's machine (the `--label-a` one), still without a model. The
+harness registers a `raw` agent profile, `fleet-e2e-agent`, whose executable is
+a stand-in agent that a command cell in task A installs under that machine's
+`remote_root` (`fleet-e2e-agent-<run>/agent`, a `sh` script; on Windows
+`agent.exe`, compiled on the machine by Windows PowerShell's `Add-Type`, so
+`remote_root` must be absolute). A `raw` agent gets the prompt as its last
+argument and its stdout is the reply. A prompt cell in task A runs it and gets
+back a `RALPHUS_LIVE_ACTION:` handoff asking for a screenshot and a GIF, and the
+review (`agent = "fleet-e2e-agent"`, `live_actions = true`) runs it for its live
+runs: it writes the machine's hostname and working directory into a new file and
+commits it, saves a small PNG and GIF into the run's exhibit directory and
+reports them with `RALPHUS_EXHIBIT:` lines, then a `RALPHUS_LIVE_RESULT:` line.
+The PR writer cannot resolve a database agent profile, so the PR text is
+ralphus's deterministic fallback.
+
+| Check | How |
+|---|---|
+| the cell's live handoff became a live action | `GET /api/guardians/{id}/live-actions`: one action with the handoff's label, sourced from this squad |
+| the automatic and the manual live run ran on the review's machine | the automatic run, then one queued with `POST .../live-actions/run` (what `ralphus review action run` does): each `finished`, its `cwd` and the cwd the agent reported both under machine A's `remote_root`, plus the strict-mode check above |
+| each run's commits were carried onto the top branch | the run's `integration` is `integrated` |
+| the live runs' reports were posted into the review | both reports in the top branch's messages |
+| the exhibits were uploaded from the machine | `GET /api/guardians/{id}/exhibits`: both slots have a URL and no file kept on the daemon host |
+| the live results and exhibits are in its PR | GitHub API: task A's PR body has the `## Live-Test Results` and `## Exhibits` sections, the action's label and every slot's URL (waits up to `--live-timeout`) |
+| another branch's PR shows none of them | GitHub API: task B's PR body has neither the label nor the action's exhibit blocks |
+| the uploaded files are reachable | each URL fetched with the token (dropped when GitHub redirects to its storage host): HTTP 200 and a PNG/GIF |
+| the live commits are on the top branch's PR | GitHub API: every file the runs committed is on the top branch's PR head |
+| the live runs ran on the same host as task A's cell | the hostname in those files matches the one task A's cell committed |
+| the forge token is not on the machine's disk | an audit squad on machine A gets the token as a registered secret and searches `remote_root` and ralphus's cache there (`~/.cache/ralphus`, `%LOCALAPPDATA%\ralphus`) |
+
+Without `--live-actions`, but with `--forge-token-env`, the run also checks
+that the forge token is in no file under `--state-root` (logs, configs, the
+fleet's state) except the daemon's database, where a stored token belongs.
+
+The PR-body checks read GitHub's REST API, so a repository elsewhere records
+them as not checked. The runs add `fleet-e2e-live-<run>-*.txt` commits to the
+review's top branch, and the stand-in agent stays under `remote_root`; delete
+them with the branches if you do not want them to accumulate.
+
 ## Not covered
 
-The base branch moving under an open review, live actions and exhibits, and a
-Windows machine over SSH are not part of this run yet (a native Windows
-outpost is).
+The base branch moving under an open review is not part of this run yet, and
+`--live-actions` checks PR bodies on GitHub only.

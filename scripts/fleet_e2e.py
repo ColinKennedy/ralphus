@@ -15,13 +15,17 @@ merges on the first, and checks what happened:
 - the work survived a ralphus-fleet restart (tokens re-issued);
 - a request no machine can serve fails with the provider's reasons;
 - the machines are handed back once the review is cancelled;
-- outpost machines (transport = "outpost") connected to the fleet.
+- outpost machines (transport = "outpost") connected to the fleet;
+- with --live-actions, the review's live actions run on its machine, carry
+  their commits onto the top branch, and put their results and uploaded
+  exhibits into the right PR (fleet_e2e_live.py).
 
 Outpost machines must be started separately (`ralphus-outpost connect`)
 against the fleet's URL, which --fleet-listen fixes in advance. An outpost on
 this same host proves the Machine API path, not that work ran elsewhere.
 
-No LLM is used: every cell and proof is a raw command. The machines are yours:
+No LLM is used: every cell and proof is a raw command, and the live-action
+agent is a stand-in script. The machines are yours:
 point --fleet-config at a ralphus-fleet.toml whose machines carry the labels
 given by --label-a/--label-b. Its `listen`, `token_env` and `state_file` are
 replaced by the harness. See docs/machine-provider-service.md and
@@ -37,7 +41,6 @@ import json
 import os
 import re
 import secrets
-import shutil
 import socket
 import subprocess
 import sys
@@ -46,6 +49,8 @@ import tomllib
 import urllib.error
 import urllib.request
 from pathlib import Path
+
+import fleet_e2e_live as live
 
 EXE = ".exe" if os.name == "nt" else ""
 FLEET_TOKEN_ENV = "RALPHUS_E2E_FLEET_TOKEN"
@@ -292,22 +297,19 @@ class Fleet:
         raise RuntimeError(f"no machine in {self.config_path} has label {label!r}")
 
 
-def squad_toml(project: str, run: str, label_a: str, label_b: str, base: str, remote_root_a: str) -> str:
-    """Two tasks on two machines feeding one review on the first."""
-
-    def commit(file: str) -> str:
-        return (
-            f"uname -a > {file} && hostname >> {file} && git add {file} && "
-            f"git -c user.email=fleet-e2e@example.invalid -c user.name=Fleet-E2E commit -q -m {file}"
-        )
-
-    root = remote_root_a.rstrip("/")
-    # Reads the secret only from the environment: its value must not appear in
-    # anything the machine stores (this command text included).
-    secret_check = (
-        f'test -n "${SECRET_NAME}" && ! grep -rqsF -- "${SECRET_NAME}" {root} '
-        "&& echo secret-seen-and-not-on-disk"
-    )
+def squad_toml(project: str, run: str, label_a: str, label_b: str, base: str, machine_a: dict,
+               machine_b: dict, live_actions: bool = False) -> str:
+    """Two tasks on two machines feeding one review on the first. With
+    `live_actions`, task A also hands off a live action the review runs."""
+    cwd_a = f"<<ralphus:new-worktree/fleet-e2e-a-{run}?upstream={base}>>"
+    review = "<<ralphus:new-review/fleet-e2e>>"
+    if live.is_windows(machine_a):
+        work_a = (live.commit_command(machine_a, f"fleet-e2e-a-{run}.txt") + "; "
+                  + live.secret_check_command(machine_a, SECRET_NAME))
+    else:
+        work_a = (live.commit_command(machine_a, f"fleet-e2e-a-{run}.txt") + " && "
+                  + live.secret_check_command(machine_a, SECRET_NAME))
+    shell_a, shell_b = live.shell_for(machine_a), live.shell_for(machine_b)
     return f"""
 [[task]]
 name = "on-a"
@@ -315,17 +317,17 @@ project = "{project}"
 machine = {{ provider = "fleet", labels = ["{label_a}"] }}
 
 [[task.cell]]
-cwd = "<<ralphus:new-worktree/fleet-e2e-a-{run}?upstream={base}>>"
-command = {json.dumps(commit(f"fleet-e2e-a-{run}.txt") + " && " + secret_check)}
+cwd = "{cwd_a}"
+command = {json.dumps(work_a)}
 mode = "raw"
-shell = "sh"
-review = "<<ralphus:new-review/fleet-e2e>>"
+shell = "{shell_a}"
+review = "{review}"
 
 [[task.cell.proof]]
 command = "git log -1 --format=%s"
 mode = "raw"
-shell = "sh"
-
+shell = "{shell_a}"
+{live.handoff_cells(machine_a, run, cwd_a, review) if live_actions else ""}
 [[task]]
 name = "on-b"
 project = "{project}"
@@ -333,15 +335,15 @@ machine = {{ provider = "fleet", labels = ["{label_b}"] }}
 
 [[task.cell]]
 cwd = "<<ralphus:new-worktree/fleet-e2e-b-{run}?upstream={base}>>"
-command = {json.dumps(commit(f"fleet-e2e-b-{run}.txt"))}
+command = {json.dumps(live.commit_command(machine_b, f"fleet-e2e-b-{run}.txt"))}
 mode = "raw"
-shell = "sh"
-review = "<<ralphus:new-review/fleet-e2e>>"
+shell = "{shell_b}"
+review = "{review}"
 
 [[task.cell.proof]]
 command = "git log -1 --format=%s"
 mode = "raw"
-shell = "sh"
+shell = "{shell_b}"
 
 [[review]]
 id = "ralphus:new-review/fleet-e2e"
@@ -349,7 +351,7 @@ upstream = "{base}"
 machine = {{ provider = "fleet", labels = ["{label_a}"] }}
 proof_scope = "nothing"
 skip_manual_checks = true
-"""
+{live.review_keys() if live_actions else ""}"""
 
 
 def wait_for(what: str, probe, timeout: float, every: float = 2.0):
@@ -386,6 +388,7 @@ def run(args: argparse.Namespace) -> int:
         return 2
     root.mkdir(parents=True, exist_ok=True)
     run_id = secrets.token_hex(3)
+    forge_token = ""
     secret_value = f"fleet-e2e-value-{secrets.token_hex(8)}"
 
     if args.fleet_url:
@@ -414,6 +417,15 @@ def run(args: argparse.Namespace) -> int:
                 raise RuntimeError("outposts did not connect") from e
         machine_a = fleet.machine_with_label(args.label_a)
         machine_b = fleet.machine_with_label(args.label_b)
+        github = None
+        if args.live_actions:
+            problem = live.remote_root_problem(machine_a)
+            if problem:
+                log(f"--live-actions: {problem} (the stand-in agent is installed under it)")
+                return 2
+            repo = live.github_repo(args.repo_url)
+            if repo:
+                github = live.GitHub(repo, os.environ.get(args.forge_token_env, "").strip())
         daemon = Daemon(root, bin_dir, fleet.url, fleet.token)
         log(f"daemon {daemon.url} (log {daemon.log_path}), fleet {fleet.url} (log {fleet.log_path})")
 
@@ -432,17 +444,21 @@ def run(args: argparse.Namespace) -> int:
         )
         daemon.post("/api/users", {"name": USER})
         if args.forge_token_env:
-            token = os.environ.get(args.forge_token_env, "").strip()
-            if not token:
+            forge_token = os.environ.get(args.forge_token_env, "").strip()
+            if not forge_token:
                 log(f"{args.forge_token_env} is empty")
                 return 2
             host = re.sub(r"^(?:https?://|ssh://)?(?:[^@/]+@)?([^/:]+).*$", r"\1", args.repo_url)
-            daemon.post(f"/api/users/{USER}/forge-tokens", {"host": host, "token": token})
+            daemon.post(f"/api/users/{USER}/forge-tokens", {"host": host, "token": forge_token})
         daemon.post("/api/secret-env-names", {"name": SECRET_NAME})
+        if args.live_actions:
+            # A `raw` profile: the stand-in agent a cell installs on machine A.
+            daemon.post("/api/agent-profiles", {"name": live.AGENT_PROFILE, "backend": "raw",
+                                                "executable": live.agent_path(machine_a, run_id)})
 
         # The squad env is where a registered secret normally comes from.
-        text = squad_toml(project, run_id, args.label_a, args.label_b, args.base,
-                          str(machine_a["remote_root"]))
+        text = squad_toml(project, run_id, args.label_a, args.label_b, args.base, machine_a,
+                          machine_b, args.live_actions)
         (root / "squad.toml").write_text(text)
         squad = str(daemon.post("/api/squads", {"toml": text, "hold": True})["squad_id"])
         daemon.post(f"/api/squads/{squad}/env", {"set": {SECRET_NAME: secret_value}})
@@ -491,6 +507,13 @@ def run(args: argparse.Namespace) -> int:
         )
         checks.record("review reached in_review on its machine", status == "in_review", f"status {status}")
 
+        live_check = None
+        if args.live_actions and status == "in_review":
+            live_check = live.LiveActions(daemon, checks, wait_for, review, squad, run_id, machine_a,
+                                          args.live_timeout)
+            live_check.after_review()
+
+        rows = []
         if args.pr:
             try:
                 # One whole-stack request; submission runs in the background,
@@ -508,7 +531,14 @@ def run(args: argparse.Namespace) -> int:
                 checks.record("pull request opened from the machine", True,
                               ", ".join(str(p.get("pr_url")) for p in rows))
             except (RuntimeError, TimeoutError) as e:
+                rows = []
                 checks.record("pull request opened from the machine", False, str(e))
+        if live_check and rows:
+            try:
+                live_check.after_pr(github, rows, args.live_timeout)
+            except (urllib.error.URLError, KeyError, ValueError) as e:
+                checks.record("the PRs show the live results (forge API)", False, str(e)[:300])
+            live_check.audit(project, args.label_a, args.base, forge_token)
 
         windows_or_mac = "macos" if any(
             m.get("os") == "windows" for m in fleet.config.get("machine", [])) else "windows"
@@ -548,6 +578,10 @@ def run(args: argparse.Namespace) -> int:
         checks.record("no remote work ran on the daemon host (strict mode)", not refusals,
                       refusals[0][:200] if refusals else "")
         checks.record("the secret is not in the daemon log", secret_value not in daemon_log)
+        if forge_token:
+            leaks = live.scan_for_token(root, forge_token)
+            checks.record("the forge token is not in the daemon's or fleet's logs and state", not leaks,
+                          ", ".join(leaks[:5]))
         task_a = next(t for t in daemon.get(f"/api/squads/{squad}")["tasks"] if t["name"] == "on-a")
         checks.record("the secret reached the cell and is not on the machine's disk",
                       task_a["cells"][0]["state"] == "done",
@@ -588,12 +622,19 @@ def main() -> int:
                         "instead of starting one, e.g. where outposts can reach it; it is not restarted")
     parser.add_argument("--outpost-timeout", type=float, default=120,
                         help="seconds to wait for outpost machines to connect")
+    parser.add_argument("--live-actions", action="store_true",
+                        help="also check live actions and exhibits on the review's machine, model-free "
+                             "(needs --pr; PR bodies are read through the GitHub API)")
+    parser.add_argument("--live-timeout", type=float, default=900,
+                        help="seconds to wait for each live run and for the PR to show its results")
     parser.add_argument("--local-clone", action="store_true",
                         help="also clone the repository on the daemon host and register that path "
                              "(default: a remote-only project with no clone here)")
     args = parser.parse_args()
     if args.pr and not args.forge_token_env:
         parser.error("--pr needs --forge-token-env")
+    if args.live_actions and not args.pr:
+        parser.error("--live-actions needs --pr (exhibits and live results are checked in the PR)")
     return run(args)
 
 
