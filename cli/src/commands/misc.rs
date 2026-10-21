@@ -1237,8 +1237,10 @@ fn check_symbol(status: &str) -> &'static str {
 /// `Harness:`/`Machine:` section per [`crate::health::CheckResult::section`]
 /// present in `results` (RAL-415 -- empty sections are omitted, matching the
 /// prior Core/Developer/Remote-targets precedent), each check's observation
-/// line followed by an indented `impact: ...; remediation: ...` line and,
-/// when present, an indented `source: ...` provenance line. Pulled out as
+/// line followed by an indented `impact: ...; remediation: ...` line for
+/// every row that [`crate::health::CheckResult::needs_attention`] (a `[OK  ]`
+/// row has none) and, when present, an indented `source: ...` provenance
+/// line. Pulled out as
 /// its own pure function (rather than inlined in [`cmd_check`]) specifically
 /// so a fixed [`crate::health::CheckResult`] fixture can assert on the exact
 /// rendered text -- a durable layout/indentation snapshot.
@@ -1265,10 +1267,12 @@ fn render_health_human(
                 r.name,
                 r.detail
             ));
-            out.push_str(&format!(
-                "        impact: {}; remediation: {}\n",
-                r.impact, r.remediation
-            ));
+            if r.needs_attention() {
+                out.push_str(&format!(
+                    "        impact: {}; remediation: {}\n",
+                    r.impact, r.remediation
+                ));
+            }
             if let Some(p) = &r.provenance {
                 out.push_str(&format!("        source: {p}\n"));
             }
@@ -1641,7 +1645,6 @@ mod tests {
         let expected = "\
 Core:
   [OK  ] daemon: reachable (ralphus-daemon 1.2.3)
-        impact: The CLI can submit and monitor tasks.; remediation: No action needed.
   [FAIL] config: task.maximum_timeout_seconds is -5; must be >= 0 (0 = unbounded, positive = seconds)
         impact: Every subprocess timeout computation is undefined with a negative cap; task execution behavior becomes unreliable.; remediation: Set task.maximum_timeout_seconds to 0 (unbounded) or a positive number of seconds.
         source: /repo/.ralphus.toml
@@ -1659,6 +1662,48 @@ Configuration file issues:
 2 check(s) failed.
 ";
         assert_eq!(rendered, expected);
+    }
+
+    /// RAL-706: a `[OK  ]` row prints only its status line (and `source:`
+    /// when present), while WARN, FAIL, and SKIP rows keep the
+    /// impact/remediation explanation.
+    #[test]
+    fn render_health_human_explains_only_rows_needing_attention() {
+        let row = |name: &str, status: &'static str, provenance: Option<&str>| {
+            crate::health::CheckResult {
+                name: name.to_string(),
+                status,
+                detail: "detail".to_string(),
+                section: crate::health::CORE,
+                id: name.to_string(),
+                impact: format!("{name} impact"),
+                remediation: format!("{name} remediation"),
+                provenance: provenance.map(str::to_string),
+            }
+        };
+        let results = vec![
+            row("passing", "pass", None),
+            row("passing-with-source", "pass", Some("/repo/.ralphus.toml")),
+            row("warning", "warn", None),
+            row("failing", "fail", None),
+            row("skipped", "skip", None),
+        ];
+        let rendered = render_health_human(&results, &[], 1);
+
+        assert!(rendered.contains("  [OK  ] passing: detail\n  [OK  ] passing-with-source"));
+        assert!(!rendered.contains("passing impact"));
+        assert!(!rendered.contains("passing remediation"));
+        assert!(!rendered.contains("passing-with-source impact"));
+        assert!(rendered.contains("        source: /repo/.ralphus.toml\n"));
+        assert!(rendered.contains(
+            "  [WARN] warning: detail\n        impact: warning impact; remediation: warning remediation\n"
+        ));
+        assert!(rendered.contains(
+            "  [FAIL] failing: detail\n        impact: failing impact; remediation: failing remediation\n"
+        ));
+        assert!(rendered.contains(
+            "  [SKIP] skipped: detail\n        impact: skipped impact; remediation: skipped remediation\n"
+        ));
     }
 
     #[test]

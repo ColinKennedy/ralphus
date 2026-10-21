@@ -154,6 +154,14 @@ impl CheckResult {
     pub fn is_fail(&self) -> bool {
         self.status == FAIL
     }
+
+    /// Whether the human renderer should explain this result's impact and
+    /// remediation: every status except a clean `pass` (SKIP keeps its line,
+    /// since a skip often says why the check was not applicable here).
+    #[must_use]
+    pub fn needs_attention(&self) -> bool {
+        self.status != PASS
+    }
 }
 
 /// RAL-110 Q5 heuristic: is `value` a compound shell command rather than a
