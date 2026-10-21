@@ -80,6 +80,12 @@ On a machine that is already paired, `ralphus-outpost install` with neither
 `install --service` switches it to start at boot (from an elevated prompt,
 as above), plain `install` switches it back to starting at logon.
 
+The logon task has been checked on a real Windows 11 machine (after a
+reboot it connected four seconds after the user logged on; a killed outpost
+was back within seconds). The boot mode (`--service`) has not been run on a
+real machine yet: in particular, that a task started at boot with a stored
+password can read the credential from the Credential Manager is untested.
+
 `install --dry-run <dir>` writes the definition it would register into
 `<dir>` and prints the commands it would run, pairing and changing nothing.
 
