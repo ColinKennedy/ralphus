@@ -152,12 +152,23 @@ JSON. Every reply carries `"protocol_version": 2`.
 
 | Call | Request | Reply |
 |---|---|---|
-| `POST /v1/allocations` | `{"requirements": {"os"?, "arch"?, "labels"?: []}, "scope": {"squad_id" or "review_id", "key"}}` | an allocation (above), or an error |
+| `POST /v1/allocations` | `{"requirements": {"os"?, "arch"?, "labels"?: [], "agents"?: []}, "scope": {"squad_id" or "review_id", "key"}}` | an allocation (above), or an error |
 | `GET /v1/allocations/{id}` | -- | the allocation without a token, or `404` |
 | `POST /v1/allocations/{id}/renew` | -- | the allocation with a new token |
 | `POST /v1/allocations/{id}/idle` | `{"idle": bool}` | `{}` -- a hint |
 | `DELETE /v1/allocations/{id}` | -- | `{}` |
 | `GET /v1/health` | -- | `{"version": "..."}` |
+
+**`requirements.agents`** (optional) names the agent backends the work
+needs installed and logged in on the machine: the daemon sends the CLI
+backends (`claude-code`, `codex`, `pi`; aliases and database agent profiles
+resolved to their backend) of the squad's prompt cells and prompt proofs on
+that machine request, or of a review's resolver agent. It is omitted when
+nothing needs one. A provider that ignores it still works -- the per-cell
+`preflight` catches a missing agent later; one that can tell refuses the
+allocation up front (`no_matching_machine`, with a remediation saying what
+to install or log in where). `ralphus-fleet` rejects a name that is not a
+known agent backend with `400` / `invalid_request`, listing the valid ones.
 
 ## Machine API
 
@@ -300,12 +311,13 @@ Each `[[machine]]`:
 | `max_allocations` | both | at most this many allocations at once |
 | `[machine.runner]` | `ssh` | `mode` (`installed`/`upload`), `command`, `artifacts` (target triple to runner binary on the fleet host) |
 | `[machine.agents]` | both | agent name to executable path on the machine; an outpost checks each one when it connects |
-| `required_agents` | both | agents (`claude-code`, `codex`, ...) the machine must be able to start, logged in; an outpost machine whose readiness report says one cannot is refused with the fix |
+| `required_agents` | both | agents the machine must always have installed and logged in, on top of what each request's `requirements.agents` asks for; each must be a known agent backend (`claude-code`, `codex`, `pi`, ...) |
 
 Validation is strict: unknown keys, an `ssh` machine without `host`, an
 `outpost` machine without `name` (or with a `[machine.runner]`, or an
 `outpost_token_env` that is not a variable name), a `required_agents` entry
-that is not an agent name, an `[outpost_runners]` key that is not
+that is not a known agent backend, an `[outpost_runners]` key that is not
+
 `<os>-<arch>`, and a Windows SSH machine whose `remote_root` contains
 anything but letters, digits and `. _ - \ /` are errors.
 
@@ -351,11 +363,14 @@ session's stdin, instead of POSIX shell scripts:
 - `GET /v1/outposts` (service token) lists outpost machines: whether each is
   connected, paired (with its key's fingerprint) and its latest readiness
   report.
-- An outpost machine whose readiness report has a blocking problem (git
-  missing, or a `required_agents` agent that cannot start or is not logged
-  in) is not allocated; the refusal (`no_matching_machine`) says what is
-  wrong and its remediation says how to fix it. `ralphus-fleet list` shows
-  the same.
+- An outpost machine whose readiness report says it cannot serve the
+  request -- git missing, or an agent in `requirements.agents` or in its
+  `required_agents` that is not installed or not logged in -- is not
+  allocated; the refusal (`no_matching_machine`) says what is wrong and its
+  remediation says, in plain words, how to fix it (e.g. "Claude Code on
+  winbox isn't logged in — on that machine run `claude`, then `/login`").
+  `ralphus-fleet list` shows each machine's agents and the same fixes. A
+  machine that has not reported yet (never connected) is not judged.
 
 
 To check a set of machines end to end (strict mode, two machines, a review,

@@ -52,9 +52,19 @@ A provider serves two HTTP APIs, which may share one listener (as
 
 ## Allocating
 
-`POST /v1/allocations` carries `requirements` (`os`, `arch`, `labels`) and a
-`scope` (`squad_id` or `review_id`, plus `key`, the canonical request). Get
-these right:
+`POST /v1/allocations` carries `requirements` (`os`, `arch`, `labels`, and
+optionally `agents`) and a `scope` (`squad_id` or `review_id`, plus `key`,
+the canonical request). Get these right:
+
+- **`agents` is optional to honour.** It lists the agent backends
+  (`claude-code`, `codex`, `pi`) the work needs installed and logged in on
+  the machine. A provider that ignores it still works: the daemon preflights
+  each agent before its first prompt cell and fails the cell with the
+  machine's answer. A provider that can tell (as `ralphus-fleet` does from
+  its outposts' readiness reports) should refuse up front with
+  `no_matching_machine` and a remediation saying what to install or log in
+  where, before any work reaches a machine.
+
 
 - **Same scope, same allocation.** The daemon may ask again for a scope it
   already holds (a retry after a lost reply). Answer with the existing
