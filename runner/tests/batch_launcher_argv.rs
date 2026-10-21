@@ -34,6 +34,28 @@ fn node_available() -> bool {
         .is_ok_and(|o| o.status.success())
 }
 
+const CHILD_ENV: &str = "RALPHUS_RAL385_ISOLATED_CHILD";
+
+/// `PiBackend` isolates its config dir and copies the login from the real one
+/// into it; run against the operator's environment that is their
+/// `~/.pi/agent/auth.json`. So each test re-runs itself in a child whose
+/// `PI_CODING_AGENT_DIR` is an empty scratch directory: `true` in that child
+/// (run the body), `false` in the parent once the child passed.
+fn runs_in_isolated_child(test: &str) -> bool {
+    if std::env::var_os(CHILD_ENV).is_some() {
+        return true;
+    }
+    let pi_home = ralphus_test_support::TestDir::new("ral385-pi-home");
+    let status = std::process::Command::new(std::env::current_exe().expect("test executable"))
+        .args(["--exact", test, "--nocapture"])
+        .env(CHILD_ENV, "1")
+        .env("PI_CODING_AGENT_DIR", pi_home.path())
+        .status()
+        .expect("run isolated test child");
+    assert!(status.success(), "{test} failed in its child: {status}");
+    false
+}
+
 /// Writes the stand-in shim plus the node script it forwards to, and returns
 /// the `.cmd` path and the report path it will write.
 fn write_fake_shim(dir: &Path) -> (PathBuf, PathBuf) {
@@ -124,6 +146,9 @@ fn multiline_prompt_reaches_a_batch_launcher_intact_over_stdin() {
         eprintln!("SKIP: node is not on PATH");
         return;
     }
+    if !runs_in_isolated_child("multiline_prompt_reaches_a_batch_launcher_intact_over_stdin") {
+        return;
+    }
     let (argv, stdin, cwd) = run_against_shim("prompt", Some(SYSTEM_PROMPT), None);
 
     assert_eq!(stdin, PROMPT, "the whole prompt must arrive over stdin");
@@ -147,6 +172,9 @@ fn multiline_prompt_reaches_a_batch_launcher_intact_over_stdin() {
 fn multiline_system_prompt_reaches_a_batch_launcher_as_a_file() {
     if !node_available() {
         eprintln!("SKIP: node is not on PATH");
+        return;
+    }
+    if !runs_in_isolated_child("multiline_system_prompt_reaches_a_batch_launcher_as_a_file") {
         return;
     }
     let (argv, _, _) = run_against_shim("sysprompt", Some(SYSTEM_PROMPT), None);
@@ -178,6 +206,9 @@ fn multiline_system_prompt_reaches_a_batch_launcher_as_a_file() {
 fn a_space_bearing_argument_survives_a_batch_launcher() {
     if !node_available() {
         eprintln!("SKIP: node is not on PATH");
+        return;
+    }
+    if !runs_in_isolated_child("a_space_bearing_argument_survives_a_batch_launcher") {
         return;
     }
     let (argv, _, _) = run_against_shim("space", None, Some("openrouter/glm 5 3 flash"));
