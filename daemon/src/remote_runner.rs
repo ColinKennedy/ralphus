@@ -1631,13 +1631,31 @@ impl ProviderRunner {
             return Ok(Some(mapped.clone()));
         }
         match &spec.executable {
-            Some(path) if path.contains('/') || path.contains('\\') => Err(format!(
-                "cell '{}' agent {:?} has a daemon-local executable override {path:?}, which \
-                 cannot run on machine {:?} — configure [machine.targets.<name>.agents].{:?} to \
-                 map it, or leave the agent profile's executable unset to use the remote \
-                 account's PATH",
-                spec.cell_id, spec.agent, self.scheme, spec.agent
-            )),
+            Some(path) if path.contains('/') || path.contains('\\') => {
+                let remediation = match &self.transport {
+                    // A provider service maps agents to executables itself,
+                    // from the agent name alone, so the daemon-local path has
+                    // to go for its mapping to apply.
+                    Transport::Http { .. } => format!(
+                        "leave the agent profile's executable unset (or use a profile without \
+                         one for cells on this machine) so the provider service picks the \
+                         executable: ralphus-fleet maps it under the machine's [machine.agents] \
+                         {:?} entry in ralphus-fleet.toml, and otherwise uses the machine \
+                         account's PATH",
+                        spec.agent
+                    ),
+                    Transport::Program { .. } => format!(
+                        "configure [machine.targets.<name>.agents].{:?} to map it, or leave the \
+                         agent profile's executable unset to use the remote account's PATH",
+                        spec.agent
+                    ),
+                };
+                Err(format!(
+                    "cell '{}' agent {:?} has a daemon-local executable override {path:?}, \
+                     which cannot run on machine {:?} — {remediation}",
+                    spec.cell_id, spec.agent, self.scheme
+                ))
+            }
             other => Ok(other.clone()),
         }
     }
@@ -3786,6 +3804,23 @@ else:
         let mut windows_path = spec(Some("ct:A"));
         windows_path.executable = Some(r"C:\Users\me\claude.exe".to_string());
         assert!(provider.resolve_remote_executable(&windows_path).is_err());
+    }
+
+    #[test]
+    fn a_path_shaped_override_on_a_provider_service_machine_points_at_its_agent_mapping() {
+        let provider = ProviderRunner::over_http("fleet", "alloc-1", "http://127.0.0.1:1", "t");
+        let mut cell = spec(Some("fleet:A"));
+        cell.executable = Some("/usr/local/bin/claude".to_string());
+        let err = provider
+            .resolve_remote_executable(&cell)
+            .expect_err("a path-shaped override must still be refused");
+        assert!(err.contains("daemon-local executable override"), "{err}");
+        assert!(err.contains("[machine.agents]"), "{err}");
+        assert!(err.contains("ralphus-fleet.toml"), "{err}");
+        assert!(
+            !err.contains("[machine.targets"),
+            "[machine.targets] does not apply to a provider service machine: {err}"
+        );
     }
 
     #[test]
