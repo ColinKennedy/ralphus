@@ -71,7 +71,7 @@ sleep/wake or network change, and keeps itself on the fleet's runner.
 
 | Platform | `install` registers | `install --service` |
 |---|---|---|
-| Windows | a per-user Scheduled Task (`ralphus-outpost`) that starts at logon and restarts on failure, run hidden through `conhost --headless` | a Scheduled Task that starts at **boot** as you, whether or not you are logged on. Run it from an elevated prompt; Windows asks for your password once and keeps it itself (ralphus never sees it) |
+| Windows | a per-user Scheduled Task (`ralphus-outpost`) that starts at logon and, if the outpost stops or is killed, starts it again within a minute, run hidden through `conhost --headless` | a Scheduled Task that starts at **boot** as you, whether or not you are logged on. Run it from an elevated prompt; Windows asks for your password once and keeps it itself (ralphus never sees it) |
 | Linux | a `systemd --user` unit (`Restart=always`); with no user systemd, an XDG autostart entry (starts with your desktop session) | the same unit plus `loginctl enable-linger`, so it starts at boot |
 | macOS | a launchd agent (`com.ralphus.outpost`, `KeepAlive`) | not supported yet: a launchd daemon cannot read your Keychain |
 

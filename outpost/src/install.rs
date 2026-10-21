@@ -130,10 +130,19 @@ pub fn utf16_with_bom(text: &str) -> Vec<u8> {
 /// user's session with their token, so the Credential Manager is
 /// reachable; through `conhost --headless` so no console window opens. At
 /// boot it runs as the user with a stored password (logon type `Password`).
+///
+/// A second trigger fires every minute from a start in the past, and a
+/// second instance is ignored while one runs: so an outpost that exits or is
+/// killed is started again within a minute, without waiting for the next
+/// logon or boot. (`RestartOnFailure` alone does not do that -- Task
+/// Scheduler reads a killed `conhost` as a run that ended; and a repetition
+/// on the logon or boot trigger only starts counting when that trigger next
+/// fires.) With the logon principal the minute trigger, like the task, runs
+/// only while the user is logged on.
 #[must_use]
 pub fn windows_task_xml(exe: &Path, home: &Path, user: &str, boot: bool) -> String {
     let user = xml_escape(user);
-    let (trigger, logon_type) = if boot {
+    let (start, logon_type) = if boot {
         (
             "<BootTrigger><Enabled>true</Enabled></BootTrigger>".to_string(),
             "Password",
@@ -144,6 +153,11 @@ pub fn windows_task_xml(exe: &Path, home: &Path, user: &str, boot: bool) -> Stri
             "InteractiveToken",
         )
     };
+    let trigger = format!(
+        "{start}\n    <TimeTrigger><StartBoundary>2000-01-01T00:00:00</StartBoundary>\
+         <Enabled>true</Enabled><Repetition><Interval>PT1M</Interval>\
+         <StopAtDurationEnd>false</StopAtDurationEnd></Repetition></TimeTrigger>"
+    );
     let arguments = xml_escape(&format!(
         "--headless \"{}\" serve --home \"{}\"",
         exe.display(),
@@ -882,7 +896,21 @@ mod tests {
         let plan = plan_install(Platform::Windows, false, &exe, &home, &dirs(&dir)).unwrap();
         let lines = write_dry_run(&plan, &dir.join("dry")).unwrap();
         let xml = utf16_text(&std::fs::read(dir.join("dry/ralphus-outpost-task.xml")).unwrap());
-        assert!(xml.contains("<LogonTrigger>"), "{xml}");
+        assert!(
+            xml.contains("<LogonTrigger><Enabled>true</Enabled>"),
+            "{xml}"
+        );
+        assert!(
+            xml.contains(
+                "<TimeTrigger><StartBoundary>2000-01-01T00:00:00</StartBoundary>\
+                 <Enabled>true</Enabled><Repetition><Interval>PT1M</Interval>"
+            ),
+            "a stopped outpost is started again within a minute: {xml}"
+        );
+        assert!(
+            xml.contains("<MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>"),
+            "a repeating trigger must not start a second outpost: {xml}"
+        );
         assert!(xml.contains("<UserId>DESK\\me</UserId>"), "{xml}");
         assert!(
             xml.contains("<LogonType>InteractiveToken</LogonType>"),
