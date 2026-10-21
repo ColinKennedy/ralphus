@@ -79,6 +79,8 @@
        * @property {boolean} originalAutoRun
        * @property {boolean} liveActions - Default for whether a future review runs its live actions.
        * @property {boolean} originalLiveActions
+       * @property {boolean} refineLiveRecipe - Default for whether a finished live run gets the final recipe-refinement turn.
+       * @property {boolean} originalRefineLiveRecipe
        * @property {RebuildOnDraft} rebuildOn - Default for when a future review rebuilds its prepared build; `inherit` means the file-config/global value applies.
        * @property {RebuildOnDraft} originalRebuildOn
        * @property {ExhibitSettingsDraft} exhibits - This project's default exhibit settings; blank fields inherit the file-config/global value.
@@ -143,6 +145,7 @@
         const skipManualChecks = boolOr(s.skip_manual_checks, effective.skip_manual_checks);
         const autoRun = boolOr(s.auto_run, effective.auto_run);
         const liveActions = boolOr(s.live_actions, effective.live_actions);
+        const refineLiveRecipe = boolOr(s.refine_live_recipe, effective.refine_live_recipe);
         /** @type {ExhibitSettingsRaw} */
         const exhibitsRaw = {
           exhibits_enabled: s.exhibits_enabled,
@@ -188,6 +191,7 @@
           skipManualChecks, originalSkipManualChecks: skipManualChecks,
           autoRun, originalAutoRun: autoRun,
           liveActions, originalLiveActions: liveActions,
+          refineLiveRecipe, originalRefineLiveRecipe: refineLiveRecipe,
           rebuildOn: buildRebuildOnDraft(s.rebuild_on, effective.rebuild_on),
           originalRebuildOn: buildRebuildOnDraft(s.rebuild_on, effective.rebuild_on),
           exhibits: buildExhibitSettingsDraft(exhibitsRaw),
@@ -408,6 +412,11 @@
        */
       function onProjectEditLiveActions(checked) { if (projectReviewSettingsDraft) projectReviewSettingsDraft.liveActions = checked; }
       /**
+       * @param {boolean} checked - The new value of the refine-live-recipe checkbox.
+       * @returns {void}
+       */
+      function onProjectEditRefineLiveRecipe(checked) { if (projectReviewSettingsDraft) projectReviewSettingsDraft.refineLiveRecipe = checked; }
+      /**
        * Stages "inherit the file-config/global default" for the rebuild-on setting.
        * @param {boolean} checked
        * @returns {void}
@@ -493,6 +502,8 @@
             <h3 class="section">live actions</h3>
             <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--muted);margin-top:4px" data-tip="For a review that declares no explicit live_actions setting of its own: once every member cell has finished and the build is prepared, turn how each cell's agent said it would test its work live into live actions and have an agent run each against the review's tip, once, automatically. A run may commit fixes, which ralphus carries onto the top branch. Costs agent time; on by default, so uncheck it to disable live actions for this project. Changing this also affects existing reviews that have no setting of their own.">
               <input type="checkbox" ${draft.liveActions ? "checked" : ""} onchange="onProjectEditLiveActions(this.checked)">run live actions</label>
+            <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--muted);margin-top:4px" data-tip="For a review that declares no explicit refine_live_recipe setting of its own: after a live run finishes, give the agent one last turn to check its reproduction recipe against the shell calls it actually made, and add any setup, environment or working-directory steps the recipe is missing. The deterministic match still grades the result. Costs one more agent turn per finished run; on by default, so uncheck it to skip the refinement turn for this project. Changing this also affects existing reviews that have no setting of their own.">
+              <input type="checkbox" ${draft.refineLiveRecipe ? "checked" : ""} onchange="onProjectEditRefineLiveRecipe(this.checked)">refine live-run recipes</label>
             <h3 class="section" data-tip="${esc(REBUILD_ON_TIP)}">rebuild preparation when</h3>
             ${renderRebuildOnFieldsHtml("project", draft.rebuildOn, draft.effective.rebuild_on, "inherit the file-config/global default", "Follow the file-config/global default for when a future review rebuilds its prepared build (every trigger when nothing sets one), for a future review that declares no explicit rebuild_on of its own. Untick to set this project's own default. Applies on Save.", "onProjectEditRebuildOnInherit", "onProjectEditRebuildOnTrigger")}
             <h3 class="section" data-tip="Screenshots, GIFs and short videos that live runs capture and show in a review's PRs/MRs. Unlike most defaults here these are not limited to future reviews: every review in this project without its own exhibit setting follows them on its next read. Blank fields and 'inherit' follow the .ralphus.toml/global config. Applies on Save.">exhibits</h3>
@@ -553,6 +564,7 @@
         if (draft.skipManualChecks !== draft.originalSkipManualChecks) body.skip_manual_checks = draft.skipManualChecks;
         if (draft.autoRun !== draft.originalAutoRun) body.auto_run = draft.autoRun;
         if (draft.liveActions !== draft.originalLiveActions) body.live_actions = draft.liveActions;
+        if (draft.refineLiveRecipe !== draft.originalRefineLiveRecipe) body.refine_live_recipe = draft.refineLiveRecipe;
         if (rebuildOnChanged(draft.rebuildOn, draft.originalRebuildOn)) body.rebuild_on = rebuildOnBodyValue(draft.rebuildOn);
         const exhibits = exhibitSettingsPatch(draft.exhibits, draft.originalExhibits, true);
         if (exhibits.error) {
