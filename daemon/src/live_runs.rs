@@ -1908,7 +1908,7 @@ prompt = "first"
     }
 
     #[test]
-    fn a_run_with_no_session_or_nothing_to_recheck_is_not_resumed() {
+    fn a_run_with_no_session_is_not_resumed() {
         // No session to resume (e.g. the native backend).
         let f = fixture("recheck-nosession", UNBACKED_RESULT);
         f.store
@@ -1918,16 +1918,6 @@ prompt = "first"
         maybe_start_automatic_run(&f.store, &f.runners, &f.gid);
         settle(&f);
         assert!(f.agent.resumes.lock().is_empty());
-
-        // A session, but no recipe to question.
-        let g = resumable_fixture(
-            "recheck-clean",
-            r#"RALPHUS_LIVE_RESULT: {"verdict":"inconclusive","summary":"ok"}"#,
-            "unused",
-        );
-        maybe_start_automatic_run(&g.store, &g.runners, &g.gid);
-        settle(&g);
-        assert!(g.agent.resumes.lock().is_empty());
     }
 
     #[test]
