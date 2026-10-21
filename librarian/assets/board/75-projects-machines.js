@@ -119,6 +119,9 @@
           machines = (d.machines || []).slice().sort(
             (/** @type {MachineProviderView} */ a, /** @type {MachineProviderView} */ b) => a.scheme.localeCompare(b.scheme));
           machineBuiltins = d.builtin || [];
+          // Fetched only while this tab is open, with the provider list.
+          const a = await (await fetch("/api/machine-allocations")).json();
+          machineAllocations = a.allocations || [];
           renderMachines();
         } catch (e) { markUnreachable(); }
       }
@@ -178,7 +181,42 @@ Not polled: probing spawns the provider program, so a board refreshing every cou
               <button class="primary" onclick="registerMachine()" data-tip="Register this provider with the daemon.\nRe-registering an existing scheme updates it in place rather than creating a duplicate.">Register</button>
             </div>
           </div>`;
-        el.innerHTML = err + builtin + table + form;
+        el.innerHTML = err + builtin + table + machineAllocationsHtml() + form;
+      }
+      /**
+       * Renders the read-only list of machines provider services granted.
+       * @returns {string}
+       */
+      function machineAllocationsHtml() {
+        const heading = `<div style="margin:16px 0 8px" data-tip="Machines provider services ([machine.providers.*] in the daemon's config.toml) handed out for squads and reviews.\nWho/when: to see where provider-service work is running, and which machines are idle waiting on a review.\nRead-only: ralphus only asks for machines and hands them back; adding or removing machines is the provider's business.">Allocated machines</div>`;
+        if (!machineAllocations.length) {
+          return `${heading}<div class="empty">No machines allocated by provider services.</div>`;
+        }
+        const rows = machineAllocations.map((a) => {
+          const scope = a.squad_id ? `squad ${esc(a.squad_id)}` : `review ${esc(a.guardian_id || "")}`;
+          const platform = [a.os, a.arch].filter(Boolean).join("/") || "—";
+          const idle = a.idle
+            ? ` <span style="color:var(--muted)" data-tip="Every review using this machine is waiting on a human, so the provider was told it may idle it (e.g. power it down). It resumes on the next request.">idle</span>`
+            : "";
+          return `<tr>
+              <td><span class="proj-name">${esc(a.provider)}</span></td>
+              <td class="mono">${esc(a.allocation_id)}</td>
+              <td>${esc(a.description || "")}</td>
+              <td>${esc(platform)}</td>
+              <td class="mono">${esc(a.request)}</td>
+              <td>${scope}${idle}</td>
+              <td style="color:var(--muted)">${fmtProjCreated(a.created_at_ms)}</td>
+            </tr>`;
+        }).join("");
+        return `${heading}<table class="proj-table"><thead><tr>`
+          + `<th data-tip="The provider service that granted this machine.">Provider</th>`
+          + `<th data-tip="The provider's own id for this allocation.">Allocation</th>`
+          + `<th data-tip="The provider's description of the machine.">Machine</th>`
+          + `<th data-tip="The machine's operating system and architecture, as the provider reported them.">Platform</th>`
+          + `<th data-tip="The machine request (provider, os, arch, labels) this allocation was granted for.">Request</th>`
+          + `<th data-tip="The squad or review the machine serves. It is handed back once the squad is finished and no open review uses it.">Serves</th>`
+          + `<th data-tip="When the machine was allocated.">Allocated</th>`
+          + `</tr></thead><tbody>${rows}</tbody></table>`;
       }
       /**
        * Renders a provider's last-known reachability as a colored chip.

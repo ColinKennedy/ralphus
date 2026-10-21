@@ -5,6 +5,8 @@
       let machineBuiltins = [];
       /** Message from the last failed register/remove, shown inline above the table. */
       let machineError = "";
+      /** @type {MachineAllocationView[]} active machines provider services granted */
+      let machineAllocations = [];
       // ---- Presets tab (RAL-…) ----
       /** @type {PresetView[]} registered presets */
       let presets = [];

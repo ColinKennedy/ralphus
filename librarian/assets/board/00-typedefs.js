@@ -885,6 +885,26 @@
        * @property {boolean} [supports_channel] - Provider reuses one process for many commands (RAL-185).
        */
       /**
+       * One machine a provider service granted (`GET /api/machine-allocations`).
+       * @typedef {object} MachineAllocationView
+       * @property {number} id
+       * @property {string} provider
+       * @property {string} allocation_id
+       * @property {string} endpoint
+       * @property {string} request - The canonical machine request it was granted for.
+       * @property {string|null} squad_id
+       * @property {string|null} guardian_id
+       * @property {string|null} os
+       * @property {string|null} arch
+       * @property {string[]} labels
+       * @property {string|null} description
+       * @property {boolean} idle
+       * @property {string} state - `active`, `released` or `lost`.
+       * @property {string|null} state_detail
+       * @property {number} created_at_ms
+       * @property {number|null} released_at_ms
+       */
+      /**
        * A registered Triage type (RAL-318) -- a `[[cell]]` with `triage = true`
        * classifies into one of these by name instead of naming an explicit
        * `[[review]]`. `"unclassified"` is a built-in that always exists and
