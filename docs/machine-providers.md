@@ -802,12 +802,12 @@ provider process after restart.
 The daemon sends resolved cell/proof and agent-profile environment values in
 an explicit `execution_environment` object on provider stdin. It does not add
 them to the local provider process environment. The SSH provider removes that
-object from the stored runner spec, writes a separate mode-`0600`-equivalent
-shell environment file over SSH stdin, sources it while preserving the remote
-account's ordinary environment, and deletes it before starting the runner.
-Cancellation, abandoned startup, and lost-job reconciliation also remove that
-transient file; a daemon crash can therefore leave it only temporarily in the
-protected job directory until one of those recovery paths runs.
+object from the stored runner spec and sends it, as shell assignments, on the
+stdin of the SSH session that starts the job: that session exports them and the
+detached runner inherits them alongside the remote account's ordinary
+environment. They are never written to the machine's disk. (Cancellation,
+abandoned startup and lost-job reconciliation still delete an `environment`
+file in a job directory, which older providers left there.)
 
 Resolved secret values never enter provider/SSH arguments or remote shell
 command text. Stream chunks, provider errors/results, and every string nested
