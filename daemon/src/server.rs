@@ -14086,7 +14086,7 @@ fn guardian_branch_forge_status(daemon: &Daemon, id: &str, branch_id: &str) -> R
     let forge_cfg = crate::config::resolve_forge(root);
     let client = crate::pr::forge_client_for_pr(
         &daemon.store_handle(),
-        root,
+        &crate::workspace::Workspace::for_guardian(&daemon.store_handle(), &guardian.id, root),
         &guardian.base_branch,
         &forge_cfg,
         repo,
@@ -17676,7 +17676,7 @@ fn pr_comments(daemon: &Daemon, pr_id: &str) -> Reply {
     let forge_cfg = crate::config::resolve_forge(root);
     let client = match crate::pr::forge_client_for_pr(
         &daemon.store_handle(),
-        root,
+        &crate::workspace::Workspace::for_guardian(&daemon.store_handle(), &guardian.id, root),
         &guardian.base_branch,
         &forge_cfg,
         &pr.repo,
@@ -17845,7 +17845,7 @@ fn pr_refresh_ci(daemon: &Daemon, pr_id: &str) -> Reply {
     // so the guardian's base-branch remote may name the wrong repository.
     let Some(client) = crate::pr::forge_client_for_pr(
         &daemon.store_handle(),
-        root,
+        &crate::workspace::Workspace::for_guardian(&daemon.store_handle(), &guardian.id, root),
         &guardian.base_branch,
         &forge_cfg,
         &pr.repo,

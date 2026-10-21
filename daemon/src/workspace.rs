@@ -757,7 +757,13 @@ impl Workspace {
     /// Best-effort by design: a path that does not exist is success, because
     /// every caller here is cleaning up and does not care.
     pub fn remove_path(&self, path: impl AsRef<Path>, recursive: bool) {
-        let full = self.resolve(path);
+        // `rm` refuses a path ending in `.`, which is how a caller names this
+        // workspace's own root.
+        let full: PathBuf = self
+            .resolve(path)
+            .components()
+            .filter(|c| !matches!(c, std::path::Component::CurDir))
+            .collect();
         match &self.machine {
             None => {
                 let removed = if recursive {
@@ -1090,6 +1096,13 @@ pub trait GitAt {
     /// cache lookups keyed by the registered project path -- never for
     /// running anything.
     fn local_path(&self) -> &Path;
+
+    /// The machine git runs on here, `None` for the daemon's host -- part of
+    /// any cache key built from [`Self::local_path`], since one project path
+    /// can name a checkout here and a clone on a machine.
+    fn git_machine(&self) -> Option<&str> {
+        None
+    }
 }
 
 impl GitAt for Path {
@@ -1120,15 +1133,27 @@ impl GitAt for Workspace {
     fn local_path(&self) -> &Path {
         self.local_root()
     }
+
+    fn git_machine(&self) -> Option<&str> {
+        self.machine()
+    }
 }
 
+/// The committer email a machine's git falls back to when the machine has no
+/// `user.email` of its own (git reads `EMAIL` only then). A review's rebase
+/// keeps each commit's author; only the committer is set from this.
+const FALLBACK_GIT_EMAIL: &str = "ralphus@ralphus.invalid";
+
 /// The environment every remote `git` invocation runs under, so nothing it
-/// does can wait on an interactive editor.
+/// does can wait on an interactive editor, and a machine with no git
+/// identity configured can still commit (a review's rebase).
 fn non_interactive_git_env() -> std::collections::BTreeMap<String, String> {
-    ["GIT_EDITOR", "GIT_SEQUENCE_EDITOR"]
+    let mut env: std::collections::BTreeMap<String, String> = ["GIT_EDITOR", "GIT_SEQUENCE_EDITOR"]
         .into_iter()
         .map(|k| (k.to_string(), "true".to_string()))
-        .collect()
+        .collect();
+    env.insert("EMAIL".to_string(), FALLBACK_GIT_EMAIL.to_string());
+    env
 }
 
 fn remove_local_destination(path: &Path) -> Result<(), String> {
@@ -1643,6 +1668,34 @@ echo {json}
 
         assert_eq!(remote, "machine-remote");
         assert_eq!(GitAt::local_path(&ws), Path::new("/srv/repo"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn removing_a_remote_workspaces_own_root_sends_the_root_itself() {
+        let dir = std::env::temp_dir().join(format!("ral-rm-root-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let script = write_script(&dir, r#"{"ok":true,"protocol_version":1}"#);
+        let store = Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
+        store
+            .lock()
+            .register_machine_provider(
+                "ib",
+                "",
+                &script.to_string_lossy(),
+                &[],
+                crate::machines::PROTOCOL_VERSION,
+                false,
+            )
+            .unwrap();
+        let ws = Workspace::on("/m/repo/g2", Some("ib:A")).with_store(Arc::clone(&store));
+
+        ws.remove_path(".", true);
+
+        let requests = std::fs::read_to_string(dir.join("requests.log")).unwrap();
+        assert!(requests.contains(r#""path":"/m/repo/g2""#), "{requests}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

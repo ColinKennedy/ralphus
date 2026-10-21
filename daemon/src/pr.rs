@@ -3889,6 +3889,7 @@ fn resolve_pr_repo_routing(
 ) -> PrRepoRouting {
     let key = (
         root.local_path().to_path_buf(),
+        root.git_machine().map(str::to_string),
         base_branch.to_string(),
         format!("{forge_cfg:?}"),
         owner.map(str::to_string),
@@ -3916,7 +3917,14 @@ const ROUTING_CACHE_TTL: std::time::Duration = if cfg!(test) {
     std::time::Duration::from_secs(15)
 };
 
-type RoutingCacheKey = (std::path::PathBuf, String, String, Option<String>);
+/// `(project path, machine, base branch, forge config, owner)`.
+type RoutingCacheKey = (
+    std::path::PathBuf,
+    Option<String>,
+    String,
+    String,
+    Option<String>,
+);
 
 fn routing_cache()
 -> &'static parking_lot::Mutex<HashMap<RoutingCacheKey, (std::time::Instant, PrRepoRouting)>> {

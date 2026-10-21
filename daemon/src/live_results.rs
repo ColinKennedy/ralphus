@@ -1634,7 +1634,7 @@ pub fn refresh_pr(
         let forge_cfg = crate::config::resolve_forge(&root);
         crate::pr::forge_client_for_pr(
             store,
-            &root,
+            &crate::workspace::Workspace::for_guardian(store, &guardian.id, &root),
             &guardian.base_branch,
             &forge_cfg,
             &pr.repo,
@@ -1732,7 +1732,7 @@ pub fn process_pr_refreshes_background(store: &crate::store_lock::StoreHandle) {
             let forge_cfg = crate::config::resolve_forge(&root);
             crate::pr::forge_client_for_pr(
                 &store,
-                &root,
+                &crate::workspace::Workspace::for_guardian(&store, &guardian.id, &root),
                 &guardian.base_branch,
                 &forge_cfg,
                 &pr.repo,
