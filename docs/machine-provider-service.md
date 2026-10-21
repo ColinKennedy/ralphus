@@ -250,3 +250,25 @@ proxies sees them in transit; that is inherent, since whoever controls a
 machine can read a running process's memory. Short-lived git and forge
 credentials requested by a job on demand are part of the credential phase and
 will be added here.
+
+### Logging an agent in on a remote machine
+
+Give the agent its credential through the environment, never a file copied to
+the machine. For Claude Code, create a long-lived token on any machine where
+you are logged in (`claude setup-token`) or use an API key, keep it in the
+daemon's environment, and link it into an agent profile:
+
+```bash
+# daemon's environment (e.g. its service definition), not a task file:
+RALPHUS_REMOTE_CLAUDE_TOKEN=<token from `claude setup-token`>
+
+ralphus agent profile register --name claude-remote --backend claude-code \
+  --env-link CLAUDE_CODE_OAUTH_TOKEN=RALPHUS_REMOTE_CLAUDE_TOKEN
+# or, with an API key:  --env-link ANTHROPIC_API_KEY=RALPHUS_REMOTE_ANTHROPIC_KEY
+```
+
+Cells using `agent = "claude-remote"` then receive the variable in the `exec`
+body on every run (re-read each time, so rotating it needs no re-save). The
+SSH provider hands it to the runner through the launching session's
+environment; it is never written to the machine's disk, and its value is
+redacted in every API and board response.
