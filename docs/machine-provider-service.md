@@ -234,6 +234,10 @@ codex = "/home/me/.local/bin/codex"           # agent executables on that machin
 - `materialize` copies the selected files to the fleet host and returns them
   in the reply, so the daemon may run elsewhere.
 
+To check a set of machines end to end (strict mode, two machines, a review,
+secrets, restarts, release), run [`scripts/fleet_e2e.py`](fleet-e2e.md). To
+write a provider of your own, see [`writing-a-provider.md`](writing-a-provider.md).
+
 ## Program providers keep working
 
 A program provider (v1) is adapted rather than replaced: its allocation is its
