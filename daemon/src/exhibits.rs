@@ -1722,7 +1722,7 @@ EXHIBIT: gif | a || output | C",
                 ExhibitOrigin::Handoff,
                 &[
                     (two_kind("A", "B"), None),
-                    (req(ExhibitKind::Output, "log"), None),
+                    (req(ExhibitKind::TerminalText, "log"), None),
                 ],
             )
             .unwrap();
@@ -1772,12 +1772,12 @@ EXHIBIT: gif | a || output | C",
         );
         let mut with_output = req(ExhibitKind::Gif, "A");
         with_output.alternatives.push(ExhibitAlternative {
-            kind: ExhibitKind::Output,
+            kind: ExhibitKind::TerminalText,
             describe: "log".into(),
         });
         assert_eq!(
             with_output.narrowed_to(&shots),
-            req(ExhibitKind::Output, "log")
+            req(ExhibitKind::TerminalText, "log")
         );
     }
 
