@@ -627,7 +627,8 @@ mod tests {
 
     #[test]
     fn an_installed_runner_is_checked_on_the_machine() {
-        let dir = std::env::temp_dir().join(format!("ral355-health-runner-{}", std::process::id()));
+        let dir =
+            ralphus_test_support::scratch(format!("ral355-health-runner-{}", std::process::id()));
         let py = fake_provider(
             &dir,
             &[

@@ -297,10 +297,10 @@ mod tests {
     #[test]
     fn strict_mode_stops_a_real_local_git_call_inside_a_remote_scope() {
         set_enabled_for_test(true);
-        let dir = std::env::temp_dir();
-        assert!(crate::guardian_merge::git(&dir, &["--version"]).is_ok());
+        let dir = ralphus_test_support::TestDir::new("strict-git");
+        assert!(crate::guardian_merge::git(dir.path(), &["--version"]).is_ok());
         let _scope = enter(Some("fleet:box"));
-        let err = crate::guardian_merge::git(&dir, &["--version"]).expect_err("must refuse");
+        let err = crate::guardian_merge::git(dir.path(), &["--version"]).expect_err("must refuse");
         assert!(err.contains("machine strict mode"), "{err}");
         assert!(err.contains("git --version"), "{err}");
     }
@@ -308,9 +308,10 @@ mod tests {
     #[test]
     fn strict_mode_stops_a_real_local_command_inside_a_remote_scope() {
         set_enabled_for_test(true);
+        let dir = ralphus_test_support::TestDir::new("strict-command");
         let _scope = enter(Some("fleet:box"));
         let (ok, out) = crate::proof::run_command_proof_capture(
-            &std::env::temp_dir().to_string_lossy(),
+            &dir.path().to_string_lossy(),
             "echo hi",
             &opentelemetry::Context::new(),
             &std::collections::BTreeMap::new(),

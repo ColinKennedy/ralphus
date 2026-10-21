@@ -1163,7 +1163,7 @@ mod tests {
         // The review derives `.git/.ralphus/...` from the daemon's own project
         // root and translates it onto the machine's repository; the suffix
         // carries the daemon's separators until it is normalised.
-        let local = std::env::temp_dir().join("ralphus-ws-map");
+        let local = ralphus_test_support::scratch("ralphus-ws-map");
         let mut ws = Workspace::on(local.clone(), Some("incredibuild:A"));
         ws.path_map = Some(Arc::new((local.clone(), PathBuf::from("/srv/repo"))));
         let derived = ws.at(local.join(".git").join(".ralphus").join("g"));
@@ -1328,7 +1328,7 @@ echo {json}
 
     #[test]
     fn worktree_initialization_runs_on_a_remote_cells_machine() {
-        let dir = std::env::temp_dir().join(format!("ral-d6-init-{}", std::process::id()));
+        let dir = ralphus_test_support::scratch(format!("ral-d6-init-{}", std::process::id()));
         let script = write_script(
             &dir,
             r#"{"ok":true,"protocol_version":1,"exit_code":0,"stdout":"installed"}"#,
@@ -1367,7 +1367,7 @@ echo {json}
     #[test]
     fn a_remote_branchs_emptiness_is_judged_on_its_machine() {
         // The daemon has no such repository; only the machine can answer.
-        let dir = std::env::temp_dir().join(format!("ral-b3-empty-{}", std::process::id()));
+        let dir = ralphus_test_support::scratch(format!("ral-b3-empty-{}", std::process::id()));
         let script = write_script(
             &dir,
             r#"{"ok":true,"protocol_version":1,"exit_code":0,"stdout":"src/changed.rs"}"#,
@@ -1398,7 +1398,7 @@ echo {json}
     fn a_rebase_on_a_remote_machine_is_detected_there() {
         // The state directory exists only on the machine; a local
         // `Path::exists` would always say no rebase is running.
-        let dir = std::env::temp_dir().join(format!("ral-b1-rebase-{}", std::process::id()));
+        let dir = ralphus_test_support::scratch(format!("ral-b1-rebase-{}", std::process::id()));
         let script = write_script(
             &dir,
             r#"{"ok":true,"protocol_version":1,"exit_code":0,"stdout":"/srv/repo/.git/worktrees/wt/rebase-merge"}"#,
@@ -1427,7 +1427,7 @@ echo {json}
         // PR routing reads remote names from the review's repository. For a
         // remote review that is the machine's, whose git answers here with an
         // upstream on a remote the daemon's own checkout does not have.
-        let dir = std::env::temp_dir().join(format!("ral-a1-remote-{}", std::process::id()));
+        let dir = ralphus_test_support::scratch(format!("ral-a1-remote-{}", std::process::id()));
         let script = write_script(
             &dir,
             r#"{"ok":true,"protocol_version":1,"exit_code":0,"stdout":"machine-remote/main"}"#,
@@ -1466,7 +1466,7 @@ echo {json}
         // With no contributing cell on the review's machine there is no
         // workspace to discover the repository from; the review provisions
         // the project itself instead of sending the daemon's own paths.
-        let dir = std::env::temp_dir().join(format!("ral-a8-ws-{}", std::process::id()));
+        let dir = ralphus_test_support::scratch(format!("ral-a8-ws-{}", std::process::id()));
         // One reply answers both verbs the fallback makes: `provision` reads
         // `workspace`, the follow-up `git rev-parse --git-common-dir` reads
         // `stdout`.

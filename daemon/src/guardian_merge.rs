@@ -13336,13 +13336,14 @@ fn prepare_action_hints(
             // the daemon's host, or under the review repository's
             // `.git/.ralphus` on its machine (a remote review's commands never
             // see the daemon's disk).
+            let build_root = std::env::temp_dir()
+                .join("ralphus")
+                .join("prepared-builds")
+                .join(id)
+                .join(&workspace_identity[..16])
+                .join(format!("action-{index}"));
             let build_root = if root.is_local() {
-                std::env::temp_dir()
-                    .join("ralphus")
-                    .join("prepared-builds")
-                    .join(id)
-                    .join(&workspace_identity[..16])
-                    .join(format!("action-{index}"))
+                build_root
             } else {
                 PathBuf::from(format!(
                     "{}/.git/.ralphus/prepared-builds/{id}/{}/action-{index}",
