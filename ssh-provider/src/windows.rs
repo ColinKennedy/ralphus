@@ -171,6 +171,7 @@ pub const VERBS: &[&str] = &[
     "cleanup",
     "capabilities",
     "retire",
+    "preflight",
 ];
 
 /// The machine's OS as the target runner policy declares it.

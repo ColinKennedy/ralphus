@@ -26,7 +26,7 @@ const EVENT_MARKER: &str = "RALPHUS_EVENT:";
 pub const PROTOCOL_VERSION: i64 = 2;
 
 /// Verbs a Machine API serves.
-pub const VERBS: [&str; 15] = [
+pub const VERBS: [&str; 16] = [
     "provision",
     "exec",
     "status",
@@ -42,6 +42,7 @@ pub const VERBS: [&str; 15] = [
     "ping",
     "cleanup",
     "retire",
+    "preflight",
 ];
 
 /// A refusal in the contract's error shape.
@@ -87,7 +88,8 @@ fn complete_request(verb: &str, machine: &MachineConfig, body: &mut Value) {
             runner_policy(machine, &Platform::default()),
         );
     }
-    if verb == "exec" {
+    // A preflight checks the same launcher an `exec` would use.
+    if matches!(verb, "exec" | "preflight") {
         let agent = fields
             .get("agent")
             .and_then(Value::as_str)
@@ -436,6 +438,15 @@ mod tests {
         let mut other = json!({"agent": "claude"});
         complete_request("exec", &m, &mut other);
         assert!(other.get("executable").is_none());
+    }
+
+    #[test]
+    fn a_preflight_checks_the_machines_configured_agent_path() {
+        let m = machine();
+        let mut preflight = json!({"agent": "codex"});
+        complete_request("preflight", &m, &mut preflight);
+        assert_eq!(preflight["executable"], "/opt/codex");
+        assert!(VERBS.contains(&"preflight"));
     }
 
     #[test]

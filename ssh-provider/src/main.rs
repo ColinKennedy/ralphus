@@ -6,7 +6,7 @@ use std::io::Read;
 
 use ralphus_ssh_provider::{
     UNIMPLEMENTED_VERBS, capabilities, channel, cleanup, exec, fileops, job, materialize, ping,
-    protocol, provision, windows,
+    preflight, protocol, provision, windows,
 };
 
 struct Args {
@@ -244,6 +244,17 @@ fn main() {
         "capabilities" => {
             let config = exec_config(&args);
             protocol::reply_capabilities(capabilities::run(&args.uri, &config));
+        }
+        "preflight" => {
+            let payload = read_stdin();
+            let config = exec_config(&args);
+            match preflight::run(&args.uri, &payload, &config) {
+                Ok(answer) => protocol::reply_preflight(answer),
+                Err(e) => {
+                    report_failure(&args.verb, &args.uri, &e);
+                    protocol::reply_err(e);
+                }
+            }
         }
         "provision" => {
             let payload = read_stdin();

@@ -18,7 +18,7 @@ provider's business.
 > **Status:** implemented — registry, `machine` syntax, validation, remote
 > cell/proof execution, and every documented verb (`provision`, `exec`,
 > `status`, `stream`, `cancel`, `run`, `read-file`, `write-file`,
-> `remove-path`, `materialize`, `ping`, `capabilities`, `channel`, `cleanup`, `retire`), each
+> `remove-path`, `materialize`, `ping`, `capabilities`, `channel`, `cleanup`, `retire`, `preflight`), each
 > dispatched genericly through the same registry with no daemon-side
 > branching on scheme. Guardian
 > reviews now dispatch to a remote review's assigned machine too (RAL-185
@@ -232,6 +232,7 @@ or `#[derive(Deserialize)]` matching the direction it's used in).
 | `channel` | `--uri` | newline-delimited `RunRequest`s | **Optional.** Serve many requests from one process: read newline-delimited JSON `run` requests on stdin, write one newline-delimited JSON response each, until stdin closes. |
 | `cleanup` | `--uri` | [`CleanupRequest`](../daemon/src/remote_runner.rs) (`project: String`, `clone_url: String`, `branch?: String`, `remote_root?: String`) | Tear one workspace down — one worktree when `branch` is given, the whole project directory (repository plus every worktree) when it is omitted. Reply `{"removed": "<abs path on this machine>"}`. See "The `cleanup` verb and its retention policy" below. |
 | `retire` | `--uri` | [`RetireRequest`](../daemon/src/remote_runner.rs) (`path: String` — the worktree's absolute path on this machine) | **Optional**, and unlike `cleanup`, called automatically once a day per stale review worktree. Decide (and possibly carry out) one worktree-retirement attempt. Reply `{"outcome": "removed"}`, `{"outcome": "deferred", "reason?": "...", "retry_at_ms?": N}`, or `{"outcome": "opted_out", "reason?": "..."}`. See "The `retire` verb and worktree-retirement policy" below. |
+| `preflight` | `--uri` | [`PreflightRequest`](../daemon/src/remote_runner.rs) (`agent: String`, `executable?: String`) | **Optional.** Say whether the agent backend can start on this machine, checked as `ralphus-runner preflight --agent <agent> [--executable <path>]` checks it. Reply `{"available": true}` or `{"available": false, "detail": "..."}` -- an unavailable agent is an answer, not an error. Asked before the first prompt cell of an agent on the machine (a pass is remembered per machine, agent and launcher); a provider that does not implement it lets the cell run unchecked. |
 
 The cell spec arrives on stdin for `exec`; the provision request arrives on
 stdin for `provision`; the file/run/cleanup requests above arrive on stdin

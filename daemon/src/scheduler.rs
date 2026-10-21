@@ -4112,6 +4112,28 @@ fn run_cell_worker(
     }
     spec.agent = selection.backend.clone();
     spec.executable = selection.executable.clone();
+    // A prompt cell on a provider machine asks that machine whether its agent
+    // can start there (remembered per machine and agent while it passes), so
+    // a missing agent fails the cell now with a remedy rather than mid-run.
+    if spec.prompt.is_some() && is_remote_machine(row.machine.as_deref()) {
+        if let Err(message) = runner.preflight_agent(
+            &spec.agent,
+            spec.executable.as_deref(),
+            row.machine.as_deref(),
+        ) {
+            fail_cell_before_dispatch(
+                store,
+                squad_id,
+                row,
+                &message,
+                "cell failed: agent unavailable on its machine",
+            );
+            let mut prog = progress.lock().expect("progress mutex poisoned");
+            prog.status[i] = CellState::Failed;
+            prog.failed.insert(row.task_idx);
+            return;
+        }
+    }
     if spec.prompt.is_some() {
         spec.capabilities = capabilities_for_agent(store, &row.agent, &selection.backend);
         if spec.closing_turn_prompt.is_some() {
@@ -6012,6 +6034,55 @@ fn guardian_blocking_tasks(
         })
         .map(|s| s.task_idx)
         .collect()
+}
+
+/// Fail `row` before its runner starts: record the result, log `headline`
+/// with `message` to Cartographer, and mail its watchers.
+fn fail_cell_before_dispatch(
+    store: &crate::store_lock::StoreHandle,
+    squad_id: &str,
+    row: &crate::store::CellRow,
+    message: &str,
+    headline: &'static str,
+) {
+    crate::rlog!(
+        ERROR,
+        "ralphus [scheduler] cell {squad_id}/{} {headline}: {message}",
+        row.cell_id,
+    );
+    let outcome = crate::store::CellOutcome {
+        state: crate::store::NodeState::Failed,
+        usage: crate::store::RecordedUsage::default(),
+        error: Some(message.to_string()),
+        agent_session_id: None,
+    };
+    let guard = store.lock();
+    store_ok(
+        &guard,
+        squad_id,
+        "record_cell_result",
+        guard.record_cell_result(squad_id, row.task_idx, row.idx, &outcome),
+    );
+    let _ = guard.cartographer_log(crate::cartographer::CartographerEntry {
+        level: crate::logging::LogLevel::ERROR,
+        source: "scheduler",
+        message: headline,
+        scope: Some("cell"),
+        squad_id: Some(squad_id),
+        guardian_id: None,
+        cell_id: Some(&row.cell_id),
+        task: Some(&row.task_name),
+        log_path: None,
+        payload: serde_json::json!({"error": message}),
+        admin_only: false,
+    });
+    enqueue_cell_failure_mailbox(
+        &guard,
+        squad_id,
+        &row.cell_id,
+        &row.task_name,
+        Some(message),
+    );
 }
 
 /// Whether `machine` names a provider-backed machine rather than the daemon's
