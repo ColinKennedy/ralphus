@@ -22323,14 +22323,14 @@ mod tests {
         // padding it directly inflates the repo root's path length -- grown
         // in a small calibration loop so this is robust to how long the
         // host's own temp directory happens to be.
-        let mut pad_len = 120usize;
+        let mut pad_len = 20usize;
         let (base, repo, _fwt) = loop {
             let (base, repo, fwt) = make_repo(&"x".repeat(pad_len));
             let root_len = repo.to_string_lossy().len();
             // Ensure the old scheme would fail (87 chars overhead), the new scheme would fit
-            // (31 chars overhead), and git can still write objects (.git/objects/xx/... ~65 chars
-            // to be conservative on Windows path handling).
-            if root_len + 87 > 260 && root_len + 50 <= 260 {
+            // (31 chars overhead), and git can still write objects (.git/objects/xx/... ~56 chars
+            // plus slack to be conservative on Windows path handling).
+            if root_len + 87 > 260 && root_len + 70 <= 260 {
                 break (base, repo, fwt);
             }
             let _ = std::fs::remove_dir_all(&base);
@@ -22338,7 +22338,7 @@ mod tests {
                 pad_len < 400,
                 "could not reach the target path-length window"
             );
-            pad_len += 40;
+            pad_len += 4;
         };
 
         let store = Arc::new(crate::store_lock::StoreMutex::new(
