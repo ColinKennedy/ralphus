@@ -2803,6 +2803,95 @@ else:
         );
     }
 
+    /// Every text value in every table of `store`, for a leak scan.
+    fn all_stored_text(store: &crate::store_lock::StoreHandle) -> String {
+        let guard = store.lock();
+        let tables: Vec<String> = guard
+            .conn
+            .prepare("SELECT name FROM sqlite_master WHERE type='table'")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        let mut text = String::new();
+        for table in tables {
+            let mut stmt = guard
+                .conn
+                .prepare(&format!("SELECT * FROM \"{table}\""))
+                .unwrap();
+            let columns = stmt.column_count();
+            let mut rows = stmt.query([]).unwrap();
+            while let Some(row) = rows.next().unwrap() {
+                for i in 0..columns {
+                    if let Ok(rusqlite::types::ValueRef::Text(t)) = row.get_ref(i) {
+                        text.push_str(&String::from_utf8_lossy(t));
+                        text.push('\n');
+                    }
+                }
+            }
+        }
+        text
+    }
+
+    #[test]
+    fn a_secret_a_remote_machine_echoes_back_is_never_persisted() {
+        // A remote cell's provider echoes a secret the daemon handed it --
+        // in its result, its error, its ghost and a runner event. None of it
+        // may reach the store (Cartographer included) or the result the
+        // scheduler persists.
+        let secret = "rlph-audit-7f3c9a1d2e";
+        crate::redact::register(secret);
+        let event = format!(
+            r#"{EVENT_MARKER}{{"source":"llm-invoke","message":"used {secret}","payload":{{"note":"{secret}"}}}}"#
+        );
+        let script = fake_provider(
+            "secret-audit",
+            &format!(
+                r#"{{"ok":true,"protocol_version":1,"result":{{"status":"failed","summary":"printed {secret}","error":"auth {secret} refused","ghost":"saw {secret}"}}}}"#
+            ),
+            &[&event],
+        );
+        let s = store();
+        s.lock()
+            .register_machine_provider(
+                "ib",
+                "",
+                &script.to_string_lossy(),
+                &[],
+                PROTOCOL_VERSION,
+                false,
+            )
+            .unwrap();
+        let (router, _local) = router(Arc::clone(&s));
+
+        let r = router.run(&spec(Some("ib:A")));
+
+        let returned = format!("{} {:?} {:?}", r.summary, r.error, r.ghost);
+        assert!(!returned.contains(secret), "{returned}");
+        assert!(
+            returned.contains("printed"),
+            "the result itself still arrives: {returned}"
+        );
+        let page = s
+            .lock()
+            .cartographer_query(&crate::cartographer::CartographerFilter::recent(50))
+            .unwrap();
+        let events = serde_json::to_string(&page.rows).unwrap();
+        assert!(
+            events.contains("llm-invoke"),
+            "the event was recorded: {events}"
+        );
+        assert!(
+            !events.contains(secret),
+            "a secret reached Cartographer: {events}"
+        );
+        assert!(
+            !all_stored_text(&s).contains(secret),
+            "a secret reached the store"
+        );
+    }
+
     #[test]
     fn provider_stderr_ralphus_events_reach_cartographer() {
         // Without this a remote cell is invisible in Cartographer AND its
