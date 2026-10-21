@@ -671,7 +671,9 @@ pub fn run_loop(
         // Live actions: nothing can still be running a live run in this
         // process, so a row left `running` by the previous daemon was
         // interrupted. It counts as the review's one automatic run; the user
-        // reruns it by hand.
+        // reruns it by hand. A run that already pinned its commits keeps its
+        // live ref on record first.
+        crate::live_runs::adopt_interrupted_live_refs(&store);
         match store.lock().interrupt_running_live_runs() {
             Ok(0) | Err(_) => {}
             Ok(n) => crate::rlog!(

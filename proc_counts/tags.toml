@@ -219,3 +219,7 @@ tag = "review-summary-poll-remote"
 [[test]]
 id = "ralphus-daemon guardian_merge::tests::an_idle_remote_review_is_maintained_on_the_remote_cadence"
 tag = "review-maintenance-remote-cadence"
+# Live-ref retirement on a remote machine (orphan sweep through the provider).
+[[test]]
+id = "ralphus-daemon live_runs::tests::orphan_live_refs_on_a_remote_machine_are_removed"
+tag = "live-ref-retirement-remote"
