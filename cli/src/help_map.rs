@@ -1418,6 +1418,15 @@ const TRIAGE_CHILDREN: &[HelpNode] = &[
 
 const MACHINE_CHILDREN: &[HelpNode] = &[
     node(
+        "allocations",
+        &[],
+        &["--all"],
+        "List the machines provider services granted (provider, allocation, os/arch, the squad or review it serves, idle). Active ones only unless --all. Read-only: ralphus never adds or removes machines.",
+        false,
+        true, // ("machine", "allocations")
+        &[],
+    ),
+    node(
         "check",
         &["machine [str]"],
         &[],

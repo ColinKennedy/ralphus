@@ -91,6 +91,7 @@ ENDPOINT_TO_CLI: dict[str, list[str]] = {
     "GET /api/internal/fork-credential": ["internal fork-credential-helper"],
     "GET /api/worktree-retirements": ["review worktree-retirements"],
     "GET /api/machines": ["machine list", "check health"],
+    "GET /api/machine-allocations": ["machine allocations"],
     "POST /api/machines": ["machine register"],
     "GET /api/machines/{scheme}": ["machine get"],
     "POST /api/machines/{scheme}/check": ["machine check"],

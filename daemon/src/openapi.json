@@ -4902,6 +4902,27 @@
         }
       }
     },
+    "/api/machine-allocations": {
+      "get": {
+        "operationId": "getMachineAllocations",
+        "summary": "Backs `ralphus machine allocations`.",
+        "responses": {
+          "200": {
+            "description": "Success.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/JsonValue"
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
     "/api/machines": {
       "get": {
         "operationId": "getMachines",

@@ -1190,6 +1190,20 @@ registry row (so a client doesn't render them as missing).
   "builtin": ["local"] }
 ```
 
+### `GET /api/machine-allocations[?all=true]`
+Machines provider services granted (`docs/machine-provider-service.md`),
+newest first; only `active` ones unless `all=true` (then also `released` and
+`lost`). Admin-only, read-only. No token is ever returned or stored.
+CLI: `ralphus machine allocations [--all]`.
+
+```json
+{ "allocations": [ { "id": 3, "provider": "fleet", "allocation_id": "alloc-7f3a",
+    "endpoint": "http://127.0.0.1:7900/v1/m/alloc-7f3a", "request": "@fleet?os=linux",
+    "squad_id": "squad-…", "guardian_id": null, "os": "linux", "arch": "x86_64",
+    "labels": [], "description": "mybox/wsl", "idle": false, "state": "active",
+    "state_detail": null, "created_at_ms": 0, "released_at_ms": null } ] }
+```
+
 ### `GET /api/machines/{scheme}`
 One registered provider by exact scheme (case-insensitive). `404` if not
 registered — built-in schemes are not returned here, only by the list route.

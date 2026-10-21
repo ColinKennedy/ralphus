@@ -1423,6 +1423,9 @@ fn route_for_user(
         // Machine provider registry (RAL-185) -- RAL-332: admin-only, client
         // and server side. Nothing outside the Machines tab reads this.
         ("GET", ["api", "machines"]) => admin_gated(daemon, user_header, || list_machines(daemon)),
+        ("GET", ["api", "machine-allocations"]) => admin_gated(daemon, user_header, || {
+            list_machine_allocations(daemon, query_param(query, "all") == Some("true"))
+        }),
         ("POST", ["api", "machines"]) => {
             admin_gated(daemon, user_header, || register_machine(daemon, body))
         }
@@ -4256,6 +4259,16 @@ fn list_machines(daemon: &Daemon) -> Reply {
                     .collect(),
             },
         ),
+        Err(e) => store_error(&e),
+    }
+}
+
+/// `GET /api/machine-allocations[?all=true]`: machines provider services
+/// granted, newest first -- only active ones unless `all`. Read-only: ralphus
+/// never manages machines, it only shows what it was given.
+fn list_machine_allocations(daemon: &Daemon, all: bool) -> Reply {
+    match daemon.lock().machine_allocations(all) {
+        Ok(allocations) => json(200, &serde_json::json!({ "allocations": allocations })),
         Err(e) => store_error(&e),
     }
 }

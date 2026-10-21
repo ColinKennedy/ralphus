@@ -810,6 +810,7 @@ use; see `READ_ONLY_NOTE`.
     - (read-only-safe) license  {Print the embedded LICENSE text decoded from the binary's obfuscated copy.}
     - (read-only-safe) listen selector [uri] --timeout [seconds] --until [status]  {Block until a squad/task/cell/proof/review/review-worktree reaches a status.}
     - machine  {Register and inspect machine providers remote work runs on.}
+        - (read-only-safe) allocations --all  {List the machines provider services granted (provider, allocation, os/arch, the squad or review it serves, idle). Active ones only unless --all. Read-only: ralphus never adds or removes machines.}
         - (read-only-safe) check machine [str]  {Ping a registered machine provider (by scheme, or a full scheme:uri) and report whether it answers. Side-effect free: the provider's `ping` verb does no work.}
         - cleanup machine [str] --branch [name] --project [name]  {Tear down one project's provisioned workspace on a machine provider -- the whole project directory, or just --branch's worktree (RAL-201, reshaped by RAL-355 Phase 2).}
         - (read-only-safe) get scheme [str]  {Show one registered machine provider by exact scheme.}
