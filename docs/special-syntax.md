@@ -33,7 +33,6 @@ validation time — a typo fails fast at submit, before the daemon sees it.
 |---|---|---|
 | `<<task:<name>[/<cell>]>>` | cell `upstream` | the tip of that dependency task's (or cell's) branch — the cell's branch rebases onto it |
 | `<<ralphus:new-worktree/<branch>?upstream=<upstream>>>` | cell `cwd` | a materialized (or reused) git worktree for `<branch>`, created under the owning task's `project`; the stored `cwd` is rewritten to the real path before the cell runs (RAL-100) |
-| `<<ralphus:new-worktree/<branch>?upstream=<base>&existing=1>>` | cell `cwd` | existing-branch mode (RAL-700): the worktree checks out `<branch>` at its current tip — the local branch, else a same-named local branch fetched from a remote and tracking it. Never renamed to `<branch>-2` (a branch checked out in another checkout is refused with remediation), never rebased, and `branch.<b>.remote/merge` is left alone. `?upstream=` is the review base, used only to freeze the commit baseline at its merge-base with the branch. Local-only; `machine` is rejected |
 | `<<default>>` | the `?upstream=` value of a new-worktree placeholder | the repository's default branch — recommended |
 | `<<current_branch>>` | the `?upstream=` value of a new-worktree placeholder | whatever branch the project currently has checked out — riskier, since it can change between runs |
 | `<<review:<id>>>` | `[[task.cell]].review`, `[[waypoint]].affected` | an existing `[[review]]`'s id in the same submission (RAL-269); also an `affected` entry (RAL-400). Prefer `<<ralphus:review/<id>>>` in a waypoint |

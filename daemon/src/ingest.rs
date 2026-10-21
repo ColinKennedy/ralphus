@@ -454,22 +454,30 @@ fn create(
     req: &IngestRequest,
     prepared: &Prepared,
 ) -> Result<(String, String), IngestError> {
+    // A registered remote-backed project's base resolves against its remote,
+    // so the commit baseline is not frozen against a stale local branch.
+    let project = match &prepared.project {
+        Some(name) => store
+            .lock()
+            .get_project(name)
+            .map_err(|e| IngestError::new(500, "store_error", e.to_string()))?,
+        None => None,
+    };
+    let base = match &project {
+        Some(project) => crate::worktrees::resolve_registered_remote_upstream(
+            &prepared.root,
+            project,
+            &prepared.base.branch,
+        )
+        .map_err(|e| IngestError::new(409, "worktree_failed", e))?,
+        None => prepared.base.branch.clone(),
+    };
     let mut cwds = Vec::new();
     for branch in &req.branches {
-        if prepared.project.is_some() {
-            cwds.push(format!(
-                "ralphus:new-worktree/{branch}?upstream={}&existing=1",
-                prepared.base.branch
-            ));
-        } else {
-            let path = crate::worktrees::ensure_existing_branch_worktree(
-                &prepared.root,
-                branch,
-                Some(&prepared.base.branch),
-            )
-            .map_err(|e| IngestError::new(409, "worktree_failed", e))?;
-            cwds.push(path.to_string_lossy().into_owned());
-        }
+        let path =
+            crate::worktrees::ensure_existing_branch_worktree(&prepared.root, branch, Some(&base))
+                .map_err(|e| IngestError::new(409, "worktree_failed", e))?;
+        cwds.push(path.to_string_lossy().into_owned());
     }
     let (file, _) = build_task_file(req, prepared, &cwds)?;
     let store_err = |e: &dyn std::fmt::Display| IngestError::new(500, "store_error", e.to_string());
@@ -621,6 +629,29 @@ mod tests {
         let squad = store.get_squad(squad_id).unwrap();
         assert_eq!(squad.tasks.len(), 2);
         assert_eq!(squad.tasks[1].depends_on, [squad.tasks[0].name.clone()]);
+    }
+
+    #[test]
+    fn a_registered_project_branch_is_checked_out_under_its_own_name_before_the_squad_exists() {
+        let root = repo();
+        let store = handle();
+        store
+            .lock()
+            .register_project("ingest-proj", "", &root.to_string_lossy(), "git")
+            .unwrap();
+        let out = ingest(&store, &request(&root, &["feat-a"], false)).unwrap();
+        assert_eq!(out["project"], "ingest-proj");
+
+        let squad = store
+            .lock()
+            .get_squad(out["squad_id"].as_str().unwrap())
+            .unwrap();
+        let cwd = squad.tasks[0].cells[0].cwd.clone().unwrap();
+        assert!(!cwd.contains("new-worktree"), "{cwd}");
+        let head = GitVcs
+            .run(Path::new(&cwd), &["rev-parse", "--abbrev-ref", "HEAD"])
+            .unwrap();
+        assert_eq!(head.trim(), "feat-a");
     }
 
     #[test]
