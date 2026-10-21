@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["core", "daemon", "librarian", "auth", "keygen", "bench-types", "bench-macros", "bench-harness", "ssh-provider", "runner", "cli", "mcp", "shell-syntax", "shell-syntax/grammars", "stress", "test-support"]
+members = ["core", "daemon", "librarian", "auth", "keygen", "bench-types", "bench-macros", "bench-harness", "ssh-provider", "fleet", "runner", "cli", "mcp", "shell-syntax", "shell-syntax/grammars", "stress", "test-support"]
 # Vendored, patched dependencies (wired in by `[patch.crates-io]` below) are
 # not workspace members: the workspace lints are not theirs to meet.
 exclude = ["vendor/tiny_http"]

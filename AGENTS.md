@@ -117,7 +117,7 @@ alternatives to reach for are in
 
 ## Architecture
 
-Twelve Rust workspace members; `cli-py/` is a Python project kept only for `docsgen/` (doc screenshot generation, dev-only, never shipped) and a trimmed `bench/` (renders the Rust bench harness's SVG/HTML graphs) — see `cli-py/AGENTS.md`. The **daemon owns all state**; the CLI and librarian are clients of its HTTP/JSON API (`docs/daemon-api.md`). The SQLite DB is daemon-private.
+Thirteen Rust workspace members; `cli-py/` is a Python project kept only for `docsgen/` (doc screenshot generation, dev-only, never shipped) and a trimmed `bench/` (renders the Rust bench harness's SVG/HTML graphs) — see `cli-py/AGENTS.md`. The **daemon owns all state**; the CLI and librarian are clients of its HTTP/JSON API (`docs/daemon-api.md`). The SQLite DB is daemon-private.
 
 | Component | Path | Language | Role | Details |
 |---|---|---|---|---|
@@ -130,6 +130,7 @@ Twelve Rust workspace members; `cli-py/` is a Python project kept only for `docs
 | `ralphus-auth` | `auth/` | Rust lib | Ed25519 license verification (no-op without `--features secure-dist`). | `auth/AGENTS.md` |
 | `ralphus-keygen` | `keygen/` | Rust bin | Author-only tool: generate keypair + sign licenses. Never shipped to users. | `keygen/AGENTS.md` |
 | `ralphus-ssh-provider` | `ssh-provider/` | Rust bin+lib | Machine provider (RAL-185) reaching any host already SSH-accessible; every provider verb except `retire` (RAL-200, RAL-355), including `channel` (one persistent `ssh` session per machine), see `docs/machine-providers.md`. | |
+| `ralphus-fleet` | `fleet/` | Rust bin+lib | The built-in machine provider *service* (provider contract v2, `docs/machine-provider-service.md`): hands the daemon allocations from its own `ralphus-fleet.toml` machine list (os/arch/labels selection, explained refusals) and serves each allocation's Machine API by driving the machine through `ralphus-ssh-provider`. Allocations persist across restarts; tokens never do. `ralphus-fleet serve/list/add`. | `docs/machine-provider-service.md` |
 | `ralphus-shell-syntax` | `shell-syntax/` | Rust lib | Optional (`parser` feature, daemon feature `shell-syntax`) tree-sitter Bash/PowerShell parse that splits an agent-log shell command into rows and highlight spans (RAL-644). Display-only; C toolchain needed only when enabled. | `docs/shell-syntax.md` |
 | `ralphus-bench-types` | `bench-types/` | Rust lib | `BenchMeta` only — kept dependency-free to avoid a cyclic dependency between bench-tagged crates and the harness (RAL-94). | `bench-harness/AGENTS.md` |
 | `ralphus-bench-macros` | `bench-macros/` | Rust proc-macro | `#[ralphus_bench(patience = N)]` attribute (RAL-94). | `bench-harness/AGENTS.md` |

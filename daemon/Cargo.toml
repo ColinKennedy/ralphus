@@ -63,6 +63,9 @@ git2 = { workspace = true }
 
 [dev-dependencies]
 ralphus-test-support = { path = "../test-support" }
+# The built-in provider service, run in-process to test the daemon against the
+# real other side of the provider contract.
+ralphus-fleet = { path = "../fleet" }
 ureq = { workspace = true }
 # Builds the GIF fixture `exhibit_media`'s real-ffmpeg conversion test reads.
 gif = { workspace = true }

@@ -325,6 +325,11 @@ pub fn get(service: &ProviderService, allocation_id: &str) -> Result<Allocation,
         &format!("/v1/allocations/{allocation_id}"),
         None,
     )?;
+    // A read hands out no token; `renew` does.
+    let reply = Reply {
+        token: Some(reply.token.unwrap_or_default()),
+        ..reply
+    };
     allocation_from(service, reply)
 }
 
@@ -1483,6 +1488,103 @@ mod tests {
                 "POST /v1/m/alloc-1/ping",
             ]
         );
+    }
+
+    /// Start the real built-in provider service in-process, reaching its one
+    /// machine (`me@box`, linux) through a fake SSH provider that answers
+    /// every verb and names the machine it was pointed at.
+    fn start_ralphus_fleet(tag: &str) -> ProviderService {
+        let dir = std::env::temp_dir().join(format!("fleet-e2e-{tag}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let event = r#"RALPHUS_EVENT:{"source":"llm-invoke","message":"m","payload":{}}"#;
+        let (script, body) = if cfg!(windows) {
+            (
+                dir.join("ssh.cmd"),
+                format!(
+                    "@echo off\r\necho {event} 1>&2\r\n\
+                     echo {{\"ok\":true,\"protocol_version\":1,\"detail\":\"pong from %3\"}}\r\n"
+                ),
+            )
+        } else {
+            (
+                dir.join("ssh.sh"),
+                format!(
+                    "#!/bin/sh\necho '{event}' 1>&2\n\
+                     echo '{{\"ok\":true,\"protocol_version\":1,\"detail\":\"pong from '\"$3\"'\"}}'\n"
+                ),
+            )
+        };
+        std::fs::write(&script, body).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let config = ralphus_fleet::config::FleetConfig::parse(
+            &format!(
+                "token_env = \"UNUSED\"\nssh_provider = {:?}\n\
+                 [[machine]]\nhost = \"box\"\nuser = \"me\"\nos = \"linux\"\narch = \"x86_64\"\n\
+                 remote_root = \"/srv/fleet\"\n",
+                script.to_string_lossy()
+            ),
+            "fleet.toml",
+        )
+        .unwrap();
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", server.server_addr());
+        let service = ralphus_fleet::server::Service::new(
+            config,
+            url.clone(),
+            "fleet-svc-token".to_string(),
+            ralphus_fleet::allocations::Allocations::default(),
+        );
+        std::thread::spawn(move || ralphus_fleet::server::serve_on(&server, service));
+        let token_env = format!("RALPHUS_TEST_REAL_FLEET_{}", tag.to_uppercase());
+        crate::provider_services::set_token_for_test(&token_env, "fleet-svc-token");
+        ProviderService {
+            name: "fleet".to_string(),
+            url,
+            token_env,
+        }
+    }
+
+    #[test]
+    fn the_built_in_fleet_grants_a_machine_and_serves_its_machine_api() {
+        let fleet = start_ralphus_fleet("serve");
+        crate::provider_services::set_services_for_test(vec![fleet]);
+        let store = handle(Store::open_in_memory().unwrap());
+
+        let machine = grant(&store, "@fleet?os=linux", Scope::Squad("squad-e2e")).expect("granted");
+
+        let row = store
+            .lock()
+            .machine_allocation(parse_bound(&machine).unwrap().1)
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.os.as_deref(), Some("linux"));
+        assert_eq!(row.description.as_deref(), Some("box"));
+        let spec = crate::runner::RunnerSpec::for_command_proof(
+            "squad-e2e",
+            "c",
+            &machine,
+            ".",
+            "",
+            "claude",
+            None,
+        );
+        let runner = crate::remote_runner::provider_from_store(&store.lock(), &machine)
+            .unwrap()
+            .expect("remote");
+        assert_eq!(
+            runner.ping(&spec).unwrap().as_deref(),
+            Some("pong from me@box"),
+            "the Machine API call reached the allocated machine over its provider"
+        );
+
+        let err = grant(&store, "@fleet?os=windows", Scope::Squad("squad-e2e"))
+            .expect_err("no windows machine");
+        assert!(err.contains("box runs linux, not windows"), "{err}");
+        assert!(err.contains("no_matching_machine"), "{err}");
     }
 
     #[test]

@@ -2,8 +2,9 @@
 
 > **Status:** the daemon side is implemented -- configuration, request
 > validation, allocation, the Machine API transport, re-attach after restart,
-> release and idle hints. `ralphus-fleet`, the built-in service, is not built
-> yet, and the board does not show allocations yet. Program providers
+> release and idle hints, and the read-only allocations view (board, CLI,
+> MCP). `ralphus-fleet` reaches machines over SSH; `ralphus-outpost`, for
+> machines without SSH (native Windows), is not built yet. Program providers
 > ([`machine-providers.md`](machine-providers.md), contract v1) keep working
 > unchanged; this page describes the service form that sits alongside them.
 
@@ -136,7 +137,7 @@ JSON. Every reply carries `"protocol_version": 2`.
 | Call | Request | Reply |
 |---|---|---|
 | `POST /v1/allocations` | `{"requirements": {"os"?, "arch"?, "labels"?: []}, "scope": {"squad_id" or "review_id", "key"}}` | an allocation (above), or an error |
-| `GET /v1/allocations/{id}` | -- | the allocation, or `404` |
+| `GET /v1/allocations/{id}` | -- | the allocation without a token, or `404` |
 | `POST /v1/allocations/{id}/renew` | -- | the allocation with a new token |
 | `POST /v1/allocations/{id}/idle` | `{"idle": bool}` | `{}` -- a hint |
 | `DELETE /v1/allocations/{id}` | -- | `{}` |
@@ -184,6 +185,53 @@ A refusal is `{"ok": false, "protocol_version": 2, "error": "...",
 | `unsupported` | the provider does not implement the operation |
 
 `remediation` is shown to the user verbatim, so it should say what to do.
+
+## Running `ralphus-fleet`
+
+`ralphus-fleet` (`fleet/`) is the built-in provider service. It reaches each
+of its machines over SSH through `ralphus-ssh-provider` (found next to its
+executable, or set `ssh_provider`), so a machine needs only an SSH login:
+a Linux box, a WSL distribution with `sshd`, or a container running OpenSSH
+(`scripts/ssh-target.sh`).
+
+```bash
+ralphus-fleet add wslbox --user me --remote-root /home/me/ralphus-fleet --label gpu
+export RALPHUS_FLEET_TOKEN=$(openssl rand -hex 32)   # the daemon gets the same value
+ralphus-fleet serve                                  # reads ./ralphus-fleet.toml
+ralphus-fleet list                                   # machines and their allocations
+```
+
+```toml
+# ralphus-fleet.toml
+listen          = "127.0.0.1:7900"
+token_env       = "RALPHUS_FLEET_TOKEN"
+ssh_config_file = "C:/ralphus/ssh_config"     # optional `ssh -F`
+
+[[machine]]
+host        = "wslbox"                        # hostname, user@host, or ssh-config alias
+user        = "me"
+os          = "linux"                         # optional: asked of the machine when omitted
+labels      = ["gpu"]
+remote_root = "/home/me/ralphus-fleet"
+max_allocations = 4                           # optional
+[machine.runner]
+mode      = "upload"                          # or "installed" (default)
+artifacts = { "linux-x86_64" = "C:/ralphus/linux/ralphus-runner" }
+[machine.agents]
+codex = "/home/me/.local/bin/codex"           # agent executables on that machine
+```
+
+- A request is granted on the least-loaded machine that matches its
+  `os`/`arch`/`labels` and has room; a refusal lists why each machine did not
+  fit.
+- A repeated request for the same scope gets the same allocation.
+- Allocations are kept in `<config>.state.json` (or `state_file`) so they
+  survive a restart; their tokens are not, so after a restart the daemon's
+  first call gets `401` and it renews.
+- The service fills in the machine's `remote_root`, runner policy and agent
+  paths; the daemon needs no `[machine.targets]` entry for it.
+- `materialize` copies the selected files to the fleet host and returns them
+  in the reply, so the daemon may run elsewhere.
 
 ## Program providers keep working
 
