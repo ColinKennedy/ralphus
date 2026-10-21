@@ -132,7 +132,7 @@ with the title for those.
 
 | OS | Stills | Recording |
 |---|---|---|
-| Windows | PowerShell + .NET; one window via `PrintWindow` (need not be in front) | ffmpeg `gdigrab`, else stills encoded into a GIF |
+| Windows | PowerShell + .NET; one window via `PrintWindow` (need not be in front), cut to its visible frame, title bar included | ffmpeg `gdigrab` of the screen under the window's frame (title bar included; whatever covers the window is recorded too), else stills encoded into a GIF |
 | macOS | `screencapture` (screen only) | ffmpeg `avfoundation`, else stills |
 | Linux | `grim` (Wayland), ImageMagick `import` (X11; one window with `xdotool`), `gnome-screenshot` | ffmpeg `x11grab`, else stills |
 

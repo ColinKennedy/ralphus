@@ -58,10 +58,14 @@ fn require_file(out: &Path) -> Result<(), String> {
 
 // ---- stills ------------------------------------------------------------------
 
-/// The PowerShell that writes a PNG of `$env:RALPHUS_CAPTURE_PID`'s main
-/// window, or of the window titled `$env:RALPHUS_CAPTURE_TITLE`, or of the
-/// primary screen when neither is set, to `$env:RALPHUS_CAPTURE_OUT`.
-const WINDOWS_STILL: &str = r#"
+/// The PowerShell prologue every window capture shares: the Win32 calls,
+/// per-monitor DPI awareness (so every rectangle is in physical pixels, the
+/// unit `gdigrab` grabs in), `Get-RalphusFrame`, and `$h`, the handle of
+/// `$env:RALPHUS_CAPTURE_PID`'s main window or of the window titled
+/// `$env:RALPHUS_CAPTURE_TITLE` (zero when neither is set).
+macro_rules! windows_find_window {
+    () => {
+        r#"
 $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Drawing
 Add-Type -AssemblyName System.Windows.Forms
@@ -73,10 +77,26 @@ public static class RalphusCapture {
   [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, out RECT r);
   [DllImport("user32.dll")] public static extern bool PrintWindow(IntPtr h, IntPtr dc, uint flags);
   [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
+  [DllImport("user32.dll")] public static extern bool SetProcessDpiAwarenessContext(IntPtr c);
+  [DllImport("user32.dll")] public static extern int GetSystemMetrics(int i);
+  [DllImport("dwmapi.dll")] public static extern int DwmGetWindowAttribute(IntPtr h, int a, out RECT r, int size);
 }
 "@
-[RalphusCapture]::SetProcessDPIAware() | Out-Null
-$out = $env:RALPHUS_CAPTURE_OUT
+# -4: DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 (Windows 10 1703+).
+$aware = $false
+try { $aware = [RalphusCapture]::SetProcessDpiAwarenessContext([IntPtr]-4) } catch {}
+if (-not $aware) { [RalphusCapture]::SetProcessDPIAware() | Out-Null }
+# The window's whole rectangle and its visible frame (title bar included):
+# on Windows 10 the whole rectangle also holds invisible resize borders.
+function Get-RalphusFrame($h) {
+  $r = New-Object RalphusCapture+RECT
+  [RalphusCapture]::GetWindowRect($h, [ref]$r) | Out-Null
+  $f = New-Object RalphusCapture+RECT
+  # 9: DWMWA_EXTENDED_FRAME_BOUNDS.
+  if ([RalphusCapture]::DwmGetWindowAttribute($h, 9, [ref]$f, 16) -ne 0 -or $f.R -le $f.L) { $f = $r }
+  if ($f.R -le $f.L -or $f.B -le $f.T) { throw "the window has no area (minimized?)" }
+  return @($r, $f)
+}
 $h = [IntPtr]::Zero
 if ($env:RALPHUS_CAPTURE_PID) {
   $p = Get-Process -Id ([int]$env:RALPHUS_CAPTURE_PID)
@@ -92,26 +112,74 @@ if ($env:RALPHUS_CAPTURE_PID) {
   if (-not $p) { throw "no window is titled `"$t`"" }
   $h = $p.MainWindowHandle
 }
+"#
+    };
+}
+
+/// The PowerShell that writes a PNG of the window `windows_find_window!`
+/// found, frame and title bar included, or of the primary screen when no
+/// window was asked for, to `$env:RALPHUS_CAPTURE_OUT`.
+const WINDOWS_STILL: &str = concat!(
+    windows_find_window!(),
+    r#"
+$out = $env:RALPHUS_CAPTURE_OUT
 if ($h -ne [IntPtr]::Zero) {
-  $r = New-Object RalphusCapture+RECT
-  [RalphusCapture]::GetWindowRect($h, [ref]$r) | Out-Null
+  $r, $f = Get-RalphusFrame $h
   $w = $r.R - $r.L; $hgt = $r.B - $r.T
-  if ($w -le 0 -or $hgt -le 0) { throw "the window has no area (minimized?)" }
-  $bmp = New-Object System.Drawing.Bitmap $w, $hgt
-  $g = [System.Drawing.Graphics]::FromImage($bmp)
+  $full = New-Object System.Drawing.Bitmap $w, $hgt
+  $g = [System.Drawing.Graphics]::FromImage($full)
   $dc = $g.GetHdc()
   $ok = [RalphusCapture]::PrintWindow($h, $dc, 2)
   $g.ReleaseHdc($dc)
-  if (-not $ok) { $g.CopyFromScreen($r.L, $r.T, 0, 0, $bmp.Size) }
+  if (-not $ok) { $g.CopyFromScreen($r.L, $r.T, 0, 0, $full.Size) }
+  $g.Dispose()
+  $crop = New-Object System.Drawing.Rectangle ($f.L - $r.L), ($f.T - $r.T), ($f.R - $f.L), ($f.B - $f.T)
+  $bmp = $full.Clone($crop, $full.PixelFormat)
+  $full.Dispose()
 } else {
   $b = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
   $bmp = New-Object System.Drawing.Bitmap $b.Width, $b.Height
   $g = [System.Drawing.Graphics]::FromImage($bmp)
   $g.CopyFromScreen($b.Left, $b.Top, 0, 0, $bmp.Size)
+  $g.Dispose()
 }
 $bmp.Save($out, [System.Drawing.Imaging.ImageFormat]::Png)
-$g.Dispose(); $bmp.Dispose()
-"#;
+$bmp.Dispose()
+"#
+);
+
+/// The PowerShell that prints `left top width height` of the window
+/// `windows_find_window!` found: its visible frame, title bar included, cut to
+/// the virtual screen and rounded down to even sizes (x264 needs them).
+const WINDOWS_FRAME_RECT: &str = concat!(
+    windows_find_window!(),
+    r#"
+if ($h -eq [IntPtr]::Zero) { throw "no window was named" }
+$r, $f = Get-RalphusFrame $h
+# 76..79: SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN.
+$vl = [RalphusCapture]::GetSystemMetrics(76); $vt = [RalphusCapture]::GetSystemMetrics(77)
+$vr = $vl + [RalphusCapture]::GetSystemMetrics(78); $vb = $vt + [RalphusCapture]::GetSystemMetrics(79)
+$l = [Math]::Max($f.L, $vl); $t = [Math]::Max($f.T, $vt)
+$w = [Math]::Min($f.R, $vr) - $l; $hgt = [Math]::Min($f.B, $vb) - $t
+$w -= $w % 2; $hgt -= $hgt % 2
+if ($w -le 0 -or $hgt -le 0) { throw "the window is off the screen" }
+"$l $t $w $hgt"
+"#
+);
+
+/// A PowerShell process running `script` against `target`.
+fn windows_capture_command(script: &str, target: &Target) -> Command {
+    let mut cmd = Command::new("powershell");
+    cmd.args(["-NoProfile", "-NonInteractive", "-Command", script]);
+    cmd.env_remove("RALPHUS_CAPTURE_PID")
+        .env_remove("RALPHUS_CAPTURE_TITLE");
+    match target {
+        Target::Pid(pid) => cmd.env("RALPHUS_CAPTURE_PID", pid.to_string()),
+        Target::Window(title) => cmd.env("RALPHUS_CAPTURE_TITLE", title),
+        Target::Screen => &mut cmd,
+    };
+    cmd
+}
 
 /// Write a PNG of `target` to `out`.
 ///
@@ -121,16 +189,8 @@ $g.Dispose(); $bmp.Dispose()
 /// fails.
 pub fn screenshot(target: &Target, out: &Path) -> Result<(), String> {
     if cfg!(windows) {
-        let mut cmd = Command::new("powershell");
-        cmd.args(["-NoProfile", "-NonInteractive", "-Command", WINDOWS_STILL])
-            .env("RALPHUS_CAPTURE_OUT", out);
-        cmd.env_remove("RALPHUS_CAPTURE_PID")
-            .env_remove("RALPHUS_CAPTURE_TITLE");
-        match target {
-            Target::Pid(pid) => cmd.env("RALPHUS_CAPTURE_PID", pid.to_string()),
-            Target::Window(title) => cmd.env("RALPHUS_CAPTURE_TITLE", title),
-            Target::Screen => &mut cmd,
-        };
+        let mut cmd = windows_capture_command(WINDOWS_STILL, target);
+        cmd.env("RALPHUS_CAPTURE_OUT", out);
         run(cmd, "PowerShell screen capture")?;
     } else if cfg!(target_os = "macos") {
         if !matches!(target, Target::Screen) {
@@ -281,21 +341,24 @@ fn ffmpeg_input(target: &Target) -> Result<Option<Vec<String>>, String> {
     if cfg!(windows) {
         return Ok(Some(match target {
             Target::Screen => v(&["-f", "gdigrab", "-i", "desktop"]),
-            Target::Pid(pid) => {
-                let title = windows_window_title(*pid)?;
+            // `gdigrab -i title=...` grabs only the client area; grabbing the
+            // desktop under the window's frame keeps the title bar, as the
+            // still does. Whatever covers the window is recorded too.
+            Target::Pid(_) | Target::Window(_) => {
+                let (left, top, width, height) = windows_frame_rect(target)?;
                 vec![
                     "-f".into(),
                     "gdigrab".into(),
+                    "-offset_x".into(),
+                    left.to_string(),
+                    "-offset_y".into(),
+                    top.to_string(),
+                    "-video_size".into(),
+                    format!("{width}x{height}"),
                     "-i".into(),
-                    format!("title={title}"),
+                    "desktop".into(),
                 ]
             }
-            Target::Window(title) => vec![
-                "-f".into(),
-                "gdigrab".into(),
-                "-i".into(),
-                format!("title={title}"),
-            ],
         }));
     }
     if cfg!(target_os = "macos") {
@@ -312,23 +375,34 @@ fn ffmpeg_input(target: &Target) -> Result<Option<Vec<String>>, String> {
     })
 }
 
-fn windows_window_title(pid: u32) -> Result<String, String> {
-    let out = Command::new("powershell")
-        .args([
-            "-NoProfile",
-            "-NonInteractive",
-            "-Command",
-            "(Get-Process -Id ([int]$env:RALPHUS_CAPTURE_PID)).MainWindowTitle",
-        ])
-        .env("RALPHUS_CAPTURE_PID", pid.to_string())
+/// The on-screen rectangle (`left, top, width, height`, physical pixels) of
+/// the window `target` names, frame and title bar included.
+fn windows_frame_rect(target: &Target) -> Result<(i32, i32, u32, u32), String> {
+    let out = windows_capture_command(WINDOWS_FRAME_RECT, target)
         .output()
         .map_err(|e| format!("could not run PowerShell: {e}"))?;
-    let title = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    if title.is_empty() {
-        Err(format!("process {pid} has no titled main window"))
-    } else {
-        Ok(title)
+    if !out.status.success() {
+        return Err(format!(
+            "finding the window failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
     }
+    parse_frame_rect(&String::from_utf8_lossy(&out.stdout))
+}
+
+/// `left top width height` as printed by [`WINDOWS_FRAME_RECT`].
+fn parse_frame_rect(text: &str) -> Result<(i32, i32, u32, u32), String> {
+    let bad = || format!("unexpected window rectangle {:?}", text.trim());
+    let fields: Vec<&str> = text.split_whitespace().collect();
+    let [left, top, width, height] = fields[..] else {
+        return Err(bad());
+    };
+    Ok((
+        left.parse().map_err(|_| bad())?,
+        top.parse().map_err(|_| bad())?,
+        width.parse().map_err(|_| bad())?,
+        height.parse().map_err(|_| bad())?,
+    ))
 }
 
 fn record_with_ffmpeg(
@@ -358,7 +432,7 @@ fn record_with_ffmpeg(
         RecordFormat::Gif => cmd.args([
             "-vf",
             &format!(
-                "fps={fps},scale='min(960,iw)':-2:flags=lanczos,split[a][b];[a]palettegen=max_colors=128[p];[b][p]paletteuse"
+                "fps={fps},scale='min(960,iw)':-2:flags=lanczos,split[a][b];[a]palettegen=max_colors=128[p];[b][p]paletteuse=dither=none"
             ),
             "-loop",
             "0",
@@ -642,6 +716,9 @@ mod tests {
         }
         let gif = dir.join("window.gif");
         let recorded = record_stills(&Target::Pid(child.id()), 1, 2, &gif);
+        let ffmpeg_gif = dir.join("window-ffmpeg.gif");
+        let ffmpeg_recorded =
+            on_path("ffmpeg").then(|| record(&Target::Pid(child.id()), 1, 5, &ffmpeg_gif));
         let by_title = dir.join("by-title.png");
         let titled = screenshot(
             &Target::Window("ralphus capture probe".to_string()),
@@ -666,7 +743,40 @@ mod tests {
             frame.height
         );
         assert!(std::fs::read(&gif).unwrap().starts_with(b"GIF89a"));
+        // The form is 320x200 including its frame: the still keeps the title
+        // bar but not the invisible resize borders.
+        assert!(
+            frame.height > 180 && frame.width > 300 && frame.width <= 320,
+            "{}x{}",
+            frame.width,
+            frame.height
+        );
+        if let Some(recorded) = ffmpeg_recorded {
+            recorded.unwrap();
+            let bytes = std::fs::read(&ffmpeg_gif).unwrap();
+            let decoder = gif::DecodeOptions::new().read_info(&bytes[..]).unwrap();
+            // The recording is framed like the still (rounded down to even).
+            assert_eq!(
+                (u32::from(decoder.width()), u32::from(decoder.height())),
+                (frame.width & !1, frame.height & !1)
+            );
+        }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_window_rectangle_is_four_numbers() {
+        assert_eq!(
+            parse_frame_rect("-8 120 640 480\r\n"),
+            Ok((-8, 120, 640, 480))
+        );
+        assert!(parse_frame_rect("").is_err());
+        assert!(parse_frame_rect("1 2 3").is_err());
+        assert!(parse_frame_rect("1 2 3 4 5").is_err());
+        assert!(
+            parse_frame_rect("1 2 -3 4").is_err(),
+            "a size is never negative"
+        );
     }
 
     #[test]

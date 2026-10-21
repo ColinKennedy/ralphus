@@ -410,8 +410,10 @@ fn attempt(
         (ExhibitKind::Gif, MediaType::Gif | MediaType::Video | MediaType::OtherVideo) => {
             for (width, fps) in [(960, 12), (720, 10), (480, 8)] {
                 let out = out_stem.with_extension("gif");
+                // No dithering: it speckles the flat backgrounds of app
+                // windows, which most exhibits are, and makes the file bigger.
                 let filter = format!(
-                    "fps={fps},scale='min({width},iw)':-2:flags=lanczos,split[a][b];[a]palettegen=max_colors=128[p];[b][p]paletteuse"
+                    "fps={fps},scale='min({width},iw)':-2:flags=lanczos,split[a][b];[a]palettegen=max_colors=128[p];[b][p]paletteuse=dither=none"
                 );
                 ffmpeg.run(&[
                     "-t".into(),
@@ -717,6 +719,24 @@ pub(crate) mod tests {
             }
             other => panic!("{other:?}"),
         }
+    }
+
+    #[test]
+    fn a_shrunk_gif_is_encoded_without_dithering() {
+        let dir = TestDir::new();
+        let gif = file(dir.path(), "a.gif", MAX_IMAGE_BYTES + 1);
+        let ff = fake(true, 1000);
+        let out = prepare(&gif, &dir.path().join("o"), &PREF, 15, 100, &ff);
+        assert!(matches!(
+            out,
+            Prepared::File {
+                kind: ExhibitKind::Gif,
+                ..
+            }
+        ));
+        let calls = ff.calls.borrow();
+        let filter = &calls[0][calls[0].iter().position(|a| a == "-vf").unwrap() + 1];
+        assert!(filter.ends_with("paletteuse=dither=none"), "{filter}");
     }
 
     #[test]
