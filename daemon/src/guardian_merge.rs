@@ -16623,7 +16623,9 @@ pub(crate) fn recompute_preliminary_summary(store: &crate::store_lock::StoreHand
         let mut prev_task = base_branch.clone();
         for c in candidates.iter().filter(|c| &c.project == proj) {
             let task_ws = c.cwd.as_ref().map(|cwd| {
-                Workspace::on(Path::new(cwd), c.machine.as_deref()).with_store(Arc::clone(store))
+                Workspace::on(Path::new(cwd), c.machine.as_deref())
+                    .with_store(Arc::clone(store))
+                    .for_review(id)
             });
             // A disabled branch is not in the review, so it contributes no
             // section -- but the producing worktrees are stacked on disk

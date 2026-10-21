@@ -3105,20 +3105,13 @@ pub(crate) fn provision_review_repository(
         .ok()
         .and_then(|g| g.squad_id);
     req.env = provision_env(store, &project, owner_squad.as_deref());
-    let spec = crate::runner::RunnerSpec::for_command_proof(
-        "review-merge",
-        "review-merge",
-        machine,
-        ".",
-        "",
-        "claude",
-        None,
-    );
+    let spec = crate::workspace::machine_call_spec(Some(guardian_id), "review-anchor", machine);
     let workspace = provider
         .provision(&req, &spec)
         .map_err(|e| format!("{who}: {e}"))?;
     let common = crate::workspace::Workspace::on(workspace.as_str(), Some(machine))
         .with_store(std::sync::Arc::clone(store))
+        .for_review(guardian_id)
         .git(&["rev-parse", "--path-format=absolute", "--git-common-dir"])
         .map_err(|e| format!("{who}: could not find the repository behind {workspace}: {e}"))?;
     let repository = Path::new(common.trim())
@@ -3130,7 +3123,8 @@ pub(crate) fn provision_review_repository(
     // refuses to fetch into a checked-out branch, so the review's base could
     // never advance to its upstream. Nobody works in this checkout: detach it.
     let repo_ws = crate::workspace::Workspace::on(repository.as_str(), Some(machine))
-        .with_store(std::sync::Arc::clone(store));
+        .with_store(std::sync::Arc::clone(store))
+        .for_review(guardian_id);
     if repo_ws.git(&["symbolic-ref", "-q", "HEAD"]).is_ok() {
         repo_ws
             .git(&["checkout", "--quiet", "--detach"])

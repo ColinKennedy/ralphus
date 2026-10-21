@@ -59,6 +59,27 @@ pub struct Workspace {
     /// network git commands get a forge credential. `None` otherwise, and
     /// the machine's own git credentials are used.
     forge_credentials: Option<Arc<ForgeCredentials>>,
+    /// The review this workspace belongs to, when it does: its machine
+    /// calls are logged and recorded under that review (see
+    /// [`machine_call_spec`]). `None` for a workspace no review owns.
+    guardian_id: Option<String>,
+}
+
+/// The [`crate::runner::RunnerSpec`] a machine call that belongs to no cell
+/// is made with -- a review's remote git, check gate or provisioning. Only
+/// its identity is read: the provider's log lines and Cartographer rows name
+/// the call by its `squad_id`/`task`/`cell_id`. A review-owned call carries
+/// the review as `guardian-<id>`, the squad id every review-owned runner
+/// spec uses and the review's Cartographer filter matches; anything else
+/// is labelled `workspace`.
+#[must_use]
+pub(crate) fn machine_call_spec(
+    guardian_id: Option<&str>,
+    task: &str,
+    machine: &str,
+) -> crate::runner::RunnerSpec {
+    let owner = guardian_id.map_or_else(|| "workspace".to_string(), |id| format!("guardian-{id}"));
+    crate::runner::RunnerSpec::for_command_proof(&owner, task, machine, ".", "", "claude", None)
 }
 
 /// Where a remote workspace's network git commands (`push`, `fetch`, ...)
@@ -360,6 +381,7 @@ impl Workspace {
             store: None,
             path_map: None,
             forge_credentials: None,
+            guardian_id: None,
         }
     }
 
@@ -381,6 +403,7 @@ impl Workspace {
             store: None,
             path_map: None,
             forge_credentials: None,
+            guardian_id: None,
         }
     }
 
@@ -471,7 +494,9 @@ impl Workspace {
             },
             None => machine,
         };
-        let mut workspace = Self::on(root, machine.as_deref()).with_store(Arc::clone(store));
+        let mut workspace = Self::on(root, machine.as_deref())
+            .with_store(Arc::clone(store))
+            .for_review(guardian_id);
         if let Some(machine) = workspace.machine.clone() {
             workspace.path_map = machine_repository_for(
                 guardian_id,
@@ -504,6 +529,14 @@ impl Workspace {
                 .map(Arc::new);
         }
         workspace
+    }
+
+    /// Mark this workspace as review `guardian_id`'s, so its machine calls
+    /// are logged under that review rather than as unowned workspace calls.
+    #[must_use]
+    pub fn for_review(mut self, guardian_id: &str) -> Self {
+        self.guardian_id = Some(guardian_id.to_string());
+        self
     }
 
     /// Attach the store handle a remote workspace needs to resolve its
@@ -551,6 +584,7 @@ impl Workspace {
             path_map: self.path_map.clone(),
             local_root,
             forge_credentials: self.forge_credentials.clone(),
+            guardian_id: self.guardian_id.clone(),
         }
     }
 
@@ -968,18 +1002,19 @@ impl Workspace {
                 format!("machine \"{machine}\" resolved to the local host unexpectedly")
             })?
         };
-        // These operations belong to no cell; the spec exists only to
-        // satisfy the invocation shape.
-        let spec = crate::runner::RunnerSpec::for_command_proof(
-            "review-merge",
-            "review-merge",
-            machine,
-            ".",
-            "",
-            "claude",
-            None,
-        );
-        f(&provider, &spec)
+        f(&provider, &self.machine_call_spec(machine))
+    }
+
+    /// The spec this workspace's machine calls are made with: these
+    /// operations belong to no cell, so it carries only their owner (see
+    /// [`machine_call_spec`]).
+    fn machine_call_spec(&self, machine: &str) -> crate::runner::RunnerSpec {
+        let task = if self.guardian_id.is_some() {
+            "review-merge"
+        } else {
+            "workspace"
+        };
+        machine_call_spec(self.guardian_id.as_deref(), task, machine)
     }
 
     /// Retire the worktree at `path` in this workspace (RAL-386).
@@ -1881,11 +1916,32 @@ echo {json}
 
         assert_eq!(ws.machine(), Some("ib:A"));
         assert_eq!(ws.root_string(), "/m/root/repo/.git/.ralphus");
+        // Its machine calls are logged under the review, not a placeholder.
+        let spec = ws.join("w/x").machine_call_spec("ib:A");
+        assert_eq!(spec.squad_id, format!("guardian-{id}"));
+        assert_eq!(spec.cell_id, "ib:A");
         // A provider clone has its base branch checked out, which git refuses
         // to fetch into; provisioning detaches it so the base can advance.
         let requests = std::fs::read_to_string(dir.join("requests.log")).unwrap();
         assert!(requests.contains("\"--detach\""), "{requests}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn machine_calls_are_logged_under_the_owning_review() {
+        let review =
+            Workspace::on("/remote/repo", Some("ib:A")).for_review("guardian-000000000007");
+        let spec = review.at("/remote/other").machine_call_spec("ib:A");
+        assert_eq!(spec.squad_id, "guardian-guardian-000000000007");
+        assert_eq!(spec.task, "review-merge");
+
+        let anchor = machine_call_spec(Some("guardian-000000000007"), "review-anchor", "ib:A");
+        assert_eq!(anchor.squad_id, "guardian-guardian-000000000007");
+        assert_eq!(anchor.task, "review-anchor");
+
+        let unowned = Workspace::on("/remote/repo", Some("ib:A")).machine_call_spec("ib:A");
+        assert_eq!(unowned.squad_id, "workspace");
+        assert_ne!(unowned.task, "review-merge");
     }
 
     /// A fake provider that answers every verb with `json` and appends each
