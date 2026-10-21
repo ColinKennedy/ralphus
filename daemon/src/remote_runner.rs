@@ -485,6 +485,24 @@ fn machine_api_agent() -> &'static ureq::Agent {
     &AGENT
 }
 
+/// How long a Machine API call keeps retrying a provider that is not
+/// answering (see [`ProviderRunner::invoke_http`]).
+#[cfg(not(test))]
+const MACHINE_API_RETRY_WINDOW: Duration = Duration::from_secs(60);
+#[cfg(test)]
+const MACHINE_API_RETRY_WINDOW: Duration = Duration::from_secs(5);
+
+/// Machine API operations that may be repeated without effect beyond the
+/// first: reads, and a cancel.
+const IDEMPOTENT_VERBS: [&str; 6] = [
+    VERB_STATUS,
+    VERB_STREAM,
+    VERB_PING,
+    VERB_CAPABILITIES,
+    VERB_READ_FILE,
+    VERB_CANCEL,
+];
+
 /// The JSON body for a Machine API call: the v1 stdin payload (an object, or
 /// nothing), with the v1 `--handle`/`--since` flags as fields.
 fn machine_api_body(payload: &str, extra: &[String]) -> Result<serde_json::Value, String> {
@@ -921,9 +939,40 @@ impl ProviderRunner {
         };
         // A token the provider no longer accepts (it restarted, say) is
         // renewed and the call made once more.
-        let reply = match send(&token(false)?) {
-            Err(e) if matches!(*e, ureq::Error::Status(401, _)) => send(&token(true)?),
-            other => other,
+        let attempt = || match send(&token(false)?) {
+            Err(e) if matches!(*e, ureq::Error::Status(401, _)) => Ok(send(&token(true)?)),
+            other => Ok::<_, String>(other),
+        };
+        // A provider that is restarting drops connections for a few seconds.
+        // Ride that out for a call that is safe to repeat, or one whose
+        // connection was refused outright (so it never arrived); anything
+        // else may already have run, and fails now.
+        let deadline = Instant::now() + MACHINE_API_RETRY_WINDOW;
+        let mut backoff = Duration::from_millis(250);
+        let reply = loop {
+            let reply = attempt()?;
+            let retry = match &reply {
+                Err(e) => match e.as_ref() {
+                    ureq::Error::Transport(t) => {
+                        IDEMPOTENT_VERBS.contains(&verb)
+                            || t.kind() == ureq::ErrorKind::ConnectionFailed
+                    }
+                    ureq::Error::Status(..) => false,
+                },
+                Ok(_) => false,
+            };
+            if !retry || Instant::now() + backoff > deadline {
+                break reply;
+            }
+            // ralphus[ignore-rlog-pair]: this low-level helper has no Store; its caller records the outcome
+            crate::rlog!(
+                INFO,
+                "ralphus [remote] provider service {} unreachable for {verb}; retrying in {}ms",
+                self.scheme,
+                backoff.as_millis()
+            );
+            std::thread::sleep(backoff);
+            backoff = (backoff * 2).min(Duration::from_secs(5));
         };
         let (status, reply) = match reply.map_err(|e| *e) {
             Ok(resp) => (resp.status(), resp),
@@ -4093,6 +4142,42 @@ else:
         let err = provider.ping(&spec(Some("fleet"))).expect_err("v1 reply");
 
         assert!(err.contains("contract version 1"), "{err}");
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn a_restarting_machine_api_is_waited_for() {
+        // The provider is down when the call is made and back a moment later
+        // (a ralphus-fleet restart): the call succeeds instead of failing
+        // the cell.
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let server = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(1200));
+            let server = tiny_http::Server::http(format!("127.0.0.1:{port}")).unwrap();
+            let req = server
+                .recv_timeout(Duration::from_secs(10))
+                .unwrap()
+                .unwrap();
+            let _ = req.respond(tiny_http::Response::from_string(
+                r#"{"ok":true,"protocol_version":2,"detail":"back"}"#,
+            ));
+        });
+        let provider = ProviderRunner::over_http(
+            "fleet",
+            "alloc-1",
+            format!("http://127.0.0.1:{port}/v1/m/alloc-1"),
+            "t",
+        );
+
+        let detail = provider
+            .ping(&spec(Some("fleet")))
+            .expect("waited for the provider");
+
+        assert_eq!(detail.as_deref(), Some("back"));
         server.join().unwrap();
     }
 
