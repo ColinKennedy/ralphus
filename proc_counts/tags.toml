@@ -188,3 +188,8 @@ tag = "ssh-windows"
 [[test]]
 id = "ralphus-outpost::loopback an_outpost_serves_an_allocations_machine_api_over_its_outbound_connection"
 tag = "outpost-loopback"
+
+# Live-ref retirement on a remote machine (orphan sweep through the provider).
+[[test]]
+id = "ralphus-daemon live_runs::tests::orphan_live_refs_on_a_remote_machine_are_removed"
+tag = "live-ref-retirement-remote"

@@ -19253,6 +19253,7 @@ fn delete_guardian_and_defer_cleanup(daemon: &Daemon, id: &str) -> Result<(), St
             }
             for (root, ws) in &workspaces {
                 crate::guardian_merge::purge_worktrees_in(&store_handle, ws, root, &id);
+                crate::live_runs::delete_review_live_refs(&store_handle, ws, &id);
             }
         }
         // RAL-154: same scoping as `kill_guardian_cell_sessions` — a
