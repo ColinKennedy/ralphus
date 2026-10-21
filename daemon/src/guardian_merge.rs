@@ -10385,56 +10385,169 @@ fn filter_by_idle_cadence(candidates: &[(String, String)]) -> Vec<String> {
         .collect()
 }
 
-/// Last full maintenance pass per review on a remote machine -- see
-/// `scheduler::REMOTE_REVIEW_MAINT_INTERVAL`. Pruned on every pass to the
-/// remote reviews that still exist.
-static REMOTE_MAINT_LAST: LazyLock<Mutex<HashMap<String, std::time::Instant>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
-
-/// Whether `machine` names somewhere other than the daemon's own host.
-fn is_remote_machine(machine: Option<&str>) -> bool {
-    machine.map(str::trim).is_some_and(|m| {
-        !m.is_empty() && !m.eq_ignore_ascii_case(ralphus_core::schema::LOCAL_MACHINE)
-    })
+/// What a review's maintenance pass does this tick ([`remote_pass_gate`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RemotePass {
+    /// The review is on the daemon's host: the full pass, as always.
+    Local,
+    /// The review is on a remote machine and nothing the pass reads moved
+    /// since its last complete pass: only the forge-side checks run.
+    Idle,
+    /// The review is on a remote machine and something moved, or could not
+    /// be checked: the full pass.
+    Full,
 }
 
-/// Ids of every review declared on a remote machine.
-fn remote_guardian_ids(store: &crate::store_lock::StoreHandle) -> HashSet<String> {
-    store
+/// What [`remote_pass_gate`] knows of a remote review's last full pass.
+#[derive(Debug, Clone, Copy)]
+struct RemotePassMemo {
+    /// The fingerprint taken just before that pass started.
+    fingerprint: u64,
+    /// Whether that pass ran to its end (an early return on a failure
+    /// leaves this `false`, so the next tick retries in full).
+    completed: bool,
+    /// When that pass started.
+    full_at: std::time::Instant,
+}
+
+/// [`RemotePassMemo`] per remote review id. Pruned on every
+/// [`review_maintenance`] tick to the reviews still maintained.
+static REMOTE_PASS_MEMO: LazyLock<Mutex<HashMap<String, RemotePassMemo>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Decide whether review `id`'s maintenance pass has anything to do on its
+/// machine this tick.
+///
+/// Every git command of a review on a remote machine is its own provider
+/// call, and an idle review's pass is about a dozen of them, so a remote
+/// review is first probed in one call per repository
+/// ([`Workspace::probe_refs`]): local refs, worktrees, config and the remote
+/// tips of everything the repository fetches. Its fingerprint -- that probe
+/// plus the review's and its PRs' rows -- is compared with the one taken
+/// before the last full pass; when they match, that pass completed, no merge
+/// check is waiting on the forge, and the last full pass is younger than
+/// [`crate::scheduler::REVIEW_IDLE_MAINT_INTERVAL`], the pass is
+/// [`RemotePass::Idle`]. Anything else -- including a probe that failed --
+/// is [`RemotePass::Full`].
+///
+/// Along the way the probe stands in for two fetches: each open PR's remote
+/// head is recorded as its current head ([`crate::pr::note_probed_pr_heads`]),
+/// so the pass fetches a PR branch exactly when it moved, and a base the
+/// probe shows behind its remote is fetched now rather than at the next
+/// base-branch poll.
+fn remote_pass_gate(store: &crate::store_lock::StoreHandle, id: &str) -> RemotePass {
+    let Ok(guardian) = store.with_read_snapshot(|conn| Store::get_guardian_conn(conn, id)) else {
+        return RemotePass::Local;
+    };
+    if Workspace::for_guardian(store, id, Path::new(&guardian.git_root))
+        .machine()
+        .is_none()
+    {
+        return RemotePass::Local;
+    }
+    let mut roots: Vec<&str> = vec![guardian.git_root.as_str()];
+    for project in &guardian.projects {
+        if !roots.contains(&project.as_str()) {
+            roots.push(project);
+        }
+    }
+    let prs = store
+        .lock()
+        .list_pull_requests_for_guardian(id)
+        .unwrap_or_default();
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    let mut probes = Vec::new();
+    for root in roots {
+        let ws = Workspace::for_guardian(store, id, Path::new(root));
+        let (Some(key), Some(Ok(probe))) = (ws.probe_key(), ws.probe_refs()) else {
+            // A failed probe forgets what its repository fetches; the full
+            // pass fetches every PR branch again so the next probe covers
+            // them (the base is fetched again by the base-branch poll).
+            crate::pr::forget_pr_fetches(&prs);
+            REMOTE_PASS_MEMO.lock().expect("poisoned").remove(id);
+            return RemotePass::Full;
+        };
+        std::hash::Hash::hash(&probe.digest, &mut hasher);
+        probes.push((key, probe));
+    }
+    std::hash::Hash::hash(&format!("{guardian:?}"), &mut hasher);
+    std::hash::Hash::hash(&format!("{prs:?}"), &mut hasher);
+    let fingerprint = std::hash::Hasher::finish(&hasher);
+
+    for (_, probe) in &probes {
+        crate::pr::note_probed_pr_heads(&prs, probe);
+    }
+    let mut fetched_base = false;
+    let infos: Vec<GuardianBaseFetchInfo> = store
         .with_read_snapshot(Store::list_guardian_base_fetch_rows_conn)
         .unwrap_or_default()
         .into_iter()
-        .filter(|g| is_remote_machine(g.machine.as_deref()))
-        .map(|g| g.guardian_id)
-        .collect()
+        .filter(|info| info.guardian_id == id)
+        .collect();
+    for target in collect_base_fetch_targets(&infos) {
+        let key = base_fetch_key(&target);
+        let Some(spec) = BASE_FETCH_SPECS
+            .lock()
+            .expect("poisoned")
+            .get(&key)
+            .cloned()
+        else {
+            continue;
+        };
+        let behind = probes
+            .iter()
+            .find(|(probed, _)| *probed == spec.probe_key)
+            .is_some_and(|(_, probe)| !spec.in_sync(probe));
+        if !behind {
+            continue;
+        }
+        if let Some(_claim) = InFlightClaim::acquire(&BASE_FETCH_IN_FLIGHT, &key) {
+            // The fetch that last succeeded for this target, made again
+            // directly; the full resolution only when that fails.
+            let ws = Workspace::for_guardian(store, id, &target.root);
+            let branch = spec.src.strip_prefix("refs/heads/").unwrap_or(&spec.src);
+            let repeated = fetch_base_ref(&ws, &key, &spec.remote, branch, &spec.dst);
+            if let Err(e) = repeated.or_else(|_| fetch_base_branch(store, &target, Some(id))) {
+                crate::rlog!(
+                    DEBUG,
+                    "ralphus [guardian] review {id} base-branch fetch after a probe failed: {e}"
+                );
+            }
+            fetched_base = true;
+        }
+    }
+
+    let unanswered = MERGE_CHECK_UNANSWERED
+        .lock()
+        .expect("poisoned")
+        .contains_key(id);
+    let mut memo = REMOTE_PASS_MEMO.lock().expect("poisoned");
+    let idle = !fetched_base
+        && !unanswered
+        && memo.get(id).is_some_and(|last| {
+            last.completed
+                && last.fingerprint == fingerprint
+                && last.full_at.elapsed() < crate::scheduler::REVIEW_IDLE_MAINT_INTERVAL
+        });
+    if idle {
+        return RemotePass::Idle;
+    }
+    memo.insert(
+        id.to_string(),
+        RemotePassMemo {
+            fingerprint,
+            completed: false,
+            full_at: std::time::Instant::now(),
+        },
+    );
+    RemotePass::Full
 }
 
-/// Keeps a review on a remote machine (one in `remote`) to at most one full
-/// maintenance pass per [`crate::scheduler::REMOTE_REVIEW_MAINT_INTERVAL`];
-/// every other id passes through.
-fn filter_by_remote_cadence(ids: Vec<String>, remote: &HashSet<String>) -> Vec<String> {
-    let now = std::time::Instant::now();
-    let mut last = REMOTE_MAINT_LAST.lock().expect("poisoned");
-    last.retain(|id, _| remote.contains(id));
-    ids.into_iter()
-        .filter(|id| {
-            if !remote.contains(id) {
-                return true;
-            }
-            match last.get(id) {
-                Some(prev)
-                    if now.duration_since(*prev)
-                        < crate::scheduler::REMOTE_REVIEW_MAINT_INTERVAL =>
-                {
-                    false
-                }
-                _ => {
-                    last.insert(id.clone(), now);
-                    true
-                }
-            }
-        })
-        .collect()
+/// Record that review `id`'s full maintenance pass ran to its end.
+fn mark_remote_pass_completed(id: &str) {
+    if let Some(memo) = REMOTE_PASS_MEMO.lock().expect("poisoned").get_mut(id) {
+        memo.completed = true;
+    }
 }
 
 /// Releases a claim from one of the in-flight sets on drop, so an early
@@ -10664,14 +10777,17 @@ fn review_maintenance_staggered(
     }
 
     let candidates: Vec<(String, String)> = full_maintenance_candidates(all_status_pairs);
+    {
+        let live: HashSet<&str> = candidates.iter().map(|(id, _)| id.as_str()).collect();
+        REMOTE_PASS_MEMO
+            .lock()
+            .expect("poisoned")
+            .retain(|id, _| live.contains(id.as_str()));
+    }
     spawn_merge_checks(store, &candidates);
     // Store lock released. Now apply the per-status cadence: an idle-tier
-    // guardian is visited at most once per `REVIEW_IDLE_MAINT_INTERVAL`, and
-    // one on a remote machine at most once per `REMOTE_REVIEW_MAINT_INTERVAL`.
-    let ids = filter_by_remote_cadence(
-        filter_by_idle_cadence(&candidates),
-        &remote_guardian_ids(store),
-    );
+    // guardian is visited at most once per `REVIEW_IDLE_MAINT_INTERVAL`.
+    let ids = filter_by_idle_cadence(&candidates);
     for id in ids {
         let Some(claim) = InFlightClaim::acquire(&MAINTAINING, &id) else {
             crate::rlog!(
@@ -10702,6 +10818,19 @@ fn review_maintenance_staggered(
                 cancellations: cancellations.clone(),
                 key: format!("guardian:{id}"),
             };
+            // A review on a remote machine whose probe shows nothing moved
+            // since its last complete pass keeps only the forge-side checks,
+            // which make no call to its machine.
+            if remote_pass_gate(&store, &id) == RemotePass::Idle {
+                crate::pr::reconcile_ci_deferral_if_stack_changed(&store, &id);
+                crate::ci_watch::poll_open_pr_ci_status(
+                    &store,
+                    runner.as_ref(),
+                    &cancellations,
+                    &id,
+                );
+                return;
+            }
             // RAL-300: ask "have the linked PRs merged?" before deciding to
             // rebase at all -- but only when the base branch has moved since
             // the forge last answered, which is the only time a rebuild can
@@ -10805,6 +10934,7 @@ fn review_maintenance_staggered(
                         ),
                         serde_json::json!({"deferred": "stack_partially_merged"}),
                     );
+                mark_remote_pass_completed(&id);
                 return;
             }
             // A base-shift rebuild (full re-derive) subsumes any manual push via
@@ -10830,6 +10960,7 @@ fn review_maintenance_staggered(
             // same sweep that already reconciles every settled review.
             crate::pr::verify_and_repair_stack_ancestry(&store, runner.as_ref(), &id);
             repair_missing_final_summary(&store, &id);
+            mark_remote_pass_completed(&id);
         });
     }
 }
@@ -15985,21 +16116,20 @@ fn fetch_base_branch(
         }
     };
     let base = &target.base_branch;
+    let key = base_fetch_key(target);
 
     if let Some((remote, branch)) = base.split_once('/') {
         if ws.git(&["remote", "get-url", remote]).is_ok() {
-            let refspec = format!("+refs/heads/{branch}:refs/remotes/{remote}/{branch}");
-            return ws
-                .git(&["fetch", "--no-write-fetch-head", remote, &refspec])
-                .map(|_| ());
+            let tracking = format!("refs/remotes/{remote}/{branch}");
+            return fetch_base_ref(&ws, &key, remote, branch, &tracking);
         }
     }
     if let Ok(upstream) = ws.git(&["rev-parse", "--abbrev-ref", &format!("{base}@{{upstream}}")]) {
         let upstream = upstream.trim();
         if let Some((remote, branch)) = upstream.split_once('/') {
-            let refspec = format!("+refs/heads/{branch}:refs/heads/{base}");
-            return match ws.git(&["fetch", "--no-write-fetch-head", remote, &refspec]) {
-                Ok(_) => Ok(()),
+            let local = format!("refs/heads/{base}");
+            return match fetch_base_ref(&ws, &key, remote, branch, &local) {
+                Ok(()) => Ok(()),
                 // Git 2.40+ says "refusing to fetch into branch ... checked
                 // out at"; older git "Refusing to fetch into current branch".
                 Err(e) if e.to_ascii_lowercase().contains("refusing to fetch into") => {
@@ -16007,22 +16137,98 @@ fn fetch_base_branch(
                     // which nobody works in: detach it so the base can move.
                     if ws.machine().is_some()
                         && ws.git(&["checkout", "--quiet", "--detach"]).is_ok()
-                        && ws
-                            .git(&["fetch", "--no-write-fetch-head", remote, &refspec])
-                            .is_ok()
+                        && fetch_base_ref(&ws, &key, remote, branch, &local).is_ok()
                     {
                         return Ok(());
                     }
                     warn_checked_out_base_once(store, target);
-                    let tracking = format!("+refs/heads/{branch}:refs/remotes/{remote}/{branch}");
-                    ws.git(&["fetch", "--no-write-fetch-head", remote, &tracking])
-                        .map(|_| ())
+                    let tracking = format!("refs/remotes/{remote}/{branch}");
+                    fetch_base_ref(&ws, &key, remote, branch, &tracking)
                 }
                 Err(e) => Err(e),
             };
         }
     }
     Ok(())
+}
+
+/// The key a base-branch fetch target is claimed and remembered under.
+fn base_fetch_key(target: &BaseFetchTarget) -> String {
+    format!(
+        "{}|{}|{}",
+        target.root.display(),
+        target.machine.as_deref().unwrap_or(""),
+        target.base_branch
+    )
+}
+
+/// The fetch a base-branch target on a remote machine last made, so a probe
+/// of that repository ([`crate::remote_probe`]) can tell whether making it
+/// again would change anything.
+#[derive(Debug, Clone)]
+struct BaseFetchSpec {
+    /// The repository's `(machine, path)` ([`Workspace::probe_key`]).
+    probe_key: (String, String),
+    /// The remote fetched from.
+    remote: String,
+    /// The full ref fetched there.
+    src: String,
+    /// The local ref fetched into.
+    dst: String,
+}
+
+impl BaseFetchSpec {
+    /// Whether `probe` shows the local ref already at the remote's tip.
+    fn in_sync(&self, probe: &crate::remote_probe::RefProbe) -> bool {
+        matches!(
+            (probe.remote_tip(&self.remote, &self.src), probe.local_tip(&self.dst)),
+            (Some(remote), Some(local)) if remote == local
+        )
+    }
+}
+
+/// [`BaseFetchSpec`] per [`base_fetch_key`].
+static BASE_FETCH_SPECS: LazyLock<Mutex<HashMap<String, BaseFetchSpec>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Fetch `branch` of `remote` into `dst` (a full ref) in `ws`, remembering
+/// the fetch under `key` when `ws` is on a remote machine.
+fn fetch_base_ref(
+    ws: &Workspace,
+    key: &str,
+    remote: &str,
+    branch: &str,
+    dst: &str,
+) -> std::result::Result<(), String> {
+    let src = format!("refs/heads/{branch}");
+    ws.git(&[
+        "fetch",
+        "--no-write-fetch-head",
+        remote,
+        &format!("+{src}:{dst}"),
+    ])?;
+    if let Some(probe_key) = ws.probe_key() {
+        BASE_FETCH_SPECS.lock().expect("poisoned").insert(
+            key.to_string(),
+            BaseFetchSpec {
+                probe_key,
+                remote: remote.to_string(),
+                src,
+                dst: dst.to_string(),
+            },
+        );
+    }
+    Ok(())
+}
+
+/// Whether the latest probe of `key`'s repository, taken within `max_age`,
+/// shows its base already at the tip its last fetch would bring.
+fn base_in_sync_on_recent_probe(key: &str, max_age: std::time::Duration) -> bool {
+    let Some(spec) = BASE_FETCH_SPECS.lock().expect("poisoned").get(key).cloned() else {
+        return false;
+    };
+    crate::remote_probe::recent(&spec.probe_key.0, &spec.probe_key.1, max_age)
+        .is_some_and(|probe| spec.in_sync(&probe))
 }
 
 /// Base-fetch targets (`"{root}|{base_branch}"`) already warned about by
@@ -16070,12 +16276,6 @@ fn warn_checked_out_base_once(store: &crate::store_lock::StoreHandle, target: &B
 static BASE_FETCH_IN_FLIGHT: LazyLock<Mutex<HashSet<String>>> =
     LazyLock::new(|| Mutex::new(HashSet::new()));
 
-/// When each base-branch fetch target on a remote machine was last fetched,
-/// keyed like [`BASE_FETCH_IN_FLIGHT`], for
-/// `scheduler::REMOTE_BASE_BRANCH_FRESHNESS_POLL_INTERVAL`.
-static REMOTE_BASE_FETCH_LAST: LazyLock<Mutex<HashMap<String, std::time::Instant>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
-
 /// RAL-<new>: dual-root fork-side upstream refreshes currently running,
 /// keyed by guardian id -- mirrors [`BASE_FETCH_IN_FLIGHT`] so one slow
 /// fork push never piles up a new thread for the same review every poll
@@ -16099,41 +16299,26 @@ pub fn poll_base_branch_freshness_once(store: &crate::store_lock::StoreHandle) {
     let inputs: Vec<GuardianBaseFetchInfo> = store
         .with_read_snapshot(Store::list_guardian_base_fetch_rows_conn)
         .unwrap_or_default();
-    let now = std::time::Instant::now();
-    let targets = collect_base_fetch_targets(&inputs);
-    REMOTE_BASE_FETCH_LAST
-        .lock()
-        .expect("poisoned")
-        .retain(|_, at| {
-            now.duration_since(*at) < crate::scheduler::REMOTE_BASE_BRANCH_FRESHNESS_POLL_INTERVAL
-        });
-    for target in targets {
-        let key = format!(
-            "{}|{}|{}",
-            target.root.display(),
-            target.machine.as_deref().unwrap_or(""),
-            target.base_branch
-        );
-        // A remote target is fetched on the machine, one provider call per
-        // git command, so it is refreshed on the longer remote cadence.
-        if is_remote_machine(target.machine.as_deref())
-            && REMOTE_BASE_FETCH_LAST
-                .lock()
-                .expect("poisoned")
-                .contains_key(&key)
+    for target in collect_base_fetch_targets(&inputs) {
+        let key = base_fetch_key(&target);
+        let guardian_ids = guardian_ids_for_target(&inputs, &target);
+        // A base on a remote machine that a maintenance probe has just seen
+        // at its remote's tip has nothing to fetch; the probe of the next
+        // maintenance pass fetches it itself once that tip moves.
+        if base_in_sync_on_recent_probe(&key, crate::scheduler::BASE_BRANCH_FRESHNESS_POLL_INTERVAL)
         {
+            for guardian_id in &guardian_ids {
+                let _ = store.lock().record_poll_outcome(
+                    crate::poller_health::PollerKind::BaseBranchFetch,
+                    guardian_id,
+                    &crate::poller_health::PollOutcome::Healthy,
+                );
+            }
             continue;
         }
         let Some(claim) = InFlightClaim::acquire(&BASE_FETCH_IN_FLIGHT, &key) else {
             continue;
         };
-        if is_remote_machine(target.machine.as_deref()) {
-            REMOTE_BASE_FETCH_LAST
-                .lock()
-                .expect("poisoned")
-                .insert(key.clone(), now);
-        }
-        let guardian_ids = guardian_ids_for_target(&inputs, &target);
         let store = Arc::clone(store);
         std::thread::spawn(move || {
             let _claim = claim;
@@ -22645,6 +22830,76 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A fake machine provider like [`recording_provider`], except that a
+    /// ref probe ([`crate::remote_probe`]) is answered with whatever reply
+    /// the test last wrote to the returned probe file, and an `--abbrev-ref`
+    /// lookup with `origin/main`. Returns the script, the request log and
+    /// the probe file.
+    fn probing_provider(dir: &Path) -> (PathBuf, PathBuf, PathBuf) {
+        std::fs::create_dir_all(dir).unwrap();
+        let log = dir.join("requests.log");
+        let probe = dir.join("probe.json");
+        let reply = |stdout: &str| {
+            serde_json::json!({"ok": true, "protocol_version": 1, "exit_code": 0, "stdout": stdout})
+                .to_string()
+        };
+        let sha = reply(PROBE_SHA);
+        let upstream = reply("origin/main");
+        let (script, body) = if cfg!(windows) {
+            (
+                dir.join("p.cmd"),
+                format!(
+                    "@echo off\r\nsetlocal EnableDelayedExpansion\r\nset \"req=\"\r\nset /p req=\r\n\
+                     >>\"{log}\" echo(!req!\r\n\
+                     if not \"!req:ralphus-probe-section=!\"==\"!req!\" (\r\n  type \"{probe}\"\r\n  exit /b 0\r\n)\r\n\
+                     if not \"!req:--abbrev-ref=!\"==\"!req!\" (\r\n  echo {upstream}\r\n  exit /b 0\r\n)\r\n\
+                     echo {sha}\r\n",
+                    log = log.display(),
+                    probe = probe.display(),
+                ),
+            )
+        } else {
+            (
+                dir.join("p.sh"),
+                format!(
+                    "#!/bin/sh\nreq=$(cat)\nprintf '%s\\n' \"$req\" >> '{log}'\n\
+                     case \"$req\" in\n  *ralphus-probe-section*) cat '{probe}' ;;\n  \
+                     *--abbrev-ref*) echo '{upstream}' ;;\n  *) echo '{sha}' ;;\nesac\n",
+                    log = log.display(),
+                    probe = probe.display(),
+                ),
+            )
+        };
+        std::fs::write(&script, body).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        (script, log, probe)
+    }
+
+    /// The sha [`probing_provider`] answers every other command with.
+    const PROBE_SHA: &str = "0123456789012345678901234567890123456789";
+
+    /// Write the reply [`probing_provider`] gives a probe: every local ref at
+    /// [`PROBE_SHA`], and `main` and `feature/a-review` on `origin` at the
+    /// given shas.
+    fn write_probe_reply(path: &Path, remote_main: &str, remote_branch: &str) {
+        let section = "ralphus-probe-section";
+        let stdout = format!(
+            "{PROBE_SHA} commit\trefs/heads/main\n\
+             {PROBE_SHA} commit\trefs/heads/feature/a-review\n\
+             {PROBE_SHA} commit\trefs/ralphus/sync/pr-000000000001\n\
+             {section}\nworktree /srv/repo\n{section}\nremote.origin.url=https://example.invalid/w.git\n\
+             {section}\n{remote_main}\trefs/heads/main\n{remote_branch}\trefs/heads/feature/a-review\n"
+        );
+        let reply = serde_json::json!({
+            "ok": true, "protocol_version": 1, "exit_code": 0, "stdout": stdout,
+        });
+        std::fs::write(path, format!("{reply}\n")).unwrap();
+    }
+
     /// Wait until no maintenance, merge-check or base-fetch work is in flight.
     fn wait_for_background_review_work() {
         std::thread::sleep(std::time::Duration::from_millis(300));
@@ -22662,18 +22917,20 @@ mod tests {
     }
 
     #[test]
-    fn an_idle_remote_review_is_maintained_on_the_remote_cadence() {
-        // An idle in_review review on a remote machine: every scheduler tick
-        // (maintenance every 5 s, base freshness every 10 s) re-ran its whole
-        // pass there -- about a dozen git commands, each its own provider
-        // call. Within `REMOTE_REVIEW_MAINT_INTERVAL` only the first tick may
-        // reach the machine.
-        let dir = ralphus_test_support::scratch(format!("remote-cadence-{}", std::process::id()));
-        let (script, log) = recording_provider(&dir);
+    fn an_idle_remote_review_costs_one_probe_per_tick_and_still_notices_moves() {
+        // An idle in_review review on a remote machine re-ran its whole
+        // maintenance pass there on every 5 s tick -- about a dozen git
+        // commands, each its own provider call -- plus a base-branch fetch
+        // every 10 s. At the same cadence it must now cost at most one call
+        // (the probe) per tick, while a base move or a push to its PR branch
+        // is still acted on within one tick.
+        let dir = ralphus_test_support::scratch(format!("remote-probe-{}", std::process::id()));
+        let (script, log, probe) = probing_provider(&dir);
+        write_probe_reply(&probe, PROBE_SHA, PROBE_SHA);
         let store = Arc::new(crate::store_lock::StoreMutex::new(
             Store::open_in_memory().unwrap(),
         ));
-        let id = {
+        {
             let guard = store.lock();
             guard
                 .register_machine_provider(
@@ -22712,51 +22969,89 @@ mod tests {
             guard
                 .set_guardian_status(&id, GuardianStatus::InReview, None)
                 .unwrap();
-            id
-        };
+        }
         let runners: RunnerFactory = Arc::new(|_: &crate::store_lock::StoreHandle| {
             Arc::new(CapturingRunner::new()) as Arc<dyn Runner>
         });
         let sem = Arc::new(Semaphore::new(4));
         let cancellations = crate::cancel::Cancellations::new();
-        let tick = || {
+        let mut seen = 0;
+        // One scheduler tick at the original cadence: the maintenance pass
+        // and the base-branch poll. Returns the provider calls it made.
+        let mut tick = || {
             review_maintenance_with(&store, &sem, &cancellations, &runners);
             poll_base_branch_freshness_once(&store);
             wait_for_background_review_work();
-            recorded_run_calls(&log)
+            let text = std::fs::read_to_string(&log).unwrap_or_default();
+            let calls: Vec<String> = text
+                .lines()
+                .filter(|l| l.contains("\"program\""))
+                .map(str::to_string)
+                .collect();
+            let new = calls[seen..].to_vec();
+            seen = calls.len();
+            new
         };
 
+        // The first passes do the work, and learn what the review fetches.
         let first = tick();
         assert!(
-            first > 0,
-            "the first tick maintains the review on its machine"
+            first.len() > 1,
+            "the first tick maintains the review on its machine: {first:#?}"
         );
-        let mut after = first;
-        for _ in 0..4 {
-            after = tick();
+        for _ in 0..3 {
+            tick();
         }
-        assert_eq!(
-            after - first,
-            0,
-            "ticks within the remote cadence must not reach the machine again ({first} \
-             commands on the first tick, {} more after it) for review {id}",
-            after - first
+        for n in 0..5 {
+            let calls = tick();
+            assert!(
+                calls.len() <= 1 && calls.iter().all(|c| c.contains("ralphus-probe-section")),
+                "idle tick {n} must cost at most the probe, made {}: {calls:#?}",
+                calls.len()
+            );
+        }
+
+        // The base branch moves on the remote: fetched within one tick.
+        write_probe_reply(
+            &probe,
+            "4444444444444444444444444444444444444444",
+            PROBE_SHA,
+        );
+        let calls = tick();
+        assert!(
+            calls
+                .iter()
+                .any(|c| c.contains("\"fetch\"") && c.contains("refs/heads/main")),
+            "a moved base is fetched on the next tick: {calls:#?}"
+        );
+
+        // A reviewer pushes to the PR branch: pulled within one tick.
+        write_probe_reply(
+            &probe,
+            PROBE_SHA,
+            "5555555555555555555555555555555555555555",
+        );
+        let calls = tick();
+        assert!(
+            calls
+                .iter()
+                .any(|c| c.contains("\"fetch\"")
+                    && c.contains("feature/a-review:refs/ralphus/sync/")),
+            "a push to the PR branch is fetched on the next tick: {calls:#?}"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn the_remote_cadence_throttles_only_remote_reviews() {
-        let remote: HashSet<String> = ["remote-r".to_string()].into_iter().collect();
-        let ids = || vec!["local-r".to_string(), "remote-r".to_string()];
-        assert_eq!(filter_by_remote_cadence(ids(), &remote), ids());
-        assert_eq!(
-            filter_by_remote_cadence(ids(), &remote),
-            vec!["local-r".to_string()]
-        );
-        assert!(is_remote_machine(Some("ib:A")));
-        assert!(!is_remote_machine(Some("local")));
-        assert!(!is_remote_machine(None));
+    fn a_review_on_the_daemons_host_is_never_probed() {
+        let store = Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
+        let id = store
+            .lock()
+            .create_guardian("r", "main", "/srv/repo")
+            .unwrap();
+        assert_eq!(remote_pass_gate(&store, &id), RemotePass::Local);
     }
 
     #[test]

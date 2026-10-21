@@ -1121,6 +1121,9 @@ impl Workspace {
     fn git_remote(&self, machine: &str, args: &[&str]) -> Result<String, String> {
         let mut env = non_interactive_git_env();
         let verb = args.first().copied().unwrap_or_default();
+        if verb == "fetch" {
+            crate::remote_probe::note_fetch(machine, &remote_path_string(&self.root), args);
+        }
         if let (true, Some(credentials), Some(store)) = (
             NETWORK_GIT_COMMANDS.contains(&verb),
             &self.forge_credentials,
@@ -1134,6 +1137,58 @@ impl Workspace {
             }
         }
         self.run_git_remote(args, env)
+    }
+
+    /// Probe this workspace's repository on its machine in one provider call
+    /// ([`crate::remote_probe`]): its local refs, worktrees and config, and
+    /// the remote tips of every ref it has been fetching. `None` for a
+    /// workspace on the daemon's host. A successful probe is also kept as the
+    /// repository's latest ([`crate::remote_probe::recent`]).
+    ///
+    /// # Errors
+    /// The probe could not be written for this repository's remotes, the
+    /// call failed, or its output was not a probe's.
+    pub fn probe_refs(&self) -> Option<Result<crate::remote_probe::RefProbe, String>> {
+        let machine = self.machine.as_deref()?;
+        let root = remote_path_string(&self.root);
+        let sources = crate::remote_probe::sources(machine, &root);
+        let Some(command) = crate::remote_probe::command(&sources) else {
+            return Some(Err(
+                "a fetched remote or ref name cannot be written into a probe".to_string(),
+            ));
+        };
+        let mut env = non_interactive_git_env();
+        if let (Some(credentials), Some(store)) = (&self.forge_credentials, &self.store) {
+            env.extend(credentials.env(store));
+        }
+        let req = crate::remote_runner::RunRequest {
+            cwd: root.clone(),
+            program: String::new(),
+            args: vec![command],
+            env,
+            shell: None,
+        };
+        let result = self
+            .with_provider(|p, spec| p.run_vcs(&req, spec))
+            .and_then(|out| {
+                crate::remote_probe::parse(&out, &sources)
+                    .ok_or_else(|| "the probe's output was not in its expected form".to_string())
+            });
+        match &result {
+            Ok(probe) => crate::remote_probe::remember(machine, &root, probe),
+            Err(_) => crate::remote_probe::forget_sources(machine, &root),
+        }
+        Some(result)
+    }
+
+    /// Where this workspace's repository is on its machine, as the key
+    /// [`crate::remote_probe`] keeps it under: `(machine, path)`. `None` on
+    /// the daemon's host.
+    #[must_use]
+    pub fn probe_key(&self) -> Option<(String, String)> {
+        self.machine
+            .as_deref()
+            .map(|machine| (machine.to_string(), remote_path_string(&self.root)))
     }
 
     fn run_git_remote(

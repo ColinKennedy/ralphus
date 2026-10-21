@@ -131,12 +131,19 @@ An **allocation** is one machine handed to ralphus for a scope of work:
   as it resumes on the next call.
 - **Background calls from an open review.** Each git command of a review on a
   machine is its own Machine API call. An open review's background
-  maintenance (base-shift and manual-push checks, PR branch sync) and its
-  base-branch fetch run every **30 s** for a review on a machine, against 5 s
-  and 10 s for a review on the daemon's host, so a review merely waiting on a
-  human costs its machine roughly two dozen short commands a minute. A
-  collecting review's change summary is recomputed at most every 30 s while
-  its page is being polled.
+  maintenance (base-shift and manual-push checks, PR branch sync) runs every
+  5 s and its base branch is kept fresh every 10 s, the same cadence as a
+  review on the daemon's host. On a machine, each maintenance tick starts
+  with one probe `run` call -- an authored command line that lists the
+  repository's local refs, worktrees and config and `git ls-remote`s every
+  branch it fetches (base and PR branches) -- and runs the rest of the pass
+  only when that probe, or the review's own state, changed since its last
+  complete pass, or that pass is 5 minutes old. An idle review therefore
+  costs its machine one call per tick; a base move or a push to a PR branch
+  is fetched and acted on at the next tick. The probe needs only `&&`,
+  `echo` and plain arguments, which the provider's default shell (`sh`, or
+  `cmd` on Windows) reads the same way. A collecting review's change summary
+  is recomputed at most every 30 s while its page is being polled.
 
 ## Provider service API
 

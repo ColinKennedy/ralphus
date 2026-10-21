@@ -5786,6 +5786,27 @@ fn note_forge_head(pr_id: &str, head: &str) {
     );
 }
 
+/// Record each of `prs`' branch tips that `probe` read on the PR remote as
+/// that PR's current head, the way a forge read is ([`note_forge_head`]): the
+/// next [`fetch_remote_pr_tip`] then fetches exactly when the branch moved.
+pub(crate) fn note_probed_pr_heads(prs: &[PullRequestView], probe: &crate::remote_probe::RefProbe) {
+    for pr in prs.iter().filter(|pr| pr.state == "open") {
+        if let Some(head) = probe.any_remote_tip(&pr.branch_alias) {
+            note_forge_head(&pr.id, head);
+        }
+    }
+}
+
+/// Make the next [`fetch_remote_pr_tip`] of each of `prs` really fetch, so
+/// the fetch is seen again by [`crate::remote_probe::note_fetch`] after a
+/// failed probe forgot what its repository fetches.
+pub(crate) fn forget_pr_fetches(prs: &[PullRequestView]) {
+    let mut fetches = last_pr_fetches().lock();
+    for pr in prs {
+        fetches.remove(&pr.id);
+    }
+}
+
 /// Whether [`fetch_remote_pr_tip`] can skip fetching: the forge reported a
 /// head within [`FORGE_HEAD_FRESH_FOR`], the sync ref already holds exactly
 /// that commit, that commit is also the one this daemon last pushed (when it
