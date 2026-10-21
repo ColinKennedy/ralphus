@@ -22171,6 +22171,34 @@ fn cors_preflight_headers(origin: &str) -> Vec<tiny_http::Header> {
     headers
 }
 
+/// Query parameters whose values authorize something on their own (the
+/// fork-credential `grant`, the event-stream `ticket`) and so never go into a
+/// log line.
+const SECRET_QUERY_KEYS: &[&str] = &["grant", "ticket", "token", "secret", "password"];
+
+/// `url` with the value of every [`SECRET_QUERY_KEYS`] parameter replaced by
+/// `<redacted>`, for request log lines that keep the query string.
+fn loggable_url(url: &str) -> std::borrow::Cow<'_, str> {
+    let Some((path, query)) = url.split_once('?') else {
+        return std::borrow::Cow::Borrowed(url);
+    };
+    let is_secret = |pair: &str| {
+        let key = pair.split_once('=').map_or(pair, |(key, _)| key);
+        SECRET_QUERY_KEYS.contains(&key)
+    };
+    if !query.split('&').any(is_secret) {
+        return std::borrow::Cow::Borrowed(url);
+    }
+    let query: Vec<String> = query
+        .split('&')
+        .map(|pair| match pair.split_once('=') {
+            Some((key, _)) if is_secret(pair) => format!("{key}=<redacted>"),
+            _ => pair.to_string(),
+        })
+        .collect();
+    std::borrow::Cow::Owned(format!("{path}?{}", query.join("&")))
+}
+
 /// Resolve the CORS decision for one incoming request against the effective
 /// (global + per-project `.ralphus.toml`) `[cors]` allow-list.
 ///
@@ -22621,7 +22649,8 @@ fn answer_request(daemon: &Daemon, pending: PendingRequest) {
         // ralphus[ignore-rlog-pair]: client disconnects are transport noise; the handler already recorded any state change
         crate::rlog!(
             DEBUG,
-            "ralphus [http] {method} {url} -> {status}: response not delivered ({e})"
+            "ralphus [http] {method} {} -> {status}: response not delivered ({e})",
+            loggable_url(&url)
         );
     }
     log_request_outcome(
@@ -22643,19 +22672,22 @@ fn answer_request(daemon: &Daemon, pending: PendingRequest) {
     if handler_ms >= SLOW_REQUEST_MS {
         crate::rlog!(
             WARNING,
-            "ralphus [http] {method} {url} -> {status} SLOW: handler {handler_ms}ms (queued {queued_ms}ms, lock_wait {lock_wait_ms}ms)"
+            "ralphus [http] {method} {} -> {status} SLOW: handler {handler_ms}ms (queued {queued_ms}ms, lock_wait {lock_wait_ms}ms)",
+            loggable_url(&url)
         );
     } else if method == "GET" {
         crate::rlog!(
             DEBUG,
-            "ralphus [http] {method} {url} -> {status} ({handler_ms}ms, queued {queued_ms}ms, lock_wait {lock_wait_ms}ms)"
+            "ralphus [http] {method} {} -> {status} ({handler_ms}ms, queued {queued_ms}ms, lock_wait {lock_wait_ms}ms)",
+            loggable_url(&url)
         );
     } else {
         // A mutating request is a user or client action, so it is kept at the
         // default log level; reads stay at DEBUG because the board polls them.
         crate::rlog!(
             INFO,
-            "ralphus [http] {method} {url} -> {status} ({handler_ms}ms, queued {queued_ms}ms, lock_wait {lock_wait_ms}ms)"
+            "ralphus [http] {method} {} -> {status} ({handler_ms}ms, queued {queued_ms}ms, lock_wait {lock_wait_ms}ms)",
+            loggable_url(&url)
         );
     }
 }
@@ -23246,7 +23278,8 @@ fn run_http_loop(
             // ralphus[ignore-rlog-pair]: this transport-only diagnostic has no event entity; handlers emit the structured request or state record
             crate::rlog!(
                 WARNING,
-                "ralphus [http] {method} {url} blocked: cross-origin request denied"
+                "ralphus [http] {method} {} blocked: cross-origin request denied",
+                loggable_url(&url)
             );
             let response = tiny_http::Response::from_string(
                 error(
@@ -23515,6 +23548,21 @@ mod tests {
 
     use super::*;
     use crate::mock_forge::MockForge;
+
+    #[test]
+    fn a_logged_url_never_carries_a_grant_or_ticket() {
+        let url = "/api/internal/fork-credential?worktree_id=w1&grant=not-a-real-grant";
+        assert_eq!(
+            loggable_url(url),
+            "/api/internal/fork-credential?worktree_id=w1&grant=<redacted>"
+        );
+        assert_eq!(
+            loggable_url("/api/events?ticket=t1"),
+            "/api/events?ticket=<redacted>"
+        );
+        assert_eq!(loggable_url("/api/squads?limit=5"), "/api/squads?limit=5");
+        assert_eq!(loggable_url("/api/squads"), "/api/squads");
+    }
 
     /// WS-D.5: the ETag helpers, which decide whether a board poll can be
     /// answered `304 Not Modified`.

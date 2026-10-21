@@ -34,6 +34,20 @@ impl std::fmt::Debug for Secret {
     }
 }
 
+/// Describes a malformed `KEY=VALUE` entry for an error message without
+/// repeating it: a value typed without its key (`--set sk-...`) is still a
+/// secret, and usage errors are logged.
+#[must_use]
+pub fn describe_malformed(entry: &str) -> String {
+    match entry.split_once('=') {
+        Some(_) => "an entry with an empty key".to_string(),
+        None => format!(
+            "an entry with no '=' ({} characters)",
+            entry.chars().count()
+        ),
+    }
+}
+
 /// Repeated `KEY=VALUE` flags whose values may be secrets, such as a review's
 /// build environment. `Debug` shows each key with its value redacted.
 #[derive(Clone, Default, PartialEq, Eq)]

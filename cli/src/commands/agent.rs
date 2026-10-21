@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
-use crate::args::GlobalOpts;
+use crate::args::{GlobalOpts, describe_malformed};
 use crate::commands::CommandError;
 use crate::flags::Scanner;
 
@@ -143,7 +143,10 @@ fn parse_env_pairs(raw: Vec<String>, kind: &str, flag: &str) -> Result<EnvPairs,
             Some((key, value)) if !key.is_empty() => {
                 Ok((key.to_string(), kind.to_string(), value.to_string()))
             }
-            _ => Err(format!("{flag} expects KEY=VALUE, got '{entry}'")),
+            _ => Err(format!(
+                "{flag} expects KEY=VALUE, got {}",
+                describe_malformed(&entry)
+            )),
         })
         .collect::<Result<Vec<_>, _>>()
         .map(EnvPairs)

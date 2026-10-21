@@ -1462,7 +1462,12 @@ pub fn parse_environment_flags(
             Some((k, v)) if !k.trim().is_empty() => {
                 result.insert(k.trim().to_string(), v.to_string());
             }
-            _ => return Err(format!("{flag_name} expects KEY=VALUE, got '{item}'")),
+            _ => {
+                return Err(format!(
+                    "{flag_name} expects KEY=VALUE, got {}",
+                    crate::args::describe_malformed(item)
+                ));
+            }
         }
     }
     Ok(result)

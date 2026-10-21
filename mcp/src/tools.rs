@@ -100,6 +100,19 @@ fn push_chip_values(
     Ok(())
 }
 
+/// The JSON type of `value`, for an error that must not repeat the value
+/// itself (it may be a misplaced secret, and errors are logged).
+fn json_kind(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "a boolean",
+        Value::Number(_) => "a number",
+        Value::String(_) => "a string",
+        Value::Array(_) => "an array",
+        Value::Object(_) => "an object",
+    }
+}
+
 fn value_to_token(value: &Value, chip: &Chip) -> Result<String, String> {
     let token = match value {
         Value::String(s) => s.clone(),
@@ -107,8 +120,9 @@ fn value_to_token(value: &Value, chip: &Chip) -> Result<String, String> {
         Value::Bool(b) => b.to_string(),
         other => {
             return Err(format!(
-                "'{}' must be a string or number, got {other}",
-                chip.property_name()
+                "'{}' must be a string or number, got {}",
+                chip.property_name(),
+                json_kind(other)
             ));
         }
     };
