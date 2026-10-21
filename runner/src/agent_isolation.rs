@@ -730,10 +730,10 @@ fn login_freshness(bytes: &[u8]) -> Option<i64> {
         match value {
             serde_json::Value::Object(map) => {
                 for (key, child) in map {
-                    if KEYS.contains(&key.as_str())
-                        && let Some(ms) = as_millis(child)
-                    {
-                        *best = Some(best.map_or(ms, |b| b.max(ms)));
+                    if KEYS.contains(&key.as_str()) {
+                        if let Some(ms) = as_millis(child) {
+                            *best = Some(best.map_or(ms, |b| b.max(ms)));
+                        }
                     }
                     walk(child, best);
                 }
