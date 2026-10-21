@@ -8234,13 +8234,10 @@ fn spawn_materialization(
 }
 
 /// Finish setting up every squad a previous daemon left `materializing`
-/// (STRESS-008). Each was stored with its submission, so the effective task
-/// file is rebuilt from it exactly as `submit` built it, and its background
-/// setup runs again: steps that already finished are idempotent or skipped
-/// (see [`run_submit_followup`]). A submission that no longer prepares
-/// cleanly -- a preset or agent profile removed meanwhile -- fails the squad
-/// with that reason. Call once at startup, after `recover_orphaned_squads`
-/// and before the scheduler runs. Returns the squad ids it resumed.
+/// (STRESS-008). Each was stored with its submission, so its background setup
+/// runs again through [`rerun_materialization`]. Call once at startup, after
+/// `recover_orphaned_squads` and before the scheduler runs. Returns the squad
+/// ids it resumed.
 pub(crate) fn resume_materializations(daemon: &Daemon) -> Vec<String> {
     let resumable = match daemon.lock().resumable_materializations() {
         Ok(rows) => rows,
@@ -8253,61 +8250,92 @@ pub(crate) fn resume_materializations(daemon: &Daemon) -> Vec<String> {
             return Vec::new();
         }
     };
-    let store_handle = daemon.store_handle();
     let mut resumed = Vec::new();
     for (squad_id, submission) in resumable {
-        let prepared = toml::from_str::<ralphus_core::schema::TaskFile>(&submission.toml)
-            .map_err(|e| format!("could not parse the stored task file: {e}"))
-            .and_then(|mut file| {
-                file.submitter = daemon
-                    .lock()
-                    .get_squad(&squad_id)
-                    .ok()
-                    .and_then(|s| s.submitter);
-                prepare_submitted_file(&daemon.store, &submission.toml, &mut file)
-                    .map(|_| file)
-                    .map_err(|reply| {
-                        format!(
-                            "the stored task file no longer passes submission checks: {}",
-                            reply.body
-                        )
-                    })
-            });
-        let file = match prepared {
-            Ok(file) => file,
-            Err(message) => {
-                fail_materialization(&store_handle, &squad_id, &message);
-                continue;
-            }
-        };
-        crate::rlog!(
-            WARNING,
-            "ralphus [recovery] squad {squad_id}: resuming setup interrupted by a restart"
-        );
-        let seeds = {
-            let guard = store_handle.lock();
-            crate::cartographer::Note::new("recovery")
-                .level(crate::logging::LogLevel::WARNING)
-                .squad(&squad_id)
-                .scope("materialize")
-                .emit(
-                    &guard,
-                    "squad setup interrupted by a restart: resuming",
-                    serde_json::json!({}),
-                );
-            seed_materializing_cells(&guard, &squad_id, &file)
-        };
-        spawn_materialization(
-            daemon.background(),
-            store_handle.clone(),
-            squad_id.clone(),
-            file,
+        if rerun_materialization(
+            daemon,
+            &squad_id,
             submission,
-            seeds,
-        );
-        resumed.push(squad_id);
+            "squad setup interrupted by a restart: resuming",
+        ) {
+            resumed.push(squad_id);
+        }
     }
     resumed
+}
+
+/// Run a `materializing` squad's background setup again from its stored
+/// submission: the effective task file is rebuilt from it exactly as `submit`
+/// built it, and steps that already finished are idempotent or skipped (see
+/// [`run_submit_followup`]). A submission that no longer prepares cleanly --
+/// a preset or agent profile removed meanwhile -- fails the squad with that
+/// reason. `reason` is logged and recorded on the squad's Cartographer
+/// timeline. Returns whether the setup was started.
+fn rerun_materialization(
+    daemon: &Daemon,
+    squad_id: &str,
+    submission: crate::store::SquadSubmission,
+    reason: &str,
+) -> bool {
+    let store_handle = daemon.store_handle();
+    let prepared = toml::from_str::<ralphus_core::schema::TaskFile>(&submission.toml)
+        .map_err(|e| format!("could not parse the stored task file: {e}"))
+        .and_then(|mut file| {
+            file.submitter = daemon
+                .lock()
+                .get_squad(squad_id)
+                .ok()
+                .and_then(|s| s.submitter);
+            prepare_submitted_file(&daemon.store, &submission.toml, &mut file)
+                .map(|_| file)
+                .map_err(|reply| {
+                    format!(
+                        "the stored task file no longer passes submission checks: {}",
+                        reply.body
+                    )
+                })
+        });
+    let file = match prepared {
+        Ok(file) => file,
+        Err(message) => {
+            fail_materialization(&store_handle, squad_id, &message);
+            return false;
+        }
+    };
+    crate::rlog!(WARNING, "ralphus [recovery] squad {squad_id}: {reason}");
+    let seeds = {
+        let guard = store_handle.lock();
+        crate::cartographer::Note::new("recovery")
+            .level(crate::logging::LogLevel::WARNING)
+            .squad(squad_id)
+            .scope("materialize")
+            .emit(&guard, reason, serde_json::json!({}));
+        seed_materializing_cells(&guard, squad_id, &file)
+    };
+    spawn_materialization(
+        daemon.background(),
+        store_handle,
+        squad_id.to_string(),
+        file,
+        submission,
+        seeds,
+    );
+    true
+}
+
+/// After a retry/restart reset squad `id` to `pending`, put it back in
+/// `materializing` when its setup never finished (it failed before review
+/// derivation and the rest of [`run_submit_followup`] completed), returning
+/// the stored submission to rerun that setup from. Call under the same store
+/// lock as the reset, so the scheduler cannot claim the squad in between.
+fn reenter_unfinished_materialization(
+    store: &Store,
+    id: &str,
+) -> Option<crate::store::SquadSubmission> {
+    let submission = store.unfinished_submission(id).ok().flatten()?;
+    store.set_squad_state(id, SquadState::Materializing).ok()?;
+    let _ = store.set_squad_error(id, None);
+    Some(submission)
 }
 
 /// Fixed count of [`run_submit_followup`]'s named materialization phases
@@ -10825,6 +10853,16 @@ fn retry_squad(daemon: &Daemon, id: &str) -> Reply {
     if let Err(e) = store.reset_squad_to_pending(id) {
         return store_error(&e);
     }
+    if let Some(submission) = reenter_unfinished_materialization(&store, id) {
+        drop(store);
+        rerun_materialization(
+            daemon,
+            id,
+            submission,
+            "squad retried before its setup finished: running setup again",
+        );
+        return get_squad(daemon, id);
+    }
     match store.get_squad(id) {
         Ok(squad) => json(200, &squad),
         Err(e) => store_error(&e),
@@ -11741,7 +11779,23 @@ fn restart_squad(daemon: &Daemon, id: &str, body: &str) -> Reply {
     // for the whole arm body below (Rust extends a match scrutinee's
     // temporaries to the arm), and `apply_restart_note` below takes its own
     // lock, which would then deadlock against the still-held one.
-    let restarted = daemon.lock().restart_squad(id);
+    let (restarted, unfinished) = {
+        let store = daemon.lock();
+        let restarted = store.restart_squad(id);
+        let unfinished = restarted
+            .as_ref()
+            .ok()
+            .and_then(|_| reenter_unfinished_materialization(&store, id));
+        (restarted, unfinished)
+    };
+    let rerunning_setup = unfinished.is_some_and(|submission| {
+        rerun_materialization(
+            daemon,
+            id,
+            submission,
+            "squad restarted before its setup finished: running setup again",
+        )
+    });
     match restarted {
         Ok(dirtied) => {
             // A whole-squad restart's target IS every cell in the squad — there
@@ -11755,7 +11809,11 @@ fn restart_squad(daemon: &Daemon, id: &str, body: &str) -> Reply {
             json(
                 200,
                 &RestartResponse {
-                    state: "pending",
+                    state: if rerunning_setup {
+                        "materializing"
+                    } else {
+                        "pending"
+                    },
                     dirtied,
                 },
             )
@@ -23876,6 +23934,66 @@ mod tests {
             error.contains("could not parse the stored task file"),
             "{error}"
         );
+    }
+
+    /// A [`deferred_review_submission`] whose setup failed before deriving
+    /// its review: the queued setup is dropped and the squad failed the way
+    /// the setup's own failure path fails it.
+    fn review_submission_whose_setup_failed(name: &str) -> (Daemon, String) {
+        let (d, id) = deferred_review_submission(name);
+        if let BackgroundWork::Deferred(queue) = d.background() {
+            queue.lock().unwrap().clear();
+        }
+        fail_materialization(&d.store_handle(), &id, "git fetch timed out");
+        assert_eq!(d.lock().squad_state(&id).unwrap(), SquadState::Failed);
+        assert!(d.lock().guardians_for_squad(&id).unwrap().is_empty());
+        (d, id)
+    }
+
+    #[test]
+    fn retrying_a_squad_whose_setup_failed_derives_its_reviews() {
+        let (d, id) = review_submission_whose_setup_failed("retry-failed-setup");
+
+        let r = route(&d, "POST", &format!("/api/squads/{id}/retry"), "");
+        assert_eq!(r.status, 200, "{}", r.body);
+        assert_eq!(
+            d.lock().squad_state(&id).unwrap(),
+            SquadState::Materializing,
+            "the scheduler must not claim the squad before its setup reruns"
+        );
+        d.background().drain();
+
+        assert_eq!(d.lock().squad_state(&id).unwrap(), SquadState::Pending);
+        assert_eq!(d.lock().guardians_for_squad(&id).unwrap().len(), 1);
+        assert_eq!(d.lock().get_squad(&id).unwrap().error, None);
+        assert_eq!(d.lock().unfinished_submission(&id).unwrap(), None);
+    }
+
+    #[test]
+    fn restarting_a_squad_whose_setup_failed_derives_its_reviews() {
+        let (d, id) = review_submission_whose_setup_failed("restart-failed-setup");
+
+        let r = route(&d, "POST", &format!("/api/squads/{id}/restart"), "");
+        assert_eq!(r.status, 200, "{}", r.body);
+        let v: serde_json::Value = serde_json::from_str(&r.body).unwrap();
+        assert_eq!(v["state"], "materializing", "{}", r.body);
+        d.background().drain();
+
+        assert_eq!(d.lock().squad_state(&id).unwrap(), SquadState::Pending);
+        assert_eq!(d.lock().guardians_for_squad(&id).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn retrying_a_squad_whose_setup_finished_does_not_rerun_it() {
+        let (d, id) = deferred_review_submission("retry-finished-setup");
+        d.background().drain();
+        d.lock().set_squad_state(&id, SquadState::Failed).unwrap();
+
+        let r = route(&d, "POST", &format!("/api/squads/{id}/retry"), "");
+        assert_eq!(r.status, 200, "{}", r.body);
+        assert_eq!(d.lock().squad_state(&id).unwrap(), SquadState::Pending);
+        d.background().drain();
+        assert_eq!(d.lock().guardians_for_squad(&id).unwrap().len(), 1);
     }
 
     #[test]

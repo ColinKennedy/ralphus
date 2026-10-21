@@ -875,7 +875,7 @@ pub struct WindowMeta {
 
 /// What a squad's background setup (`server::run_submit_followup`) needs to
 /// run again after a restart (STRESS-008), stored with the squad while it
-/// is `materializing`.
+/// is `materializing` and kept when that setup fails, for a retry.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SquadSubmission {
     /// The task file exactly as submitted.
@@ -5630,8 +5630,13 @@ impl Store {
         let entering_running = i64::from(state == SquadState::Running);
         let entering_terminal = i64::from(state.is_terminal());
         // The stored submission (STRESS-008) is needed only while the squad
-        // is still being set up.
-        let staying_materializing = i64::from(state == SquadState::Materializing);
+        // is still being set up, or after its setup failed: a retry or
+        // restart runs that setup again from it. Setup that finished already
+        // cleared it, so a later failure has none to keep.
+        let staying_materializing = i64::from(matches!(
+            state,
+            SquadState::Materializing | SquadState::Failed
+        ));
         let n = self.conn.execute(
             "UPDATE squads SET state=?, updated_at_ms=?,
                  started_at_ms = CASE WHEN ?=1 THEN COALESCE(started_at_ms, ?) ELSE started_at_ms END,
@@ -11192,6 +11197,27 @@ impl Store {
             ))
         })?;
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    /// The stored submission of squad `id` whose setup never finished: one
+    /// that failed during setup, or (once a retry has reset it) is about to
+    /// run it again. `None` once setup completed.
+    pub fn unfinished_submission(&self, id: &str) -> Result<Option<SquadSubmission>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT submission_toml, COALESCE(submission_hold, 0), submission_user
+                 FROM squads WHERE id=? AND submission_toml IS NOT NULL",
+                params![id],
+                |r| {
+                    Ok(SquadSubmission {
+                        toml: r.get(0)?,
+                        hold: r.get::<_, i64>(1)? != 0,
+                        acting_user: r.get(2)?,
+                    })
+                },
+            )
+            .optional()?)
     }
 
     /// Whether this squad's declared waypoints were already created by its
