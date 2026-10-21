@@ -41,7 +41,7 @@ pub fn dispatch(options: &ExerciseOptions) -> i32 {
         Ok(value) => value,
         Err(error) => return fail(&format!("could not submit review fixture: {error}")),
     };
-    let guardian = match wait_for_guardian(&exercise.client) {
+    let guardian = match wait_for_guardian(&exercise.client, exercise.remote()) {
         Ok(value) => value,
         Err(error) => return fail(&error),
     };
@@ -107,8 +107,10 @@ fn fixture_toml(project: &str, remote: bool) -> String {
     )
 }
 
-fn wait_for_guardian(client: &crate::client::DaemonClient) -> Result<Value, String> {
-    let deadline = Instant::now() + Duration::from_secs(15);
+/// The review the submission creates. Remotely it appears only once both
+/// worktrees are provisioned on the machine, which takes a few verbs each.
+fn wait_for_guardian(client: &crate::client::DaemonClient, remote: bool) -> Result<Value, String> {
+    let deadline = Instant::now() + Duration::from_secs(if remote { 120 } else { 15 });
     while Instant::now() < deadline {
         match client.guardian_list().map_err(|e| e.to_string())? {
             Value::Array(guardians) if !guardians.is_empty() => {

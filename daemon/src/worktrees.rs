@@ -787,10 +787,35 @@ fn forge_default_branch(store: &StoreHandle, project: &ProjectView) -> Result<St
             project.name
         )
     })?;
+    // A clone URL that is a path names a repository on a filesystem the
+    // daemon and the machine share; its `HEAD` file says which branch is the
+    // default, with no forge to ask.
+    if let Some(branch) = local_repository_default_branch(Path::new(url)) {
+        return Ok(branch);
+    }
     let cfg = crate::config::resolve_forge(Path::new(&project.path));
-    crate::forge::resolve_url_with_store(store, url, &cfg, None)?
+    crate::forge::resolve_url_with_store(store, url, &cfg, None)
+        .map_err(|e| {
+            format!(
+                "{e}; name the upstream branch explicitly (e.g. \"?upstream=main\") for a \
+                 project whose clone URL is not on a supported forge"
+            )
+        })?
         .default_branch()
         .ok_or_else(|| format!("the forge for {url} did not report a default branch"))
+}
+
+/// The branch `HEAD` points at in the repository at `path` (bare or not), if
+/// `path` is one.
+fn local_repository_default_branch(path: &Path) -> Option<String> {
+    let head = [path.join("HEAD"), path.join(".git").join("HEAD")]
+        .into_iter()
+        .find(|p| p.is_file())?;
+    std::fs::read_to_string(head)
+        .ok()?
+        .trim()
+        .strip_prefix("ref: refs/heads/")
+        .map(str::to_string)
 }
 
 /// Whether `machine` names a remote machine rather than the daemon's own host
@@ -4334,6 +4359,34 @@ mod tests {
         });
         assert!(exhausted.is_err());
         assert_eq!(calls, 4);
+    }
+
+    #[test]
+    fn a_path_clone_urls_default_branch_comes_from_its_head_file() {
+        // A remote cell on a machine that shares the daemon's filesystem (the
+        // loopback provider) may name an origin by path; there is no forge
+        // to ask, so its HEAD says which branch is the default.
+        let dir = tmp_dir("path-origin-head");
+        let bare = dir.join("origin.git");
+        std::fs::create_dir_all(&bare).unwrap();
+        std::fs::write(bare.join("HEAD"), "ref: refs/heads/trunk\n").unwrap();
+        let checkout = dir.join("checkout");
+        std::fs::create_dir_all(checkout.join(".git")).unwrap();
+        std::fs::write(checkout.join(".git").join("HEAD"), "ref: refs/heads/main\n").unwrap();
+
+        assert_eq!(
+            local_repository_default_branch(&bare).as_deref(),
+            Some("trunk")
+        );
+        assert_eq!(
+            local_repository_default_branch(&checkout).as_deref(),
+            Some("main")
+        );
+        assert_eq!(
+            local_repository_default_branch(Path::new("https://github.com/o/r")),
+            None
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn tmp_dir(tag: &str) -> PathBuf {
