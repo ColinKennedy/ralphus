@@ -71,6 +71,23 @@ pub const REVIEW_MAINT_INTERVAL: Duration = Duration::from_secs(5);
 /// source of idle daemon load.
 pub const REVIEW_IDLE_MAINT_INTERVAL: Duration = Duration::from_secs(300);
 
+/// How often the full maintenance pass runs for a review on a remote machine,
+/// in place of [`REVIEW_MAINT_INTERVAL`]. Every git command of that pass runs
+/// on the machine as its own provider call (an SSH session and a runner
+/// process for the built-in providers), and an idle review's pass is about a
+/// dozen of them -- base tips, the parent remote, each PR branch's sync fetch
+/// -- so at five seconds an idle remote review kept a machine busy with a
+/// command a second. Everything the pass notices (a base shift, a reviewer's
+/// push to a PR branch, a branch to republish) is picked up at most this much
+/// later; nothing is skipped. Work a person starts is not affected.
+pub const REMOTE_REVIEW_MAINT_INTERVAL: Duration = Duration::from_secs(30);
+
+/// [`BASE_BRANCH_FRESHNESS_POLL_INTERVAL`] for a base branch fetched on a
+/// remote machine: the same fetch, each one an `@{upstream}` lookup and a
+/// `git fetch` there. Matches [`REMOTE_REVIEW_MAINT_INTERVAL`], the pass that
+/// acts on what it fetches.
+pub const REMOTE_BASE_BRANCH_FRESHNESS_POLL_INTERVAL: Duration = Duration::from_secs(30);
+
 /// How often to sweep for guardians whose debounced final change-summary
 /// regen request (RAL-208) has gone quiet long enough to fire the LLM call.
 /// Finer-grained than [`REVIEW_MAINT_INTERVAL`] since it's checked against
