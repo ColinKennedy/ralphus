@@ -22702,6 +22702,11 @@ mod tests {
     #[test]
     fn a_staged_merge_builds_the_stack_when_the_lower_task_finishes_mid_merge() {
         let (base, repo, _fwt) = make_repo("out-of-order");
+        // Stacking B onto A's review branch rebases a real commit through
+        // `GitVcs::exec_raw`, which injects no identity, so the repo needs
+        // its own on a CI runner with no global gitconfig.
+        g(&repo, &["config", "user.name", "t"]);
+        g(&repo, &["config", "user.email", "t@t"]);
         let bwt = base.join("bwt");
         g(
             &repo,
