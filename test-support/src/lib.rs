@@ -161,12 +161,15 @@ pub fn scratch(leaf: impl AsRef<Path>) -> PathBuf {
     let leaf = leaf.as_ref();
     let root = scratch_root();
     let path = root.join(leaf);
-    if leaf.is_relative()
-        && let Some(first) = leaf.components().find_map(|c| match c {
+    let first = if leaf.is_relative() {
+        leaf.components().find_map(|c| match c {
             Component::Normal(n) => Some(n.to_owned()),
             _ => None,
         })
-    {
+    } else {
+        None
+    };
+    if let Some(first) = first {
         let owned = TestDir {
             path: root.join(first),
             children: Vec::new(),
@@ -214,11 +217,11 @@ fn clear_readonly(path: &Path) {
         perms.set_readonly(false);
         let _ = std::fs::set_permissions(path, perms);
     }
-    if md.is_dir()
-        && let Ok(entries) = std::fs::read_dir(path)
-    {
-        for entry in entries.flatten() {
-            clear_readonly(&entry.path());
+    if md.is_dir() {
+        if let Ok(entries) = std::fs::read_dir(path) {
+            for entry in entries.flatten() {
+                clear_readonly(&entry.path());
+            }
         }
     }
 }
