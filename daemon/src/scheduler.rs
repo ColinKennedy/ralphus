@@ -729,6 +729,9 @@ pub fn run_loop(
                 &store,
                 &crate::live_runs::default_runner_factory(),
             );
+            // Provider-service machines: re-attach after a start, release
+            // what nothing needs, idle hints.
+            crate::allocations::maintain_in_background(&store);
             last_maintenance = std::time::Instant::now();
         }
         if last_base_branch_freshness_poll.elapsed() >= BASE_BRANCH_FRESHNESS_POLL_INTERVAL {
@@ -1556,6 +1559,31 @@ fn execute_squad_inner(
             guard.cancelled_tasks(squad_id).unwrap_or_default(),
         )
     };
+    // Ask provider services for the machines this squad's cells request,
+    // before anything (worktrees, upstream prefetch) reads a cell's machine.
+    // Network calls; no lock is held across them.
+    if let Err(reason) = crate::allocations::bind_squad(store, squad_id, &mut cells) {
+        {
+            let guard = store.lock();
+            let _ = guard.enqueue_error_mailbox_message(
+                crate::mailbox::MailboxPriority::High,
+                &format!("Squad {squad_id} could not get a machine: {reason}"),
+                &crate::mailbox::Remediation::ManualInterventionRequired {
+                    guidance: format!(
+                        "make one of the providers above able to serve the request (or change \
+                         the task's `machine`), then run `ralphus squad restart {squad_id}`"
+                    ),
+                },
+                Some(squad_id),
+                None,
+                None,
+                None,
+                Some("machine_allocation"),
+            );
+        }
+        finalize_all_failed(store, squad_id, &tasks, &reason);
+        return;
+    }
     // RAL-<pending>: fetch every registered-remote project's bare `?upstream=`
     // BEFORE taking the store lock that guards placeholder resolution below --
     // `git fetch` is a real network call (bounded to `GIT_TIMEOUT`, but that's

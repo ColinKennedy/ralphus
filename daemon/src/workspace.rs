@@ -315,6 +315,30 @@ impl Workspace {
                 }
             }
         };
+        // A review that asked a provider service for a machine is granted one
+        // the first time it is used (and again after that allocation is
+        // released, e.g. by a reopened review).
+        let needs_grant = machine
+            .as_deref()
+            .and_then(|m| crate::allocations::request_needing_grant(store, m));
+        let machine = match needs_grant {
+            Some(request) => match crate::allocations::bind_review(store, guardian_id, &request) {
+                Ok(granted) => Some(granted),
+                Err(e) => {
+                    crate::cartographer::Note::new("workspace")
+                        .level(crate::logging::LogLevel::WARNING)
+                        .scope("guardian")
+                        .guardian(guardian_id)
+                        .emit(
+                            &store.lock(),
+                            format!("review {guardian_id} has no machine yet: {e}"),
+                            serde_json::json!({ "error": e }),
+                        );
+                    machine
+                }
+            },
+            None => machine,
+        };
         let mut workspace = Self::on(root, machine.as_deref()).with_store(Arc::clone(store));
         if let Some(machine) = workspace.machine.clone() {
             workspace.path_map = machine_repository_for(

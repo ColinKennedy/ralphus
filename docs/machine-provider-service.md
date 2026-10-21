@@ -107,9 +107,17 @@ An **allocation** is one machine handed to ralphus for a scope of work:
   which keeps the existing affinity rule ("the same `machine` value means the
   same machine": a task's cells together, a review on its cells' machine). A
   walk runs once per scope and its result is pinned.
-- **Persistence.** Allocations are stored. After a daemon restart each live
-  allocation is re-read (`GET`); one the provider no longer knows fails its
-  work with a classified, remediated error.
+- **When.** A squad's requests are granted when the scheduler picks the squad
+  up, before any worktree is made; a review's own request (`[[review]]
+  machine` or the project default) the first time the review is used, reusing
+  an allocation one of its squads holds for the same request so the review
+  merges where its cells ran. A request no provider grants fails the squad
+  with a mailbox error listing every provider tried and why.
+- **Persistence.** Allocations are stored, without their tokens. After a
+  daemon restart each live allocation is re-read (`GET`) and gets a new token
+  (`renew`) on first use; one the provider no longer knows is marked lost and
+  reported in the mailbox with how to get a new machine (restarting the squad
+  or reopening the review asks again).
 - **Tokens** are short-lived and renewed by the daemon before they expire.
 - **Release.** When the squad is terminal and every review fed by it is merged
   or deleted. An open review holds its allocation (its merge worktree and any
@@ -124,7 +132,7 @@ JSON. Every reply carries `"protocol_version": 2`.
 
 | Call | Request | Reply |
 |---|---|---|
-| `POST /v1/allocations` | `{"requirements": {"os"?, "arch"?, "labels"?: []}, "scope": {"squad_id", "key"}}` | an allocation (above), or an error |
+| `POST /v1/allocations` | `{"requirements": {"os"?, "arch"?, "labels"?: []}, "scope": {"squad_id" or "review_id", "key"}}` | an allocation (above), or an error |
 | `GET /v1/allocations/{id}` | -- | the allocation, or `404` |
 | `POST /v1/allocations/{id}/renew` | -- | the allocation with a new token |
 | `POST /v1/allocations/{id}/idle` | `{"idle": bool}` | `{}` -- a hint |

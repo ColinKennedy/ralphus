@@ -459,11 +459,14 @@ enum Transport {
     /// An allocation's Machine API (contract v2): `POST <endpoint>/<verb>`.
     Http {
         endpoint: String,
-        /// The allocation's bearer token. Sent only as a header, never
-        /// logged.
-        token: String,
+        /// The allocation's bearer token, asked for on every call so an
+        /// expiring one is renewed. Sent only as a header, never logged.
+        token: TokenSource,
     },
 }
+
+/// Where a Machine API call gets its bearer token.
+pub type TokenSource = Arc<dyn Fn() -> Result<String, String> + Send + Sync>;
 
 /// The agent for Machine API calls. `exec` may run a whole cell
 /// synchronously when the machine does not hand back a handle, so a reply is
@@ -663,10 +666,27 @@ impl ProviderRunner {
         endpoint: impl Into<String>,
         token: impl Into<String>,
     ) -> Self {
+        let token = token.into();
+        Self::over_http_with(
+            provider,
+            allocation_id,
+            endpoint,
+            Arc::new(move || Ok(token.clone())),
+        )
+    }
+
+    /// [`Self::over_http`], asking `token` for the bearer token on each call.
+    #[must_use]
+    pub fn over_http_with(
+        provider: impl Into<String>,
+        allocation_id: impl Into<String>,
+        endpoint: impl Into<String>,
+        token: TokenSource,
+    ) -> Self {
         Self::with_transport(
             Transport::Http {
                 endpoint: endpoint.into().trim_end_matches('/').to_string(),
-                token: token.into(),
+                token,
             },
             provider.into(),
             allocation_id.into(),
@@ -862,7 +882,7 @@ impl ProviderRunner {
     fn invoke_http(
         &self,
         endpoint: &str,
-        token: &str,
+        token: &TokenSource,
         verb: &str,
         payload: &str,
         spec: &RunnerSpec,
@@ -874,6 +894,7 @@ impl ProviderRunner {
                 self.scheme
             )
         })?;
+        let token = token()?;
         let url = format!("{endpoint}/{verb}");
         // ralphus[ignore-rlog-pair]: this low-level helper has no Store; its Store-owning caller records the structured workflow outcome
         crate::rlog!(
@@ -1417,12 +1438,18 @@ impl ProviderRunner {
                 // dispatch, the same way every other Cartographer write in
                 // this module is best-effort.
                 if let Some(store) = &self.cartographer {
+                    // An allocation is found again by its bound machine value,
+                    // kept whole in `scheme` (see `reconcile_remote_exec_handles`).
+                    let (scheme, uri) = match self.transport {
+                        Transport::Program { .. } => (self.scheme.as_str(), self.uri.as_str()),
+                        Transport::Http { .. } => (spec.machine.as_deref().unwrap_or_default(), ""),
+                    };
                     let guard = store.lock();
                     if let Err(e) = guard.save_remote_exec_handle(
                         &spec.squad_id,
                         &spec.cell_id,
-                        &self.scheme,
-                        &self.uri,
+                        scheme,
+                        uri,
                         &handle,
                     ) {
                         crate::cartographer::Note::new("remote")
@@ -1951,9 +1978,12 @@ pub fn provider_from_store(store: &Store, machine: &str) -> Result<Option<Provid
         ResolvedMachine::Provider { scheme, uri } => (scheme, uri),
         ResolvedMachine::Service(_) => {
             return Err(format!(
-                "machine {machine:?} asks a provider service for an allocation, and dispatching \
-                 to provider services is not wired into this daemon build yet"
+                "machine {machine:?} has not been granted an allocation yet; restart the work \
+                 that uses it so the daemon asks its providers again"
             ));
+        }
+        ResolvedMachine::Allocation(row_id) => {
+            return allocation_runner(store, machine, row_id).map(Some);
         }
     };
     let Some(provider) = store
@@ -1985,6 +2015,49 @@ pub fn provider_from_store(store: &Store, machine: &str) -> Result<Option<Provid
             .with_channel(supports_channel)
             .with_target_runner(target_runner)
             .with_agent_executables(agent_executables),
+    ))
+}
+
+/// The runner for allocation row `row_id`, which `machine` names. No network
+/// call happens here: the token is fetched (and renewed if needed) by the
+/// first Machine API call, outside the store lock.
+fn allocation_runner(store: &Store, machine: &str, row_id: i64) -> Result<ProviderRunner, String> {
+    let row = store
+        .machine_allocation(row_id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| {
+            format!("machine {machine:?} names an allocation the daemon has no record of")
+        })?;
+    if row.state != crate::allocations::STATE_ACTIVE {
+        return Err(format!(
+            "machine {machine:?} was allocation {} from provider {:?}, which is {}{}; restart the \
+             work that uses it so the daemon asks its providers for a new machine",
+            row.allocation_id,
+            row.provider,
+            row.state,
+            row.state_detail
+                .as_deref()
+                .map(|d| format!(" ({d})"))
+                .unwrap_or_default()
+        ));
+    }
+    let service = crate::provider_services::load_provider_services()?
+        .into_iter()
+        .find(|s| s.name == row.provider)
+        .ok_or_else(|| {
+            format!(
+                "machine {machine:?} came from provider service {:?}, which is no longer \
+                 configured; declare [machine.providers.{}] in the daemon's config.toml again",
+                row.provider, row.provider
+            )
+        })?;
+    let endpoint = row.endpoint.clone();
+    let (provider, allocation_id) = (row.provider.clone(), row.allocation_id.clone());
+    Ok(ProviderRunner::over_http_with(
+        provider,
+        allocation_id,
+        endpoint,
+        Arc::new(move || crate::allocations::token_for(&row, &service)),
     ))
 }
 
@@ -2020,7 +2093,11 @@ pub fn reconcile_remote_exec_handles(store: &Store) {
         }
     };
     for h in &handles {
-        let machine = format!("{}:{}", h.scheme, h.uri);
+        let machine = if crate::allocations::parse_bound(&h.scheme).is_some() {
+            h.scheme.clone()
+        } else {
+            format!("{}:{}", h.scheme, h.uri)
+        };
         let outcome = match provider_from_store(store, &machine) {
             Ok(Some(provider)) => {
                 let spec = crate::runner::RunnerSpec::for_command_proof(

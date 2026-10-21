@@ -10,6 +10,7 @@ pub mod agent_catalog;
 pub mod agent_profile_env;
 pub mod agent_profile_store;
 pub mod agent_profiles;
+pub mod allocations;
 pub mod appraisal;
 pub mod appraisal_pr;
 pub mod arbiter;

@@ -2652,6 +2652,29 @@ impl Store {
             -- no such idempotent re-derivation -- without this row, the only
             -- record that remote work is in flight lived in a Rust
             -- `Instant`/loop on a thread that a restart just killed.
+            -- Machines granted by provider services (contract v2,
+            -- `crate::allocations`). A bound machine value `<request>#<id>`
+            -- names a row. No token is stored: the daemon renews one after a
+            -- restart. `squad_id` or `guardian_id` is the scope it was granted
+            -- for; `state` is `active`, `released` or `lost`.
+            CREATE TABLE IF NOT EXISTS machine_allocations (
+                id             INTEGER PRIMARY KEY AUTOINCREMENT,
+                provider       TEXT NOT NULL,
+                allocation_id  TEXT NOT NULL,
+                endpoint       TEXT NOT NULL,
+                request        TEXT NOT NULL,
+                squad_id       TEXT,
+                guardian_id    TEXT,
+                os             TEXT,
+                arch           TEXT,
+                labels         TEXT NOT NULL DEFAULT '[]',
+                description    TEXT,
+                idle           INTEGER NOT NULL DEFAULT 0,
+                state          TEXT NOT NULL DEFAULT 'active',
+                state_detail   TEXT,
+                created_at_ms  INTEGER NOT NULL,
+                released_at_ms INTEGER
+            );
             CREATE TABLE IF NOT EXISTS remote_exec_handles (
                 squad_id        TEXT NOT NULL,
                 cell_id    TEXT NOT NULL,

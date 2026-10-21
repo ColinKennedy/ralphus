@@ -134,6 +134,9 @@ pub enum ResolvedMachine {
     /// A request to provider services (contract v2), granted later as an
     /// allocation. Every provider it names is configured (or `local`).
     Service(ralphus_core::schema::MachineRequest),
+    /// A request already granted: the `machine_allocations` row it is bound
+    /// to ([`crate::allocations::parse_bound`]).
+    Allocation(i64),
 }
 
 impl ResolvedMachine {
@@ -474,6 +477,9 @@ impl Store {
         let Some(raw) = machine.map(str::trim).filter(|m| !m.is_empty()) else {
             return Ok(ResolvedMachine::Local);
         };
+        if let Some((_, row_id)) = crate::allocations::parse_bound(raw) {
+            return Ok(ResolvedMachine::Allocation(row_id));
+        }
         let parsed = ralphus_core::schema::parse_machine(raw)
             .map_err(|_| ResolveError::Malformed(raw.to_string()))?;
         let (scheme, uri) = match parsed {

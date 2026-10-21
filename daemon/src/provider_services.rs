@@ -38,6 +38,10 @@ impl ProviderService {
     /// is unavailable until it is set (and the daemon restarted, if the
     /// variable comes from its environment).
     pub fn token(&self) -> Result<String, String> {
+        #[cfg(test)]
+        if let Some(token) = TEST_TOKENS.lock().expect("poisoned").get(&self.token_env) {
+            return Ok(token.clone());
+        }
         std::env::var(&self.token_env)
             .ok()
             .filter(|t| !t.trim().is_empty())
@@ -49,6 +53,35 @@ impl ProviderService {
                 )
             })
     }
+}
+
+/// Tokens tests give a `token_env` name, since a test cannot set the
+/// process environment (`set_var` is `unsafe`).
+#[cfg(test)]
+static TEST_TOKENS: std::sync::LazyLock<std::sync::Mutex<BTreeMap<String, String>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(BTreeMap::new()));
+
+/// Make [`ProviderService::token`] answer `token` for `token_env`. Use a name
+/// unique to the test.
+#[cfg(test)]
+pub(crate) fn set_token_for_test(token_env: &str, token: &str) {
+    TEST_TOKENS
+        .lock()
+        .expect("poisoned")
+        .insert(token_env.to_string(), token.to_string());
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_SERVICES: std::cell::RefCell<Option<Vec<ProviderService>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Make [`load_provider_services`] return `services` on this thread instead
+/// of reading configuration files.
+#[cfg(test)]
+pub(crate) fn set_services_for_test(services: Vec<ProviderService>) {
+    TEST_SERVICES.with(|s| *s.borrow_mut() = Some(services));
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -161,6 +194,10 @@ fn read_file(path: &Path) -> Result<Vec<ProviderService>, String> {
 /// # Errors
 /// The first configuration error found.
 pub fn load_provider_services() -> Result<Vec<ProviderService>, String> {
+    #[cfg(test)]
+    if let Some(services) = TEST_SERVICES.with(|s| s.borrow().clone()) {
+        return Ok(services);
+    }
     let raw = std::env::var("RALPHUS_CONFIGURATION_PATH").ok();
     let mut files: Vec<PathBuf> = crate::config::global_config_path()
         .filter(|p| p.is_file())
