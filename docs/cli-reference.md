@@ -902,7 +902,7 @@ use; see `READ_ONLY_NOTE`.
         - link-cell selector [uri] cell [uri]  {Link a cell/task to an already-attached review branch, so its readiness follows that cell finishing (RAL-392).}
         - (read-only-safe) list --pr-ready --status [statuses]  {List reviews.}
         - live  {Live actions: agent-run live tests of the review's tip, generated from its cells' RALPHUS_LIVE_ACTION handoffs.}
-            - cancel selector [uri] run_id [str]  {Cancel a queued or running live run.}
+            - cancel selector [uri] run_id [id]  {Cancel a queued or running live run.}
             - (read-only-safe) list selector [uri]  {List the review's live actions (agent-run live tests from its cells' handoffs) and their runs.}
             - run selector [uri] --index [integer]  {Queue a run of one live action (--index) or all of them; generates the review's live actions from its finished cells' handoffs first if it has none.}
         - (read-only-safe) logs selector [uri]  {Show a review's state-transition audit log.}
@@ -984,7 +984,7 @@ use; see `READ_ONLY_NOTE`.
             - mode waypoint_id [id] entry_id [id] mode [block|advisory]  {Override the block/advisory mode of one existing affected entry.}
             - remove waypoint_id [id] entry_id [id]  {Remove one affected entry from a waypoint.}
         - bearing  {Append a completed-work bearing to a waypoint's delivery feed.}
-            - add waypoint_id [id] producer_kind [review|squad] producer_id [str] --commit-id [str] --commit-summary [text] --entity-uri [uri] --summary [text]  {Append a completed-work bearing to a waypoint's durable delivery feed.}
+            - add waypoint_id [id] producer_kind [review|squad] producer_id [id] --commit-id [str] --commit-summary [text] --entity-uri [uri] --summary [text]  {Append a completed-work bearing to a waypoint's durable delivery feed.}
         - (read-only-safe) bearings waypoint_id [id]  {List a waypoint's bearing feed.}
         - close waypoint_id [id]  {Manually close an open waypoint.}
         - create --affected [kind:entry_id[:mode]...] --agent [name] --allow-advisory --label [text] --model [name] --prompt [text] --roster [entry_id[:note]...]  {Create a cross-squad waypoint: --affected names the work it lands on, --roster the work whose          landing IS it being carried out. A waypoint with no roster is a broadcast -- nothing has to land,          so its affected work is never held, only asked to answer (RAL-400).}

@@ -43,8 +43,12 @@
 //! forms and the RAL-188 URI form both work, see [`URI_ARGUMENT_NOTE`]);
 //! `[id]` for a chip that is an opaque identifier the daemon assigns and
 //! matches only by exact string equality -- never parsed, resolved, or
-//! accepted in URI form (see [`ID_ARGUMENT_NOTE`]). Everything else
-//! declared `[str]` is a plain, unconstrained string.
+//! accepted in URI form (see [`ID_ARGUMENT_NOTE`]). The names live in
+//! [`URI_CHIPS`] and [`ID_CHIPS`]; a test fails if a chip named `*_id` or
+//! `selector` is left `[str]`. Everything else declared `[str]` is a plain,
+//! unconstrained string -- including values that are identifiers but not
+//! daemon-assigned (`--commit-id` git hashes, `machine` names), and
+//! cartographer's `--task`/`--cell` exact-match filters.
 //!
 //! `quick-start` is excluded from the AI-oriented generated map, mirroring
 //! Python's `_HIDDEN_COMMANDS`, but is present in the user-facing command
@@ -3273,16 +3277,36 @@ fn signature(n: &HelpNode) -> String {
     }
 }
 
+/// Chip names rendered `[uri]` (see [`URI_ARGUMENT_NOTE`]).
+const URI_CHIPS: &[&str] = &[
+    "selector",
+    "entity_uri",
+    "--entity",
+    "--for",
+    "cell",
+    "to_review",
+];
+
+/// Chip names rendered `[id]` (see [`ID_ARGUMENT_NOTE`]).
+const ID_CHIPS: &[&str] = &[
+    "squad_id",
+    "pr_id",
+    "--squad",
+    "--guardian",
+    "waypoint_id",
+    "entry_id",
+    "run_id",
+    "producer_id",
+];
+
 fn display_chip(chip: &str) -> String {
     let name = chip.split_whitespace().next().unwrap_or(chip);
-    match name {
-        "selector" | "entity_uri" | "--entity" | "--for" | "cell" | "to_review" => {
-            chip.replacen("[str", "[uri", 1)
-        }
-        "squad_id" | "pr_id" | "--squad" | "--guardian" | "waypoint_id" | "entry_id" => {
-            chip.replacen("[str", "[id", 1)
-        }
-        _ => chip.to_string(),
+    if URI_CHIPS.contains(&name) {
+        chip.replacen("[str", "[uri", 1)
+    } else if ID_CHIPS.contains(&name) {
+        chip.replacen("[str", "[id", 1)
+    } else {
+        chip.to_string()
     }
 }
 
@@ -4129,6 +4153,38 @@ mod tests {
         assert!(command.contains("squad_id [id]"));
         assert!(command.contains("ID ARGUMENTS:"));
         assert!(!command.contains("URI ARGUMENTS:"));
+    }
+
+    /// RAL-718: repeatable forms keep the `...` suffix, newly retyped names
+    /// render, and no identifier-named chip is left as `[str]`.
+    #[test]
+    fn id_and_uri_chips_cover_every_identifier_named_chip() {
+        assert_eq!(display_chip("run_id [str]"), "run_id [id]");
+        assert_eq!(display_chip("producer_id [str]"), "producer_id [id]");
+        assert_eq!(
+            display_chip("squad_id [str, optional]"),
+            "squad_id [id, optional]"
+        );
+        assert_eq!(display_chip("squad_id [str...]"), "squad_id [id...]");
+        assert_eq!(display_chip("selector [str...]"), "selector [uri...]");
+        assert_eq!(display_chip("--commit-id [str]"), "--commit-id [str]");
+
+        fn walk(n: &HelpNode, bad: &mut Vec<String>) {
+            for chip in n.positionals.iter().chain(n.options.iter()) {
+                let name = chip.split_whitespace().next().unwrap_or(chip);
+                if (name.ends_with("_id") || name == "selector")
+                    && display_chip(chip).contains("[str")
+                {
+                    bad.push(format!("{}: {chip}", n.name));
+                }
+            }
+            for c in n.children {
+                walk(c, bad);
+            }
+        }
+        let mut bad = Vec::new();
+        walk(&ROOT, &mut bad);
+        assert!(bad.is_empty(), "identifier chips left as [str]: {bad:?}");
     }
 
     #[test]
