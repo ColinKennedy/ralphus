@@ -69,7 +69,7 @@ a Qt desktop app, anything with output a person would look at.
    markers are fixed when the PR is created. Ralphus never appends a
    `review-upstream` block, and it needs an upstream capture only for
    `review-upstream` markers that are present in the description; a slot with
-   the hint but no such marker needs none. A description with no tokens renders
+   the hint but no such marker needs none. For each action with such a marker ralphus runs that action once against the freshly fetched remote base (on a fork with `dual_root_pr`, the parent repo's base) in a detached checkout on the review's machine, with a read-only prompt, no commits and no integration. The result is cached per upstream sha; when the base moves the side shows as stale and re-runs. Each side shows its own state (pending, captured, absent, not runnable at review-upstream naming the failing prepare step, failed, skipped (budget)); absent is not a failure. These runs count against the review's `maximum_budget_usd`. A description with no tokens renders
    exactly as before.
 
    **Projects can also require exhibits deterministically**, with recipes in

@@ -1426,7 +1426,10 @@ fn section_runs(
     let all = crate::live_runs::guardian_live_runs_conn(&guard.conn, &guardian.id)?;
     let mut out = Vec::new();
     for run in all {
-        if run.kind != "live" || matches!(run.state.as_str(), "queued" | "running") {
+        if run.kind != "live"
+            || run.role == crate::live_runs::ROLE_UPSTREAM
+            || matches!(run.state.as_str(), "queued" | "running")
+        {
             continue;
         }
         let evidence = guard.live_run_evidence(&run.run_id)?;
@@ -1456,6 +1459,69 @@ fn section_runs(
         });
     }
     Ok(out)
+}
+
+/// Bring the `review-upstream` side of a PR's slots in line with its
+/// description: a slot with a `review-upstream` marker gets a pending side
+/// (which the sweep turns into a run), a slot whose marker is gone loses its
+/// side, and captured files go up through the PR's own client. Returns the PR's
+/// slots as they stand afterwards.
+fn sync_upstream_sides(
+    store: &crate::store_lock::StoreHandle,
+    pr: &crate::pr::PullRequestView,
+    guardian: &crate::guardian::GuardianView,
+    number: i64,
+    client: &crate::forge::ForgeClient,
+    description: &str,
+    slots: &[(crate::exhibits::ExhibitSlot, String)],
+) -> std::result::Result<Vec<(crate::exhibits::ExhibitSlot, String)>, String> {
+    use crate::exhibits::{ExhibitFill, UpstreamFill, UpstreamState};
+    let plain: Vec<_> = slots.iter().map(|(slot, _)| slot.clone()).collect();
+    let marked = crate::exhibits::upstream_markers(description, &plain);
+    let mut added = Vec::new();
+    {
+        let guard = store.lock();
+        for slot in &plain {
+            match (marked.contains(&slot.key), slot.upstream.is_some()) {
+                (true, false) => {
+                    let _ = guard.set_upstream_fill(
+                        &guardian.id,
+                        slot.key,
+                        &UpstreamFill {
+                            state: UpstreamState::Pending,
+                            upstream_sha: String::new(),
+                            fill: ExhibitFill::default(),
+                        },
+                    );
+                    added.push(slot.key);
+                }
+                (false, true) => {
+                    let _ = guard.delete_upstream_fill(&guardian.id, slot.key);
+                }
+                _ => {}
+            }
+        }
+    }
+    if !added.is_empty() {
+        crate::rlog!(
+            INFO,
+            "ralphus [guardian] review {} PR #{number}: {} slot(s) await a review-upstream capture",
+            guardian.id,
+            added.len()
+        );
+        crate::cartographer::Note::new("guardian")
+            .guardian(&guardian.id)
+            .scope("live_action")
+            .emit(
+                &store.lock(),
+                "exhibit slots need a review-upstream run",
+                serde_json::json!({ "pr_id": pr.id, "slots": added }),
+            );
+    }
+    let current = crate::exhibits::pr_slots(store, pr, guardian).map_err(|e| e.to_string())?;
+    let plain: Vec<_> = current.iter().map(|(slot, _)| slot.clone()).collect();
+    crate::exhibit_delivery::upload_pending_upstream(store, &guardian.id, number, client, &plain);
+    crate::exhibits::pr_slots(store, pr, guardian).map_err(|e| e.to_string())
 }
 
 /// Re-render one PR's results section into its forge description. The current
@@ -1506,6 +1572,19 @@ pub fn refresh_pr_with(
         crate::exhibits::pr_slots(store, &pr, &guardian).map_err(|e| e.to_string())?
     };
     let current = client.get_pull_request_description(number)?;
+    let exhibit_slots = if exhibit_slots.is_empty() {
+        exhibit_slots
+    } else {
+        sync_upstream_sides(
+            store,
+            &pr,
+            &guardian,
+            number,
+            &client,
+            &current,
+            &exhibit_slots,
+        )?
+    };
     let mut updated = match &section {
         Some(section) => splice_section(&current, section),
         None => current.clone(),
@@ -1516,9 +1595,10 @@ pub fn refresh_pr_with(
         let keyed: Vec<_> = exhibit_slots
             .iter()
             .filter_map(|(slot, _)| {
-                Some(crate::exhibits::KeyedBlock {
+                let marker_key = slot.request.marker_key.clone()?;
+                let after = crate::exhibits::KeyedBlock {
                     slot: slot.key,
-                    marker_key: slot.request.marker_key.clone()?,
+                    marker_key: marker_key.clone(),
                     side: crate::exhibits::MarkerSide::After,
                     content: crate::exhibits::render_side_content(
                         slot.request.kind,
@@ -1526,8 +1606,23 @@ pub fn refresh_pr_with(
                         None,
                         client.kind(),
                     ),
-                })
+                };
+                let upstream = slot
+                    .upstream
+                    .as_ref()
+                    .map(|up| crate::exhibits::KeyedBlock {
+                        slot: slot.key,
+                        marker_key,
+                        side: crate::exhibits::MarkerSide::ReviewUpstream,
+                        content: crate::exhibits::render_upstream_content(
+                            slot.request.kind,
+                            Some(up),
+                            client.kind(),
+                        ),
+                    });
+                Some(std::iter::once(after).chain(upstream))
             })
+            .flatten()
             .collect();
         let keyed_out = crate::exhibits::splice_keyed(&updated, &keyed);
         updated = keyed_out.body;
@@ -1541,23 +1636,6 @@ pub fn refresh_pr_with(
                 )
             })
             .collect();
-        let upstream = crate::exhibits::upstream_markers(
-            &updated,
-            &exhibit_slots
-                .iter()
-                .map(|(s, _)| s.clone())
-                .collect::<Vec<_>>(),
-        );
-        if !upstream.is_empty() {
-            crate::cartographer::Note::new("guardian")
-                .guardian(&guardian.id)
-                .scope("live_action")
-                .emit(
-                    &store.lock(),
-                    "exhibit slots need an upstream run",
-                    serde_json::json!({ "pr_id": pr.id, "slots": upstream }),
-                );
-        }
         let mut spliced = crate::exhibits::splice_exhibits(&updated, &blocks);
         spliced.damaged.extend(keyed_out.damaged);
         if !spliced.damaged.is_empty() {
@@ -2090,6 +2168,8 @@ live
             queued_at_ms: queued,
             started_at_ms: Some(queued),
             finished_at_ms: Some(queued + 1),
+            role: crate::live_runs::ROLE_AFTER.into(),
+            upstream_sha: None,
         }
     }
 

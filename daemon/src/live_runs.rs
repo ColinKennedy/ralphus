@@ -94,11 +94,21 @@ pub struct LiveRunRow {
     pub queued_at_ms: i64,
     pub started_at_ms: Option<i64>,
     pub finished_at_ms: Option<i64>,
+    /// [`ROLE_AFTER`] for a run of the review's own code, [`ROLE_UPSTREAM`] for
+    /// a `review-upstream` capture run against the fetched base.
+    pub role: String,
+    /// The base commit a `review-upstream` run captures against.
+    pub upstream_sha: Option<String>,
 }
+
+/// A run of the review's own code (every run before `review-upstream` existed).
+pub const ROLE_AFTER: &str = "after";
+/// A `review-upstream` capture run: a detached checkout of the review's base.
+pub const ROLE_UPSTREAM: &str = "review-upstream";
 
 const RUN_COLUMNS: &str = "run_id, guardian_id, kind, action_idx, label, trigger, state, cwd, \
      base_tip, live_ref, commits, report, error, cost_usd, cell_id, integration, \
-     integration_detail, queued_at_ms, started_at_ms, finished_at_ms";
+     integration_detail, queued_at_ms, started_at_ms, finished_at_ms, role, upstream_sha";
 
 fn run_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<LiveRunRow> {
     let commits: Option<String> = r.get(10)?;
@@ -125,6 +135,8 @@ fn run_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<LiveRunRow> {
         queued_at_ms: r.get(17)?,
         started_at_ms: r.get(18)?,
         finished_at_ms: r.get(19)?,
+        role: r.get(20)?,
+        upstream_sha: r.get(21)?,
     })
 }
 
@@ -239,12 +251,64 @@ impl crate::store::Store {
                 &format!(
                     "SELECT {RUN_COLUMNS} FROM guardian_live_runs
                      WHERE guardian_id=? AND state='queued'
-                     ORDER BY queued_at_ms, run_id LIMIT 1"
+                     ORDER BY (role='review-upstream'), queued_at_ms, run_id LIMIT 1"
                 ),
                 rusqlite::params![guardian_id],
                 run_from_row,
             )
             .optional()?)
+    }
+
+    /// Queue the `review-upstream` run of one action, against the base commit
+    /// `upstream_sha`. Returns its id.
+    ///
+    /// # Errors
+    ///
+    /// On a database failure.
+    pub fn queue_upstream_live_run(
+        &self,
+        guardian_id: &str,
+        action_idx: i64,
+        label: &str,
+        upstream_sha: &str,
+    ) -> crate::store::Result<String> {
+        let run_id = new_run_id();
+        self.conn.execute(
+            "INSERT INTO guardian_live_runs
+                (run_id, guardian_id, kind, action_idx, label, trigger, state, integration,
+                 queued_at_ms, role, upstream_sha)
+             VALUES (?, ?, ?, ?, ?, 'review-upstream', 'queued', 'none', ?, 'review-upstream', ?)",
+            rusqlite::params![
+                run_id,
+                guardian_id,
+                LiveRunKind::Live.as_str(),
+                action_idx,
+                label,
+                crate::store::now_ms(),
+                upstream_sha
+            ],
+        )?;
+        Ok(run_id)
+    }
+
+    /// Whether the review has a queued or running `review-upstream` run of
+    /// the action.
+    ///
+    /// # Errors
+    ///
+    /// On a database failure.
+    pub fn upstream_run_in_flight(
+        &self,
+        guardian_id: &str,
+        action_idx: i64,
+    ) -> crate::store::Result<bool> {
+        Ok(self.conn.query_row(
+            "SELECT COUNT(*) FROM guardian_live_runs
+             WHERE guardian_id=? AND action_idx=? AND role='review-upstream'
+               AND state IN ('queued','running')",
+            rusqlite::params![guardian_id, action_idx],
+            |r| r.get::<_, i64>(0),
+        )? > 0)
     }
 
     /// Mark a queued run as running.
@@ -818,6 +882,15 @@ pub fn drain_queue(
             let Ok(Some(run)) = next else {
                 break;
             };
+            // A `review-upstream` run needs the stack integrated first: it
+            // waits for the carries below, and never delays them.
+            if run.role == ROLE_UPSTREAM && !to_integrate.is_empty() {
+                break;
+            }
+            if run.role == ROLE_UPSTREAM {
+                execute_upstream_run(store, runners, &run);
+                continue;
+            }
             if execute_queued_run(store, runners, &run) {
                 to_integrate.push(run.run_id.clone());
             }
@@ -995,6 +1068,7 @@ fn execute_queued_run(
             cwd: &cwd,
             allow_commits: target.allow_commits,
             exhibit_slots,
+            upstream_sha: None,
         },
         &cancel,
     );
@@ -1393,6 +1467,391 @@ pub fn retry_pending_integrations(
     }
 }
 
+/// Write `state` and `reason` into the `review-upstream` side of every marked
+/// slot of the action that the run at `sha` has not settled: still pending or
+/// stale, or captured against another commit.
+fn settle_upstream_slots(
+    store: &crate::store_lock::StoreHandle,
+    guardian_id: &str,
+    action_idx: i64,
+    sha: &str,
+    state: crate::exhibits::UpstreamState,
+    reason: &str,
+) {
+    use crate::exhibits::{ExhibitFill, UpstreamFill, UpstreamState};
+    let guard = store.lock();
+    let slots = guard
+        .guardian_exhibit_slots(guardian_id)
+        .unwrap_or_default();
+    for slot in slots.iter().filter(|s| s.key.action_idx == action_idx) {
+        let Some(up) = &slot.upstream else {
+            continue;
+        };
+        let unsettled = up.upstream_sha != sha
+            || matches!(up.state, UpstreamState::Pending | UpstreamState::Stale);
+        if !unsettled {
+            continue;
+        }
+        let _ = guard.set_upstream_fill(
+            guardian_id,
+            slot.key,
+            &UpstreamFill {
+                state,
+                upstream_sha: sha.to_string(),
+                fill: ExhibitFill {
+                    missing_reason: Some(reason.to_string()),
+                    updated_at_ms: crate::store::now_ms(),
+                    ..ExhibitFill::default()
+                },
+            },
+        );
+    }
+    let _ = guard.request_live_refresh_for_guardian(guardian_id);
+}
+
+/// Tell the review's watchers a `review-upstream` capture could not be set up.
+fn notify_upstream_failure(
+    store: &crate::store_lock::StoreHandle,
+    guardian_id: &str,
+    label: &str,
+    reason: &str,
+) {
+    let _ = store.lock().enqueue_error_mailbox_message(
+        crate::mailbox::MailboxPriority::Normal,
+        &format!(
+            "Review {guardian_id}: the review-upstream capture of live action \"{label}\" failed: {reason}"
+        ),
+        &crate::mailbox::Remediation::ManualInterventionRequired {
+            guidance: "open the run from the review's live actions on the board to read its \
+                       transcript; the capture re-runs when the upstream base next moves"
+                .to_string(),
+        },
+        None,
+        None,
+        None,
+        Some(&format!("guardian:{guardian_id}")),
+        Some("live_actions"),
+    );
+}
+
+/// Execute one queued `review-upstream` run: check out the fetched base
+/// detached, run the review's preparation there, run the action's prompt
+/// read-only for every marked slot, and record each slot's `review-upstream`
+/// side. Never integrates commits.
+fn execute_upstream_run(
+    store: &crate::store_lock::StoreHandle,
+    runners: &LiveRunnerFactory,
+    run: &LiveRunRow,
+) {
+    use crate::exhibits::UpstreamState;
+    let gid = run.guardian_id.as_str();
+    let sha = run.upstream_sha.clone().unwrap_or_default();
+    let scope = |msg: &str, data: serde_json::Value| {
+        crate::cartographer::Note::new("guardian")
+            .guardian(gid)
+            .scope("live_action")
+            .emit(&store.lock(), msg, data);
+    };
+    let (guardian, target, slots, over) = {
+        let guard = store.lock();
+        let Ok(g) = guard.get_guardian(gid) else {
+            let _ = guard.fail_queued_live_run(&run.run_id, "the review no longer exists");
+            return;
+        };
+        let target = match resolve_target(&guard, &g, run) {
+            Ok(t) => t,
+            Err(e) => {
+                let _ = guard.fail_queued_live_run(&run.run_id, &e);
+                return;
+            }
+        };
+        let slots: Vec<_> = guard
+            .guardian_exhibit_slots(gid)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|s| s.key.action_idx == run.action_idx && s.upstream.is_some())
+            .collect();
+        (g, target, slots, over_budget(&guard, gid))
+    };
+    if slots.is_empty() {
+        let _ = store
+            .lock()
+            .fail_queued_live_run(&run.run_id, "no marker asks for this run any more");
+        return;
+    }
+    if over {
+        let _ = store
+            .lock()
+            .fail_queued_live_run(&run.run_id, "skipped: the review's budget is spent");
+        settle_upstream_slots(
+            store,
+            gid,
+            run.action_idx,
+            &sha,
+            UpstreamState::SkippedBudget,
+            "the review's maximum_budget_usd is spent",
+        );
+        crate::rlog!(
+            INFO,
+            "ralphus [guardian] review {gid} review-upstream run {} skipped: budget",
+            run.run_id
+        );
+        scope(
+            "review-upstream run skipped for budget",
+            serde_json::json!({"run_id": run.run_id, "upstream_sha": sha}),
+        );
+        return;
+    }
+    let action_index = usize::try_from(run.action_idx).unwrap_or(0);
+    let cell_id = crate::live_actions::live_run_cell_id(action_index, &run.run_id);
+    let cancel = CancelToken::new();
+    let memory = store.lock_free_memory();
+    memory.register_live_run_cancel(&run.run_id, cancel.clone());
+    let runner = runners(store);
+    let prepared = crate::guardian_merge::prepare_upstream_checkout(
+        store,
+        runner.as_ref(),
+        &guardian,
+        &sha,
+        &cancel,
+    );
+    let cwd = match prepared {
+        Ok(cwd) => cwd,
+        Err(err) => {
+            memory.clear_live_run_cancel(&run.run_id);
+            let (state, reason, notify) = match err {
+                crate::guardian_merge::UpstreamPrepError::NotRunnable(step) => {
+                    (UpstreamState::NotRunnable, step, false)
+                }
+                crate::guardian_merge::UpstreamPrepError::Setup(why) => {
+                    (UpstreamState::Failed, why, true)
+                }
+            };
+            let _ = store.lock().fail_queued_live_run(&run.run_id, &reason);
+            settle_upstream_slots(store, gid, run.action_idx, &sha, state, &reason);
+            crate::rlog!(
+                WARNING,
+                "ralphus [guardian] review {gid} review-upstream run {} {}: {reason}",
+                run.run_id,
+                state.as_str()
+            );
+            scope(
+                "review-upstream run could not prepare",
+                serde_json::json!({
+                    "run_id": run.run_id, "upstream_sha": sha,
+                    "state": state.as_str(), "reason": reason
+                }),
+            );
+            if notify {
+                notify_upstream_failure(store, gid, &target.label, &reason);
+            }
+            return;
+        }
+    };
+    let _checkout_hold = crate::checkout_hold::hold(
+        &cwd,
+        &format!("live-run:{gid}:{}", run.run_id),
+        crate::live_actions::LIVE_RUN_HOLD_MAX_AGE,
+    )
+    .ok();
+    let _ = store.lock().start_live_run(&run.run_id, &cwd, &cell_id);
+    let outcome = crate::live_actions::execute_live_run(
+        store,
+        runner.as_ref(),
+        &LiveRunRequest {
+            guardian: &guardian,
+            run_id: &run.run_id,
+            action_index,
+            label: &target.label,
+            prompt: &target.prompt,
+            cwd: &cwd,
+            allow_commits: false,
+            exhibit_slots: slots,
+            upstream_sha: Some(&sha),
+        },
+        &cancel,
+    );
+    memory.clear_live_run_cancel(&run.run_id);
+    let _ = store.lock().finish_live_run(&run.run_id, &outcome, "none");
+    let (state, reason) = match outcome.end {
+        LiveRunEnd::OverBudget => (
+            UpstreamState::SkippedBudget,
+            "the review's maximum_budget_usd is spent".to_string(),
+        ),
+        LiveRunEnd::Cancelled => (UpstreamState::Failed, "the run was cancelled".to_string()),
+        _ => (
+            UpstreamState::Failed,
+            outcome
+                .error
+                .clone()
+                .filter(|e| !e.is_empty())
+                .unwrap_or_else(|| "the run did not report this exhibit".to_string()),
+        ),
+    };
+    // Slots the run reported are already recorded at `sha`; this settles the
+    // rest (a run that failed or was cut short reported nothing).
+    settle_upstream_slots(store, gid, run.action_idx, &sha, state, &reason);
+    let _ = store.lock().request_live_refresh_for_guardian(gid);
+    crate::rlog!(
+        INFO,
+        "ralphus [guardian] review {gid} review-upstream run {} ended {}",
+        run.run_id,
+        outcome.end.as_str()
+    );
+    scope(
+        "review-upstream run finished",
+        serde_json::json!({
+            "run_id": run.run_id, "upstream_sha": sha, "end": outcome.end.as_str()
+        }),
+    );
+    if outcome.end == LiveRunEnd::Failed {
+        notify_upstream_failure(store, gid, &target.label, &reason);
+    }
+}
+
+/// Minimum time between fetches of one review's upstream base by the sweep.
+const UPSTREAM_FETCH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// Whether the sweep may fetch the review's upstream base now; records the
+/// attempt when it may.
+fn upstream_fetch_due(guardian_id: &str) -> bool {
+    static LAST: std::sync::OnceLock<
+        parking_lot::Mutex<std::collections::HashMap<String, std::time::Instant>>,
+    > = std::sync::OnceLock::new();
+    let mut last = LAST.get_or_init(Default::default).lock();
+    let now = std::time::Instant::now();
+    if last
+        .get(guardian_id)
+        .is_some_and(|t| now.duration_since(*t) < UPSTREAM_FETCH_INTERVAL)
+    {
+        return false;
+    }
+    last.insert(guardian_id.to_string(), now);
+    true
+}
+
+/// Queue the `review-upstream` runs a review's PR markers ask for: one per live
+/// action with a marked slot that is pending, or whose capture was taken at an
+/// older upstream commit (marked stale until the re-run lands). A review whose
+/// marked slots are all captured at the current commit queues nothing, and a
+/// review with no markers is never touched.
+fn queue_upstream_runs_for(
+    store: &crate::store_lock::StoreHandle,
+    runners: &LiveRunnerFactory,
+    guardian_id: &str,
+) {
+    use crate::exhibits::{UpstreamFill, UpstreamState};
+    let (guardian, slots) = {
+        let guard = store.lock();
+        let Ok(g) = guard.get_guardian(guardian_id) else {
+            return;
+        };
+        let slots = guard
+            .guardian_exhibit_slots(guardian_id)
+            .unwrap_or_default();
+        (g, slots)
+    };
+    if guardian.live_actions_auto_ran_at_ms.is_none() || review_is_settled_out(&guardian) {
+        return;
+    }
+    if slots.iter().all(|s| s.upstream.is_none()) {
+        return;
+    }
+    let wants_pending = slots
+        .iter()
+        .any(|s| matches!(&s.upstream, Some(u) if u.state == UpstreamState::Pending));
+    if !wants_pending && !upstream_fetch_due(guardian_id) {
+        return;
+    }
+    let sha = match crate::guardian_merge::resolve_upstream_base(store, &guardian) {
+        Ok(sha) => sha,
+        Err(e) => {
+            crate::rlog!(
+                WARNING,
+                "ralphus [guardian] review {guardian_id} review-upstream base unresolved: {e}"
+            );
+            return;
+        }
+    };
+    let mut actions: Vec<i64> = slots
+        .iter()
+        .filter(|s| s.upstream.is_some())
+        .map(|s| s.key.action_idx)
+        .collect();
+    actions.sort_unstable();
+    actions.dedup();
+    for action_idx in actions {
+        let due = slots
+            .iter()
+            .filter(|s| s.key.action_idx == action_idx)
+            .filter_map(|s| s.upstream.as_ref().map(|u| (s.key, u)))
+            .any(|(_, u)| u.state == UpstreamState::Pending || u.upstream_sha != sha);
+        if !due {
+            continue;
+        }
+        let guard = store.lock();
+        if guard
+            .upstream_run_in_flight(guardian_id, action_idx)
+            .unwrap_or(true)
+        {
+            continue;
+        }
+        let Some(action) = guard
+            .guardian_live_actions(guardian_id)
+            .unwrap_or_default()
+            .into_iter()
+            .find(|a| a.idx == action_idx)
+        else {
+            continue;
+        };
+        for (key, u) in slots
+            .iter()
+            .filter(|s| s.key.action_idx == action_idx)
+            .filter_map(|s| s.upstream.as_ref().map(|u| (s.key, u)))
+        {
+            if u.state != UpstreamState::Pending && u.upstream_sha != sha {
+                let _ = guard.set_upstream_fill(
+                    guardian_id,
+                    key,
+                    &UpstreamFill {
+                        state: UpstreamState::Stale,
+                        ..u.clone()
+                    },
+                );
+            }
+        }
+        let queued = guard.queue_upstream_live_run(guardian_id, action_idx, &action.label, &sha);
+        let _ = guard.request_live_refresh_for_guardian(guardian_id);
+        drop(guard);
+        crate::rlog!(
+            INFO,
+            "ralphus [guardian] review {guardian_id} queued review-upstream run of action {action_idx} at {sha}"
+        );
+        crate::cartographer::Note::new("guardian")
+            .guardian(guardian_id)
+            .scope("live_action")
+            .emit(
+                &store.lock(),
+                "review-upstream run queued",
+                serde_json::json!({
+                    "action_idx": action_idx, "upstream_sha": sha, "run_id": queued.ok()
+                }),
+            );
+    }
+    start_worker(store, runners, guardian_id);
+}
+
+/// Queue the `review-upstream` runs every review's markers ask for.
+fn sweep_upstream_runs(store: &crate::store_lock::StoreHandle, runners: &LiveRunnerFactory) {
+    let ids = store
+        .lock()
+        .guardians_with_upstream_fills()
+        .unwrap_or_default();
+    for gid in ids {
+        queue_upstream_runs_for(store, runners, &gid);
+    }
+}
+
 /// Post the run's report into the review's conversation on its top branch,
 /// so what the live test found is part of the review, not only a log row.
 fn post_report(
@@ -1473,6 +1932,7 @@ pub fn sweep_automatic_runs(store: &crate::store_lock::StoreHandle, runners: &Li
         let _ = maybe_start_automatic_run(store, runners, &gid);
     }
     retry_pending_integrations(store, runners);
+    sweep_upstream_runs(store, runners);
     crate::live_results::process_pr_refreshes_background(store);
 }
 
@@ -2000,6 +2460,57 @@ prompt = "first"
             );
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
+    }
+
+    #[test]
+    fn an_upstream_run_waits_behind_every_after_run() {
+        let f = fixture("upstream-order", "ok");
+        let g = f.store.lock();
+        let up = g
+            .queue_upstream_live_run(&f.gid, 0, "Greeting", "abc123")
+            .unwrap();
+        let after = g
+            .queue_live_run(&f.gid, LiveRunKind::Live, 0, "Greeting", "manual")
+            .unwrap();
+        assert_eq!(
+            g.next_queued_live_run(&f.gid).unwrap().unwrap().run_id,
+            after
+        );
+        g.fail_queued_live_run(&after, "x").unwrap();
+        let next = g.next_queued_live_run(&f.gid).unwrap().unwrap();
+        assert_eq!(next.run_id, up);
+        assert_eq!(next.role, ROLE_UPSTREAM);
+        assert_eq!(next.upstream_sha.as_deref(), Some("abc123"));
+        assert_eq!(next.integration, "none");
+    }
+
+    #[test]
+    fn an_upstream_run_in_flight_is_per_action() {
+        let f = fixture("upstream-inflight", "ok");
+        let g = f.store.lock();
+        assert!(!g.upstream_run_in_flight(&f.gid, 0).unwrap());
+        let id = g.queue_upstream_live_run(&f.gid, 0, "L", "abc").unwrap();
+        assert!(g.upstream_run_in_flight(&f.gid, 0).unwrap());
+        assert!(!g.upstream_run_in_flight(&f.gid, 1).unwrap());
+        g.fail_queued_live_run(&id, "x").unwrap();
+        assert!(!g.upstream_run_in_flight(&f.gid, 0).unwrap());
+    }
+
+    #[test]
+    fn a_review_without_markers_queues_no_upstream_run() {
+        let f = fixture("upstream-none", "ok");
+        f.store
+            .lock()
+            .conn
+            .execute(
+                "UPDATE guardians SET live_actions_auto_ran_at_ms=1 WHERE id=?",
+                rusqlite::params![f.gid],
+            )
+            .unwrap();
+        queue_upstream_runs_for(&f.store, &f.runners, &f.gid);
+        let runs = guardian_live_runs_conn(&f.store.lock().conn, &f.gid).unwrap();
+        assert!(runs.is_empty(), "{runs:?}");
+        assert!(f.agent.prompts.lock().is_empty());
     }
 
     /// A fixture whose agent reports a resumable session and answers a resume

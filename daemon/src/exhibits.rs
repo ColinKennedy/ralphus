@@ -397,6 +397,66 @@ pub struct ExhibitFill {
     pub updated_at_ms: i64,
 }
 
+/// Where a slot's `review-upstream` side stands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UpstreamState {
+    /// A marker wants it and no run has finished yet.
+    Pending,
+    /// The run captured it.
+    Captured,
+    /// The feature does not exist at the review's base: an expected answer,
+    /// not a failure.
+    Absent,
+    /// The base could not be prepared or run (`missing_reason` names the step).
+    NotRunnable,
+    /// The run itself failed.
+    Failed,
+    /// The review's budget was spent before the run.
+    SkippedBudget,
+    /// A capture exists but the base has moved since; a re-run is due.
+    Stale,
+}
+
+impl UpstreamState {
+    const ALL: [Self; 7] = [
+        Self::Pending,
+        Self::Captured,
+        Self::Absent,
+        Self::NotRunnable,
+        Self::Failed,
+        Self::SkippedBudget,
+        Self::Stale,
+    ];
+
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Captured => "captured",
+            Self::Absent => "absent",
+            Self::NotRunnable => "not_runnable",
+            Self::Failed => "failed",
+            Self::SkippedBudget => "skipped_budget",
+            Self::Stale => "stale",
+        }
+    }
+
+    #[must_use]
+    pub fn parse(raw: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|s| s.as_str() == raw)
+    }
+}
+
+/// A slot's `review-upstream` capture: the state, the base commit it was made
+/// (or is due) against, and what was delivered.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct UpstreamFill {
+    pub state: UpstreamState,
+    pub upstream_sha: String,
+    pub fill: ExhibitFill,
+}
+
 /// One slot of a review: its request, origin and current fill.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct ExhibitSlot {
@@ -406,6 +466,8 @@ pub struct ExhibitSlot {
     /// Why an inferred request was added.
     pub why: Option<String>,
     pub fill: Option<ExhibitFill>,
+    /// The `review-upstream` side; `None` until a marker asks for it.
+    pub upstream: Option<UpstreamFill>,
 }
 
 /// Every exhibit slot of a review, ordered by action and slot.
@@ -482,9 +544,64 @@ pub fn guardian_exhibit_slots_conn(
             origin: ExhibitOrigin::parse(&origin),
             why,
             fill,
+            upstream: None,
         });
     }
+    for (key, up) in upstream_fills_conn(conn, guardian_id)? {
+        if let Some(slot) = out.iter_mut().find(|s| s.key == key) {
+            slot.upstream = Some(up);
+        }
+    }
     Ok(out)
+}
+
+/// Every `review-upstream` fill of a review.
+///
+/// # Errors
+///
+/// On a database failure.
+pub fn upstream_fills_conn(
+    conn: &rusqlite::Connection,
+    guardian_id: &str,
+) -> Result<Vec<(SlotKey, UpstreamFill)>> {
+    let mut stmt = conn.prepare(
+        "SELECT action_idx, slot_idx, state, upstream_sha, delivered_kind, url, caption, text,
+                missing_reason, local_path, forge_upload_id, stale_upload_ids, run_id,
+                updated_at_ms
+         FROM guardian_exhibit_upstream_fills WHERE guardian_id = ?
+         ORDER BY action_idx, slot_idx",
+    )?;
+    let rows = stmt.query_map(rusqlite::params![guardian_id], |r| {
+        let delivered: Option<String> = r.get(4)?;
+        let stale: Option<String> = r.get(11)?;
+        let state: String = r.get(2)?;
+        Ok((
+            SlotKey {
+                action_idx: r.get(0)?,
+                slot_idx: r.get(1)?,
+            },
+            UpstreamFill {
+                state: UpstreamState::parse(&state).unwrap_or(UpstreamState::Pending),
+                upstream_sha: r.get(3)?,
+                fill: ExhibitFill {
+                    delivered_kind: delivered.as_deref().and_then(ExhibitKind::parse),
+                    url: r.get(5)?,
+                    caption: r.get(6)?,
+                    text: r.get(7)?,
+                    missing_reason: r.get(8)?,
+                    local_path: r.get(9)?,
+                    forge_upload_id: r.get(10)?,
+                    stale_upload_ids: stale
+                        .as_deref()
+                        .and_then(|s| serde_json::from_str(s).ok())
+                        .unwrap_or_default(),
+                    run_id: r.get(12)?,
+                    updated_at_ms: r.get(13)?,
+                },
+            },
+        ))
+    })?;
+    Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
 }
 
 impl crate::store::Store {
@@ -653,6 +770,159 @@ impl crate::store::Store {
             ],
         )?;
         Ok(())
+    }
+
+    /// Record a slot's `review-upstream` side, replacing the earlier one. As
+    /// with [`Self::set_exhibit_fill`], the replaced upload's id carries over
+    /// into `stale_upload_ids` so the old file is deleted only after the new
+    /// one is in place.
+    ///
+    /// # Errors
+    ///
+    /// On a database failure.
+    pub fn set_upstream_fill(
+        &self,
+        guardian_id: &str,
+        key: SlotKey,
+        up: &UpstreamFill,
+    ) -> Result<Option<UpstreamFill>> {
+        let previous = upstream_fills_conn(&self.conn, guardian_id)?
+            .into_iter()
+            .find(|(k, _)| *k == key)
+            .map(|(_, up)| up);
+        let mut stale = up.fill.stale_upload_ids.clone();
+        if let Some(prev) = &previous {
+            for id in prev
+                .fill
+                .stale_upload_ids
+                .iter()
+                .chain(prev.fill.forge_upload_id.iter())
+            {
+                if Some(id) != up.fill.forge_upload_id.as_ref() && !stale.contains(id) {
+                    stale.push(id.clone());
+                }
+            }
+        }
+        self.write_upstream_fill(guardian_id, key, up, &stale)?;
+        Ok(previous)
+    }
+
+    fn write_upstream_fill(
+        &self,
+        guardian_id: &str,
+        key: SlotKey,
+        up: &UpstreamFill,
+        stale: &[String],
+    ) -> Result<()> {
+        let fill = &up.fill;
+        self.conn.execute(
+            "INSERT INTO guardian_exhibit_upstream_fills
+                (guardian_id, action_idx, slot_idx, state, upstream_sha, delivered_kind, url,
+                 caption, text, missing_reason, local_path, forge_upload_id, stale_upload_ids,
+                 run_id, updated_at_ms)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT(guardian_id, action_idx, slot_idx) DO UPDATE SET
+                state=excluded.state, upstream_sha=excluded.upstream_sha,
+                delivered_kind=excluded.delivered_kind, url=excluded.url,
+                caption=excluded.caption, text=excluded.text,
+                missing_reason=excluded.missing_reason, local_path=excluded.local_path,
+                forge_upload_id=excluded.forge_upload_id,
+                stale_upload_ids=excluded.stale_upload_ids, run_id=excluded.run_id,
+                updated_at_ms=excluded.updated_at_ms",
+            rusqlite::params![
+                guardian_id,
+                key.action_idx,
+                key.slot_idx,
+                up.state.as_str(),
+                up.upstream_sha,
+                fill.delivered_kind.map(ExhibitKind::as_str),
+                fill.url,
+                fill.caption,
+                fill.text,
+                fill.missing_reason,
+                fill.local_path,
+                fill.forge_upload_id,
+                (!stale.is_empty())
+                    .then(|| serde_json::to_string(stale).unwrap_or_else(|_| "[]".into())),
+                fill.run_id,
+                fill.updated_at_ms
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Every review that has a `review-upstream` side to maintain.
+    ///
+    /// # Errors
+    ///
+    /// On a database failure.
+    pub fn guardians_with_upstream_fills(&self) -> Result<Vec<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT DISTINCT guardian_id FROM guardian_exhibit_upstream_fills")?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        Ok(rows.flatten().collect())
+    }
+
+    /// Forget a slot's `review-upstream` side (its marker is gone).
+    ///
+    /// # Errors
+    ///
+    /// On a database failure.
+    pub fn delete_upstream_fill(&self, guardian_id: &str, key: SlotKey) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM guardian_exhibit_upstream_fills
+             WHERE guardian_id=? AND action_idx=? AND slot_idx=?",
+            rusqlite::params![guardian_id, key.action_idx, key.slot_idx],
+        )?;
+        Ok(())
+    }
+
+    /// Record that a `review-upstream` capture is now on the forge.
+    ///
+    /// # Errors
+    ///
+    /// On a database failure.
+    pub fn record_upstream_upload(
+        &self,
+        guardian_id: &str,
+        key: SlotKey,
+        url: &str,
+        upload_id: Option<&str>,
+    ) -> Result<()> {
+        self.conn.execute(
+            "UPDATE guardian_exhibit_upstream_fills SET url=?, forge_upload_id=?, local_path=NULL
+             WHERE guardian_id=? AND action_idx=? AND slot_idx=?",
+            rusqlite::params![url, upload_id, guardian_id, key.action_idx, key.slot_idx],
+        )?;
+        Ok(())
+    }
+
+    /// Forget stale `review-upstream` upload ids once they are deleted.
+    ///
+    /// # Errors
+    ///
+    /// On a database failure.
+    pub fn clear_stale_upstream_uploads(
+        &self,
+        guardian_id: &str,
+        key: SlotKey,
+        removed: &[String],
+    ) -> Result<()> {
+        let Some((_, up)) = upstream_fills_conn(&self.conn, guardian_id)?
+            .into_iter()
+            .find(|(k, _)| *k == key)
+        else {
+            return Ok(());
+        };
+        let keep: Vec<String> = up
+            .fill
+            .stale_upload_ids
+            .iter()
+            .filter(|id| !removed.contains(id))
+            .cloned()
+            .collect();
+        self.write_upstream_fill(guardian_id, key, &up, &keep)
     }
 
     /// Record that a slot's captured file is now on the forge; its cached
@@ -1995,6 +2265,80 @@ pub fn render_side_content(
     }
 }
 
+/// The first seven characters of a commit id.
+fn short_sha(sha: &str) -> &str {
+    sha.get(..7).unwrap_or(sha)
+}
+
+/// What to put between a `review-upstream` marker pair, by the side's state.
+/// Always one line unless the capture is terminal text (as for the `after`
+/// side), with `|` escaped so the pair stays valid inside a table cell. An
+/// absent feature reads as an expected answer, not a failure; a stale capture
+/// keeps showing, with a quiet note that the base moved.
+#[must_use]
+pub fn render_upstream_content(
+    requested: ExhibitKind,
+    up: Option<&UpstreamFill>,
+    forge: crate::forge::ForgeKind,
+) -> String {
+    let Some(up) = up else {
+        return PENDING_PLACEHOLDER.to_string();
+    };
+    let sha = short_sha(&up.upstream_sha);
+    let reason = |fallback: &str| {
+        one_line(up.fill.missing_reason.as_deref().unwrap_or(fallback)).replace('|', "\\|")
+    };
+    let at = if sha.is_empty() {
+        CompareTarget::ReviewUpstream.as_str().to_string()
+    } else {
+        format!("{} `{sha}`", CompareTarget::ReviewUpstream.as_str())
+    };
+    match up.state {
+        UpstreamState::Pending => format!("_Pending: {at} capture not run yet._"),
+        UpstreamState::Captured | UpstreamState::Stale => {
+            let own = up.fill.caption.as_deref().map(one_line);
+            let caption = match (&own, up.state) {
+                (Some(c), UpstreamState::Stale) => {
+                    format!("{at}: {c} (base has moved; refreshing)")
+                }
+                (None, UpstreamState::Stale) => format!("{at} (base has moved; refreshing)"),
+                (Some(c), _) => format!("{at}: {c}"),
+                (None, _) => at.clone(),
+            };
+            if up.fill.url.is_none() && up.fill.text.is_none() {
+                return match up.fill.missing_reason.as_deref() {
+                    Some(r) => format!(
+                        "_Not captured at {at}: {}_",
+                        one_line(r).replace('|', "\\|")
+                    ),
+                    None => format!("_Pending: {at} capture not uploaded yet._"),
+                };
+            }
+            let out = render_side_content(requested, Some(&up.fill), Some(&caption), forge);
+            if up.fill.url.is_some() {
+                out.replace('|', "\\|")
+            } else {
+                out
+            }
+        }
+        UpstreamState::Absent => format!(
+            "_Absent at {at}: {}_",
+            reason("the feature does not exist there")
+        ),
+        UpstreamState::NotRunnable => format!(
+            "_⚠️ not runnable at {at}: {}_",
+            reason("the base could not be prepared")
+        ),
+        UpstreamState::Failed => format!(
+            "_❌ {at} capture failed: {}_",
+            reason("the capture run failed")
+        ),
+        UpstreamState::SkippedBudget => {
+            format!("_⏭ skipped (budget): {at} capture; the review's budget is spent._")
+        }
+    }
+}
+
 /// The result of [`splice_exhibits`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Spliced {
@@ -2100,6 +2444,7 @@ mod tests {
             origin: ExhibitOrigin::Handoff,
             why: None,
             fill: None,
+            upstream: None,
         }
     }
 
@@ -3127,5 +3472,96 @@ EXHIBIT: gif | a || output | C",
         assert_eq!(fill.stale_upload_ids, vec!["12".to_string()]);
         assert!(store.guardian_has_exhibits(g).unwrap());
         assert!(!store.guardian_has_exhibits("other").unwrap());
+    }
+}
+
+#[cfg(test)]
+mod upstream_render_tests {
+    use super::*;
+    use crate::forge::ForgeKind;
+
+    fn up(state: UpstreamState, url: Option<&str>, reason: Option<&str>) -> UpstreamFill {
+        UpstreamFill {
+            state,
+            upstream_sha: "0123456789abcdef".to_string(),
+            fill: ExhibitFill {
+                url: url.map(str::to_string),
+                caption: Some("chart at zoom 1".to_string()),
+                missing_reason: reason.map(str::to_string),
+                updated_at_ms: 1,
+                ..ExhibitFill::default()
+            },
+        }
+    }
+
+    #[test]
+    fn every_state_renders_one_line_for_both_forges() {
+        for forge in [ForgeKind::GitHub, ForgeKind::GitLab] {
+            for state in UpstreamState::ALL {
+                let with_url = state == UpstreamState::Captured || state == UpstreamState::Stale;
+                let fill = up(
+                    state,
+                    with_url.then_some("https://x/y.png"),
+                    Some("step | `npm ci`\nfailed"),
+                );
+                let out = render_upstream_content(ExhibitKind::Screenshot, Some(&fill), forge);
+                assert!(!out.contains('\n'), "{state:?}/{forge:?}: {out:?}");
+                assert!(!out.replace(r"\|", "").contains('|'), "{state:?}: {out:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn each_state_names_itself() {
+        let f = ForgeKind::GitHub;
+        let r = |s, url, why| {
+            render_upstream_content(ExhibitKind::Screenshot, Some(&up(s, url, why)), f)
+        };
+        assert!(r(UpstreamState::Pending, None, None).contains("Pending"));
+        let captured = r(UpstreamState::Captured, Some("https://x/y.png"), None);
+        assert!(captured.contains("https://x/y.png") && captured.contains("0123456"));
+        let stale = r(UpstreamState::Stale, Some("https://x/y.png"), None);
+        assert!(stale.contains("https://x/y.png") && stale.contains("base has moved"));
+        let absent = r(UpstreamState::Absent, None, Some("no zoom yet"));
+        assert!(absent.contains("Absent") && !absent.contains("❌") && !absent.contains("⚠️"));
+        let nr = r(UpstreamState::NotRunnable, None, Some("step npm ci"));
+        assert!(nr.contains("not runnable at review-upstream") && nr.contains("npm ci"));
+        assert!(r(UpstreamState::Failed, None, Some("boom")).contains("❌"));
+        assert!(r(UpstreamState::SkippedBudget, None, None).contains("⏭ skipped (budget)"));
+    }
+
+    #[test]
+    fn a_failed_side_shows_no_image() {
+        for state in [
+            UpstreamState::Absent,
+            UpstreamState::NotRunnable,
+            UpstreamState::Failed,
+            UpstreamState::SkippedBudget,
+            UpstreamState::Pending,
+        ] {
+            let out = render_upstream_content(
+                ExhibitKind::Screenshot,
+                Some(&up(state, None, Some("why"))),
+                ForgeKind::GitLab,
+            );
+            assert!(!out.contains("!["), "{state:?}: {out}");
+            assert!(!out.contains("<img"), "{state:?}: {out}");
+        }
+    }
+
+    #[test]
+    fn no_fill_is_the_pending_placeholder() {
+        assert_eq!(
+            render_upstream_content(ExhibitKind::Gif, None, ForgeKind::GitHub),
+            PENDING_PLACEHOLDER
+        );
+    }
+
+    #[test]
+    fn state_names_round_trip() {
+        for s in UpstreamState::ALL {
+            assert_eq!(UpstreamState::parse(s.as_str()), Some(s));
+        }
+        assert_eq!(UpstreamState::parse("nope"), None);
     }
 }

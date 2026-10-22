@@ -3023,6 +3023,28 @@ impl Store {
                 updated_at_ms   INTEGER NOT NULL,
                 PRIMARY KEY (guardian_id, action_idx, slot_idx)
             );
+            -- What a `review-upstream` run captured for an exhibit slot: the
+            -- state of the slot at the upstream base the run was cut from.
+            -- `state` is captured / absent / not_runnable / failed. Rows are
+            -- kept per upstream sha so a stale one can be told from a fresh one.
+            CREATE TABLE IF NOT EXISTS guardian_exhibit_upstream_fills (
+                guardian_id     TEXT NOT NULL REFERENCES guardians(id) ON DELETE CASCADE,
+                action_idx      INTEGER NOT NULL,
+                slot_idx        INTEGER NOT NULL,
+                state           TEXT NOT NULL,
+                upstream_sha    TEXT NOT NULL,
+                delivered_kind  TEXT,
+                url             TEXT,
+                caption         TEXT,
+                text            TEXT,
+                missing_reason  TEXT,
+                local_path      TEXT,
+                forge_upload_id TEXT,
+                stale_upload_ids TEXT,
+                run_id          TEXT,
+                updated_at_ms   INTEGER NOT NULL,
+                PRIMARY KEY (guardian_id, action_idx, slot_idx)
+            );
             -- A PR whose `## Live-Test Results` section needs re-rendering.
             -- A row lives until the forge accepts the update.
             CREATE TABLE IF NOT EXISTS pr_live_result_refresh (
@@ -3545,6 +3567,11 @@ impl Store {
             "ALTER TABLE guardian_pending_exhibits ADD COLUMN compare TEXT",
             "ALTER TABLE guardian_pending_exhibits ADD COLUMN marker_key TEXT",
             "ALTER TABLE guardian_live_run_evidence ADD COLUMN original_result TEXT",
+            // Which side of a comparison a live run captures (`after` or
+            // `review-upstream`) and the upstream sha a `review-upstream`
+            // run was cut from.
+            "ALTER TABLE guardian_live_runs ADD COLUMN role TEXT NOT NULL DEFAULT 'after'",
+            "ALTER TABLE guardian_live_runs ADD COLUMN upstream_sha TEXT",
             // A scored-proof threshold a preset supplies to an extending
             // proof step's unset `pass_score`.
             "ALTER TABLE presets ADD COLUMN pass_score INTEGER",

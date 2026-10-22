@@ -5709,7 +5709,7 @@ writer placed anywhere in the description: only the text between a pair's
 markers is rewritten, a slot with an `after` pair there gets no block in the
 managed section, and no `review-upstream` block is ever appended. Slots whose
 `review-upstream` pair is present are recorded in the Cartographer ("exhibit
-slots need an upstream run"); capturing that side is a separate step. See
+slots need an upstream run") and each such action gets one `review-upstream` live run (a normal live-run row with `role: "review-upstream"` and `upstream_sha`, queued behind the after-runs, detached checkout at the fetched base, no integration, counted against `maximum_budget_usd`). Each slot item in `GET .../exhibits` carries `review_upstream` (`null` or `{state, upstream_sha, url, caption, text, missing_reason, has_file}`; state is one of `pending|captured|absent|not_runnable|failed|skipped_budget|stale`). See
 [`exhibits.md`](exhibits.md) for the request/report syntax and limits.
 
 A live agent ends its reply with `RALPHUS_LIVE_RESULT: {"verdict": "...",

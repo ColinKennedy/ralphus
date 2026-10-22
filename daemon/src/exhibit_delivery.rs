@@ -124,7 +124,251 @@ pub fn record_run(
     summary
 }
 
+/// The word a `review-upstream` run opens a `missing` reason with when the
+/// feature does not exist at the base.
+pub const ABSENT_PREFIX: &str = "absent";
+/// The words it opens a `missing` reason with when the base cannot run it.
+pub const NOT_RUNNABLE_PREFIX: &str = "not runnable";
+
+/// The state a `missing` reason from a `review-upstream` run stands for, and
+/// the reason with its leading word and punctuation removed. A reason naming
+/// neither leaves the slot failed.
+fn classify_missing(reason: &str) -> (crate::exhibits::UpstreamState, String) {
+    use crate::exhibits::UpstreamState;
+    let trimmed = reason.trim();
+    let lower = trimmed.to_lowercase();
+    for (prefix, state) in [
+        (ABSENT_PREFIX, UpstreamState::Absent),
+        (NOT_RUNNABLE_PREFIX, UpstreamState::NotRunnable),
+    ] {
+        if let Some(rest) = lower.strip_prefix(prefix) {
+            let cut = trimmed.len() - rest.len();
+            let rest = trimmed[cut..].trim_start_matches([':', '-', ' ']).trim();
+            let rest = if rest.is_empty() { trimmed } else { rest };
+            return (state, rest.to_string());
+        }
+    }
+    (UpstreamState::Failed, trimmed.to_string())
+}
+
+/// Record a `review-upstream` run's exhibits into the `review-upstream` side of
+/// its action's slots, as [`record_run`] does for the `after` side. A reported
+/// file takes what its delivery says; a reported `missing` is absent or not
+/// runnable when it says so and failed otherwise; a slot the run did not report
+/// failed. `upstream_sha` is the base commit the run captured against.
+#[allow(clippy::too_many_arguments)]
+pub fn record_upstream_run(
+    store: &crate::store_lock::StoreHandle,
+    guardian_id: &str,
+    run_id: &str,
+    upstream_sha: &str,
+    slots: &[ExhibitSlot],
+    reports: &[SlotReport],
+    outcomes: &[SlotOutcome],
+    undelivered: &str,
+) -> RecordSummary {
+    use crate::exhibits::{UpstreamFill, UpstreamState};
+    let mut summary = RecordSummary::default();
+    for slot in slots {
+        let label = crate::exhibits::slot_label(slot.key);
+        let mut fill = ExhibitFill {
+            run_id: Some(run_id.to_string()),
+            updated_at_ms: crate::store::now_ms(),
+            ..ExhibitFill::default()
+        };
+        let mut state = UpstreamState::Captured;
+        match reports.iter().find(|r| r.key() == slot.key) {
+            None => {
+                state = UpstreamState::Failed;
+                fill.missing_reason = Some("the review-upstream run did not report it".to_string());
+            }
+            Some(SlotReport::Missing { reason, .. }) => {
+                let (s, why) = classify_missing(reason);
+                state = s;
+                fill.missing_reason = Some(why);
+            }
+            Some(SlotReport::File { caption, .. }) => {
+                fill.caption.clone_from(caption);
+                match outcomes.iter().find(|o| {
+                    o.action_idx == slot.key.action_idx && o.slot_idx == slot.key.slot_idx
+                }) {
+                    None => fill.missing_reason = Some(undelivered.to_string()),
+                    Some(outcome) => {
+                        fill.delivered_kind = outcome.delivered_kind;
+                        fill.url.clone_from(&outcome.url);
+                        fill.forge_upload_id.clone_from(&outcome.upload_id);
+                        fill.text.clone_from(&outcome.text);
+                        fill.missing_reason.clone_from(&outcome.missing_reason);
+                        fill.local_path.clone_from(&outcome.kept_path);
+                    }
+                }
+                if fill.url.is_none() && fill.text.is_none() && fill.local_path.is_none() {
+                    state = UpstreamState::Failed;
+                }
+            }
+        }
+        if state == UpstreamState::Captured {
+            summary.delivered.push(label);
+        } else {
+            summary.missing.push(label);
+        }
+        let up = UpstreamFill {
+            state,
+            upstream_sha: upstream_sha.to_string(),
+            fill,
+        };
+        let _ = store.lock().set_upstream_fill(guardian_id, slot.key, &up);
+    }
+    summary
+}
+
 // ---- uploading at publish time ---------------------------------------------
+
+/// [`upload_pending`] for the `review-upstream` side of `slots`.
+pub fn upload_pending_upstream(
+    store: &crate::store_lock::StoreHandle,
+    guardian_id: &str,
+    pr_number: i64,
+    client: &crate::forge::ForgeClient,
+    slots: &[ExhibitSlot],
+) {
+    for slot in slots {
+        let Some(up) = &slot.upstream else {
+            continue;
+        };
+        let fill = &up.fill;
+        match (fill.url.as_deref(), fill.local_path.as_deref()) {
+            (None, Some(local)) => {
+                let uploaded = upload_one_upstream(
+                    store,
+                    guardian_id,
+                    pr_number,
+                    client,
+                    slot.key,
+                    Path::new(local),
+                );
+                if uploaded && !fill.stale_upload_ids.is_empty() {
+                    delete_stale_upstream(
+                        store,
+                        guardian_id,
+                        client,
+                        slot.key,
+                        &fill.stale_upload_ids,
+                    );
+                }
+            }
+            _ if !fill.stale_upload_ids.is_empty() => {
+                delete_stale_upstream(store, guardian_id, client, slot.key, &fill.stale_upload_ids);
+            }
+            _ => {}
+        }
+    }
+}
+
+fn upload_one_upstream(
+    store: &crate::store_lock::StoreHandle,
+    guardian_id: &str,
+    pr_number: i64,
+    client: &crate::forge::ForgeClient,
+    key: SlotKey,
+    local: &Path,
+) -> bool {
+    let Ok(bytes) = std::fs::read(local) else {
+        mark_upstream_failed(store, guardian_id, key, "the captured file is gone");
+        return false;
+    };
+    let name = local
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "exhibit".to_string());
+    let ctype = ralphus_runner::exhibit_media::content_type(local);
+    let uploaded = match client.upload_attachment(&name, ctype, &bytes) {
+        Ok(up) => Ok((up.url, up.upload_id)),
+        Err(api_error) => match client.kind() {
+            crate::forge::ForgeKind::GitHub => match gh_attach_status(&client.web_host()) {
+                Ok(()) => gh_attach(client, pr_number, local)
+                    .map(|url| (url, None))
+                    .map_err(|gh_error| format!("{api_error}; gh --attach: {gh_error}")),
+                Err(why) => Err(format!("{api_error}; gh fallback unavailable: {why}")),
+            },
+            crate::forge::ForgeKind::GitLab => Err(api_error),
+        },
+    };
+    match uploaded {
+        Ok((url, upload_id)) => {
+            let guard = store.lock();
+            let _ = guard.record_upstream_upload(guardian_id, key, &url, upload_id.as_deref());
+            let _ = std::fs::remove_file(local);
+            crate::cartographer::Note::new("guardian")
+                .guardian(guardian_id)
+                .scope("live_action")
+                .emit(
+                    &guard,
+                    "review-upstream exhibit uploaded",
+                    serde_json::json!({ "slot": key, "url": url, "bytes": bytes.len() }),
+                );
+            true
+        }
+        Err(message) => {
+            crate::rlog!(
+                WARNING,
+                "ralphus [guardian] review {guardian_id} review-upstream exhibit {} upload failed: {message}",
+                crate::exhibits::slot_label(key)
+            );
+            mark_upstream_failed(
+                store,
+                guardian_id,
+                key,
+                &format!("upload failed: {message}"),
+            );
+            false
+        }
+    }
+}
+
+fn mark_upstream_failed(
+    store: &crate::store_lock::StoreHandle,
+    guardian_id: &str,
+    key: SlotKey,
+    reason: &str,
+) {
+    let guard = store.lock();
+    let Ok(fills) = crate::exhibits::upstream_fills_conn(&guard.conn, guardian_id) else {
+        return;
+    };
+    let Some((_, mut up)) = fills.into_iter().find(|(k, _)| *k == key) else {
+        return;
+    };
+    up.state = crate::exhibits::UpstreamState::Failed;
+    up.fill.missing_reason = Some(reason.to_string());
+    up.fill.local_path = None;
+    let _ = guard.set_upstream_fill(guardian_id, key, &up);
+}
+
+fn delete_stale_upstream(
+    store: &crate::store_lock::StoreHandle,
+    guardian_id: &str,
+    client: &crate::forge::ForgeClient,
+    key: SlotKey,
+    stale: &[String],
+) {
+    let mut removed = Vec::new();
+    for id in stale {
+        match client.kind() {
+            crate::forge::ForgeKind::GitHub => removed.push(id.clone()),
+            crate::forge::ForgeKind::GitLab => {
+                if client.delete_attachment(id).is_ok() {
+                    removed.push(id.clone());
+                }
+            }
+        }
+    }
+    if !removed.is_empty() {
+        let _ = store
+            .lock()
+            .clear_stale_upstream_uploads(guardian_id, key, &removed);
+    }
+}
 
 /// Upload every captured, not-yet-uploaded file among `slots` through
 /// `client`, and delete uploads those files replaced once the new ones are
@@ -390,6 +634,28 @@ impl TestDir {
 mod tests {
     use super::*;
     use crate::exhibits::{ExhibitKind, ExhibitOrigin, ExhibitRequest};
+
+    #[test]
+    fn classify_missing_separates_absent_and_not_runnable_from_failed() {
+        use crate::exhibits::UpstreamState;
+        assert_eq!(
+            classify_missing("Absent: no zoom slider yet"),
+            (UpstreamState::Absent, "no zoom slider yet".to_string())
+        );
+        assert_eq!(
+            classify_missing("not runnable - npm ci failed"),
+            (UpstreamState::NotRunnable, "npm ci failed".to_string())
+        );
+        assert_eq!(
+            classify_missing("absent").0,
+            UpstreamState::Absent,
+            "a bare prefix keeps the reason"
+        );
+        assert_eq!(
+            classify_missing("browser crashed"),
+            (UpstreamState::Failed, "browser crashed".to_string())
+        );
+    }
 
     #[test]
     fn the_cache_root_is_never_the_state_directory() {
