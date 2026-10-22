@@ -16795,8 +16795,8 @@ fn apply_live_action_fields(
     }
     let agent = resolver_field(req_agent);
     let model = resolver_field(req_model);
-    let effective_agent = agent.map_or(guardian.live_action_agent.as_deref(), |a| a);
-    let effective_model = model.map_or(guardian.live_action_model.as_deref(), |m| m);
+    let effective_agent = agent.unwrap_or(guardian.live_action_agent.as_deref());
+    let effective_model = model.unwrap_or(guardian.live_action_model.as_deref());
     if let Some(reply) = reject_invalid_live_action_pair(
         store,
         effective_agent,
