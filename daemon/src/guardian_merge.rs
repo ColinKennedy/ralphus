@@ -6823,7 +6823,10 @@ fn staged_merge_pass(
             // branch merged while earlier branches were rebuilding. A merged
             // branch needs no rebase, and once every enabled branch is merged
             // the review is settled and the pass stops.
-            if let Ok(fresh) = store.lock().get_guardian(id) {
+            // Read into a binding first: a guard in the `if let` scrutinee
+            // would live through the body, which locks the store again.
+            let fresh = store.lock().get_guardian(id);
+            if let Ok(fresh) = fresh {
                 let now_merged = fresh
                     .branches
                     .iter()
