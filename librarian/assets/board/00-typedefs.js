@@ -619,6 +619,8 @@
        * @property {Record<string,InputResolution>} [input_resolutions]
        * @property {string} [resolver_agent]
        * @property {string} [resolver_model]
+       * @property {string|null} [live_action_agent] - Agent live actions run on; unset means the resolver agent.
+       * @property {string|null} [live_action_model]
        * @property {boolean} [resolver_thinking_capable] - RAL-516: whether the effective resolver agent can emit thinking output at all (backend capability folded with any per-profile override, computed server-side). The Live View hides its "Show Thinking" checkbox entirely when this is `false`.
        * @property {string} [summary_agent]
        * @property {string} [summary_model]
@@ -1113,6 +1115,8 @@
        * @typedef {object} ProjectReviewSettingsRaw
        * @property {string|null|undefined} default_resolver_agent
        * @property {string|null|undefined} default_resolver_model
+       * @property {string|null|undefined} default_live_action_agent
+       * @property {string|null|undefined} default_live_action_model
        * @property {string|null|undefined} default_machine
        * @property {number|null|undefined} default_maximum_budget_usd
        * @property {string|null|undefined} default_proof_scope
@@ -1151,6 +1155,8 @@
        * @typedef {object} EffectiveReviewDefaults
        * @property {string} resolver_agent
        * @property {string|undefined} resolver_model
+       * @property {string|undefined} live_action_agent
+       * @property {string|undefined} live_action_model
        * @property {string|undefined} machine
        * @property {number|undefined} maximum_budget_usd
        * @property {string} proof_scope

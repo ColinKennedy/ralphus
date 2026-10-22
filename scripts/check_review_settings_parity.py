@@ -21,6 +21,8 @@ MAPPING = {
     "skip_worktrees": "skip_worktrees",
     "resolver_agent": "agent",
     "resolver_model": "model",
+    "live_action_agent": "live_action_agent",
+    "live_action_model": "live_action_model",
     "proof_scope": "proof_scope",
     "ci_deferral": "ci_deferral",
     "proof_skip_auto_clean": "skip_auto_clean",

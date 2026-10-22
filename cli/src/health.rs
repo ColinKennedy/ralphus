@@ -2056,6 +2056,60 @@ fn check_default_resolver_agent(daemon_url: &str, cwd: &Path) -> CheckResult {
     }
 }
 
+/// Validates the project's live-action agent default, when one is set, the
+/// same way [`check_default_resolver_agent`] validates the resolver default.
+/// Passes with a note when none is set (live actions use each review's
+/// resolver agent).
+fn check_default_live_action_agent(daemon_url: &str, cwd: &Path) -> CheckResult {
+    const NAME: &str = "default-live-action-agent";
+    let client = DaemonClient::new(daemon_url);
+    let response = match client.list_agents(cwd) {
+        Ok(response) => response,
+        Err(e) => {
+            return CheckResult::new(
+                NAME,
+                FAIL,
+                format!("could not reach daemon to check the default live-action agent: {e}"),
+                "A misconfigured live-action agent could fail silently when a live action runs.",
+                "Ensure the daemon is reachable, then re-run this check.",
+            );
+        }
+    };
+    let Some(agent) = response["default_live_action_agent"].as_str() else {
+        return CheckResult::new(
+            NAME,
+            PASS,
+            "not set (live actions use each review's resolver agent)",
+            "Live actions run on the review's resolver agent.",
+            "No action needed.",
+        );
+    };
+    let known = response["agents"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .any(|a| a["id"].as_str() == Some(agent));
+    if known {
+        CheckResult::new(
+            NAME,
+            PASS,
+            agent,
+            "Reviews without their own live-action agent run live actions on this agent.",
+            "No action needed.",
+        )
+    } else {
+        CheckResult::new(
+            NAME,
+            FAIL,
+            format!(
+                "[review].default_live_action_agent = \"{agent}\" does not match any                  built-in backend or configured [agent.profiles.*] entry for this project"
+            ),
+            "Live actions fail to start instead of running on a working agent.",
+            "Fix [review].default_live_action_agent to name a built-in backend or a configured [agent.profiles.*] entry, or remove it to use the review's resolver agent.",
+        )
+    }
+}
+
 /// RAL-318: a live completion round-trip against the configured Arbiter
 /// agent/model, via `POST /api/health/arbiter`. Unlike every other check in
 /// this module (config shape/reachability only), this is a genuinely live,
@@ -2291,6 +2345,9 @@ pub fn run_checks(
             .map(|r| r.with_id(ID_AGENT_PROFILES)),
     );
     results.push(check_default_resolver_agent(daemon_url, cwd).with_id(ID_DEFAULT_RESOLVER_AGENT));
+    results.push(
+        check_default_live_action_agent(daemon_url, cwd).with_id(ID_DEFAULT_LIVE_ACTION_AGENT),
+    );
     if enable_live_agent_checks {
         results.push(check_arbiter(daemon_url).with_id(ID_ARBITER));
     }

@@ -779,6 +779,8 @@ instead of falling through to a global, non-project-aware default:
 | `.ralphus.toml [review]` key | Mirrors `[[review]]`'s... | Unset resolves to |
 | --- | --- | --- |
 | `default_resolver_model` | `model` | each backend's own default (`"qwen3:8b"` for ollama, `None` otherwise) |
+| `default_live_action_agent` | `live_action_agent` | the review's resolver agent (live actions run on it) |
+| `default_live_action_model` | `live_action_model` | the live-action agent's own default; the model follows whichever layer supplies the live-action agent, and a model without an agent is rejected |
 | `default_base_branch` | none (not a `[[review]]` key) | none; read only by existing-branch ingest, which falls back through the repository default branch and the closest of `main`/`master`/`beta` |
 | `default_machine` | `machine` | the local machine |
 | `default_maximum_budget_usd` | `maximum_budget_usd` | unbounded |
@@ -2381,9 +2383,16 @@ Field-by-field, this replaces:
 |---|---|
 | `name` | `POST .../rename` |
 | `base_branch` | `POST .../base` |
-| `resolver_agent`, `resolver_model`, `proof_scope`, `ci_deferral`, `proof_skip_auto_clean`, `skip_worktrees`, `skip_base_updates`, `base_update_mode`, `separate_pr_branch`, `match_pr_branch_name`, `auto_submit_pr_stack` | `POST .../settings` |
+| `resolver_agent`, `resolver_model`, `live_action_agent`, `live_action_model`, `proof_scope`, `ci_deferral`, `proof_skip_auto_clean`, `skip_worktrees`, `skip_base_updates`, `base_update_mode`, `separate_pr_branch`, `match_pr_branch_name`, `auto_submit_pr_stack` | `POST .../settings` |
 | `squash_projects` (full desired membership — every project in the list gets squash turned on, every other project on the review gets it turned off) | `POST .../squash` (one call per project) |
 | `build_env`, `manual_checks_env`, `branch_env` (keyed by branch id) | `POST .../build-env`, `POST .../manual-checks-env`, `POST .../branches/{id}/env` respectively — each an `{set, unset, clear}` object with the same three-way inherited-override shape those endpoints already use |
+
+`live_action_agent`/`live_action_model` (also accepted by `POST .../settings`)
+choose the agent that answers a live action's handoff question and runs it;
+omit a field to keep it, send `""` to clear it (back to the resolver agent),
+and a model without an agent is `400`. The agent is validated like
+`resolver_agent`. Live-action spend still counts toward the review's cost,
+and the merge-time integration step keeps using the resolver agent.
 
 Like `POST .../base`, changing `base_branch` or `resolver_agent`/
 `resolver_model` on a `merged`/`deployed` review is rejected with `409`;

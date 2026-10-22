@@ -33,6 +33,10 @@
        * @property {string} originalResolverAgent
        * @property {string} resolverModel
        * @property {string} originalResolverModel
+       * @property {string} liveActionAgent - "" means live actions use the review agent.
+       * @property {string} originalLiveActionAgent
+       * @property {string} liveActionModel
+       * @property {string} originalLiveActionModel
        * @property {string} machine
        * @property {string} originalMachine
        * @property {number|null} maximumBudgetUsd
@@ -118,6 +122,8 @@
         const proj = projects.find((p) => p.name === project);
         const resolverAgent = str(s.default_resolver_agent);
         const resolverModel = str(s.default_resolver_model);
+        const liveActionAgent = str(s.default_live_action_agent);
+        const liveActionModel = str(s.default_live_action_model);
         const machine = str(s.default_machine);
         const maximumBudgetUsd = s.default_maximum_budget_usd === null || s.default_maximum_budget_usd === undefined
           ? null
@@ -168,6 +174,8 @@
           effective,
           resolverAgent, originalResolverAgent: resolverAgent,
           resolverModel, originalResolverModel: resolverModel,
+          liveActionAgent, originalLiveActionAgent: liveActionAgent,
+          liveActionModel, originalLiveActionModel: liveActionModel,
           machine, originalMachine: machine,
           maximumBudgetUsd, originalMaximumBudgetUsd: maximumBudgetUsd,
           proofScope, originalProofScope: proofScope,
@@ -251,6 +259,34 @@
        * @returns {void}
        */
       function onProjectEditResolverModel(value) { if (projectReviewSettingsDraft) projectReviewSettingsDraft.resolverModel = value; }
+      /**
+       * Switches the project's live-action default between the review agent and its own agent.
+       * @param {boolean} same - true = use the review agent.
+       * @returns {void}
+       */
+      function onProjectEditLiveActionSame(same) {
+        if (!projectReviewSettingsDraft) return;
+        projectReviewSettingsDraft.liveActionAgent = same ? "" : (projectReviewSettingsDraft.resolverAgent || "claude-code");
+        if (same) projectReviewSettingsDraft.liveActionModel = "";
+        renderProjectReviewSettingsModal();
+      }
+      /**
+       * Stages a new live-action agent default and drops the model, which belongs to the previous agent.
+       * @param {string} value
+       * @returns {void}
+       */
+      function onProjectEditLiveActionAgent(value) {
+        if (!projectReviewSettingsDraft) return;
+        projectReviewSettingsDraft.liveActionAgent = value;
+        projectReviewSettingsDraft.liveActionModel = "";
+        renderProjectReviewSettingsModal();
+      }
+      /**
+       * Stages a new live-action model default, leaving focus in the text field.
+       * @param {string} value
+       * @returns {void}
+       */
+      function onProjectEditLiveActionModel(value) { if (projectReviewSettingsDraft) projectReviewSettingsDraft.liveActionModel = value; }
       /**
        * Stages a new machine default.
        * @param {string} value
@@ -460,7 +496,8 @@
       function renderProjectReviewSettingsModal() {
         const draft = projectReviewSettingsDraft;
         if (!draft) return;
-        const resolverSection = renderResolverFieldsHtml(draft.cwd, draft.resolverAgent, draft.resolverModel, false, "onProjectEditResolverAgent", "onProjectEditResolverModel");
+        const resolverSection = renderResolverFieldsHtml(draft.cwd, draft.resolverAgent, draft.resolverModel, false, "onProjectEditResolverAgent", "onProjectEditResolverModel")
+          + renderLiveActionFieldsHtml(draft.cwd, draft.liveActionAgent, draft.liveActionModel, false, "onProjectEditLiveActionSame", "onProjectEditLiveActionAgent", "onProjectEditLiveActionModel");
         const proofScopeSection = renderProofScopeFieldsHtml(draft.proofScope, draft.proofSkipAutoClean, "onProjectEditProofScope", "onProjectEditProofSkipAutoClean", true);
         const prSettingsSection = renderPrSettingsFieldsHtml(draft.separatePrBranch, draft.matchPrBranchName, draft.autoSubmitPrStack, draft.dualRootPr, "onProjectEditSeparatePrBranch", "onProjectEditMatchPrBranchName", "onProjectEditAutoSubmitPrStack", "onProjectEditDualRootPr");
         const autoFixSection = renderAutoFixFieldsHtml(draft.autoFixPrErrors, draft.autoFixPromptTemplate, draft.discourageTests, "onProjectEditAutoFixPrErrors", "onProjectEditAutoFixPromptTemplate", "onProjectEditDiscourageTests");
@@ -529,6 +566,8 @@
         const body = {};
         if (draft.resolverAgent !== draft.originalResolverAgent) body.default_resolver_agent = draft.resolverAgent;
         if (draft.resolverModel !== draft.originalResolverModel) body.default_resolver_model = draft.resolverModel;
+        if (draft.liveActionAgent !== draft.originalLiveActionAgent) body.default_live_action_agent = draft.liveActionAgent;
+        if (draft.liveActionModel !== draft.originalLiveActionModel) body.default_live_action_model = draft.liveActionAgent ? draft.liveActionModel : "";
         if (draft.machine !== draft.originalMachine) body.default_machine = draft.machine;
         if (draft.maximumBudgetUsd !== draft.originalMaximumBudgetUsd) {
           if (draft.maximumBudgetUsd === null) {
@@ -593,4 +632,4 @@
         closeProjectReviewSettingsModal();
       }
 
-      void [onProjectEditBaseUpdateMode, onProjectEditResolverAgent, onProjectEditResolverModel, onProjectEditMachine, onProjectEditMaximumBudgetUsd, onProjectEditProofScope, onProjectEditCiDeferral, onProjectEditProofSkipAutoClean, onProjectEditSkipWorktrees, onProjectEditSkipBaseUpdates, onProjectEditBaseShiftMaximumRebuilds, onProjectEditSeparatePrBranch, onProjectEditDualRootPr, onProjectEditMatchPrBranchName, onProjectEditAutoBuild, onProjectEditAutoSubmitPrStack, onProjectEditAutoFixPrErrors, onProjectEditAutoFixPromptTemplate, onProjectEditDiscourageTests, onProjectEditAutoCancelOutdatedPrPipelines, onProjectEditRebuildOnInherit, onProjectEditRebuildOnTrigger, onProjectEditExhibitSetting];
+      void [onProjectEditBaseUpdateMode, onProjectEditResolverAgent, onProjectEditResolverModel, onProjectEditLiveActionSame, onProjectEditLiveActionAgent, onProjectEditLiveActionModel, onProjectEditMachine, onProjectEditMaximumBudgetUsd, onProjectEditProofScope, onProjectEditCiDeferral, onProjectEditProofSkipAutoClean, onProjectEditSkipWorktrees, onProjectEditSkipBaseUpdates, onProjectEditBaseShiftMaximumRebuilds, onProjectEditSeparatePrBranch, onProjectEditDualRootPr, onProjectEditMatchPrBranchName, onProjectEditAutoBuild, onProjectEditAutoSubmitPrStack, onProjectEditAutoFixPrErrors, onProjectEditAutoFixPromptTemplate, onProjectEditDiscourageTests, onProjectEditAutoCancelOutdatedPrPipelines, onProjectEditRebuildOnInherit, onProjectEditRebuildOnTrigger, onProjectEditExhibitSetting];

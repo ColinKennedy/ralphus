@@ -2228,6 +2228,93 @@ pub(crate) fn resolve_resolver_agent(
     })
 }
 
+/// The agent/model a review's live actions run on, before profile resolution.
+pub(crate) struct LiveActionInputs {
+    pub agent: Option<String>,
+    pub model: Option<String>,
+    /// Whether `agent`/`model` came from a live-action setting (review, then
+    /// project default) rather than the review's resolver pair.
+    pub overridden: bool,
+}
+
+/// Picks the live-action agent/model: the review's own pair, else the
+/// project's `default_live_action_*` pair (file layers + database), else the
+/// review's stored resolver pair (so an unset live agent behaves exactly like
+/// the resolver). The model always comes from the same level as the agent.
+pub(crate) fn live_action_inputs(
+    live_agent: Option<&str>,
+    live_model: Option<&str>,
+    resolver_agent: Option<&str>,
+    resolver_model: Option<&str>,
+    store: &crate::store_lock::StoreHandle,
+    cwd: &Path,
+) -> LiveActionInputs {
+    let clean = |s: Option<&str>| {
+        s.map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(ToString::to_string)
+    };
+    if let Some(agent) = clean(live_agent) {
+        return LiveActionInputs {
+            agent: Some(agent),
+            model: clean(live_model),
+            overridden: true,
+        };
+    }
+    let cfg = store.lock().resolve_review_config(cwd);
+    if let Some(agent) = clean(cfg.default_live_action_agent()) {
+        return LiveActionInputs {
+            agent: Some(agent),
+            model: clean(cfg.default_live_action_model()),
+            overridden: true,
+        };
+    }
+    LiveActionInputs {
+        agent: clean(resolver_agent),
+        model: clean(resolver_model),
+        overridden: false,
+    }
+}
+
+/// Resolves the agent a review's live actions run on. Without a live-action
+/// setting this is exactly [`resolve_resolver_agent`]. With one, the named
+/// agent is resolved the same way but takes only its own model: the
+/// agent-blind resolver model defaults do not apply to a different agent.
+pub(crate) fn resolve_live_action_agent(
+    inputs: &LiveActionInputs,
+    store: &crate::store_lock::StoreHandle,
+    cwd: &Path,
+) -> Result<ResolvedResolverAgent, String> {
+    if !inputs.overridden {
+        return resolve_resolver_agent(
+            inputs.agent.as_deref(),
+            inputs.model.as_deref(),
+            store,
+            cwd,
+        );
+    }
+    let raw = inputs.agent.clone().unwrap_or_default();
+    let selection = {
+        let guard = store.lock();
+        crate::agent_profiles::resolve_agent_for_path_db(&raw, cwd, &guard)?
+    };
+    let model = inputs
+        .model
+        .clone()
+        .or_else(|| selection.model.clone())
+        .or_else(|| match selection.backend.as_str() {
+            "ollama" => Some("qwen3:8b".to_string()),
+            _ => None,
+        });
+    Ok(ResolvedResolverAgent {
+        backend: selection.backend,
+        executable: selection.executable,
+        env: selection.env,
+        custom_profile: selection.custom_profile,
+        model,
+    })
+}
+
 /// Resolves this review's resolver backend/model (RAL-149/168) -- cheap, one
 /// DB read, no LLM call. Split out from [`resolve_conflicts_with_agent`] so
 /// [`drive_rebase`]'s clean (no-conflict) path can also resolve it, without
@@ -6736,7 +6823,10 @@ fn staged_merge_pass(
             // branch merged while earlier branches were rebuilding. A merged
             // branch needs no rebase, and once every enabled branch is merged
             // the review is settled and the pass stops.
-            if let Ok(fresh) = store.lock().get_guardian(id) {
+            // Read into a binding first: a guard in the `if let` scrutinee
+            // would live through the body, which locks the store again.
+            let fresh = store.lock().get_guardian(id);
+            if let Ok(fresh) = fresh {
                 let now_merged = fresh
                     .branches
                     .iter()
@@ -8435,7 +8525,9 @@ pub fn run_feedback(
 /// the branch's current head (feedback or an auto-fix moved it since the live
 /// run started), the pick is abandoned and the review's resolver agent is
 /// given `feedback` -- which carries the patch and the live run's report --
-/// to apply the change itself.
+/// to apply the change itself. This pass is conflict resolution, not a live
+/// action, so it stays on the resolver agent even when the review's live
+/// actions run on their own agent.
 pub fn run_live_action_integration(
     store: &crate::store_lock::StoreHandle,
     runner: &dyn Runner,

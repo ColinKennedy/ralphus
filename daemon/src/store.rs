@@ -1095,6 +1095,12 @@ pub struct ProjectReviewSettings {
     pub default_resolver_agent: Option<String>,
     #[serde(default)]
     pub default_resolver_model: Option<String>,
+    /// Project default agent for live actions; unset uses the resolver agent.
+    #[serde(default)]
+    pub default_live_action_agent: Option<String>,
+    /// Project default model for live actions; set only with an agent.
+    #[serde(default)]
+    pub default_live_action_model: Option<String>,
     /// The base branch `ralphus ingest` falls back to; see
     /// [`crate::config::ReviewConfig::default_base_branch`]. Read only by
     /// ingest, never applied to other reviews.
@@ -1247,6 +1253,8 @@ impl ProjectReviewSettings {
             proof_skip_auto_clean: self.verify_skip_auto_clean,
             default_resolver_agent: self.default_resolver_agent,
             default_resolver_model: self.default_resolver_model,
+            default_live_action_agent: self.default_live_action_agent,
+            default_live_action_model: self.default_live_action_model,
             default_base_branch: self.default_base_branch,
             default_machine: self.default_machine,
             default_maximum_budget_usd: self.default_maximum_budget_usd,
@@ -4613,6 +4621,9 @@ impl Store {
             // Live actions: the session cell of the agent that generated the
             // review's live actions (its deduplication pass).
             "ALTER TABLE guardians ADD COLUMN live_actions_generation_cell TEXT",
+            // Per-review agent/model for live actions; NULL uses the resolver.
+            "ALTER TABLE guardians ADD COLUMN live_action_agent TEXT",
+            "ALTER TABLE guardians ADD COLUMN live_action_model TEXT",
             // Per-review overrides of the global `[followup]` config: whether
             // this review offers follow-up work when it merges, and whether an
             // accepted follow-up squad starts at once. NULL inherits the
@@ -20819,6 +20830,8 @@ command = "e"
         let settings = ProjectReviewSettings {
             default_resolver_agent: Some("claude-code".to_string()),
             default_resolver_model: Some("opus".to_string()),
+            default_live_action_agent: Some("codex".to_string()),
+            default_live_action_model: Some("gpt-5".to_string()),
             default_base_branch: Some("develop".to_string()),
             default_machine: Some("local".to_string()),
             default_maximum_budget_usd: Some(5.0),

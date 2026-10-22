@@ -415,6 +415,8 @@ struct Membership {
     /// Optional conflict-resolver backend/model declared on the review.
     agent: Option<String>,
     model: Option<String>,
+    live_action_agent: Option<String>,
+    live_action_model: Option<String>,
     /// The machine this review's worktrees, rebase and conflict resolution run
     /// on (RAL-185). `None` means the daemon's own host.
     machine: Option<String>,
@@ -1142,6 +1144,12 @@ pub fn derive_reviews_with_full_prefetch(
             model: rv
                 .and_then(|r| r.model.clone())
                 .filter(|s| !s.trim().is_empty()),
+            live_action_agent: rv
+                .and_then(|r| r.live_action_agent.clone())
+                .filter(|s| !s.trim().is_empty()),
+            live_action_model: rv
+                .and_then(|r| r.live_action_model.clone())
+                .filter(|s| !s.trim().is_empty()),
             machine: rv
                 .and_then(|r| r.machine.clone())
                 .filter(|s| !s.trim().is_empty()),
@@ -1542,6 +1550,17 @@ fn apply_resolver(
         // custom agent profile (see `Store::set_guardian_resolver`).
         store
             .set_guardian_resolver(gid, agent.as_deref().map(Some), model.as_deref().map(Some))
+            .map_err(|e| ReviewError::new(e.to_string()))?;
+    }
+    // The live-action agent/model pair comes from one declaring member so the
+    // model always belongs to the agent beside it.
+    if let Some(m) = members.iter().find(|m| m.live_action_agent.is_some()) {
+        store
+            .set_guardian_live_action_agent(
+                gid,
+                Some(m.live_action_agent.as_deref()),
+                Some(m.live_action_model.as_deref()),
+            )
             .map_err(|e| ReviewError::new(e.to_string()))?;
     }
     // RAL-185: where this review's own work runs. Independent of any
@@ -3589,6 +3608,8 @@ mod tests {
             link_key: None,
             agent: None,
             model: None,
+            live_action_agent: None,
+            live_action_model: None,
             machine: None,
             maximum_budget_usd,
             proof_scope: None,

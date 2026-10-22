@@ -176,6 +176,15 @@ pub struct ReviewConfig {
     /// scalars win over the global layer, same as `skip_worktrees`.
     #[serde(default)]
     pub default_resolver_model: Option<String>,
+    /// The agent live actions run on when a review sets none of its own;
+    /// `None` uses the review's resolver agent (see
+    /// [`Self::default_live_action_agent`]).
+    #[serde(default)]
+    pub default_live_action_agent: Option<String>,
+    /// The model for [`Self::default_live_action_agent`]; meaningful only
+    /// together with it.
+    #[serde(default)]
+    pub default_live_action_model: Option<String>,
     /// The base branch `ralphus ingest` uses when no PR among the ingested
     /// branches names one and `--base` is absent. Read only by ingest's
     /// base-resolution fallback ([`crate::ingest_defaults`]), never as a
@@ -548,6 +557,8 @@ pub const DEFAULT_RETRY_AFTER_UNKNOWN_DEFAULT_SECONDS: u64 = 30;
 pub const REVIEW_CONFIG_KEYS: &[&str] = &[
     "default_resolver_agent",
     "default_resolver_model",
+    "default_live_action_agent",
+    "default_live_action_model",
     "default_base_branch",
     "default_machine",
     "default_maximum_budget_usd",
@@ -635,6 +646,19 @@ impl ReviewConfig {
     #[must_use]
     pub fn default_resolver_model(&self) -> Option<&str> {
         self.default_resolver_model.as_deref()
+    }
+
+    /// The configured default live-action agent, if any; unset means live
+    /// actions run on the review's resolver agent.
+    #[must_use]
+    pub fn default_live_action_agent(&self) -> Option<&str> {
+        self.default_live_action_agent.as_deref()
+    }
+
+    /// The configured default live-action model, if any.
+    #[must_use]
+    pub fn default_live_action_model(&self) -> Option<&str> {
+        self.default_live_action_model.as_deref()
     }
 
     /// The configured ingest base-branch fallback, trimmed; unset or
@@ -938,6 +962,11 @@ impl ReviewConfig {
         {
             return Err("[review] default_base_branch must not be empty".to_string());
         }
+        if self.default_live_action_model.is_some() && self.default_live_action_agent.is_none() {
+            return Err(
+                "[review] default_live_action_model requires default_live_action_agent".to_string(),
+            );
+        }
         if self.exhibits_max_per_pr == Some(0) {
             return Err("[review] exhibits_max_per_pr must be at least 1".to_string());
         }
@@ -980,6 +1009,17 @@ impl ReviewConfig {
             proof_skip_auto_clean: over.proof_skip_auto_clean.or(self.proof_skip_auto_clean),
             default_resolver_agent: over.default_resolver_agent.or(self.default_resolver_agent),
             default_resolver_model: over.default_resolver_model.or(self.default_resolver_model),
+            // The agent and model are one pair: a layer that names an agent
+            // brings its own model rather than inheriting a lower layer's.
+            default_live_action_agent: over
+                .default_live_action_agent
+                .clone()
+                .or(self.default_live_action_agent.clone()),
+            default_live_action_model: if over.default_live_action_agent.is_some() {
+                over.default_live_action_model.clone()
+            } else {
+                self.default_live_action_model.clone()
+            },
             default_base_branch: over.default_base_branch.or(self.default_base_branch),
             default_machine: over.default_machine.or(self.default_machine),
             default_maximum_budget_usd: over
@@ -1116,6 +1156,14 @@ pub const REVIEW_FIELD_PARITY: &[(&str, ReviewFieldDefault)] = &[
     (
         "model",
         ReviewFieldDefault::ProjectDefault(|c| c.default_resolver_model.is_some()),
+    ),
+    (
+        "live_action_agent",
+        ReviewFieldDefault::ProjectDefault(|c| c.default_live_action_agent.is_some()),
+    ),
+    (
+        "live_action_model",
+        ReviewFieldDefault::ProjectDefault(|c| c.default_live_action_model.is_some()),
     ),
     (
         "upstream",

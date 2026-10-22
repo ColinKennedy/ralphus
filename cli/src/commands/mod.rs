@@ -495,6 +495,8 @@ fn parse_initialize_solo_developer(
             "--review-auto-submit-pr-stack",
         )?,
         review_resolver_agent: scanner.take_value("--review-resolver-agent")?,
+        review_live_action_agent: scanner.take_value("--review-live-action-agent")?,
+        review_live_action_model: scanner.take_value("--review-live-action-model")?,
         require_forks: parse_initialize_bool(scanner, "--require-forks")?,
         fork_user: scanner.take_value("--fork-user")?,
         fork_url: scanner.take_value("--fork-url")?,
