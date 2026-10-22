@@ -9527,6 +9527,7 @@ prompt = "anything"
         struct ReclaimRunner {
             a_calls: Arc<AtomicUsize>,
             b_started: Arc<AtomicBool>,
+            b_release: Arc<AtomicBool>,
         }
         impl Runner for ReclaimRunner {
             fn run(&self, spec: &RunnerSpec) -> RunnerResult {
@@ -9561,7 +9562,14 @@ prompt = "anything"
                     }
                 } else {
                     self.b_started.store(true, Ordering::SeqCst);
-                    std::thread::sleep(Duration::from_millis(400));
+                    // Held until the test has observed the re-dispatch (bounded so a
+                    // broken test cannot hang).
+                    for _ in 0..15_000 {
+                        if self.b_release.load(Ordering::SeqCst) {
+                            break;
+                        }
+                        std::thread::sleep(Duration::from_millis(2));
+                    }
                     RunnerResult {
                         bearing: None,
                         thinking_stall_last_line: None,
@@ -9592,7 +9600,9 @@ prompt = "anything"
         let (store, id) = store_with(TWO_INDEPENDENT_TASKS);
         let a_calls = Arc::new(AtomicUsize::new(0));
         let b_started = Arc::new(AtomicBool::new(false));
+        let b_release = Arc::new(AtomicBool::new(false));
         let runner: Arc<dyn Runner> = Arc::new(ReclaimRunner {
+            b_release: Arc::clone(&b_release),
             a_calls: Arc::clone(&a_calls),
             b_started: Arc::clone(&b_started),
         });
@@ -9642,19 +9652,21 @@ prompt = "anything"
         // The still-running worker (not a fresh claim after b finishes) must
         // pick this up and re-run task a within a few dispatcher-loop ticks.
         let mut retried = false;
-        for _ in 0..100 {
+        for _ in 0..2000 {
             if a_calls.load(Ordering::SeqCst) >= 2 {
                 retried = true;
                 break;
             }
             std::thread::sleep(Duration::from_millis(5));
         }
+        let still_alive = !worker.is_finished();
+        b_release.store(true, Ordering::SeqCst);
         assert!(
             retried,
             "the still-running worker must re-dispatch the restarted sibling task itself"
         );
         assert!(
-            !worker.is_finished(),
+            still_alive,
             "task a must be retried while the worker is still alive driving task b, \
              not only after a fresh re-claim once the whole squad drains"
         );
