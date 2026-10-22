@@ -227,28 +227,38 @@ pub fn format_live_test_inventory(caps: &[crate::capability_store::UsableCapabil
 }
 
 /// [`LIVE_HANDOFF_QUESTION`] followed by what the review's agent can do. The
-/// agent is the squad's review's resolver agent -- the one a live run uses --
-/// or, while no review exists yet, the review default agent for `cwd`.
+/// agent is the one a live run uses: the review's live-action agent, else its
+/// resolver agent, or, while no review exists yet, the project's live-action
+/// default / review default agent for `cwd`.
 #[must_use]
 pub fn live_handoff_question_for(
     store: &crate::store_lock::StoreHandle,
     squad_id: &str,
     cwd: &str,
 ) -> String {
-    let (stored_agent, stored_model) = {
+    let guardian = {
         let guard = store.lock();
         guard
             .guardians_for_squad(squad_id)
             .ok()
             .and_then(|ids| ids.first().and_then(|id| guard.get_guardian(id).ok()))
-            .map_or((None, None), |g| (g.resolver_agent, g.resolver_model))
     };
-    let Ok(resolved) = crate::guardian_merge::resolve_resolver_agent(
-        stored_agent.as_deref(),
-        stored_model.as_deref(),
+    let inputs = crate::guardian_merge::live_action_inputs(
+        guardian
+            .as_ref()
+            .and_then(|g| g.live_action_agent.as_deref()),
+        guardian
+            .as_ref()
+            .and_then(|g| g.live_action_model.as_deref()),
+        guardian.as_ref().and_then(|g| g.resolver_agent.as_deref()),
+        guardian.as_ref().and_then(|g| g.resolver_model.as_deref()),
         store,
         Path::new(cwd),
-    ) else {
+    );
+    let stored_agent = inputs.agent.clone();
+    let Ok(resolved) =
+        crate::guardian_merge::resolve_live_action_agent(&inputs, store, Path::new(cwd))
+    else {
         return LIVE_HANDOFF_QUESTION.to_string();
     };
     let profile = stored_agent
@@ -816,9 +826,16 @@ pub fn deduplicate_handoffs(
         return undeduplicated(handoffs);
     }
     let gid = guardian.id.as_str();
-    let resolved = match crate::guardian_merge::resolve_resolver_agent(
+    let inputs = crate::guardian_merge::live_action_inputs(
+        guardian.live_action_agent.as_deref(),
+        guardian.live_action_model.as_deref(),
         guardian.resolver_agent.as_deref(),
         guardian.resolver_model.as_deref(),
+        store,
+        Path::new(cwd),
+    );
+    let resolved = match crate::guardian_merge::resolve_live_action_agent(
+        &inputs,
         store,
         Path::new(cwd),
     ) {
@@ -1135,9 +1152,16 @@ pub fn execute_live_run(
         .ok()
         .map(|s| s.trim().to_string());
 
-    let resolved = match crate::guardian_merge::resolve_resolver_agent(
+    let live_inputs = crate::guardian_merge::live_action_inputs(
+        req.guardian.live_action_agent.as_deref(),
+        req.guardian.live_action_model.as_deref(),
         req.guardian.resolver_agent.as_deref(),
         req.guardian.resolver_model.as_deref(),
+        store,
+        Path::new(req.cwd),
+    );
+    let resolved = match crate::guardian_merge::resolve_live_action_agent(
+        &live_inputs,
         store,
         Path::new(req.cwd),
     ) {
@@ -1210,13 +1234,10 @@ pub fn execute_live_run(
         thrash_max_compactions: None,
         thrash_min_turn_gap: None,
         allow_personal_settings: false,
-        // The resolver agent's own profile decides what the live run may use.
+        // The live run's own agent profile decides what it may use.
         capabilities: crate::scheduler::capabilities_for_agent(
             store,
-            req.guardian
-                .resolver_agent
-                .as_deref()
-                .unwrap_or(&resolved.backend),
+            live_inputs.agent.as_deref().unwrap_or(&resolved.backend),
             &resolved.backend,
         ),
         allow_personal_memory: false,
@@ -2649,6 +2670,80 @@ prompt = "second"
         assert!(!q.contains("broken"), "failing server listed: {q}");
         assert!(!q.contains("other-agent-only"), "{q}");
         assert!(!q.contains("SECRET"), "{q}");
+    }
+
+    #[test]
+    fn handoff_question_describes_the_live_action_agent_not_the_resolver() {
+        let store = mem_store();
+        add_mcp(&store, "claude-code", "resolver-only", "ok");
+        add_mcp(&store, "codex", "live-only", "ok");
+        {
+            let guard = store.lock();
+            let gid = guard
+                .create_guardian_for_squad("r", "main", "/repo", Some("squad-x"))
+                .unwrap();
+            guard
+                .set_guardian_resolver(&gid, Some(Some("claude-code")), None)
+                .unwrap();
+            guard
+                .set_guardian_live_action_agent(&gid, Some(Some("codex")), None)
+                .unwrap();
+        }
+        let q = live_handoff_question_for(&store, "squad-x", "/nonexistent-cwd");
+        assert!(q.contains("live-only"), "{q}");
+        assert!(!q.contains("resolver-only"), "{q}");
+    }
+
+    #[test]
+    fn live_action_inputs_prefer_review_then_project_then_resolver() {
+        let store = mem_store();
+        let cwd = Path::new("/nonexistent-cwd");
+        let unset = crate::guardian_merge::live_action_inputs(
+            None,
+            None,
+            Some("claude-code"),
+            Some("opus"),
+            &store,
+            cwd,
+        );
+        assert!(!unset.overridden);
+        assert_eq!(unset.agent.as_deref(), Some("claude-code"));
+        assert_eq!(unset.model.as_deref(), Some("opus"));
+        let own = crate::guardian_merge::live_action_inputs(
+            Some("codex"),
+            Some(" "),
+            Some("claude-code"),
+            Some("opus"),
+            &store,
+            cwd,
+        );
+        assert!(own.overridden);
+        assert_eq!(own.agent.as_deref(), Some("codex"));
+        assert_eq!(own.model, None, "the resolver model must not carry over");
+    }
+
+    #[test]
+    fn guardian_live_action_agent_updates_partially_and_clears() {
+        let store = mem_store();
+        let guard = store.lock();
+        let gid = guard
+            .create_guardian_for_squad("r", "main", "/repo", Some("squad-x"))
+            .unwrap();
+        guard
+            .set_guardian_live_action_agent(&gid, Some(Some("codex")), Some(Some("gpt-5")))
+            .unwrap();
+        guard
+            .set_guardian_live_action_agent(&gid, None, Some(Some("gpt-6")))
+            .unwrap();
+        let g = guard.get_guardian(&gid).unwrap();
+        assert_eq!(g.live_action_agent.as_deref(), Some("codex"));
+        assert_eq!(g.live_action_model.as_deref(), Some("gpt-6"));
+        guard
+            .set_guardian_live_action_agent(&gid, Some(None), Some(None))
+            .unwrap();
+        let g = guard.get_guardian(&gid).unwrap();
+        assert_eq!(g.live_action_agent, None);
+        assert_eq!(g.live_action_model, None);
     }
 
     #[test]

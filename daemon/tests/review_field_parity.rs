@@ -8,6 +8,8 @@ use ralphus_daemon::config::REVIEW_CONFIG_KEYS;
 const PAIRS: &[(&str, &str)] = &[
     ("agent", "default_resolver_agent"),
     ("model", "default_resolver_model"),
+    ("live_action_agent", "default_live_action_agent"),
+    ("live_action_model", "default_live_action_model"),
     ("machine", "default_machine"),
     ("maximum_budget_usd", "default_maximum_budget_usd"),
     ("proof_scope", "default_proof_scope"),

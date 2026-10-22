@@ -45,6 +45,14 @@
        * @property {string} originalResolverAgent
        * @property {string} resolverModel
        * @property {string} originalResolverModel
+       * @property {string} liveActionAgent - "" means live actions use the resolver agent.
+       * @property {string} originalLiveActionAgent
+       * @property {string} liveActionModel
+       * @property {string} originalLiveActionModel
+       * @property {string} liveActionAgent - "" means live actions use the resolver agent.
+       * @property {string} originalLiveActionAgent
+       * @property {string} liveActionModel
+       * @property {string} originalLiveActionModel
        * @property {string} proofScope - "each_branch" | "final_branch" | "nothing"
        * @property {string} originalProofScope
        * @property {string} ciDeferral - "" (inherit the project default) | "every" | "top" | "bottom+top"
@@ -541,6 +549,14 @@
           originalResolverAgent: g.resolver_agent || "",
           resolverModel: g.resolver_model || "",
           originalResolverModel: g.resolver_model || "",
+          liveActionAgent: g.live_action_agent || "",
+          originalLiveActionAgent: g.live_action_agent || "",
+          liveActionModel: g.live_action_model || "",
+          originalLiveActionModel: g.live_action_model || "",
+          liveActionAgent: g.live_action_agent || "",
+          originalLiveActionAgent: g.live_action_agent || "",
+          liveActionModel: g.live_action_model || "",
+          originalLiveActionModel: g.live_action_model || "",
           proofScope, originalProofScope: proofScope,
           ciDeferral, originalCiDeferral: ciDeferral,
           proofSkipAutoClean, originalProofSkipAutoClean: proofSkipAutoClean,
@@ -657,6 +673,72 @@
        * @returns {void}
        */
       function onEditResolverModel(value) { if (reviewEditDraft) reviewEditDraft.resolverModel = value; }
+      /**
+       * Switches this review's live actions between the resolver agent and
+       * their own agent; re-renders so the agent/model fields appear or hide.
+       * @param {boolean} same - true = use the resolver agent.
+       * @returns {void}
+       */
+      function onEditLiveActionSame(same) {
+        if (!reviewEditDraft) return;
+        if (same) {
+          reviewEditDraft.liveActionAgent = "";
+          reviewEditDraft.liveActionModel = "";
+        } else {
+          reviewEditDraft.liveActionAgent = reviewEditDraft.resolverAgent || "claude-code";
+        }
+        renderReviewEditModal();
+      }
+      /**
+       * Stages a new live-action agent and drops the model, which belongs to the previous agent.
+       * @param {string} value
+       * @returns {void}
+       */
+      function onEditLiveActionAgent(value) {
+        if (!reviewEditDraft) return;
+        reviewEditDraft.liveActionAgent = value;
+        reviewEditDraft.liveActionModel = "";
+        renderReviewEditModal();
+      }
+      /**
+       * Stages a new live-action model value, leaving focus in the text field.
+       * @param {string} value
+       * @returns {void}
+       */
+      function onEditLiveActionModel(value) { if (reviewEditDraft) reviewEditDraft.liveActionModel = value; }
+      /**
+       * Switches this review's live actions between the resolver agent and
+       * their own agent; re-renders so the agent/model fields appear or hide.
+       * @param {boolean} same - true = use the resolver agent.
+       * @returns {void}
+       */
+      function onEditLiveActionSame(same) {
+        if (!reviewEditDraft) return;
+        if (same) {
+          reviewEditDraft.liveActionAgent = "";
+          reviewEditDraft.liveActionModel = "";
+        } else {
+          reviewEditDraft.liveActionAgent = reviewEditDraft.resolverAgent || reviewEditDraft.originalResolverAgent || "claude-code";
+        }
+        renderReviewEditModal();
+      }
+      /**
+       * Stages a new live-action agent and drops the model, which belongs to the previous agent.
+       * @param {string} value
+       * @returns {void}
+       */
+      function onEditLiveActionAgent(value) {
+        if (!reviewEditDraft) return;
+        reviewEditDraft.liveActionAgent = value;
+        reviewEditDraft.liveActionModel = "";
+        renderReviewEditModal();
+      }
+      /**
+       * Stages a new live-action model value, leaving focus in the text field.
+       * @param {string} value
+       * @returns {void}
+       */
+      function onEditLiveActionModel(value) { if (reviewEditDraft) reviewEditDraft.liveActionModel = value; }
       /**
        * Stages a new Proof-scope choice and re-renders, since the
        * skip-auto-clean sub-row's visibility depends on it.
@@ -1054,6 +1136,32 @@
              <div class="kv-row"><span class="k">resolver model</span><input type="text" class="mono" style="${REVIEW_EDIT_INPUT_STYLE};width:200px" value="${esc(resolverModel)}" placeholder="agent default" oninput="${onModelChange}(this.value)" data-tip="Exact model passed to the selected resolver agent. Clear to use the agent's default. Applies on Save."></div>`;
       }
       /**
+       * Renders the live-action agent/model rows shared by the review edit
+       * and project review-settings modals. An empty agent means live
+       * actions use the review's resolver agent. The model follows the
+       * agent, so it is only offered once an agent is chosen.
+       * @param {string} cwd
+       * @param {string} liveAgent
+       * @param {string} liveModel
+       * @param {boolean} frozen
+       * @param {string} onSameChange
+       * @param {string} onAgentChange
+       * @param {string} onModelChange
+       * @returns {string}
+       */
+      function renderLiveActionFieldsHtml(cwd, liveAgent, liveModel, frozen, onSameChange, onAgentChange, onModelChange) {
+        if (frozen) {
+          return `<div class="kv-row"><span class="k">live action agent</span><span class="v mono">${esc(liveAgent || "same as review agent")}</span></div>
+             <div class="kv-row"><span class="k">live action model</span><span class="v mono">${esc(liveModel || "agent default")}</span></div>`;
+        }
+        const same = !liveAgent;
+        const sameRow = `<div class="kv-row"><span class="k">live action agent</span><label data-tip="Run live actions with the review agent and model. Untick to give live actions their own agent and model, e.g. a cheaper model for read-only runs. Applies on Save."><input type="checkbox" ${same ? "checked" : ""} onchange="${onSameChange}(this.checked)"> Same as review agent</label></div>`;
+        if (same) return sameRow;
+        return `${sameRow}
+             <div class="kv-row"><span class="k">&nbsp;</span>${renderAgentSelectHtml("", cwd, liveAgent, onAgentChange, REVIEW_EDIT_INPUT_STYLE, "Agent that runs live actions and answers their handoff question. Applies on Save.")}</div>
+             <div class="kv-row"><span class="k">live action model</span><input type="text" class="mono" style="${REVIEW_EDIT_INPUT_STYLE};width:200px" value="${esc(liveModel)}" placeholder="agent default" oninput="${onModelChange}(this.value)" data-tip="Exact model passed to the live-action agent. Clear to use that agent's default. Applies on Save."></div>`;
+      }
+      /**
        * RAL-408: proof-scope + skip-auto-clean fields, shared as
        * [`renderResolverFieldsHtml`] above. `allowInherit` (project-settings
        * scope only -- a review's effective proof scope is always a concrete
@@ -1181,6 +1289,7 @@
         const g = guardians.find((x) => x.id === draft.gid);
         const cwd = (g && (g.git_root || (g.projects && g.projects[0]))) || "";
         const resolverSection = renderResolverFieldsHtml(cwd, draft.resolverAgent, draft.resolverModel, draft.resolverFrozen, "onEditResolverAgent", "onEditResolverModel");
+        const liveActionSection = renderLiveActionFieldsHtml(cwd, draft.liveActionAgent, draft.liveActionModel, draft.resolverFrozen, "onEditLiveActionSame", "onEditLiveActionAgent", "onEditLiveActionModel");
         const proofScopeSection = renderProofScopeFieldsHtml(draft.proofScope, draft.proofSkipAutoClean, "onEditProofScope", "onEditProofSkipAutoClean");
         const squashSection = draft.projects.map((p) => {
           const label = (p || "").split(/[\\/]/).filter(Boolean).pop() || p;
@@ -1197,7 +1306,7 @@
               <div class="edit-form">
                 <label data-tip="The branch every submitted branch is rebased onto. Type or focus to load remote branch suggestions. Triggers a rebase on Save.">upstream branch<input type="text" class="mono" list="base-datalist" value="${esc(draft.baseBranch)}" onfocus="loadBaseBranches(${JSON.stringify(draft.gid)})" oninput="onEditBaseBranch(this.value)"><datalist id="base-datalist">${(baseBranchCache[draft.gid] || []).map((b) => `<option value="${esc(b)}"></option>`).join("")}</datalist></label>
               </div></div>
-            <div ${grp("resolver")}><h3 class="section">resolver</h3>${resolverSection}</div>
+            <div ${grp("resolver")}><h3 class="section">resolver</h3>${resolverSection}${liveActionSection}</div>
             <div ${grp("proof")}><h3 class="section">proof</h3>${proofScopeSection}</div>
             <div ${grp("ci")}><h3 class="section">CI</h3>${renderCiDeferralFieldsHtml(draft.ciDeferral, "onEditCiDeferral", "(inherit project default)")}</div>
             <div><h3 class="section">rebase</h3>
@@ -1290,6 +1399,11 @@
             body.resolver_agent = draft.resolverAgent;
             body.resolver_model = model;
           }
+          const liveModel = draft.liveActionModel.trim();
+          if (draft.liveActionAgent !== draft.originalLiveActionAgent || liveModel !== draft.originalLiveActionModel) {
+            body.live_action_agent = draft.liveActionAgent;
+            body.live_action_model = draft.liveActionAgent ? liveModel : "";
+          }
         }
         if (draft.proofScope !== draft.originalProofScope || draft.proofSkipAutoClean !== draft.originalProofSkipAutoClean) {
           body.proof_scope = draft.proofScope;
@@ -1353,4 +1467,4 @@
         }
       }
 
-      void [onEditBaseUpdateMode, onEditResolverAgent, onEditResolverModel, onEditProofScope, onEditCiDeferral, onEditProofSkipAutoClean, onEditSeparatePrBranch, onEditMatchPrBranchName, onEditAutoSubmitPrStack, onEditDualRootPr, onEditAutoFixPrErrors, onEditAutoFixPromptTemplate, onEditDiscourageTests, onEditRebuildOnInherit, onEditRebuildOnTrigger, onEditExhibitSetting];
+      void [onEditBaseUpdateMode, onEditResolverAgent, onEditResolverModel, onEditLiveActionSame, onEditLiveActionAgent, onEditLiveActionModel, onEditProofScope, onEditCiDeferral, onEditProofSkipAutoClean, onEditSeparatePrBranch, onEditMatchPrBranchName, onEditAutoSubmitPrStack, onEditDualRootPr, onEditAutoFixPrErrors, onEditAutoFixPromptTemplate, onEditDiscourageTests, onEditRebuildOnInherit, onEditRebuildOnTrigger, onEditExhibitSetting];

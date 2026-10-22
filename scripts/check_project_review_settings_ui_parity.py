@@ -32,6 +32,8 @@ MODAL = REPO_ROOT / "librarian" / "assets" / "board" / "76-project-review-settin
 MAPPING = {
     "agent": "default_resolver_agent",
     "model": "default_resolver_model",
+    "live_action_agent": "default_live_action_agent",
+    "live_action_model": "default_live_action_model",
     "machine": "default_machine",
     "maximum_budget_usd": "default_maximum_budget_usd",
     "proof_scope": "default_proof_scope",

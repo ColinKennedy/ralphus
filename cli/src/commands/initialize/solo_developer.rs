@@ -151,6 +151,14 @@ const REVIEW_RESOLVER_AGENT: InitializeSetting = InitializeSetting {
     prompt: "review resolver agent",
     flag: "--review-resolver-agent",
 };
+const REVIEW_LIVE_ACTION_AGENT: InitializeSetting = InitializeSetting {
+    prompt: "review live-action agent",
+    flag: "--review-live-action-agent",
+};
+const REVIEW_LIVE_ACTION_MODEL: InitializeSetting = InitializeSetting {
+    prompt: "review live-action model",
+    flag: "--review-live-action-model",
+};
 const REQUIRE_FORKS: InitializeSetting = InitializeSetting {
     prompt: "require forks",
     flag: "--require-forks",
@@ -214,6 +222,8 @@ const INTERACTIVE_SETTINGS: &[&InitializeSetting] = &[
     &PROJECT_DESCRIPTION,
     &REVIEW_AUTO_SUBMIT_PR_STACK,
     &REVIEW_RESOLVER_AGENT,
+    &REVIEW_LIVE_ACTION_AGENT,
+    &REVIEW_LIVE_ACTION_MODEL,
     &REQUIRE_FORKS,
     &FORK_USER,
     &FORK_URL,
@@ -265,6 +275,11 @@ pub struct InitializeSoloDeveloperOptions {
     pub project_description: Option<String>,
     pub review_auto_submit_pr_stack: Option<bool>,
     pub review_resolver_agent: Option<String>,
+    /// The agent live actions run on; empty keeps them on the resolver agent.
+    pub review_live_action_agent: Option<String>,
+    /// The model for `review_live_action_agent`; empty uses the agent's
+    /// default. Ignored when no live-action agent is chosen.
+    pub review_live_action_model: Option<String>,
     pub require_forks: Option<bool>,
     pub fork_user: Option<String>,
     pub fork_url: Option<String>,
@@ -301,6 +316,8 @@ impl std::fmt::Debug for InitializeSoloDeveloperOptions {
                 &self.review_auto_submit_pr_stack,
             )
             .field("review_resolver_agent", &self.review_resolver_agent)
+            .field("review_live_action_agent", &self.review_live_action_agent)
+            .field("review_live_action_model", &self.review_live_action_model)
             .field("require_forks", &self.require_forks)
             .field("fork_user", &self.fork_user)
             .field("fork_url", &self.fork_url)
@@ -337,6 +354,8 @@ impl InitializeSoloDeveloperOptions {
             || self.project_description.is_some()
             || self.review_auto_submit_pr_stack.is_some()
             || self.review_resolver_agent.is_some()
+            || self.review_live_action_agent.is_some()
+            || self.review_live_action_model.is_some()
             || self.require_forks.is_some()
             || self.fork_user.is_some()
             || self.fork_url.is_some()
@@ -1351,6 +1370,9 @@ const RECOMMENDED_TRIAGE_THRESHOLDS: [(&str, i64); 4] = [
 struct ReviewDefaults {
     auto_submit_pr_stack: bool,
     resolver_agent: String,
+    /// Empty: live actions use the resolver agent.
+    live_action_agent: String,
+    live_action_model: String,
 }
 
 fn step_review_settings(setup: &InitializeSoloDeveloperOptions) -> ReviewDefaults {
@@ -1371,9 +1393,29 @@ fn step_review_settings(setup: &InitializeSoloDeveloperOptions) -> ReviewDefault
         setup.review_resolver_agent.as_ref(),
         setup.yes,
     );
+    let live_action_agent = prompt(
+        &REVIEW_LIVE_ACTION_AGENT,
+        "  agent for this project's live actions (blank: same as the resolver agent)",
+        "",
+        setup.review_live_action_agent.as_ref(),
+        setup.yes,
+    );
+    let live_action_model = if live_action_agent.trim().is_empty() {
+        String::new()
+    } else {
+        prompt(
+            &REVIEW_LIVE_ACTION_MODEL,
+            "  model for the live-action agent (blank: the agent's default)",
+            "",
+            setup.review_live_action_model.as_ref(),
+            setup.yes,
+        )
+    };
     ReviewDefaults {
         auto_submit_pr_stack,
         resolver_agent,
+        live_action_agent,
+        live_action_model,
     }
 }
 
@@ -1544,6 +1586,8 @@ fn finalize_project_registration(
     let patch = ProjectReviewSettingsPatch {
         auto_submit_pr_stack: Some(review.auto_submit_pr_stack),
         default_resolver_agent: Some(&review.resolver_agent),
+        default_live_action_agent: Some(review.live_action_agent.trim()),
+        default_live_action_model: Some(review.live_action_model.trim()),
         dual_root_pr: dual_root_pr.then_some(true),
         auto_fix_pr_errors: Some(true),
         discourage_tests_during_auto_pull_request_fixes: Some(true),
@@ -1552,8 +1596,14 @@ fn finalize_project_registration(
     };
     match client.set_project_review_settings(&name, &patch) {
         Ok(_) => println!(
-            "  review defaults: auto-submit PR stacks = {}; resolver agent = {}; dual-root PRs = {dual_root_pr}; auto-fix PR errors = on; discourage tests during auto-fix = on; rebuild on feedback/auto-fix = on",
-            review.auto_submit_pr_stack, review.resolver_agent
+            "  review defaults: auto-submit PR stacks = {}; resolver agent = {}; live-action agent = {}; dual-root PRs = {dual_root_pr}; auto-fix PR errors = on; discourage tests during auto-fix = on; rebuild on feedback/auto-fix = on",
+            review.auto_submit_pr_stack,
+            review.resolver_agent,
+            if review.live_action_agent.trim().is_empty() {
+                "(resolver agent)"
+            } else {
+                review.live_action_agent.trim()
+            }
         ),
         Err(error) => println!("  error setting review defaults: {error}"),
     }
@@ -2069,7 +2119,7 @@ mod tests {
     #[test]
     fn interactive_settings_have_unique_prompt_and_flag_contracts() {
         assert!(interactive_settings_are_valid());
-        assert_eq!(INTERACTIVE_SETTINGS.len(), 25);
+        assert_eq!(INTERACTIVE_SETTINGS.len(), 27);
     }
 
     #[test]

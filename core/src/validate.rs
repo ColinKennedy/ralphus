@@ -369,6 +369,8 @@ pub const REVIEW_KEYS: &[&str] = &[
     "name",
     "agent",
     "model",
+    "live_action_agent",
+    "live_action_model",
     "machine",
     "upstream",
     "action",
@@ -2584,6 +2586,17 @@ fn validate_review_blocks(value: Option<&toml::Value>, ctx: &mut Ctx) {
         check_type(ctx, table, "name", Ty::Str, &rpath, header);
         check_type(ctx, table, "agent", Ty::Str, &rpath, header);
         check_type(ctx, table, "model", Ty::Str, &rpath, header);
+        check_type(ctx, table, "live_action_agent", Ty::Str, &rpath, header);
+        check_type(ctx, table, "live_action_model", Ty::Str, &rpath, header);
+        if table.contains_key("live_action_model") && !table.contains_key("live_action_agent") {
+            let line = ctx.key_line(header, "live_action_model");
+            ctx.error(
+                &format!("{rpath}.live_action_model"),
+                ErrorKind::InvalidValue,
+                "'live_action_model' requires 'live_action_agent'",
+                line,
+            );
+        }
         check_type(ctx, table, "upstream", Ty::Str, &rpath, header);
         check_machine(ctx, table, &rpath, header);
         check_type(ctx, table, "maximum_budget_usd", Ty::Float, &rpath, header);

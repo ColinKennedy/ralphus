@@ -50,6 +50,8 @@ fn exec_review_settings(cmd: ProjectReviewSettingsCommand, client: &DaemonClient
             name,
             resolver_agent,
             resolver_model,
+            live_action_agent,
+            live_action_model,
             default_base_branch,
             machine,
             maximum_budget_usd,
@@ -82,6 +84,8 @@ fn exec_review_settings(cmd: ProjectReviewSettingsCommand, client: &DaemonClient
             let patch = ProjectReviewSettingsPatch {
                 default_resolver_agent: resolver_agent.as_deref(),
                 default_resolver_model: resolver_model.as_deref(),
+                default_live_action_agent: live_action_agent.as_deref(),
+                default_live_action_model: live_action_model.as_deref(),
                 default_base_branch: default_base_branch.as_deref(),
                 default_machine: machine.as_deref(),
                 default_maximum_budget_usd: maximum_budget_usd,

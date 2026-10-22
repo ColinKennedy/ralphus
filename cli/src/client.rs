@@ -575,6 +575,16 @@ impl DaemonClient {
             "default_resolver_model",
             patch.default_resolver_model,
         );
+        set_if_some(
+            &mut body,
+            "default_live_action_agent",
+            patch.default_live_action_agent,
+        );
+        set_if_some(
+            &mut body,
+            "default_live_action_model",
+            patch.default_live_action_model,
+        );
         set_if_some(&mut body, "default_base_branch", patch.default_base_branch);
         set_if_some(&mut body, "default_machine", patch.default_machine);
         set_if_some(
@@ -2078,6 +2088,16 @@ impl DaemonClient {
         );
         set_if_some(
             &mut body,
+            "live_action_agent",
+            settings.live_action_agent.map(str::to_string),
+        );
+        set_if_some(
+            &mut body,
+            "live_action_model",
+            settings.live_action_model.map(str::to_string),
+        );
+        set_if_some(
+            &mut body,
             "base_branch",
             settings.base_branch.map(str::to_string),
         );
@@ -2710,6 +2730,10 @@ pub struct GuardianSettings<'a> {
     pub skip_worktrees: Option<bool>,
     pub resolver_agent: Option<&'a str>,
     pub resolver_model: Option<&'a str>,
+    /// The agent this review's live actions run on; an empty string clears it
+    /// back to the resolver agent. A live model requires a live agent.
+    pub live_action_agent: Option<&'a str>,
+    pub live_action_model: Option<&'a str>,
     pub base_branch: Option<&'a str>,
     pub auto_pr_feedback: Option<bool>,
     pub proof_scope: Option<&'a str>,
@@ -2797,6 +2821,8 @@ pub struct GuardianSettings<'a> {
 pub struct ProjectReviewSettingsPatch<'a> {
     pub default_resolver_agent: Option<&'a str>,
     pub default_resolver_model: Option<&'a str>,
+    pub default_live_action_agent: Option<&'a str>,
+    pub default_live_action_model: Option<&'a str>,
     pub default_base_branch: Option<&'a str>,
     pub default_machine: Option<&'a str>,
     pub default_maximum_budget_usd: Option<f64>,

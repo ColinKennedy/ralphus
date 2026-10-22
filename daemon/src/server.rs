@@ -687,6 +687,11 @@ struct AgentsResponse {
     /// resolver agent of its own. Not guaranteed to match an entry in
     /// `agents` if misconfigured -- see `ralphus check health`.
     default_agent: String,
+    /// The effective project-level live-action agent default (database
+    /// settings layered over `.ralphus.toml`); absent when live actions use
+    /// each review's resolver agent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    default_live_action_agent: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -3350,6 +3355,12 @@ struct EffectiveReviewDefaults {
     resolver_agent: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     resolver_model: Option<String>,
+    /// The agent live actions run on by default; absent means they use the
+    /// review's resolver agent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    live_action_agent: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    live_action_model: Option<String>,
     /// The base branch `ralphus ingest` falls back to (no other review reads it).
     #[serde(skip_serializing_if = "Option::is_none")]
     default_base_branch: Option<String>,
@@ -3419,6 +3430,8 @@ impl EffectiveReviewDefaults {
         Self {
             resolver_agent: cfg.default_resolver_agent().to_string(),
             resolver_model: cfg.default_resolver_model().map(str::to_string),
+            live_action_agent: cfg.default_live_action_agent().map(str::to_string),
+            live_action_model: cfg.default_live_action_model().map(str::to_string),
             default_base_branch: cfg.default_base_branch().map(str::to_string),
             machine: cfg.default_machine().map(str::to_string),
             maximum_budget_usd: cfg.default_maximum_budget_usd(),
@@ -3516,6 +3529,13 @@ struct ProjectReviewSettingsBody {
     default_resolver_agent: Option<String>,
     #[serde(default)]
     default_resolver_model: Option<String>,
+    /// The agent live actions run on by default; an empty string clears it
+    /// (live actions then use the review's resolver agent).
+    #[serde(default)]
+    default_live_action_agent: Option<String>,
+    /// The model for `default_live_action_agent`; requires an agent.
+    #[serde(default)]
+    default_live_action_model: Option<String>,
     /// The base branch `ralphus ingest` falls back to; an empty string clears
     /// it, a whitespace-only value is rejected.
     #[serde(default)]
@@ -3826,6 +3846,20 @@ fn set_project_review_settings(daemon: &Daemon, name: &str, body: &str) -> Reply
     }
     if let Some(v) = req.default_resolver_model {
         settings.default_resolver_model = clear_if_empty(v);
+    }
+    if let Some(v) = req.default_live_action_agent {
+        settings.default_live_action_agent = clear_if_empty(v.trim().to_string());
+    }
+    if let Some(v) = req.default_live_action_model {
+        settings.default_live_action_model = clear_if_empty(v.trim().to_string());
+    }
+    if let Some(reply) = reject_invalid_live_action_pair(
+        &store,
+        settings.default_live_action_agent.as_deref(),
+        settings.default_live_action_model.as_deref(),
+        std::path::Path::new(&project.path),
+    ) {
+        return reply;
     }
     if let Some(v) = req.default_base_branch {
         settings.default_base_branch = clear_if_empty(v.trim().to_string());
@@ -6231,11 +6265,17 @@ fn list_agents(daemon: &Daemon, query: &str, user_header: Option<&str>) -> Reply
             let default_agent = crate::config::resolve(Path::new(&cwd))
                 .default_resolver_agent()
                 .to_string();
+            let default_live_action_agent = daemon
+                .lock()
+                .resolve_review_config(Path::new(&cwd))
+                .default_live_action_agent()
+                .map(str::to_string);
             json(
                 200,
                 &AgentsResponse {
                     agents,
                     default_agent,
+                    default_live_action_agent,
                 },
             )
         }
@@ -15819,6 +15859,13 @@ struct GuardianSettingsBody {
     resolver_agent: Option<String>,
     #[serde(default)]
     resolver_model: Option<String>,
+    /// The agent this review's live actions run on; an empty string clears
+    /// it (live actions then use the resolver agent).
+    #[serde(default)]
+    live_action_agent: Option<String>,
+    /// The model for `live_action_agent`; requires an agent.
+    #[serde(default)]
+    live_action_model: Option<String>,
     #[serde(default)]
     base_branch: Option<String>,
     /// RAL-117: opt this review into automatically incorporating PR feedback
@@ -16184,6 +16231,11 @@ struct GuardianDetailsBody {
     resolver_agent: Option<String>,
     #[serde(default)]
     resolver_model: Option<String>,
+    /// See [`GuardianSettingsBody::live_action_agent`].
+    #[serde(default)]
+    live_action_agent: Option<String>,
+    #[serde(default)]
+    live_action_model: Option<String>,
     #[serde(default)]
     proof_scope: Option<String>,
     /// See [`GuardianSettingsBody::ci_deferral`].
@@ -16698,6 +16750,67 @@ fn resolver_field(raw: Option<&str>) -> Option<Option<&str>> {
     raw.map(|s| (!s.is_empty()).then_some(s))
 }
 
+/// Rejects a live-action agent/model pair the daemon could not run: a model
+/// without an agent, or an agent that is neither a built-in backend nor a
+/// registered profile (the same resolution the live run itself performs).
+fn reject_invalid_live_action_pair(
+    store: &crate::store::Store,
+    agent: Option<&str>,
+    model: Option<&str>,
+    cwd: &std::path::Path,
+) -> Option<Reply> {
+    let agent = agent.map(str::trim).filter(|s| !s.is_empty());
+    let model = model.map(str::trim).filter(|s| !s.is_empty());
+    if model.is_some() && agent.is_none() {
+        return Some(error(
+            400,
+            "invalid_value",
+            "a live-action model requires a live-action agent",
+            vec![],
+        ));
+    }
+    if let Some(agent) = agent {
+        if let Err(message) = crate::agent_profiles::resolve_agent_for_path_db(agent, cwd, store) {
+            return Some(error(
+                400,
+                "invalid_value",
+                &format!("invalid live-action agent {agent:?}: {message}"),
+                vec![],
+            ));
+        }
+    }
+    None
+}
+
+/// Validates a review-settings request's live-action fields against the
+/// review's stored pair and, when valid, applies them.
+fn apply_live_action_fields(
+    store: &crate::store::Store,
+    guardian: &crate::guardian::GuardianView,
+    req_agent: Option<&str>,
+    req_model: Option<&str>,
+) -> Option<Reply> {
+    if req_agent.is_none() && req_model.is_none() {
+        return None;
+    }
+    let agent = resolver_field(req_agent);
+    let model = resolver_field(req_model);
+    let effective_agent = agent.map_or(guardian.live_action_agent.as_deref(), |a| a);
+    let effective_model = model.map_or(guardian.live_action_model.as_deref(), |m| m);
+    if let Some(reply) = reject_invalid_live_action_pair(
+        store,
+        effective_agent,
+        effective_model,
+        std::path::Path::new(&guardian.git_root),
+    ) {
+        return Some(reply);
+    }
+    store
+        .set_guardian_live_action_agent(&guardian.id, agent, model)
+        .err()
+        .map(|e| store_error(&e))
+}
+
 /// Update per-review settings (opt-out flags). Only the fields present in the
 /// body are changed; the updated guardian view is returned.
 fn guardian_settings(daemon: &Daemon, id: &str, body: &str) -> Reply {
@@ -16741,6 +16854,20 @@ fn guardian_settings(daemon: &Daemon, id: &str, body: &str) -> Reply {
         let model = resolver_field(req.resolver_model.as_deref());
         if let Err(e) = store.set_guardian_resolver(id, agent, model) {
             return store_error(&e);
+        }
+    }
+    {
+        let guardian = match store.get_guardian(id) {
+            Ok(g) => g,
+            Err(e) => return store_error(&e),
+        };
+        if let Some(reply) = apply_live_action_fields(
+            &store,
+            &guardian,
+            req.live_action_agent.as_deref(),
+            req.live_action_model.as_deref(),
+        ) {
+            return reply;
         }
     }
     if let Some(branch) = req.base_branch.as_deref().filter(|s| !s.is_empty()) {
@@ -17152,6 +17279,14 @@ fn guardian_details(daemon: &Daemon, id: &str, body: &str) -> Reply {
         if let Err(e) = store.set_guardian_resolver(id, agent, model) {
             return store_error(&e);
         }
+    }
+    if let Some(reply) = apply_live_action_fields(
+        &store,
+        &guardian,
+        req.live_action_agent.as_deref(),
+        req.live_action_model.as_deref(),
+    ) {
+        return reply;
     }
     if let Some(scope) = req.proof_scope.as_deref() {
         let scope = if scope.is_empty() { None } else { Some(scope) };

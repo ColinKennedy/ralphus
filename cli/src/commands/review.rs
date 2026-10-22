@@ -90,6 +90,8 @@ pub enum ReviewCommand {
         skip_worktrees: Option<bool>,
         resolver_agent: Option<String>,
         resolver_model: Option<String>,
+        live_action_agent: Option<String>,
+        live_action_model: Option<String>,
         base_branch: Option<String>,
         auto_pr_feedback: Option<bool>,
         proof_scope: Option<String>,
@@ -493,6 +495,8 @@ pub fn parse(args: &[String]) -> ReviewCommand {
             let skip_worktrees = take_tri_bool(&mut scanner, "--skip-worktrees");
             let resolver_agent = scanner.take_value("--resolver-agent").ok().flatten();
             let resolver_model = scanner.take_value("--resolver-model").ok().flatten();
+            let live_action_agent = scanner.take_value("--live-action-agent").ok().flatten();
+            let live_action_model = scanner.take_value("--live-action-model").ok().flatten();
             let base_branch = scanner.take_value("--base-branch").ok().flatten();
             let auto_pr_feedback = take_tri_bool(&mut scanner, "--auto-pr-feedback");
             let proof_scope = scanner.take_value("--proof-scope").ok().flatten();
@@ -540,6 +544,8 @@ pub fn parse(args: &[String]) -> ReviewCommand {
                 skip_worktrees,
                 resolver_agent,
                 resolver_model,
+                live_action_agent,
+                live_action_model,
                 base_branch,
                 auto_pr_feedback,
                 proof_scope,
@@ -1729,6 +1735,8 @@ pub fn dispatch(cmd: ReviewCommand, opts: &GlobalOpts) -> i32 {
             skip_worktrees,
             resolver_agent,
             resolver_model,
+            live_action_agent,
+            live_action_model,
             base_branch,
             auto_pr_feedback,
             proof_scope,
@@ -1759,6 +1767,8 @@ pub fn dispatch(cmd: ReviewCommand, opts: &GlobalOpts) -> i32 {
                 skip_worktrees,
                 resolver_agent: resolver_agent.as_deref(),
                 resolver_model: resolver_model.as_deref(),
+                live_action_agent: live_action_agent.as_deref(),
+                live_action_model: live_action_model.as_deref(),
                 base_branch: base_branch.as_deref(),
                 auto_pr_feedback,
                 proof_scope: proof_scope.as_deref(),
@@ -3138,6 +3148,22 @@ fn render_review_detail(g: &Value) {
     rows.push((
         "resolver_model",
         g["resolver_model"]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .unwrap_or("(default)")
+            .to_string(),
+    ));
+    rows.push((
+        "live_action_agent",
+        g["live_action_agent"]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .unwrap_or("(resolver agent)")
+            .to_string(),
+    ));
+    rows.push((
+        "live_action_model",
+        g["live_action_model"]
             .as_str()
             .filter(|s| !s.is_empty())
             .unwrap_or("(default)")

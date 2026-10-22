@@ -2108,6 +2108,14 @@ pub struct ReviewDef {
     /// default).
     #[serde(default)]
     pub model: Option<String>,
+    /// Agent that runs this review's live actions. Unset falls back to the
+    /// project's `default_live_action_agent`, then to the review's resolver
+    /// `agent`. Validated exactly like `agent`.
+    #[serde(default)]
+    pub live_action_agent: Option<String>,
+    /// Model for `live_action_agent`; allowed only together with it.
+    #[serde(default)]
+    pub live_action_model: Option<String>,
     /// The branch this review's stack rebases onto, declared rather than
     /// discovered (RAL-185).
     ///

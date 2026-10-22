@@ -699,35 +699,42 @@ fn validate_task_file_profiles_with(
     // can span several projects, materializing one guardian per project).
     // Resolve against every distinct project a matching cell resolves to.
     for (review_idx, review) in file.review.iter().enumerate() {
-        let (Some(review_id), Some(agent)) = (review.id.as_deref(), review.agent.as_deref()) else {
-            continue;
-        };
-        let mut seen_cwds = BTreeSet::new();
-        for task in &file.task {
-            for cell in &task.cell {
-                let cell_review_id = cell
-                    .review
-                    .as_deref()
-                    .and_then(ralphus_core::schema::parse_cell_review_sentinel);
-                if cell_review_id != Some(review_id) {
-                    continue;
-                }
-                let Some(cwd) = config_cwd_for_cell(store, task.project.as_deref(), cell) else {
-                    continue;
-                };
-                if !seen_cwds.insert(cwd.clone()) {
-                    continue;
-                }
-                let db = AgentDbSnapshot::load(store, agent);
-                if let Err(message) =
-                    resolve_agent_for_path_with(agent, &cwd, configuration_path_env, Some(&db))
-                {
-                    errors.push(ValidationError {
-                        path: format!("review[{review_idx}].agent"),
-                        kind: ErrorKind::InvalidValue,
-                        message: format!("{message} (for project {})", cwd.display()),
-                        line: None,
-                    });
+        // `live_action_agent` is validated exactly like `agent`.
+        for (field, agent) in [
+            ("agent", review.agent.as_deref()),
+            ("live_action_agent", review.live_action_agent.as_deref()),
+        ] {
+            let (Some(review_id), Some(agent)) = (review.id.as_deref(), agent) else {
+                continue;
+            };
+            let mut seen_cwds = BTreeSet::new();
+            for task in &file.task {
+                for cell in &task.cell {
+                    let cell_review_id = cell
+                        .review
+                        .as_deref()
+                        .and_then(ralphus_core::schema::parse_cell_review_sentinel);
+                    if cell_review_id != Some(review_id) {
+                        continue;
+                    }
+                    let Some(cwd) = config_cwd_for_cell(store, task.project.as_deref(), cell)
+                    else {
+                        continue;
+                    };
+                    if !seen_cwds.insert(cwd.clone()) {
+                        continue;
+                    }
+                    let db = AgentDbSnapshot::load(store, agent);
+                    if let Err(message) =
+                        resolve_agent_for_path_with(agent, &cwd, configuration_path_env, Some(&db))
+                    {
+                        errors.push(ValidationError {
+                            path: format!("review[{review_idx}].{field}"),
+                            kind: ErrorKind::InvalidValue,
+                            message: format!("{message} (for project {})", cwd.display()),
+                            line: None,
+                        });
+                    }
                 }
             }
         }
@@ -770,26 +777,37 @@ pub fn apply_profile_model_defaults(store: &Store, file: &mut TaskFile) {
     }
 
     for review in &mut file.review {
-        if review.model.is_some() {
-            continue;
-        }
-        let (Some(review_id), Some(agent)) = (review.id.as_deref(), review.agent.as_deref()) else {
-            continue;
-        };
-        let matching_cwd = file.task.iter().find_map(|task| {
-            task.cell.iter().find_map(|cell| {
-                (cell
-                    .review
-                    .as_deref()
-                    .and_then(ralphus_core::schema::parse_cell_review_sentinel)
-                    == Some(review_id))
-                .then(|| config_cwd_for_cell(store, task.project.as_deref(), cell))
-                .flatten()
-            })
-        });
-        if let Some(cwd) = matching_cwd {
-            if let Ok(selection) = resolve_agent_for_path_db(agent, &cwd, store) {
-                review.model = selection.model;
+        for live in [false, true] {
+            let (model, agent) = if live {
+                (&review.live_action_model, &review.live_action_agent)
+            } else {
+                (&review.model, &review.agent)
+            };
+            if model.is_some() {
+                continue;
+            }
+            let (Some(review_id), Some(agent)) = (review.id.as_deref(), agent.as_deref()) else {
+                continue;
+            };
+            let matching_cwd = file.task.iter().find_map(|task| {
+                task.cell.iter().find_map(|cell| {
+                    (cell
+                        .review
+                        .as_deref()
+                        .and_then(ralphus_core::schema::parse_cell_review_sentinel)
+                        == Some(review_id))
+                    .then(|| config_cwd_for_cell(store, task.project.as_deref(), cell))
+                    .flatten()
+                })
+            });
+            if let Some(cwd) = matching_cwd {
+                if let Ok(selection) = resolve_agent_for_path_db(agent, &cwd, store) {
+                    if live {
+                        review.live_action_model = selection.model;
+                    } else {
+                        review.model = selection.model;
+                    }
+                }
             }
         }
     }
