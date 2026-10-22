@@ -68,6 +68,55 @@ pub struct TriageTypeView {
     pub label: String,
     pub description: String,
     pub created_at_ms: i64,
+    /// Per-project upstream branches reviews drained from this type's pools
+    /// target (RAL-637), alphabetical by project.
+    pub upstreams: Vec<TriageTypeUpstream>,
+}
+
+/// One `(project, triage type)` upstream branch assignment (RAL-637).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct TriageTypeUpstream {
+    pub project: String,
+    pub upstream: String,
+}
+
+/// Shape-check a git ref name used as a triage type's upstream (RAL-637):
+/// the `git check-ref-format --branch` rules, without asking the repository
+/// whether the branch exists.
+///
+/// # Errors
+/// A human-readable reason when `upstream` is empty or not a valid ref name.
+pub fn validate_upstream_ref(upstream: &str) -> Result<(), String> {
+    let name = upstream;
+    if name.is_empty() {
+        return Err("'upstream' must not be empty".to_string());
+    }
+    let bad = |why: &str| Err(format!("'{name}' is not a valid git branch name: {why}"));
+    if name == "@" {
+        return bad("cannot be '@'");
+    }
+    if name.starts_with('-') || name.starts_with('/') || name.ends_with('/') {
+        return bad("cannot start with '-' or start/end with '/'");
+    }
+    if name.ends_with('.') {
+        return bad("cannot end with '.'");
+    }
+    if name.contains("..") || name.contains("@{") || name.contains("//") {
+        return bad("cannot contain '..', '@{' or '//'");
+    }
+    if name
+        .chars()
+        .any(|c| c.is_control() || c.is_whitespace() || "~^:?*[\\".contains(c))
+    {
+        return bad("cannot contain whitespace, control characters or any of ~ ^ : ? * [ \\");
+    }
+    if name
+        .split('/')
+        .any(|part| part.starts_with('.') || part.ends_with(".lock"))
+    {
+        return bad("a path component cannot start with '.' or end with '.lock'");
+    }
+    Ok(())
 }
 
 /// The outcome of attempting to deregister a Triage type.
@@ -197,10 +246,102 @@ impl Store {
                     label: r.get(1)?,
                     description: r.get(2)?,
                     created_at_ms: r.get(3)?,
+                    upstreams: Vec::new(),
                 })
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
+        let mut rows = rows;
+        let mut stmt = self.conn.prepare(
+            "SELECT triage_type, project, upstream FROM triage_type_upstreams
+             ORDER BY triage_type, project",
+        )?;
+        let upstreams = stmt
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    TriageTypeUpstream {
+                        project: r.get(1)?,
+                        upstream: r.get(2)?,
+                    },
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        for (triage_type, upstream) in upstreams {
+            if let Some(t) = rows.iter_mut().find(|t| t.name == triage_type) {
+                t.upstreams.push(upstream);
+            }
+        }
         Ok(rows)
+    }
+
+    /// Set (`Some`) or clear (`None`) the upstream branch reviews drained from
+    /// `(project, triage_type)` target (RAL-637). `project` is the pool-key
+    /// project (`resolve_pool_key_input`). The caller validates `upstream`
+    /// with [`validate_upstream_ref`]; the type must be registered.
+    ///
+    /// # Errors
+    /// Propagates any SQLite failure.
+    pub fn set_triage_type_upstream(
+        &self,
+        project: &str,
+        triage_type: &str,
+        upstream: Option<&str>,
+    ) -> StoreResult<()> {
+        match upstream {
+            Some(u) => {
+                self.conn.execute(
+                    "INSERT INTO triage_type_upstreams(project, triage_type, upstream, updated_at_ms)
+                     VALUES(?,?,?,?)
+                     ON CONFLICT(project, triage_type) DO UPDATE SET upstream=excluded.upstream, updated_at_ms=excluded.updated_at_ms",
+                    params![project, triage_type, u, now_ms()],
+                )?;
+            }
+            None => {
+                self.conn.execute(
+                    "DELETE FROM triage_type_upstreams WHERE project=? AND triage_type=?",
+                    params![project, triage_type],
+                )?;
+            }
+        }
+        crate::rlog!(
+            INFO,
+            "ralphus [store] triage type {triage_type:?} upstream for {project:?} set to {upstream:?}"
+        );
+        let _ = self.cartographer_log(crate::cartographer::CartographerEntry {
+            level: crate::logging::LogLevel::INFO,
+            source: "store",
+            message: "triage type upstream set",
+            scope: Some("triage"),
+            squad_id: None,
+            guardian_id: None,
+            cell_id: None,
+            task: None,
+            log_path: None,
+            payload: serde_json::json!({
+                "project": project, "triage_type": triage_type, "upstream": upstream,
+            }),
+            admin_only: false,
+        });
+        Ok(())
+    }
+
+    /// The upstream branch configured for `(project, triage_type)`, or `None`.
+    ///
+    /// # Errors
+    /// Propagates any SQLite failure.
+    pub fn get_triage_type_upstream(
+        &self,
+        project: &str,
+        triage_type: &str,
+    ) -> StoreResult<Option<String>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT upstream FROM triage_type_upstreams WHERE project=? AND triage_type=?",
+                params![project, triage_type],
+                |r| r.get(0),
+            )
+            .optional()?)
     }
 
     /// One Triage type by exact name, or `None`.
@@ -235,6 +376,10 @@ impl Store {
         if n == 0 {
             return Ok(DeregisterOutcome::NotFound);
         }
+        self.conn.execute(
+            "DELETE FROM triage_type_upstreams WHERE triage_type = ?",
+            params![name],
+        )?;
         crate::rlog!(INFO, "ralphus [store] triage type {name:?} removed");
         let _ = self.cartographer_log(crate::cartographer::CartographerEntry {
             level: crate::logging::LogLevel::INFO,
@@ -1574,6 +1719,67 @@ mod tests {
 
     fn store() -> Store {
         Store::open_in_memory().expect("in-memory store")
+    }
+
+    #[test]
+    fn validate_upstream_ref_accepts_branch_names_and_rejects_malformed_ones() {
+        for ok in ["main", "beta", "release/1.2", "feat/x-y_z"] {
+            assert!(validate_upstream_ref(ok).is_ok(), "{ok}");
+        }
+        for bad in [
+            "", " ", "a b", "-x", "/x", "x/", "x.", "a..b", "a@{b", "@", "a//b", "a:b", "a~b",
+            "a^b", "a?b", "a*b", "a[b", r"a\b", "x.lock", "a/.b", "a\tb",
+        ] {
+            assert!(validate_upstream_ref(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn type_upstreams_are_per_project_listed_updated_cleared_and_dropped_with_the_type() {
+        let store = store();
+        store.register_triage_type("sec", "Sec", "").unwrap();
+        store
+            .set_triage_type_upstream("p1", "sec", Some("main"))
+            .unwrap();
+        store
+            .set_triage_type_upstream("p2", "sec", Some("beta"))
+            .unwrap();
+        store
+            .set_triage_type_upstream("p1", "sec", Some("staging"))
+            .unwrap();
+        assert_eq!(
+            store
+                .get_triage_type_upstream("p1", "sec")
+                .unwrap()
+                .as_deref(),
+            Some("staging")
+        );
+        let listed = store.list_triage_types().unwrap();
+        let sec = listed.iter().find(|t| t.name == "sec").unwrap();
+        assert_eq!(sec.upstreams.len(), 2);
+        store.set_triage_type_upstream("p2", "sec", None).unwrap();
+        assert!(
+            store
+                .get_triage_type_upstream("p2", "sec")
+                .unwrap()
+                .is_none()
+        );
+        // Re-registering (as startup seeding does) leaves the upstream alone.
+        store.register_triage_type("sec", "Sec", "d").unwrap();
+        assert_eq!(
+            store
+                .get_triage_type_upstream("p1", "sec")
+                .unwrap()
+                .as_deref(),
+            Some("staging")
+        );
+        store.deregister_triage_type("sec").unwrap();
+        assert!(
+            store
+                .get_triage_type_upstream("p1", "sec")
+                .unwrap()
+                .is_none()
+        );
     }
 
     fn completed_pool_cell(store: &mut Store) -> String {

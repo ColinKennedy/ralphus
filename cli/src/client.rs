@@ -1151,10 +1151,28 @@ impl DaemonClient {
         name: &str,
         label: &str,
         description: &str,
+        project: Option<&str>,
+        upstream: Option<&str>,
+    ) -> Result<Value, DaemonError> {
+        let mut body = json!({"name": name, "label": label, "description": description});
+        if let (Some(project), Some(upstream)) = (project, upstream) {
+            body["project"] = json!(project);
+            body["upstream"] = json!(upstream);
+        }
+        self.post("/api/triage/types", Some(body))
+    }
+
+    /// Set (or, with `None`, clear) the review upstream branch for a
+    /// `(project, triage_type)` pair.
+    pub fn set_triage_type_upstream(
+        &self,
+        project: &str,
+        triage_type: &str,
+        upstream: Option<&str>,
     ) -> Result<Value, DaemonError> {
         self.post(
-            "/api/triage/types",
-            Some(json!({"name": name, "label": label, "description": description})),
+            "/api/triage/types/upstream",
+            Some(json!({"project": project, "triage_type": triage_type, "upstream": upstream})),
         )
     }
 

@@ -40,6 +40,15 @@ pub enum TriageTypeCommand {
         name: String,
         label: String,
         description: String,
+        /// Project the review upstream applies to; paired with `upstream`.
+        project: Option<String>,
+        upstream: Option<String>,
+    },
+    /// Set (or `--clear`) the review upstream for a `(project, type)` pair.
+    Upstream {
+        project: String,
+        triage_type: String,
+        upstream: Option<String>,
     },
     List,
     Get {
@@ -121,15 +130,53 @@ fn parse_type(args: &[String]) -> TriageTypeCommand {
                 Ok(v) => v.unwrap_or_default(),
                 Err(e) => return TriageTypeCommand::UsageError(e.0),
             };
+            let project = match scanner.take_value("--project") {
+                Ok(v) => v,
+                Err(e) => return TriageTypeCommand::UsageError(e.0),
+            };
+            let upstream = match scanner.take_value("--upstream") {
+                Ok(v) => v,
+                Err(e) => return TriageTypeCommand::UsageError(e.0),
+            };
+            if project.is_some() != upstream.is_some() {
+                return TriageTypeCommand::UsageError(
+                    "--project and --upstream must be given together".to_string(),
+                );
+            }
             match scanner.remaining().into_iter().next() {
                 Some(name) => TriageTypeCommand::Register {
                     name,
                     label,
                     description,
+                    project,
+                    upstream,
                 },
                 None => {
                     TriageTypeCommand::UsageError("register requires a <name> argument".to_string())
                 }
+            }
+        }
+        Some("upstream") => {
+            let upstream = match scanner.take_value("--upstream") {
+                Ok(v) => v,
+                Err(e) => return TriageTypeCommand::UsageError(e.0),
+            };
+            let clear = scanner.take_bool("--clear");
+            if upstream.is_some() == clear {
+                return TriageTypeCommand::UsageError(
+                    "upstream requires exactly one of --upstream <branch> or --clear".to_string(),
+                );
+            }
+            let mut rest = scanner.remaining().into_iter();
+            let (Some(project), Some(triage_type)) = (rest.next(), rest.next()) else {
+                return TriageTypeCommand::UsageError(
+                    "upstream requires <project> and <triage_type> arguments".to_string(),
+                );
+            };
+            TriageTypeCommand::Upstream {
+                project,
+                triage_type,
+                upstream,
             }
         }
         Some("list") => TriageTypeCommand::List,
@@ -269,9 +316,40 @@ fn dispatch_type(cmd: TriageTypeCommand, opts: &GlobalOpts) -> i32 {
             name,
             label,
             description,
-        } => match client.register_triage_type(&name, &label, &description) {
+            project,
+            upstream,
+        } => match client.register_triage_type(
+            &name,
+            &label,
+            &description,
+            project.as_deref(),
+            upstream.as_deref(),
+        ) {
             Ok(_) => {
                 println!("registered triage type \"{name}\"");
+                0
+            }
+            Err(e) => {
+                CommandError::Daemon(e).print(false, None);
+                1
+            }
+        },
+        TriageTypeCommand::Upstream {
+            project,
+            triage_type,
+            upstream,
+        } => match client.set_triage_type_upstream(&project, &triage_type, upstream.as_deref()) {
+            Ok(_) => {
+                match upstream {
+                    Some(u) => {
+                        println!(
+                            "triage type \"{triage_type}\" in {project} now reviews against {u}"
+                        );
+                    }
+                    None => {
+                        println!("cleared the review upstream for \"{triage_type}\" in {project}")
+                    }
+                }
                 0
             }
             Err(e) => {
@@ -375,6 +453,17 @@ fn render_triage_type_list(payload: &Value) {
         if let Some(description) = t["description"].as_str().filter(|d| !d.is_empty()) {
             println!("    {description}");
         }
+        print_upstreams(t, "    ");
+    }
+}
+
+fn print_upstreams(t: &Value, indent: &str) {
+    for u in t["upstreams"].as_array().into_iter().flatten() {
+        println!(
+            "{indent}upstream[{}]: {}",
+            u["project"].as_str().unwrap_or_default(),
+            u["upstream"].as_str().unwrap_or_default()
+        );
     }
 }
 
@@ -384,6 +473,7 @@ fn render_triage_type_detail(t: &Value) {
     if let Some(description) = t["description"].as_str().filter(|d| !d.is_empty()) {
         println!("description: {description}");
     }
+    print_upstreams(t, "");
 }
 
 #[cfg(test)]
@@ -414,13 +504,71 @@ mod tests {
                 name,
                 label,
                 description,
+                project,
+                upstream,
             }) => {
                 assert_eq!(name, "security");
                 assert_eq!(label, "Security");
                 assert_eq!(description, "sensitive changes");
+                assert!(project.is_none() && upstream.is_none());
             }
             other => panic!("unexpected: {other:?}"),
         }
+    }
+
+    #[test]
+    fn parses_type_register_with_upstream() {
+        match parse(&v(&[
+            "type",
+            "register",
+            "--project",
+            "web",
+            "--upstream",
+            "beta",
+            "security",
+        ])) {
+            TriageCommand::Type(TriageTypeCommand::Register {
+                project, upstream, ..
+            }) => {
+                assert_eq!(project.as_deref(), Some("web"));
+                assert_eq!(upstream.as_deref(), Some("beta"));
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+        assert!(matches!(
+            parse(&v(&["type", "register", "--upstream", "beta", "security"])),
+            TriageCommand::Type(TriageTypeCommand::UsageError(_))
+        ));
+    }
+
+    #[test]
+    fn parses_type_upstream_set_and_clear() {
+        match parse(&v(&[
+            "type",
+            "upstream",
+            "web",
+            "sec",
+            "--upstream",
+            "beta",
+        ])) {
+            TriageCommand::Type(TriageTypeCommand::Upstream {
+                project,
+                triage_type,
+                upstream,
+            }) => {
+                assert_eq!((project.as_str(), triage_type.as_str()), ("web", "sec"));
+                assert_eq!(upstream.as_deref(), Some("beta"));
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+        assert!(matches!(
+            parse(&v(&["type", "upstream", "web", "sec", "--clear"])),
+            TriageCommand::Type(TriageTypeCommand::Upstream { upstream: None, .. })
+        ));
+        assert!(matches!(
+            parse(&v(&["type", "upstream", "web", "sec"])),
+            TriageCommand::Type(TriageTypeCommand::UsageError(_))
+        ));
     }
 
     #[test]

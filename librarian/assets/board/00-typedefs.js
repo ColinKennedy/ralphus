@@ -915,6 +915,7 @@
        * @property {string} label
        * @property {string} description
        * @property {number} created_at_ms
+       * @property {{project: string, upstream: string}[]} upstreams - per-project review upstream branch
        */
       /**
        * A registered preset -- a named bundle of field defaults an `extends
@@ -1067,6 +1068,7 @@
        * @typedef {object} TriagePaneEditDraft
        * @property {string} key - `triagePreviewKey(project, triageType)`
        * @property {string} threshold - raw threshold text; "" means no count trigger
+       * @property {string} upstream - raw review upstream branch text
        * @property {TriageScheduleDraft[]} scheds
        */
       /**

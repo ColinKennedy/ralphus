@@ -2299,6 +2299,13 @@ pub(crate) fn create_review_from_triage_pool(
     triage_type: &str,
     orderer: impl Fn(&[crate::arbiter::OrderingCandidate]) -> Option<Vec<String>>,
 ) -> std::result::Result<Option<String>, ReviewError> {
+    // Resolved before draining: a pool with no configured upstream keeps its
+    // cells rather than losing them to a refused review.
+    let Some(upstream) =
+        require_triage_upstream(store, project, &[project.to_string()], triage_type)?
+    else {
+        return Ok(None);
+    };
     // `drain_triage_pool` is a single atomic `DELETE ... RETURNING`; kept as
     // one statement-scoped lock so two concurrent firers can never both drain
     // the same pool. The guard is gone before
@@ -2308,7 +2315,65 @@ pub(crate) fn create_review_from_triage_pool(
         .lock()
         .drain_triage_pool(project, triage_type)
         .map_err(|e| ReviewError::new(e.to_string()))?;
-    build_review_from_drained_pool(store, project, triage_type, drained, orderer)
+    build_review_from_drained_pool(store, project, triage_type, &upstream, drained, orderer)
+}
+
+/// The upstream branch a review drained from `(pool_key, triage_type)` must
+/// target (RAL-637), read at drain time from the triage type's per-project
+/// setting. It overrides the project's review-settings default and any
+/// pooled cell's own upstream.
+///
+/// A pool with none configured is not drained: a mailbox message with
+/// remediation tells the user how to set one, and `Ok(None)` is returned.
+/// Pools with no pooled cells stay silent (nothing is waiting on a review).
+fn require_triage_upstream(
+    store: &crate::store_lock::StoreHandle,
+    pool_key: &str,
+    pool_keys: &[String],
+    triage_type: &str,
+) -> std::result::Result<Option<String>, ReviewError> {
+    let guard = store.lock();
+    let base_project = crate::triage::base_project_key(pool_key);
+    if let Some(upstream) = guard
+        .get_triage_type_upstream(base_project, triage_type)
+        .map_err(|e| ReviewError::new(e.to_string()))?
+    {
+        return Ok(Some(upstream));
+    }
+    let mut waiting = 0;
+    for key in pool_keys {
+        waiting += guard
+            .triage_pool_count(key, triage_type)
+            .map_err(|e| ReviewError::new(e.to_string()))?;
+    }
+    if waiting > 0 {
+        let message = format!(
+            "Triage pool ({base_project}, {triage_type}) cannot create a review: the triage type has no upstream branch for this project."
+        );
+        let _ = guard.enqueue_error_mailbox_message_deduped(
+            crate::mailbox::MailboxPriority::High,
+            &message,
+            &crate::mailbox::Remediation::SuggestedCommand {
+                command: format!(
+                    "ralphus triage type upstream {base_project} {triage_type} --upstream <branch>"
+                ),
+                purpose: "set the branch its reviews target; the pooled cells are kept".to_string(),
+            },
+            None,
+            None,
+            None,
+            None,
+            Some("triage"),
+        );
+        crate::cartographer::Note::new("arbiter")
+            .level(crate::logging::LogLevel::WARNING)
+            .emit(
+                &guard,
+                message,
+                serde_json::json!({"project": base_project, "triage_type": triage_type}),
+            );
+    }
+    Ok(None)
 }
 
 /// The production RAL-412 ordering request: ask the currently configured
@@ -2401,6 +2466,9 @@ pub(crate) fn create_review_from_triage_project_sweep(
         let store = store.lock();
         crate::triage::project_pool_keys(&store, base_project, triage_type)
     };
+    let Some(upstream) = require_triage_upstream(store, base_project, &keys, triage_type)? else {
+        return Ok(None);
+    };
     let mut drained = Vec::new();
     for key in &keys {
         // Each drain stays its own statement-scoped lock: a single atomic
@@ -2412,7 +2480,14 @@ pub(crate) fn create_review_from_triage_project_sweep(
                 .map_err(|e| ReviewError::new(e.to_string()))?,
         );
     }
-    build_review_from_drained_pool(store, base_project, triage_type, drained, orderer)
+    build_review_from_drained_pool(
+        store,
+        base_project,
+        triage_type,
+        &upstream,
+        drained,
+        orderer,
+    )
 }
 
 /// Shared tail of [`create_review_from_triage_pool`]/
@@ -2436,6 +2511,7 @@ fn build_review_from_drained_pool(
     store: &crate::store_lock::StoreHandle,
     pool_key: &str,
     triage_type: &str,
+    upstream: &str,
     drained: Vec<crate::triage::TriagePoolCellRow>,
     orderer: impl Fn(&[crate::arbiter::OrderingCandidate]) -> Option<Vec<String>>,
 ) -> std::result::Result<Option<String>, ReviewError> {
@@ -2518,13 +2594,28 @@ fn build_review_from_drained_pool(
         None => drained,
     };
     let drained = stratify_by_followup_depth(drained, &depths);
-    let upstream = drained
-        .first()
-        .map(|c| c.upstream.clone())
-        .unwrap_or_else(|| "main".to_string());
     // Creation phase: guard re-taken for every store write that materializes
     // the review.
     let store = store.lock();
+    // A cell based on another branch is accepted as is (no rebase); the
+    // mismatch is only recorded.
+    for cell in drained.iter().filter(|c| c.upstream != upstream) {
+        crate::cartographer::Note::new("arbiter")
+            .squad(&cell.squad_id)
+            .level(crate::logging::LogLevel::WARNING)
+            .emit(
+                &store,
+                format!(
+                    "pooled branch {:?} tracks upstream {:?} but the Triage type {triage_type:?} targets {upstream:?}",
+                    cell.branch, cell.upstream
+                ),
+                serde_json::json!({
+                    "branch": cell.branch,
+                    "cell_upstream": cell.upstream,
+                    "type_upstream": upstream,
+                }),
+            );
+    }
     let base_project = crate::triage::base_project_key(pool_key);
     let registered_project = store
         .get_project(base_project)
@@ -2545,7 +2636,7 @@ fn build_review_from_drained_pool(
     let gid = store
         .create_guardian_keyed(
             &name,
-            &upstream,
+            upstream,
             &project_root,
             None,
             None,
@@ -4290,6 +4381,10 @@ print(json.dumps(result))
             .record_triage_pool_cell("proj", "security", &squad_2, 0, 0, "b2", "main")
             .unwrap();
 
+        store
+            .lock()
+            .set_triage_type_upstream("proj", "security", Some("main"))
+            .unwrap();
         let gid = create_review_from_triage_pool(&store, "proj", "security", |_| None)
             .unwrap()
             .expect("pool was non-empty, must create a review");
@@ -4310,6 +4405,71 @@ print(json.dumps(result))
             create_review_from_triage_pool(&store, "proj", "security", |_| None)
                 .unwrap()
                 .is_none()
+        );
+    }
+
+    fn pooled_store(
+        project: &str,
+        triage_type: &str,
+    ) -> std::sync::Arc<crate::store_lock::StoreMutex> {
+        let store = std::sync::Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
+        for branch in ["b1", "b2"] {
+            let squad = completed_pool_cell(&mut store.lock());
+            store
+                .lock()
+                .record_triage_pool_cell(project, triage_type, &squad, 0, 0, branch, "main")
+                .unwrap();
+        }
+        store
+    }
+
+    /// RAL-637: the type's upstream, not the project default or the cell's
+    /// own base, is the drained review's base branch.
+    #[test]
+    fn drained_pool_review_targets_the_triage_type_upstream() {
+        let store = pooled_store("proj", "security");
+        store
+            .lock()
+            .set_triage_type_upstream("proj", "security", Some("beta"))
+            .unwrap();
+        let gid = create_review_from_triage_pool(&store, "proj", "security", |_| None)
+            .unwrap()
+            .expect("review created");
+        assert_eq!(store.lock().get_guardian(&gid).unwrap().base_branch, "beta");
+    }
+
+    /// RAL-637: with no upstream the pool is kept and the user is told how to
+    /// set one.
+    #[test]
+    fn pool_without_a_type_upstream_is_not_drained_and_sends_remediation_mail() {
+        let store = pooled_store("proj", "security");
+        let created = create_review_from_triage_pool(&store, "proj", "security", |_| None).unwrap();
+        assert!(created.is_none());
+        assert_eq!(
+            store.lock().triage_pool_count("proj", "security").unwrap(),
+            2
+        );
+        let mail = store
+            .lock()
+            .mailbox_messages_for_client("tester", false, None)
+            .unwrap();
+        assert!(
+            mail.iter().any(|m| m
+                .message
+                .contains("ralphus triage type upstream proj security")),
+            "mail: {mail:?}"
+        );
+
+        store
+            .lock()
+            .set_triage_type_upstream("proj", "security", Some("main"))
+            .unwrap();
+        assert!(
+            create_review_from_triage_pool(&store, "proj", "security", |_| None)
+                .unwrap()
+                .is_some()
         );
     }
 
@@ -4334,6 +4494,10 @@ print(json.dumps(result))
         store
             .lock()
             .record_triage_pool_cell("proj", "security", &squad_3, 0, 0, "b3", "main")
+            .unwrap();
+        store
+            .lock()
+            .set_triage_type_upstream("proj", "security", Some("main"))
             .unwrap();
         let gid = create_review_from_triage_pool(
             &store,
@@ -4372,6 +4536,10 @@ print(json.dumps(result))
         store
             .lock()
             .record_triage_pool_cell("proj", "security", &squad_2, 0, 0, "b2", "main")
+            .unwrap();
+        store
+            .lock()
+            .set_triage_type_upstream("proj", "security", Some("main"))
             .unwrap();
         let gid = create_review_from_triage_pool(
             &store,
@@ -4427,6 +4595,10 @@ prompt=\"c\"
                 .record_triage_pool_cell("proj", "bug", &squad_id, 0, idx, "b-shared", "main")
                 .unwrap();
         }
+        store
+            .lock()
+            .set_triage_type_upstream("proj", "bug", Some("main"))
+            .unwrap();
         let gid = create_review_from_triage_pool(&store, "proj", "bug", |_| None)
             .unwrap()
             .expect("pool was non-empty, must create a review");
@@ -4464,6 +4636,10 @@ prompt=\"a\"
                 .record_triage_pool_cell("proj", "bug", &squad_id, 0, 0, "b-work", "main")
                 .unwrap();
         }
+        store
+            .lock()
+            .set_triage_type_upstream("proj", "bug", Some("main"))
+            .unwrap();
         let gid = create_review_from_triage_pool(&store, "proj", "bug", |_| None)
             .unwrap()
             .expect("pool was non-empty, must create a review");
@@ -4495,6 +4671,10 @@ prompt=\"a\"
         store
             .lock()
             .record_triage_pool_cell("proj", "security", &squad_id, 0, 0, "b-work", "main")
+            .unwrap();
+        store
+            .lock()
+            .set_triage_type_upstream("proj", "security", Some("main"))
             .unwrap();
         let gid = create_review_from_triage_pool(&store, "proj", "security", |cands| {
             assert_eq!(cands.len(), 1, "one pooled cell, one candidate");
@@ -4647,6 +4827,10 @@ prompt=\"a\"
             let store = std::sync::Arc::new(crate::store_lock::StoreMutex::new(
                 Store::open_in_memory().unwrap(),
             ));
+            store
+                .lock()
+                .set_triage_type_upstream("proj", "bug", Some("main"))
+                .unwrap();
             let followup_squad = completed_pool_cell(&mut store.lock());
             let submitted_squad = completed_pool_cell(&mut store.lock());
             {
@@ -4741,6 +4925,10 @@ prompt=\"a\"
             .record_triage_pool_cell("proj", "security", &ok_squad, 0, 0, "b-ok", "main")
             .unwrap();
 
+        store
+            .lock()
+            .set_triage_type_upstream("proj", "security", Some("main"))
+            .unwrap();
         let gid = create_review_from_triage_pool(&store, "proj", "security", |_| None)
             .unwrap()
             .expect("one viable cell remains, must still create a review");
@@ -4824,6 +5012,10 @@ prompt=\"a\"
             .record_triage_pool_cell("proj", "security", &squad_id, 0, 0, "b1", "main")
             .unwrap();
 
+        store
+            .lock()
+            .set_triage_type_upstream("proj", "security", Some("main"))
+            .unwrap();
         let gid = create_review_from_triage_pool(&store, "proj", "security", |_| None)
             .unwrap()
             .expect("pool was non-empty, must create a review");
@@ -4915,6 +5107,10 @@ prompt=\"a\"
             .record_triage_pool_cell("proj", "security", &squad_id, 0, 0, "b1", "main")
             .unwrap();
 
+        store
+            .lock()
+            .set_triage_type_upstream("proj", "security", Some("main"))
+            .unwrap();
         let gid = create_review_from_triage_pool(&store, "proj", "security", |_| None)
             .unwrap()
             .expect("pool was non-empty, must create a review");
@@ -5130,6 +5326,10 @@ prompt=\"a\"
         store
             .lock()
             .register_project("proj", "", &root.to_string_lossy(), "git")
+            .unwrap();
+        store
+            .lock()
+            .set_triage_type_upstream("proj", "bug", Some("main"))
             .unwrap();
 
         let stale_key = root.to_string_lossy().replace('\\', "/");
@@ -5393,6 +5593,10 @@ prompt=\"a\"
         store
             .lock()
             .register_triage_type("security", "Security", "")
+            .unwrap();
+        store
+            .lock()
+            .set_triage_type_upstream("proj", "security", Some("main"))
             .unwrap();
         store
             .lock()
@@ -5793,6 +5997,10 @@ prompt=\"a\"
             .lock()
             .register_triage_type("security", "Security", "")
             .unwrap();
+        store
+            .lock()
+            .set_triage_type_upstream("proj", "security", Some("main"))
+            .unwrap();
 
         let cwd = root.to_string_lossy().replace('\\', "/");
         let src = format!(
@@ -5811,6 +6019,10 @@ prompt=\"a\"
         // The threshold is configured before the candidate is submitted.
         let triage_project =
             crate::reviews::project_root_of(&cwd).expect("cwd resolves to a git worktree project");
+        store
+            .lock()
+            .set_triage_type_upstream(&triage_project, "security", Some("main"))
+            .unwrap();
         store
             .lock()
             .set_triage_pool_threshold(&triage_project, "security", Some(1))
@@ -5896,6 +6108,10 @@ prompt=\"a\"
             .lock()
             .register_triage_type("security", "Security", "")
             .unwrap();
+        store
+            .lock()
+            .set_triage_type_upstream("proj", "security", Some("main"))
+            .unwrap();
 
         let cwd = root.to_string_lossy().replace('\\', "/");
         let sub_cwd = format!("{cwd}/sub");
@@ -5912,6 +6128,10 @@ prompt=\"a\"
             .unwrap();
         let triage_project =
             crate::reviews::project_root_of(&cwd).expect("cwd resolves to a git worktree project");
+        store
+            .lock()
+            .set_triage_type_upstream(&triage_project, "security", Some("main"))
+            .unwrap();
         store
             .lock()
             .set_triage_pool_threshold(&triage_project, "security", Some(1))
