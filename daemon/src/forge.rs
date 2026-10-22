@@ -783,6 +783,14 @@ impl ForgeClient {
         self.token.as_deref()
     }
 
+    /// The token a remote machine's `git push`/`fetch` for this repository
+    /// authenticates with ([`crate::workspace::ForgeCredentials`]), handed
+    /// to that one git process through its environment only.
+    #[must_use]
+    pub(crate) fn token_for_remote_git(&self) -> Option<&str> {
+        self.token.as_deref()
+    }
+
     /// The `head` value to use when this client's own repo owns both the
     /// branch and the PR/MR -- i.e. everywhere except the GitHub cross-repo
     /// fork root, which already builds its own `owner:branch` head from the

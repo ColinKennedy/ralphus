@@ -886,6 +886,16 @@ impl DaemonClient {
         self.get("/api/machines")
     }
 
+    /// Machines provider services granted (`allocations`), active ones only
+    /// unless `all`.
+    pub fn list_machine_allocations(&self, all: bool) -> Result<Value, DaemonError> {
+        self.get(if all {
+            "/api/machine-allocations?all=true"
+        } else {
+            "/api/machine-allocations"
+        })
+    }
+
     /// RAL-355 Phase 9: health of every configured `[machine.targets.*]`
     /// entry. Always live -- see `health_targets::check_all_targets`'s doc.
     pub fn health_remote_targets(&self) -> Result<Value, DaemonError> {

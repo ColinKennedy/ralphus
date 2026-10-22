@@ -30,6 +30,11 @@ pub enum MachineCommand {
         channel: bool,
     },
     List,
+    /// Machines provider services granted; `all` includes released and lost
+    /// ones.
+    Allocations {
+        all: bool,
+    },
     Get {
         scheme: String,
     },
@@ -54,6 +59,9 @@ pub fn parse(args: &[String]) -> MachineCommand {
     let mut scanner = Scanner::new(&args[1.min(args.len())..]);
     match args.first().map(String::as_str) {
         None | Some("list") => MachineCommand::List,
+        Some("allocations") => MachineCommand::Allocations {
+            all: scanner.take_bool("--all"),
+        },
         Some("help" | "--help" | "-h") => MachineCommand::Help,
         Some("register") => match parse_register(&mut scanner) {
             Ok(cmd) => cmd,
@@ -185,6 +193,16 @@ pub fn dispatch(cmd: MachineCommand, opts: &GlobalOpts) -> i32 {
                 2
             }
         },
+        MachineCommand::Allocations { all } => match client.list_machine_allocations(all) {
+            Ok(payload) => {
+                super::emit(opts, &payload, render_allocations);
+                0
+            }
+            Err(e) => {
+                CommandError::Daemon(e).print(false, None);
+                2
+            }
+        },
         MachineCommand::Get { scheme } => match client.get_machine(&scheme) {
             Ok(m) => {
                 render_machine_detail(&m);
@@ -239,6 +257,38 @@ pub fn dispatch(cmd: MachineCommand, opts: &GlobalOpts) -> i32 {
                 1
             }
         },
+    }
+}
+
+fn render_allocations(payload: &Value) {
+    let rows = payload["allocations"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    if rows.is_empty() {
+        println!("no machine allocations");
+        return;
+    }
+    for row in rows {
+        let text = |key: &str| row[key].as_str().unwrap_or("-").to_string();
+        let platform = format!("{}/{}", text("os"), text("arch"));
+        let scope = row["squad_id"]
+            .as_str()
+            .map(|s| format!("squad {s}"))
+            .or_else(|| row["guardian_id"].as_str().map(|g| format!("review {g}")))
+            .unwrap_or_default();
+        let idle = if row["idle"] == true { " (idle)" } else { "" };
+        println!(
+            "#{} {} {} [{}{idle}] {} {} -- {}",
+            row["id"],
+            text("provider"),
+            text("allocation_id"),
+            text("state"),
+            platform,
+            scope,
+            text("description")
+        );
+        println!("    request {}", text("request"));
     }
 }
 

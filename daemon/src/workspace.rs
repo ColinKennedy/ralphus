@@ -55,6 +55,148 @@ pub struct Workspace {
     /// the registered project path config and project lookups are keyed by.
     /// Equal to `root` for every workspace that was not translated.
     local_root: PathBuf,
+    /// For a remote workspace whose project is cloned over HTTPS: where its
+    /// network git commands get a forge credential. `None` otherwise, and
+    /// the machine's own git credentials are used.
+    forge_credentials: Option<Arc<ForgeCredentials>>,
+    /// The review this workspace belongs to, when it does: its machine
+    /// calls are logged and recorded under that review (see
+    /// [`machine_call_spec`]). `None` for a workspace no review owns.
+    guardian_id: Option<String>,
+}
+
+/// The [`crate::runner::RunnerSpec`] a machine call that belongs to no cell
+/// is made with -- a review's remote git, check gate or provisioning. Only
+/// its identity is read: the provider's log lines and Cartographer rows name
+/// the call by its `squad_id`/`task`/`cell_id`. A review-owned call carries
+/// the review as `guardian-<id>`, the squad id every review-owned runner
+/// spec uses and the review's Cartographer filter matches; anything else
+/// is labelled `workspace`.
+#[must_use]
+pub(crate) fn machine_call_spec(
+    guardian_id: Option<&str>,
+    task: &str,
+    machine: &str,
+) -> crate::runner::RunnerSpec {
+    let owner = guardian_id.map_or_else(|| "workspace".to_string(), |id| format!("guardian-{id}"));
+    crate::runner::RunnerSpec::for_command_proof(&owner, task, machine, ".", "", "claude", None)
+}
+
+/// Where a remote workspace's network git commands (`push`, `fetch`, ...)
+/// get a forge credential: the project's clone URL and the identity whose
+/// token to use. The token is looked up once, on the first command that
+/// needs it, and handed to that command only through its environment and an
+/// inline `credential.helper` that answers for the clone URL's host alone --
+/// never written to the machine's disk or a git config file.
+pub struct ForgeCredentials {
+    clone_url: String,
+    identity: Option<String>,
+    config_root: PathBuf,
+    resolved: std::sync::OnceLock<Option<GitCredential>>,
+}
+
+/// A resolved credential for one forge host.
+struct GitCredential {
+    host: String,
+    username: &'static str,
+    token: String,
+}
+
+/// Git subcommands that may talk to a remote and so need a credential.
+const NETWORK_GIT_COMMANDS: [&str; 4] = ["push", "fetch", "pull", "ls-remote"];
+
+/// The `credential.helper` a remote network git command gets: answers only
+/// a `get` for the host in `$RALPHUS_GIT_HOST`, from the environment.
+const INLINE_CREDENTIAL_HELPER: &str = "!f() { test \"$1\" = get || exit 0; h=; \
+     while IFS== read -r k v; do [ \"$k\" = host ] && h=$v; done; \
+     [ \"$h\" = \"$RALPHUS_GIT_HOST\" ] || exit 0; \
+     printf 'username=%s\\npassword=%s\\n' \"$RALPHUS_GIT_USERNAME\" \"$RALPHUS_GIT_PASSWORD\"; }; f";
+
+impl ForgeCredentials {
+    /// Credentials for `clone_url` as `identity` (`None`: the daemon's
+    /// default), when the URL is HTTPS -- git's credential protocol never
+    /// fires for SSH, which keeps using the machine's own keys.
+    #[must_use]
+    pub fn for_clone_url(
+        clone_url: &str,
+        identity: Option<&str>,
+        config_root: &Path,
+    ) -> Option<Self> {
+        let url = clone_url.trim();
+        (url.starts_with("https://") || url.starts_with("http://")).then(|| Self {
+            clone_url: url.to_string(),
+            identity: identity.map(str::to_string),
+            config_root: config_root.to_path_buf(),
+            resolved: std::sync::OnceLock::new(),
+        })
+    }
+
+    fn resolve(&self, store: &crate::store_lock::StoreHandle) -> Option<&GitCredential> {
+        self.resolved
+            .get_or_init(|| {
+                let (host, _) = crate::forge::parse_remote_url(&self.clone_url)?;
+                let cfg = crate::config::resolve_forge(&self.config_root);
+                let client = crate::forge::resolve_url_with_store(
+                    store,
+                    &self.clone_url,
+                    &cfg,
+                    self.identity.as_deref(),
+                )
+                .ok()?;
+                let token = client.token_for_remote_git()?.to_string();
+                crate::redact::register(&token);
+                let username = match client.kind() {
+                    crate::forge::ForgeKind::GitHub => "x-access-token",
+                    crate::forge::ForgeKind::GitLab => "oauth2",
+                };
+                Some(GitCredential {
+                    host,
+                    username,
+                    token,
+                })
+            })
+            .as_ref()
+    }
+
+    /// Credentials already resolved to `token` for `host`, for tests that do
+    /// not stand up a forge.
+    #[cfg(test)]
+    fn resolved_for_test(host: &str, token: &str) -> Self {
+        let resolved = std::sync::OnceLock::new();
+        let _ = resolved.set(Some(GitCredential {
+            host: host.to_string(),
+            username: "x-access-token",
+            token: token.to_string(),
+        }));
+        Self {
+            clone_url: format!("https://{host}/o/r.git"),
+            identity: None,
+            config_root: PathBuf::new(),
+            resolved,
+        }
+    }
+
+    /// The environment that lets one git command authenticate.
+    pub(crate) fn env(&self, store: &crate::store_lock::StoreHandle) -> Vec<(String, String)> {
+        let Some(credential) = self.resolve(store) else {
+            return Vec::new();
+        };
+        [
+            // An empty helper first resets any the machine configures, so
+            // this one is asked.
+            ("GIT_CONFIG_COUNT", "2"),
+            ("GIT_CONFIG_KEY_0", "credential.helper"),
+            ("GIT_CONFIG_VALUE_0", ""),
+            ("GIT_CONFIG_KEY_1", "credential.helper"),
+            ("GIT_CONFIG_VALUE_1", INLINE_CREDENTIAL_HELPER),
+            ("RALPHUS_GIT_HOST", credential.host.as_str()),
+            ("RALPHUS_GIT_USERNAME", credential.username),
+            ("RALPHUS_GIT_PASSWORD", credential.token.as_str()),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect()
+    }
 }
 
 /// One remote-produced branch of a review: the daemon-local project root it
@@ -238,6 +380,8 @@ impl Workspace {
             machine: None,
             store: None,
             path_map: None,
+            forge_credentials: None,
+            guardian_id: None,
         }
     }
 
@@ -258,7 +402,18 @@ impl Workspace {
             machine,
             store: None,
             path_map: None,
+            forge_credentials: None,
+            guardian_id: None,
         }
+    }
+
+    /// Give this workspace's network git commands a forge credential (see
+    /// [`ForgeCredentials`]). Only a remote workspace uses it: a local one
+    /// keeps the daemon's own credential helper wiring.
+    #[must_use]
+    pub fn with_forge_credentials(mut self, credentials: Option<Arc<ForgeCredentials>>) -> Self {
+        self.forge_credentials = credentials;
+        self
     }
 
     /// The workspace a guardian's review work happens in, honouring the
@@ -285,9 +440,9 @@ impl Workspace {
                 projects: g.projects,
                 base_branch: g.base_branch,
             };
-            Ok((g.machine, sources, review))
+            Ok((g.machine, sources, review, g.owner))
         });
-        let (machine, sources, review) = {
+        let (machine, sources, review, owner) = {
             match loaded {
                 Ok(found) => found,
                 Err(e) => {
@@ -311,11 +466,37 @@ impl Workspace {
                             ),
                             serde_json::json!({ "error": e.to_string() }),
                         );
-                    (None, Vec::new(), ReviewProjects::default())
+                    (None, Vec::new(), ReviewProjects::default(), None)
                 }
             }
         };
-        let mut workspace = Self::on(root, machine.as_deref()).with_store(Arc::clone(store));
+        // A review that asked a provider service for a machine is granted one
+        // the first time it is used (and again after that allocation is
+        // released, e.g. by a reopened review).
+        let needs_grant = machine
+            .as_deref()
+            .and_then(|m| crate::allocations::request_needing_grant(store, m));
+        let machine = match needs_grant {
+            Some(request) => match crate::allocations::bind_review(store, guardian_id, &request) {
+                Ok(granted) => Some(granted),
+                Err(e) => {
+                    crate::cartographer::Note::new("workspace")
+                        .level(crate::logging::LogLevel::WARNING)
+                        .scope("guardian")
+                        .guardian(guardian_id)
+                        .emit(
+                            &store.lock(),
+                            format!("review {guardian_id} has no machine yet: {e}"),
+                            serde_json::json!({ "error": e }),
+                        );
+                    machine
+                }
+            },
+            None => machine,
+        };
+        let mut workspace = Self::on(root, machine.as_deref())
+            .with_store(Arc::clone(store))
+            .for_review(guardian_id);
         if let Some(machine) = workspace.machine.clone() {
             workspace.path_map = machine_repository_for(
                 guardian_id,
@@ -327,8 +508,35 @@ impl Workspace {
             )
             .map(Arc::new);
             workspace.root = workspace.map_path(&workspace.root);
+            // Pushes and fetches on the machine authenticate as the review's
+            // owner when the project is cloned over HTTPS.
+            let clone_url = {
+                let guard = store.lock();
+                guard
+                    .project_name_for_path(&review.git_root)
+                    .and_then(|name| guard.get_project(&name).ok().flatten())
+                    .and_then(|project| project.clone_url)
+            };
+            let identity = crate::forge::effective_forge_identity(None, owner.as_deref());
+            workspace.forge_credentials = clone_url
+                .and_then(|url| {
+                    ForgeCredentials::for_clone_url(
+                        &url,
+                        identity.as_deref(),
+                        &workspace.local_root,
+                    )
+                })
+                .map(Arc::new);
         }
         workspace
+    }
+
+    /// Mark this workspace as review `guardian_id`'s, so its machine calls
+    /// are logged under that review rather than as unowned workspace calls.
+    #[must_use]
+    pub fn for_review(mut self, guardian_id: &str) -> Self {
+        self.guardian_id = Some(guardian_id.to_string());
+        self
     }
 
     /// Attach the store handle a remote workspace needs to resolve its
@@ -375,6 +583,8 @@ impl Workspace {
             store: self.store.clone(),
             path_map: self.path_map.clone(),
             local_root,
+            forge_credentials: self.forge_credentials.clone(),
+            guardian_id: self.guardian_id.clone(),
         }
     }
 
@@ -581,7 +791,13 @@ impl Workspace {
     /// Best-effort by design: a path that does not exist is success, because
     /// every caller here is cleaning up and does not care.
     pub fn remove_path(&self, path: impl AsRef<Path>, recursive: bool) {
-        let full = self.resolve(path);
+        // `rm` refuses a path ending in `.`, which is how a caller names this
+        // workspace's own root.
+        let full: PathBuf = self
+            .resolve(path)
+            .components()
+            .filter(|c| !matches!(c, std::path::Component::CurDir))
+            .collect();
         match &self.machine {
             None => {
                 let removed = if recursive {
@@ -786,18 +1002,19 @@ impl Workspace {
                 format!("machine \"{machine}\" resolved to the local host unexpectedly")
             })?
         };
-        // These operations belong to no cell; the spec exists only to
-        // satisfy the invocation shape.
-        let spec = crate::runner::RunnerSpec::for_command_proof(
-            "review-merge",
-            "review-merge",
-            machine,
-            ".",
-            "",
-            "claude",
-            None,
-        );
-        f(&provider, &spec)
+        f(&provider, &self.machine_call_spec(machine))
+    }
+
+    /// The spec this workspace's machine calls are made with: these
+    /// operations belong to no cell, so it carries only their owner (see
+    /// [`machine_call_spec`]).
+    fn machine_call_spec(&self, machine: &str) -> crate::runner::RunnerSpec {
+        let task = if self.guardian_id.is_some() {
+            "review-merge"
+        } else {
+            "workspace"
+        };
+        machine_call_spec(self.guardian_id.as_deref(), task, machine)
     }
 
     /// Retire the worktree at `path` in this workspace (RAL-386).
@@ -850,15 +1067,58 @@ impl Workspace {
     /// sets (`crate::vcs::GitVcs`): without them `rebase --continue` on the
     /// machine opens an editor with no terminal, fails, and the merge retries
     /// it forever.
-    fn git_remote(&self, _machine: &str, args: &[&str]) -> Result<String, String> {
+    fn git_remote(&self, machine: &str, args: &[&str]) -> Result<String, String> {
+        let mut env = non_interactive_git_env();
+        let verb = args.first().copied().unwrap_or_default();
+        if let (true, Some(credentials), Some(store)) = (
+            NETWORK_GIT_COMMANDS.contains(&verb),
+            &self.forge_credentials,
+            &self.store,
+        ) {
+            env.extend(credentials.env(store));
+        }
+        if COMMITTING_GIT_COMMANDS.contains(&verb) && !self.machine_has_git_identity(machine) {
+            for key in ["GIT_COMMITTER_NAME", "GIT_AUTHOR_NAME"] {
+                env.insert(key.to_string(), FALLBACK_GIT_NAME.to_string());
+            }
+        }
+        self.run_git_remote(args, env)
+    }
+
+    fn run_git_remote(
+        &self,
+        args: &[&str],
+        env: std::collections::BTreeMap<String, String>,
+    ) -> Result<String, String> {
         let req = crate::remote_runner::RunRequest {
             cwd: remote_path_string(&self.root),
             program: "git".to_string(),
             args: args.iter().map(|a| (*a).to_string()).collect(),
-            env: non_interactive_git_env(),
+            env,
             shell: None,
         };
         self.with_provider(|p, spec| p.run_vcs(&req, spec))
+    }
+
+    /// Whether git on `machine` can name a committer by itself (its own
+    /// `user.name`, or a full name in the account's record), asked once per
+    /// machine. A machine that cannot gets [`FALLBACK_GIT_NAME`] for the
+    /// commands that make commits; one that can keeps its own identity.
+    fn machine_has_git_identity(&self, machine: &str) -> bool {
+        static KNOWN: std::sync::LazyLock<
+            std::sync::Mutex<std::collections::HashMap<String, bool>>,
+        > = std::sync::LazyLock::new(Default::default);
+        if let Some(known) = KNOWN.lock().expect("poisoned").get(machine) {
+            return *known;
+        }
+        let has = self
+            .run_git_remote(&["var", "GIT_COMMITTER_IDENT"], non_interactive_git_env())
+            .is_ok();
+        KNOWN
+            .lock()
+            .expect("poisoned")
+            .insert(machine.to_string(), has);
+        has
     }
 }
 
@@ -905,6 +1165,13 @@ pub trait GitAt {
     /// cache lookups keyed by the registered project path -- never for
     /// running anything.
     fn local_path(&self) -> &Path;
+
+    /// The machine git runs on here, `None` for the daemon's host -- part of
+    /// any cache key built from [`Self::local_path`], since one project path
+    /// can name a checkout here and a clone on a machine.
+    fn git_machine(&self) -> Option<&str> {
+        None
+    }
 }
 
 impl GitAt for Path {
@@ -935,15 +1202,55 @@ impl GitAt for Workspace {
     fn local_path(&self) -> &Path {
         self.local_root()
     }
+
+    fn git_machine(&self) -> Option<&str> {
+        self.machine()
+    }
 }
 
+/// The committer email a machine's git falls back to when the machine has no
+/// `user.email` of its own (git reads `EMAIL` only then). A review's rebase
+/// keeps each commit's author; only the committer is set from this.
+const FALLBACK_GIT_EMAIL: &str = "ralphus@ralphus.invalid";
+
+/// The committer (and new-commit author) name for a machine whose git cannot
+/// name one itself (see [`Workspace::machine_has_git_identity`]).
+const FALLBACK_GIT_NAME: &str = "ralphus";
+
+/// Whether `error`, a failed git command's message, is git refusing to make a
+/// commit because it cannot name the committer or author -- no `user.name` /
+/// `user.email` and nothing it can derive one from.
+pub(crate) fn is_git_identity_error(error: &str) -> bool {
+    [
+        "Please tell me who you are",
+        "unable to auto-detect email address",
+        "empty ident name",
+    ]
+    .iter()
+    .any(|sign| error.contains(sign))
+}
+
+/// Git subcommands that may create commits.
+const COMMITTING_GIT_COMMANDS: [&str; 7] = [
+    "commit",
+    "rebase",
+    "cherry-pick",
+    "merge",
+    "am",
+    "revert",
+    "pull",
+];
+
 /// The environment every remote `git` invocation runs under, so nothing it
-/// does can wait on an interactive editor.
+/// does can wait on an interactive editor, and a machine with no git
+/// identity configured can still commit (a review's rebase).
 fn non_interactive_git_env() -> std::collections::BTreeMap<String, String> {
-    ["GIT_EDITOR", "GIT_SEQUENCE_EDITOR"]
+    let mut env: std::collections::BTreeMap<String, String> = ["GIT_EDITOR", "GIT_SEQUENCE_EDITOR"]
         .into_iter()
         .map(|k| (k.to_string(), "true".to_string()))
-        .collect()
+        .collect();
+    env.insert("EMAIL".to_string(), FALLBACK_GIT_EMAIL.to_string());
+    env
 }
 
 fn remove_local_destination(path: &Path) -> Result<(), String> {
@@ -1025,7 +1332,7 @@ fn copy_local_artifact(
 }
 
 #[cfg(unix)]
-fn set_executable(path: &Path) -> Result<(), String> {
+pub(crate) fn set_executable(path: &Path) -> Result<(), String> {
     use std::os::unix::fs::PermissionsExt;
 
     let mut permissions = std::fs::metadata(path)
@@ -1041,7 +1348,7 @@ fn set_executable(path: &Path) -> Result<(), String> {
 }
 
 #[cfg(not(unix))]
-fn set_executable(_path: &Path) -> Result<(), String> {
+pub(crate) fn set_executable(_path: &Path) -> Result<(), String> {
     Ok(())
 }
 
@@ -1462,6 +1769,110 @@ echo {json}
     }
 
     #[test]
+    fn removing_a_remote_workspaces_own_root_sends_the_root_itself() {
+        let dir = ralphus_test_support::scratch(format!("ral-rm-root-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let script = write_script(&dir, r#"{"ok":true,"protocol_version":1}"#);
+        let store = Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
+        store
+            .lock()
+            .register_machine_provider(
+                "ib",
+                "",
+                &script.to_string_lossy(),
+                &[],
+                crate::machines::PROTOCOL_VERSION,
+                false,
+            )
+            .unwrap();
+        let ws = Workspace::on("/m/repo/g2", Some("ib:A")).with_store(Arc::clone(&store));
+
+        ws.remove_path(".", true);
+
+        let requests = std::fs::read_to_string(dir.join("requests.log")).unwrap();
+        assert!(requests.contains(r#""path":"/m/repo/g2""#), "{requests}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_inline_credential_helper_answers_real_git_for_its_host_only() {
+        let store = Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
+        let env = ForgeCredentials::resolved_for_test("github.com", "tok-for-test").env(&store);
+        let fill = |host: &str| {
+            let mut command = std::process::Command::new("git");
+            command
+                .args(["credential", "fill"])
+                .env("GIT_TERMINAL_PROMPT", "0")
+                .env("GIT_ASKPASS", "")
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::null());
+            for (k, v) in &env {
+                command.env(k, v);
+            }
+            let mut child = command.spawn().unwrap();
+            std::io::Write::write_all(
+                &mut child.stdin.take().unwrap(),
+                format!("protocol=https\nhost={host}\n\n").as_bytes(),
+            )
+            .unwrap();
+            String::from_utf8_lossy(&child.wait_with_output().unwrap().stdout).into_owned()
+        };
+
+        let answered = fill("github.com");
+        assert!(answered.contains("username=x-access-token"), "{answered}");
+        assert!(answered.contains("password=tok-for-test"), "{answered}");
+        let other = fill("evil.example");
+        assert!(
+            !other.contains("tok-for-test"),
+            "another host got the token: {other}"
+        );
+    }
+
+    #[test]
+    fn only_network_git_commands_on_a_machine_carry_the_credential() {
+        let dir = ralphus_test_support::scratch(format!("ral-cred-run-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let script = write_script(
+            &dir,
+            r#"{"ok":true,"protocol_version":1,"exit_code":0,"stdout":""}"#,
+        );
+        let store = Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
+        store
+            .lock()
+            .register_machine_provider(
+                "ib",
+                "",
+                &script.to_string_lossy(),
+                &[],
+                crate::machines::PROTOCOL_VERSION,
+                false,
+            )
+            .unwrap();
+        let ws = Workspace::on("/m/repo", Some("ib:A"))
+            .with_store(Arc::clone(&store))
+            .with_forge_credentials(Some(Arc::new(ForgeCredentials::resolved_for_test(
+                "github.com",
+                "tok-for-test",
+            ))));
+
+        ws.git(&["status"]).unwrap();
+        let after_status = std::fs::read_to_string(dir.join("requests.log")).unwrap();
+        ws.git(&["push", "origin", "main"]).unwrap();
+        let all = std::fs::read_to_string(dir.join("requests.log")).unwrap();
+
+        assert!(!after_status.contains("tok-for-test"), "{after_status}");
+        assert!(all[after_status.len()..].contains("tok-for-test"), "{all}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn a_review_on_a_machine_none_of_its_cells_used_is_provisioned_there() {
         // With no contributing cell on the review's machine there is no
         // workspace to discover the repository from; the review provisions
@@ -1505,11 +1916,32 @@ echo {json}
 
         assert_eq!(ws.machine(), Some("ib:A"));
         assert_eq!(ws.root_string(), "/m/root/repo/.git/.ralphus");
+        // Its machine calls are logged under the review, not a placeholder.
+        let spec = ws.join("w/x").machine_call_spec("ib:A");
+        assert_eq!(spec.squad_id, format!("guardian-{id}"));
+        assert_eq!(spec.cell_id, "ib:A");
         // A provider clone has its base branch checked out, which git refuses
         // to fetch into; provisioning detaches it so the base can advance.
         let requests = std::fs::read_to_string(dir.join("requests.log")).unwrap();
         assert!(requests.contains("\"--detach\""), "{requests}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn machine_calls_are_logged_under_the_owning_review() {
+        let review =
+            Workspace::on("/remote/repo", Some("ib:A")).for_review("guardian-000000000007");
+        let spec = review.at("/remote/other").machine_call_spec("ib:A");
+        assert_eq!(spec.squad_id, "guardian-guardian-000000000007");
+        assert_eq!(spec.task, "review-merge");
+
+        let anchor = machine_call_spec(Some("guardian-000000000007"), "review-anchor", "ib:A");
+        assert_eq!(anchor.squad_id, "guardian-guardian-000000000007");
+        assert_eq!(anchor.task, "review-anchor");
+
+        let unowned = Workspace::on("/remote/repo", Some("ib:A")).machine_call_spec("ib:A");
+        assert_eq!(unowned.squad_id, "workspace");
+        assert_ne!(unowned.task, "review-merge");
     }
 
     /// A fake provider that answers every verb with `json` and appends each

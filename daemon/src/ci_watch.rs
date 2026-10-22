@@ -362,7 +362,7 @@ fn run_watch(store: &crate::store_lock::StoreHandle, guardian_id: &str, branch_i
     // answer for one of them (see `crate::pr::PrRepoRouting`'s doc comment).
     let client = match crate::pr::forge_client_for_pr(
         store,
-        &root,
+        &crate::workspace::Workspace::for_guardian(store, &guardian.id, &root),
         &guardian.base_branch,
         &forge_cfg,
         &pr.repo,
@@ -1044,7 +1044,7 @@ pub fn poll_open_pr_ci_status(
         // ever answer for one of them, and silently 404s polling the rest.
         let Some(client) = crate::pr::forge_client_for_pr(
             store,
-            &root,
+            &crate::workspace::Workspace::for_guardian(store, &guardian.id, &root),
             &guardian.base_branch,
             &forge_cfg,
             &pr.repo,
@@ -1176,7 +1176,7 @@ pub fn poll_open_pr_ci_status(
         if decision.dispatch {
             let Some(client) = crate::pr::forge_client_for_pr(
                 store,
-                &root,
+                &crate::workspace::Workspace::for_guardian(store, &guardian.id, &root),
                 &guardian.base_branch,
                 &forge_cfg,
                 &decision.pr.repo,

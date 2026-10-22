@@ -37,9 +37,9 @@
         const tasks = squad.tasks.map((t, ti) => {
           const cells = t.cells.map((s, si) => `
             <div class="cell selectable ${selCls("cell", ti, si)}" id="n-${ti}-${si}" data-click="onGraphNodeClick" data-ctx="openCellNodeMenu" data-squad-id="${esc(squad.id)}" data-kind="cell" data-ti="${ti}" data-si="${si}" data-vi="-1"
-                 data-tip="${esc(s.name ?? s.id)} · ${esc(s.state)}\nAgent: ${esc(s.agent)}${s.model ? " · " + esc(s.model) : ""}${(s.depends_on||[]).length ? "\nDepends on: " + esc((s.depends_on||[]).join(", ")) : ""}\nClick to view details; Shift/Ctrl-click to multi-select; right-click for actions.">
+                 data-tip="${esc(s.name ?? s.id)} · ${esc(s.state)}\nAgent: ${esc(s.agent ?? "—")}${s.model ? " · " + esc(s.model) : ""}${(s.depends_on||[]).length ? "\nDepends on: " + esc((s.depends_on||[]).join(", ")) : ""}\nClick to view details; Shift/Ctrl-click to multi-select; right-click for actions.">
               <div class="sid">${esc(s.name ?? s.id)} ${pill(s.state)}${delayedGraphBadge(s.delayed_until_ms)}${runnerStalledBadge(s.runner_stalled_at_ms)}${s.error ? failLogBtn(s.error) : ""}</div>
-              <div class="kv">${esc(s.agent)}${s.model ? " · " + esc(s.model) : ""}</div>
+              <div class="kv">${esc(s.agent ?? "—")}${s.model ? " · " + esc(s.model) : ""}</div>
               ${cellProof(s, ti, si, selCls, squad.id)}
             </div>`).join("");
           const tproof = (t.proof || []).map((v, vi) => `<span class="vchip selectable ${selCls("proof", ti, -1, vi)}" id="v-${ti}-${vi}" data-tip="Task proof step: ${esc(v.kind)}${v.id ? " — " + esc(v.id) : ""}\nRuns after all cells finish to validate the task result.\nState: ${esc(v.state)}.\nShift/Ctrl-click to multi-select; right-click for batch actions." data-click="onGraphNodeClick" data-ctx="openProofMenu" data-squad-id="${esc(squad.id)}" data-kind="proof" data-ti="${ti}" data-si="-1" data-vi="${vi}">${sdot(v.state)} ${esc(v.id || v.kind)}${delayedGraphBadge(v.delayed_until_ms, v.delayed_reason || "")}</span>`).join("");
@@ -1181,7 +1181,7 @@ Saving restarts the proof step and the rest of its list; an unchanged value rest
           <div class="kv-row"><span class="k">task</span><span class="v">${esc(t.name)}</span></div>
           <div class="kv-row"><span class="k">state</span><span class="v">${pill(s.state)}${blockingBadge(s.blocking)}${delayedBadge(s.delayed_until_ms)}${runnerStalledBadge(s.runner_stalled_at_ms)}${outOfDateBadge(s.env_out_of_date)}${subprojectBadge(s)}${["pending","queued"].includes(s.state) ? "" : squadLogsBtn(r.id)}${s.error ? failLogBtn(s.error) : ""}</span></div>
           ${timingRows(s.started_at_ms, s.finished_at_ms, s.duration_ms ?? 0, s.active_duration_intervals ?? 0)}
-          <div class="kv-row"><span class="k">agent</span>${detailValueHtml(s.agent, agentTip)}</div>
+          <div class="kv-row"><span class="k">agent</span>${detailValueHtml(s.agent ?? "—", agentTip)}</div>
           <div class="kv-row"><span class="k">model</span>${detailValueHtml(s.model || "—", modelTip)}</div>
           <div class="kv-row"><span class="k">project</span><span class="v mono">${esc(project)}${paths && paths.project ? copyBtn(paths.project) : ""}</span></div>
           <div class="kv-row"><span class="k">worktree</span><span class="v mono">${esc(s.cwd || "—")}${s.cwd ? copyBtn(s.cwd) : ""}</span></div>

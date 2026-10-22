@@ -2978,14 +2978,52 @@ fn parse_suggested_pr(text: &str) -> Option<(String, String, Vec<i64>)> {
     Some((title, description, relevant_prophecy_ids))
 }
 
-/// Removes the runner's reply markers from a PR-writer reply. Every prompt
-/// run is asked for a `RALPHUS_GHOST:` handoff section and
-/// `RALPHUS_PROPHECY:` lines, and a backend that does not strip them from its
-/// summary would otherwise publish them in the PR body. A prophecy is one
-/// line; a ghost section is its marker line plus the bullets under it. Lines
-/// inside code fences are kept, so a description that quotes the syntax is
-/// left intact.
-fn strip_agent_reply_markers(text: &str) -> String {
+/// Reply markers ralphus parses out of an agent's reply. None of them is
+/// meant for a human reader.
+const AGENT_REPLY_MARKERS: [&str; 6] = [
+    "RALPHUS_GHOST:",
+    "RALPHUS_PROPHECY:",
+    "RALPHUS_PROOF:",
+    "RALPHUS_STILL_WORKING:",
+    "RALPHUS_LIVE_ACTION:",
+    "RALPHUS_APPRAISAL:",
+];
+
+/// Byte offset of a `RALPHUS_GHOST:` or `RALPHUS_STILL_WORKING:` marker
+/// written after other text on `line`. Both are end-of-reply markers the
+/// runner finds anywhere in the reply, so one appended to a sentence is
+/// still a marker. A mention inside an inline code span is not one.
+fn trailing_end_marker_at(line: &str) -> Option<usize> {
+    ["RALPHUS_GHOST:", "RALPHUS_STILL_WORKING:"]
+        .iter()
+        .filter_map(|marker| line.find(marker))
+        .filter(|&at| line[..at].matches('`').count() % 2 == 0)
+        .min()
+}
+
+/// Whether `line` (`trimmed` is it without indentation) continues a ghost
+/// section's list.
+fn continues_ghost_section(line: &str, trimmed: &str) -> bool {
+    let numbered = trimmed.split_once(['.', ')']).is_some_and(|(n, rest)| {
+        !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()) && rest.starts_with(' ')
+    });
+    trimmed.is_empty()
+        || trimmed.starts_with("- ")
+        || trimmed.starts_with("* ")
+        || numbered
+        || line.starts_with([' ', '\t'])
+}
+
+/// Removes the runner's reply markers from an agent reply bound for a human
+/// reader (a PR description, a review's change summary). Every prompt run is
+/// asked for a `RALPHUS_GHOST:` handoff section and `RALPHUS_PROPHECY:`
+/// lines, and may end with `RALPHUS_STILL_WORKING:`; a backend that does not
+/// strip them would otherwise publish them. A line starting with any of
+/// [`AGENT_REPLY_MARKERS`] is dropped; a ghost section is its marker line
+/// plus the list under it; a ghost or still-working marker written after
+/// other text drops the rest of its line. Lines inside code fences are kept,
+/// so a description that quotes the syntax is left intact.
+pub(crate) fn strip_agent_reply_markers(text: &str) -> String {
     let mut kept: Vec<&str> = Vec::new();
     let mut in_fence = false;
     let mut in_ghost = false;
@@ -3002,11 +3040,7 @@ fn strip_agent_reply_markers(text: &str) -> String {
             continue;
         }
         if in_ghost {
-            let continues = trimmed.is_empty()
-                || trimmed.starts_with("- ")
-                || trimmed.starts_with("* ")
-                || line.starts_with([' ', '\t']);
-            if continues {
+            if continues_ghost_section(line, trimmed) {
                 continue;
             }
             in_ghost = false;
@@ -3015,7 +3049,15 @@ fn strip_agent_reply_markers(text: &str) -> String {
             in_ghost = true;
             continue;
         }
-        if trimmed.starts_with("RALPHUS_PROPHECY:") {
+        if AGENT_REPLY_MARKERS.iter().any(|m| trimmed.starts_with(m)) {
+            continue;
+        }
+        if let Some(at) = trailing_end_marker_at(line) {
+            in_ghost = line[at..].starts_with("RALPHUS_GHOST:");
+            let before = line[..at].trim_end();
+            if !before.is_empty() {
+                kept.push(before);
+            }
             continue;
         }
         kept.push(line);
@@ -3889,6 +3931,7 @@ fn resolve_pr_repo_routing(
 ) -> PrRepoRouting {
     let key = (
         root.local_path().to_path_buf(),
+        root.git_machine().map(str::to_string),
         base_branch.to_string(),
         format!("{forge_cfg:?}"),
         owner.map(str::to_string),
@@ -3916,7 +3959,14 @@ const ROUTING_CACHE_TTL: std::time::Duration = if cfg!(test) {
     std::time::Duration::from_secs(15)
 };
 
-type RoutingCacheKey = (std::path::PathBuf, String, String, Option<String>);
+/// `(project path, machine, base branch, forge config, owner)`.
+type RoutingCacheKey = (
+    std::path::PathBuf,
+    Option<String>,
+    String,
+    String,
+    Option<String>,
+);
 
 fn routing_cache()
 -> &'static parking_lot::Mutex<HashMap<RoutingCacheKey, (std::time::Instant, PrRepoRouting)>> {
@@ -8569,6 +8619,152 @@ pub(crate) fn retire_dual_root_branch_for_guardian(
             },
             reason,
         );
+    }
+}
+
+/// The PRs/MRs of `guardian` still open on the forge, each paired with the
+/// root of the project it belongs to. Snapshotted before a review is deleted,
+/// since its PR rows go with it.
+pub(crate) fn open_prs_for_review_delete(
+    store: &crate::store_lock::StoreHandle,
+    guardian: &GuardianView,
+) -> Vec<(PullRequestView, String)> {
+    let prs = store
+        .lock()
+        .list_pull_requests_for_guardian(&guardian.id)
+        .unwrap_or_default();
+    prs.into_iter()
+        .filter(|pr| pr.state == "open" && pr.pr_number.is_some())
+        .map(|pr| {
+            let root = pr
+                .branch_id
+                .as_deref()
+                .and_then(|branch_id| guardian.branches.iter().find(|b| b.id == branch_id))
+                .and_then(|branch| branch.project.clone())
+                .unwrap_or_else(|| guardian.git_root.clone());
+            (pr, root)
+        })
+        .collect()
+}
+
+/// Close every PR/MR a deleted review left open (see
+/// [`open_prs_for_review_delete`]), resolving each one's forge client the
+/// same way [`check_pr_merges`] does. `workspaces` holds each project's
+/// workspace, resolved while the review row still existed. The PRs' remote
+/// branches are left in place.
+pub(crate) fn close_prs_of_deleted_review(
+    store: &crate::store_lock::StoreHandle,
+    guardian: &GuardianView,
+    prs: Vec<(PullRequestView, String)>,
+    workspaces: &[(String, crate::workspace::Workspace)],
+) {
+    if prs.is_empty() {
+        return;
+    }
+    let _remote_scope = crate::machine_strict::enter(guardian.machine.as_deref());
+    let jobs = prs
+        .into_iter()
+        .map(|(pr, root)| {
+            let client = workspaces
+                .iter()
+                .find(|(r, _)| *r == root)
+                .and_then(|(_, workspace)| {
+                    let forge_cfg = crate::config::resolve_forge(Path::new(&root));
+                    resolve_pr_repo_routing(
+                        store,
+                        workspace,
+                        &guardian.base_branch,
+                        &forge_cfg,
+                        guardian.owner.as_deref(),
+                    )
+                    .client_for(&pr.repo)
+                    .cloned()
+                });
+            (pr, client)
+        })
+        .collect();
+    close_prs_with_clients(store, &guardian.id, jobs);
+}
+
+/// Close each PR/MR through its forge client. A PR/MR that has no client for
+/// its own repository, or whose close call fails, gets a mailbox message
+/// telling the user to close it by hand. A client for any other repository is
+/// never used: PR/MR numbers are per-repository, so it would close an
+/// unrelated PR/MR.
+fn close_prs_with_clients(
+    store: &crate::store_lock::StoreHandle,
+    guardian_id: &str,
+    jobs: Vec<(PullRequestView, Option<crate::forge::ForgeClient>)>,
+) {
+    for (pr, client) in jobs {
+        let Some(number) = pr.pr_number else {
+            continue;
+        };
+        let result = match client {
+            Some(client)
+                if client.kind().as_str() == pr.forge && client.repo_label() == pr.repo =>
+            {
+                client.close_pull_request(number)
+            }
+            _ => Err(format!(
+                "no forge client is configured for {} repository {}",
+                pr.forge, pr.repo
+            )),
+        };
+        let label = format!("{} {}#{number}", pr.forge, pr.repo);
+        let guard = store.lock();
+        match result {
+            Ok(()) => {
+                crate::cartographer::Note::new("pr")
+                    .scope("guardian")
+                    .guardian(guardian_id)
+                    .emit(
+                        &guard,
+                        format!("review {guardian_id} deleted: closed its PR {label}"),
+                        serde_json::json!({"pr_id": pr.id, "pr_number": number}),
+                    );
+            }
+            Err(e) => {
+                crate::cartographer::Note::new("pr")
+                    .level(crate::logging::LogLevel::WARNING)
+                    .scope("guardian")
+                    .guardian(guardian_id)
+                    .emit(
+                        &guard,
+                        format!(
+                            "review {guardian_id} deleted but its PR {label} could not be closed: {e}"
+                        ),
+                        serde_json::json!({"pr_id": pr.id, "pr_number": number, "error": e}),
+                    );
+                let target = pr.pr_url.clone().unwrap_or_else(|| label.clone());
+                if let Err(enqueue_error) = guard.enqueue_error_mailbox_message(
+                    crate::mailbox::MailboxPriority::High,
+                    &format!(
+                        "Review {guardian_id} was deleted, but its PR {label} could not be \
+                         closed and is still open: {e}"
+                    ),
+                    &crate::mailbox::Remediation::ManualInterventionRequired {
+                        guidance: format!(
+                            "close {target} on the forge yourself (the review no longer exists, \
+                             so ralphus will not retry), and check the forge token and network \
+                             access if other PRs fail the same way"
+                        ),
+                    },
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some("review"),
+                ) {
+                    // ralphus[ignore-rlog-pair]: the store write itself failed; the cartographer row above records the close failure
+                    crate::rlog!(
+                        WARNING,
+                        "ralphus [pr] review {guardian_id} could not enqueue the PR close \
+                         failure notice for {label}: {enqueue_error}"
+                    );
+                }
+            }
+        }
     }
 }
 
@@ -24790,6 +24986,20 @@ token_env = "RALPHUS_TEST_FORGE_TOKEN"
         )
         .unwrap();
         assert_eq!(d, "Fixes it.\n\n## Testing\n\nRan it.");
+    }
+
+    #[test]
+    fn parse_suggested_pr_drops_every_marker_kind_and_a_ghost_appended_to_a_line() {
+        let (_, d, _) = parse_suggested_pr(
+            "TITLE: Fix bug\n===DESCRIPTION===\nFixes it.\n\
+             RALPHUS_STILL_WORKING: waiting on CI\n\
+             RALPHUS_PROOF: PASS\n\
+             RALPHUS_LIVE_ACTION: (Nothing to test live)\n\
+             Ran the tests. RALPHUS_GHOST: (nothing to report)\n\
+             1. a numbered handoff note\n\n## Testing\n\nRan it.",
+        )
+        .unwrap();
+        assert_eq!(d, "Fixes it.\nRan the tests.\n## Testing\n\nRan it.");
     }
 
     #[test]

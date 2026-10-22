@@ -320,7 +320,7 @@ fn forge_preflight(
     for (pr, number) in roots {
         let Some(client) = crate::pr::forge_client_for_pr(
             store,
-            &root,
+            &crate::workspace::Workspace::for_guardian(store, &guardian.id, &root),
             &guardian.base_branch,
             &forge_cfg,
             &pr.repo,

@@ -573,6 +573,10 @@ struct RegisterProjectBody {
     name: String,
     #[serde(default)]
     description: String,
+    /// The daemon host's clone. Omitted (or empty) registers a remote-only
+    /// project, which needs a `clone_url` and runs all its work on remote
+    /// machines ([`crate::remote_projects`]).
+    #[serde(default)]
     path: String,
     /// Authoritative clone URL for provisioning this project on another
     /// machine. `url` is accepted as the user-facing API alias.
@@ -992,7 +996,9 @@ struct TaskIndexCell {
     /// view carries, and it is the only field that lookup needs beyond what
     /// this index already had.
     cwd: Option<String>,
-    agent: String,
+    /// Omitted for a command cell, which runs no agent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    agent: Option<String>,
     model: Option<String>,
     state: String,
     duration_ms: i64,
@@ -1423,6 +1429,9 @@ fn route_for_user(
         // Machine provider registry (RAL-185) -- RAL-332: admin-only, client
         // and server side. Nothing outside the Machines tab reads this.
         ("GET", ["api", "machines"]) => admin_gated(daemon, user_header, || list_machines(daemon)),
+        ("GET", ["api", "machine-allocations"]) => admin_gated(daemon, user_header, || {
+            list_machine_allocations(daemon, query_param(query, "all") == Some("true"))
+        }),
         ("POST", ["api", "machines"]) => {
             admin_gated(daemon, user_header, || register_machine(daemon, body))
         }
@@ -2912,6 +2921,66 @@ fn validate_projects_registered(
     Ok(())
 }
 
+/// A remote-only project has no clone on this host, so every cell of a task on
+/// it, and every review those cells feed, must run on a machine.
+fn validate_remote_only_projects(
+    store: &Store,
+    file: &ralphus_core::schema::TaskFile,
+) -> std::result::Result<(), String> {
+    let is_remote = |machine: Option<&str>| {
+        machine.map(str::trim).is_some_and(|m| {
+            !m.is_empty() && !m.eq_ignore_ascii_case(ralphus_core::schema::LOCAL_MACHINE)
+        })
+    };
+    let bare = |id: &str| {
+        id.trim()
+            .trim_start_matches("<<")
+            .trim_end_matches(">>")
+            .to_string()
+    };
+    for task in &file.task {
+        let Some(project_name) = task.project.as_deref() else {
+            continue;
+        };
+        let Some(project) = store
+            .resolve_project(project_name)
+            .map_err(|e| e.to_string())?
+        else {
+            continue;
+        };
+        if !project.remote_only {
+            continue;
+        }
+        for (index, cell) in task.cell.iter().enumerate() {
+            let machine = ralphus_core::schema::resolve_cell_machine(task, cell);
+            if !is_remote(machine.as_deref()) {
+                return Err(format!(
+                    "task \"{}\" cell {index} would run on the daemon's host, but project \
+                     \"{}\" has no clone here (it was registered with a clone URL only); give \
+                     the task or cell a remote `machine`",
+                    task.name, project.name
+                ));
+            }
+            let Some(review) = cell.review.as_deref() else {
+                continue;
+            };
+            let declared = file
+                .review
+                .iter()
+                .find(|r| r.id.as_deref().map(bare) == Some(bare(review)));
+            if !declared.is_some_and(|r| is_remote(r.machine.as_deref())) {
+                return Err(format!(
+                    "task \"{}\" feeds review {review:?}, which would merge on the daemon's host, \
+                     but project \"{}\" has no clone here; declare that [[review]] with a remote \
+                     `machine`",
+                    task.name, project.name
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Require the declarative inputs a remote-fed review needs, before anything is
 /// provisioned (RAL-185 Phase 3b).
 ///
@@ -3116,21 +3185,68 @@ fn validate_project_location(path: &str, kind: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Why a project registered without a `path` (remote-only) cannot be: it
+/// must be git with a clone URL its machines clone from, and its name keys
+/// its reserved root, so it must be a plain path segment.
+fn validate_remote_only_project(req: &RegisterProjectBody) -> Result<(), String> {
+    if req.vcs != "git" {
+        return Err(format!(
+            "a project without a 'path' must be git (remote machines clone it from its \
+             'clone_url'); got vcs {:?}",
+            req.vcs
+        ));
+    }
+    let has_url = req
+        .clone_url
+        .as_deref()
+        .is_some_and(|url| !url.trim().is_empty());
+    if !has_url || req.clear_clone_url {
+        return Err(
+            "give 'path' (a clone on the daemon's host) or 'clone_url' (a remote-only project \
+             whose work all runs on remote machines)"
+                .to_string(),
+        );
+    }
+    let plain = std::path::Path::new(&req.name)
+        .components()
+        .map(|c| matches!(c, std::path::Component::Normal(_)))
+        .eq([true]);
+    if !plain {
+        return Err(format!(
+            "a remote-only project's name must be a single path segment; got {:?}",
+            req.name
+        ));
+    }
+    Ok(())
+}
+
 fn register_project(daemon: &Daemon, body: &str) -> Reply {
     let Ok(req) = serde_json::from_str::<RegisterProjectBody>(body) else {
         return error(
             400,
             "bad_request",
-            "body must include \"name\" and \"path\" strings",
+            "body must include a \"name\" string, and \"path\" or \"clone_url\"",
             vec![],
         );
     };
     if req.name.trim().is_empty() {
         return error(400, "invalid_value", "'name' must not be empty", vec![]);
     }
-    if let Err(msg) = validate_project_location(&req.path, &req.vcs) {
+    let remote_only = req.path.trim().is_empty();
+    if remote_only {
+        if let Err(msg) = validate_remote_only_project(&req) {
+            return error(400, "invalid_value", &msg, vec![]);
+        }
+    } else if let Err(msg) = validate_project_location(&req.path, &req.vcs) {
         return error(400, "invalid_value", &msg, vec![]);
     }
+    let path = if remote_only {
+        crate::remote_projects::root_for(&req.name)
+            .to_string_lossy()
+            .into_owned()
+    } else {
+        req.path.clone()
+    };
     let clone_url = req
         .clone_url
         .as_deref()
@@ -3181,7 +3297,7 @@ fn register_project(daemon: &Daemon, body: &str) -> Reply {
     match guard.register_project_with_clone_url_ex(
         &req.name,
         &req.description,
-        &req.path,
+        &path,
         &req.vcs,
         clone_url,
         req.match_pr_branch_name,
@@ -3198,7 +3314,8 @@ fn register_project(daemon: &Daemon, body: &str) -> Reply {
             // (`worktrees::sync_commit_metadata_hook_best_effort`), but doing it at
             // registration too covers a cell whose `cwd` is the project root
             // itself rather than a `ralphus:new-worktree/...` placeholder.
-            if req.vcs == "git" {
+            // A remote-only project has no clone here to hook.
+            if req.vcs == "git" && !remote_only {
                 let enabled =
                     crate::config::load_commit_config(Path::new(&req.path)).add_coauthor();
                 let workspace = crate::workspace::Workspace::local(&req.path);
@@ -4256,6 +4373,16 @@ fn list_machines(daemon: &Daemon) -> Reply {
                     .collect(),
             },
         ),
+        Err(e) => store_error(&e),
+    }
+}
+
+/// `GET /api/machine-allocations[?all=true]`: machines provider services
+/// granted, newest first -- only active ones unless `all`. Read-only: ralphus
+/// never manages machines, it only shows what it was given.
+fn list_machine_allocations(daemon: &Daemon, all: bool) -> Reply {
+    match daemon.lock().machine_allocations(all) {
+        Ok(allocations) => json(200, &serde_json::json!({ "allocations": allocations })),
         Err(e) => store_error(&e),
     }
 }
@@ -7497,6 +7624,17 @@ fn validate_project(daemon: &Daemon, name: &str) -> Reply {
     // handler never touches the writer lock at all.
     let project = daemon.with_read_snapshot(|c| Store::get_project_conn(c, name));
     match project {
+        // No clone on this host to check: its machines clone the URL.
+        Ok(Some(p)) if p.remote_only => json(
+            200,
+            &ProjectValidateResponse {
+                valid: p.clone_url.is_some(),
+                message: p
+                    .clone_url
+                    .is_none()
+                    .then(|| "remote-only project has no clone URL".to_string()),
+            },
+        ),
         Ok(Some(p)) => match validate_project_location(&p.path, &p.vcs) {
             Ok(()) => json(
                 200,
@@ -7926,6 +8064,9 @@ fn prepare_submitted_file(
     if let Err(msg) = validate_projects_registered(&guard, file) {
         return Err(error(400, "project_validation_failed", &msg, vec![]));
     }
+    if let Err(msg) = validate_remote_only_projects(&guard, file) {
+        return Err(error(400, "project_validation_failed", &msg, vec![]));
+    }
 
     // Every `machine` value must name a registered provider at a supported
     // contract version (RAL-185). Core validated the syntax offline; only the
@@ -8093,13 +8234,10 @@ fn spawn_materialization(
 }
 
 /// Finish setting up every squad a previous daemon left `materializing`
-/// (STRESS-008). Each was stored with its submission, so the effective task
-/// file is rebuilt from it exactly as `submit` built it, and its background
-/// setup runs again: steps that already finished are idempotent or skipped
-/// (see [`run_submit_followup`]). A submission that no longer prepares
-/// cleanly -- a preset or agent profile removed meanwhile -- fails the squad
-/// with that reason. Call once at startup, after `recover_orphaned_squads`
-/// and before the scheduler runs. Returns the squad ids it resumed.
+/// (STRESS-008). Each was stored with its submission, so its background setup
+/// runs again through [`rerun_materialization`]. Call once at startup, after
+/// `recover_orphaned_squads` and before the scheduler runs. Returns the squad
+/// ids it resumed.
 pub(crate) fn resume_materializations(daemon: &Daemon) -> Vec<String> {
     let resumable = match daemon.lock().resumable_materializations() {
         Ok(rows) => rows,
@@ -8112,61 +8250,92 @@ pub(crate) fn resume_materializations(daemon: &Daemon) -> Vec<String> {
             return Vec::new();
         }
     };
-    let store_handle = daemon.store_handle();
     let mut resumed = Vec::new();
     for (squad_id, submission) in resumable {
-        let prepared = toml::from_str::<ralphus_core::schema::TaskFile>(&submission.toml)
-            .map_err(|e| format!("could not parse the stored task file: {e}"))
-            .and_then(|mut file| {
-                file.submitter = daemon
-                    .lock()
-                    .get_squad(&squad_id)
-                    .ok()
-                    .and_then(|s| s.submitter);
-                prepare_submitted_file(&daemon.store, &submission.toml, &mut file)
-                    .map(|_| file)
-                    .map_err(|reply| {
-                        format!(
-                            "the stored task file no longer passes submission checks: {}",
-                            reply.body
-                        )
-                    })
-            });
-        let file = match prepared {
-            Ok(file) => file,
-            Err(message) => {
-                fail_materialization(&store_handle, &squad_id, &message);
-                continue;
-            }
-        };
-        crate::rlog!(
-            WARNING,
-            "ralphus [recovery] squad {squad_id}: resuming setup interrupted by a restart"
-        );
-        let seeds = {
-            let guard = store_handle.lock();
-            crate::cartographer::Note::new("recovery")
-                .level(crate::logging::LogLevel::WARNING)
-                .squad(&squad_id)
-                .scope("materialize")
-                .emit(
-                    &guard,
-                    "squad setup interrupted by a restart: resuming",
-                    serde_json::json!({}),
-                );
-            seed_materializing_cells(&guard, &squad_id, &file)
-        };
-        spawn_materialization(
-            daemon.background(),
-            store_handle.clone(),
-            squad_id.clone(),
-            file,
+        if rerun_materialization(
+            daemon,
+            &squad_id,
             submission,
-            seeds,
-        );
-        resumed.push(squad_id);
+            "squad setup interrupted by a restart: resuming",
+        ) {
+            resumed.push(squad_id);
+        }
     }
     resumed
+}
+
+/// Run a `materializing` squad's background setup again from its stored
+/// submission: the effective task file is rebuilt from it exactly as `submit`
+/// built it, and steps that already finished are idempotent or skipped (see
+/// [`run_submit_followup`]). A submission that no longer prepares cleanly --
+/// a preset or agent profile removed meanwhile -- fails the squad with that
+/// reason. `reason` is logged and recorded on the squad's Cartographer
+/// timeline. Returns whether the setup was started.
+fn rerun_materialization(
+    daemon: &Daemon,
+    squad_id: &str,
+    submission: crate::store::SquadSubmission,
+    reason: &str,
+) -> bool {
+    let store_handle = daemon.store_handle();
+    let prepared = toml::from_str::<ralphus_core::schema::TaskFile>(&submission.toml)
+        .map_err(|e| format!("could not parse the stored task file: {e}"))
+        .and_then(|mut file| {
+            file.submitter = daemon
+                .lock()
+                .get_squad(squad_id)
+                .ok()
+                .and_then(|s| s.submitter);
+            prepare_submitted_file(&daemon.store, &submission.toml, &mut file)
+                .map(|_| file)
+                .map_err(|reply| {
+                    format!(
+                        "the stored task file no longer passes submission checks: {}",
+                        reply.body
+                    )
+                })
+        });
+    let file = match prepared {
+        Ok(file) => file,
+        Err(message) => {
+            fail_materialization(&store_handle, squad_id, &message);
+            return false;
+        }
+    };
+    crate::rlog!(WARNING, "ralphus [recovery] squad {squad_id}: {reason}");
+    let seeds = {
+        let guard = store_handle.lock();
+        crate::cartographer::Note::new("recovery")
+            .level(crate::logging::LogLevel::WARNING)
+            .squad(squad_id)
+            .scope("materialize")
+            .emit(&guard, reason, serde_json::json!({}));
+        seed_materializing_cells(&guard, squad_id, &file)
+    };
+    spawn_materialization(
+        daemon.background(),
+        store_handle,
+        squad_id.to_string(),
+        file,
+        submission,
+        seeds,
+    );
+    true
+}
+
+/// After a retry/restart reset squad `id` to `pending`, put it back in
+/// `materializing` when its setup never finished (it failed before review
+/// derivation and the rest of [`run_submit_followup`] completed), returning
+/// the stored submission to rerun that setup from. Call under the same store
+/// lock as the reset, so the scheduler cannot claim the squad in between.
+fn reenter_unfinished_materialization(
+    store: &Store,
+    id: &str,
+) -> Option<crate::store::SquadSubmission> {
+    let submission = store.unfinished_submission(id).ok().flatten()?;
+    store.set_squad_state(id, SquadState::Materializing).ok()?;
+    let _ = store.set_squad_error(id, None);
+    Some(submission)
 }
 
 /// Fixed count of [`run_submit_followup`]'s named materialization phases
@@ -10684,6 +10853,16 @@ fn retry_squad(daemon: &Daemon, id: &str) -> Reply {
     if let Err(e) = store.reset_squad_to_pending(id) {
         return store_error(&e);
     }
+    if let Some(submission) = reenter_unfinished_materialization(&store, id) {
+        drop(store);
+        rerun_materialization(
+            daemon,
+            id,
+            submission,
+            "squad retried before its setup finished: running setup again",
+        );
+        return get_squad(daemon, id);
+    }
     match store.get_squad(id) {
         Ok(squad) => json(200, &squad),
         Err(e) => store_error(&e),
@@ -11600,7 +11779,23 @@ fn restart_squad(daemon: &Daemon, id: &str, body: &str) -> Reply {
     // for the whole arm body below (Rust extends a match scrutinee's
     // temporaries to the arm), and `apply_restart_note` below takes its own
     // lock, which would then deadlock against the still-held one.
-    let restarted = daemon.lock().restart_squad(id);
+    let (restarted, unfinished) = {
+        let store = daemon.lock();
+        let restarted = store.restart_squad(id);
+        let unfinished = restarted
+            .as_ref()
+            .ok()
+            .and_then(|_| reenter_unfinished_materialization(&store, id));
+        (restarted, unfinished)
+    };
+    let rerunning_setup = unfinished.is_some_and(|submission| {
+        rerun_materialization(
+            daemon,
+            id,
+            submission,
+            "squad restarted before its setup finished: running setup again",
+        )
+    });
     match restarted {
         Ok(dirtied) => {
             // A whole-squad restart's target IS every cell in the squad — there
@@ -11614,7 +11809,11 @@ fn restart_squad(daemon: &Daemon, id: &str, body: &str) -> Reply {
             json(
                 200,
                 &RestartResponse {
-                    state: "pending",
+                    state: if rerunning_setup {
+                        "materializing"
+                    } else {
+                        "pending"
+                    },
                     dirtied,
                 },
             )
@@ -14073,7 +14272,7 @@ fn guardian_branch_forge_status(daemon: &Daemon, id: &str, branch_id: &str) -> R
     let forge_cfg = crate::config::resolve_forge(root);
     let client = crate::pr::forge_client_for_pr(
         &daemon.store_handle(),
-        root,
+        &crate::workspace::Workspace::for_guardian(&daemon.store_handle(), &guardian.id, root),
         &guardian.base_branch,
         &forge_cfg,
         repo,
@@ -17663,7 +17862,7 @@ fn pr_comments(daemon: &Daemon, pr_id: &str) -> Reply {
     let forge_cfg = crate::config::resolve_forge(root);
     let client = match crate::pr::forge_client_for_pr(
         &daemon.store_handle(),
-        root,
+        &crate::workspace::Workspace::for_guardian(&daemon.store_handle(), &guardian.id, root),
         &guardian.base_branch,
         &forge_cfg,
         &pr.repo,
@@ -17832,7 +18031,7 @@ fn pr_refresh_ci(daemon: &Daemon, pr_id: &str) -> Reply {
     // so the guardian's base-branch remote may name the wrong repository.
     let Some(client) = crate::pr::forge_client_for_pr(
         &daemon.store_handle(),
-        root,
+        &crate::workspace::Workspace::for_guardian(&daemon.store_handle(), &guardian.id, root),
         &guardian.base_branch,
         &forge_cfg,
         &pr.repo,
@@ -19012,6 +19211,12 @@ fn delete_guardian_and_defer_cleanup(daemon: &Daemon, id: &str) -> Result<(), St
     // exists.
     let dual_root_branch = store.guardian_dual_root_stack_branch(id).ok().flatten();
     drop(store);
+    // Its still-open PRs/MRs, closed once the row is gone: the PR rows are
+    // deleted with the review.
+    let open_prs = snapshot
+        .as_ref()
+        .map(|g| crate::pr::open_prs_for_review_delete(&store_handle, g))
+        .unwrap_or_default();
     // Each project's workspace, resolved while the review still records its
     // machine: once the row is gone, cleanup could only fall back to the
     // daemon's host and would leave a remote review's worktrees behind.
@@ -19033,6 +19238,7 @@ fn delete_guardian_and_defer_cleanup(daemon: &Daemon, id: &str) -> Result<(), St
     let id = id.to_string();
     daemon.background().spawn(move || {
         if let Some(g) = snapshot {
+            crate::pr::close_prs_of_deleted_review(&store_handle, &g, open_prs, &workspaces);
             if let Some(branch) = dual_root_branch {
                 crate::pr::retire_dual_root_upstream_branch(
                     &store_handle,
@@ -19057,7 +19263,8 @@ fn delete_guardian_and_defer_cleanup(daemon: &Daemon, id: &str) -> Result<(), St
     Ok(())
 }
 
-/// Delete a review and purge its review worktrees/branches from every project.
+/// Delete a review, close its still-open PRs/MRs (their remote branches are
+/// kept), and purge its review worktrees/branches from every project.
 fn guardian_delete(daemon: &Daemon, id: &str) -> Reply {
     match delete_guardian_and_defer_cleanup(daemon, id) {
         Ok(()) => json(200, &StateResponse { state: "deleted" }),
@@ -22032,6 +22239,34 @@ fn cors_preflight_headers(origin: &str) -> Vec<tiny_http::Header> {
     headers
 }
 
+/// Query parameters whose values authorize something on their own (the
+/// fork-credential `grant`, the event-stream `ticket`) and so never go into a
+/// log line.
+const SECRET_QUERY_KEYS: &[&str] = &["grant", "ticket", "token", "secret", "password"];
+
+/// `url` with the value of every [`SECRET_QUERY_KEYS`] parameter replaced by
+/// `<redacted>`, for request log lines that keep the query string.
+fn loggable_url(url: &str) -> std::borrow::Cow<'_, str> {
+    let Some((path, query)) = url.split_once('?') else {
+        return std::borrow::Cow::Borrowed(url);
+    };
+    let is_secret = |pair: &str| {
+        let key = pair.split_once('=').map_or(pair, |(key, _)| key);
+        SECRET_QUERY_KEYS.contains(&key)
+    };
+    if !query.split('&').any(is_secret) {
+        return std::borrow::Cow::Borrowed(url);
+    }
+    let query: Vec<String> = query
+        .split('&')
+        .map(|pair| match pair.split_once('=') {
+            Some((key, _)) if is_secret(pair) => format!("{key}=<redacted>"),
+            _ => pair.to_string(),
+        })
+        .collect();
+    std::borrow::Cow::Owned(format!("{path}?{}", query.join("&")))
+}
+
 /// Resolve the CORS decision for one incoming request against the effective
 /// (global + per-project `.ralphus.toml`) `[cors]` allow-list.
 ///
@@ -22482,7 +22717,8 @@ fn answer_request(daemon: &Daemon, pending: PendingRequest) {
         // ralphus[ignore-rlog-pair]: client disconnects are transport noise; the handler already recorded any state change
         crate::rlog!(
             DEBUG,
-            "ralphus [http] {method} {url} -> {status}: response not delivered ({e})"
+            "ralphus [http] {method} {} -> {status}: response not delivered ({e})",
+            loggable_url(&url)
         );
     }
     log_request_outcome(
@@ -22504,19 +22740,22 @@ fn answer_request(daemon: &Daemon, pending: PendingRequest) {
     if handler_ms >= SLOW_REQUEST_MS {
         crate::rlog!(
             WARNING,
-            "ralphus [http] {method} {url} -> {status} SLOW: handler {handler_ms}ms (queued {queued_ms}ms, lock_wait {lock_wait_ms}ms)"
+            "ralphus [http] {method} {} -> {status} SLOW: handler {handler_ms}ms (queued {queued_ms}ms, lock_wait {lock_wait_ms}ms)",
+            loggable_url(&url)
         );
     } else if method == "GET" {
         crate::rlog!(
             DEBUG,
-            "ralphus [http] {method} {url} -> {status} ({handler_ms}ms, queued {queued_ms}ms, lock_wait {lock_wait_ms}ms)"
+            "ralphus [http] {method} {} -> {status} ({handler_ms}ms, queued {queued_ms}ms, lock_wait {lock_wait_ms}ms)",
+            loggable_url(&url)
         );
     } else {
         // A mutating request is a user or client action, so it is kept at the
         // default log level; reads stay at DEBUG because the board polls them.
         crate::rlog!(
             INFO,
-            "ralphus [http] {method} {url} -> {status} ({handler_ms}ms, queued {queued_ms}ms, lock_wait {lock_wait_ms}ms)"
+            "ralphus [http] {method} {} -> {status} ({handler_ms}ms, queued {queued_ms}ms, lock_wait {lock_wait_ms}ms)",
+            loggable_url(&url)
         );
     }
 }
@@ -23107,7 +23346,8 @@ fn run_http_loop(
             // ralphus[ignore-rlog-pair]: this transport-only diagnostic has no event entity; handlers emit the structured request or state record
             crate::rlog!(
                 WARNING,
-                "ralphus [http] {method} {url} blocked: cross-origin request denied"
+                "ralphus [http] {method} {} blocked: cross-origin request denied",
+                loggable_url(&url)
             );
             let response = tiny_http::Response::from_string(
                 error(
@@ -23376,6 +23616,21 @@ mod tests {
 
     use super::*;
     use crate::mock_forge::MockForge;
+
+    #[test]
+    fn a_logged_url_never_carries_a_grant_or_ticket() {
+        let url = "/api/internal/fork-credential?worktree_id=w1&grant=not-a-real-grant";
+        assert_eq!(
+            loggable_url(url),
+            "/api/internal/fork-credential?worktree_id=w1&grant=<redacted>"
+        );
+        assert_eq!(
+            loggable_url("/api/events?ticket=t1"),
+            "/api/events?ticket=<redacted>"
+        );
+        assert_eq!(loggable_url("/api/squads?limit=5"), "/api/squads?limit=5");
+        assert_eq!(loggable_url("/api/squads"), "/api/squads");
+    }
 
     /// WS-D.5: the ETag helpers, which decide whether a board poll can be
     /// answered `304 Not Modified`.
@@ -23679,6 +23934,66 @@ mod tests {
             error.contains("could not parse the stored task file"),
             "{error}"
         );
+    }
+
+    /// A [`deferred_review_submission`] whose setup failed before deriving
+    /// its review: the queued setup is dropped and the squad failed the way
+    /// the setup's own failure path fails it.
+    fn review_submission_whose_setup_failed(name: &str) -> (Daemon, String) {
+        let (d, id) = deferred_review_submission(name);
+        if let BackgroundWork::Deferred(queue) = d.background() {
+            queue.lock().unwrap().clear();
+        }
+        fail_materialization(&d.store_handle(), &id, "git fetch timed out");
+        assert_eq!(d.lock().squad_state(&id).unwrap(), SquadState::Failed);
+        assert!(d.lock().guardians_for_squad(&id).unwrap().is_empty());
+        (d, id)
+    }
+
+    #[test]
+    fn retrying_a_squad_whose_setup_failed_derives_its_reviews() {
+        let (d, id) = review_submission_whose_setup_failed("retry-failed-setup");
+
+        let r = route(&d, "POST", &format!("/api/squads/{id}/retry"), "");
+        assert_eq!(r.status, 200, "{}", r.body);
+        assert_eq!(
+            d.lock().squad_state(&id).unwrap(),
+            SquadState::Materializing,
+            "the scheduler must not claim the squad before its setup reruns"
+        );
+        d.background().drain();
+
+        assert_eq!(d.lock().squad_state(&id).unwrap(), SquadState::Pending);
+        assert_eq!(d.lock().guardians_for_squad(&id).unwrap().len(), 1);
+        assert_eq!(d.lock().get_squad(&id).unwrap().error, None);
+        assert_eq!(d.lock().unfinished_submission(&id).unwrap(), None);
+    }
+
+    #[test]
+    fn restarting_a_squad_whose_setup_failed_derives_its_reviews() {
+        let (d, id) = review_submission_whose_setup_failed("restart-failed-setup");
+
+        let r = route(&d, "POST", &format!("/api/squads/{id}/restart"), "");
+        assert_eq!(r.status, 200, "{}", r.body);
+        let v: serde_json::Value = serde_json::from_str(&r.body).unwrap();
+        assert_eq!(v["state"], "materializing", "{}", r.body);
+        d.background().drain();
+
+        assert_eq!(d.lock().squad_state(&id).unwrap(), SquadState::Pending);
+        assert_eq!(d.lock().guardians_for_squad(&id).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn retrying_a_squad_whose_setup_finished_does_not_rerun_it() {
+        let (d, id) = deferred_review_submission("retry-finished-setup");
+        d.background().drain();
+        d.lock().set_squad_state(&id, SquadState::Failed).unwrap();
+
+        let r = route(&d, "POST", &format!("/api/squads/{id}/retry"), "");
+        assert_eq!(r.status, 200, "{}", r.body);
+        assert_eq!(d.lock().squad_state(&id).unwrap(), SquadState::Pending);
+        d.background().drain();
+        assert_eq!(d.lock().guardians_for_squad(&id).unwrap().len(), 1);
     }
 
     #[test]
@@ -26313,6 +26628,101 @@ triage=true
             &register_body("proj", "C:/definitely/does/not/exist/anywhere", ""),
         );
         assert_eq!(r.status, 400);
+    }
+
+    #[test]
+    fn a_project_registered_with_a_clone_url_alone_is_remote_only() {
+        let d = daemon();
+        let r = route(
+            &d,
+            "POST",
+            "/api/projects",
+            r#"{"name":"widgets","clone_url":"https://github.com/acme/widgets.git"}"#,
+        );
+        assert_eq!(r.status, 201, "{}", r.body);
+
+        let r = route(&d, "GET", "/api/projects/widgets", "");
+        let project: serde_json::Value = serde_json::from_str(&r.body).unwrap();
+        assert_eq!(project["remote_only"], true, "{project}");
+        let root = project["path"].as_str().unwrap();
+        assert!(
+            crate::remote_projects::is_remote_only_root(Path::new(root)),
+            "{root}"
+        );
+        assert!(
+            !Path::new(root).exists(),
+            "the reserved root is never created"
+        );
+        let r = route(&d, "GET", "/api/projects/widgets/validate", "");
+        assert!(r.body.contains("\"valid\":true"), "{}", r.body);
+    }
+
+    #[test]
+    fn a_project_needs_a_path_or_a_clone_url() {
+        let d = daemon();
+        let r = route(&d, "POST", "/api/projects", r#"{"name":"nothing"}"#);
+        assert_eq!(r.status, 400);
+        assert!(r.body.contains("clone_url"), "{}", r.body);
+        let r = route(
+            &d,
+            "POST",
+            "/api/projects",
+            r#"{"name":"a/b","clone_url":"https://github.com/acme/widgets.git"}"#,
+        );
+        assert_eq!(r.status, 400);
+        assert!(r.body.contains("single path segment"), "{}", r.body);
+    }
+
+    #[test]
+    fn a_remote_only_projects_work_must_all_run_on_machines() {
+        let d = daemon();
+        route(
+            &d,
+            "POST",
+            "/api/projects",
+            r#"{"name":"widgets","clone_url":"https://github.com/acme/widgets.git"}"#,
+        );
+        let cell = "[[task.cell]]\ncwd = \"<<ralphus:new-worktree/w-1?upstream=main>>\"\n\
+                    command = \"true\"\nmode = \"raw\"\nshell = \"sh\"\n";
+        let submit = |toml: &str| {
+            route(
+                &d,
+                "POST",
+                "/api/squads",
+                &serde_json::json!({ "toml": toml }).to_string(),
+            )
+        };
+
+        let local = submit(&format!(
+            "no_review = true\n[[task]]\nname = \"t\"\nproject = \"widgets\"\n{cell}"
+        ));
+        assert_eq!(local.status, 400, "{}", local.body);
+        assert!(local.body.contains("has no clone here"), "{}", local.body);
+
+        let unplaced_review = submit(&format!(
+            "[[task]]\nname = \"t\"\nproject = \"widgets\"\nmachine = \"ssh:box\"\n{cell}\
+             review = \"<<ralphus:new-review/r>>\"\n\
+             [[review]]\nid = \"ralphus:new-review/r\"\nupstream = \"main\"\n"
+        ));
+        assert_eq!(unplaced_review.status, 400, "{}", unplaced_review.body);
+        assert!(
+            unplaced_review
+                .body
+                .contains("declare that [[review]] with a remote `machine`"),
+            "{}",
+            unplaced_review.body
+        );
+
+        let placed = submit(&format!(
+            "[[task]]\nname = \"t\"\nproject = \"widgets\"\nmachine = \"ssh:box\"\n{cell}\
+             review = \"<<ralphus:new-review/r>>\"\n\
+             [[review]]\nid = \"ralphus:new-review/r\"\nupstream = \"main\"\nmachine = \"ssh:box\"\n"
+        ));
+        assert!(
+            !placed.body.contains("project_validation_failed"),
+            "{}",
+            placed.body
+        );
     }
 
     #[test]
@@ -35861,6 +36271,173 @@ remediation_attempts=1
                 None,
             )
             .unwrap()
+    }
+
+    /// A mock forge recording `(method, url, body)` per request.
+    type CloseMock = crate::mock_forge::MockForge<Vec<(String, String, String)>>;
+
+    /// A review over a git repo whose `origin` is `acme/widget` on `kind`'s
+    /// forge, reached through a mock that answers every request with
+    /// `status` and records `(method, url, body)` for each.
+    fn review_with_close_mock(tag: &str, kind: &str, status: u16) -> (Daemon, String, CloseMock) {
+        let repo = tmp_git_repo(tag);
+        let host = if kind == "gitlab" {
+            "gitlab.com"
+        } else {
+            "github.com"
+        };
+        let ok = std::process::Command::new("git")
+            .args([
+                "remote",
+                "add",
+                "origin",
+                &format!("https://{host}/acme/widget.git"),
+            ])
+            .current_dir(&repo)
+            .status()
+            .expect("git")
+            .success();
+        assert!(ok, "git remote add failed");
+        let mock = crate::mock_forge::MockForge::start(move |server| {
+            let mut seen = Vec::new();
+            for mut req in server.requests() {
+                let mut body = String::new();
+                let _ = std::io::Read::read_to_string(req.as_reader(), &mut body);
+                seen.push((req.method().to_string(), req.url().to_string(), body));
+                req.respond(tiny_http::Response::from_string("{}").with_status_code(status))
+                    .unwrap();
+            }
+            seen
+        });
+        let addr = mock.addr();
+        std::fs::write(
+            repo.join(".ralphus.toml"),
+            format!(
+                "[forge]\nkind = \"{kind}\"\napi_base = \"http://{addr}\"\ntoken_env = \"RALPHUS_TEST_FORGE_TOKEN\"\n"
+            ),
+        )
+        .unwrap();
+        let d = daemon();
+        d.lock()
+            .register_project("demo", "orchestrator", repo.to_str().unwrap(), "git")
+            .unwrap();
+        let gid = d
+            .lock()
+            .create_guardian("demo", "origin/main", repo.to_str().unwrap())
+            .unwrap();
+        (d, gid, mock)
+    }
+
+    /// Deleting a review closes its still-open PR/MR through the forge's
+    /// REST API (GitHub: `PATCH .../pulls/N {"state":"closed"}`; GitLab:
+    /// `PUT .../merge_requests/N {"state_event":"close"}`), leaves an
+    /// already-closed one alone, and never deletes the remote branch.
+    fn delete_review_closes_its_open_prs(kind: &str) {
+        let (d, gid, mock) = review_with_close_mock("delete-closes-prs", kind, 200);
+        let repo = if kind == "gitlab" {
+            "acme%2Fwidget"
+        } else {
+            "acme/widget"
+        };
+        add_pr(&d, &gid, kind, repo, 7);
+        let closed = add_pr(&d, &gid, kind, repo, 8);
+        d.lock()
+            .update_pull_request(&closed, None, None, None, Some("closed"))
+            .unwrap();
+
+        let r = route(&d, "DELETE", &format!("/api/guardians/{gid}"), "");
+        assert_eq!(r.status, 200, "{}", r.body);
+
+        let seen = mock.finish();
+        assert_eq!(seen.len(), 1, "exactly one close call, saw {seen:?}");
+        let (method, url, body) = &seen[0];
+        let body: serde_json::Value = serde_json::from_str(body).unwrap();
+        if kind == "gitlab" {
+            assert_eq!(method, "PUT");
+            assert!(
+                url.ends_with("/projects/acme%2Fwidget/merge_requests/7"),
+                "{url}"
+            );
+            assert_eq!(body["state_event"], "close");
+        } else {
+            assert_eq!(method, "PATCH");
+            assert!(url.ends_with("/repos/acme/widget/pulls/7"), "{url}");
+            assert_eq!(body["state"], "closed");
+        }
+        assert!(
+            d.lock()
+                .list_pull_requests_for_guardian(&gid)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn delete_review_closes_its_open_github_prs() {
+        delete_review_closes_its_open_prs("github");
+    }
+
+    #[test]
+    fn delete_review_closes_its_open_gitlab_mrs() {
+        delete_review_closes_its_open_prs("gitlab");
+    }
+
+    /// A forge refusing the close does not fail the delete; it leaves a
+    /// mailbox message with remediation naming the PR/MR to close by hand.
+    fn delete_review_reports_a_pr_it_could_not_close(kind: &str) {
+        let (d, gid, mock) = review_with_close_mock("delete-close-fails", kind, 500);
+        let repo = if kind == "gitlab" {
+            "acme%2Fwidget"
+        } else {
+            "acme/widget"
+        };
+        d.lock()
+            .create_pull_request(
+                &gid,
+                None,
+                kind,
+                repo,
+                "feature/foo",
+                "main",
+                "Add foo",
+                "",
+                Some(7),
+                Some("https://forge.example/acme/widget/7"),
+            )
+            .unwrap();
+        let client_id = d.lock().register_mailbox_client().unwrap();
+
+        let r = route(&d, "DELETE", &format!("/api/guardians/{gid}"), "");
+        assert_eq!(r.status, 200, "{}", r.body);
+        assert!(d.lock().get_guardian(&gid).is_err(), "the review is gone");
+
+        let seen = mock.finish();
+        assert!(!seen.is_empty(), "the close was attempted");
+        let messages = d
+            .lock()
+            .mailbox_messages_for_client(&client_id, true, None)
+            .unwrap();
+        let notice = messages
+            .iter()
+            .find(|m| m.message.contains("could not be closed"))
+            .unwrap_or_else(|| panic!("no close-failure notice in {messages:?}"));
+        assert!(
+            notice.message.contains(
+                "Manual intervention required: close https://forge.example/acme/widget/7"
+            ),
+            "{}",
+            notice.message
+        );
+    }
+
+    #[test]
+    fn delete_review_reports_a_github_pr_it_could_not_close() {
+        delete_review_reports_a_pr_it_could_not_close("github");
+    }
+
+    #[test]
+    fn delete_review_reports_a_gitlab_mr_it_could_not_close() {
+        delete_review_reports_a_pr_it_could_not_close("gitlab");
     }
 
     /// Regression (RAL-668): a fork PR's number means nothing in the parent

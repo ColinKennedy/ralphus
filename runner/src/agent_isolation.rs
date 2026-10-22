@@ -57,7 +57,7 @@ pub fn preserve_auth_file(real_dir: Option<&Path>, isolated_dir: &Path, filename
     if !source.is_file() {
         return;
     }
-    if let Err(e) = std::fs::create_dir_all(isolated_dir) {
+    if let Err(e) = create_private_dir(isolated_dir) {
         emit_isolation_warning(
             "could not create isolated config directory",
             isolated_dir,
@@ -66,8 +66,9 @@ pub fn preserve_auth_file(real_dir: Option<&Path>, isolated_dir: &Path, filename
         );
         return;
     }
-    match std::fs::copy(source, isolated_dir.join(filename)) {
-        Ok(_) => crate::cartographer::emit(
+    let copy = isolated_dir.join(filename);
+    match std::fs::copy(source, &copy).and_then(|_| make_owner_only(&copy)) {
+        Ok(()) => crate::cartographer::emit(
             "runner",
             "preserved file into isolated config directory",
             "debug",
@@ -83,6 +84,39 @@ pub fn preserve_auth_file(real_dir: Option<&Path>, isolated_dir: &Path, filename
             filename,
             &e,
         ),
+    }
+}
+
+/// Create `dir` (and missing parents) readable only by its owner: it holds a
+/// copy of a login, and the temp directory it lives under is shared by every
+/// account on the machine.
+fn create_private_dir(dir: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt as _;
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(dir)
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::create_dir_all(dir)
+    }
+}
+
+/// Make a copied login file readable only by its owner, whatever the
+/// original's mode.
+fn make_owner_only(file: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(file, std::fs::Permissions::from_mode(0o600))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = file;
+        Ok(())
     }
 }
 
@@ -119,6 +153,31 @@ mod tests {
         let a = isolated_config_dir(Path::new("/tmp/a"), "codex");
         let b = isolated_config_dir(Path::new("/tmp/b"), "codex");
         assert_ne!(a, b);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_preserved_login_is_readable_only_by_its_owner() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let real =
+            std::env::temp_dir().join(format!("ralphus-auth-mode-real-{}", std::process::id()));
+        let isolated =
+            std::env::temp_dir().join(format!("ralphus-auth-mode-iso-{}", std::process::id()));
+        std::fs::create_dir_all(&real).unwrap();
+        std::fs::write(real.join("auth.json"), "{}").unwrap();
+        std::fs::set_permissions(
+            real.join("auth.json"),
+            std::fs::Permissions::from_mode(0o644),
+        )
+        .unwrap();
+
+        preserve_auth_file(Some(&real), &isolated, "auth.json");
+
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&isolated), 0o700);
+        assert_eq!(mode(&isolated.join("auth.json")), 0o600);
+        let _ = std::fs::remove_dir_all(&real);
+        let _ = std::fs::remove_dir_all(&isolated);
     }
 
     #[test]

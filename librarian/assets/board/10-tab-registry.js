@@ -5,6 +5,8 @@
       let machineBuiltins = [];
       /** Message from the last failed register/remove, shown inline above the table. */
       let machineError = "";
+      /** @type {MachineAllocationView[]} active machines provider services granted */
+      let machineAllocations = [];
       // ---- Presets tab (RAL-…) ----
       /** @type {PresetView[]} registered presets */
       let presets = [];
@@ -801,7 +803,7 @@
        */
       function ttTaskAgents(task) {
         const cells = task.cells || [];
-        if (cells.length) return [...new Set(cells.map((c) => c.agent))];
+        if (cells.length) return [...new Set(cells.flatMap((c) => (c.agent ? [c.agent] : [])))];
         return task.agent ? [task.agent] : [];
       }
       /**

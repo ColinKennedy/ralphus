@@ -3214,8 +3214,11 @@ impl Store {
                 // `guardian_merge::run_agent_with_rate_limit_retry` exhausting
                 // its provider-rate-limit retries is recoverable by re-running
                 // the merge, not by manual conflict surgery -- downgrade to
-                // High and point straight at `review reopen` instead of the
-                // generic "inspect and resolve" guidance.
+                // High and point straight at `review restart-merge` instead of
+                // the generic "inspect and resolve" guidance. `review reopen`
+                // only accepts the terminal statuses (`reopen_guardian`);
+                // `restart-merge` is the path that resets `merge_failed`
+                // (`reset_guardian_to_collecting`).
                 let exhausted = detail.is_some_and(crate::mailbox::is_retry_exhaustion_error);
                 let (priority, notify_msg, remediation) = if exhausted {
                     (
@@ -3226,7 +3229,7 @@ impl Store {
                             detail.unwrap_or_default()
                         ),
                         crate::mailbox::Remediation::SuggestedCommand {
-                            command: format!("ralphus review reopen {id}"),
+                            command: format!("ralphus review restart-merge {id}"),
                             purpose: "retry the merge now that the provider rate limit has had \
                                       time to clear"
                                 .to_string(),
@@ -3240,7 +3243,7 @@ impl Store {
                             guidance: format!(
                                 "inspect the merge failure (`ralphus review worktrees {id}`) and \
                                  resolve the underlying conflict or error before retrying \
-                                 (`ralphus review reopen {id}`)"
+                                 (`ralphus review restart-merge {id}`)"
                             ),
                         },
                     )
@@ -12132,7 +12135,7 @@ mod tests {
     /// [`crate::mailbox::is_retry_exhaustion_error`] (the wording
     /// `guardian_merge::run_agent_with_rate_limit_retry` uses once its
     /// provider-rate-limit retries are genuinely exhausted) must enqueue a
-    /// single High-priority mailbox message pointing at `review reopen`,
+    /// single High-priority mailbox message pointing at `review restart-merge`,
     /// not the generic Urgent/manual-inspection wording an ordinary merge
     /// failure gets.
     #[test]
@@ -12170,8 +12173,42 @@ mod tests {
         assert!(
             messages[0]
                 .message
-                .contains(&format!("ralphus review reopen {id}"))
+                .contains(&format!("ralphus review restart-merge {id}"))
         );
+    }
+
+    /// Both `merge_failed` mailbox remediations must name a command that
+    /// actually accepts a `merge_failed` review: `review restart-merge`
+    /// (backed by `reset_guardian_to_collecting`), never `review reopen`
+    /// (`reopen_guardian`, terminal statuses only).
+    #[test]
+    fn merge_failed_remediation_names_a_command_that_accepts_merge_failed() {
+        for detail in [
+            "merge conflict in foo.rs",
+            "provider rate-limit retries exhausted after 3 attempt(s)",
+        ] {
+            let store = Store::open_in_memory().unwrap();
+            let id = store.create_guardian("r", "main", "/repo").unwrap();
+            store
+                .set_guardian_status(&id, GuardianStatus::MergeFailed, Some(detail))
+                .unwrap();
+            let client_id = store.register_mailbox_client().unwrap();
+            let messages = store
+                .mailbox_messages_for_client(&client_id, true, None)
+                .unwrap();
+            assert_eq!(messages.len(), 1);
+            let text = &messages[0].message;
+            assert!(
+                !text.contains(&format!("ralphus review reopen {id}")),
+                "{detail}: remediation must not suggest `review reopen`: {text}"
+            );
+            assert!(
+                text.contains(&format!("ralphus review restart-merge {id}")),
+                "{detail}: remediation must suggest `review restart-merge`: {text}"
+            );
+            assert!(store.reopen_guardian(&id).is_err());
+            store.reset_guardian_to_collecting(&id).unwrap();
+        }
     }
 
     /// Contrast with the exhaustion case above: an ordinary merge failure

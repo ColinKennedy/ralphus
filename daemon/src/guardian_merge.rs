@@ -2027,13 +2027,34 @@ fn rebase_head_sha(wt: &Workspace) -> Option<String> {
     (!sha.is_empty()).then(|| sha.to_string())
 }
 
-/// The branch-failure detail for an [`advance_rebase`] error.
-fn rebase_stuck_detail(branch: &str, error: &str) -> String {
+/// The branch-failure detail for an [`advance_rebase`] error in a worktree on
+/// `machine` (`None`: the daemon's host).
+fn rebase_stuck_detail(branch: &str, machine: Option<&str>, error: &str) -> String {
+    if crate::workspace::is_git_identity_error(error) {
+        return git_identity_detail(branch, machine, error);
+    }
     format!(
         "git rebase --continue failed for branch {branch} with every conflict already resolved, \
          so retrying cannot help: {error}. The rebase is left paused in the review worktree. \
          Check that git can commit there (user.name/user.email configured on that machine, \
          commit hooks succeed), then restart this review."
+    )
+}
+
+/// The branch-failure detail for a git step in a review worktree on `machine`
+/// (`None`: the daemon's host) that could not commit because git there has no
+/// identity. Not a conflict: no resolver can fix it, only configuring git.
+fn git_identity_detail(branch: &str, machine: Option<&str>, error: &str) -> String {
+    let place = machine.map_or_else(
+        || "the daemon's host".to_string(),
+        |machine| format!("machine {machine}"),
+    );
+    format!(
+        "git on {place} has no committer identity, so branch {branch} could not be committed \
+         (not a merge conflict): {error}. Set user.name and user.email in git's config there \
+         (git config --global user.name ...; git config --global user.email ...), then restart \
+         this review. A remote machine whose git has no identity when ralphus first reaches it \
+         commits as \"ralphus\" instead."
     )
 }
 
@@ -3050,7 +3071,7 @@ fn resolve_conflicts_with_agent(
                 // conflict was resolved correctly, or because whatever resolved
                 // it made the diff disappear entirely.
                 guard_against_rebase_step_content_loss(store, id, branch, wt)?;
-                advance_rebase(wt).map_err(|e| rebase_stuck_detail(branch, &e))?;
+                advance_rebase(wt).map_err(|e| rebase_stuck_detail(branch, wt.machine(), &e))?;
                 // RAL-144: advancing to the next commit -- nothing was found or
                 // committed for it yet.
                 committed = 0;
@@ -3115,7 +3136,7 @@ fn resolve_conflicts_with_agent(
             }
             wt.git(&["add", "--all"])?;
             guard_against_rebase_step_content_loss(store, id, branch, wt)?;
-            advance_rebase(wt).map_err(|e| rebase_stuck_detail(branch, &e))?;
+            advance_rebase(wt).map_err(|e| rebase_stuck_detail(branch, wt.machine(), &e))?;
             // RAL-144: advancing to the next commit -- nothing committed for it yet.
             committed = 0;
             commit_attempts = 0;
@@ -3446,7 +3467,7 @@ fn resolve_conflicts_with_agent(
                 });
             }
             guard_against_rebase_step_content_loss(store, id, branch, wt)?;
-            advance_rebase(wt).map_err(|e| rebase_stuck_detail(branch, &e))?;
+            advance_rebase(wt).map_err(|e| rebase_stuck_detail(branch, wt.machine(), &e))?;
             // RAL-144: advancing to the next commit -- nothing committed for it yet.
             committed = 0;
             commit_attempts = 0;
@@ -3537,7 +3558,7 @@ fn resolve_conflicts_with_agent(
         // Either way the loop re-checks and resolves any further conflicting
         // commits.
         guard_against_rebase_step_content_loss(store, id, branch, wt)?;
-        advance_rebase(wt).map_err(|e| rebase_stuck_detail(branch, &e))?;
+        advance_rebase(wt).map_err(|e| rebase_stuck_detail(branch, wt.machine(), &e))?;
         // RAL-144: advancing to the next commit -- nothing committed for it yet.
         committed = 0;
         commit_attempts = 0;
@@ -6259,9 +6280,11 @@ enum StagedPassOutcome {
 ///   tail). Otherwise it returns to `Collecting` so a later task completion
 ///   re-triggers a further pass via `try_start_ready_reviews_for_task`.
 /// - The residual race — a branch becoming `ready` *while* a pass is already
-///   building, so `try_start_ready_reviews_for_task`'s claim loses to the
+///   running, so `try_start_ready_reviews_for_task`'s claim loses to the
 ///   running merge — is closed by the pass-level loop below coalescing
-///   consecutive completions instead of dropping them.
+///   consecutive completions instead of dropping them, including after a
+///   pass that built nothing (an earlier branch was not ready yet) and right
+///   after returning to `Collecting`.
 ///
 /// `claim_guardian_merge` (collecting→merging) already guarantees a single
 /// merge runs at a time, so concurrent task completions can never double-trigger
@@ -6270,6 +6293,19 @@ enum StagedPassOutcome {
 /// `skip_worktrees` reviews (shared worktree, no per-branch worktrees) are not
 /// incremental in this design: they fall back to the legacy all-or-nothing
 /// `run_merge_cancellable`, once every enabled branch's cells are done.
+/// Passes in a row that may build nothing before a staged merge gives up and
+/// waits for the next task completion (see [`run_merge_staged`]).
+const MAX_UNBUILT_PASSES: u32 = 3;
+
+#[cfg(test)]
+thread_local! {
+    /// Run on this thread after each staged pass that finished, before the
+    /// merge decides whether to look again -- a test's stand-in for a task
+    /// completing while the review is merging.
+    static AFTER_STAGED_PASS: std::cell::RefCell<Option<Box<dyn FnMut()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 pub fn run_merge_staged(
     store: &crate::store_lock::StoreHandle,
     runner: &dyn Runner,
@@ -6312,7 +6348,9 @@ pub fn run_merge_staged(
             return;
         }
     };
-    if let Err(error) = preflight_resolver_agent(runner, &resolved, guardian.machine.as_deref()) {
+    let review_machine =
+        crate::allocations::review_machine(store, &guardian.id, guardian.machine.as_deref());
+    if let Err(error) = preflight_resolver_agent(runner, &resolved, review_machine.as_deref()) {
         set_status(GuardianStatus::MergeFailed, Some(&error));
         return;
     }
@@ -6355,6 +6393,7 @@ pub fn run_merge_staged(
     }
 
     let mut built_any_total = false;
+    let mut unbuilt_passes = 0;
     loop {
         if cancel.is_cancelled() {
             log_merge_cancelled(store, id);
@@ -6364,6 +6403,12 @@ pub fn run_merge_staged(
             StagedPassOutcome::Cancelled => return,
             StagedPassOutcome::Failed => return,
             StagedPassOutcome::Ok { built_any } => {
+                #[cfg(test)]
+                AFTER_STAGED_PASS.with(|hook| {
+                    if let Some(hook) = hook.borrow_mut().as_mut() {
+                        hook();
+                    }
+                });
                 if built_any {
                     built_any_total = true;
                 }
@@ -6375,14 +6420,25 @@ pub fn run_merge_staged(
                     finish_staged_merge(store, id, cancel, &set_status);
                     return;
                 }
-                if !built_any || !next_not_built_is_ready(store, id) {
-                    // Nothing more can build right now: return to Collecting so
-                    // the next task completion re-triggers a further pass.
-                    set_status(GuardianStatus::Collecting, None);
-                    return;
+                // A task that finished while this merge ran had its trigger
+                // dropped (the review was already merging), so its branch
+                // becoming ready is only seen by looking again -- here, and
+                // once more after returning to Collecting, which closes the
+                // window between this check and the status change. Bounded:
+                // a pass that keeps building nothing stops.
+                if !built_any {
+                    unbuilt_passes += 1;
                 }
-                // A `pending` branch became `ready` while we were building;
-                // coalesce it into this same merge rather than waiting.
+                let ready = next_not_built_is_ready(store, id);
+                if !ready || unbuilt_passes > MAX_UNBUILT_PASSES {
+                    set_status(GuardianStatus::Collecting, None);
+                    if unbuilt_passes > MAX_UNBUILT_PASSES || !next_not_built_is_ready(store, id) {
+                        return;
+                    }
+                    set_status(GuardianStatus::Merging, None);
+                }
+                // A `pending` branch became `ready`; coalesce it into this
+                // same merge rather than waiting.
             }
         }
     }
@@ -7086,7 +7142,9 @@ pub fn run_merge_cancellable(
             return;
         }
     };
-    if let Err(error) = preflight_resolver_agent(runner, &resolved, guardian.machine.as_deref()) {
+    let review_machine =
+        crate::allocations::review_machine(store, &guardian.id, guardian.machine.as_deref());
+    if let Err(error) = preflight_resolver_agent(runner, &resolved, review_machine.as_deref()) {
         set_status(GuardianStatus::MergeFailed, Some(&error));
         return;
     }
@@ -15838,6 +15896,16 @@ fn fetch_base_branch(
                 // Git 2.40+ says "refusing to fetch into branch ... checked
                 // out at"; older git "Refusing to fetch into current branch".
                 Err(e) if e.to_ascii_lowercase().contains("refusing to fetch into") => {
+                    // On a machine the repository is the provider's clone,
+                    // which nobody works in: detach it so the base can move.
+                    if ws.machine().is_some()
+                        && ws.git(&["checkout", "--quiet", "--detach"]).is_ok()
+                        && ws
+                            .git(&["fetch", "--no-write-fetch-head", remote, &refspec])
+                            .is_ok()
+                    {
+                        return Ok(());
+                    }
                     warn_checked_out_base_once(store, target);
                     let tracking = format!("+refs/heads/{branch}:refs/remotes/{remote}/{branch}");
                     ws.git(&["fetch", "--no-write-fetch-head", remote, &tracking])
@@ -16284,6 +16352,13 @@ fn drive_rebase(
                 log_merge_cancelled(store, id);
                 return Err("cancelled".to_string());
             }
+            if crate::workspace::is_git_identity_error(&e) {
+                // The rebase paused because git could not commit a step, not
+                // on a conflict: a resolver has nothing to resolve, and its
+                // own `--continue` would fail the same way.
+                let _ = wt.git(&["rebase", "--abort"]);
+                return Err(git_identity_detail(feature, wt.machine(), &e));
+            }
             let conflicts = conflicted_files(wt);
             if conflicts.is_empty() && !rebase_in_progress(wt) {
                 // Genuine failure with no conflict to resolve (e.g. a bad ref): abort clean.
@@ -16548,7 +16623,9 @@ pub(crate) fn recompute_preliminary_summary(store: &crate::store_lock::StoreHand
         let mut prev_task = base_branch.clone();
         for c in candidates.iter().filter(|c| &c.project == proj) {
             let task_ws = c.cwd.as_ref().map(|cwd| {
-                Workspace::on(Path::new(cwd), c.machine.as_deref()).with_store(Arc::clone(store))
+                Workspace::on(Path::new(cwd), c.machine.as_deref())
+                    .with_store(Arc::clone(store))
+                    .for_review(id)
             });
             // A disabled branch is not in the review, so it contributes no
             // section -- but the producing worktrees are stacked on disk
@@ -17022,11 +17099,12 @@ fn generate_final_summary(
     };
     let result = runner.run(&spec);
     let _ = record_guardian_call_cost(store, id, None, "summary", &result);
-    if result.is_done() && !result.summary.trim().is_empty() {
+    let summary = crate::pr::strip_agent_reply_markers(&result.summary);
+    let summary = summary.trim();
+    if result.is_done() && !summary.is_empty() {
         // RAL-88: record which resolved agent/model produced this summary.
         let guard = store.lock();
-        let _ =
-            guard.set_guardian_summary(id, &result.summary, Some(agent.as_str()), model.as_deref());
+        let _ = guard.set_guardian_summary(id, summary, Some(agent.as_str()), model.as_deref());
         guard.mark_final_summary_generated(id, signature);
     } else {
         // RAL-303: the review is left showing its git-log preliminary summary,
@@ -20250,7 +20328,110 @@ mod tests {
             rebase_in_progress(&wt),
             "the rebase stays paused for inspection"
         );
-        assert!(rebase_stuck_detail("side", &error).contains("user.name/user.email"));
+        assert!(rebase_stuck_detail("side", None, &error).contains("user.name/user.email"));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_stuck_continue_without_a_git_identity_names_the_identity_not_a_conflict() {
+        let stderr = "Committer identity unknown\n\n*** Please tell me who you are.\n\n\
+                      Run\n\n  git config --global user.email \"you@example.com\"\n\n\
+                      fatal: unable to auto-detect email address (got 'me@box.(none)')";
+        for error in [stderr, "fatal: empty ident name (for <me@box>) not allowed"] {
+            assert!(crate::workspace::is_git_identity_error(error), "{error}");
+            let detail = rebase_stuck_detail("side", Some("ssh:box"), error);
+            assert!(detail.contains("no committer identity"), "{detail}");
+            assert!(detail.contains("machine ssh:box"), "{detail}");
+            assert!(detail.contains("user.name and user.email"), "{detail}");
+            assert!(
+                !detail.contains("every conflict already resolved"),
+                "{detail}"
+            );
+        }
+        for error in [
+            "CONFLICT (content): Merge conflict in base.txt",
+            "fatal: Unable to create '.git/index.lock': File exists.",
+        ] {
+            assert!(!crate::workspace::is_git_identity_error(error), "{error}");
+        }
+    }
+
+    #[test]
+    fn a_rebase_that_cannot_commit_for_want_of_an_identity_is_not_a_conflict() {
+        // The rebase stops because git cannot commit a cleanly-applied pick,
+        // which pauses it with nothing conflicted -- the shape the resolver
+        // path takes for a rerere-staged conflict. It must fail the branch
+        // with the identity named instead, without a resolver or any
+        // conflict bookkeeping.
+        if ["GIT_COMMITTER_NAME", "GIT_AUTHOR_NAME"]
+            .iter()
+            .any(|key| std::env::var_os(key).is_some())
+        {
+            eprintln!("skipped: the environment names a git identity");
+            return;
+        }
+        let (base, repo, fwt) = make_repo("drive-rebase-no-identity");
+        std::fs::write(repo.join("main.txt"), "main\n").unwrap();
+        g(&repo, &["add", "main.txt"]);
+        g(&repo, &["commit", "--message", "main edit"]);
+        let old_base = git(&repo, &["rev-parse", "main~1"])
+            .unwrap()
+            .trim()
+            .to_string();
+        let new_base = git(&repo, &["rev-parse", "main"])
+            .unwrap()
+            .trim()
+            .to_string();
+        g(&repo, &["config", "user.name", ""]);
+        let store = Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
+        let id = {
+            let guard = store.lock();
+            let id = guard
+                .create_guardian("r", "main", repo.to_str().unwrap())
+                .unwrap();
+            guard.add_guardian_branch(&id, "feature/a").unwrap();
+            id
+        };
+        let branch_id = store.lock().get_guardian(&id).unwrap().branches[0]
+            .id
+            .clone();
+        struct MustNotRunRunner;
+        impl Runner for MustNotRunRunner {
+            fn run(&self, _: &RunnerSpec) -> RunnerResult {
+                panic!("no resolver may run for a missing git identity")
+            }
+        }
+        let gate = ProofGate {
+            scope: "nothing".to_string(),
+            skip_auto_clean: false,
+            is_final_branch: false,
+        };
+        let wt = Workspace::local(&fwt);
+        let error = drive_rebase(
+            &store,
+            &id,
+            &branch_id,
+            &MustNotRunRunner,
+            "feature/a",
+            &wt,
+            &new_base,
+            &old_base,
+            "feature/a",
+            &gate,
+            &CancelToken::never(),
+        )
+        .err()
+        .expect("the rebase cannot commit without an identity");
+
+        assert!(error.contains("no committer identity"), "{error}");
+        assert!(error.contains("not a merge conflict"), "{error}");
+        assert!(!rebase_in_progress(&wt), "the rebase is aborted: {error}");
+        let view = store.lock().get_guardian(&id).unwrap();
+        assert_eq!(view.conflicts_found, None, "no conflict bookkeeping");
+        assert_eq!(view.branches[0].conflicts_found, None);
+
         let _ = std::fs::remove_dir_all(&base);
     }
 
@@ -22512,6 +22693,106 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
+    /// A review over task A's branch then task B's, where B finishes first:
+    /// the merge B's completion starts builds nothing (A is still pending),
+    /// and A finishes while that merge is running, so A's own trigger is
+    /// dropped (the review is already merging). The merge must look again
+    /// and build both rather than settle in `collecting` with nothing left to
+    /// wake it.
+    #[test]
+    fn a_staged_merge_builds_the_stack_when_the_lower_task_finishes_mid_merge() {
+        let (base, repo, _fwt) = make_repo("out-of-order");
+        // Stacking B onto A's review branch rebases a real commit through
+        // `GitVcs::exec_raw`, which injects no identity, so the repo needs
+        // its own on a CI runner with no global gitconfig.
+        g(&repo, &["config", "user.name", "t"]);
+        g(&repo, &["config", "user.email", "t@t"]);
+        let bwt = base.join("bwt");
+        g(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "feature/b",
+                bwt.to_str().unwrap(),
+                "main",
+            ],
+        );
+        std::fs::write(
+            bwt.join("b.txt"),
+            "b
+",
+        )
+        .unwrap();
+        g(&bwt, &["add", "."]);
+        g(&bwt, &["commit", "--message", "b"]);
+        let store = Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
+        let id = {
+            let guard = store.lock();
+            let id = guard
+                .create_guardian("r", "main", repo.to_str().unwrap())
+                .unwrap();
+            guard.add_guardian_branch(&id, "feature/a").unwrap();
+            guard.add_guardian_branch(&id, "feature/b").unwrap();
+            id
+        };
+        let branch_id = |name: &str| {
+            store
+                .lock()
+                .get_guardian(&id)
+                .unwrap()
+                .branches
+                .into_iter()
+                .find(|b| b.branch == name)
+                .unwrap()
+                .id
+        };
+        let (a, b) = (branch_id("feature/a"), branch_id("feature/b"));
+        // Task B finished first: its branch is ready, A's is still pending.
+        store
+            .lock()
+            .set_branch_status(&id, &b, MergeStatus::Ready, None)
+            .unwrap();
+        assert!(store.lock().claim_guardian_merge(&id).unwrap());
+
+        // Task A finishes after the first pass read the stack, while the
+        // review is merging: its own claim loses, so nothing re-triggers.
+        let hook_store = Arc::clone(&store);
+        let (hook_id, hook_a) = (id.clone(), a.clone());
+        let mut fired = false;
+        AFTER_STAGED_PASS.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                if fired {
+                    return;
+                }
+                fired = true;
+                let guard = hook_store.lock();
+                guard
+                    .set_branch_status(&hook_id, &hook_a, MergeStatus::Ready, None)
+                    .unwrap();
+                assert!(
+                    !guard.claim_guardian_merge(&hook_id).unwrap(),
+                    "A's completion must find the review already merging"
+                );
+            }));
+        });
+        run_merge_staged(&store, &CapturingRunner::new(), &id, &CancelToken::never());
+        AFTER_STAGED_PASS.with(|hook| *hook.borrow_mut() = None);
+
+        let view = store.lock().get_guardian(&id).unwrap();
+        assert_eq!(view.status, "in_review", "detail: {:?}", view.detail);
+        assert!(
+            view.branches.iter().all(|b| b.merge_status == "done"),
+            "both branches built: {:?}",
+            view.branches
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     #[test]
     fn the_artifact_probe_uses_the_machines_shell_not_the_daemons() {
         // A Windows daemon checking a Linux review machine must send POSIX
@@ -23661,12 +23942,18 @@ mod tests {
 
     struct CapturingRunner {
         last_prompt: Mutex<Option<String>>,
+        reply: String,
     }
 
     impl CapturingRunner {
         fn new() -> Self {
+            Self::replying("captured")
+        }
+
+        fn replying(reply: &str) -> Self {
             Self {
                 last_prompt: Mutex::new(None),
+                reply: reply.to_string(),
             }
         }
     }
@@ -23686,7 +23973,7 @@ mod tests {
                 compaction_count: 0,
                 cost_usd: 0.0,
                 cost_is_estimated: false,
-                summary: "captured".to_string(),
+                summary: self.reply.clone(),
                 error: None,
                 proofed: None,
                 agent_session_id: None,
@@ -23870,6 +24157,34 @@ mod tests {
                 .lock()
                 .take_due_final_summary_requests(crate::store::now_ms() + 60_000, 0)
                 .is_empty()
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn generate_final_summary_strips_agent_reply_markers() {
+        let (base, repo, _fwt) = make_repo("gensum-markers");
+        let base_sha = git(&repo, &["rev-parse", "main"])
+            .unwrap()
+            .trim()
+            .to_string();
+        let store = Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
+        let id = setup_final_summary_guardian(&store, &repo, &base_sha, "feature/a", "feature/a");
+        let runner = CapturingRunner::replying(
+            "- feature/a: adds the widget\n\
+             RALPHUS_PROPHECY: decision: kept the old API\n\
+             RALPHUS_GHOST:\n- could not run the slow suite\n",
+        );
+
+        generate_final_summary(&store, &runner, &id, "sig");
+
+        let g = store.lock().get_guardian(&id).unwrap();
+        assert_eq!(
+            g.change_summary.as_deref(),
+            Some("- feature/a: adds the widget")
         );
 
         let _ = std::fs::remove_dir_all(&base);

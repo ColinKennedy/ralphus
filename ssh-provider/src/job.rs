@@ -157,16 +157,14 @@ pub fn start(uri: &str, spec_json: &str, config: &EffectiveConfig) -> Result<Str
             "remote job setup returned an invalid acknowledgement {setup_output:?}"
         ));
     }
-    if let Err(error) = write_protected_file(
+    if let Err(error) = launch_worker(
         &target,
-        &format!("{dir}/environment"),
-        protected_environment.as_bytes(),
+        &dir,
+        cwd,
+        &runner_command,
+        &protected_environment,
         config,
     ) {
-        abandon_start(&target, &dir, config);
-        return Err(error);
-    }
-    if let Err(error) = launch_worker(&target, &dir, cwd, &runner_command, config) {
         abandon_start(&target, &dir, config);
         return Err(error);
     }
@@ -178,24 +176,29 @@ pub fn start(uri: &str, spec_json: &str, config: &EffectiveConfig) -> Result<Str
     Ok(handle)
 }
 
+/// Start the detached worker. `environment` (shell assignments, possibly
+/// secrets) travels on this SSH session's stdin and is exported into the
+/// launching shell, so the worker inherits it without it ever being written
+/// to the machine's disk.
 fn launch_worker(
     target: &SshTarget,
     dir: &str,
     cwd: &str,
     runner_command: &str,
+    environment: &str,
     config: &EffectiveConfig,
 ) -> Result<(), String> {
     let q_dir = shell_quote_single(dir);
     let worker = format!(
-        "job={q_dir}; printf '%s\\n' \"$$\" > \"$job/supervisor_pid\"; awk '{{print $22}}' /proc/$$/stat > \"$job/supervisor_start\"; printf 'running\\n' > \"$job/state.tmp\"; mv \"$job/state.tmp\" \"$job/state\"; set -a; . \"$job/environment\"; set +a; rm -f \"$job/environment\"; cd {cwd}; {runner} < \"$job/spec.json\" >> \"$job/output\" 2>&1; code=$?; tail -n 1 \"$job/output\" > \"$job/result.tmp\" || true; if [ ! -s \"$job/result.tmp\" ]; then printf '{{\"status\":\"failed\",\"summary\":\"remote runner produced no result\",\"error\":\"remote runner exited %s without a result\"}}\\n' \"$code\" > \"$job/result.tmp\"; terminal=failed; elif grep -Eq '\"status\"[[:space:]]*:[[:space:]]*\"failed\"' \"$job/result.tmp\"; then terminal=failed; else terminal=done; fi; mv \"$job/result.tmp\" \"$job/result\"; printf '%s\\n' \"$terminal\" > \"$job/state.tmp\"; mv \"$job/state.tmp\" \"$job/state\"",
+        "job={q_dir}; printf '%s\\n' \"$$\" > \"$job/supervisor_pid\"; awk '{{print $22}}' /proc/$$/stat > \"$job/supervisor_start\"; printf 'running\\n' > \"$job/state.tmp\"; mv \"$job/state.tmp\" \"$job/state\"; cd {cwd}; {runner} < \"$job/spec.json\" >> \"$job/output\" 2>&1; code=$?; tail -n 1 \"$job/output\" > \"$job/result.tmp\" || true; if [ ! -s \"$job/result.tmp\" ]; then printf '{{\"status\":\"failed\",\"summary\":\"remote runner produced no result\",\"error\":\"remote runner exited %s without a result\"}}\\n' \"$code\" > \"$job/result.tmp\"; terminal=failed; elif grep -Eq '\"status\"[[:space:]]*:[[:space:]]*\"failed\"' \"$job/result.tmp\"; then terminal=failed; else terminal=done; fi; mv \"$job/result.tmp\" \"$job/result\"; printf '%s\\n' \"$terminal\" > \"$job/state.tmp\"; mv \"$job/state.tmp\" \"$job/state\"",
         cwd = shell_quote_single(cwd),
         runner = runner_command,
     );
     let command = format!(
-        "set -eu; nohup setsid sh -c {} >/dev/null 2>&1 </dev/null & printf '%s\\n' \"$!\"",
+        "set -eu; set -a; eval \"$(cat)\"; set +a; nohup setsid sh -c {} >/dev/null 2>&1 </dev/null & printf '%s\\n' \"$!\"",
         shell_quote_single(&worker)
     );
-    let output = ssh_command(target, &command, config, None)?;
+    let output = ssh_command(target, &command, config, Some(environment.as_bytes()))?;
     if output.trim().parse::<u32>().is_err() {
         return Err(format!(
             "remote worker returned an invalid process id {output:?}"
@@ -327,19 +330,6 @@ fn environment_file(
         file.push('\n');
     }
     Ok(file)
-}
-
-fn write_protected_file(
-    target: &SshTarget,
-    path: &str,
-    content: &[u8],
-    config: &EffectiveConfig,
-) -> Result<(), String> {
-    let path = shell_quote_single(path);
-    let command = format!(
-        "set -eu; umask 077; file={path}; tmp=\"$file.tmp\"; trap 'rm -f \"$tmp\"' EXIT HUP INT TERM; cat > \"$tmp\"; mv \"$tmp\" \"$file\"; trap - EXIT HUP INT TERM"
-    );
-    ssh_command(target, &command, config, Some(content)).map(|_| ())
 }
 
 fn abandon_start(target: &SshTarget, dir: &str, config: &EffectiveConfig) {

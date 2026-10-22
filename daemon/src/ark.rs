@@ -454,7 +454,11 @@ fn sweep_inner(
         }
     };
     let mut report = SweepReport::default();
-    for project in projects.into_iter().filter(|p| p.vcs == "git") {
+    // A remote-only project has no clone on this host to snapshot.
+    for project in projects
+        .into_iter()
+        .filter(|p| p.vcs == "git" && !p.remote_only)
+    {
         let root = PathBuf::from(&project.path);
         let cfg = crate::config::load_ark_config(&root);
         if let Err(error) = cfg.validate() {

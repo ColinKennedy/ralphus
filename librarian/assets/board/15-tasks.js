@@ -647,7 +647,7 @@
         return `<div class="tt-row tt-cell-row ${selected ? "selected" : ""}" style="top:${top}px;height:${TT_ROW_H}px" data-squad-id="${esc(row.squadId)}" onclick="event.stopPropagation();ttSelectCell('${esc(row.squadId)}',${row.taskIdx},${cellIdx})">`
           + ttColCell("star", "")
           + ttColCell("name", `<span class="tt-name-cell" style="padding-left:20px">${sdot(cell.state)}<span class="tt-name-text" data-tip="${esc(cell.name || cell.id)}">${esc(cell.name || cell.id)}</span>${blockingBadge(cell.blocking)}</span>`)
-          + ttColCell("squad", cell.model ? `<span data-tip="Agent / model for this cell.">${esc(cell.agent)} / ${esc(cell.model)}</span>` : `<span data-tip="Agent for this cell.">${esc(cell.agent)}</span>`)
+          + ttColCell("squad", cell.model ? `<span data-tip="Agent / model for this cell.">${esc(cell.agent ?? "—")} / ${esc(cell.model)}</span>` : `<span data-tip="Agent for this cell.">${esc(cell.agent ?? "—")}</span>`)
           + ttColCell("cells", proofPips)
           + ttColCell("review", `<span data-tip="Review branch(es) this cell submitted under.">${branch}</span>`)
           + ttColCell("time", ttTimeCellHtml(cell.started_at_ms ?? null, cell.duration_ms ?? 0, cell.active_duration_intervals ?? 0, cell.state))
@@ -1314,7 +1314,7 @@
         }).join("");
         if (cell) {
           html += `<h4 style="margin:14px 0 6px">${esc(cell.name || cell.id)}</h4>`;
-          html += `<div class="kv-row"><span class="k">agent</span><span class="v">${esc(cell.agent)}${cell.model ? " / " + esc(cell.model) : ""}</span></div>`;
+          html += `<div class="kv-row"><span class="k">agent</span><span class="v">${esc(cell.agent ?? "—")}${cell.model ? " / " + esc(cell.model) : ""}</span></div>`;
           html += timingRows(cell.started_at_ms ?? null, cell.finished_at_ms ?? null, cell.duration_ms ?? 0, cell.active_duration_intervals ?? 0);
           const cu = ttCellUsage(cell);
           html += `<div class="kv-row"><span class="k">tokens</span><span class="v">${ttFmtTokens(cu)}</span></div>`;

@@ -662,10 +662,16 @@ fn check_projects(daemon_url: &str) -> ProjectsSummary {
                 return Vec::new();
             };
             let vcs = p["vcs"].as_str().unwrap_or("git");
-            let mut results = vec![
-                check_project_path(name, path, vcs)
-                    .with_id(ralphus_core::health_catalog::ID_PROJECT_PATH),
-            ];
+            // A remote-only project has no clone on this host to check; its
+            // machines clone the URL.
+            let mut results = if p["remote_only"] == true {
+                Vec::new()
+            } else {
+                vec![
+                    check_project_path(name, path, vcs)
+                        .with_id(ralphus_core::health_catalog::ID_PROJECT_PATH),
+                ]
+            };
             if vcs == "git" {
                 results.extend(
                     check_project_clone_url(name, p["clone_url"].as_str(), has_remote_providers)

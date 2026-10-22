@@ -494,8 +494,10 @@ pub struct CellView {
     pub name: Option<String>,
     /// Working directory.
     pub cwd: Option<String>,
-    /// Resolved agent program.
-    pub agent: String,
+    /// Resolved agent program. Omitted for a command cell, which runs no
+    /// agent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
     /// RAL-516: whether `agent` can emit thinking output the Live View's
     /// "Show Thinking" control has anything to fold -- see
     /// `agent_profiles::thinking_capable_for_agent` for how this is derived.
@@ -873,7 +875,7 @@ pub struct WindowMeta {
 
 /// What a squad's background setup (`server::run_submit_followup`) needs to
 /// run again after a restart (STRESS-008), stored with the squad while it
-/// is `materializing`.
+/// is `materializing` and kept when that setup fails, for a retry.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SquadSubmission {
     /// The task file exactly as submitted.
@@ -1030,8 +1032,14 @@ pub struct ProjectView {
     pub name: String,
     /// Human-readable description (also searched by fuzzy lookup).
     pub description: String,
-    /// Absolute filesystem path to the project's root.
+    /// Absolute filesystem path to the project's root -- for a remote-only
+    /// project, a reserved key that names no directory
+    /// ([`crate::remote_projects`]).
     pub path: String,
+    /// Registered with a clone URL alone: there is no clone on the daemon's
+    /// host, so all of its work runs on remote machines.
+    #[serde(default)]
+    pub remote_only: bool,
     /// Canonical clone URL used when a provider provisions this project on a
     /// different machine. Kept separate from `path`, which names this
     /// daemon host's existing checkout.
@@ -1041,6 +1049,21 @@ pub struct ProjectView {
     pub vcs: String,
     /// Registration time (Unix epoch milliseconds).
     pub created_at_ms: i64,
+}
+
+/// A [`ProjectView`] from a `SELECT name, description, path, clone_url, vcs,
+/// created_at_ms FROM projects` row.
+fn project_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<ProjectView> {
+    let path: String = r.get(2)?;
+    Ok(ProjectView {
+        name: r.get(0)?,
+        description: r.get(1)?,
+        remote_only: crate::remote_projects::is_remote_only_root(std::path::Path::new(&path)),
+        path,
+        clone_url: r.get(3)?,
+        vcs: r.get(4)?,
+        created_at_ms: r.get(5)?,
+    })
 }
 
 /// RAL-408: a project's DEFAULT review settings, editable any time from the
@@ -2652,6 +2675,29 @@ impl Store {
             -- no such idempotent re-derivation -- without this row, the only
             -- record that remote work is in flight lived in a Rust
             -- `Instant`/loop on a thread that a restart just killed.
+            -- Machines granted by provider services (contract v2,
+            -- `crate::allocations`). A bound machine value `<request>#<id>`
+            -- names a row. No token is stored: the daemon renews one after a
+            -- restart. `squad_id` or `guardian_id` is the scope it was granted
+            -- for; `state` is `active`, `released` or `lost`.
+            CREATE TABLE IF NOT EXISTS machine_allocations (
+                id             INTEGER PRIMARY KEY AUTOINCREMENT,
+                provider       TEXT NOT NULL,
+                allocation_id  TEXT NOT NULL,
+                endpoint       TEXT NOT NULL,
+                request        TEXT NOT NULL,
+                squad_id       TEXT,
+                guardian_id    TEXT,
+                os             TEXT,
+                arch           TEXT,
+                labels         TEXT NOT NULL DEFAULT '[]',
+                description    TEXT,
+                idle           INTEGER NOT NULL DEFAULT 0,
+                state          TEXT NOT NULL DEFAULT 'active',
+                state_detail   TEXT,
+                created_at_ms  INTEGER NOT NULL,
+                released_at_ms INTEGER
+            );
             CREATE TABLE IF NOT EXISTS remote_exec_handles (
                 squad_id        TEXT NOT NULL,
                 cell_id    TEXT NOT NULL,
@@ -5584,8 +5630,13 @@ impl Store {
         let entering_running = i64::from(state == SquadState::Running);
         let entering_terminal = i64::from(state.is_terminal());
         // The stored submission (STRESS-008) is needed only while the squad
-        // is still being set up.
-        let staying_materializing = i64::from(state == SquadState::Materializing);
+        // is still being set up, or after its setup failed: a retry or
+        // restart runs that setup again from it. Setup that finished already
+        // cleared it, so a later failure has none to keep.
+        let staying_materializing = i64::from(matches!(
+            state,
+            SquadState::Materializing | SquadState::Failed
+        ));
         let n = self.conn.execute(
             "UPDATE squads SET state=?, updated_at_ms=?,
                  started_at_ms = CASE WHEN ?=1 THEN COALESCE(started_at_ms, ?) ELSE started_at_ms END,
@@ -7095,9 +7146,15 @@ impl Store {
                     .get(&(task_idx, idx))
                     .cloned()
                     .unwrap_or_default();
-                let agent: String = r.get(5)?;
-                let thinking_capable =
-                    crate::agent_profiles::thinking_capable_for_agent(&agent, db_profiles);
+                // The stored `agent` is the resolved one even for a command
+                // cell, whose proof steps inherit it; the cell itself runs
+                // no agent, so its view names none.
+                let runs_agent = r.get::<_, Option<String>>(12)?.is_some()
+                    || r.get::<_, Option<String>>(13)?.is_none();
+                let agent: Option<String> = runs_agent.then(|| r.get(5)).transpose()?;
+                let thinking_capable = agent.as_deref().is_some_and(|a| {
+                    crate::agent_profiles::thinking_capable_for_agent(a, db_profiles)
+                });
                 Ok((
                     task_idx,
                     idx,
@@ -8019,16 +8076,7 @@ impl Store {
             .query_row(
                 "SELECT name, description, path, clone_url, vcs, created_at_ms FROM projects WHERE name=?",
                 params![name],
-                |r| {
-                    Ok(ProjectView {
-                        name: r.get(0)?,
-                        description: r.get(1)?,
-                        path: r.get(2)?,
-                        clone_url: r.get(3)?,
-                        vcs: r.get(4)?,
-                        created_at_ms: r.get(5)?,
-                    })
-                },
+                project_from_row,
             )
             .optional()
             .map_err(Into::into)
@@ -8089,16 +8137,7 @@ impl Store {
             "SELECT name, description, path, clone_url, vcs, created_at_ms FROM projects ORDER BY created_at_ms DESC, name",
         )?;
         let rows = stmt
-            .query_map([], |r| {
-                Ok(ProjectView {
-                    name: r.get(0)?,
-                    description: r.get(1)?,
-                    path: r.get(2)?,
-                    clone_url: r.get(3)?,
-                    vcs: r.get(4)?,
-                    created_at_ms: r.get(5)?,
-                })
-            })?
+            .query_map([], project_from_row)?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(rows)
     }
@@ -11158,6 +11197,27 @@ impl Store {
             ))
         })?;
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    /// The stored submission of squad `id` whose setup never finished: one
+    /// that failed during setup, or (once a retry has reset it) is about to
+    /// run it again. `None` once setup completed.
+    pub fn unfinished_submission(&self, id: &str) -> Result<Option<SquadSubmission>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT submission_toml, COALESCE(submission_hold, 0), submission_user
+                 FROM squads WHERE id=? AND submission_toml IS NOT NULL",
+                params![id],
+                |r| {
+                    Ok(SquadSubmission {
+                        toml: r.get(0)?,
+                        hold: r.get::<_, i64>(1)? != 0,
+                        acting_user: r.get(2)?,
+                    })
+                },
+            )
+            .optional()?)
     }
 
     /// Whether this squad's declared waypoints were already created by its
@@ -15696,7 +15756,7 @@ prompt = "legacy cell, no review_guardian_id"
         assert!(task.model.is_none());
         assert_eq!(task.cells.len(), 1);
         assert_eq!(task.cells[0].id, "worker");
-        assert_eq!(task.cells[0].agent, "claude");
+        assert_eq!(task.cells[0].agent.as_deref(), Some("claude"));
         assert_eq!(task.cells[0].state, "pending");
         assert!(
             task.cells[0]
@@ -15936,8 +15996,36 @@ prompt = "go"
         let task = &squad.tasks[0];
         assert_eq!(task.agent.as_deref(), Some("codex"));
         assert_eq!(task.model.as_deref(), Some("gpt-5-codex"));
-        assert_eq!(task.cells[0].agent, "codex");
+        assert_eq!(task.cells[0].agent.as_deref(), Some("codex"));
         assert_eq!(task.cells[0].model.as_deref(), Some("gpt-5-codex"));
+    }
+
+    #[test]
+    fn command_cell_view_names_no_agent() {
+        let src = r#"
+[[task]]
+name = "build"
+[[task.cell]]
+id = "compile"
+cwd = "/repo"
+command = "cargo build"
+[[task.cell]]
+id = "worker"
+cwd = "/repo"
+prompt = "go"
+"#;
+        let mut store = Store::open_in_memory().unwrap();
+        let id = store.insert_squad(&parse(src), None, false).unwrap();
+        let squad = store.get_squad(&id).unwrap();
+        let cells = &squad.tasks[0].cells;
+        assert_eq!(cells[0].agent, None);
+        assert!(!cells[0].thinking_capable);
+        let json = serde_json::to_value(&cells[0]).unwrap();
+        assert!(json.get("agent").is_none(), "{json}");
+        assert_eq!(cells[1].agent.as_deref(), Some("claude"));
+        // The stored agent is unchanged: proof steps inherit it.
+        let rows = store.cells_of(&id).unwrap();
+        assert_eq!(rows[0].agent, "claude");
     }
 
     #[test]

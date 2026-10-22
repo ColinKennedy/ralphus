@@ -597,7 +597,7 @@ const REVIEW_CHILDREN: &[HelpNode] = &[
         "delete",
         &["selector [str]"],
         &["--yes"],
-        "Delete a review and its worktrees.",
+        "Delete a review and its worktrees, closing its open PRs/MRs.",
         false,
         false,
         &[],
@@ -1418,6 +1418,15 @@ const TRIAGE_CHILDREN: &[HelpNode] = &[
 
 const MACHINE_CHILDREN: &[HelpNode] = &[
     node(
+        "allocations",
+        &[],
+        &["--all"],
+        "List the machines provider services granted (provider, allocation, os/arch, the squad or review it serves, idle). Active ones only unless --all. Read-only: ralphus never adds or removes machines.",
+        false,
+        true, // ("machine", "allocations")
+        &[],
+    ),
+    node(
         "check",
         &["machine [str]"],
         &[],
@@ -1940,7 +1949,8 @@ actionable diagnostic.",
             "--url [url]",
         ],
         "Register a git repository as a project the daemon can resolve placeholder cell \
-cwds against.",
+cwds against. --path names a clone on the daemon's host; --url alone registers a remote-only \
+project whose cells and reviews must all run on remote machines.",
         false,
         false,
         &[],

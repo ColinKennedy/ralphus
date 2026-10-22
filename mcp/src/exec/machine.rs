@@ -23,6 +23,7 @@ pub fn execute(cmd: MachineCommand, client: &DaemonClient) -> ExecResult {
             channel,
         )?),
         MachineCommand::List => Ok(client.list_machines()?),
+        MachineCommand::Allocations { all } => Ok(client.list_machine_allocations(all)?),
         MachineCommand::Get { scheme } => Ok(client.get_machine(&scheme)?),
         MachineCommand::Check { scheme } => Ok(client.check_machine(&scheme)?),
         MachineCommand::Remove { scheme } => Ok(client.deregister_machine(&scheme)?),

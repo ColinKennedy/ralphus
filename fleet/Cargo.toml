@@ -1,0 +1,26 @@
+[package]
+name = "ralphus-fleet"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "The built-in machine provider service (provider contract v2): hands ralphus machines as allocations and serves their Machine API."
+
+[[bin]]
+name = "ralphus-fleet"
+path = "src/main.rs"
+
+[lib]
+name = "ralphus_fleet"
+path = "src/lib.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
+tiny_http = { workspace = true }
+base64 = { workspace = true }
+getrandom = { workspace = true }

@@ -952,7 +952,7 @@
        */
       async function ntRunGenerationStep(kind) {
         const project = projects.find((p) => p.name === ntSimple.project);
-        const cwd = project ? project.path : ".";
+        const cwd = project && !project.remote_only ? project.path : ".";
         /** @type {string|null} */
         let id = null;
         try {
@@ -1274,7 +1274,7 @@
        */
       function ntRequestSuggestedName(squadId, fallbackName) {
         const project = projects.find((p) => p.name === ntSimple.project);
-        const cwd = project ? project.path : ".";
+        const cwd = project && !project.remote_only ? project.path : ".";
         fetch(`/api/squads/${encodeURIComponent(squadId)}/tasks/0/suggest-name`, {
           method: "POST",
           body: JSON.stringify({
@@ -1298,7 +1298,7 @@
        */
       function ntRequestSuggestedName(squadId, fallbackName) {
         const project = projects.find((p) => p.name === ntSimple.project);
-        const cwd = project ? project.path : ".";
+        const cwd = project && !project.remote_only ? project.path : ".";
         fetch(`/api/squads/${encodeURIComponent(squadId)}/tasks/0/suggest-name`, {
           method: "POST",
           body: JSON.stringify({

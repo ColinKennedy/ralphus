@@ -31,6 +31,10 @@ provider's business.
 > turns any remaining daemon-host fallback into a visible failure while
 > developing ralphus.
 
+> **Provider services:** a provider can also be a long-running service that
+> hands ralphus *allocations* rather than a program run per call -- see
+> [`machine-provider-service.md`](machine-provider-service.md) (contract v2).
+
 > **Platform support:** Linux and Windows daemon hosts are fully supported.
 > macOS as a daemon host is **experimental** (RAL-398) — see "Platform
 > support" in `docs/dependencies.md`.
@@ -84,6 +88,29 @@ placeholder (`ralphus:new-worktree/<branch>`) and the entity URI
 (`ralphus:/SQUAD[...]`), so registering it as a third thing is rejected.
 
 Attempting to register a provider under either name is rejected.
+
+## Projects with no clone on the daemon's host
+
+A project whose work runs entirely on remote machines does not need a clone on
+the daemon's host. Register it with its clone URL alone:
+
+```bash
+ralphus project git --name widgets --url https://github.com/acme/widgets.git
+```
+
+It is shown as **remote only** (`"remote_only": true` in `GET /api/projects`).
+Its machines clone the URL; the daemon keeps only a reserved key
+(`<state dir>/remote-only-projects/<name>`, never created) where a clone's path
+would go, and reads no `.ralphus.toml` for it from its own disk (global config
+applies). Because nothing can run on the daemon's host:
+
+- every cell of a task on it must have a remote `machine` (directly or
+  inherited), and
+- every `[[review]]` those cells feed must declare a remote `machine`,
+
+or the submission is refused with which task, cell or review needs one.
+`ralphus check health` and `GET /api/projects/{name}/validate` do not look for
+a local path for it.
 
 ## Machine strict mode (development only)
 
@@ -798,12 +825,12 @@ provider process after restart.
 The daemon sends resolved cell/proof and agent-profile environment values in
 an explicit `execution_environment` object on provider stdin. It does not add
 them to the local provider process environment. The SSH provider removes that
-object from the stored runner spec, writes a separate mode-`0600`-equivalent
-shell environment file over SSH stdin, sources it while preserving the remote
-account's ordinary environment, and deletes it before starting the runner.
-Cancellation, abandoned startup, and lost-job reconciliation also remove that
-transient file; a daemon crash can therefore leave it only temporarily in the
-protected job directory until one of those recovery paths runs.
+object from the stored runner spec and sends it, as shell assignments, on the
+stdin of the SSH session that starts the job: that session exports them and the
+detached runner inherits them alongside the remote account's ordinary
+environment. They are never written to the machine's disk. (Cancellation,
+abandoned startup and lost-job reconciliation still delete an `environment`
+file in a job directory, which older providers left there.)
 
 Resolved secret values never enter provider/SSH arguments or remote shell
 command text. Stream chunks, provider errors/results, and every string nested

@@ -810,6 +810,7 @@ use; see `READ_ONLY_NOTE`.
     - (read-only-safe) license  {Print the embedded LICENSE text decoded from the binary's obfuscated copy.}
     - (read-only-safe) listen selector [uri] --timeout [seconds] --until [status]  {Block until a squad/task/cell/proof/review/review-worktree reaches a status.}
     - machine  {Register and inspect machine providers remote work runs on.}
+        - (read-only-safe) allocations --all  {List the machines provider services granted (provider, allocation, os/arch, the squad or review it serves, idle). Active ones only unless --all. Read-only: ralphus never adds or removes machines.}
         - (read-only-safe) check machine [str]  {Ping a registered machine provider (by scheme, or a full scheme:uri) and report whether it answers. Side-effect free: the provider's `ping` verb does no work.}
         - cleanup machine [str] --branch [name] --project [name]  {Tear down one project's provisioned workspace on a machine provider -- the whole project directory, or just --branch's worktree (RAL-201, reshaped by RAL-355 Phase 2).}
         - (read-only-safe) get scheme [str]  {Show one registered machine provider by exact scheme.}
@@ -845,7 +846,7 @@ use; see `READ_ONLY_NOTE`.
             - remove project [str] --user [name]  {Remove a fork registration (defaults to the project-wide fallback row when --user is omitted).}
             - set project [str] --owner [owner] --remote-name [name] --url [url] --user [name]  {Update fields on an existing fork registration (defaults to the project-wide fallback row when --user is omitted).}
         - (read-only-safe) get name [str]  {Show one registered project's details by exact name.}
-        - git --clear-url --description [text] --match-pr-branch-name/--no-match-pr-branch-name --name [name] --path [path] --url [url]  {Register a git repository as a project the daemon can resolve placeholder cell cwds against.}
+        - git --clear-url --description [text] --match-pr-branch-name/--no-match-pr-branch-name --name [name] --path [path] --url [url]  {Register a git repository as a project the daemon can resolve placeholder cell cwds against. --path names a clone on the daemon's host; --url alone registers a remote-only project whose cells and reviews must all run on remote machines.}
         - (read-only-safe) list --short  {List every project registered with the daemon.}
         - remove name [str]  {Unregister a project by exact name. Existing squads/tasks/reviews that reference it are unaffected; project-scoped settings (forks, Triage thresholds, review-settings defaults) are left in place as orphaned rows.}
         - review-settings  {Manage a project's database-backed DEFAULT review settings (RAL-408) -- resolver agent/model, machine, budget, proof scope, and the project-level equivalents of every `ralphus review settings` opt-out flag.}
@@ -885,7 +886,7 @@ use; see `READ_ONLY_NOTE`.
             - (read-only-safe) run selector [uri] --all --index [integer...] --input [name=value...]  {Print the command(s) + cwd to run one/some/all manual checks yourself.}
             - terminal selector [uri] --mode [open|readonly]  {Print the command to resume the manual-checks-generation agent conversation locally.}
         - create name [str] base_branch [str] git_root [str] --checks [list] --review-type [label] --skip-worktrees  {Create a new review.}
-        - delete selector [uri] --yes  {Delete a review and its worktrees.}
+        - delete selector [uri] --yes  {Delete a review and its worktrees, closing its open PRs/MRs.}
         - dismiss-reenable selector [uri]  {Dismiss the 're-enable' notification for a branch.}
         - (read-only-safe) env selector [uri] --scope [build|tests|manual-checks|worktree]  {List a review surface's resolved environment variables, read-only (RAL-324): the auto-build step, the check gates, manual checks, or one branch's review worktree.}
         - extract-branch selector [uri]  {Move a branch into a new review of its own, then rebuild both.}

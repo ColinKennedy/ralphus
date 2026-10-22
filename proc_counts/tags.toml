@@ -155,3 +155,9 @@ tag = "exhibit-upload-runner"
 [[test]]
 id = "ralphus-daemon pr::tests::exhibit_recipes_match_only_the_branchs_own_changed_files"
 tag = "exhibit-recipes"
+
+# The built-in provider service serving a Machine API call by running the SSH
+# provider once per verb (ralphus-fleet, provider contract v2).
+[[test]]
+id = "ralphus-daemon allocations::tests::the_built_in_fleet_grants_a_machine_and_serves_its_machine_api"
+tag = "fleet-machine-api"

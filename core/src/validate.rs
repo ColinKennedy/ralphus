@@ -138,12 +138,14 @@ fn runs_locally(value: &toml::Value) -> bool {
     match value {
         toml::Value::Table(t) => t.iter().all(|(k, v)| {
             if k == "machine" {
-                v.as_str().is_none_or(|m| {
-                    matches!(
-                        crate::schema::parse_machine(m),
-                        Ok(crate::schema::MachineRef::Local)
-                    )
-                })
+                // A request table always asks a provider service for a machine.
+                !v.is_table()
+                    && v.as_str().is_none_or(|m| {
+                        matches!(
+                            crate::schema::parse_machine(m),
+                            Ok(crate::schema::MachineRef::Local)
+                        )
+                    })
             } else {
                 runs_locally(v)
             }
@@ -2083,17 +2085,33 @@ fn check_machine(ctx: &mut Ctx, table: &toml::Table, path: &str, header: Option<
     let Some(v) = table.get("machine") else {
         return;
     };
-    check_type(ctx, table, "machine", Ty::Str, path, header);
-    let Some(raw) = v.as_str() else { return };
+    let line = ctx.key_line(header, "machine");
+    let mpath = format!("{path}.machine");
+    if let Some(request) = v.as_table() {
+        check_machine_request(ctx, request, &mpath, line);
+        return;
+    }
+    let Some(raw) = v.as_str() else {
+        ctx.error(
+            &mpath,
+            ErrorKind::WrongType,
+            "machine must be a string (\"local\", a provider name, or \"<provider>:<uri>\") or a \
+             table (machine = { provider = \"...\", os = \"...\" })"
+                .to_string(),
+            line,
+        );
+        return;
+    };
     let Err(e) = crate::schema::parse_machine(raw) else {
         return;
     };
     use crate::schema::MachineParseError as E;
     let detail = match e {
         E::Empty => "must not be empty".to_string(),
-        E::MissingScheme => {
-            "must be \"local\" or \"<provider>:<uri>\" (e.g. \"incredibuild:A\")".to_string()
-        }
+        E::MissingScheme => "must be \"local\", a provider name (e.g. \"fleet\"), or \
+             \"<provider>:<uri>\" (e.g. \"incredibuild:A\")"
+            .to_string(),
+        E::InvalidRequest => "is not a valid machine request".to_string(),
         E::EmptyScheme => "provider name (before the ':') must not be empty".to_string(),
         E::EmptyUri => "value after the ':' must not be empty".to_string(),
         E::SchemeTooShort => format!(
@@ -2104,13 +2122,123 @@ fn check_machine(ctx: &mut Ctx, table: &toml::Table, path: &str, header: Option<
             format!("provider name may only contain letters, digits, '_' and '-' (found {c:?})")
         }
     };
-    let line = ctx.key_line(header, "machine");
     ctx.error(
-        &format!("{path}.machine"),
+        &mpath,
         ErrorKind::InvalidValue,
         format!("invalid machine {raw:?}: {detail}"),
         line,
     );
+}
+
+/// Validate a `machine = { provider = ..., os = ..., arch = ..., labels = [...] }`
+/// request table (provider contract v2). Offline checks only: provider names
+/// are well formed, a list is non-empty without duplicates, the
+/// [`AUTO_PROVIDER`](crate::schema::AUTO_PROVIDER) placeholder stands alone,
+/// `os`/`arch` come from their closed sets, labels are well formed, and no
+/// other key is present. Whether each named provider is configured is the
+/// daemon's check at submit.
+fn check_machine_request(ctx: &mut Ctx, request: &toml::Table, path: &str, line: Option<u32>) {
+    use crate::schema::{AUTO_PROVIDER, MACHINE_ARCH, MACHINE_OS};
+    for key in request.keys() {
+        if !matches!(key.as_str(), "provider" | "os" | "arch" | "labels") {
+            ctx.error(
+                &format!("{path}.{key}"),
+                ErrorKind::UnknownKey,
+                format!(
+                    "unknown key {key:?} in a machine request (expected provider, os, arch, labels)"
+                ),
+                line,
+            );
+        }
+    }
+    let bad_name = |name: &str| !crate::schema::is_valid_provider_name(name);
+    match request.get("provider") {
+        None => ctx.error(
+            &format!("{path}.provider"),
+            ErrorKind::MissingRequired,
+            format!(
+                "a machine request needs `provider`: a name, a list of names, or {AUTO_PROVIDER:?}"
+            ),
+            line,
+        ),
+        Some(toml::Value::String(p)) if p.trim() == AUTO_PROVIDER => {}
+        Some(toml::Value::String(p)) if bad_name(p.trim()) => ctx.error(
+            &format!("{path}.provider"),
+            ErrorKind::InvalidValue,
+            format!(
+                "invalid provider {p:?}: use letters, digits, '_' and '-', at least {} characters",
+                crate::schema::MIN_MACHINE_SCHEME_LEN
+            ),
+            line,
+        ),
+        Some(toml::Value::String(_)) => {}
+        Some(toml::Value::Array(list)) => {
+            let names: Vec<&str> = list.iter().filter_map(toml::Value::as_str).collect();
+            let problem = if list.is_empty() {
+                Some("the provider list must not be empty".to_string())
+            } else if names.len() != list.len() {
+                Some("every provider in the list must be a string".to_string())
+            } else if let Some(p) = names.iter().find(|p| p.trim() == AUTO_PROVIDER) {
+                Some(format!(
+                    "{p:?} cannot appear inside a list; use it on its own to try every provider"
+                ))
+            } else if let Some(p) = names.iter().find(|p| bad_name(p.trim())) {
+                Some(format!(
+                    "invalid provider {p:?}: use letters, digits, '_' and '-', at least {} characters",
+                    crate::schema::MIN_MACHINE_SCHEME_LEN
+                ))
+            } else {
+                let mut seen = std::collections::HashSet::new();
+                names
+                    .iter()
+                    .find(|p| !seen.insert(p.trim()))
+                    .map(|p| format!("provider {p:?} is listed more than once"))
+            };
+            if let Some(message) = problem {
+                ctx.error(
+                    &format!("{path}.provider"),
+                    ErrorKind::InvalidValue,
+                    message,
+                    line,
+                );
+            }
+        }
+        Some(_) => ctx.error(
+            &format!("{path}.provider"),
+            ErrorKind::WrongType,
+            "provider must be a string or a list of strings".to_string(),
+            line,
+        ),
+    }
+    for (key, allowed) in [("os", MACHINE_OS), ("arch", MACHINE_ARCH)] {
+        match request.get(key) {
+            None => {}
+            Some(toml::Value::String(v)) if allowed.contains(&v.as_str()) => {}
+            Some(v) => ctx.error(
+                &format!("{path}.{key}"),
+                ErrorKind::InvalidValue,
+                format!("{key} must be one of {} (got {v})", allowed.join(", ")),
+                line,
+            ),
+        }
+    }
+    if let Some(labels) = request.get("labels") {
+        let ok = labels.as_array().is_some_and(|a| {
+            a.iter().all(|l| {
+                l.as_str()
+                    .is_some_and(crate::schema::is_valid_machine_label)
+            })
+        });
+        if !ok {
+            ctx.error(
+                &format!("{path}.labels"),
+                ErrorKind::InvalidValue,
+                "labels must be a list of non-empty strings of letters, digits, '_', '.' and '-'"
+                    .to_string(),
+                line,
+            );
+        }
+    }
 }
 
 /// Enforce the appended-system-prompt rules (RAL-5). `system_prompt` and
@@ -6626,8 +6754,22 @@ project = "ralphus"
     }
 
     #[test]
-    fn machine_without_a_scheme_is_rejected() {
-        let src = "[[task]]\nname=\"t\"\nmachine=\"incredibuild\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\n";
+    fn a_bare_machine_name_asks_that_provider_service() {
+        // Provider contract v2: `machine = "fleet"` asks provider "fleet" for
+        // any machine; whether it is configured is the daemon's check.
+        let src =
+            "[[task]]\nname=\"t\"\nmachine=\"fleet\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\n";
+        assert!(
+            validate_toml(src).is_ok(),
+            "{:?}",
+            validate_toml(src).errors
+        );
+    }
+
+    #[test]
+    fn a_bare_machine_name_that_is_not_a_provider_name_is_rejected() {
+        let src =
+            "[[task]]\nname=\"t\"\nmachine=\"my box\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\n";
         let r = validate_toml(src);
         let e = r
             .errors
@@ -6635,8 +6777,91 @@ project = "ralphus"
             .find(|e| e.path == "task[0].machine")
             .expect("machine error");
         assert_eq!(e.kind, ErrorKind::InvalidValue);
-        assert!(e.message.contains("incredibuild:A"), "{}", e.message);
+        assert!(e.message.contains("provider name"), "{}", e.message);
         assert_eq!(e.line, Some(3), "must point at the machine line");
+    }
+
+    #[test]
+    fn machine_request_tables_are_valid_in_every_documented_form() {
+        for machine in [
+            "{ provider = \"fleet\" }",
+            "{ provider = \"fleet\", os = \"windows\" }",
+            "{ provider = \"fleet\", os = \"linux\", arch = \"x86_64\", labels = [\"gpu\", \"big-disk\"] }",
+            "{ provider = [\"fleet\", \"local\"], os = \"linux\" }",
+            "{ provider = \"<<ralphus:auto-provider>>\", arch = \"aarch64\" }",
+        ] {
+            let src = format!(
+                "[[task]]\nname=\"t\"\nmachine={machine}\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\n"
+            );
+            assert!(
+                validate_toml(&src).is_ok(),
+                "{machine}: {:?}",
+                validate_toml(&src).errors
+            );
+        }
+    }
+
+    #[test]
+    fn machine_request_tables_reject_each_invalid_field() {
+        for (machine, path, needle) in [
+            (
+                "{ os = \"linux\" }",
+                "task[0].machine.provider",
+                "needs `provider`",
+            ),
+            (
+                "{ provider = \"fleet\", os = \"beos\" }",
+                "task[0].machine.os",
+                "windows, linux, macos",
+            ),
+            (
+                "{ provider = \"fleet\", arch = \"sparc\" }",
+                "task[0].machine.arch",
+                "x86_64, aarch64",
+            ),
+            (
+                "{ provider = \"fleet\", color = \"red\" }",
+                "task[0].machine.color",
+                "unknown key",
+            ),
+            (
+                "{ provider = [] }",
+                "task[0].machine.provider",
+                "must not be empty",
+            ),
+            (
+                "{ provider = [\"fleet\", \"fleet\"] }",
+                "task[0].machine.provider",
+                "more than once",
+            ),
+            (
+                "{ provider = [\"fleet\", \"<<ralphus:auto-provider>>\"] }",
+                "task[0].machine.provider",
+                "cannot appear inside a list",
+            ),
+            (
+                "{ provider = \"x\" }",
+                "task[0].machine.provider",
+                "at least",
+            ),
+            (
+                "{ provider = \"fleet\", labels = [\"\"] }",
+                "task[0].machine.labels",
+                "labels",
+            ),
+        ] {
+            let src = format!(
+                "[[task]]\nname=\"t\"\nmachine={machine}\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\n"
+            );
+            let r = validate_toml(&src);
+            let e = r
+                .errors
+                .iter()
+                .find(|e| e.path == path)
+                .unwrap_or_else(|| panic!("{machine}: no error at {path}: {:?}", r.errors));
+            assert!(e.message.contains(needle), "{machine}: {}", e.message);
+            assert_eq!(e.line, Some(3), "{machine}: must point at the machine line");
+        }
     }
 
     #[test]

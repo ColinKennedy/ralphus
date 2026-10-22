@@ -49,6 +49,10 @@ struct ProvisionRequest {
     remote_root: Option<String>,
     #[serde(default)]
     runner: Option<crate::runner_install::RunnerPolicy>,
+    /// Exported for the script's git commands (a forge credential for an
+    /// HTTPS clone URL); sent on ssh's stdin, never written to the machine.
+    #[serde(default)]
+    env: std::collections::BTreeMap<String, String>,
 }
 
 /// Run `provision`: parse the request on stdin, ensure the deterministic
@@ -123,17 +127,30 @@ pub fn run(uri: &str, request_json: &str, config: &EffectiveConfig) -> Result<St
         upstream: &upstream,
     });
 
+    let script = with_exports(&req.env, &script)?;
+    // The script (with any credential in it) goes on ssh's stdin, not its
+    // command line, so it never appears in a process listing on either end.
     let ssh_args = ssh::command_args(
         &target.target_string(),
         config.connect_timeout_secs,
-        &script,
+        "sh -s",
         config.ssh_config_file.as_deref(),
     );
-    let out = Command::new("ssh")
+    let mut child = Command::new("ssh")
         .args(&ssh_args)
-        .stdin(Stdio::null())
-        .output()
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
         .map_err(|e| format!("could not run ssh to reach {target}: {e}"))?;
+    if let Some(mut pipe) = child.stdin.take() {
+        use std::io::Write as _;
+        pipe.write_all(script.as_bytes())
+            .map_err(|e| format!("could not send the provision script to {target}: {e}"))?;
+    }
+    let out = child
+        .wait_with_output()
+        .map_err(|e| format!("could not wait for ssh to {target}: {e}"))?;
 
     if !out.status.success() {
         let raw_stderr = String::from_utf8_lossy(&out.stderr);
@@ -170,6 +187,30 @@ pub fn run(uri: &str, request_json: &str, config: &EffectiveConfig) -> Result<St
         ));
     }
     Ok(workspace.to_string())
+}
+
+/// `script` as a function the shell reads whole before running it, with `env`
+/// exported inside, called with stdin detached -- so a command in it that
+/// reads stdin cannot swallow the rest of the script `sh -s` is reading.
+fn with_exports(
+    env: &std::collections::BTreeMap<String, String>,
+    script: &str,
+) -> Result<String, String> {
+    let mut exports = String::new();
+    for (key, value) in env {
+        let valid = !key.is_empty()
+            && key.chars().all(|c| c == '_' || c.is_ascii_alphanumeric())
+            && !key.starts_with(|c: char| c.is_ascii_digit());
+        if !valid {
+            return Err(format!(
+                "invalid environment key in provision request: {key:?}"
+            ));
+        }
+        exports.push_str(&format!("export {key}={}\n", shell_quote_single(value)));
+    }
+    Ok(format!(
+        "ralphus_provision() {{\n{exports}{script}\n}}\nralphus_provision </dev/null\n"
+    ))
 }
 
 /// Scrub `url` out of `error_text`, replacing it with its credential-redacted
@@ -281,6 +322,35 @@ echo {worktree_dir_q}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_wrapped_script_run_from_stdin_sees_its_exports_and_runs_to_the_end() {
+        let Ok(probe) = Command::new("sh").args(["-c", "true"]).status() else {
+            return;
+        };
+        if !probe.success() {
+            return;
+        }
+        let env = std::collections::BTreeMap::from([("TOKEN".to_string(), "a b'c".to_string())]);
+        // `cat` would swallow the rest of an unwrapped script.
+        let script = with_exports(&env, "cat\nprintf '%s|' \"$TOKEN\"\necho done").unwrap();
+        let mut child = Command::new("sh")
+            .arg("-s")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        std::io::Write::write_all(&mut child.stdin.take().unwrap(), script.as_bytes()).unwrap();
+        let out = child.wait_with_output().unwrap();
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "a b'c|done");
+        assert!(
+            with_exports(
+                &std::collections::BTreeMap::from([("1BAD".to_string(), String::new())]),
+                ""
+            )
+            .is_err()
+        );
+    }
 
     #[allow(clippy::too_many_arguments)]
     fn args<'a>(

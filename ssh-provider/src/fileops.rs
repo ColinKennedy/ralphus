@@ -178,8 +178,11 @@ pub fn run(
     config: &EffectiveConfig,
 ) -> Result<(String, i64), String> {
     let target = uri::parse(uri).map_err(|e| e.to_string())?;
-    let script = run_script(payload_json, config, RUN_EXIT_MARKER, false)?;
-    let raw = ssh_command(&target, &script, config, None)?;
+    // The script (with any environment values in it) goes on ssh's stdin,
+    // not its command line, so it never appears in a process listing on
+    // either end.
+    let script = run_script(payload_json, config, RUN_EXIT_MARKER, true)?;
+    let raw = ssh_command(&target, "sh -s", config, Some(script.as_bytes()))?;
     split_run_output(&raw)
 }
 
@@ -230,12 +233,6 @@ pub(crate) fn run_script(
             .join(" ");
         format!("{} {quoted_args}", shell_quote_single(&req.program))
     } else {
-        let assignments = req
-            .env
-            .iter()
-            .map(|(key, value)| shell_quote_single(&format!("{key}={value}")))
-            .collect::<Vec<_>>()
-            .join(" ");
         let shell = req.shell.as_deref().unwrap_or("sh");
         let flags = if req.shell.is_some() {
             ralphus_core::shellcmd::shell_command_flags(shell).join(" ")
@@ -243,16 +240,30 @@ pub(crate) fn run_script(
             "-c".to_string()
         };
         format!(
-            "env {assignments} {} {flags} {}",
+            "{} {flags} {}",
             shell_quote_single(shell),
             shell_quote_single(&req.args[0])
         )
     };
+    // Exported by the shell itself, inside a subshell: values never become a
+    // process's arguments (visible to anyone listing processes) and never
+    // outlive this one command in a reused channel shell.
+    let exports: String = req
+        .env
+        .iter()
+        .map(|(key, value)| format!("export {key}={}; ", shell_quote_single(value)))
+        .collect();
     let stdin = if detach_stdin { " </dev/null" } else { "" };
-    Ok(format!(
-        "cd {cwd} && {{ {invocation}; }}{stdin} 2>&1; printf '\\n{marker}%s\\n' \"$?\"",
+    let body = format!(
+        "{exports}cd {cwd} && {{ {invocation}; }}{stdin} 2>&1",
         cwd = shell_quote_single(&req.cwd),
-    ))
+    );
+    let body = if exports.is_empty() {
+        body
+    } else {
+        format!("( {body} )")
+    };
+    Ok(format!("{body}; printf '\\n{marker}%s\\n' \"$?\""))
 }
 
 fn split_run_output(raw: &str) -> Result<(String, i64), String> {
@@ -331,6 +342,55 @@ mod tests {
         let payload = format!(r#"{{"cwd":"{cwd}","program":"","args":["a ; b"]}}"#);
         let script = run_script(&payload, &cfg, "M", false).unwrap();
         assert!(script.contains("'sh' -c 'a ; b'"), "{script}");
+    }
+
+    #[test]
+    fn a_one_shot_script_run_by_sh_from_stdin_sees_its_environment() {
+        // `run` sends the script to the machine as `sh -s` on stdin; do the
+        // same with a local sh.
+        let Ok(probe) = std::process::Command::new("sh")
+            .args(["-c", "true"])
+            .status()
+        else {
+            return;
+        };
+        if !probe.success() {
+            return;
+        }
+        let cfg = EffectiveConfig {
+            remote_base: "/".to_string(),
+            ..config()
+        };
+        let payload = r#"{"cwd":"/","program":"","args":["printf '%s' \"$TOKEN\"; cat"],"env":{"TOKEN":"a b'c"}}"#;
+        let script = run_script(payload, &cfg, RUN_EXIT_MARKER, true).unwrap();
+        let mut child = std::process::Command::new("sh")
+            .arg("-s")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        std::io::Write::write_all(&mut child.stdin.take().unwrap(), script.as_bytes()).unwrap();
+        let out = child.wait_with_output().unwrap();
+        let (stdout, code) = split_run_output(&String::from_utf8_lossy(&out.stdout)).unwrap();
+        assert_eq!(code, 0);
+        // `cat` read /dev/null, not the rest of the script.
+        assert_eq!(stdout, "a b'c");
+    }
+
+    #[test]
+    fn environment_values_are_exported_in_a_subshell_not_passed_as_arguments() {
+        let cfg = EffectiveConfig {
+            remote_base: "/srv/ralphus".to_string(),
+            ..config()
+        };
+        let payload =
+            r#"{"cwd":"/srv/ralphus/w","program":"git","args":["push"],"env":{"TOKEN":"s3'cret"}}"#;
+        let script = run_script(payload, &cfg, "M", true).unwrap();
+        assert!(
+            script.starts_with("( export TOKEN='s3'\\''cret'; cd "),
+            "{script}"
+        );
+        assert!(!script.contains("env TOKEN"), "{script}");
     }
 
     #[test]

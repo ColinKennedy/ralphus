@@ -27,7 +27,8 @@ const SHORT_DESCRIPTION_MAX: usize = 80;
 pub enum ProjectCommand {
     Help,
     Git {
-        path: String,
+        /// The daemon host's clone; `None` registers a remote-only project.
+        path: Option<String>,
         clone_url: Option<String>,
         /// RAL-355: explicitly clear a previously registered clone URL.
         /// Mutually exclusive with `clone_url` -- `parse_git` rejects both
@@ -302,6 +303,20 @@ fn parse_fork_check(scanner: &mut Scanner) -> Result<ProjectForkCommand, UsageEr
     Ok(ProjectForkCommand::Check { project, url, user })
 }
 
+/// The `path` sent to `POST /api/projects`: the given directory with a
+/// leading `~` expanded and canonicalised (no other relative-path expansion,
+/// matching `cmd_initialize_git` in misc.rs), or empty for a remote-only
+/// project registered with `--url` alone.
+#[must_use]
+pub fn project_path_arg(path: Option<&str>) -> String {
+    let Some(path) = path else {
+        return String::new();
+    };
+    let target = ralphus_core::expand_home(path);
+    let target = ralphus_core::strip_verbatim_prefix(target.canonicalize().unwrap_or(target));
+    target.to_string_lossy().to_string()
+}
+
 fn parse_git(scanner: &mut Scanner) -> Result<ProjectCommand, UsageError> {
     let path = scanner.take_value("--path")?;
     let name = scanner.take_value("--name")?;
@@ -310,9 +325,13 @@ fn parse_git(scanner: &mut Scanner) -> Result<ProjectCommand, UsageError> {
     let description = scanner.take_value("--description")?.unwrap_or_default();
     let match_pr_branch_name =
         crate::commands::review::take_tri_bool(scanner, "--match-pr-branch-name");
-    let Some(path) = path else {
-        return Err(UsageError("project git requires --path".to_string()));
-    };
+    if path.is_none() && (clone_url.is_none() || clear_url) {
+        return Err(UsageError(
+            "project git requires --path (a clone on the daemon's host) or --url (a remote-only \
+             project whose work all runs on remote machines)"
+                .to_string(),
+        ));
+    }
     let Some(name) = name else {
         return Err(UsageError("project git requires --name".to_string()));
     };
@@ -487,13 +506,7 @@ pub fn dispatch(cmd: ProjectCommand, opts: &GlobalOpts) -> i32 {
             description,
             match_pr_branch_name,
         } => {
-            // A leading `~` is expanded (see `ralphus_core::expand_home`); no
-            // other relative-path expansion is done, matching this crate's
-            // `cmd_initialize_git` in misc.rs.
-            let target = ralphus_core::expand_home(&path);
-            let target =
-                ralphus_core::strip_verbatim_prefix(target.canonicalize().unwrap_or(target));
-            let target_str = target.to_string_lossy().to_string();
+            let target_str = project_path_arg(path.as_deref());
             match client.register_project(
                 &name,
                 &target_str,
@@ -504,7 +517,13 @@ pub fn dispatch(cmd: ProjectCommand, opts: &GlobalOpts) -> i32 {
                 match_pr_branch_name,
             ) {
                 Ok(payload) => {
-                    println!("registered project \"{name}\" -> {target_str}");
+                    if target_str.is_empty() {
+                        println!(
+                            "registered remote-only project \"{name}\" (no clone on the daemon's host)"
+                        );
+                    } else {
+                        println!("registered project \"{name}\" -> {target_str}");
+                    }
                     for warning in payload["warnings"].as_array().into_iter().flatten() {
                         if let Some(warning) = warning.as_str() {
                             println!("warning: {warning}");
@@ -1055,7 +1074,7 @@ mod tests {
                 clear_url,
                 match_pr_branch_name,
             } => {
-                assert_eq!(path, "/repo");
+                assert_eq!(path.as_deref(), Some("/repo"));
                 assert_eq!(name, "my-project");
                 assert_eq!(description, "desc");
                 assert_eq!(clone_url, None);

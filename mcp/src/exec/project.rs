@@ -18,10 +18,7 @@ pub fn execute(cmd: ProjectCommand, client: &DaemonClient) -> ExecResult {
             description,
             match_pr_branch_name,
         } => {
-            let target = ralphus_core::expand_home(&path);
-            let target =
-                ralphus_core::strip_verbatim_prefix(target.canonicalize().unwrap_or(target));
-            let target_str = target.to_string_lossy().to_string();
+            let target_str = ralphus_cli::commands::project::project_path_arg(path.as_deref());
             Ok(client.register_project(
                 &name,
                 &target_str,

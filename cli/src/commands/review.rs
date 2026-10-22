@@ -259,7 +259,7 @@ pub enum ReviewCommand {
 #[derive(Debug, Clone)]
 pub struct GuardianEnvArgs {
     pub selector: String,
-    pub set: Vec<String>,
+    pub set: crate::args::SecretAssignments,
     pub unset: Vec<String>,
     pub clear: Vec<String>,
 }
@@ -913,7 +913,7 @@ fn parse_guardian_env(mut scanner: Scanner) -> Result<GuardianEnvArgs, UsageErro
         .ok_or_else(|| UsageError("missing required <selector> argument".to_string()))?;
     Ok(GuardianEnvArgs {
         selector,
-        set,
+        set: crate::args::SecretAssignments::new(set),
         unset,
         clear,
     })
@@ -1462,7 +1462,12 @@ pub fn parse_environment_flags(
             Some((k, v)) if !k.trim().is_empty() => {
                 result.insert(k.trim().to_string(), v.to_string());
             }
-            _ => return Err(format!("{flag_name} expects KEY=VALUE, got '{item}'")),
+            _ => {
+                return Err(format!(
+                    "{flag_name} expects KEY=VALUE, got {}",
+                    crate::args::describe_malformed(item)
+                ));
+            }
         }
     }
     Ok(result)
@@ -4192,7 +4197,11 @@ mod tests {
         ])) {
             ReviewCommand::BuildEnv(args) => {
                 assert_eq!(args.selector, "g1");
-                assert_eq!(args.set, vec!["A=1".to_string(), "B=2".to_string()]);
+                assert_eq!(*args.set, ["A=1".to_string(), "B=2".to_string()]);
+                assert_eq!(
+                    format!("{:?}", args.set),
+                    r#"["A=<redacted>", "B=<redacted>"]"#
+                );
                 assert_eq!(args.unset, vec!["C".to_string()]);
                 assert_eq!(args.clear, vec!["D".to_string()]);
             }

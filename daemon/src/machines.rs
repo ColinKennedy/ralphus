@@ -114,6 +114,11 @@ pub struct MachineProviderView {
 /// an explicit error rather than invoked and hoped for.
 pub const PROTOCOL_VERSION: i64 = 1;
 
+/// The provider-service contract version (`docs/machine-provider-service.md`):
+/// what a provider service's allocation API and an allocation's Machine API
+/// both reply with.
+pub const SERVICE_PROTOCOL_VERSION: i64 = 2;
+
 /// How a `machine` value resolved.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ResolvedMachine {
@@ -126,6 +131,12 @@ pub enum ResolvedMachine {
         /// The opaque provider-defined remainder.
         uri: String,
     },
+    /// A request to provider services (contract v2), granted later as an
+    /// allocation. Every provider it names is configured (or `local`).
+    Service(ralphus_core::schema::MachineRequest),
+    /// A request already granted: the `machine_allocations` row it is bound
+    /// to ([`crate::allocations::parse_bound`]).
+    Allocation(i64),
 }
 
 impl ResolvedMachine {
@@ -157,6 +168,20 @@ pub enum ResolveError {
         /// The version this daemon implements.
         expected: i64,
     },
+    /// A machine request names a provider service that is not configured.
+    UnknownProviderService {
+        /// The unconfigured provider.
+        provider: String,
+        /// Every provider that *is* available (`local` plus the configured
+        /// services), for the error message.
+        configured: Vec<String>,
+    },
+    /// `<<ralphus:auto-provider>>` with no provider service configured.
+    NoProviderServices,
+    /// A request only `local` may serve, which the daemon host cannot.
+    LocalCannotServe(String),
+    /// The `[machine.providers.*]` configuration itself is invalid.
+    ProviderConfig(String),
 }
 
 impl std::fmt::Display for ResolveError {
@@ -188,8 +213,71 @@ impl std::fmt::Display for ResolveError {
                 f,
                 "machine provider {scheme:?} declares contract version {found}, but this daemon implements {expected}"
             ),
+            Self::UnknownProviderService {
+                provider,
+                configured,
+            } => write!(
+                f,
+                "machine provider {provider:?} is not configured (available: {}); declare it as \
+                 [machine.providers.{provider}] in the daemon's config.toml",
+                configured.join(", ")
+            ),
+            Self::NoProviderServices => write!(
+                f,
+                "{} asks any configured provider service for a machine, but none is configured; \
+                 declare one as [machine.providers.<name>] in the daemon's config.toml",
+                ralphus_core::schema::AUTO_PROVIDER
+            ),
+            Self::ProviderConfig(e) => write!(f, "invalid provider service configuration: {e}"),
+            Self::LocalCannotServe(reason) => write!(
+                f,
+                "only provider \"local\" may serve this machine request, and {reason}; drop the \
+                 os/arch/labels it cannot meet or add a provider service to the list"
+            ),
         }
     }
+}
+
+/// Check a provider-service request against the configured `services`: every
+/// provider it names must be configured or `local`, and the auto placeholder
+/// needs at least one configured service.
+///
+/// # Errors
+/// [`ResolveError::UnknownProviderService`] or [`ResolveError::NoProviderServices`].
+pub fn resolve_service_request(
+    request: ralphus_core::schema::MachineRequest,
+    services: &[crate::provider_services::ProviderService],
+) -> std::result::Result<ResolvedMachine, ResolveError> {
+    if request.is_auto() {
+        if services.is_empty() {
+            return Err(ResolveError::NoProviderServices);
+        }
+        return Ok(ResolvedMachine::Service(request));
+    }
+    for provider in &request.providers {
+        let known = provider.eq_ignore_ascii_case(LOCAL_SCHEME)
+            || services.iter().any(|s| s.name == *provider);
+        if !known {
+            let mut configured = vec![LOCAL_SCHEME.to_string()];
+            configured.extend(services.iter().map(|s| s.name.clone()));
+            return Err(ResolveError::UnknownProviderService {
+                provider: provider.clone(),
+                configured,
+            });
+        }
+    }
+    // The daemon host is known now, so a request only it may serve and that
+    // it cannot is refused at submit rather than when the squad starts.
+    if request
+        .providers
+        .iter()
+        .all(|p| p.eq_ignore_ascii_case(LOCAL_SCHEME))
+    {
+        if let Some(reason) = crate::allocations::local_refusal(&request) {
+            return Err(ResolveError::LocalCannotServe(reason));
+        }
+    }
+    Ok(ResolvedMachine::Service(request))
 }
 
 impl Store {
@@ -407,11 +495,19 @@ impl Store {
         let Some(raw) = machine.map(str::trim).filter(|m| !m.is_empty()) else {
             return Ok(ResolvedMachine::Local);
         };
+        if let Some((_, row_id)) = crate::allocations::parse_bound(raw) {
+            return Ok(ResolvedMachine::Allocation(row_id));
+        }
         let parsed = ralphus_core::schema::parse_machine(raw)
             .map_err(|_| ResolveError::Malformed(raw.to_string()))?;
         let (scheme, uri) = match parsed {
             ralphus_core::schema::MachineRef::Local => return Ok(ResolvedMachine::Local),
             ralphus_core::schema::MachineRef::Provider { scheme, uri } => (scheme, uri),
+            ralphus_core::schema::MachineRef::Service(request) => {
+                let services = crate::provider_services::load_provider_services()
+                    .map_err(ResolveError::ProviderConfig)?;
+                return resolve_service_request(request, &services);
+            }
         };
         if scheme.eq_ignore_ascii_case(LOCAL_SCHEME) {
             return Ok(ResolvedMachine::Local);
@@ -671,8 +767,72 @@ mod tests {
     fn malformed_machine_errors_before_touching_the_registry() {
         let s = store();
         assert!(matches!(
-            s.resolve_machine(Some("incredibuild")),
+            s.resolve_machine(Some("my box")),
             Err(ResolveError::Malformed(_))
+        ));
+    }
+
+    fn service(name: &str) -> crate::provider_services::ProviderService {
+        crate::provider_services::ProviderService {
+            name: name.to_string(),
+            url: "http://127.0.0.1:7900".to_string(),
+            token_env: "T".to_string(),
+        }
+    }
+
+    fn request(providers: &[&str]) -> ralphus_core::schema::MachineRequest {
+        ralphus_core::schema::MachineRequest {
+            providers: providers.iter().map(|p| (*p).to_string()).collect(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_service_request_must_name_configured_providers_or_local() {
+        let services = [service("fleet")];
+        assert!(matches!(
+            resolve_service_request(request(&["fleet", "local"]), &services),
+            Ok(ResolvedMachine::Service(_))
+        ));
+        let err = resolve_service_request(request(&["fleet", "farm"]), &services)
+            .expect_err("farm is not configured");
+        assert!(
+            matches!(&err, ResolveError::UnknownProviderService { provider, .. } if provider == "farm")
+        );
+        let message = err.to_string();
+        assert!(message.contains("local, fleet"), "{message}");
+        assert!(message.contains("[machine.providers.farm]"), "{message}");
+    }
+
+    #[test]
+    fn a_request_only_local_may_serve_must_fit_the_daemon_host() {
+        let other_os = if std::env::consts::OS == "linux" {
+            "windows"
+        } else {
+            "linux"
+        };
+        let mut wrong_os = request(&["local"]);
+        wrong_os.os = Some(other_os.to_string());
+        let err = resolve_service_request(wrong_os.clone(), &[]).expect_err("host cannot serve");
+        assert!(matches!(err, ResolveError::LocalCannotServe(_)));
+        assert!(err.to_string().contains(other_os), "{err}");
+        // Another provider in the list may still grant it.
+        wrong_os.providers.insert(0, "fleet".to_string());
+        assert!(resolve_service_request(wrong_os, &[service("fleet")]).is_ok());
+        let mut host = request(&["local"]);
+        host.os = Some(std::env::consts::OS.to_string());
+        assert!(resolve_service_request(host, &[]).is_ok());
+    }
+
+    #[test]
+    fn the_auto_provider_needs_at_least_one_configured_service() {
+        assert!(matches!(
+            resolve_service_request(request(&[]), &[]),
+            Err(ResolveError::NoProviderServices)
+        ));
+        assert!(matches!(
+            resolve_service_request(request(&[]), &[service("fleet")]),
+            Ok(ResolvedMachine::Service(_))
         ));
     }
 

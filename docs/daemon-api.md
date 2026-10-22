@@ -1190,6 +1190,20 @@ registry row (so a client doesn't render them as missing).
   "builtin": ["local"] }
 ```
 
+### `GET /api/machine-allocations[?all=true]`
+Machines provider services granted (`docs/machine-provider-service.md`),
+newest first; only `active` ones unless `all=true` (then also `released` and
+`lost`). Admin-only, read-only. No token is ever returned or stored.
+CLI: `ralphus machine allocations [--all]`.
+
+```json
+{ "allocations": [ { "id": 3, "provider": "fleet", "allocation_id": "alloc-7f3a",
+    "endpoint": "http://127.0.0.1:7900/v1/m/alloc-7f3a", "request": "@fleet?os=linux",
+    "squad_id": "squad-…", "guardian_id": null, "os": "linux", "arch": "x86_64",
+    "labels": [], "description": "mybox/wsl", "idle": false, "state": "active",
+    "state_detail": null, "created_at_ms": 0, "released_at_ms": null } ] }
+```
+
 ### `GET /api/machines/{scheme}`
 One registered provider by exact scheme (case-insensitive). `404` if not
 registered — built-in schemes are not returned here, only by the list route.
@@ -2426,15 +2440,19 @@ HTTP status for the whole request:
 
 ### `DELETE /api/guardians/{id}`
 Deletes the guardian row, then defers the worktree/branch/terminal-log
-cleanup (`purge_worktrees`, dual-root upstream branch retirement, durable
-terminal logs) to a background thread instead of running it synchronously
+cleanup (closing the review's still-open PRs/MRs on GitHub or GitLab,
+`purge_worktrees`, dual-root upstream branch retirement, durable terminal
+logs) to a background thread instead of running it synchronously
 before the response returns. The cleanup shells out to git with no timeout
 and delete has no eligibility gate (unlike Cancel/Reopen/Merge), so it can be
 invoked on a review whose worktree is actively held by an in-progress merge
 — running it inline used to block the response for as long as that merge
 held the worktree lease (RAL-549). Returns `200` with `{ "state": "deleted"
 }` as soon as the row itself is gone; the cleanup finishing is not
-observable through this response.
+observable through this response. The PRs' remote branches are kept. A PR/MR
+that cannot be closed (forge error, no client for its repository) gets a
+mailbox message asking the user to close it by hand; the delete itself still
+succeeds.
 
 ### `POST /api/guardians/delete-batch` (RAL-549)
 Batch form of `DELETE /api/guardians/{id}` — the board's multi-select

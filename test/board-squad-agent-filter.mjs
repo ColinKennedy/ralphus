@@ -111,7 +111,7 @@ export function makeSquadAgentFilter({ squads = [], agents = new Set(), defaulte
     // The one collaborator from another region: a task's resolved agents.
     ttTaskAgents: (t) => {
       const cells = t.cells || [];
-      if (cells.length) return [...new Set(cells.map((c) => c.agent))];
+      if (cells.length) return [...new Set(cells.flatMap((c) => (c.agent ? [c.agent] : [])))];
       return t.agent ? [t.agent] : [];
     },
     renderSquads: () => { calls.renderSquads++; api.renderSquadAgentFilter(); },
