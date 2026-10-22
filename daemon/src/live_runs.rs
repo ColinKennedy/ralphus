@@ -1698,12 +1698,16 @@ fn execute_upstream_run(
         run.run_id,
         outcome.end.as_str()
     );
-    scope(
-        "review-upstream run finished",
-        serde_json::json!({
-            "run_id": run.run_id, "upstream_sha": sha, "end": outcome.end.as_str()
-        }),
-    );
+    crate::cartographer::Note::new("guardian")
+        .guardian(gid)
+        .scope("live_action")
+        .emit(
+            &store.lock(),
+            "review-upstream run finished",
+            serde_json::json!({
+                "run_id": run.run_id, "upstream_sha": sha, "end": outcome.end.as_str()
+            }),
+        );
     if outcome.end == LiveRunEnd::Failed {
         notify_upstream_failure(store, gid, &target.label, &reason);
     }
