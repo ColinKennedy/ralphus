@@ -2407,6 +2407,7 @@ fn push_ref(
             // applies to the retry: if the first attempt did land, the retry
             // is refused as stale rather than overwriting anything.
             Err(e) if attempt < PUSH_REF_ATTEMPTS && is_transient_push_transport_error(&e) => {
+                // ralphus[ignore-rlog-pair]: push_ref takes only a Workspace and has no Store; per-attempt retry detail, and a final failure is returned to the caller that records it
                 crate::rlog!(
                     WARNING,
                     "ralphus [pr] push of {alias} hit a transient transport error \
