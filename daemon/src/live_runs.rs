@@ -680,6 +680,25 @@ pub fn generate_and_queue_all(
 
 /// The review's live actions, generating them from its member cells'
 /// handoffs when it has none yet. The set is written once and then fixed.
+/// Give the review's waiting exhibit requests their slots; best-effort.
+fn assign_pending(store: &crate::store_lock::StoreHandle, guardian_id: &str) {
+    let assigned = store.lock().assign_pending_exhibits(guardian_id);
+    if let Err(e) = assigned {
+        crate::rlog!(
+            WARNING,
+            "ralphus [guardian] review {guardian_id} could not assign pending exhibit requests: {e}"
+        );
+        crate::cartographer::Note::new("guardian")
+            .guardian(guardian_id)
+            .scope("exhibit")
+            .emit(
+                &store.lock(),
+                "pending exhibit requests not assigned",
+                serde_json::json!({ "error": e.to_string() }),
+            );
+    }
+}
+
 pub fn ensure_live_actions(
     store: &crate::store_lock::StoreHandle,
     runners: &LiveRunnerFactory,
@@ -691,6 +710,9 @@ pub fn ensure_live_actions(
         .guardian_live_actions(guardian_id)
         .unwrap_or_default();
     if !existing.is_empty() {
+        // Requests the PR writer made after the actions were written wait in
+        // the pending table; every pass gives them their slots.
+        assign_pending(store, guardian_id);
         return existing;
     }
     let (guardian, handoffs, checkout) = {
@@ -704,6 +726,7 @@ pub fn ensure_live_actions(
         (g, handoffs, checkout)
     };
     if handoffs.is_empty() {
+        assign_pending(store, guardian_id);
         crate::cartographer::Note::new("guardian")
             .guardian(guardian_id)
             .scope("live_action")

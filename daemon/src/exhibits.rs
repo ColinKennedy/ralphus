@@ -35,7 +35,7 @@ const DESCRIBE_MAX_CHARS: usize = 300;
 /// Longest text excerpt a `terminal-text` slot shows.
 const TERMINAL_TEXT_MAX_CHARS: usize = ralphus_runner::exhibit_upload::MAX_TEXT_CHARS;
 
-pub use ralphus_core::exhibit_recipes::ExhibitKind;
+pub use ralphus_core::exhibit_recipes::{CompareTarget, ExhibitKind};
 
 /// Where a request came from. Earlier origins win when a PR's slot cap cuts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
@@ -85,6 +85,12 @@ pub struct ExhibitRequest {
     pub describe: String,
     /// Fallbacks after the primary, in order of preference.
     pub alternatives: Vec<ExhibitAlternative>,
+    /// What a before/after comparison is made against, when one is suggested
+    /// (by the cell) or asked for (by the PR writer).
+    pub compare: Option<CompareTarget>,
+    /// The name the PR writer gave this request so it can place markers for
+    /// it in the description before any slot exists.
+    pub marker_key: Option<String>,
 }
 
 /// The separator between a request's alternatives.
@@ -98,6 +104,19 @@ impl ExhibitRequest {
             kind,
             describe: describe.into(),
             alternatives: Vec::new(),
+            compare: None,
+            marker_key: None,
+        }
+    }
+
+    /// Fold a duplicate request into this one so what only it carried (a
+    /// comparison target, the writer's marker key) survives.
+    fn absorb(&mut self, other: &Self) {
+        if self.compare.is_none() {
+            self.compare = other.compare;
+        }
+        if self.marker_key.is_none() {
+            self.marker_key.clone_from(&other.marker_key);
         }
     }
 
@@ -152,9 +171,15 @@ impl ExhibitRequest {
                 kind: primary.kind,
                 describe: primary.describe,
                 alternatives: kept.collect(),
+                compare: self.compare,
+                marker_key: self.marker_key.clone(),
             },
             None => match preference.first() {
-                Some(first) => Self::single(*first, self.describe.clone()),
+                Some(first) => Self {
+                    compare: self.compare,
+                    marker_key: self.marker_key.clone(),
+                    ..Self::single(*first, self.describe.clone())
+                },
                 None => self.clone(),
             },
         }
@@ -164,6 +189,14 @@ impl ExhibitRequest {
         (!self.alternatives.is_empty())
             .then(|| serde_json::to_string(&self.alternatives).ok())
             .flatten()
+    }
+
+    /// Restore the comparison target and marker key from their stored form.
+    /// A target this build does not know is dropped, as an unknown kind is.
+    fn with_stored_marking(mut self, compare: Option<&str>, marker_key: Option<String>) -> Self {
+        self.compare = compare.and_then(CompareTarget::parse);
+        self.marker_key = marker_key;
+        self
     }
 
     fn with_stored_alternatives(mut self, json: Option<&str>) -> Self {
@@ -218,10 +251,39 @@ fn parse_alternative(part: &str) -> Option<ExhibitAlternative> {
     })
 }
 
+/// Peel a trailing `| compare=<target>` field off the text after `EXHIBIT:`.
+/// Only that exact trailing shape is read as a target, so a `|` inside a
+/// description is never misread. Returns the text without the field, the
+/// target when it is a known one, and the field verbatim when its value is not.
+fn peel_compare(rest: &str) -> (&str, Option<CompareTarget>, Option<String>) {
+    let trimmed = rest.trim_end();
+    let Some((head, tail)) = trimmed.rsplit_once('|') else {
+        return (rest, None, None);
+    };
+    let field = tail.trim();
+    let Some((name, value)) = field.split_once('=') else {
+        return (rest, None, None);
+    };
+    if !name.trim().eq_ignore_ascii_case(COMPARE_FIELD) {
+        return (rest, None, None);
+    }
+    let head = head.trim_end_matches('|');
+    match CompareTarget::parse(value) {
+        Some(target) => (head, Some(target), None),
+        None => (head, None, Some(field.to_string())),
+    }
+}
+
+/// The name of the trailing field that suggests a comparison.
+const COMPARE_FIELD: &str = "compare";
+
 /// Separate a live handoff's `EXHIBIT: <kind> | <what to show>` lines from
 /// its test steps. A line may continue with `|| <kind> | <what that kind
 /// shows>` fallbacks, each with its own description; one that is unusable is
 /// dropped (and reported in `rejected`) while the rest of the line is kept.
+/// A trailing `| compare=review-upstream` suggests a before/after comparison;
+/// an unknown target is reported in `rejected` and the request is kept without
+/// one.
 #[must_use]
 pub fn split_handoff(text: &str) -> SplitHandoff {
     let mut out = SplitHandoff::default();
@@ -233,6 +295,10 @@ pub fn split_handoff(text: &str) -> SplitHandoff {
         };
         let mut usable: Vec<ExhibitAlternative> = Vec::new();
         let mut bad: Vec<String> = Vec::new();
+        let (rest, compare, bad_compare) = peel_compare(rest);
+        if let Some(field) = bad_compare {
+            bad.push(format!("{REQUEST_MARKER} ... | {field}"));
+        }
         for part in split_alternatives(rest) {
             match parse_alternative(part) {
                 Some(alt) => {
@@ -248,16 +314,19 @@ pub fn split_handoff(text: &str) -> SplitHandoff {
             kind: primary.kind,
             describe: primary.describe,
             alternatives: usable.collect(),
+            compare,
+            marker_key: None,
         });
         match parsed {
             Some(request) if out.requests.len() < MAX_PER_ACTION => {
                 out.rejected.extend(bad);
-                if !out
+                match out
                     .requests
-                    .iter()
-                    .any(|r| r.dedupe_key() == request.dedupe_key())
+                    .iter_mut()
+                    .find(|r| r.dedupe_key() == request.dedupe_key())
                 {
-                    out.requests.push(request);
+                    Some(existing) => existing.absorb(&request),
+                    None => out.requests.push(request),
                 }
             }
             _ => out.rejected.push(line.trim().to_string()),
@@ -278,8 +347,12 @@ pub fn merge_requests<'a>(
         if out.len() == MAX_PER_ACTION {
             break;
         }
-        if !out.iter().any(|r| r.dedupe_key() == request.dedupe_key()) {
-            out.push(request.clone());
+        match out
+            .iter_mut()
+            .find(|r| r.dedupe_key() == request.dedupe_key())
+        {
+            Some(existing) => existing.absorb(request),
+            None => out.push(request.clone()),
         }
     }
     out
@@ -348,7 +421,7 @@ pub fn guardian_exhibit_slots_conn(
         "SELECT r.action_idx, r.slot_idx, r.kind, r.describe, r.origin, r.why,
                 f.delivered_kind, f.url, f.caption, f.text, f.missing_reason,
                 f.forge_upload_id, f.run_id, f.updated_at_ms, f.local_path,
-                f.stale_upload_ids, r.alternatives
+                f.stale_upload_ids, r.alternatives, r.compare, r.marker_key
          FROM guardian_exhibit_requests r
          LEFT JOIN guardian_exhibit_fills f
            ON f.guardian_id = r.guardian_id
@@ -371,6 +444,10 @@ pub fn guardian_exhibit_slots_conn(
             kind,
             r.get::<_, String>(3)?,
             r.get::<_, Option<String>>(16)?,
+            (
+                r.get::<_, Option<String>>(17)?,
+                r.get::<_, Option<String>>(18)?,
+            ),
             origin,
             r.get::<_, Option<String>>(5)?,
             updated.map(|updated_at_ms| ExhibitFill {
@@ -392,7 +469,7 @@ pub fn guardian_exhibit_slots_conn(
     })?;
     let mut out = Vec::new();
     for row in rows {
-        let (key, kind, describe, alternatives, origin, why, fill) = row?;
+        let (key, kind, describe, alternatives, (compare, marker_key), origin, why, fill) = row?;
         // A kind this build no longer knows is skipped rather than guessed.
         let Some(kind) = ExhibitKind::parse(&kind) else {
             continue;
@@ -400,7 +477,8 @@ pub fn guardian_exhibit_slots_conn(
         out.push(ExhibitSlot {
             key,
             request: ExhibitRequest::single(kind, describe)
-                .with_stored_alternatives(alternatives.as_deref()),
+                .with_stored_alternatives(alternatives.as_deref())
+                .with_stored_marking(compare.as_deref(), marker_key),
             origin: ExhibitOrigin::parse(&origin),
             why,
             fill,
@@ -433,7 +511,7 @@ impl crate::store::Store {
         origin: ExhibitOrigin,
         requests: &[(ExhibitRequest, Option<String>)],
     ) -> Result<Vec<SlotKey>> {
-        let existing: Vec<ExhibitSlot> = guardian_exhibit_slots_conn(&self.conn, guardian_id)?
+        let mut existing: Vec<ExhibitSlot> = guardian_exhibit_slots_conn(&self.conn, guardian_id)?
             .into_iter()
             .filter(|s| s.key.action_idx == action_idx)
             .collect();
@@ -447,14 +525,37 @@ impl crate::store::Store {
         let now = crate::store::now_ms();
         let mut created = Vec::new();
         for (request, why) in requests {
+            if let Some(slot) = existing
+                .iter_mut()
+                .find(|s| s.request.dedupe_key() == request.dedupe_key())
+            {
+                // A duplicate adds no slot, but a comparison target or marker
+                // key it carries must not be lost.
+                let before = slot.request.clone();
+                slot.request.absorb(request);
+                if slot.request != before {
+                    self.conn.execute(
+                        "UPDATE guardian_exhibit_requests SET compare=?, marker_key=?
+                         WHERE guardian_id=? AND action_idx=? AND slot_idx=?",
+                        rusqlite::params![
+                            slot.request.compare.map(CompareTarget::as_str),
+                            slot.request.marker_key,
+                            guardian_id,
+                            slot.key.action_idx,
+                            slot.key.slot_idx
+                        ],
+                    )?;
+                }
+                continue;
+            }
             if keys.len() >= MAX_PER_ACTION || keys.contains(&request.dedupe_key()) {
                 continue;
             }
             self.conn.execute(
                 "INSERT INTO guardian_exhibit_requests
                     (guardian_id, action_idx, slot_idx, kind, describe, origin, why, created_at_ms,
-                     alternatives)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                     alternatives, compare, marker_key)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 rusqlite::params![
                     guardian_id,
                     action_idx,
@@ -464,7 +565,9 @@ impl crate::store::Store {
                     origin.as_str(),
                     why,
                     now,
-                    request.alternatives_json()
+                    request.alternatives_json(),
+                    request.compare.map(CompareTarget::as_str),
+                    request.marker_key
                 ],
             )?;
             keys.push(request.dedupe_key());
@@ -772,6 +875,10 @@ struct RawInferred {
     kind: String,
     describe: String,
     #[serde(default)]
+    key: Option<String>,
+    #[serde(default)]
+    compare: Option<String>,
+    #[serde(default)]
     why: Option<String>,
 }
 
@@ -818,6 +925,7 @@ pub fn inference_prompt(
     let slots = guard
         .guardian_exhibit_slots(&guardian.id)
         .unwrap_or_default();
+    let hinted = hinted_requests(&guard.conn, &guardian.id, branch_id, &slots);
     drop(guard);
     let mut out = String::from(
         "\n\nREVIEWER EXHIBITS. A separate agent will run this change live and capture \
@@ -843,25 +951,103 @@ pub fn inference_prompt(
             out.push_str(&format!("- {}: {}\n", a.idx, one_line(&a.label)));
             for s in slots.iter().filter(|s| s.key.action_idx == a.idx) {
                 out.push_str(&format!(
-                    "    already requested: {}\n",
-                    request_line(&s.request)
+                    "    already requested: {}{}\n",
+                    request_line(&s.request),
+                    compare_hint(&s.request)
                 ));
             }
+        }
+    }
+    if !hinted.is_empty() {
+        out.push_str(
+            "\nThe agents that made this change suggested these exhibits in their own handoffs \
+             (none has a live test yet):\n",
+        );
+        for request in &hinted {
+            out.push_str(&format!(
+                "- {}{}\n",
+                request_line(request),
+                compare_hint(request)
+            ));
         }
     }
     out.push_str(&format!(
         "\nFor each additional exhibit (at most {MAX_INFERRED_PER_PR}), add one line BEFORE \
          the ===DESCRIPTION=== line: {INFER_MARKER} {{\"owner\": <live test id, or \"new\">, \
          \"kind\": {}, \"describe\": \"<what to show; for terminal-text, the command and \
-         the lines that matter>\", \"why\": \"<why the reviewer needs it>\"}}. Prefer the \
-         live test that already exercises that part of the program.",
+         the lines that matter>\", \"why\": \"<why the reviewer needs it>\", \"key\": \
+         \"<optional short name: lowercase letters, digits, - or _>\", \"compare\": \
+         \"<optional: {}>\"}}. Prefer the live test that already exercises that part of the \
+         program. To use a suggestion above, repeat it as an {INFER_MARKER} line with the same \
+         kind and description.",
         ExhibitKind::ALL
             .iter()
             .map(|k| format!("\"{}\"", k.as_str()))
             .collect::<Vec<_>>()
-            .join(" | ")
+            .join(" | "),
+        CompareTarget::ReviewUpstream.as_str()
+    ));
+    out.push_str(&format!(
+        "\n\nBEFORE/AFTER. A request with a \"key\" can be shown in the description wherever \
+         you place a token: {TOKEN_OPEN}<key>:after{TOKEN_CLOSE} for what the change produces, \
+         and {TOKEN_OPEN}<key>:{up}{TOKEN_CLOSE} for the same capture made against the review's \
+         base branch, which shows what it looked like before. Put a token anywhere you like in \
+         the description (a sentence, a list, a table cell) and write whatever text around it \
+         suits the change; ralphus replaces only the token, with the picture or recording and a \
+         short caption. Place a {up} token only where seeing before and after side by side \
+         helps the reader, and set \"compare\": \"{up}\" on that request; a comparison is \
+         captured only for tokens you place. You may use neither, one side, or both, and may \
+         skip a suggested comparison that is not useful. A token that names a key no request \
+         carries is left as written. Requests without a key appear in the Exhibits section \
+         as before.",
+        up = CompareTarget::ReviewUpstream.as_str()
     ));
     Some(out)
+}
+
+/// ` (cell suggests comparing with review-upstream)` for a request a cell
+/// hinted a comparison for, else nothing.
+fn compare_hint(request: &ExhibitRequest) -> String {
+    request
+        .compare
+        .map(|c| format!(" (cell suggests comparing with {})", c.as_str()))
+        .unwrap_or_default()
+}
+
+/// The `EXHIBIT:` requests in the stored handoffs of the finished cells of
+/// `branch_id`, read straight from the cells because no live test (and so no
+/// slot) holds them while the description is written. Those a slot already
+/// holds are left out.
+fn hinted_requests(
+    conn: &rusqlite::Connection,
+    guardian_id: &str,
+    branch_id: &str,
+    slots: &[ExhibitSlot],
+) -> Vec<ExhibitRequest> {
+    let handoffs =
+        crate::live_actions::collect_review_handoffs_conn(conn, guardian_id).unwrap_or_default();
+    let mut out: Vec<ExhibitRequest> = Vec::new();
+    for handoff in handoffs {
+        let on_branch = crate::live_results::resolve_branch_ids(
+            conn,
+            guardian_id,
+            std::slice::from_ref(&handoff.source_cell),
+        )
+        .iter()
+        .any(|b| b == branch_id);
+        if !on_branch {
+            continue;
+        }
+        for request in handoff.exhibits {
+            let held = slots
+                .iter()
+                .any(|s| s.request.dedupe_key() == request.dedupe_key());
+            if !held && !out.iter().any(|r| r.dedupe_key() == request.dedupe_key()) {
+                out.push(request);
+            }
+        }
+    }
+    out
 }
 
 /// The requests the project's `.ralphus.toml` recipes make for a branch that
@@ -933,17 +1119,31 @@ pub fn parse_inferred(reply: &str) -> Vec<InferredRequest> {
                 .map_or(InferredOwner::New, InferredOwner::Action),
             _ => InferredOwner::New,
         };
-        let request = ExhibitRequest::single(
+        let mut request = ExhibitRequest::single(
             kind,
             describe
                 .chars()
                 .take(DESCRIBE_MAX_CHARS)
                 .collect::<String>(),
         );
-        if out
-            .iter()
-            .any(|r| r.request.dedupe_key() == request.dedupe_key())
+        request.marker_key = raw.key.as_deref().and_then(clean_marker_key);
+        if let Some(name) = raw.compare.as_deref().filter(|c| !c.trim().is_empty()) {
+            request.compare = CompareTarget::parse(name);
+            if request.compare.is_none() {
+                // ralphus[ignore-rlog-pair]: parse_inferred is a pure reply parser with no Store to record a Cartographer row against
+                crate::rlog!(
+                    WARNING,
+                    "ralphus [pr] exhibit request \"{}\" names unknown compare target \"{}\"; ignored",
+                    one_line(&request.describe),
+                    one_line(name)
+                );
+            }
+        }
+        if let Some(existing) = out
+            .iter_mut()
+            .find(|r| r.request.dedupe_key() == request.dedupe_key())
         {
+            existing.request.absorb(&request);
             continue;
         }
         out.push(InferredRequest {
@@ -1008,8 +1208,8 @@ impl crate::store::Store {
                     self.conn.execute(
                         "INSERT INTO guardian_pending_exhibits
                             (guardian_id, branch_id, kind, describe, why, origin, created_at_ms,
-                             alternatives)
-                         VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                             alternatives, compare, marker_key)
+                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                         rusqlite::params![
                             guardian_id,
                             branch_id,
@@ -1018,13 +1218,41 @@ impl crate::store::Store {
                             r.why,
                             origin.as_str(),
                             crate::store::now_ms(),
-                            r.request.alternatives_json()
+                            r.request.alternatives_json(),
+                            r.request.compare.map(CompareTarget::as_str),
+                            r.request.marker_key
                         ],
                     )?;
                 }
             }
         }
         Ok(attached)
+    }
+
+    /// Every marker key a request of this review carries, whether it already
+    /// has a slot or still waits for one.
+    ///
+    /// # Errors
+    ///
+    /// On a database failure.
+    pub fn exhibit_marker_keys(&self, guardian_id: &str) -> Result<Vec<String>> {
+        let mut keys: Vec<String> = Vec::new();
+        for table in ["guardian_exhibit_requests", "guardian_pending_exhibits"] {
+            let found: Vec<String> = self
+                .conn
+                .prepare(&format!(
+                    "SELECT marker_key FROM {table}
+                     WHERE guardian_id=? AND marker_key IS NOT NULL"
+                ))?
+                .query_map(rusqlite::params![guardian_id], |r| r.get(0))?
+                .collect::<std::result::Result<_, _>>()?;
+            for key in found {
+                if !keys.contains(&key) {
+                    keys.push(key);
+                }
+            }
+        }
+        Ok(keys)
     }
 
     /// Turn pending inferred requests into slots once a review's live actions
@@ -1044,11 +1272,13 @@ impl crate::store::Store {
             Option<String>,
             String,
             Option<String>,
+            Option<String>,
+            Option<String>,
         );
         let pending: Vec<PendingRow> = self
             .conn
             .prepare(
-                "SELECT branch_id, kind, describe, why, origin, alternatives
+                "SELECT branch_id, kind, describe, why, origin, alternatives, compare, marker_key
                  FROM guardian_pending_exhibits
                  WHERE guardian_id=? ORDER BY rowid",
             )?
@@ -1060,6 +1290,8 @@ impl crate::store::Store {
                     r.get(3)?,
                     r.get(4)?,
                     r.get(5)?,
+                    r.get(6)?,
+                    r.get(7)?,
                 ))
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -1069,12 +1301,13 @@ impl crate::store::Store {
         type Waiting = Vec<(ExhibitOrigin, ExhibitRequest, Option<String>)>;
         let mut by_branch: std::collections::BTreeMap<String, Waiting> =
             std::collections::BTreeMap::new();
-        for (branch, kind, describe, why, origin, alternatives) in &pending {
+        for (branch, kind, describe, why, origin, alternatives, compare, marker_key) in &pending {
             if let Some(kind) = ExhibitKind::parse(kind) {
                 by_branch.entry(branch.clone()).or_default().push((
                     ExhibitOrigin::parse(origin),
                     ExhibitRequest::single(kind, describe.clone())
-                        .with_stored_alternatives(alternatives.as_deref()),
+                        .with_stored_alternatives(alternatives.as_deref())
+                        .with_stored_marking(compare.as_deref(), marker_key.clone()),
                     why.clone(),
                 ));
             }
@@ -1492,6 +1725,276 @@ pub fn render_section(blocks: &[String]) -> String {
     out
 }
 
+// ---- writer-placed markers ---------------------------------------------------
+
+/// Opens a token the PR writer places in its description:
+/// `<<exhibit:KEY:SIDE>>`.
+pub const TOKEN_OPEN: &str = "<<exhibit:";
+const TOKEN_CLOSE: &str = ">>";
+
+/// Placeholder text between a freshly placed marker pair.
+const PENDING_PLACEHOLDER: &str = "_Exhibit pending._";
+
+/// The longest marker key kept.
+const MARKER_KEY_MAX_CHARS: usize = 40;
+
+/// Which side of a comparison a marker shows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum MarkerSide {
+    /// The slot's own capture of the review's code.
+    After,
+    /// The capture made against the review's base branch.
+    ReviewUpstream,
+}
+
+impl MarkerSide {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::After => "after",
+            Self::ReviewUpstream => CompareTarget::ReviewUpstream.as_str(),
+        }
+    }
+
+    fn parse(name: &str) -> Option<Self> {
+        let name = name.trim();
+        if name.eq_ignore_ascii_case("after") {
+            Some(Self::After)
+        } else {
+            CompareTarget::parse(name).map(|_| Self::ReviewUpstream)
+        }
+    }
+}
+
+/// A marker key the writer may use: lowercase letters, digits, `-` and `_`.
+/// Anything else is no key (the request is still recorded, just not
+/// addressable by a marker).
+fn clean_marker_key(raw: &str) -> Option<String> {
+    let key = raw.trim().to_lowercase();
+    let valid = !key.is_empty()
+        && key.chars().count() <= MARKER_KEY_MAX_CHARS
+        && key
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_');
+    valid.then_some(key)
+}
+
+/// The marker that opens a writer-placed block.
+#[must_use]
+pub fn side_start(key: &str, side: MarkerSide) -> String {
+    format!(
+        "<!-- ralphus:exhibit:start key={key} side={} -->",
+        side.as_str()
+    )
+}
+
+/// The marker that closes a writer-placed block.
+#[must_use]
+pub fn side_end(key: &str, side: MarkerSide) -> String {
+    format!(
+        "<!-- ralphus:exhibit:end key={key} side={} -->",
+        side.as_str()
+    )
+}
+
+/// The result of [`normalize_markers`].
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct NormalizedMarkers {
+    pub body: String,
+    /// The (key, side) of every token turned into a marker pair, in order.
+    pub placed: Vec<(String, MarkerSide)>,
+    /// Tokens left as written because they are malformed, name an unknown
+    /// side, or name a key no request carries.
+    pub unknown: Vec<String>,
+}
+
+/// Turn the `<<exhibit:KEY:SIDE>>` tokens the PR writer placed into durable,
+/// single-line start/end comment pairs around a pending placeholder, so the
+/// pair survives inside a table cell. A token whose side is not `after` or a
+/// known comparison target, or whose key is not in `known_keys`, is left
+/// exactly as written and reported: ralphus never guesses.
+#[must_use]
+pub fn normalize_markers(description: &str, known_keys: &[String]) -> NormalizedMarkers {
+    let mut out = NormalizedMarkers::default();
+    let mut rest = description;
+    while let Some(open) = rest.find(TOKEN_OPEN) {
+        out.body.push_str(&rest[..open]);
+        let after_open = &rest[open + TOKEN_OPEN.len()..];
+        let Some(close) = after_open.find(TOKEN_CLOSE) else {
+            out.body.push_str(&rest[open..]);
+            rest = "";
+            break;
+        };
+        let inner = &after_open[..close];
+        let token_end = open + TOKEN_OPEN.len() + close + TOKEN_CLOSE.len();
+        let verbatim = &rest[open..token_end];
+        let parsed = inner
+            .split_once(':')
+            .and_then(|(key, side)| Some((clean_marker_key(key)?, MarkerSide::parse(side)?)))
+            .filter(|(key, _)| known_keys.contains(key));
+        match parsed {
+            Some((key, side)) => {
+                out.body.push_str(&format!(
+                    "{}{PENDING_PLACEHOLDER}{}",
+                    side_start(&key, side),
+                    side_end(&key, side)
+                ));
+                out.placed.push((key, side));
+            }
+            None => {
+                out.body.push_str(verbatim);
+                out.unknown.push(verbatim.to_string());
+            }
+        }
+        rest = &rest[token_end..];
+    }
+    out.body.push_str(rest);
+    out
+}
+
+/// The keys of the well-formed `review-upstream` marker pairs in `body`.
+#[must_use]
+pub fn upstream_marker_keys(body: &str) -> Vec<String> {
+    const PREFIX: &str = "<!-- ralphus:exhibit:start key=";
+    let side = format!(" side={} -->", MarkerSide::ReviewUpstream.as_str());
+    let mut keys: Vec<String> = Vec::new();
+    let mut rest = body;
+    while let Some(at) = rest.find(PREFIX) {
+        let after = &rest[at + PREFIX.len()..];
+        rest = after;
+        let Some(key) = after
+            .find(&side)
+            .and_then(|end| clean_marker_key(&after[..end]))
+        else {
+            continue;
+        };
+        if body.contains(&side_end(&key, MarkerSide::ReviewUpstream)) && !keys.contains(&key) {
+            keys.push(key);
+        }
+    }
+    keys
+}
+
+/// The slots whose `review-upstream` marker pair is present in `body`: the
+/// only slots an upstream run is needed for. A hint on a slot never counts;
+/// only a marker the writer placed does.
+#[must_use]
+pub fn upstream_markers(body: &str, slots: &[ExhibitSlot]) -> Vec<SlotKey> {
+    let keys = upstream_marker_keys(body);
+    let mut out: Vec<SlotKey> = slots
+        .iter()
+        .filter(|s| {
+            s.request
+                .marker_key
+                .as_ref()
+                .is_some_and(|k| keys.contains(k))
+        })
+        .map(|s| s.key)
+        .collect();
+    out.sort();
+    out
+}
+
+/// What goes between one writer-placed marker pair.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeyedBlock {
+    pub slot: SlotKey,
+    pub marker_key: String,
+    pub side: MarkerSide,
+    pub content: String,
+}
+
+/// The result of [`splice_keyed`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeyedSpliced {
+    pub body: String,
+    /// Slots whose `after` pair was found (filled or damaged): they need no
+    /// block in the managed section.
+    pub placed: Vec<SlotKey>,
+    /// Slots whose pair is damaged and so was not written.
+    pub damaged: Vec<SlotKey>,
+}
+
+/// Fill the writer-placed marker pairs of `blocks` in place, replacing only the
+/// text between a pair's markers. A block whose pair is not in `current` is
+/// skipped -- never appended anywhere -- and a damaged pair (a start with no
+/// end before the next exhibit start marker) is skipped and reported.
+#[must_use]
+pub fn splice_keyed(current: &str, blocks: &[KeyedBlock]) -> KeyedSpliced {
+    let mut body = current.to_string();
+    let mut placed = Vec::new();
+    let mut damaged = Vec::new();
+    for block in blocks {
+        let start_marker = side_start(&block.marker_key, block.side);
+        let end_marker = side_end(&block.marker_key, block.side);
+        let mut from = 0;
+        let mut found = false;
+        let mut broken = false;
+        while let Some(rel) = body[from..].find(&start_marker) {
+            found = true;
+            let start = from + rel;
+            let after = start + start_marker.len();
+            let end = body[after..].find(&end_marker).map(|i| after + i);
+            let next_start = body[after..].find(ANY_SLOT_START).map(|i| after + i);
+            match end {
+                Some(end) if next_start.is_none_or(|n| n > end) => {
+                    body.replace_range(after..end, &block.content);
+                    from = after + block.content.len() + end_marker.len();
+                }
+                _ => {
+                    broken = true;
+                    from = after;
+                }
+            }
+        }
+        if found && block.side == MarkerSide::After {
+            placed.push(block.slot);
+        }
+        if broken {
+            damaged.push(block.slot);
+        }
+    }
+    KeyedSpliced {
+        body,
+        placed,
+        damaged,
+    }
+}
+
+/// What to put between a marker pair for `fill`: the media (or fenced text)
+/// with a one-line caption, kept on one line unless it is terminal text so the
+/// pair works inside a table cell. `caption` replaces the fill's own caption
+/// (an upstream side names its ref and short sha there). Without delivered
+/// content it is the pending placeholder, or the reason nothing was captured.
+#[must_use]
+pub fn render_side_content(
+    requested: ExhibitKind,
+    fill: Option<&ExhibitFill>,
+    caption: Option<&str>,
+    forge: crate::forge::ForgeKind,
+) -> String {
+    let Some(fill) = fill else {
+        return PENDING_PLACEHOLDER.to_string();
+    };
+    let kind = fill.delivered_kind.unwrap_or(requested);
+    let caption = caption.or(fill.caption.as_deref()).map(one_line);
+    if let Some(url) = &fill.url {
+        let alt = caption.as_deref().unwrap_or_default();
+        let mut out = media(kind, url, alt, forge);
+        if let Some(c) = caption.filter(|c| !c.is_empty()) {
+            out.push_str(&format!("<br>_{c}_"));
+        }
+        return out;
+    }
+    if let Some(text) = &fill.text {
+        return format!("\n\n{}\n\n", fenced(text));
+    }
+    match fill.missing_reason.as_deref() {
+        Some(reason) => format!("_Not captured: {}_", one_line(reason)),
+        None => PENDING_PLACEHOLDER.to_string(),
+    }
+}
+
 /// The result of [`splice_exhibits`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Spliced {
@@ -1651,6 +2154,243 @@ mod tests {
         let split =
             split_handoff("EXHIBIT: gif | Drag  the slider\nEXHIBIT: GIF | drag the slider");
         assert_eq!(split.requests.len(), 1);
+    }
+
+    #[test]
+    fn split_handoff_reads_a_trailing_compare_hint() {
+        let split = split_handoff(
+            "steps\nEXHIBIT: screenshot | chart at zoom 1 | compare=review-upstream\nEXHIBIT: gif | a | b pipe",
+        );
+        assert_eq!(split.text, "steps");
+        assert_eq!(split.requests.len(), 2);
+        assert_eq!(
+            split.requests[0].compare,
+            Some(CompareTarget::ReviewUpstream)
+        );
+        assert_eq!(split.requests[0].describe, "chart at zoom 1");
+        assert_eq!(split.requests[1].compare, None);
+        assert!(split.rejected.is_empty());
+    }
+
+    #[test]
+    fn split_handoff_reports_an_unknown_compare_value_and_keeps_the_request() {
+        let split = split_handoff("EXHIBIT: screenshot | chart | compare=upstream");
+        assert_eq!(split.requests.len(), 1);
+        assert_eq!(split.requests[0].compare, None);
+        assert_eq!(split.requests[0].describe, "chart");
+        assert_eq!(split.rejected.len(), 1, "{:?}", split.rejected);
+        assert!(split.rejected[0].contains("compare=upstream"));
+    }
+
+    #[test]
+    fn split_handoff_keeps_the_hint_of_a_duplicate_request() {
+        let split = split_handoff(
+            "EXHIBIT: gif | drag it\nEXHIBIT: gif | drag it | compare=review-upstream",
+        );
+        assert_eq!(split.requests.len(), 1);
+        assert_eq!(
+            split.requests[0].compare,
+            Some(CompareTarget::ReviewUpstream)
+        );
+    }
+
+    #[test]
+    fn parse_inferred_reads_key_and_compare_and_ignores_an_unknown_compare() {
+        let reply = format!(
+            "{INFER_MARKER} {{\"owner\": \"new\", \"kind\": \"screenshot\", \"describe\": \"chart\", \"why\": \"w\", \"key\": \"Zoom-1\", \"compare\": \"review-upstream\"}}\n{INFER_MARKER} {{\"owner\": \"new\", \"kind\": \"gif\", \"describe\": \"drag\", \"why\": \"w\", \"key\": \"bad key!\", \"compare\": \"upstream\"}}\n===DESCRIPTION===\nbody"
+        );
+        let parsed = parse_inferred(&reply);
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].request.marker_key.as_deref(), Some("zoom-1"));
+        assert_eq!(
+            parsed[0].request.compare,
+            Some(CompareTarget::ReviewUpstream)
+        );
+        assert_eq!(parsed[1].request.marker_key, None);
+        assert_eq!(parsed[1].request.compare, None);
+    }
+
+    fn keyed_slot(action: i64, idx: i64, key: &str) -> ExhibitSlot {
+        let mut s = slot(action, idx, ExhibitKind::Screenshot, "chart");
+        s.request.marker_key = Some(key.to_string());
+        s
+    }
+
+    fn pair(key: &str, side: MarkerSide, inner: &str) -> String {
+        format!("{}{inner}{}", side_start(key, side), side_end(key, side))
+    }
+
+    fn after_block(s: &ExhibitSlot, content: &str) -> KeyedBlock {
+        KeyedBlock {
+            slot: s.key,
+            marker_key: s.request.marker_key.clone().unwrap(),
+            side: MarkerSide::After,
+            content: content.to_string(),
+        }
+    }
+
+    #[test]
+    fn normalize_markers_places_pairs_and_leaves_bad_tokens_alone() {
+        let keys = vec!["a".to_string()];
+        let n = normalize_markers(
+            "x <<exhibit:a:after>> y <<exhibit:a:review-upstream>> z <<exhibit:a:before>> <<exhibit:zz:after>> <<exhibit:a",
+            &keys,
+        );
+        assert_eq!(
+            n.body,
+            format!(
+                "x {} y {} z <<exhibit:a:before>> <<exhibit:zz:after>> <<exhibit:a",
+                pair("a", MarkerSide::After, PENDING_PLACEHOLDER),
+                pair("a", MarkerSide::ReviewUpstream, PENDING_PLACEHOLDER)
+            )
+        );
+        assert_eq!(n.placed.len(), 2);
+        assert_eq!(n.unknown.len(), 2);
+    }
+
+    #[test]
+    fn a_description_without_markers_renders_exactly_as_before() {
+        let n = normalize_markers("plain body\n\n| a | b |", &["a".to_string()]);
+        assert_eq!(n.body, "plain body\n\n| a | b |");
+        let out = splice_keyed("plain body", &[after_block(&keyed_slot(0, 0, "a"), "X")]);
+        assert_eq!(out.body, "plain body");
+        assert!(out.placed.is_empty());
+        assert!(upstream_markers("plain body", &[keyed_slot(0, 0, "a")]).is_empty());
+    }
+
+    #[test]
+    fn splice_keyed_fills_interleaved_pairs_in_place() {
+        let (a, b) = (keyed_slot(0, 0, "a"), keyed_slot(0, 1, "b"));
+        let body = format!(
+            "intro\n{}\nmid {} mid\n{}\n{}\nend",
+            pair("a", MarkerSide::After, "_p_"),
+            pair("b", MarkerSide::After, "_p_"),
+            pair("a", MarkerSide::ReviewUpstream, "_p_"),
+            pair("b", MarkerSide::ReviewUpstream, "_p_"),
+        );
+        let out = splice_keyed(&body, &[after_block(&a, "A!"), after_block(&b, "B!")]);
+        assert_eq!(
+            out.body,
+            format!(
+                "intro\n{}\nmid {} mid\n{}\n{}\nend",
+                pair("a", MarkerSide::After, "A!"),
+                pair("b", MarkerSide::After, "B!"),
+                pair("a", MarkerSide::ReviewUpstream, "_p_"),
+                pair("b", MarkerSide::ReviewUpstream, "_p_"),
+            )
+        );
+        assert_eq!(out.placed, vec![a.key, b.key]);
+        assert!(out.damaged.is_empty());
+    }
+
+    #[test]
+    fn splice_keyed_fills_a_pair_inside_a_table_without_touching_the_row() {
+        let a = keyed_slot(0, 0, "a");
+        let body = format!(
+            "| Before | After |\n|---|---|\n| {} | {} |\ntail",
+            pair("a", MarkerSide::ReviewUpstream, "_p_"),
+            pair("a", MarkerSide::After, "_p_"),
+        );
+        let out = splice_keyed(&body, &[after_block(&a, "![after](u)")]);
+        assert_eq!(
+            out.body,
+            format!(
+                "| Before | After |\n|---|---|\n| {} | {} |\ntail",
+                pair("a", MarkerSide::ReviewUpstream, "_p_"),
+                pair("a", MarkerSide::After, "![after](u)"),
+            )
+        );
+    }
+
+    #[test]
+    fn a_damaged_upstream_pair_does_not_stop_a_healthy_after_pair() {
+        let a = keyed_slot(0, 0, "a");
+        let damaged_up = side_start("a", MarkerSide::ReviewUpstream);
+        let body = format!(
+            "{damaged_up} lost its end\n{}",
+            pair("a", MarkerSide::After, "_p_")
+        );
+        let up = KeyedBlock {
+            side: MarkerSide::ReviewUpstream,
+            ..after_block(&a, "U")
+        };
+        let out = splice_keyed(&body, &[up, after_block(&a, "A!")]);
+        assert_eq!(
+            out.body,
+            format!(
+                "{damaged_up} lost its end\n{}",
+                pair("a", MarkerSide::After, "A!")
+            )
+        );
+        assert_eq!(out.damaged, vec![a.key]);
+        assert_eq!(out.placed, vec![a.key]);
+        assert!(upstream_markers(&body, &[a]).is_empty());
+    }
+
+    #[test]
+    fn an_upstream_only_marker_is_never_turned_into_an_appended_block() {
+        let a = keyed_slot(0, 0, "a");
+        let body = pair("a", MarkerSide::ReviewUpstream, "_p_");
+        let out = splice_keyed(&body, &[after_block(&a, "A")]);
+        assert_eq!(out.body, body);
+        assert!(out.placed.is_empty());
+    }
+
+    #[test]
+    fn upstream_markers_names_only_slots_with_a_present_upstream_pair() {
+        let (a, b) = (keyed_slot(0, 0, "a"), keyed_slot(0, 1, "b"));
+        let body = format!(
+            "{} {}",
+            pair("a", MarkerSide::ReviewUpstream, "_p_"),
+            pair("b", MarkerSide::After, "_p_")
+        );
+        assert_eq!(upstream_markers(&body, &[a.clone(), b]), vec![a.key]);
+    }
+
+    #[test]
+    fn compare_and_key_ride_a_pending_request_onto_its_slot() {
+        let store = crate::store::Store::open_in_memory().unwrap();
+        let g = store.create_guardian("r", "main", "/repo").unwrap();
+        store
+            .conn
+            .execute(
+                "INSERT INTO guardian_pending_exhibits
+                    (guardian_id, branch_id, kind, describe, why, origin, created_at_ms, compare, marker_key)
+                 VALUES (?, 'br-a', 'screenshot', 'chart', NULL, 'inferred', 0, 'review-upstream', 'zoom')",
+                rusqlite::params![g],
+            )
+            .unwrap();
+        assert_eq!(
+            store.exhibit_marker_keys(&g).unwrap(),
+            vec!["zoom".to_string()]
+        );
+        store
+            .conn
+            .execute(
+                "INSERT INTO guardian_live_actions (guardian_id, idx, label, prompt, source_cells, created_at_ms)
+                 VALUES (?, 0, 'A', 'test a', '[]', 0)",
+                rusqlite::params![g],
+            )
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "INSERT INTO guardian_live_action_branches (guardian_id, action_idx, branch_id) VALUES (?, 0, 'br-a')",
+                rusqlite::params![g],
+            )
+            .unwrap();
+        store.assign_pending_exhibits(&g).unwrap();
+        let slots = store.guardian_exhibit_slots(&g).unwrap();
+        assert_eq!(slots.len(), 1);
+        assert_eq!(
+            slots[0].request.compare,
+            Some(CompareTarget::ReviewUpstream)
+        );
+        assert_eq!(slots[0].request.marker_key.as_deref(), Some("zoom"));
+        assert_eq!(
+            store.exhibit_marker_keys(&g).unwrap(),
+            vec!["zoom".to_string()]
+        );
     }
 
     fn two_kind(primary: &str, fallback: &str) -> ExhibitRequest {

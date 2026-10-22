@@ -46,13 +46,31 @@ a Qt desktop app, anything with output a person would look at.
    <!-- ralphus:exhibit:end action=0 slot=0 -->
    ```
 
+   A cell can add `| compare=review-upstream` to a request to suggest showing
+   how the program looked before the change (the review's base branch on its
+   remote; the only value). This is a hint for the PR writer, not a decision.
+
 3. **The PR writer may add more** (`infer_exhibits`, on by default). When it
    writes the description it sees the cells' prompts, the diff, and the slots
    already asked for, and can add `EXHIBIT_REQUEST:` lines for anything else a
    reviewer needs to see. A request names the live action that should
    capture it; if the branch has no live action yet, it waits and is
    assigned when they are created (a branch with none gets a small
-   "Exhibits" live action of its own).
+   "Exhibits" live action of its own). The writer also sees the finished
+   cells' `EXHIBIT:` lines for the branch, including `compare=review-upstream`
+   hints, before any slot exists for them.
+
+   **Placing a request in the description, and before/after.** A request may
+   carry a `"key"` and `"compare": "review-upstream"`. The writer can then put
+   `<<exhibit:KEY:after>>` and `<<exhibit:KEY:review-upstream>>` anywhere in the
+   description, including inside a markdown table cell, in whatever layout suits
+   the change. Each token becomes a marker pair; ralphus fills only the text
+   between the markers (media plus a short caption) and imposes no layout. The
+   markers are fixed when the PR is created. Ralphus never appends a
+   `review-upstream` block, and it needs an upstream capture only for
+   `review-upstream` markers that are present in the description; a slot with
+   the hint but no such marker needs none. A description with no tokens renders
+   exactly as before.
 
    **Projects can also require exhibits deterministically**, with recipes in
    any `.ralphus.toml`:

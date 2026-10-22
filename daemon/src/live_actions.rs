@@ -179,7 +179,11 @@ change with nothing to see asks for nothing, or for terminal-text. Examples: \
 If a kind may not be capturable, add fallbacks after '||', each with its own \
 description written for what that kind can show, tried in order: \
 'EXHIBIT: gif | dragging the zoom slider from 0 to 1 magnifies the chart || \
-screenshot | the chart magnified at zoom 1'.";
+screenshot | the chart magnified at zoom 1'. \
+If seeing how the program looked before this change would help a reviewer, end \
+the line with '| compare=review-upstream' (the review's base branch on its \
+remote): 'EXHIBIT: screenshot | the chart at zoom 1 | compare=review-upstream'. \
+This only suggests a comparison; the pull request's writer decides whether to show it.";
 
 /// Most capabilities named per kind in the handoff question; the rest are
 /// counted.
