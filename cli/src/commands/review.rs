@@ -38,6 +38,7 @@ use crate::selector::{
 };
 
 #[derive(Debug, Clone)]
+#[allow(clippy::large_enum_variant)]
 pub enum ReviewCommand {
     Help,
     List {
