@@ -67,7 +67,7 @@ test("a heredoc body becomes a collapsed block under its row", () => {
     spans: [{ kind: "heredoc", start: 10, end: 13 }],
   };
   const html = shellSyntaxRowsHtml(text, p, esc);
-  assert.match(html, /<details class="alog-sh-heredoc">.*<pre>hi\n<\/pre>/s);
+  assert.match(html, /<details class="alog-sh-heredoc" data-hd="0:0">.*<pre>hi\n<\/pre>/s);
 });
 
 test("anything but a clean parse is not usable", () => {
@@ -75,21 +75,14 @@ test("anything but a clean parse is not usable", () => {
   assert.ok(!shellSyntaxUsable({ status: "ok", commands: [], spans: [] }));
 });
 
-test("heredoc open state is rendered per row and ordinal", () => {
-  const text = "cat <<A\nx\nA\ncat <<B\ny\nB";
+test("a heredoc the reader expanded renders open, independently per row and ordinal", () => {
+  const text = ["cat <<A", "x", "A", "cat <<B", "y", "B"].join("\n");
   const p = {
     status: "ok",
-    commands: [
-      { text: "cat <<A\nx\nA", start: 0, end: 11, sep: "" },
-      { text: "cat <<B\ny\nB", start: 12, end: 23, sep: ";" },
-    ],
-    spans: [
-      { kind: "heredoc", start: 8, end: 10 },
-      { kind: "heredoc", start: 20, end: 22 },
-    ],
+    commands: [{ text: "", start: 0, end: 11, sep: "" }, { text: "", start: 12, end: 25, sep: "" }],
+    spans: [{ kind: "heredoc", start: 8, end: 10 }, { kind: "heredoc", start: 20, end: 22 }],
   };
-  const hd = { isOpen: (id) => id === "1:0", toggleAttr: "t(this)" };
-  const html = shellSyntaxRowsHtml(text, p, esc, hd);
-  assert.match(html, /<details class="alog-sh-heredoc" data-hd="0:0" ontoggle="t\(this\)">/);
-  assert.match(html, /<details class="alog-sh-heredoc" data-hd="1:0" open ontoggle="t\(this\)">/);
+  const html = shellSyntaxRowsHtml(text, p, esc, (row, ord) => row === 1 && ord === 0);
+  assert.match(html, /data-hd="0:0"><summary/);
+  assert.match(html, /data-hd="1:0" open><summary/);
 });
