@@ -55,36 +55,10 @@ pub fn remote_workspace_dir(base: &str, local_dir: &str) -> String {
     format!("{base}/{slug}-{digest:016x}")
 }
 
-/// Reduce an arbitrary local path to a short, shell-safe slug: its final
-/// path component, with anything that is not alphanumeric/`-`/`_` collapsed
-/// to `_`, capped to a reasonable length so it stays readable.
-///
-/// `pub(crate)`: also reused by [`crate::layout`] to sanitize a project name
-/// or branch name into a directory-safe slug (RAL-355 Phase 2/4) -- the same
-/// "final path component, unsafe chars collapsed, capped length" shape
-/// applies there too, just with a bare name instead of a path.
+/// [`ralphus_core::machine_layout::sanitize_slug`], kept under this name for
+/// [`remote_workspace_dir`].
 pub(crate) fn sanitize_slug(local_dir: &str) -> String {
-    let last = local_dir
-        .rsplit(['/', '\\'])
-        .find(|s| !s.is_empty())
-        .unwrap_or("workspace");
-    let cleaned: String = last
-        .chars()
-        .map(|c| {
-            if c.is_alphanumeric() || c == '-' || c == '_' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect();
-    let trimmed = cleaned.trim_matches('_');
-    let trimmed = if trimmed.is_empty() {
-        "workspace"
-    } else {
-        trimmed
-    };
-    trimmed.chars().take(48).collect()
+    ralphus_core::machine_layout::sanitize_slug(local_dir)
 }
 
 #[cfg(test)]

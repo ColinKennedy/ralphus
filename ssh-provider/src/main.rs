@@ -6,7 +6,7 @@ use std::io::Read;
 
 use ralphus_ssh_provider::{
     UNIMPLEMENTED_VERBS, capabilities, channel, cleanup, exec, fileops, job, materialize, ping,
-    protocol, provision,
+    protocol, provision, windows,
 };
 
 struct Args {
@@ -121,6 +121,29 @@ fn main() {
             return;
         }
     };
+
+    let target = exec_config(&args);
+    if windows::serves(&args.verb, &target) {
+        // A Windows machine runs the verb in its runner; see `windows`.
+        let payload = read_stdin();
+        let reply = windows::serve(
+            &args.verb,
+            &args.uri,
+            args.handle.as_deref(),
+            args.since,
+            &payload,
+            &target,
+        );
+        if reply["ok"] != true {
+            report_failure(
+                &args.verb,
+                &args.uri,
+                reply["error"].as_str().unwrap_or_default(),
+            );
+        }
+        protocol::reply(reply);
+        return;
+    }
 
     match args.verb.as_str() {
         "exec" => {

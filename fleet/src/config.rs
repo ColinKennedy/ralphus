@@ -16,7 +16,18 @@
 //! artifacts = { "linux-x86_64" = "C:/ralphus/linux/ralphus-runner" }
 //! [machine.agents]
 //! codex = "/home/me/.local/bin/codex"
+//!
+//! [[machine]]
+//! name              = "winbox"            # reached through ralphus-outpost
+//! transport         = "outpost"
+//! outpost_token_env = "WINBOX_OUTPOST_TOKEN"
+//! remote_root       = "C:/ralphus/fleet"
 //! ```
+//!
+//! `transport` picks how the service reaches a machine: `ssh` (the default,
+//! through `ralphus-ssh-provider`) or `outpost` (the machine runs
+//! `ralphus-outpost connect`, which connects out to this service; see
+//! `docs/outpost.md`).
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -65,7 +76,17 @@ pub struct MachineConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
     /// SSH destination: a hostname, `user@host`, or a `~/.ssh/config` alias.
+    /// Required for `ssh`; unused by `outpost`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub host: String,
+    /// `ssh` (default) or `outpost`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transport: Option<String>,
+    /// `outpost` only: the environment variable (in this service's
+    /// environment) holding the pairing secret the machine's outpost
+    /// presents. The secret itself is never written to this file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outpost_token_env: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user: Option<String>,
     /// `linux`, `windows` or `macos`; asked of the machine when omitted.
@@ -93,6 +114,18 @@ impl MachineConfig {
     #[must_use]
     pub fn display_name(&self) -> &str {
         self.name.as_deref().unwrap_or(&self.host)
+    }
+
+    /// Whether the machine is reached through `ralphus-outpost`.
+    #[must_use]
+    pub fn is_outpost(&self) -> bool {
+        self.transport.as_deref() == Some(TRANSPORT_OUTPOST)
+    }
+
+    /// `ssh` or `outpost`.
+    #[must_use]
+    pub fn transport_name(&self) -> &str {
+        self.transport.as_deref().unwrap_or(TRANSPORT_SSH)
     }
 
     /// The `--uri` the SSH provider is given.
@@ -140,6 +173,30 @@ fn default_runner_command() -> String {
 }
 
 const OSES: [&str; 3] = ["linux", "windows", "macos"];
+/// The default transport.
+pub const TRANSPORT_SSH: &str = "ssh";
+/// The outbound-connection transport (`ralphus-outpost`).
+pub const TRANSPORT_OUTPOST: &str = "outpost";
+
+fn valid_env_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.chars().all(|c| c == '_' || c.is_ascii_alphanumeric())
+        && !name.starts_with(|c: char| c.is_ascii_digit())
+}
+
+/// Whether `root` can go unquoted on a Windows machine's command line (the
+/// SSH transport's rule, `ssh-provider/src/windows.rs`).
+fn windows_root_ok(root: &str) -> bool {
+    let bytes = root.as_bytes();
+    bytes.len() > 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && matches!(bytes[2], b'/' | b'\\')
+        && root
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | ':' | '\\' | '/'))
+        && !root.split(['/', '\\']).any(|p| p == "..")
+}
 const ARCHES: [&str; 2] = ["x86_64", "aarch64"];
 
 impl FleetConfig {
@@ -173,8 +230,45 @@ impl FleetConfig {
         let mut names = Vec::new();
         for machine in &self.machines {
             let name = machine.display_name();
-            if machine.host.trim().is_empty() {
-                return Err(format!("{origin}: a [[machine]] has an empty host"));
+            match machine.transport_name() {
+                TRANSPORT_SSH => {
+                    if machine.host.trim().is_empty() {
+                        return Err(format!("{origin}: a [[machine]] has an empty host"));
+                    }
+                    if machine.outpost_token_env.is_some() {
+                        return Err(format!(
+                            "{origin}: machine {name:?} sets outpost_token_env but its transport is ssh"
+                        ));
+                    }
+                }
+                TRANSPORT_OUTPOST => {
+                    if machine.name.as_deref().is_none_or(|n| n.trim().is_empty()) {
+                        return Err(format!(
+                            "{origin}: an outpost [[machine]] needs a name (its outpost connects with --name)"
+                        ));
+                    }
+                    if !machine
+                        .outpost_token_env
+                        .as_deref()
+                        .is_some_and(valid_env_name)
+                    {
+                        return Err(format!(
+                            "{origin}: outpost machine {name:?} needs outpost_token_env naming the \
+                             environment variable that holds its pairing secret"
+                        ));
+                    }
+                    if machine.runner != RunnerConfig::default() {
+                        return Err(format!(
+                            "{origin}: outpost machine {name:?} takes no [machine.runner]: the outpost \
+                             carries its own runner"
+                        ));
+                    }
+                }
+                other => {
+                    return Err(format!(
+                        "{origin}: machine {name:?} transport {other:?} must be \"ssh\" or \"outpost\""
+                    ));
+                }
             }
             if names.contains(&name) {
                 return Err(format!("{origin}: two machines are named {name:?}"));
@@ -192,6 +286,17 @@ impl FleetConfig {
             }
             if machine.remote_root.trim().is_empty() {
                 return Err(format!("{origin}: machine {name:?} needs a remote_root"));
+            }
+            if machine.os.as_deref() == Some("windows")
+                && !machine.is_outpost()
+                && !windows_root_ok(&machine.remote_root)
+            {
+                return Err(format!(
+                    "{origin}: Windows machine {name:?} remote_root {:?} must be a drive path made \
+                     only of letters, digits and . _ - \\ / (no spaces), since it goes unquoted \
+                     on the machine's command line",
+                    machine.remote_root
+                ));
             }
             if !["upload", "installed"].contains(&machine.runner.mode.as_str()) {
                 return Err(format!(
@@ -242,6 +347,22 @@ mod tests {
         assert_eq!(machine.display_name(), "box");
         assert_eq!(machine.ssh_uri(), "me@box");
         assert_eq!(machine.runner.mode, "installed");
+        assert_eq!(machine.transport_name(), "ssh");
+    }
+
+    #[test]
+    fn an_outpost_machine_needs_no_host() {
+        let config = FleetConfig::parse(
+            "token_env = \"T\"\n[[machine]]\nname = \"winbox\"\ntransport = \"outpost\"\n\
+             outpost_token_env = \"WINBOX_TOKEN\"\nremote_root = \"C:/Program Files/ralphus\"\n",
+            "fleet.toml",
+        )
+        .unwrap();
+        assert!(config.machines[0].is_outpost());
+        assert_eq!(config.machines[0].display_name(), "winbox");
+        let text = toml::to_string_pretty(&config).unwrap();
+        assert!(!text.contains("host"), "{text}");
+        FleetConfig::parse(&text, "round trip").unwrap();
     }
 
     #[test]
@@ -259,6 +380,26 @@ mod tests {
             (
                 "token_env = \"T\"\n[[machine]]\nhost = \"a\"\n",
                 "remote_root",
+            ),
+            (
+                "token_env = \"T\"\n[[machine]]\nname = \"w\"\ntransport = \"outpost\"\nremote_root = \"/r\"\n",
+                "outpost_token_env",
+            ),
+            (
+                "token_env = \"T\"\n[[machine]]\ntransport = \"outpost\"\noutpost_token_env = \"W\"\nremote_root = \"/r\"\n",
+                "needs a name",
+            ),
+            (
+                "token_env = \"T\"\n[[machine]]\nname = \"w\"\ntransport = \"pigeon\"\nremote_root = \"/r\"\n",
+                "transport",
+            ),
+            (
+                "token_env = \"T\"\n[[machine]]\nname = \"w\"\ntransport = \"outpost\"\noutpost_token_env = \"W\"\nremote_root = \"/r\"\n[machine.runner]\nmode = \"upload\"\n",
+                "carries its own runner",
+            ),
+            (
+                "token_env = \"T\"\n[[machine]]\nhost = \"w\"\nos = \"windows\"\nremote_root = \"C:/Program Files/r\"\n",
+                "no spaces",
             ),
         ] {
             let err = FleetConfig::parse(text, "f").expect_err(text);

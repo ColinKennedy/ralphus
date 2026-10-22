@@ -269,16 +269,20 @@ impl ModelBackend for PiBackend {
         // assistant turn.
         let real_config_dir =
             real_config_dir(ambient_dir.clone(), crate::agent_isolation::home_dir());
-        let isolated_dir = if isolate {
-            let dir = crate::agent_isolation::isolated_config_dir(workspace.root(), "pi");
+        // Held for the rest of `run()`: dropping it removes the login copied
+        // below from the isolated directory.
+        let isolation_lease = isolate.then(|| {
+            crate::agent_isolation::IsolationLease::acquire(
+                &crate::agent_isolation::isolated_config_dir(workspace.root(), "pi"),
+                crate::agent_isolation::AUTH_JSON_PRESERVED_FILES,
+            )
+        });
+        let isolated_dir = if let Some(lease) = &isolation_lease {
+            let dir = lease.dir().to_path_buf();
             // Best-effort: preserve a stored login so isolation doesn't force
             // a re-auth. Preserved regardless of the two opt-ins -- this is
             // about *authentication*, not personal settings/memory.
-            crate::agent_isolation::preserve_auth_file(
-                real_config_dir.as_deref(),
-                &dir,
-                "auth.json",
-            );
+            lease.preserve(real_config_dir.as_deref(), "auth.json");
             // Pi resolves an explicit provider/model through this downloaded
             // catalog. It contains model metadata rather than personal memory
             // or settings, so carry it into the isolated directory whenever

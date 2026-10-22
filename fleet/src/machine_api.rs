@@ -1,7 +1,10 @@
-//! An allocation's Machine API, served by running the matching verb of the
-//! SSH machine provider (contract v1) against the allocated machine: the
+//! An allocation's Machine API. For an `ssh` machine it runs the matching
+//! verb of the SSH machine provider (contract v1) against the machine: the
 //! request body goes to its stdin, its stdout is the reply, and the runner's
 //! `RALPHUS_EVENT:` lines on its stderr come back as the reply's `events`.
+//! For an `outpost` machine it hands the request to the machine's connected
+//! outpost ([`crate::outposts`]), which runs it and answers with the same
+//! reply fields and events.
 //!
 //! The service fills in what it owns about a machine -- its storage root,
 //! runner policy and agent paths -- so ralphus never needs to know them.
@@ -12,7 +15,9 @@ use std::process::{Command, Stdio};
 
 use serde_json::{Value, json};
 
+use crate::allocations::Platform;
 use crate::config::{FleetConfig, MachineConfig};
+use crate::outposts::Outposts;
 
 /// Marker the runner prefixes its events with on stderr.
 const EVENT_MARKER: &str = "RALPHUS_EVENT:";
@@ -21,12 +26,13 @@ const EVENT_MARKER: &str = "RALPHUS_EVENT:";
 pub const PROTOCOL_VERSION: i64 = 2;
 
 /// Verbs a Machine API serves.
-pub const VERBS: [&str; 14] = [
+pub const VERBS: [&str; 15] = [
     "provision",
     "exec",
     "status",
     "stream",
     "cancel",
+    "job-cleanup",
     "run",
     "read-file",
     "write-file",
@@ -75,8 +81,11 @@ fn complete_request(verb: &str, machine: &MachineConfig, body: &mut Value) {
     if matches!(verb, "provision" | "cleanup") && missing(fields, "remote_root") {
         fields.insert("remote_root".into(), machine.remote_root.clone().into());
     }
-    if verb == "provision" && missing(fields, "runner") {
-        fields.insert("runner".into(), runner_policy(machine));
+    if verb == "provision" && missing(fields, "runner") && !machine.is_outpost() {
+        fields.insert(
+            "runner".into(),
+            runner_policy(machine, &Platform::default()),
+        );
     }
     if verb == "exec" {
         let agent = fields
@@ -89,14 +98,22 @@ fn complete_request(verb: &str, machine: &MachineConfig, body: &mut Value) {
     }
 }
 
-/// The SSH provider's target runner policy for `machine`.
-fn runner_policy(machine: &MachineConfig) -> Value {
-    json!({
+/// The SSH provider's target runner policy for `machine`, with its os and
+/// arch when known (a Windows machine is driven differently).
+fn runner_policy(machine: &MachineConfig, platform: &Platform) -> Value {
+    let mut policy = json!({
         "mode": machine.runner.mode,
         "command": machine.runner.command,
         "artifacts": machine.runner.artifacts,
         "remote_root": machine.remote_root,
-    })
+    });
+    if let Some(os) = machine.os.clone().or_else(|| platform.os.clone()) {
+        policy["os"] = os.into();
+    }
+    if let Some(arch) = machine.arch.clone().or_else(|| platform.arch.clone()) {
+        policy["arch"] = arch.into();
+    }
+    policy
 }
 
 /// What one provider invocation produced.
@@ -111,6 +128,7 @@ struct Invocation {
 fn invoke(
     config: &FleetConfig,
     machine: &MachineConfig,
+    platform: &Platform,
     verb: &str,
     body: &Value,
     extra: &[String],
@@ -124,7 +142,7 @@ fn invoke(
         .args(extra)
         .env(
             "RALPHUS_TARGET_RUNNER_CONFIG",
-            runner_policy(machine).to_string(),
+            runner_policy(machine, platform).to_string(),
         )
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -167,9 +185,23 @@ fn invoke(
     })
 }
 
-/// Serve `verb` of the Machine API for `machine`: the reply body.
+/// How the service reaches its machines.
+pub struct Reach<'a> {
+    pub config: &'a FleetConfig,
+    pub outposts: &'a Outposts,
+}
+
+/// Serve `verb` of the Machine API for `machine`, whose os/arch so far known
+/// are `platform`: the reply body.
 #[must_use]
-pub fn serve(config: &FleetConfig, machine: &MachineConfig, verb: &str, mut body: Value) -> Value {
+pub fn serve(
+    reach: &Reach<'_>,
+    machine: &MachineConfig,
+    platform: &Platform,
+    verb: &str,
+    mut body: Value,
+) -> Value {
+    let config = reach.config;
     if !VERBS.contains(&verb) {
         return refusal(
             "unsupported",
@@ -179,6 +211,9 @@ pub fn serve(config: &FleetConfig, machine: &MachineConfig, verb: &str, mut body
     }
     if !body.is_object() {
         body = json!({});
+    }
+    if machine.is_outpost() {
+        return through_outpost(reach.outposts, machine, verb, body);
     }
     // v1 takes the job handle and cursor as flags, not stdin.
     let mut extra = Vec::new();
@@ -195,19 +230,61 @@ pub fn serve(config: &FleetConfig, machine: &MachineConfig, verb: &str, mut body
     }
     complete_request(verb, machine, &mut body);
     if verb == "materialize" {
-        return materialize(config, machine, body);
+        return materialize(config, machine, platform, body);
     }
-    reply_from(config, machine, verb, &body, &extra)
+    reply_from(config, machine, platform, verb, &body, &extra)
+}
+
+/// Hand `verb` to `machine`'s outpost: it runs the verb itself, so the reply
+/// (a `materialize`'s `files` included) comes back as it is.
+fn through_outpost(
+    outposts: &Outposts,
+    machine: &MachineConfig,
+    verb: &str,
+    mut body: Value,
+) -> Value {
+    complete_request(verb, machine, &mut body);
+    if let Some(fields) = body.as_object_mut() {
+        fields.remove("destination");
+    }
+    let context = json!({"remote_root": machine.remote_root});
+    match outposts.call(machine.display_name(), verb, body, context) {
+        Ok(answer) => {
+            let mut reply = answer.reply;
+            if !reply.is_object() {
+                return refusal(
+                    "unreachable",
+                    &format!(
+                        "outpost {:?} sent no reply to {verb}",
+                        machine.display_name()
+                    ),
+                    "check the outpost's own log on the machine",
+                );
+            }
+            reply["protocol_version"] = PROTOCOL_VERSION.into();
+            reply["events"] = answer.events.into();
+            reply
+        }
+        Err(e) => refusal(
+            "unreachable",
+            &e,
+            &format!(
+                "start (or restart) `ralphus-outpost connect` on {:?} and check it can reach                  this service",
+                machine.display_name()
+            ),
+        ),
+    }
 }
 
 fn reply_from(
     config: &FleetConfig,
     machine: &MachineConfig,
+    platform: &Platform,
     verb: &str,
     body: &Value,
     extra: &[String],
 ) -> Value {
-    let invocation = match invoke(config, machine, verb, body, extra) {
+    let invocation = match invoke(config, machine, platform, verb, body, extra) {
         Ok(invocation) => invocation,
         Err(e) => {
             return refusal(
@@ -242,7 +319,12 @@ fn reply_from(
 /// `materialize`: let the provider copy the selected path onto this host,
 /// then return its files in the reply, since ralphus's own host may be
 /// another machine.
-fn materialize(config: &FleetConfig, machine: &MachineConfig, mut body: Value) -> Value {
+fn materialize(
+    config: &FleetConfig,
+    machine: &MachineConfig,
+    platform: &Platform,
+    mut body: Value,
+) -> Value {
     let staging = match staging_dir() {
         Ok(dir) => dir,
         Err(e) => return refusal("unreachable", &e, "check the fleet host's temp directory"),
@@ -250,7 +332,7 @@ fn materialize(config: &FleetConfig, machine: &MachineConfig, mut body: Value) -
     let destination = staging.join("out");
     let executable = body["executable"].as_bool().unwrap_or(false);
     body["destination"] = destination.to_string_lossy().into_owned().into();
-    let mut reply = reply_from(config, machine, "materialize", &body, &[]);
+    let mut reply = reply_from(config, machine, platform, "materialize", &body, &[]);
     if reply["ok"] == true {
         match collect_files(&destination, executable) {
             Ok(files) => reply["files"] = files.into(),
@@ -342,6 +424,10 @@ mod tests {
         complete_request("provision", &m, &mut provision);
         assert_eq!(provision["remote_root"], "/srv/fleet");
         assert_eq!(provision["runner"]["remote_root"], "/srv/fleet");
+        assert!(
+            provision["runner"].get("os").is_none(),
+            "unknown until probed"
+        );
 
         let mut exec = json!({"agent": "codex", "executable": null});
         complete_request("exec", &m, &mut exec);
@@ -355,14 +441,71 @@ mod tests {
     #[test]
     fn an_unknown_operation_is_refused() {
         let config = FleetConfig::parse("token_env = \"T\"\n", "f").unwrap();
-        let reply = serve(&config, &machine(), "format-disk", json!({}));
+        let outposts = Outposts::new(&config, |_| None);
+        let reach = Reach {
+            config: &config,
+            outposts: &outposts,
+        };
+        let reply = serve(
+            &reach,
+            &machine(),
+            &Platform::default(),
+            "format-disk",
+            json!({}),
+        );
         assert_eq!(reply["reason_code"], "unsupported");
     }
 
     #[test]
+    fn a_windows_machine_gets_its_os_in_the_runner_policy() {
+        let mut m = machine();
+        m.os = Some("windows".to_string());
+        let policy = runner_policy(&m, &Platform::default());
+        assert_eq!(policy["os"], "windows");
+        let probed = runner_policy(
+            &machine(),
+            &Platform {
+                os: Some("windows".to_string()),
+                arch: Some("x86_64".to_string()),
+            },
+        );
+        assert_eq!(probed["os"], "windows");
+        assert_eq!(probed["arch"], "x86_64");
+    }
+
+    #[test]
+    fn an_outpost_machine_that_is_not_connected_is_unreachable_with_how_to_connect_it() {
+        let config = FleetConfig::parse(
+            "token_env = \"T\"\n[[machine]]\nname = \"win\"\ntransport = \"outpost\"\n\
+             outpost_token_env = \"WIN_SECRET\"\nremote_root = \"C:/r\"\n",
+            "f",
+        )
+        .unwrap();
+        let outposts = Outposts::new(&config, |_| Some("s".repeat(40)));
+        let reach = Reach {
+            config: &config,
+            outposts: &outposts,
+        };
+        let reply = serve(
+            &reach,
+            &config.machines[0],
+            &Platform::default(),
+            "ping",
+            json!({}),
+        );
+        assert_eq!(reply["reason_code"], "unreachable", "{reply}");
+        assert!(
+            reply["error"]
+                .as_str()
+                .unwrap()
+                .contains("ralphus-outpost connect")
+        );
+    }
+
+    #[test]
     fn a_materialized_directory_comes_back_as_relative_files() {
-        let root = std::env::temp_dir().join(format!("fleet-collect-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
+        let root = ralphus_test_support::TestDir::new("fleet-collect");
+        let root = root.path().to_path_buf();
         std::fs::create_dir_all(root.join("clips")).unwrap();
         std::fs::write(root.join("a.png"), "a").unwrap();
         std::fs::write(root.join("clips").join("b.gif"), "b").unwrap();
@@ -373,6 +516,5 @@ mod tests {
             .collect();
         paths.sort();
         assert_eq!(paths, ["a.png", "clips/b.gif"]);
-        let _ = std::fs::remove_dir_all(&root);
     }
 }

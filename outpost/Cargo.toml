@@ -1,0 +1,28 @@
+[package]
+name = "ralphus-outpost"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Serves a machine's Machine API by connecting out to ralphus-fleet: for machines with no SSH."
+
+[[bin]]
+name = "ralphus-outpost"
+path = "src/main.rs"
+
+[lib]
+name = "ralphus_outpost"
+path = "src/lib.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+ralphus-fleet = { path = "../fleet" }
+ralphus-runner = { path = "../runner" }
+serde_json = { workspace = true }
+ureq = { workspace = true, features = ["tls"] }
+
+[dev-dependencies]
+ralphus-test-support = { path = "../test-support" }
+tiny_http = { workspace = true }

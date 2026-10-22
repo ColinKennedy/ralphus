@@ -20,6 +20,7 @@ first, and prints a pass/fail line for each check:
 | a request no machine can serve fails with the provider's reasons | a second squad asks for an os no machine has |
 | the machines are handed back once the review is cancelled | allocations released within `--release-timeout` |
 | the review's pull request opens from the machine | only with `--pr` |
+| outpost machines connected | only when a machine has `transport = "outpost"` |
 
 No model is called: every cell and proof is a raw `sh` command, so a run costs
 only machine time. It never touches a running dev stack; everything lives under
@@ -64,7 +65,29 @@ branches. Task B's branch is pushed to `refs/ralphus/cells/...` on the test
 repository so the review on machine A can fetch it, and `--pr` opens a pull
 request; delete those afterwards if you do not want them to accumulate.
 
+## Outpost machines
+
+A machine with `transport = "outpost"` is not started by the harness: run
+`ralphus-outpost connect` on it yourself ([`outpost.md`](outpost.md)), with its
+pairing secret in the outpost's environment and the variable named by
+`outpost_token_env` set in the harness's environment (the fleet inherits it).
+Because outposts connect to the fleet, give the fleet a fixed address with
+`--fleet-listen` (`0.0.0.0:7931` to let a WSL distribution or a container
+reach it; the daemon still uses loopback). The harness waits up to
+`--outpost-timeout` seconds for every outpost to connect, and they reconnect
+by themselves when the harness restarts the fleet. When the machines cannot
+reach this host at all (an inbound firewall), run `ralphus-fleet serve`
+yourself somewhere they can, with its service token in
+`$RALPHUS_E2E_FLEET_TOKEN`, and pass `--fleet-url` (the harness then neither
+starts nor restarts it).
+
+An outpost running on the daemon's own host (with its own `remote_root`) is
+useful for testing the transport, but it does not prove remote execution:
+strict mode still shows the daemon did no machine work itself, while the work
+ran on the same computer through the outpost.
+
 ## Not covered
 
 The base branch moving under an open review, live actions and exhibits, and a
-Windows machine are not part of this run yet.
+Windows machine over SSH are not part of this run yet (a native Windows
+outpost is).

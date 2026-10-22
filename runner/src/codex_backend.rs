@@ -146,16 +146,23 @@ impl ModelBackend for CodexBackend {
         args.extend(provisioning.args.iter().cloned());
         args.push("-".to_string());
 
-        let mut child = spawn(&program, compound, &args, workspace, codex_home.as_deref())
-            .map_err(|e| {
-                crate::cli_agent_common::emit_child_lifecycle(
-                    "codex",
-                    "agent process spawn failed",
-                    "error",
-                    serde_json::json!({"compound": compound, "error": e.to_string()}),
-                );
-                BackendError(format!("could not spawn {program}: {e}"))
-            })?;
+        let codex_home_dir = codex_home.as_ref().map(|lease| lease.dir().to_path_buf());
+        let mut child = spawn(
+            &program,
+            compound,
+            &args,
+            workspace,
+            codex_home_dir.as_deref(),
+        )
+        .map_err(|e| {
+            crate::cli_agent_common::emit_child_lifecycle(
+                "codex",
+                "agent process spawn failed",
+                "error",
+                serde_json::json!({"compound": compound, "error": e.to_string()}),
+            );
+            BackendError(format!("could not spawn {program}: {e}"))
+        })?;
         crate::cli_agent_common::emit_child_lifecycle(
             "codex",
             "agent process spawned",
@@ -200,7 +207,7 @@ impl ModelBackend for CodexBackend {
                 .thrash_min_turn_gap
                 .unwrap_or(crate::thrash::DEFAULT_MIN_TURN_GAP),
         };
-        let sessions_root = codex_home
+        let sessions_root = codex_home_dir
             .clone()
             .or_else(|| std::env::var_os("CODEX_HOME").map(std::path::PathBuf::from))
             .or_else(|| crate::agent_isolation::home_dir().map(|h| h.join(".codex")))
@@ -376,7 +383,7 @@ fn write_codex_config(
 fn isolated_codex_home(
     options: &RunOptions<'_>,
     workspace: &Workspace,
-) -> Option<std::path::PathBuf> {
+) -> Option<crate::agent_isolation::IsolationLease> {
     // RAL-695: a capability set is the only source of MCP servers and skills,
     // both of which live under `CODEX_HOME`, so it is isolated whenever one
     // is present.
@@ -389,17 +396,21 @@ fn isolated_codex_home(
     let real_dir = std::env::var_os("CODEX_HOME")
         .map(std::path::PathBuf::from)
         .or_else(|| crate::agent_isolation::home_dir().map(|h| h.join(".codex")));
-    let isolated = crate::agent_isolation::isolated_config_dir(workspace.root(), "codex");
+    let lease = crate::agent_isolation::IsolationLease::acquire(
+        &crate::agent_isolation::isolated_config_dir(workspace.root(), "codex"),
+        crate::agent_isolation::AUTH_JSON_PRESERVED_FILES,
+    );
     // Preserved unconditionally: isolating personal config/memory is not the
-    // same decision as forcing a re-login.
-    crate::agent_isolation::preserve_auth_file(real_dir.as_deref(), &isolated, "auth.json");
+    // same decision as forcing a re-login. The copy is removed when the
+    // lease drops.
+    lease.preserve(real_dir.as_deref(), "auth.json");
     if options.allow_personal_settings {
         // Settings opted back in but memory did not (the single lever can't
         // separate the two) -- copy the settings file into the isolated dir
         // so personal settings still take effect there.
-        crate::agent_isolation::preserve_auth_file(real_dir.as_deref(), &isolated, "config.toml");
+        lease.preserve(real_dir.as_deref(), "config.toml");
     }
-    Some(isolated)
+    Some(lease)
 }
 
 fn spawn(
@@ -1205,11 +1216,13 @@ mod tests {
             ..Default::default()
         };
         let ws = test_workspace();
-        assert_eq!(isolated_codex_home(&options, &ws), None);
+        assert!(isolated_codex_home(&options, &ws).is_none());
     }
 
     #[test]
     fn isolated_codex_home_is_some_when_either_opt_in_is_off() {
+        let isolation_root = ralphus_test_support::TestDir::new("isolation-root");
+        crate::agent_isolation::set_test_isolation_root(isolation_root.path());
         let ws = test_workspace();
         assert!(isolated_codex_home(&RunOptions::default(), &ws).is_some());
         let settings_only = RunOptions {

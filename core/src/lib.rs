@@ -13,6 +13,7 @@ pub mod git_remote;
 pub mod git_spawn;
 pub mod health_catalog;
 pub mod license;
+pub mod machine_layout;
 pub mod process;
 pub mod project_hints;
 pub mod rate_limit;

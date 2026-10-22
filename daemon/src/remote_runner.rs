@@ -1291,6 +1291,8 @@ impl ProviderRunner {
             store,
             session_name: &session_name,
         });
+        // When the status polls started failing; reset by one that succeeds.
+        let mut status_failing_since: Option<Instant> = None;
         loop {
             if let Some(store) = &self.cartographer {
                 crate::runner::escalate_stall_if_due(
@@ -1441,9 +1443,31 @@ impl ProviderRunner {
                     );
                 }
             }
+            // The job is durable on the machine, so a status the provider
+            // could not get (its SSH connection to the machine timed out,
+            // say) is asked again until the failures outlast the retry
+            // window, instead of failing a cell that is still running.
             let status = match self.invoke_handle(VERB_STATUS, handle, None, spec) {
-                Ok(s) => s,
+                Ok(s) => {
+                    status_failing_since = None;
+                    s
+                }
                 Err(e) => {
+                    let since = *status_failing_since.get_or_insert_with(Instant::now);
+                    if since.elapsed() < MACHINE_API_RETRY_WINDOW {
+                        self.note(
+                            spec,
+                            crate::logging::LogLevel::WARNING,
+                            "remote job status unavailable; asking again",
+                            serde_json::json!({
+                                "handle": handle,
+                                "scheme": self.scheme,
+                                "error": e,
+                            }),
+                        );
+                        std::thread::sleep(POLL_INTERVAL);
+                        continue;
+                    }
                     crate::cell_session::write_pane_snapshot(&session_name, &transcript);
                     return RunnerResult::failure(e);
                 }
@@ -4114,6 +4138,42 @@ else:
             .find(|(url, ..)| url.ends_with("/status"))
             .expect("the handle is polled");
         assert_eq!(status.2["handle"], "job-9");
+    }
+
+    #[test]
+    fn a_status_the_provider_could_not_get_is_asked_again() {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}/v1/m/alloc-1/", server.server_addr());
+        let thread = std::thread::spawn(move || {
+            let mut statuses = 0;
+            while let Ok(Some(req)) = server.recv_timeout(Duration::from_secs(5)) {
+                let verb = req.url().rsplit('/').next().unwrap_or_default().to_string();
+                let reply = match verb.as_str() {
+                    "exec" => r#"{"ok":true,"protocol_version":2,"handle":"job-9"}"#,
+                    "stream" => r#"{"ok":true,"protocol_version":2,"output":"","next":0}"#,
+                    "status" => {
+                        statuses += 1;
+                        if statuses == 1 {
+                            r#"{"ok":false,"protocol_version":2,"error":"ssh connection timed out"}"#
+                        } else {
+                            r#"{"ok":true,"protocol_version":2,"state":"done","result":{"status":"done","summary":"async"}}"#
+                        }
+                    }
+                    _ => r#"{"ok":true,"protocol_version":2}"#,
+                };
+                let _ = req.respond(tiny_http::Response::from_string(reply));
+                if statuses >= 2 {
+                    break;
+                }
+            }
+            statuses
+        });
+        let provider = ProviderRunner::over_http("fleet", "alloc-1", endpoint, "t");
+
+        let r = provider.run(&spec(Some("fleet")));
+
+        assert_eq!(r.status, "done", "{r:?}");
+        assert_eq!(thread.join().unwrap(), 2);
     }
 
     #[test]

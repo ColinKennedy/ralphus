@@ -454,6 +454,18 @@ impl StoreMemory {
         (generation, token, gate)
     }
 
+    /// The review's preparation gate, without starting a generation: a live
+    /// run locks it while it picks and holds its checkout, so it never picks
+    /// one a preparation is in the middle of resetting.
+    pub fn guardian_preparation_gate(&self, guardian_id: &str) -> std::sync::Arc<Mutex<()>> {
+        self.preparation
+            .lock()
+            .gates
+            .entry(guardian_id.to_string())
+            .or_insert_with(|| std::sync::Arc::new(Mutex::new(())))
+            .clone()
+    }
+
     /// Cancel preparation as soon as work starts changing the review basis.
     pub fn cancel_guardian_preparation(&self, guardian_id: &str) {
         if let Some((_, token)) = self.preparation.lock().active.get(guardian_id) {
@@ -1129,6 +1141,26 @@ mod tests {
         assert!(second_gate.try_lock().is_none());
         drop(first_lease);
         assert!(second_gate.try_lock().is_some());
+    }
+
+    #[test]
+    fn a_live_run_waits_on_the_same_gate_a_preparation_holds() {
+        let mem = StoreMemory::new();
+        let (_, _, preparing) = mem.begin_guardian_preparation("g1");
+        let lease = preparing.lock();
+        let live_run_gate = mem.guardian_preparation_gate("g1");
+
+        assert!(live_run_gate.try_lock().is_none());
+        drop(lease);
+        let live_lease = live_run_gate
+            .try_lock()
+            .expect("free once preparation ends");
+        assert!(
+            preparing.try_lock().is_none(),
+            "and a preparation waits on the run"
+        );
+        drop(live_lease);
+        assert!(mem.guardian_preparation_gate("g2").try_lock().is_some());
     }
 
     #[test]

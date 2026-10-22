@@ -161,3 +161,30 @@ tag = "exhibit-recipes"
 [[test]]
 id = "ralphus-daemon allocations::tests::the_built_in_fleet_grants_a_machine_and_serves_its_machine_api"
 tag = "fleet-machine-api"
+
+# Machine-side verbs (`ralphus-runner machine`): a durable job started under
+# a detached supervisor, which runs the runner (Windows over SSH, outposts).
+[[test]]
+id = "ralphus-runner::machine_jobs a_job_runs_detached_to_done_with_its_environment_kept_off_disk"
+tag = "machine-job"
+
+# Machine-side `provision`: git clone, fetch and worktree add as programs.
+[[test]]
+id = "ralphus-runner machine::provision::tests::provision_clones_once_and_adds_a_worktree_per_branch"
+tag = "machine-provision"
+
+# Machine-side `run`: one authored command through the machine's shell.
+[[test]]
+id = "ralphus-runner machine::command::tests::an_authored_command_runs_in_the_workspace_with_its_environment"
+tag = "machine-run"
+
+# The SSH provider's Windows path, with `cmd.exe /c` standing in for the
+# session shell: runner upload (copy, then a PowerShell digest check), then verbs (Windows only).
+[[test]]
+id = "ralphus-ssh-provider windows::tests::the_whole_flow_runs_through_cmd_exe_with_the_real_runner"
+tag = "ssh-windows"
+
+# ralphus-fleet handing Machine API requests to a connected ralphus-outpost.
+[[test]]
+id = "ralphus-outpost::loopback an_outpost_serves_an_allocations_machine_api_over_its_outbound_connection"
+tag = "outpost-loopback"

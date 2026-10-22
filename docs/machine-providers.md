@@ -689,8 +689,12 @@ host**. `exec`:
 **The remote host is assumed to have a POSIX-like shell** (`sh`/`bash`) for
 the extraction/invocation commands this provider constructs — the common case
 for an SSH-reachable dev/build box. A Windows *daemon host* is fully
-supported (that's the transport-selection split above); a Windows *remote
-target* is not exercised by this provider today.
+supported (that's the transport-selection split above). A Windows *remote
+target* is driven differently: when the target runner policy carries
+`"os": "windows"` (`ralphus-fleet` passes it), every verb but `ping` and
+`channel` runs as `ralphus-runner machine <verb>` on the machine instead of a
+shell script -- see
+[Windows over SSH](machine-provider-service.md#windows-over-ssh).
 
 ### What `provision` actually does (RAL-355 Phase 4)
 
@@ -841,8 +845,9 @@ reach Cartographer, durable pane text, or returned diagnostics.
 On Linux, `cancel` sends TERM and then KILL to the runner's entire process
 group, verifies the recorded PID/start-time identity is gone, and records the
 request time, requester, and outcome before publishing a terminal cancelled
-result. Windows-target process-tree cancellation is not implemented by this
-POSIX SSH backend.
+result. On a Windows target the runner's job supervisor (`ralphus-runner
+machine supervise`) confines the runner to a job object and ends the whole
+tree on cancel.
 
 Job-state cleanup is intentionally distinct from workspace cleanup and is an
 explicit provider operation:
