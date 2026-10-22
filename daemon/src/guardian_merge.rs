@@ -6272,6 +6272,9 @@ enum StagedPassOutcome {
     /// The pass was cancelled at a checkpoint (`log_merge_cancelled` already
     /// ran); leave the merge state for the next pass's cleanup.
     Cancelled,
+    /// Every enabled branch turned out to be merged mid-pass and the review was
+    /// settled to `merged`; nothing remains to rebuild or finalize.
+    Settled,
 }
 
 /// RAL-265: incremental stack rebase. Unlike the all-or-nothing
@@ -6415,7 +6418,7 @@ pub fn run_merge_staged(
         }
         match staged_merge_pass(store, runner, id, cancel) {
             StagedPassOutcome::Cancelled => return,
-            StagedPassOutcome::Failed => return,
+            StagedPassOutcome::Failed | StagedPassOutcome::Settled => return,
             StagedPassOutcome::Ok { built_any } => {
                 #[cfg(test)]
                 AFTER_STAGED_PASS.with(|hook| {
@@ -6728,6 +6731,36 @@ fn staged_merge_pass(
             // all done yet.
             if bv.merge_status == MergeStatus::Pending.as_str() {
                 break;
+            }
+            // The snapshot above can be stale: a PR sync may have marked this
+            // branch merged while earlier branches were rebuilding. A merged
+            // branch needs no rebase, and once every enabled branch is merged
+            // the review is settled and the pass stops.
+            if let Ok(fresh) = store.lock().get_guardian(id) {
+                let now_merged = fresh
+                    .branches
+                    .iter()
+                    .find(|b| b.id == bv.id)
+                    .is_some_and(|b| b.merge_status == MergeStatus::Merged.as_str());
+                if now_merged {
+                    crate::cartographer::Note::new("guardian")
+                        .guardian(id)
+                        .emit(
+                            &store.lock(),
+                            format!("branch {} skipped: already merged upstream", bv.branch),
+                            serde_json::json!({
+                                "outcome": "already_merged",
+                                "branch_id": bv.id,
+                                "branch": bv.branch,
+                            }),
+                        );
+                    if every_enabled_branch_merged(&fresh)
+                        && settle_if_all_branches_merged(store, id)
+                    {
+                        return StagedPassOutcome::Settled;
+                    }
+                    continue;
+                }
             }
             let _ = store
                 .lock()
@@ -7057,6 +7090,9 @@ fn finish_staged_merge<F: Fn(GuardianStatus, Option<&str>)>(
     // Their result is advisory and never turns a correct rebase back into a
     // failure; see `run_commit_checks` for why gates run *during* the merge
     // still fail it.
+    if settle_if_all_branches_merged(store, id) {
+        return;
+    }
     snapshot_review_heads(store, id);
     queue_final_summary_regen(store, id);
     set_status(GuardianStatus::InReview, None);
@@ -11446,7 +11482,7 @@ fn approve_base_already_landed(store: &crate::store_lock::StoreHandle, id: &str)
     let merged = {
         let guard = store.lock();
         if let Ok(status_str) = guard.guardian_status_str(id) {
-            if status_str == "in_review" {
+            if matches!(status_str.as_str(), "in_review" | "merging") {
                 guard
                     .set_guardian_status(id, crate::guardian::GuardianStatus::Merged, None)
                     .is_ok()
@@ -11504,6 +11540,61 @@ fn approve_base_already_landed(store: &crate::store_lock::StoreHandle, id: &str)
             payload: serde_json::json!({}),
             admin_only: false,
         });
+    }
+    merged
+}
+
+/// Whether `guardian` has at least one enabled branch and every enabled branch
+/// is `merged`. Status only -- no git ancestry -- and `false` when there is
+/// nothing to judge, so missing branch info never reads as merged.
+fn every_enabled_branch_merged(guardian: &crate::guardian::GuardianView) -> bool {
+    let mut enabled = guardian.branches.iter().filter(|b| b.enabled).peekable();
+    enabled.peek().is_some() && enabled.all(|b| b.merge_status == MergeStatus::Merged.as_str())
+}
+
+/// Settle `id` to `merged` when every enabled branch is already `merged`,
+/// from `merging`, `in_review` or `merge_failed`. A review with a live PR that
+/// has not merged keeps waiting for the forge-driven transition (RAL-460).
+/// Returns whether the review is now `merged` by this call.
+fn settle_if_all_branches_merged(store: &crate::store_lock::StoreHandle, id: &str) -> bool {
+    let guardian = match store.lock().get_guardian(id) {
+        Ok(g) => g,
+        Err(_) => return false,
+    };
+    if !matches!(
+        guardian.status.as_str(),
+        "merging" | "in_review" | "merge_failed"
+    ) || !every_enabled_branch_merged(&guardian)
+    {
+        return false;
+    }
+    let open_pr = store
+        .lock()
+        .list_pull_requests_for_guardian(id)
+        .unwrap_or_default()
+        .iter()
+        .any(|pr| pr.state != "dropped" && pr.state != "merged");
+    if open_pr {
+        return false;
+    }
+    let detail = "every enabled branch is already merged";
+    let merged = store
+        .lock()
+        .set_guardian_status(id, GuardianStatus::Merged, Some(detail))
+        .is_ok();
+    if merged {
+        crate::cartographer::Note::new("guardian")
+            .guardian(id)
+            .emit(
+                &store.lock(),
+                format!("merged: {detail}"),
+                serde_json::json!({"outcome": "already_merged", "from": guardian.status}),
+            );
+        crate::pr::retire_dual_root_branch_for_guardian(
+            store,
+            &guardian,
+            "review merged: every enabled branch is already merged",
+        );
     }
     merged
 }
@@ -20424,6 +20515,85 @@ mod tests {
     fn manual_commands_prompt_requires_runnable_commands() {
         let prompt = manual_commands_prompt("tail", None);
         assert!(prompt.contains("must be a real, runnable command line"));
+    }
+
+    /// A review with two enabled branches in `from` status; returns the store,
+    /// the review id and the branch ids.
+    fn settle_fixture(
+        from: GuardianStatus,
+        branch_statuses: &[MergeStatus],
+    ) -> (Arc<crate::store_lock::StoreMutex>, String, Vec<String>) {
+        let store = Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
+        let id = store.lock().create_guardian("r", "main", "/repo").unwrap();
+        for (i, status) in branch_statuses.iter().enumerate() {
+            let name = format!("feat-{i}");
+            let guard = store.lock();
+            guard.add_guardian_branch(&id, &name).unwrap();
+            let bid = guard
+                .get_guardian(&id)
+                .unwrap()
+                .branches
+                .iter()
+                .find(|b| b.branch == name)
+                .unwrap()
+                .id
+                .clone();
+            guard.set_branch_status(&id, &bid, *status, None).unwrap();
+        }
+        store.lock().set_guardian_status(&id, from, None).unwrap();
+        let ids = store
+            .lock()
+            .get_guardian(&id)
+            .unwrap()
+            .branches
+            .iter()
+            .map(|b| b.id.clone())
+            .collect();
+        (store, id, ids)
+    }
+
+    #[test]
+    fn settle_marks_review_merged_from_in_review_and_merging() {
+        for from in [GuardianStatus::InReview, GuardianStatus::Merging] {
+            let (store, id, _) = settle_fixture(from, &[MergeStatus::Merged, MergeStatus::Merged]);
+            assert!(settle_if_all_branches_merged(&store, &id));
+            let g = store.lock().get_guardian(&id).unwrap();
+            assert_eq!(g.status.as_str(), GuardianStatus::Merged.as_str());
+        }
+    }
+
+    #[test]
+    fn settle_leaves_review_alone_when_any_branch_is_not_merged() {
+        let (store, id, _) = settle_fixture(
+            GuardianStatus::InReview,
+            &[MergeStatus::Merged, MergeStatus::Done],
+        );
+        assert!(!settle_if_all_branches_merged(&store, &id));
+        let g = store.lock().get_guardian(&id).unwrap();
+        assert_eq!(g.status.as_str(), GuardianStatus::InReview.as_str());
+    }
+
+    #[test]
+    fn settle_never_reads_a_review_without_branches_as_merged() {
+        let (store, id, _) = settle_fixture(GuardianStatus::InReview, &[]);
+        assert!(!settle_if_all_branches_merged(&store, &id));
+        let g = store.lock().get_guardian(&id).unwrap();
+        assert_eq!(g.status.as_str(), GuardianStatus::InReview.as_str());
+    }
+
+    #[test]
+    fn approve_base_already_landed_accepts_a_merging_review() {
+        let (store, id, _) = settle_fixture(GuardianStatus::Merging, &[MergeStatus::Done]);
+        assert!(approve_base_already_landed(&store, &id));
+        let g = store.lock().get_guardian(&id).unwrap();
+        assert_eq!(g.status.as_str(), GuardianStatus::Merged.as_str());
+        assert!(
+            g.branches
+                .iter()
+                .all(|b| b.merge_status == MergeStatus::Merged.as_str())
+        );
     }
 
     #[test]
