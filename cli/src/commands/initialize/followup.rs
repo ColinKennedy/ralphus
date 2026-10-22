@@ -111,8 +111,12 @@ fn run(options: &ExerciseOptions) -> Result<(), String> {
     // Follow-up cells are pooled by the Arbiter under whichever triage type it
     // gives them (the built-in `feature`, or `unclassified` when it cannot
     // classify). A threshold of one drains either pool as soon as a follow-up
-    // cell lands.
+    // cell lands. A drained pool needs its type's upstream for this project,
+    // so both types target the fixture's `main` branch, as the review does.
     for triage_type in ["feature", "unclassified"] {
+        client
+            .set_triage_type_upstream(&fixture.name, triage_type, Some("main"))
+            .map_err(|e| format!("could not set the {triage_type} upstream: {e}"))?;
         client
             .set_triage_pool_threshold(&fixture.name, triage_type, Some(1))
             .map_err(|e| format!("could not set the {triage_type} pool threshold: {e}"))?;
