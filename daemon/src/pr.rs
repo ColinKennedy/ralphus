@@ -2397,13 +2397,39 @@ fn push_ref(
         "--force-with-lease=refs/heads/{alias}:{}",
         expected.0.as_deref().unwrap_or_default()
     );
-    ws.git(&[
-        "push",
-        remote,
-        &lease,
-        &format!("{local}:refs/heads/{alias}"),
-    ])
-    .map(|_| ())
+    let refspec = format!("{local}:refs/heads/{alias}");
+    let args = ["push", remote, lease.as_str(), refspec.as_str()];
+    let mut attempt = 1;
+    loop {
+        match ws.git(&args) {
+            Ok(_) => return Ok(()),
+            // A dropped transport mid-push is retried. The lease still
+            // applies to the retry: if the first attempt did land, the retry
+            // is refused as stale rather than overwriting anything.
+            Err(e) if attempt < PUSH_REF_ATTEMPTS && is_transient_push_transport_error(&e) => {
+                crate::rlog!(
+                    WARNING,
+                    "ralphus [pr] push of {alias} hit a transient transport error \
+                     (attempt {attempt} of {PUSH_REF_ATTEMPTS}); retrying: {e}"
+                );
+                attempt += 1;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+/// How many times [`push_ref`] tries a force-with-lease push that the
+/// transport dropped partway through.
+const PUSH_REF_ATTEMPTS: u32 = 3;
+
+/// Whether a failed `git push` reports the transport dropping mid-transfer
+/// (the remote side or a pipe going away), as opposed to the remote refusing
+/// the update. Only the former is worth retrying.
+fn is_transient_push_transport_error(error: &str) -> bool {
+    error.contains("unexpected disconnect while reading sideband packet")
+        || error.contains("the remote end hung up unexpectedly")
+        || error.contains("write error: Broken pipe")
 }
 
 /// Cancel whatever CI this force-push just superseded (RAL-510) -- called
@@ -15141,6 +15167,21 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&remote_dir);
         let _ = std::fs::remove_dir_all(&clone_dir);
+    }
+
+    #[test]
+    fn transient_push_transport_errors_are_retried_but_refusals_are_not() {
+        assert!(is_transient_push_transport_error(
+            "git push origin --force-with-lease=refs/heads/pr-1:abc x:refs/heads/pr-1 failed: \
+             send-pack: unexpected disconnect while reading sideband packet"
+        ));
+        assert!(is_transient_push_transport_error(
+            "git push origin x failed: fatal: sha1 file '<stdout>' write error: Broken pipe"
+        ));
+        assert!(!is_transient_push_transport_error(
+            "git push origin --force-with-lease=refs/heads/pr-1:abc x:refs/heads/pr-1 failed: \
+             ! [rejected] x -> pr-1 (stale info)"
+        ));
     }
 
     /// The clobber check and the push are separate round-trips. A reviewer
