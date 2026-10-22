@@ -384,14 +384,14 @@ fn an_allocation_needing_an_agent_the_machine_lacks_is_refused_up_front_with_the
         refusal["error"]
             .as_str()
             .unwrap()
-            .contains("box is not ready"),
+            .contains("box is not ready: Claude Code isn't installed on box"),
         "{refusal}"
     );
     assert!(
         refusal["remediation"]
             .as_str()
             .unwrap()
-            .contains("Claude Code isn't installed on box"),
+            .starts_with("install Claude Code on box"),
         "{refusal}"
     );
     let (status, refusal) = ask("typo", json!(["claude code"]));
