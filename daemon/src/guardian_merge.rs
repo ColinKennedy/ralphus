@@ -25545,9 +25545,6 @@ mod tests {
         let parent = base.join("pm-parent");
         std::fs::create_dir_all(&parent).unwrap();
         let before = head_of(&repo);
-        let branches_before = root
-            .git(&["branch", "--list", "--format=%(refname)"])
-            .unwrap();
         std::fs::write(repo.join("later.txt"), "x").unwrap();
         root.git(&["add", "."]).unwrap();
         root.git(&[
@@ -25563,6 +25560,9 @@ mod tests {
         .unwrap();
         let tip = head_of(&repo);
         let post_merge = claim_post_merge_checkout(&root, &root, &parent, &tip).unwrap();
+        let branches_before = root
+            .git(&["for-each-ref", "--format=%(refname)", "refs/heads"])
+            .unwrap();
 
         let dir = claim_named_checkout(
             UPSTREAM_WORKTREE_DIR,
@@ -25579,7 +25579,7 @@ mod tests {
         assert_eq!(head_of(&post_merge), tip, "the other checkout is untouched");
         assert_eq!(head_of(&repo), tip, "the review's own branch does not move");
         assert_eq!(
-            root.git(&["branch", "--list", "--format=%(refname)"])
+            root.git(&["for-each-ref", "--format=%(refname)", "refs/heads"])
                 .unwrap(),
             branches_before,
             "no branch was created or removed for it"

@@ -1740,7 +1740,7 @@ fn queue_upstream_runs_for(
     runners: &LiveRunnerFactory,
     guardian_id: &str,
 ) {
-    use crate::exhibits::{UpstreamFill, UpstreamState};
+    use crate::exhibits::UpstreamState;
     let (guardian, slots) = {
         let guard = store.lock();
         let Ok(g) = guard.get_guardian(guardian_id) else {
@@ -1773,6 +1773,19 @@ fn queue_upstream_runs_for(
             return;
         }
     };
+    queue_upstream_runs_at(store, guardian_id, &slots, &sha);
+    start_worker(store, runners, guardian_id);
+}
+
+/// Queue one `review-upstream` run per action whose marked slots are pending
+/// or were captured at a commit other than `sha`, marking those stale.
+fn queue_upstream_runs_at(
+    store: &crate::store_lock::StoreHandle,
+    guardian_id: &str,
+    slots: &[crate::exhibits::ExhibitSlot],
+    sha: &str,
+) {
+    use crate::exhibits::{UpstreamFill, UpstreamState};
     let mut actions: Vec<i64> = slots
         .iter()
         .filter(|s| s.upstream.is_some())
@@ -1820,7 +1833,7 @@ fn queue_upstream_runs_for(
                 );
             }
         }
-        let queued = guard.queue_upstream_live_run(guardian_id, action_idx, &action.label, &sha);
+        let queued = guard.queue_upstream_live_run(guardian_id, action_idx, &action.label, sha);
         let _ = guard.request_live_refresh_for_guardian(guardian_id);
         drop(guard);
         crate::rlog!(
@@ -1838,7 +1851,6 @@ fn queue_upstream_runs_for(
                 }),
             );
     }
-    start_worker(store, runners, guardian_id);
 }
 
 /// Queue the `review-upstream` runs every review's markers ask for.
@@ -2511,6 +2523,117 @@ prompt = "first"
         let runs = guardian_live_runs_conn(&f.store.lock().conn, &f.gid).unwrap();
         assert!(runs.is_empty(), "{runs:?}");
         assert!(f.agent.prompts.lock().is_empty());
+    }
+
+    /// A fixture with one marked exhibit slot on action 0 whose
+    /// `review-upstream` side is `state` at `sha`.
+    fn marked_fixture(tag: &str, state: crate::exhibits::UpstreamState, sha: &str) -> Fixture {
+        use crate::exhibits::{
+            ExhibitFill, ExhibitKind, ExhibitOrigin, ExhibitRequest, UpstreamFill,
+        };
+        let f = fixture(tag, "ok");
+        let guard = f.store.lock();
+        guard
+            .insert_guardian_live_actions(
+                &f.gid,
+                &[crate::live_actions::NewLiveAction {
+                    label: "Greeting".into(),
+                    prompt: "Check the greeting".into(),
+                    source_cells: vec![format!("cell:{}:0:0", f.squad)],
+                    exhibits: Vec::new(),
+                }],
+            )
+            .unwrap();
+        let keys = guard
+            .add_exhibit_requests(
+                &f.gid,
+                0,
+                ExhibitOrigin::Handoff,
+                &[(
+                    ExhibitRequest::single(ExhibitKind::Screenshot, "the greeting"),
+                    None,
+                )],
+            )
+            .unwrap();
+        guard
+            .set_upstream_fill(
+                &f.gid,
+                keys[0],
+                &UpstreamFill {
+                    state,
+                    upstream_sha: sha.to_string(),
+                    fill: ExhibitFill::default(),
+                },
+            )
+            .unwrap();
+        drop(guard);
+        f
+    }
+
+    fn upstream_runs(f: &Fixture) -> Vec<LiveRunRow> {
+        guardian_live_runs_conn(&f.store.lock().conn, &f.gid)
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.role == ROLE_UPSTREAM)
+            .collect()
+    }
+
+    fn queue_at(f: &Fixture, sha: &str) {
+        let slots = f.store.lock().guardian_exhibit_slots(&f.gid).unwrap();
+        queue_upstream_runs_at(&f.store, &f.gid, &slots, sha);
+    }
+
+    #[test]
+    fn a_pending_marker_queues_exactly_one_upstream_run_at_the_fetched_sha() {
+        let f = marked_fixture("up-pending", crate::exhibits::UpstreamState::Pending, "");
+        queue_at(&f, "abc123");
+        queue_at(&f, "abc123");
+        let runs = upstream_runs(&f);
+        assert_eq!(runs.len(), 1, "{runs:?}");
+        assert_eq!(runs[0].upstream_sha.as_deref(), Some("abc123"));
+        assert_eq!(runs[0].integration, "none");
+        assert!(f.agent.prompts.lock().is_empty());
+    }
+
+    #[test]
+    fn a_capture_at_the_current_upstream_sha_is_not_run_again() {
+        let f = marked_fixture(
+            "up-cached",
+            crate::exhibits::UpstreamState::Captured,
+            "abc123",
+        );
+        queue_at(&f, "abc123");
+        assert!(upstream_runs(&f).is_empty());
+    }
+
+    #[test]
+    fn a_moved_upstream_marks_the_side_stale_and_queues_a_rerun() {
+        let f = marked_fixture(
+            "up-moved",
+            crate::exhibits::UpstreamState::Captured,
+            "abc123",
+        );
+        queue_at(&f, "def456");
+        assert_eq!(upstream_runs(&f).len(), 1);
+        let slots = f.store.lock().guardian_exhibit_slots(&f.gid).unwrap();
+        assert_eq!(
+            slots[0].upstream.as_ref().unwrap().state,
+            crate::exhibits::UpstreamState::Stale
+        );
+    }
+
+    #[test]
+    fn an_upstream_run_never_counts_as_the_automatic_run() {
+        let f = marked_fixture("up-auto", crate::exhibits::UpstreamState::Pending, "");
+        queue_at(&f, "abc123");
+        assert!(
+            f.store
+                .lock()
+                .get_guardian(&f.gid)
+                .unwrap()
+                .live_actions_auto_ran_at_ms
+                .is_none()
+        );
     }
 
     /// A fixture whose agent reports a resumable session and answers a resume
