@@ -367,9 +367,10 @@
        * @param {string} text - The exact command text that was parsed.
        * @param {ShellSyntaxParse} p
        * @param {(s: string) => string} escFn - HTML escaper.
+       * @param {{isOpen: (id: string) => boolean, toggleAttr: string}} [hd] - Heredoc open state: `isOpen("row:ordinal")` and the `ontoggle` handler source.
        * @returns {string}
        */
-      function shellSyntaxRowsHtml(text, p, escFn) {
+      function shellSyntaxRowsHtml(text, p, escFn, hd) {
         const bytes = new TextEncoder().encode(text);
         const dec = new TextDecoder();
         /**
@@ -378,7 +379,7 @@
          * @returns {string}
          */
         const slice = (a, b) => dec.decode(bytes.subarray(a, b));
-        return p.commands.map((c) => {
+        return p.commands.map((c, rowIdx) => {
           let pos = c.start;
           let html = "";
           /** @type {string[]} */
@@ -397,7 +398,11 @@
           }
           html += escFn(slice(pos, c.end));
           const sep = c.sep === "" ? "" : `<span class="alog-sh-sep" data-tip="Joins this command to the previous one.">${escFn(c.sep)}</span>`;
-          const blocks = docs.map((d) => `<details class="alog-sh-heredoc"><summary data-tip="The heredoc / here-string body, kept collapsed and unhighlighted.">heredoc · ${d.split("\n").length} lines</summary><pre>${escFn(d)}</pre></details>`).join("");
+          const blocks = docs.map((d, ord) => {
+            const id = `${rowIdx}:${ord}`;
+            const state = hd === undefined ? "" : ` data-hd="${id}"${hd.isOpen(id) ? " open" : ""} ontoggle="${hd.toggleAttr}"`;
+            return `<details class="alog-sh-heredoc"${state}><summary data-tip="The heredoc / here-string body, kept collapsed and unhighlighted.">heredoc · ${d.split("\n").length} lines</summary><pre>${escFn(d)}</pre></details>`;
+          }).join("");
           return `<div class="alog-sh-row">${sep}${html}${blocks}</div>`;
         }).join("");
       }
@@ -407,6 +412,8 @@
       const agentLogFilter = {};
       /** @type {{[key: string]: {[index: number]: boolean}}} Which entries the reader expanded, by call index. */
       const agentLogOpen = {};
+      /** @type {{[key: string]: {[index: number]: {[id: string]: boolean}}}} Heredoc blocks the reader opened or closed, by call index then "row:ordinal". */
+      const agentLogHeredocOpen = {};
       /** @type {{[key: string]: boolean}} Runs whose older entries were revealed. */
       const agentLogAll = {};
       /** @type {{[key: string]: number}} Scroll offset of each run's widget list. */
@@ -494,11 +501,16 @@
           ? `<span class="alog-sh-more" data-tip="This call runs ${more} more command${more === 1 ? "" : "s"} after the one shown.\nExpand it to see every row.">+${more} more</span>`
           : "";
         const cmdText = shellCommandText(e.args);
+        const hdMap = agentLogHeredocOpen[key] && agentLogHeredocOpen[key][e.index];
+        const heredocState = {
+          isOpen: (/** @type {string} */ id) => !!(hdMap && hdMap[id]),
+          toggleAttr: `agentLogHeredocToggled(this,'${esc(key).replace(/'/g, "&#39;")}')`,
+        };
         const inputHtml = e.args.length === 0
           ? `<pre class="alog-pre">${esc(e.input) || "(none)"}</pre>`
           : e.args.map((a) => {
             const body = parse !== null && !raw && a.value === cmdText && (a.key === "command" || a.key === "cmd")
-              ? `<div class="alog-sh" data-tip="Syntax-highlighted view of the command. Display-only and optional: it never changes what ran, and the raw text is one click away.">${shellSyntaxRowsHtml(a.value, parse, esc)}</div>`
+              ? `<div class="alog-sh" data-tip="Syntax-highlighted view of the command. Display-only and optional: it never changes what ran, and the raw text is one click away.">${shellSyntaxRowsHtml(a.value, parse, esc, heredocState)}</div>`
               : `<pre class="alog-pre">${esc(a.value)}</pre>`;
             return `<div class="alog-kv"><span class="alog-k" data-tip="The &quot;${esc(a.key)}&quot; argument of this call.">${esc(a.key)}</span>${body}</div>`;
           }).join("");
@@ -641,6 +653,21 @@
           const entry = memo === undefined ? undefined : memo.entries.find((x) => x.index === idx);
           if (entry !== undefined) void ensureAgentLogShellSyntax(key, entry);
         }
+      }
+      /**
+       * Remembers whether a heredoc block inside a widget is expanded.
+       * @param {HTMLDetailsElement} el
+       * @param {string} key
+       * @returns {void}
+       */
+      function agentLogHeredocToggled(el, key) {
+        const w = el.closest(".alog-w");
+        const id = el.dataset.hd;
+        if (!(w instanceof HTMLElement) || id === undefined) return;
+        const idx = Number(w.dataset.idx);
+        const byCall = agentLogHeredocOpen[key] || (agentLogHeredocOpen[key] = {});
+        const m = byCall[idx] || (byCall[idx] = {});
+        m[id] = el.open;
       }
       /**
        * Remembers the list's scroll offset.
