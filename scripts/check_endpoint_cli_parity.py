@@ -100,6 +100,7 @@ ENDPOINT_TO_CLI: dict[str, list[str]] = {
     "GET /api/machines/targets/health": ["check health"],
     "GET /api/triage/types": ["triage type list"],
     "POST /api/triage/types": ["triage type register"],
+    "POST /api/triage/types/upstream": ["triage type upstream"],
     "GET /api/triage/types/{name}": ["triage type get"],
     "DELETE /api/triage/types/{name}": ["triage type deregister"],
     "GET /api/presets": ["preset list"],
