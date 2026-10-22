@@ -2245,6 +2245,9 @@ prompt=\"y\"
             let mut guard = store.lock();
             let squad_id = completed_pool_cell(&mut guard);
             guard
+                .set_triage_type_upstream("proj", "security", Some("main"))
+                .unwrap();
+            guard
                 .record_triage_pool_cell("proj", "security", &squad_id, 0, 0, "b1", "main")
                 .unwrap();
             // Anchored a few seconds in the past so this "every second" cron
@@ -2282,6 +2285,9 @@ prompt=\"y\"
             let mut guard = store.lock();
             // One straggler each in the plain pool and two subproject pools,
             // none of which individually reached any count threshold.
+            guard
+                .set_triage_type_upstream("proj", "bug", Some("main"))
+                .unwrap();
             let squad_1 = completed_pool_cell(&mut guard);
             guard
                 .record_triage_pool_cell("proj", "bug", &squad_1, 0, 0, "b1", "main")

@@ -38134,6 +38134,9 @@ remediation_attempts=1
     #[test]
     fn force_drain_triage_pool_route_creates_a_review_below_threshold() {
         let d = daemon();
+        d.lock()
+            .set_triage_type_upstream("proj", "bug", Some("main"))
+            .unwrap();
         pool_a_finished_cell(&d, "proj", "bug", "b1");
         let r = route(
             &d,
@@ -38211,6 +38214,9 @@ remediation_attempts=1
         std::fs::create_dir_all(&dir).unwrap();
         d.lock()
             .register_project("proj", "", &dir.to_string_lossy(), "none")
+            .unwrap();
+        d.lock()
+            .set_triage_type_upstream("proj", "bug", Some("main"))
             .unwrap();
         pool_a_finished_cell(&d, "proj", "bug", "b1");
 
