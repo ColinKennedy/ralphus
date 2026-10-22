@@ -500,7 +500,11 @@ Response `200` (sent before the daemon actually exits):
 ### `POST /api/ingest`
 Attach existing branches, and any open PRs on them, to a review (RAL-702;
 `ralphus ingest`). Body: `{path, branches[], review_id?, pr?, base?, prompt?,
-label?, dry_run?}`. `path` is the git checkout (registered project or not).
+label?, dry_run?, ralphus_extras?, infer_live_actions?, extras_exhibits?,
+extras_insights?}`. The `ralphus_extras` umbrella enables the three individual
+opt-ins; the plan echoes them as `extras` and, for live-action inference, each
+branch's `inference_diff_chars` / `inference_diff_truncated` (diff against the
+branch beneath it, capped at 30,000 characters). `path` is the git checkout (registered project or not).
 With `dry_run: true` nothing is created and the plan is returned (`200`):
 `base` and `base_rule`, `agent`/`model` and `agent_rule`, `branches[]`
 (`branch`, `pr_number`, `pr_url`, `description_source`), `warnings`, and
