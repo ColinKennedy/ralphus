@@ -553,10 +553,6 @@
           originalLiveActionAgent: g.live_action_agent || "",
           liveActionModel: g.live_action_model || "",
           originalLiveActionModel: g.live_action_model || "",
-          liveActionAgent: g.live_action_agent || "",
-          originalLiveActionAgent: g.live_action_agent || "",
-          liveActionModel: g.live_action_model || "",
-          originalLiveActionModel: g.live_action_model || "",
           proofScope, originalProofScope: proofScope,
           ciDeferral, originalCiDeferral: ciDeferral,
           proofSkipAutoClean, originalProofSkipAutoClean: proofSkipAutoClean,
@@ -673,39 +669,6 @@
        * @returns {void}
        */
       function onEditResolverModel(value) { if (reviewEditDraft) reviewEditDraft.resolverModel = value; }
-      /**
-       * Switches this review's live actions between the resolver agent and
-       * their own agent; re-renders so the agent/model fields appear or hide.
-       * @param {boolean} same - true = use the resolver agent.
-       * @returns {void}
-       */
-      function onEditLiveActionSame(same) {
-        if (!reviewEditDraft) return;
-        if (same) {
-          reviewEditDraft.liveActionAgent = "";
-          reviewEditDraft.liveActionModel = "";
-        } else {
-          reviewEditDraft.liveActionAgent = reviewEditDraft.resolverAgent || "claude-code";
-        }
-        renderReviewEditModal();
-      }
-      /**
-       * Stages a new live-action agent and drops the model, which belongs to the previous agent.
-       * @param {string} value
-       * @returns {void}
-       */
-      function onEditLiveActionAgent(value) {
-        if (!reviewEditDraft) return;
-        reviewEditDraft.liveActionAgent = value;
-        reviewEditDraft.liveActionModel = "";
-        renderReviewEditModal();
-      }
-      /**
-       * Stages a new live-action model value, leaving focus in the text field.
-       * @param {string} value
-       * @returns {void}
-       */
-      function onEditLiveActionModel(value) { if (reviewEditDraft) reviewEditDraft.liveActionModel = value; }
       /**
        * Switches this review's live actions between the resolver agent and
        * their own agent; re-renders so the agent/model fields appear or hide.
