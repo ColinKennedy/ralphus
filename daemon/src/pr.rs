@@ -4633,6 +4633,26 @@ pub(crate) fn defers_full_ci(mode: &str, index: usize, count: usize) -> bool {
     }
 }
 
+/// Whether a PR/MR created now for `branch_id` is born deferred.
+///
+/// The position comes from the review's whole branch order -- every enabled
+/// branch that is not `merged`/`closed`, including ones not yet rebased and so
+/// not yet submittable -- so a middle branch is labelled at creation even when
+/// it is momentarily the newest PR. If the later branches never join, they are
+/// disabled and [`reconcile_ci_deferral`] removes the label.
+fn defers_full_ci_at_creation(guardian: &GuardianView, branch_id: &str) -> bool {
+    let mut members: Vec<&BranchView> = guardian
+        .branches
+        .iter()
+        .filter(|b| b.enabled && !matches!(b.merge_status.as_str(), "merged" | "closed"))
+        .collect();
+    members.sort_by_key(|b| b.position);
+    members
+        .iter()
+        .position(|b| b.id == branch_id)
+        .is_some_and(|index| defers_full_ci(&guardian.effective_ci_deferral, index, members.len()))
+}
+
 /// Put [`ralphus_core::schema::DEFER_FULL_CI_LABEL`] on exactly the open
 /// stack members the review's `ci_deferral` mode defers, and take it off every
 /// other one, on the forge. The stack is the review's open `parent`-kind PRs/
@@ -9497,16 +9517,7 @@ fn submit_stacked_branch_pr(
             }
             // The label is decided against the stack as currently intended;
             // `reconcile_ci_deferral` corrects it if the final shape differs.
-            let defer_label = ordered_enabled_branches
-                .iter()
-                .position(|b| b.id == branch.id)
-                .is_some_and(|index| {
-                    defers_full_ci(
-                        &guardian.effective_ci_deferral,
-                        index,
-                        ordered_enabled_branches.len(),
-                    )
-                });
+            let defer_label = defers_full_ci_at_creation(guardian, &branch.id);
             let initial_labels: &[&str] = if defer_label {
                 &[ralphus_core::schema::DEFER_FULL_CI_LABEL]
             } else {
@@ -24257,7 +24268,10 @@ token_env = "RALPHUS_TEST_FORGE_TOKEN"
             &root,
             "origin",
             &guardian,
-            &ordered_enabled,
+            // The auto-submit pass only lists branches already rebased, so
+            // the not-yet-done upper branch is absent here; the label must
+            // still follow the review's full branch order.
+            &ordered_enabled[..1],
             &mut alias_by_branch,
             "main",
             branch,
