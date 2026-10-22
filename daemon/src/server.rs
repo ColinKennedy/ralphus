@@ -1464,6 +1464,11 @@ fn route_for_user(
         ("POST", ["api", "triage", "types"]) => {
             admin_gated(daemon, user_header, || register_triage_type(daemon, body))
         }
+        ("POST", ["api", "triage", "types", "upstream"]) => {
+            admin_gated(daemon, user_header, || {
+                set_triage_type_upstream(daemon, body)
+            })
+        }
         ("GET", ["api", "triage", "types", name]) => {
             admin_gated(daemon, user_header, || get_triage_type(daemon, name))
         }
@@ -4459,6 +4464,64 @@ struct RegisterTriageTypeBody {
     label: String,
     #[serde(default)]
     description: String,
+    /// RAL-637: with `upstream`, also sets that project's upstream branch
+    /// for this type. `project` and `upstream` come together or not at all.
+    #[serde(default)]
+    project: Option<String>,
+    #[serde(default)]
+    upstream: Option<String>,
+}
+
+/// `POST /api/triage/types/upstream` body (RAL-637). `upstream: null` clears.
+#[derive(Deserialize)]
+struct SetTriageTypeUpstreamBody {
+    project: String,
+    triage_type: String,
+    #[serde(default)]
+    upstream: Option<String>,
+}
+
+/// `POST /api/triage/types/upstream`: set (or clear) the branch reviews
+/// drained from a `(project, triage_type)` pool target (RAL-637). Shape-checked
+/// only; the branch is not required to exist.
+fn set_triage_type_upstream(daemon: &Daemon, body: &str) -> Reply {
+    let Ok(req) = serde_json::from_str::<SetTriageTypeUpstreamBody>(body) else {
+        return error(
+            400,
+            "bad_request",
+            "body must include \"project\" and \"triage_type\" strings",
+            vec![],
+        );
+    };
+    let upstream = req.upstream.as_deref().map(str::trim);
+    if let Some(u) = upstream {
+        if let Err(msg) = crate::triage::validate_upstream_ref(u) {
+            return error(400, "invalid_value", &msg, vec![]);
+        }
+    }
+    let store = daemon.lock();
+    match store.get_triage_type(&req.triage_type) {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            return error(
+                404,
+                "not_found",
+                &format!("triage type \"{}\" is not registered", req.triage_type),
+                vec![],
+            );
+        }
+        Err(e) => return store_error(&e),
+    }
+    let project = crate::triage::resolve_pool_key_input(&store, &req.project);
+    match store.set_triage_type_upstream(&project, req.triage_type.trim(), upstream) {
+        Ok(()) => json(
+            200,
+            &serde_json::json!({
+                "project": project, "triage_type": req.triage_type.trim(), "upstream": upstream,
+            }),
+        ),
+        Err(e) => store_error(&e),
+    }
 }
 
 #[derive(Serialize)]
@@ -4480,13 +4543,34 @@ fn register_triage_type(daemon: &Daemon, body: &str) -> Reply {
     if name.is_empty() {
         return error(400, "invalid_value", "'name' must not be empty", vec![]);
     }
-    match daemon
-        .lock()
-        .register_triage_type(name, &req.label, &req.description)
-    {
-        Ok(()) => json(201, &serde_json::json!({"name": name})),
-        Err(e) => store_error(&e),
+    let upstream = match (&req.project, req.upstream.as_deref().map(str::trim)) {
+        (Some(project), Some(upstream)) => {
+            if let Err(msg) = crate::triage::validate_upstream_ref(upstream) {
+                return error(400, "invalid_value", &msg, vec![]);
+            }
+            Some((project.as_str(), upstream))
+        }
+        (None, None) => None,
+        _ => {
+            return error(
+                400,
+                "bad_request",
+                "'project' and 'upstream' must be given together",
+                vec![],
+            );
+        }
+    };
+    let store = daemon.lock();
+    if let Err(e) = store.register_triage_type(name, &req.label, &req.description) {
+        return store_error(&e);
     }
+    if let Some((project, upstream)) = upstream {
+        let project = crate::triage::resolve_pool_key_input(&store, project);
+        if let Err(e) = store.set_triage_type_upstream(&project, name, Some(upstream)) {
+            return store_error(&e);
+        }
+    }
+    json(201, &serde_json::json!({"name": name}))
 }
 
 /// `GET /api/triage/types`: every registered Triage type (including the
@@ -23086,6 +23170,7 @@ fn manual_action_label(method: &str, segs: &[&str]) -> Option<&'static str> {
         ("POST", ["api", "machines"]) => "register machine",
         ("DELETE", ["api", "machines", _]) => "deregister machine",
         ("POST", ["api", "triage", "types"]) => "register triage type",
+        ("POST", ["api", "triage", "types", "upstream"]) => "set triage type upstream",
         ("DELETE", ["api", "triage", "types", _]) => "deregister triage type",
         ("POST", ["api", "triage", "schedules"]) => "add triage schedule",
         ("DELETE", ["api", "triage", "schedules", _]) => "remove triage schedule",
@@ -38241,6 +38326,9 @@ remediation_attempts=1
     #[test]
     fn force_drain_triage_pool_route_creates_a_review_below_threshold() {
         let d = daemon();
+        d.lock()
+            .set_triage_type_upstream("proj", "bug", Some("main"))
+            .unwrap();
         pool_a_finished_cell(&d, "proj", "bug", "b1");
         let r = route(
             &d,
@@ -38318,6 +38406,9 @@ remediation_attempts=1
         std::fs::create_dir_all(&dir).unwrap();
         d.lock()
             .register_project("proj", "", &dir.to_string_lossy(), "none")
+            .unwrap();
+        d.lock()
+            .set_triage_type_upstream("proj", "bug", Some("main"))
             .unwrap();
         pool_a_finished_cell(&d, "proj", "bug", "b1");
 

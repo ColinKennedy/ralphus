@@ -21,6 +21,8 @@ pub fn dispatch(options: &ExerciseOptions) -> i32 {
         "exercise",
         "Exercise",
         "A deterministic guided-exercise type.",
+        Some(&project),
+        Some("main"),
     ) {
         return fail(&format!("could not register type: {error}"));
     }

@@ -3267,6 +3267,17 @@ impl Store {
                 updated_at_ms   INTEGER NOT NULL,
                 PRIMARY KEY (project, triage_type)
             );
+            -- RAL-637: the branch a review drained from a (project,
+            -- triage_type) pool targets. Read at drain time; a separate table
+            -- (not a `triage_types` column) because a type's upstream is per
+            -- project, and startup seeding of `triage_types` never touches it.
+            CREATE TABLE IF NOT EXISTS triage_type_upstreams (
+                project       TEXT NOT NULL,
+                triage_type   TEXT NOT NULL,
+                upstream      TEXT NOT NULL,
+                updated_at_ms INTEGER NOT NULL,
+                PRIMARY KEY (project, triage_type)
+            );
             -- RAL-318: one independent cron-style schedule entry for a
             -- (project, triage_type) pool. `anchor_date_ms` establishes
             -- interval parity (e.g. \"every other Monday\") together with

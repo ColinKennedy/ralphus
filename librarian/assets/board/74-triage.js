@@ -796,6 +796,11 @@
         const queued = triageCandidatesFor(p, "queued");
         const unpooled = triageUnpooledCandidatesFor(p, "queued");
         const inflight = triageCandidatesFor(p, "scheduled");
+        const upstream = triageUpstreamFor(p);
+        h += `<h3 class="section">Review upstream</h3>`
+          + (upstream
+            ? `<div class="tri-hint mono" data-tip="Reviews drained from this pool target this branch, overriding the project's review default.">${esc(upstream)}</div>`
+            : `<div class="tri-err" data-tip="Without an upstream this pool will not drain. Press Edit to set one.">not set — this pool will not drain</div>`);
         h += `<h3 class="section">Triggers</h3>${triageTriggersHtml(p, true)}`;
         h += `<h3 class="section">Pooled cells <span style="color:var(--faint)">${queued.length}</span></h3>`
           + (queued.length ? queued.map((c) => triageCellRowHtml(c, "Jump to this cell on the Squads tab — selects its squad, task, and cell.")).join("")
@@ -817,13 +822,31 @@
       }
 
       /**
+       * The review upstream branch registered for this pool's type in its
+       * project, or "" when none is set. A subproject pool key (`base::sub`)
+       * shares its base project's upstream.
+       * @param {TriagePoolView} p
+       * @returns {string}
+       */
+      function triageUpstreamFor(p) {
+        const t = triageTypes.find((x) => x.name === p.triage_type);
+        const base = p.project.split("::")[0];
+        const u = t && (t.upstreams || []).find((x) => x.project === base);
+        return u ? u.upstream : "";
+      }
+      /**
        * Edit mode's form: the count threshold plus one block per cron schedule.
        * Inputs carry ids so `preserveUserState` keeps focus across a poll.
        * @returns {string}
        */
       function triagePaneEditFormHtml() {
         const e = /** @type {TriagePaneEditDraft} */ (triagePaneEdit);
-        let h = `<h3 class="section">Count threshold</h3>`
+        let h = `<h3 class="section">Review upstream</h3>`
+          + `<div class="tri-tedit" onkeydown="triagePaneEditKey(event)">`
+          + `<div class="tri-tedit-row"><label for="tri-pe-up">Branch</label>`
+          + `<input id="tri-pe-up" class="mono" type="text" placeholder="required" value="${esc(e.upstream)}" data-tip="The branch reviews drained from this pool are based on. Overrides the project's review default.
+Required: a pool without one does not drain." /></div></div>`
+          + `<h3 class="section">Count threshold</h3>`
           + `<div class="tri-tedit" onkeydown="triagePaneEditKey(event)">`
           + `<div class="tri-tedit-row"><label for="tri-pe-n">Every</label>`
           + `<input id="tri-pe-n" class="tri-n mono" type="number" min="1" step="1" placeholder="none" value="${esc(e.threshold)}" oninput="triagePaneEditHints()" data-tip="Drain once this many viable cells are pooled, in threshold-sized batches — each full batch becomes its own review.\nLeave blank for no count trigger." />`
@@ -861,6 +884,7 @@
         triagePaneEdit = {
           key: triagePreviewKey(p.project, p.triage_type),
           threshold: p.threshold === null || p.threshold === undefined ? "" : String(p.threshold),
+          upstream: triageUpstreamFor(p),
           scheds: triageSchedulesFor(p).map((s) => ({
             id: s.id, cron: s.cron_expr, every: String(s.every_n),
             anchor: new Date(s.anchor_date_ms).toISOString().slice(0, 10),
@@ -885,6 +909,8 @@
         const n = /** @type {HTMLInputElement|null} */ (document.getElementById("tri-pe-n"));
         if (!n) return;
         e.threshold = n.value;
+        const up = /** @type {HTMLInputElement|null} */ (document.getElementById("tri-pe-up"));
+        if (up) e.upstream = up.value;
         document.querySelectorAll(".tri-pe-sched").forEach((row) => {
           const d = e.scheds[Number(row.getAttribute("data-i"))];
           if (!d) return;
@@ -986,6 +1012,13 @@
         });
         const existing = triageSchedulesFor(p);
         try {
+          const upstream = e.upstream.trim();
+          if (upstream !== triageUpstreamFor(p)) {
+            const r = await send("/api/triage/types/upstream", "POST", {
+              project: p.project.split("::")[0], triage_type: p.triage_type, upstream: upstream === "" ? null : upstream,
+            });
+            if (!r.ok) throw new Error(await responseError(r, "saving the upstream failed"));
+          }
           const raw = e.threshold.trim();
           const threshold = raw === "" ? null : Number(raw);
           if (threshold !== (p.threshold ?? null)) {

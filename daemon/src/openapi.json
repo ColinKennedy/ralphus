@@ -9792,6 +9792,37 @@
         }
       }
     },
+    "/api/triage/types/upstream": {
+      "post": {
+        "operationId": "postTriageTypesUpstream",
+        "summary": "Backs `ralphus triage type upstream`.",
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/JsonObject"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Success.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/JsonValue"
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
     "/api/triage/types/{name}": {
       "get": {
         "operationId": "getTriageTypesByName",

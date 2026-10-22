@@ -1455,6 +1455,7 @@ mod tests {
             label: label.to_string(),
             description: description.to_string(),
             created_at_ms: 0,
+            upstreams: Vec::new(),
         }
     }
 

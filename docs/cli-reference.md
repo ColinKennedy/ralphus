@@ -970,7 +970,8 @@ use; see `READ_ONLY_NOTE`.
             - deregister name [str]  {Remove a Triage type. The built-in "unclassified" type can never be deregistered.}
             - (read-only-safe) get name [str]  {Show one registered Triage type by exact name.}
             - (read-only-safe) list  {List every registered Triage type, including the built-in "unclassified" type.}
-            - register name [str] --description [text] --label [text]  {Register (or update) a Triage type -- the categories the Arbiter classifies a Triage-opted-in cell into (RAL-318).}
+            - register name [str] --description [text] --label [text] --project [str] --upstream [str]  {Register (or update) a Triage type -- the categories the Arbiter classifies a Triage-opted-in cell into (RAL-318). Pass --project and --upstream together to also set the branch that project's reviews for this type target.}
+            - upstream project [str] triage_type [str] --clear --upstream [str]  {Set (or --clear) the review upstream branch for a (project, triage_type) pair (RAL-637). A drained pool's review targets this branch, overriding the project's review default; a pool with no upstream is not drained.}
     - (read-only-safe) tutor  {Print the Task TOML schema reference and worked examples. (Rust port hoists Python's `task show-tutor` to this top-level command.)}
     - user  {Manage a ralphus user's own forge personal access tokens (RAL-338 follow-up).}
         - (read-only-safe) check-forge-token user [str] host [str]  {Run a manual connectivity check of a ralphus user's stored personal access token for one forge host: the daemon authenticates against the forge with it and reports whether the token works (and as whom) and whether the forge is reachable. Never returns the token.}
