@@ -2986,6 +2986,8 @@ impl Store {
                 why           TEXT,
                 created_at_ms INTEGER NOT NULL,
                 alternatives  TEXT,
+                compare       TEXT,
+                marker_key    TEXT,
                 PRIMARY KEY (guardian_id, action_idx, slot_idx)
             );
             -- Exhibit requests the PR writer added before the review had a
@@ -2999,7 +3001,9 @@ impl Store {
                 why           TEXT,
                 origin        TEXT NOT NULL DEFAULT 'inferred',
                 created_at_ms INTEGER NOT NULL,
-                alternatives  TEXT
+                alternatives  TEXT,
+                compare       TEXT,
+                marker_key    TEXT
             );
             -- What a live run delivered for an exhibit slot; a re-run
             -- replaces the row.
@@ -3534,6 +3538,12 @@ impl Store {
             // Fallback (kind, describe) pairs of an exhibit request, as JSON.
             "ALTER TABLE guardian_exhibit_requests ADD COLUMN alternatives TEXT",
             "ALTER TABLE guardian_pending_exhibits ADD COLUMN alternatives TEXT",
+            // The comparison target of an exhibit request (`review-upstream`)
+            // and the key the PR writer's description markers refer to it by.
+            "ALTER TABLE guardian_exhibit_requests ADD COLUMN compare TEXT",
+            "ALTER TABLE guardian_exhibit_requests ADD COLUMN marker_key TEXT",
+            "ALTER TABLE guardian_pending_exhibits ADD COLUMN compare TEXT",
+            "ALTER TABLE guardian_pending_exhibits ADD COLUMN marker_key TEXT",
             "ALTER TABLE guardian_live_run_evidence ADD COLUMN original_result TEXT",
             // A scored-proof threshold a preset supplies to an extending
             // proof step's unset `pass_score`.

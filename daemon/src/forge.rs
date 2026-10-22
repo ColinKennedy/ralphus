@@ -11076,7 +11076,68 @@ mod live_exhibit_tests {
         let read = client.get_pull_request_description(number).expect("read");
         assert!(read.contains(&up.url), "{read}");
         assert!(read.contains("ralphus:exhibit:start"), "{read}");
+        keyed_table_round_trip(client, number, &up.url);
         up
+    }
+
+    /// A before/after pair inside a markdown table survives the forge, and
+    /// filling it in place leaves every surrounding byte as it was.
+    fn keyed_table_round_trip(client: &ForgeClient, number: i64, url: &str) {
+        use crate::exhibits::{
+            KeyedBlock, MarkerSide, SlotKey, normalize_markers, splice_keyed, upstream_marker_keys,
+        };
+        let written = normalize_markers(
+            "Intro.
+
+| Before | After |
+|---|---|
+| <<exhibit:zoom:review-upstream>> | <<exhibit:zoom:after>> |
+
+Outro.",
+            &["zoom".to_string()],
+        );
+        assert_eq!(written.placed.len(), 2);
+        client
+            .update_pull_request_description(number, &written.body)
+            .expect("write keyed markers");
+        let read = client.get_pull_request_description(number).expect("read");
+        assert_eq!(upstream_marker_keys(&read), ["zoom"], "{read}");
+        let slot = SlotKey {
+            action_idx: 0,
+            slot_idx: 0,
+        };
+        let filled = splice_keyed(
+            &read,
+            &[KeyedBlock {
+                slot,
+                marker_key: "zoom".to_string(),
+                side: MarkerSide::After,
+                content: format!("![after]({url})"),
+            }],
+        );
+        assert_eq!(filled.placed, [slot]);
+        assert!(filled.damaged.is_empty());
+        client
+            .update_pull_request_description(number, &filled.body)
+            .expect("write filled markers");
+        let again = client.get_pull_request_description(number).expect("read");
+        assert!(again.contains(&format!("![after]({url})")), "{again}");
+        assert!(again.starts_with(
+            "Intro.
+
+| Before | After |
+|---|---|
+| "
+        ));
+        assert!(
+            again.ends_with(
+                " |
+
+Outro."
+            ),
+            "{again}"
+        );
+        assert_eq!(upstream_marker_keys(&again), ["zoom"], "{again}");
     }
 
     #[test]

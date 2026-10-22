@@ -5700,7 +5700,16 @@ the daemon remains its only writer. Only the text between a slot's own markers
 is rewritten; a slot whose markers were edited is skipped and logged.
 `GET /api/guardians/{id}/exhibits` lists a review's slots with their fills,
 and `GET /api/guardians/{id}/exhibits/{action}/{slot}/file` serves a slot's
-captured file (the board shows it while it is not uploaded). See
+captured file (the board shows it while it is not uploaded). A PR writer's
+request may carry a `key` and `compare` (`review-upstream`); both are stored
+(`guardian_exhibit_requests.compare` / `marker_key`, and the same two columns on
+the pending table), shown to the writer as a hint, and used to fill the
+`<!-- ralphus:exhibit:start key=<k> side=<after|review-upstream> -->` pairs the
+writer placed anywhere in the description: only the text between a pair's
+markers is rewritten, a slot with an `after` pair there gets no block in the
+managed section, and no `review-upstream` block is ever appended. Slots whose
+`review-upstream` pair is present are recorded in the Cartographer ("exhibit
+slots need an upstream run"); capturing that side is a separate step. See
 [`exhibits.md`](exhibits.md) for the request/report syntax and limits.
 
 A live agent ends its reply with `RALPHUS_LIVE_RESULT: {"verdict": "...",

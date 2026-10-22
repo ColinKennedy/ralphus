@@ -47,6 +47,36 @@ pub enum ExhibitKind {
     TerminalText,
 }
 
+/// What a before/after comparison is made against. The only target is the
+/// review's base branch on its remote (the same meaning as `[[review]]
+/// upstream`), so the "before" side shows the code without the review's changes.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, Deserialize,
+)]
+pub enum CompareTarget {
+    #[serde(rename = "review-upstream")]
+    ReviewUpstream,
+}
+
+impl CompareTarget {
+    /// The stored/written name.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ReviewUpstream => "review-upstream",
+        }
+    }
+
+    /// Parse a target name, ignoring case and surrounding space.
+    #[must_use]
+    pub fn parse(name: &str) -> Option<Self> {
+        let name = name.trim();
+        [Self::ReviewUpstream]
+            .into_iter()
+            .find(|t| t.as_str().eq_ignore_ascii_case(name))
+    }
+}
+
 impl ExhibitKind {
     /// Every kind, in declaration order.
     pub const ALL: [ExhibitKind; 4] =

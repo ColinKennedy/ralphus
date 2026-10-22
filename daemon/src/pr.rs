@@ -3138,6 +3138,50 @@ fn pr_writer_spec(
 /// line, and its answer is accepted only if it kept the description intact and
 /// carries the line exactly once. If the agent is unavailable or answers badly,
 /// the line is appended at the bottom so it is never missing.
+/// Turn the exhibit tokens the writer placed into marker pairs. A token the
+/// writer got wrong is left as written and logged.
+fn place_exhibit_markers(
+    store: &crate::store_lock::StoreHandle,
+    guardian: &GuardianView,
+    branch_id: &str,
+    description: &str,
+) -> String {
+    if !description.contains(crate::exhibits::TOKEN_OPEN) {
+        return description.to_string();
+    }
+    let keys: Vec<String> = store
+        .lock()
+        .exhibit_marker_keys(&guardian.id)
+        .unwrap_or_default();
+    let normalized = crate::exhibits::normalize_markers(description, &keys);
+    if !normalized.unknown.is_empty() {
+        crate::rlog!(
+            WARNING,
+            "ralphus [pr] review {} branch {branch_id}: {} exhibit token(s) left as written (unknown side or key): {}",
+            guardian.id,
+            normalized.unknown.len(),
+            normalized.unknown.join(" ")
+        );
+    }
+    if !normalized.placed.is_empty() {
+        crate::cartographer::Note::new("guardian")
+            .guardian(&guardian.id)
+            .scope("live_action")
+            .emit(
+                &store.lock(),
+                "exhibit markers placed in PR description",
+                serde_json::json!({
+                    "branch_id": branch_id,
+                    "markers": normalized.placed.iter()
+                        .map(|(k, s)| format!("{k}:{}", s.as_str()))
+                        .collect::<Vec<_>>(),
+                    "unknown": normalized.unknown,
+                }),
+            );
+    }
+    normalized.body
+}
+
 fn attribute_description(
     runner: &dyn Runner,
     guardian: &GuardianView,
@@ -9437,6 +9481,7 @@ fn submit_stacked_branch_pr(
             }
             let description =
                 attribute_description(runner, guardian, position, trace_context, &description);
+            let description = place_exhibit_markers(store, guardian, branch_id, &description);
             let description = match format_prophecy_details_block(&reviewer_relevant_prophecies) {
                 Some(block) => format!("{description}\n\n{block}"),
                 None => description,

@@ -1511,8 +1511,29 @@ pub fn refresh_pr_with(
         None => current.clone(),
     };
     if !exhibit_slots.is_empty() {
+        // Slots the PR writer addressed with a marker are filled where the
+        // writer put them; every other slot goes in the managed section.
+        let keyed: Vec<_> = exhibit_slots
+            .iter()
+            .filter_map(|(slot, _)| {
+                Some(crate::exhibits::KeyedBlock {
+                    slot: slot.key,
+                    marker_key: slot.request.marker_key.clone()?,
+                    side: crate::exhibits::MarkerSide::After,
+                    content: crate::exhibits::render_side_content(
+                        slot.request.kind,
+                        slot.fill.as_ref(),
+                        None,
+                        client.kind(),
+                    ),
+                })
+            })
+            .collect();
+        let keyed_out = crate::exhibits::splice_keyed(&updated, &keyed);
+        updated = keyed_out.body;
         let blocks: Vec<_> = exhibit_slots
             .iter()
+            .filter(|(slot, _)| !keyed_out.placed.contains(&slot.key))
             .map(|(slot, label)| {
                 (
                     slot.key,
@@ -1520,7 +1541,25 @@ pub fn refresh_pr_with(
                 )
             })
             .collect();
-        let spliced = crate::exhibits::splice_exhibits(&updated, &blocks);
+        let upstream = crate::exhibits::upstream_markers(
+            &updated,
+            &exhibit_slots
+                .iter()
+                .map(|(s, _)| s.clone())
+                .collect::<Vec<_>>(),
+        );
+        if !upstream.is_empty() {
+            crate::cartographer::Note::new("guardian")
+                .guardian(&guardian.id)
+                .scope("live_action")
+                .emit(
+                    &store.lock(),
+                    "exhibit slots need an upstream run",
+                    serde_json::json!({ "pr_id": pr.id, "slots": upstream }),
+                );
+        }
+        let mut spliced = crate::exhibits::splice_exhibits(&updated, &blocks);
+        spliced.damaged.extend(keyed_out.damaged);
         if !spliced.damaged.is_empty() {
             crate::rlog!(
                 WARNING,

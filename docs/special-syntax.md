@@ -544,7 +544,12 @@ tool guidance, but without the waypoint section (`waypoint_context` false). The 
   `EXHIBIT: gif | <what> || screenshot | <what>`; the pair actually delivered
   supplies the description shown. A `||` not followed by `<kind> |` stays part
   of the description, and a fallback without a description is dropped and
-  logged. An alternative list is one slot. Lifted out of the handoff text by `exhibits::split_handoff` before
+  logged. An alternative list is one slot. A trailing `| compare=review-upstream`
+  suggests a before/after comparison against the review's base branch on its
+  remote (`review-upstream` is the only value; any other value is reported in the
+  handoff's rejected lines and logged, and the request is kept without a
+  comparison). It is only a hint: the PR writer decides whether the comparison
+  is shown. Lifted out of the handoff text by `exhibits::split_handoff` before
   deduplication and carried to the merged live action by handoff number, so
   dedupe can neither drop nor reassign one; each becomes an **exhibit slot**.
 - **`RALPHUS_EXHIBIT: {json}`** — one line per exhibit slot in a live run
@@ -564,7 +569,25 @@ tool guidance, but without the waypoint section (`waypoint_context` false). The 
   header of its reply (before `===DESCRIPTION===`), when the review's
   `infer_exhibits` setting is on: `{"owner": <live action id> | "new", "kind":
   ..., "describe": ..., "why": ...}`. Parsed by `exhibits::parse_inferred`;
-  `owner` is only honoured when that action covers the PR's branch.
+  `owner` is only honoured when that action covers the PR's branch. Two optional
+  fields: `"key"` (a short name of lowercase letters, digits, `-` or `_`, at most
+  40 characters) lets the description place the exhibit with the tokens below,
+  and `"compare": "review-upstream"` asks for a before/after comparison (an
+  unknown value is logged and ignored). The key and comparison are stored with
+  the request and carried onto its slot.
+- **`<<exhibit:KEY:after>>`** and **`<<exhibit:KEY:review-upstream>>`** — tokens
+  the PR writer places anywhere in its description (a sentence, a list item, a
+  table cell) to show the exhibit whose `EXHIBIT_REQUEST` carries `KEY`: `after`
+  is the slot's own capture, `review-upstream` the same capture made against the
+  review's base branch on its remote. When the description is created ralphus
+  turns each token into a single-line `<!-- ralphus:exhibit:start key=KEY
+  side=SIDE -->` … `<!-- ralphus:exhibit:end key=KEY side=SIDE -->` pair around
+  a placeholder, and later fills only the text between the markers with the
+  media and a short caption; the text around a pair is never touched. A token
+  with an unknown side or a key no request carries is left as written and
+  logged. A damaged pair is skipped and logged. No block is ever appended for a
+  `review-upstream` pair, and a slot is reported as needing an upstream run only
+  when its `review-upstream` pair is present in the description.
 - **`<!-- ralphus:exhibits:start -->` … `<!-- ralphus:exhibits:end -->`** and
   **`<!-- ralphus:exhibit:start action=<a> slot=<s> -->` … `<!--
   ralphus:exhibit:end action=<a> slot=<s> -->`** — the managed `## Exhibits`
