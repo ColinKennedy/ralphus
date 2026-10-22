@@ -268,6 +268,10 @@ export function makeSquadMenu({ squads = {}, selection = [], clickedId, watching
   return factory({ ...deps, SQUAD_TERMINAL_STATES: ["done", "failed", "cancelled"], menuEl });
 }
 
+// Mirrors `MERGE_STARTABLE` in librarian/assets/board/65-reviews.js; the
+// region slice does not carry it, so the loader supplies the same list.
+const MERGE_STARTABLE_STATUSES = ["collecting", "merge_failed", "merge_stopped", "in_review"];
+
 /**
  * Renders the real review context menu (openReviewMenu) for one clicked
  * review under a given multi-selection, returning the menu element.
@@ -277,13 +281,14 @@ export function makeReviewMenu({ guardians = {}, selection = [], clickedId, watc
   const { document, window, event, menuEl } = makeMenuDom();
   const deps = {
     esc, guardians: Object.values(guardians), guardianMultiSel: new Set(selection),
-    G_CANCELLABLE: cancellable, isWatching: (uri) => watching.includes(uri), hiddenGuardianIds: new Set(hidden),
+    G_CANCELLABLE: cancellable, MERGE_STARTABLE: MERGE_STARTABLE_STATUSES,
+    isWatching: (uri) => watching.includes(uri), hiddenGuardianIds: new Set(hidden),
     closeSquadMenu: () => {}, document, window, event, clickedId,
   };
   // eslint-disable-next-line no-new-func -- evaluating the real shipped source is the point; see the header.
   const factory = new Function(
     "deps",
-    `const { esc, guardians, guardianMultiSel, G_CANCELLABLE, isWatching, hiddenGuardianIds, closeSquadMenu, document, window, event, clickedId, menuEl } = deps;
+    `const { esc, guardians, guardianMultiSel, G_CANCELLABLE, MERGE_STARTABLE, isWatching, hiddenGuardianIds, closeSquadMenu, document, window, event, clickedId, menuEl } = deps;
      ${sliceRegion(REGIONS.helpers)}
      ${sliceRegion(REGIONS.reviewMenu)}
      openReviewMenu(event, clickedId);

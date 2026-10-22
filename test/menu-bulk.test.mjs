@@ -564,6 +564,21 @@ test("a multi-selection disables the review menu's popup-bearing items (Edit Det
   }
 });
 
+test("a single merged review's menu offers no merge/rebase, while an in-review one does", () => {
+  const merged = makeReviewMenu({
+    guardians: { g1: { id: "g1", name: "R1", status: "merged" } },
+    selection: ["g1"],
+    clickedId: "g1",
+  }).innerHTML;
+  assert.ok(!merged.includes('data-click="mergeReviewFromMenu"'));
+  const inReview = makeReviewMenu({
+    guardians: { g1: { id: "g1", name: "R1", status: "in_review" } },
+    selection: ["g1"],
+    clickedId: "g1",
+  }).innerHTML;
+  assert.ok(inReview.includes('data-click="mergeReviewFromMenu"'));
+});
+
 test("a single-selection review menu keeps Edit Details/Watch clickable", () => {
   const menu = makeReviewMenu({
     guardians: { g1: { id: "g1", name: "R1", status: "collecting" } },
