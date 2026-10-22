@@ -247,9 +247,15 @@ fn allocation_from(service: &ProviderService, reply: Reply) -> Result<Allocation
     })
 }
 
-/// The requirements object of a `POST /v1/allocations` request.
-fn requirements(request: &ralphus_core::schema::MachineRequest) -> Value {
+/// The requirements object of a `POST /v1/allocations` request. `agents`
+/// (the agent backends the work needs on the machine, from
+/// [`needed_agents`]) is sent only when non-empty; a provider that ignores
+/// it still works.
+fn requirements(request: &ralphus_core::schema::MachineRequest, agents: &[String]) -> Value {
     let mut fields = serde_json::Map::new();
+    if !agents.is_empty() {
+        fields.insert("agents".into(), agents.to_vec().into());
+    }
     if let Some(os) = &request.os {
         fields.insert("os".into(), os.clone().into());
     }
@@ -286,8 +292,35 @@ impl Scope<'_> {
     }
 }
 
-/// Ask `service` for a machine satisfying `request`, for the work of `scope`
-/// that shares the request `key`.
+/// The agent backends that need an installed, logged-in CLI on the machine
+/// (`claude-code`, `codex`, `pi`) among `agents` -- built-in names and their
+/// aliases, or database agent profiles resolved to their backend -- sorted
+/// and deduplicated. API backends (`claude`, `anthropic`, `ollama`), `raw`,
+/// and profiles that cannot be resolved here are left out: the machine has
+/// nothing to install or log in for them, or the daemon cannot say what.
+#[must_use]
+pub fn needed_agents<'a>(store: &Store, agents: impl IntoIterator<Item = &'a str>) -> Vec<String> {
+    let mut needed: Vec<String> = agents
+        .into_iter()
+        .filter_map(|agent| {
+            crate::agent_profiles::normalize_builtin_agent(agent)
+                .map(str::to_string)
+                .or_else(|| {
+                    store.get_agent_profile(agent).ok().flatten().and_then(|p| {
+                        crate::agent_profiles::normalize_builtin_agent(&p.backend)
+                            .map(str::to_string)
+                    })
+                })
+        })
+        .filter(|backend| matches!(backend.as_str(), "claude-code" | "codex" | "pi"))
+        .collect();
+    needed.sort();
+    needed.dedup();
+    needed
+}
+
+/// Ask `service` for a machine satisfying `request`, with `agents` installed
+/// and logged in, for the work of `scope` that shares the request `key`.
 ///
 /// # Errors
 /// The provider's refusal, or [`REASON_UNAVAILABLE`] when it could not be
@@ -297,6 +330,7 @@ pub fn allocate(
     request: &ralphus_core::schema::MachineRequest,
     scope: Scope<'_>,
     key: &str,
+    agents: &[String],
 ) -> Result<Allocation, ServiceError> {
     let mut scope_fields = serde_json::Map::new();
     if let Some(id) = scope.squad_id() {
@@ -307,7 +341,7 @@ pub fn allocate(
     }
     scope_fields.insert("key".into(), key.into());
     let body = json!({
-        "requirements": requirements(request),
+        "requirements": requirements(request, agents),
         "scope": scope_fields,
     });
     let reply = call(service, "POST", "/v1/allocations", Some(&body))?;
@@ -585,6 +619,33 @@ impl Store {
             rusqlite::params![to, squad_id, from],
         )?)
     }
+
+    /// The agents (as stored, before resolution) of `squad_id`'s prompt
+    /// cells on `machine` and of the prompt proofs that run there: the
+    /// cell-scope proofs of those cells and the task-scope proofs of tasks
+    /// with a cell there.
+    ///
+    /// # Errors
+    /// Propagates any SQLite failure.
+    pub fn prompt_agents_on_machine(
+        &self,
+        squad_id: &str,
+        machine: &str,
+    ) -> StoreResult<Vec<String>> {
+        let mut statement = self.conn.prepare(
+            "SELECT agent FROM cells WHERE squad_id=?1 AND machine=?2 AND prompt IS NOT NULL
+             UNION
+             SELECT p.agent FROM proofs p WHERE p.squad_id=?1 AND p.kind='prompt' AND EXISTS (
+                 SELECT 1 FROM cells c WHERE c.squad_id=p.squad_id AND c.task_idx=p.task_idx
+                   AND c.machine=?2 AND (p.scope='task' OR c.idx=p.cell_idx))",
+        )?;
+        let agents = statement
+            .query_map(rusqlite::params![squad_id, machine], |row| {
+                row.get::<_, String>(0)
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(agents)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -691,6 +752,7 @@ pub fn grant(
     store: &crate::store_lock::StoreHandle,
     request_text: &str,
     scope: Scope<'_>,
+    agents: &[String],
 ) -> Result<String, String> {
     let request = ralphus_core::schema::MachineRequest::parse_canonical(request_text)
         .ok_or_else(|| format!("machine {request_text:?} is not a provider request"))?;
@@ -716,7 +778,7 @@ pub fn grant(
             ));
             continue;
         };
-        match allocate(service, &request, scope, request_text) {
+        match allocate(service, &request, scope, request_text, agents) {
             Ok(allocation) => {
                 let row_id = store
                     .lock()
@@ -806,7 +868,14 @@ pub fn bind_squad(
     }
     for current in pending {
         let request = parse_bound(&current).map_or(current.as_str(), |(r, _)| r);
-        let granted = grant(store, request, Scope::Squad(squad_id))?;
+        let agents = {
+            let guard = store.lock();
+            let raw = guard
+                .prompt_agents_on_machine(squad_id, &current)
+                .map_err(|e| format!("could not read the agents squad {squad_id} needs: {e}"))?;
+            needed_agents(&guard, raw.iter().map(String::as_str))
+        };
+        let granted = grant(store, request, Scope::Squad(squad_id), &agents)?;
         store
             .lock()
             .rebind_squad_machine(squad_id, &current, &granted)
@@ -848,7 +917,7 @@ pub fn bind_review(
             return Err(reason.clone());
         }
     }
-    let reuse = {
+    let (reuse, agents) = {
         let guard = store.lock();
         let guardian = guard
             .get_guardian(guardian_id)
@@ -869,17 +938,19 @@ pub fn bind_review(
                 .iter()
                 .filter_map(|b| b.source_squad_id.clone()),
         );
-        guard
+        let agents = needed_agents(&guard, guardian.resolver_agent.as_deref());
+        let reuse = guard
             .machine_allocations(false)
             .unwrap_or_default()
             .into_iter()
             .find(|row| {
                 row.request == request && row.squad_id.as_ref().is_some_and(|s| squads.contains(s))
-            })
+            });
+        (reuse, agents)
     };
     let granted = match reuse {
         Some(row) => Ok(row.machine()),
-        None => grant(store, request, Scope::Review(guardian_id)),
+        None => grant(store, request, Scope::Review(guardian_id), &agents),
     };
     let machine = match granted {
         Ok(machine) => machine,
@@ -1232,6 +1303,7 @@ mod tests {
             &linux_gpu(),
             Scope::Squad("squad-1"),
             "@fleet?os=linux&labels=gpu",
+            &[],
         )
         .expect("granted");
 
@@ -1265,7 +1337,8 @@ mod tests {
             }),
         );
 
-        let err = allocate(&svc, &linux_gpu(), Scope::Squad("squad-1"), "k").expect_err("refused");
+        let err =
+            allocate(&svc, &linux_gpu(), Scope::Squad("squad-1"), "k", &[]).expect_err("refused");
 
         assert_eq!(err.reason_code, "no_matching_machine");
         let shown = err.to_string();
@@ -1431,8 +1504,13 @@ mod tests {
         ]);
         let store = handle(Store::open_in_memory().unwrap());
 
-        let machine = grant(&store, "@walk-a,walk-b?os=linux", Scope::Squad("squad-1"))
-            .expect("the second provider grants");
+        let machine = grant(
+            &store,
+            "@walk-a,walk-b?os=linux",
+            Scope::Squad("squad-1"),
+            &[],
+        )
+        .expect("the second provider grants");
 
         let (request, row) = parse_bound(&machine).expect("bound");
         assert_eq!(request, "@walk-a,walk-b?os=linux");
@@ -1449,7 +1527,7 @@ mod tests {
         crate::provider_services::set_services_for_test(vec![only.service.clone()]);
         let store = handle(Store::open_in_memory().unwrap());
 
-        let err = grant(&store, "@none-a,local?labels=gpu", Scope::Squad("s"))
+        let err = grant(&store, "@none-a,local?labels=gpu", Scope::Squad("s"), &[])
             .expect_err("nothing grants");
 
         assert!(err.contains("all busy"), "{err}");
@@ -1467,15 +1545,78 @@ mod tests {
         let store = handle(Store::open_in_memory().unwrap());
         let host = format!("@local?os={}", std::env::consts::OS);
 
-        assert_eq!(grant(&store, &host, Scope::Squad("s")).unwrap(), "local");
+        assert_eq!(
+            grant(&store, &host, Scope::Squad("s"), &[]).unwrap(),
+            "local"
+        );
         let other = if std::env::consts::OS == "linux" {
             "windows"
         } else {
             "linux"
         };
-        let err =
-            grant(&store, &format!("@local?os={other}"), Scope::Squad("s")).expect_err("wrong os");
+        let err = grant(
+            &store,
+            &format!("@local?os={other}"),
+            Scope::Squad("s"),
+            &[],
+        )
+        .expect_err("wrong os");
+
         assert!(err.contains(&format!("not {other}")), "{err}");
+    }
+
+    #[test]
+    fn a_squads_allocation_request_names_the_agents_its_prompt_work_needs_there() {
+        let bodies = std::sync::Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
+        let seen = std::sync::Arc::clone(&bodies);
+        let fleet = FakeFleet::start("agents", move |method, path, body| {
+            if (method, path) == ("POST", "/v1/allocations") {
+                seen.lock().unwrap().push(body.clone());
+                (200, granted("alloc-agents"))
+            } else {
+                (404, json!({}))
+            }
+        });
+        crate::provider_services::set_services_for_test(vec![fleet.service.clone()]);
+        let mut store = Store::open_in_memory().unwrap();
+        let file: ralphus_core::schema::TaskFile = toml::from_str(
+            "[[task]]\nname=\"a\"\nmachine=\"agents\"\n\
+             [[task.cell]]\nprompt=\"write it\"\nagent=\"claude-cli\"\n\
+             [[task.cell]]\nprompt=\"think\"\nagent=\"ollama\"\n\
+             [[task.cell]]\ncommand=\"echo 1\"\nmode=\"raw\"\nagent=\"pi\"\n\
+             [[task.proof]]\nprompt=\"check it\"\nagent=\"codex\"\n\
+             [[task]]\nname=\"local\"\n\
+             [[task.cell]]\nprompt=\"here\"\nagent=\"pi\"\n",
+        )
+        .unwrap();
+        let squad_id = store.insert_squad(&file, None, false).unwrap();
+        let store = handle(store);
+        let mut cells = store.lock().cells_of(&squad_id).unwrap();
+
+        bind_squad(&store, &squad_id, &mut cells).expect("granted");
+
+        let bodies = bodies.lock().unwrap();
+        assert_eq!(bodies.len(), 1);
+        assert_eq!(
+            bodies[0]["requirements"]["agents"],
+            json!(["claude-code", "codex"]),
+            "CLI agents of the prompt cells and proofs on that machine, by backend; not the \
+             API backend, the command cell, or work elsewhere: {}",
+            bodies[0]
+        );
+    }
+
+    #[test]
+    fn needed_agents_resolves_aliases_and_keeps_only_cli_backends() {
+        let store = Store::open_in_memory().unwrap();
+        assert_eq!(
+            needed_agents(
+                &store,
+                ["codex-cli", "claude", "claude-code", "codex", "raw", "who"]
+            ),
+            ["claude-code", "codex"]
+        );
+        assert!(needed_agents(&store, ["ollama"]).is_empty());
     }
 
     #[test]
@@ -1606,7 +1747,8 @@ mod tests {
         crate::provider_services::set_services_for_test(vec![fleet]);
         let store = handle(Store::open_in_memory().unwrap());
 
-        let machine = grant(&store, "@fleet?os=linux", Scope::Squad("squad-e2e")).expect("granted");
+        let machine =
+            grant(&store, "@fleet?os=linux", Scope::Squad("squad-e2e"), &[]).expect("granted");
 
         let row = store
             .lock()
@@ -1636,7 +1778,7 @@ mod tests {
             "the Machine API call reached the allocated machine over its provider"
         );
 
-        let err = grant(&store, "@fleet?os=windows", Scope::Squad("squad-e2e"))
+        let err = grant(&store, "@fleet?os=windows", Scope::Squad("squad-e2e"), &[])
             .expect_err("no windows machine");
         assert!(err.contains("box runs linux, not windows"), "{err}");
         assert!(err.contains("no_matching_machine"), "{err}");
@@ -1690,7 +1832,7 @@ mod tests {
         });
         crate::provider_services::set_services_for_test(vec![fleet.service.clone()]);
         let store = handle(Store::open_in_memory().unwrap());
-        let machine = grant(&store, "@renew-401", Scope::Squad("s")).unwrap();
+        let machine = grant(&store, "@renew-401", Scope::Squad("s"), &[]).unwrap();
         let runner = {
             let guard = store.lock();
             crate::remote_runner::provider_from_store(&guard, &machine)

@@ -154,12 +154,40 @@ impl SessionKey {
         fleet_nonce: &str,
         session: &str,
     ) -> Result<Self, String> {
-        let salt = hkdf::Salt::new(
-            hkdf::HKDF_SHA256,
-            format!("{outpost_nonce}{fleet_nonce}").as_bytes(),
-        );
-        let prk = salt.extract(secret.trim().as_bytes());
-        let info = format!("{PROTOCOL}|session|{name}|{session}");
+        Self::derive_from(
+            secret.trim().as_bytes(),
+            &format!("{outpost_nonce}{fleet_nonce}"),
+            &format!("{PROTOCOL}|session|{name}|{session}"),
+            session,
+        )
+    }
+
+    /// Derive a paired (`v2`) session's key from the X25519 shared secret
+    /// (`crate::outpost_keys`).
+    ///
+    /// # Errors
+    /// Key derivation failed (it cannot for these lengths).
+    pub fn derive_v2(
+        shared: &[u8],
+        name: &str,
+        outpost_nonce: &str,
+        fleet_nonce: &str,
+        session: &str,
+    ) -> Result<Self, String> {
+        Self::derive_from(
+            shared,
+            &format!("{outpost_nonce}{fleet_nonce}"),
+            &format!(
+                "{}|session|{name}|{session}",
+                crate::outpost_keys::PROTOCOL_V2
+            ),
+            session,
+        )
+    }
+
+    fn derive_from(ikm: &[u8], salt: &str, info: &str, session: &str) -> Result<Self, String> {
+        let salt = hkdf::Salt::new(hkdf::HKDF_SHA256, salt.as_bytes());
+        let prk = salt.extract(ikm);
         let info = [info.as_bytes()];
         let okm = prk
             .expand(&info, &aead::CHACHA20_POLY1305)

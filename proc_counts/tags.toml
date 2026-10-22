@@ -223,3 +223,8 @@ tag = "review-maintenance-remote-probe"
 [[test]]
 id = "ralphus-daemon live_runs::tests::orphan_live_refs_on_a_remote_machine_are_removed"
 tag = "live-ref-retirement-remote"
+
+# An outpost's readiness check on connecting (git version probe, agent preflights).
+[[test]]
+id = "ralphus-outpost::loopback an_allocation_needing_an_agent_the_machine_lacks_is_refused_up_front_with_the_fix"
+tag = "outpost-readiness"

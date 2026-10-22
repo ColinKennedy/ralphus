@@ -1,15 +1,23 @@
 //! `ralphus-fleet` and `ralphus-outpost` over loopback: an outpost connects
 //! out, the fleet hands it Machine API requests for an allocation, and the
 //! replies come back -- and an outpost or a fleet without the right pairing
-//! secret gets nothing.
+//! secret or paired credential gets nothing. A paired outpost is kept on
+//! the fleet's runner and reports its readiness.
 
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use ralphus_fleet::allocations::Allocations;
 use ralphus_fleet::config::FleetConfig;
+use ralphus_fleet::outpost_keys::Identity;
+use ralphus_fleet::outpost_registry::Registry;
+use ralphus_fleet::outposts::Outposts;
+use ralphus_fleet::runner_artifacts::sha256_hex;
 use ralphus_fleet::server::{Service, serve_on};
+use ralphus_outpost::Auth;
+use ralphus_outpost::runner_cache::RunnerCache;
 use serde_json::{Value, json};
 
 const SERVICE_TOKEN: &str = "fleet-service-token";
@@ -62,12 +70,31 @@ impl Drop for Outpost {
 }
 
 fn outpost(url: &str, remote_root: &str, secret: &str) -> Outpost {
+    outpost_with(
+        url,
+        remote_root,
+        Auth::Secret(secret.to_string()),
+        None,
+        false,
+    )
+}
+
+fn outpost_with(
+    url: &str,
+    remote_root: &str,
+    auth: Auth,
+    runner_cache: Option<PathBuf>,
+    check_readiness: bool,
+) -> Outpost {
     let options = ralphus_outpost::Options {
         fleet_url: url.to_string(),
         name: "box".to_string(),
-        secret: secret.to_string(),
+        auth,
         remote_root: remote_root.to_string(),
         runner: vec!["ralphus-runner-not-needed".to_string()],
+        runner_cache,
+        check_readiness,
+        status_file: None,
     };
     let stop = Arc::new(AtomicBool::new(false));
     let flag = Arc::clone(&stop);
@@ -92,14 +119,18 @@ fn call(method: &str, url: &str, token: &str, body: &Value) -> (u16, Value) {
     (status, serde_json::from_str(&text).unwrap_or(Value::Null))
 }
 
-fn connected(fleet: &Fleet) -> bool {
-    let (_, list) = call(
+fn outposts_list(fleet: &Fleet) -> Value {
+    call(
         "GET",
         &format!("{}/v1/outposts", fleet.url),
         SERVICE_TOKEN,
         &Value::Null,
-    );
-    list["outposts"][0]["connected"] == true
+    )
+    .1
+}
+
+fn connected(fleet: &Fleet) -> bool {
+    outposts_list(fleet)["outposts"][0]["connected"] == true
 }
 
 fn wait_connected(fleet: &Fleet) {
@@ -111,17 +142,272 @@ fn wait_connected(fleet: &Fleet) {
 }
 
 fn allocate(fleet: &Fleet) -> (String, String) {
-    let (status, granted) = call(
-        "POST",
-        &format!("{}/v1/allocations", fleet.url),
-        SERVICE_TOKEN,
-        &json!({"requirements": {"labels": ["outpost"]}, "scope": {"squad_id": "s", "key": "k"}}),
-    );
+    let (status, granted) = try_allocate(fleet, "s");
     assert_eq!(status, 200, "{granted}");
     (
         granted["endpoint"].as_str().unwrap().to_string(),
         granted["token"].as_str().unwrap().to_string(),
     )
+}
+
+fn try_allocate(fleet: &Fleet, squad: &str) -> (u16, Value) {
+    call(
+        "POST",
+        &format!("{}/v1/allocations", fleet.url),
+        SERVICE_TOKEN,
+        &json!({"requirements": {"labels": ["outpost"]}, "scope": {"squad_id": squad, "key": "k"}}),
+    )
+}
+
+/// A fleet that pairs: its registry in `dir`, its own identity, and `top`
+/// (top-level keys) and `machine` (keys of the one machine, `box`) added to
+/// the configuration.
+fn paired_fleet(dir: &Path, remote_root: &str, top: &str, machine: &str) -> (Fleet, Registry) {
+    let config = FleetConfig::parse(
+        &format!(
+            "token_env = \"UNUSED\"\n{top}\n[[machine]]\nname = \"box\"\ntransport = \"outpost\"\n\
+             labels = [\"outpost\"]\nremote_root = {remote_root:?}\n{machine}\n"
+        ),
+        "fleet.toml",
+    )
+    .unwrap();
+    let registry = Registry::new(dir.join("fleet.toml.outposts.json"));
+    let outposts = Outposts::new(&config, |_| None)
+        .with_registry(registry.clone())
+        .with_identity(Identity::generate().unwrap());
+    let server = Arc::new(tiny_http::Server::http("127.0.0.1:0").unwrap());
+    let url = format!("http://{}", server.server_addr());
+    let service = Service::with_outposts(
+        config,
+        url.clone(),
+        SERVICE_TOKEN.to_string(),
+        Allocations::default(),
+        outposts,
+    );
+    let serving = Arc::clone(&server);
+    std::thread::spawn(move || serve_on(&serving, service));
+    (Fleet { url, server }, registry)
+}
+
+fn paired_auth(credential: &ralphus_outpost::pairing::Credential) -> Auth {
+    Auth::Paired {
+        machine: Arc::clone(&credential.machine),
+        fleet_public_key: credential.fleet_public_key.clone(),
+    }
+}
+
+/// Make the outpost poll again (each answered request ends its long poll)
+/// until `done`, or fail with `what`.
+fn poll_until(fleet: &Fleet, what: &str, done: impl Fn() -> bool) {
+    let (endpoint, token) = allocate(fleet);
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while !done() {
+        assert!(Instant::now() < deadline, "{what}");
+        let _ = call("POST", &format!("{endpoint}/ping"), &token, &json!({}));
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+#[test]
+fn a_pairing_code_pairs_once_and_its_credential_connects_until_revoked() {
+    let dir = ralphus_test_support::TestDir::new("outpost-paired");
+    let root = root_of(&dir.join("root"));
+    let (fleet, registry) = paired_fleet(&dir, &root, "", "");
+    let code = registry.start_pairing("box").unwrap();
+    let paired = ralphus_outpost::pairing::pair(&fleet.url, &code).unwrap();
+    assert_eq!(paired.name, "box");
+    assert_eq!(paired.remote_root, root);
+    let again = ralphus_outpost::pairing::pair(&fleet.url, &code).unwrap_err();
+    assert!(
+        again.contains("not accepted"),
+        "a code is single use: {again}"
+    );
+    let stored = std::fs::read_to_string(registry.path()).unwrap();
+    assert!(!stored.contains(&paired.credential.machine.private_b64()));
+
+    let _outpost = outpost_with(
+        &fleet.url,
+        &root,
+        paired_auth(&paired.credential),
+        None,
+        false,
+    );
+    wait_connected(&fleet);
+    assert_eq!(outposts_list(&fleet)["outposts"][0]["paired"], true);
+    let (endpoint, token) = allocate(&fleet);
+    let (_, ping) = call("POST", &format!("{endpoint}/ping"), &token, &json!({}));
+    assert_eq!(ping["ok"], true, "{ping}");
+
+    assert!(registry.revoke("box").unwrap());
+    let deadline = Instant::now() + Duration::from_secs(40);
+    while connected(&fleet) {
+        assert!(
+            Instant::now() < deadline,
+            "a revoked outpost stays connected"
+        );
+        let _ = call("POST", &format!("{endpoint}/ping"), &token, &json!({}));
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    let (_, ping) = call("POST", &format!("{endpoint}/ping"), &token, &json!({}));
+    assert_eq!(ping["reason_code"], "unreachable", "{ping}");
+}
+
+#[test]
+fn a_paired_outpost_refuses_a_fleet_that_is_not_the_one_it_paired_with() {
+    let dir = ralphus_test_support::TestDir::new("outpost-wrong-fleet");
+    let root = root_of(&dir.join("root"));
+    let (fleet, registry) = paired_fleet(&dir, &root, "", "");
+    let machine = Arc::new(Identity::generate().unwrap());
+    let public_key = machine.public_key();
+    registry
+        .update(|file| {
+            file.machines
+                .entry("box".to_string())
+                .or_default()
+                .public_key = Some(public_key);
+            Ok(())
+        })
+        .unwrap();
+    let impostor_pinned = Auth::Paired {
+        machine,
+        fleet_public_key: Identity::generate().unwrap().public_key(),
+    };
+    let _outpost = outpost_with(&fleet.url, &root, impostor_pinned, None, false);
+    std::thread::sleep(Duration::from_secs(2));
+    assert!(
+        !connected(&fleet),
+        "the outpost must not serve an unknown fleet"
+    );
+}
+
+#[test]
+fn a_paired_outpost_keeps_the_fleets_runner_and_rolls_forward_when_it_changes() {
+    let dir = ralphus_test_support::TestDir::new("outpost-runner-update");
+    let root = root_of(&dir.join("root"));
+    let artifact = dir.join("ralphus-runner-artifact");
+    std::fs::write(&artifact, b"runner version one").unwrap();
+    let top = format!(
+        "[outpost_runners]\n\"{}-{}\" = {:?}\n",
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+        root_of(&artifact)
+    );
+    let (fleet, registry) = paired_fleet(&dir, &root, &top, "");
+    let paired =
+        ralphus_outpost::pairing::pair(&fleet.url, &registry.start_pairing("box").unwrap())
+            .unwrap();
+    let cache_dir = dir.join("cache");
+    let _outpost = outpost_with(
+        &fleet.url,
+        &root,
+        paired_auth(&paired.credential),
+        Some(cache_dir.clone()),
+        false,
+    );
+    wait_connected(&fleet);
+    let cache = RunnerCache::new(cache_dir, &root);
+    let one = sha256_hex(b"runner version one");
+    poll_until(&fleet, "the first runner was never installed", || {
+        cache.current() == cache.installed(&one) && cache.current().is_some()
+    });
+
+    std::fs::write(&artifact, b"runner version two, rebuilt").unwrap();
+    let two = sha256_hex(b"runner version two, rebuilt");
+    poll_until(&fleet, "the changed runner was never installed", || {
+        cache.current().is_some() && cache.current() == cache.installed(&two)
+    });
+    assert!(
+        cache.installed(&one).is_none(),
+        "the old runner, used by no job, is removed"
+    );
+}
+
+#[test]
+fn an_allocation_needing_an_agent_the_machine_lacks_is_refused_up_front_with_the_fix() {
+    let dir = ralphus_test_support::TestDir::new("outpost-readiness");
+    let root = root_of(&dir.join("root"));
+    // Point every CLI agent at a missing program, so the check never runs
+    // a real agent on this computer.
+    let missing = |agent: &str| root_of(&dir.join("missing").join(agent));
+    let machine = format!(
+        "[machine.agents]\n\"claude-code\" = {:?}\ncodex = {:?}\npi = {:?}\n",
+        missing("claude"),
+        missing("codex"),
+        missing("pi")
+    );
+    let (fleet, registry) = paired_fleet(&dir, &root, "", &machine);
+    let paired =
+        ralphus_outpost::pairing::pair(&fleet.url, &registry.start_pairing("box").unwrap())
+            .unwrap();
+    let _outpost = outpost_with(
+        &fleet.url,
+        &root,
+        paired_auth(&paired.credential),
+        None,
+        true,
+    );
+    wait_connected(&fleet);
+    poll_until(&fleet, "the outpost never reported its readiness", || {
+        !outposts_list(&fleet)["outposts"][0]["readiness"].is_null()
+    });
+    let report = &outposts_list(&fleet)["outposts"][0]["readiness"];
+    let ids: Vec<&str> = report["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|c| c["id"].as_str())
+        .collect();
+    for id in [
+        "git",
+        "agent:claude-code",
+        "agent:codex",
+        "agent:pi",
+        "disk",
+    ] {
+        assert!(ids.contains(&id), "{id}: {report}");
+    }
+
+    let ask = |squad: &str, agents: Value| {
+        call(
+            "POST",
+            &format!("{}/v1/allocations", fleet.url),
+            SERVICE_TOKEN,
+            &json!({
+                "requirements": {"labels": ["outpost"], "agents": agents},
+                "scope": {"squad_id": squad, "key": "k"},
+            }),
+        )
+    };
+    let (status, refusal) = ask("needs-claude", json!(["claude-code"]));
+    assert_eq!(status, 409, "{refusal}");
+    assert!(
+        refusal["error"]
+            .as_str()
+            .unwrap()
+            .contains("box is not ready: Claude Code isn't installed on box"),
+        "{refusal}"
+    );
+    assert!(
+        refusal["remediation"]
+            .as_str()
+            .unwrap()
+            .starts_with("install Claude Code on box"),
+        "{refusal}"
+    );
+    let (status, refusal) = ask("typo", json!(["claude code"]));
+    assert_eq!(status, 400, "{refusal}");
+    assert!(
+        refusal["error"].as_str().unwrap().contains("claude-code"),
+        "the valid names are listed: {refusal}"
+    );
+    let (status, granted) = ask("no-agents", json!([]));
+    assert_eq!(status, 200, "work needing no agent still runs: {granted}");
+
+    let saved = registry.load().unwrap();
+    assert!(
+        saved.machines["box"].readiness.is_some(),
+        "the report is kept for `ralphus-fleet list`"
+    );
 }
 
 fn root_of(dir: &std::path::Path) -> String {
