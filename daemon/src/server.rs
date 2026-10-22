@@ -16835,6 +16835,27 @@ fn guardian_settings(daemon: &Daemon, id: &str, body: &str) -> Reply {
         return reply;
     }
     let store = daemon.lock();
+    // Resolver and live-action fields are frozen once merged/deployed, same as
+    // `guardian_details`. Checked before any write so a rejected request
+    // applies none of its fields.
+    let touches_frozen_agent = req.resolver_agent.is_some()
+        || req.resolver_model.is_some()
+        || req.live_action_agent.is_some()
+        || req.live_action_model.is_some();
+    if touches_frozen_agent {
+        match store.get_guardian(id) {
+            Ok(g) if matches!(g.status.as_str(), "merged" | "deployed") => {
+                return error(
+                    409,
+                    "invalid_transition",
+                    "cannot change resolver or live-action agent on a merged or deployed review",
+                    vec![],
+                );
+            }
+            Ok(_) => {}
+            Err(e) => return store_error(&e),
+        }
+    }
     if let Some(skip) = req.skip_worktrees {
         if let Err(e) = store.set_guardian_skip_worktrees(id, skip) {
             return store_error(&e);
@@ -37412,6 +37433,33 @@ remediation_attempts=1
         );
         assert_eq!(r.status, 200, "{}", r.body);
         assert!(r.body.contains("\"name\":\"still renamable\""));
+    }
+
+    #[test]
+    fn guardian_settings_frozen_agent_fields_rejected_when_merged() {
+        let d = daemon();
+        let gid = make_guardian(&d);
+        d.lock()
+            .set_guardian_status(&gid, crate::guardian::GuardianStatus::Merged, None)
+            .unwrap();
+
+        let path = format!("/api/guardians/{gid}/settings");
+        for body in [
+            serde_json::json!({"live_action_agent": "codex"}),
+            serde_json::json!({"live_action_model": "haiku"}),
+            serde_json::json!({"resolver_agent": "codex"}),
+        ] {
+            let r = route(&d, "POST", &path, &body.to_string());
+            assert_eq!(r.status, 409, "{body}: {}", r.body);
+        }
+
+        // Still open: the same live-action write is accepted.
+        d.lock()
+            .set_guardian_status(&gid, crate::guardian::GuardianStatus::InReview, None)
+            .unwrap();
+        let open = serde_json::json!({"live_action_agent": "codex"}).to_string();
+        let r = route(&d, "POST", &path, &open);
+        assert_eq!(r.status, 200, "{}", r.body);
     }
 
     #[test]
