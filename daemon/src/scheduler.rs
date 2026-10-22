@@ -9425,9 +9425,10 @@ prompt = "anything"
             });
         });
 
-        // Give both cells time to be dispatched and pile up behind the held
-        // permit before it frees.
-        std::thread::sleep(Duration::from_millis(300));
+        // Wait until both cells have registered as ranked waiters behind the
+        // held permit before freeing it. A fixed sleep here races under a
+        // loaded test run: the plain sibling could win the permit first.
+        wait_for_ranked_waiters(&sem, 2);
         drop(held);
         assert_completes_within(Duration::from_secs(5), move || handle.join().unwrap());
 
