@@ -1547,10 +1547,11 @@ fn execute_upstream_run(
     let gid = run.guardian_id.as_str();
     let sha = run.upstream_sha.clone().unwrap_or_default();
     let scope = |msg: &str, data: serde_json::Value| {
+        let guard = store.lock();
         crate::cartographer::Note::new("guardian")
             .guardian(gid)
             .scope("live_action")
-            .emit(&store.lock(), msg, data);
+            .emit(&guard, msg, data);
     };
     let (guardian, target, slots, over) = {
         let guard = store.lock();
