@@ -7,8 +7,8 @@ const src = boardScript();
 const a = src.indexOf("// RALPHUS-AGENT-LOG:BEGIN");
 const b = src.indexOf("// RALPHUS-AGENT-LOG:END");
 if (a === -1 || b < a) throw new Error("agent-log markers not found");
-const { parseAgentLog, agentLogEntryVisible, agentLogPrettyInput, agentLogAtBottom, agentLogScrollTarget } = new Function(
-  `${src.slice(a, b)}\nreturn { parseAgentLog, agentLogEntryVisible, agentLogPrettyInput, agentLogAtBottom, agentLogScrollTarget };`,
+const { parseAgentLog, agentLogEntryVisible, agentLogPrettyInput, agentLogAtBottom, agentLogScrollTarget, agentLogBlockId, agentLogBlockRestore } = new Function(
+  `${src.slice(a, b)}\nreturn { parseAgentLog, agentLogEntryVisible, agentLogPrettyInput, agentLogAtBottom, agentLogScrollTarget, agentLogBlockId, agentLogBlockRestore };`,
 )();
 
 test("pairs results to calls by order and splits tool/sub", () => {
@@ -244,4 +244,11 @@ test("a reader mid-log stays on the same widget across refreshes", () => {
   assert.equal(agentLogScrollTarget(false, top, 5000, 100, { now: 840, rel: 40 }), null);
   // no anchor available: position is untouched
   assert.equal(agentLogScrollTarget(false, 300, 3000, 100, null), null);
+});
+
+test("block scroll restore only writes when the offset moved", () => {
+  assert.equal(agentLogBlockId(3, 1), "3:1");
+  assert.equal(agentLogBlockRestore(undefined, 0, 0), null);
+  assert.equal(agentLogBlockRestore({ top: 40, left: 0 }, 40, 0), null);
+  assert.deepEqual(agentLogBlockRestore({ top: 40, left: 2 }, 0, 0), { top: 40, left: 2 });
 });

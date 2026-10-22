@@ -298,6 +298,26 @@
         const want = stick ? Math.max(0, scrollHeight - clientHeight) : anchor === null ? scrollTop : anchor.now - anchor.rel;
         return Math.abs(want - scrollTop) >= 1 ? want : null;
       }
+      /**
+       * Identifies a scrollable block inside a list: its call and its order among that call's blocks.
+       * @param {number} index - Call index.
+       * @param {number} pos - Position of the block within the widget.
+       * @returns {string}
+       */
+      function agentLogBlockId(index, pos) {
+        return `${index}:${pos}`;
+      }
+      /**
+       * The scroll offset to write back to a block, or null when it is already there.
+       * @param {{top: number, left: number}|undefined} saved
+       * @param {number} top - Current scrollTop.
+       * @param {number} left - Current scrollLeft.
+       * @returns {{top: number, left: number}|null}
+       */
+      function agentLogBlockRestore(saved, top, left) {
+        if (saved === undefined || (saved.top === top && saved.left === left)) return null;
+        return saved;
+      }
       // RALPHUS-AGENT-LOG:END
 
       // Optional tree-sitter parse of a shell call (RAL-644). The daemon splits
@@ -367,10 +387,10 @@
        * @param {string} text - The exact command text that was parsed.
        * @param {ShellSyntaxParse} p
        * @param {(s: string) => string} escFn - HTML escaper.
-       * @param {{isOpen: (id: string) => boolean, toggleAttr: string}} [hd] - Heredoc open state: `isOpen("row:ordinal")` and the `ontoggle` handler source.
+       * @param {(row: number, ordinal: number) => boolean} [isOpen] - Whether the reader expanded the heredoc at this row and ordinal.
        * @returns {string}
        */
-      function shellSyntaxRowsHtml(text, p, escFn, hd) {
+      function shellSyntaxRowsHtml(text, p, escFn, isOpen) {
         const bytes = new TextEncoder().encode(text);
         const dec = new TextDecoder();
         /**
@@ -379,7 +399,7 @@
          * @returns {string}
          */
         const slice = (a, b) => dec.decode(bytes.subarray(a, b));
-        return p.commands.map((c, rowIdx) => {
+        return p.commands.map((c, row) => {
           let pos = c.start;
           let html = "";
           /** @type {string[]} */
@@ -398,11 +418,7 @@
           }
           html += escFn(slice(pos, c.end));
           const sep = c.sep === "" ? "" : `<span class="alog-sh-sep" data-tip="Joins this command to the previous one.">${escFn(c.sep)}</span>`;
-          const blocks = docs.map((d, ord) => {
-            const id = `${rowIdx}:${ord}`;
-            const state = hd === undefined ? "" : ` data-hd="${id}"${hd.isOpen(id) ? " open" : ""} ontoggle="${hd.toggleAttr}"`;
-            return `<details class="alog-sh-heredoc"${state}><summary data-tip="The heredoc / here-string body, kept collapsed and unhighlighted.">heredoc · ${d.split("\n").length} lines</summary><pre>${escFn(d)}</pre></details>`;
-          }).join("");
+          const blocks = docs.map((d, ord) => `<details class="alog-sh-heredoc" data-hd="${row}:${ord}"${isOpen !== undefined && isOpen(row, ord) ? " open" : ""}><summary data-tip="The heredoc / here-string body, kept collapsed and unhighlighted.">heredoc · ${d.split("\n").length} lines</summary><pre>${escFn(d)}</pre></details>`).join("");
           return `<div class="alog-sh-row">${sep}${html}${blocks}</div>`;
         }).join("");
       }
@@ -424,6 +440,8 @@
       const agentLogShellSyntax = {};
       /** @type {{[key: string]: {[index: number]: boolean}}} Calls whose raw text the reader chose over the parsed view. */
       const agentLogShellRaw = {};
+      /** @type {{[key: string]: {[block: string]: {top: number, left: number}}}} Scroll offset of each scrollable block, by `callIndex:position`. */
+      const agentLogBlockScroll = {};
       /** Set once the daemon says shell-syntax is not built, so the board stops asking for the session. */
       let agentLogShellSyntaxOff = false;
 
@@ -501,16 +519,11 @@
           ? `<span class="alog-sh-more" data-tip="This call runs ${more} more command${more === 1 ? "" : "s"} after the one shown.\nExpand it to see every row.">+${more} more</span>`
           : "";
         const cmdText = shellCommandText(e.args);
-        const hdMap = agentLogHeredocOpen[key] && agentLogHeredocOpen[key][e.index];
-        const heredocState = {
-          isOpen: (/** @type {string} */ id) => !!(hdMap && hdMap[id]),
-          toggleAttr: `agentLogHeredocToggled(this,'${esc(key).replace(/'/g, "&#39;")}')`,
-        };
         const inputHtml = e.args.length === 0
           ? `<pre class="alog-pre">${esc(e.input) || "(none)"}</pre>`
           : e.args.map((a) => {
             const body = parse !== null && !raw && a.value === cmdText && (a.key === "command" || a.key === "cmd")
-              ? `<div class="alog-sh" data-tip="Syntax-highlighted view of the command. Display-only and optional: it never changes what ran, and the raw text is one click away.">${shellSyntaxRowsHtml(a.value, parse, esc, heredocState)}</div>`
+              ? `<div class="alog-sh" data-tip="Syntax-highlighted view of the command. Display-only and optional: it never changes what ran, and the raw text is one click away.">${shellSyntaxRowsHtml(a.value, parse, esc, (row, ord) => agentLogHeredocIsOpen(key, e.index, row, ord))}</div>`
               : `<pre class="alog-pre">${esc(a.value)}</pre>`;
             return `<div class="alog-kv"><span class="alog-k" data-tip="The &quot;${esc(a.key)}&quot; argument of this call.">${esc(a.key)}</span>${body}</div>`;
           }).join("");
@@ -655,19 +668,81 @@
         }
       }
       /**
-       * Remembers whether a heredoc block inside a widget is expanded.
-       * @param {HTMLDetailsElement} el
+       * Whether the reader left a heredoc block expanded.
        * @param {string} key
+       * @param {number} index - Call index.
+       * @param {number} row - Command row within the call.
+       * @param {number} ordinal - Heredoc ordinal within the row.
+       * @returns {boolean}
+       */
+      function agentLogHeredocIsOpen(key, index, row, ordinal) {
+        const m = agentLogHeredocOpen[key];
+        return !!(m && m[index] && m[index][`${row}:${ordinal}`]);
+      }
+      /**
+       * Remembers a heredoc block's open state; wired once on the document
+       * because `toggle` events do not bubble.
+       * @param {Event} ev
        * @returns {void}
        */
-      function agentLogHeredocToggled(el, key) {
-        const w = el.closest(".alog-w");
-        const id = el.dataset.hd;
-        if (!(w instanceof HTMLElement) || id === undefined) return;
+      function agentLogHeredocToggled(ev) {
+        const el = ev.target;
+        if (!(el instanceof HTMLDetailsElement) || !el.classList.contains("alog-sh-heredoc")) return;
+        const w = /** @type {HTMLElement|null} */ (el.closest("details.alog-w"));
+        const host = /** @type {HTMLElement|null} */ (el.closest(".alog[data-key]"));
+        if (!w || !host || !el.dataset.hd) return;
+        const key = host.dataset.key || "";
         const idx = Number(w.dataset.idx);
         const byCall = agentLogHeredocOpen[key] || (agentLogHeredocOpen[key] = {});
         const m = byCall[idx] || (byCall[idx] = {});
-        m[id] = el.open;
+        if (el.open) m[el.dataset.hd] = true; else delete m[el.dataset.hd];
+      }
+      document.addEventListener("toggle", agentLogHeredocToggled, true);
+      /**
+       * The scrollable blocks of a list with their ids.
+       * @param {HTMLElement} host
+       * @returns {{id: string, el: HTMLElement}[]}
+       */
+      function agentLogBlocks(host) {
+        /** @type {{id: string, el: HTMLElement}[]} */
+        const out = [];
+        host.querySelectorAll("details.alog-w").forEach((w) => {
+          const idx = Number(/** @type {HTMLElement} */ (w).dataset.idx);
+          w.querySelectorAll(".alog-pre, .alog-sh").forEach((b, pos) => out.push({ id: agentLogBlockId(idx, pos), el: /** @type {HTMLElement} */ (b) }));
+        });
+        return out;
+      }
+      /**
+       * Records a block's scroll offset as the reader moves it (capture-phase
+       * `scroll`, since scroll events do not bubble).
+       * @param {Event} ev
+       * @returns {void}
+       */
+      function agentLogBlockScrolled(ev) {
+        const el = ev.target;
+        if (!(el instanceof HTMLElement) || !(el.classList.contains("alog-pre") || el.classList.contains("alog-sh"))) return;
+        const w = /** @type {HTMLElement|null} */ (el.closest("details.alog-w"));
+        const host = /** @type {HTMLElement|null} */ (el.closest(".alog[data-key]"));
+        if (!w || !host) return;
+        const pos = [...w.querySelectorAll(".alog-pre, .alog-sh")].indexOf(el);
+        if (pos < 0) return;
+        const key = host.dataset.key || "";
+        const m = agentLogBlockScroll[key] || (agentLogBlockScroll[key] = {});
+        m[agentLogBlockId(Number(w.dataset.idx), pos)] = { top: el.scrollTop, left: el.scrollLeft };
+      }
+      document.addEventListener("scroll", agentLogBlockScrolled, true);
+      /**
+       * Puts every scrollable block back at its remembered offset after a repaint.
+       * @param {HTMLElement} host
+       * @returns {void}
+       */
+      function restoreAgentLogBlocks(host) {
+        const m = agentLogBlockScroll[host.dataset.key || ""];
+        if (!m) return;
+        for (const b of agentLogBlocks(host)) {
+          const to = agentLogBlockRestore(m[b.id], b.el.scrollTop, b.el.scrollLeft);
+          if (to !== null) { b.el.scrollTop = to.top; b.el.scrollLeft = to.left; }
+        }
       }
       /**
        * Remembers the list's scroll offset.
@@ -756,6 +831,7 @@
           host.innerHTML = html;
           agentLogLastHtml.set(host, html);
           applyAgentLogView(host, view);
+          restoreAgentLogBlocks(host);
           return;
         }
         agentLogLastHtml.delete(host);
@@ -773,6 +849,7 @@
           }
         }
         applyAgentLogView(host, view);
+        restoreAgentLogBlocks(host);
       }
       /** @type {WeakMap<Element, string>} The list HTML last written into each redrawn Agent Log. */
       const agentLogLastHtml = new WeakMap();
