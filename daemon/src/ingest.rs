@@ -73,6 +73,68 @@ pub struct IngestRequest {
     pub label: Option<String>,
     #[serde(default)]
     pub dry_run: bool,
+    /// Umbrella for the three extras below.
+    #[serde(default)]
+    pub ralphus_extras: bool,
+    /// Infer live actions from each branch's diff and pull request text.
+    #[serde(default)]
+    pub infer_live_actions: bool,
+    /// Add recipe and inferred exhibit requests to the pull requests.
+    #[serde(default)]
+    pub extras_exhibits: bool,
+    /// Choose the insights shown on adopted pull requests with a model.
+    #[serde(default)]
+    pub extras_insights: bool,
+}
+
+/// The extras an ingest request opts into, after the umbrella is expanded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct ExtrasSelection {
+    pub live_actions: bool,
+    pub exhibits: bool,
+    pub insights: bool,
+}
+
+impl ExtrasSelection {
+    fn from_request(req: &IngestRequest) -> Self {
+        Self {
+            live_actions: req.ralphus_extras || req.infer_live_actions,
+            exhibits: req.ralphus_extras || req.extras_exhibits,
+            insights: req.ralphus_extras || req.extras_insights,
+        }
+    }
+
+    fn any(self) -> bool {
+        self.live_actions || self.exhibits || self.insights
+    }
+}
+
+/// The most diff text handed to live-action inference for one branch.
+pub const INFERENCE_DIFF_CAP: usize = 30_000;
+
+/// Appended to a diff that was cut at [`INFERENCE_DIFF_CAP`].
+const DIFF_TRUNCATED_NOTE: &str = "\n[diff truncated]\n";
+
+/// `branch`'s diff against `beneath` (the branch under it in the stack, or the
+/// review base for the root), cut to `cap` characters on a character boundary
+/// with a trailing note when anything was dropped. `None` when git cannot
+/// produce the diff.
+pub fn capped_branch_diff(
+    root: &Path,
+    beneath: &str,
+    branch: &str,
+    cap: usize,
+) -> Option<(String, bool)> {
+    let range = format!("{beneath}...{branch}");
+    let diff = GitVcs.run(root, &["diff", &range]).ok()?;
+    Some(cap_text(&diff, cap))
+}
+
+fn cap_text(text: &str, cap: usize) -> (String, bool) {
+    match text.char_indices().nth(cap) {
+        None => (text.to_string(), false),
+        Some((end, _)) => (format!("{}{DIFF_TRUNCATED_NOTE}", &text[..end]), true),
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -83,6 +145,11 @@ struct BranchPlan {
     /// Where the cell's description came from: `prompt`, `pull request`,
     /// `commits` or `branch name`.
     description_source: &'static str,
+    /// Characters of diff live-action inference would read (opted in only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    inference_diff_chars: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    inference_diff_truncated: Option<bool>,
 }
 
 struct Prepared {
@@ -101,15 +168,29 @@ struct Prepared {
 /// A request that cannot be satisfied; the message says what to change.
 pub fn ingest(store: &StoreHandle, req: &IngestRequest) -> Result<Value, IngestError> {
     let prepared = prepare(store, req)?;
+    let extras = ExtrasSelection::from_request(req);
     let branches: Vec<BranchPlan> = req
         .branches
         .iter()
         .enumerate()
-        .map(|(i, branch)| BranchPlan {
-            branch: branch.clone(),
-            pr_number: prepared.prs[i].as_ref().map(|p| p.number),
-            pr_url: prepared.prs[i].as_ref().map(|p| p.url.clone()),
-            description_source: prepared.descriptions[i].1,
+        .map(|(i, branch)| {
+            let beneath = if i == 0 {
+                prepared.base.branch.as_str()
+            } else {
+                req.branches[i - 1].as_str()
+            };
+            let diff = extras
+                .live_actions
+                .then(|| capped_branch_diff(&prepared.root, beneath, branch, INFERENCE_DIFF_CAP))
+                .flatten();
+            BranchPlan {
+                branch: branch.clone(),
+                pr_number: prepared.prs[i].as_ref().map(|p| p.number),
+                pr_url: prepared.prs[i].as_ref().map(|p| p.url.clone()),
+                description_source: prepared.descriptions[i].1,
+                inference_diff_chars: diff.as_ref().map(|(d, _)| d.chars().count()),
+                inference_diff_truncated: diff.map(|(_, t)| t),
+            }
         })
         .collect();
     let mut out = json!({
@@ -124,7 +205,13 @@ pub fn ingest(store: &StoreHandle, req: &IngestRequest) -> Result<Value, IngestE
         "force_push_warning": FORCE_PUSH_WARNING,
         "review_id": req.review_id,
         "project": prepared.project,
+        "extras": extras,
     });
+    if extras.any() && prepared.prs.iter().all(Option::is_none) {
+        out["warnings"].as_array_mut().expect("array").push(json!(
+            "ralphus extras were requested but no branch has an open pull request"
+        ));
+    }
     if req.dry_run {
         return Ok(out);
     }
@@ -593,6 +680,44 @@ mod tests {
             prompt: None,
             label: None,
             dry_run,
+            ralphus_extras: false,
+            infer_live_actions: false,
+            extras_exhibits: false,
+            extras_insights: false,
+        }
+    }
+
+    #[test]
+    fn extras_umbrella_expands_and_flags_stand_alone() {
+        let mut req = request(Path::new("."), &["a"], true);
+        assert!(!ExtrasSelection::from_request(&req).any());
+        req.extras_exhibits = true;
+        let one = ExtrasSelection::from_request(&req);
+        assert!(one.exhibits && !one.live_actions && !one.insights);
+        req.ralphus_extras = true;
+        let all = ExtrasSelection::from_request(&req);
+        assert!(all.live_actions && all.exhibits && all.insights);
+    }
+
+    #[test]
+    fn diff_is_capped_on_a_character_boundary() {
+        assert_eq!(cap_text("abc", 3), ("abc".to_string(), false));
+        let (cut, truncated) = cap_text("ééééé", 2);
+        assert!(truncated);
+        assert!(cut.starts_with("éé") && cut.ends_with("[diff truncated]\n"));
+    }
+
+    #[test]
+    fn dry_run_reports_inference_diff_for_each_stacked_branch() {
+        let root = repo();
+        let mut req = request(&root, &["feat-a", "feat-b"], true);
+        req.infer_live_actions = true;
+        let out = ingest(&handle(), &req).unwrap();
+        assert_eq!(out["extras"]["live_actions"], true);
+        assert_eq!(out["extras"]["insights"], false);
+        for b in out["branches"].as_array().unwrap() {
+            assert!(b["inference_diff_chars"].as_u64().unwrap() > 0);
+            assert_eq!(b["inference_diff_truncated"], false);
         }
     }
 

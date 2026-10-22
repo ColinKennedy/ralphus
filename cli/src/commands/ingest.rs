@@ -21,10 +21,18 @@ pub struct IngestArgs {
     pub prompt_file: Option<String>,
     pub label: Option<String>,
     pub yes: bool,
+    pub ralphus_extras: bool,
+    pub infer_live_actions: bool,
+    pub extras_exhibits: bool,
+    pub extras_insights: bool,
 }
 
 pub fn parse_ingest(scanner: &mut Scanner) -> super::Command {
     let yes = scanner.take_bool("--yes");
+    let ralphus_extras = scanner.take_bool("--ralphus-extras");
+    let infer_live_actions = scanner.take_bool("--infer-live-actions");
+    let extras_exhibits = scanner.take_bool("--extras-exhibits");
+    let extras_insights = scanner.take_bool("--extras-insights");
     let review = scanner.take_value("--review").ok().flatten();
     let pr = scanner
         .take_value("--pr")
@@ -44,6 +52,10 @@ pub fn parse_ingest(scanner: &mut Scanner) -> super::Command {
         prompt_file,
         label,
         yes,
+        ralphus_extras,
+        infer_live_actions,
+        extras_exhibits,
+        extras_insights,
     })
 }
 
@@ -108,6 +120,16 @@ pub fn build_request(
     if let Some(v) = &args.label {
         map.insert("label".into(), json!(v));
     }
+    for (flag, key) in [
+        (args.ralphus_extras, "ralphus_extras"),
+        (args.infer_live_actions, "infer_live_actions"),
+        (args.extras_exhibits, "extras_exhibits"),
+        (args.extras_insights, "extras_insights"),
+    ] {
+        if flag {
+            map.insert(key.into(), json!(true));
+        }
+    }
     Ok(body)
 }
 
@@ -132,6 +154,16 @@ fn print_plan(plan: &Value) {
         match b["pr_number"].as_u64() {
             Some(n) => println!("  {name}: will adopt PR #{n}"),
             None => println!("  {name}: no open PR"),
+        }
+    }
+    let extras = &plan["extras"];
+    for (key, label) in [
+        ("live_actions", "inferred live actions"),
+        ("exhibits", "exhibits"),
+        ("insights", "model-filtered insights"),
+    ] {
+        if extras[key].as_bool() == Some(true) {
+            println!("extra: {label}");
         }
     }
     for w in plan["warnings"].as_array().into_iter().flatten() {
