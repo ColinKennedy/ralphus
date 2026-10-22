@@ -2397,13 +2397,40 @@ fn push_ref(
         "--force-with-lease=refs/heads/{alias}:{}",
         expected.0.as_deref().unwrap_or_default()
     );
-    ws.git(&[
-        "push",
-        remote,
-        &lease,
-        &format!("{local}:refs/heads/{alias}"),
-    ])
-    .map(|_| ())
+    let refspec = format!("{local}:refs/heads/{alias}");
+    let args = ["push", remote, lease.as_str(), refspec.as_str()];
+    let mut attempt = 1;
+    loop {
+        match ws.git(&args) {
+            Ok(_) => return Ok(()),
+            // A dropped transport mid-push is retried. The lease still
+            // applies to the retry: if the first attempt did land, the retry
+            // is refused as stale rather than overwriting anything.
+            Err(e) if attempt < PUSH_REF_ATTEMPTS && is_transient_push_transport_error(&e) => {
+                // ralphus[ignore-rlog-pair]: push_ref takes only a Workspace and has no Store; per-attempt retry detail, and a final failure is returned to the caller that records it
+                crate::rlog!(
+                    WARNING,
+                    "ralphus [pr] push of {alias} hit a transient transport error \
+                     (attempt {attempt} of {PUSH_REF_ATTEMPTS}); retrying: {e}"
+                );
+                attempt += 1;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+/// How many times [`push_ref`] tries a force-with-lease push that the
+/// transport dropped partway through.
+const PUSH_REF_ATTEMPTS: u32 = 3;
+
+/// Whether a failed `git push` reports the transport dropping mid-transfer
+/// (the remote side or a pipe going away), as opposed to the remote refusing
+/// the update. Only the former is worth retrying.
+fn is_transient_push_transport_error(error: &str) -> bool {
+    error.contains("unexpected disconnect while reading sideband packet")
+        || error.contains("the remote end hung up unexpectedly")
+        || error.contains("write error: Broken pipe")
 }
 
 /// Cancel whatever CI this force-push just superseded (RAL-510) -- called
@@ -4675,6 +4702,26 @@ pub(crate) fn defers_full_ci(mode: &str, index: usize, count: usize) -> bool {
         CI_DEFERRAL_BOTTOM_AND_TOP => !is_bottom && !is_top,
         _ => false,
     }
+}
+
+/// Whether a PR/MR created now for `branch_id` is born deferred.
+///
+/// The position comes from the review's whole branch order -- every enabled
+/// branch that is not `merged`/`closed`, including ones not yet rebased and so
+/// not yet submittable -- so a middle branch is labelled at creation even when
+/// it is momentarily the newest PR. If the later branches never join, they are
+/// disabled and [`reconcile_ci_deferral`] removes the label.
+fn defers_full_ci_at_creation(guardian: &GuardianView, branch_id: &str) -> bool {
+    let mut members: Vec<&BranchView> = guardian
+        .branches
+        .iter()
+        .filter(|b| b.enabled && !matches!(b.merge_status.as_str(), "merged" | "closed"))
+        .collect();
+    members.sort_by_key(|b| b.position);
+    members
+        .iter()
+        .position(|b| b.id == branch_id)
+        .is_some_and(|index| defers_full_ci(&guardian.effective_ci_deferral, index, members.len()))
 }
 
 /// Put [`ralphus_core::schema::DEFER_FULL_CI_LABEL`] on exactly the open
@@ -9542,16 +9589,7 @@ fn submit_stacked_branch_pr(
             }
             // The label is decided against the stack as currently intended;
             // `reconcile_ci_deferral` corrects it if the final shape differs.
-            let defer_label = ordered_enabled_branches
-                .iter()
-                .position(|b| b.id == branch.id)
-                .is_some_and(|index| {
-                    defers_full_ci(
-                        &guardian.effective_ci_deferral,
-                        index,
-                        ordered_enabled_branches.len(),
-                    )
-                });
+            let defer_label = defers_full_ci_at_creation(guardian, &branch.id);
             let initial_labels: &[&str] = if defer_label {
                 &[ralphus_core::schema::DEFER_FULL_CI_LABEL]
             } else {
@@ -15175,6 +15213,21 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&remote_dir);
         let _ = std::fs::remove_dir_all(&clone_dir);
+    }
+
+    #[test]
+    fn transient_push_transport_errors_are_retried_but_refusals_are_not() {
+        assert!(is_transient_push_transport_error(
+            "git push origin --force-with-lease=refs/heads/pr-1:abc x:refs/heads/pr-1 failed: \
+             send-pack: unexpected disconnect while reading sideband packet"
+        ));
+        assert!(is_transient_push_transport_error(
+            "git push origin x failed: fatal: sha1 file '<stdout>' write error: Broken pipe"
+        ));
+        assert!(!is_transient_push_transport_error(
+            "git push origin --force-with-lease=refs/heads/pr-1:abc x:refs/heads/pr-1 failed: \
+             ! [rejected] x -> pr-1 (stale info)"
+        ));
     }
 
     /// The clobber check and the push are separate round-trips. A reviewer
@@ -24302,7 +24355,10 @@ token_env = "RALPHUS_TEST_FORGE_TOKEN"
             &root,
             "origin",
             &guardian,
-            &ordered_enabled,
+            // The auto-submit pass only lists branches already rebased, so
+            // the not-yet-done upper branch is absent here; the label must
+            // still follow the review's full branch order.
+            &ordered_enabled[..1],
             &mut alias_by_branch,
             "main",
             branch,

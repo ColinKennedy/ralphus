@@ -1239,8 +1239,10 @@ pub const PROOF_SCOPE_VALUES: &[&str] = &[
 /// Valid values for `[[review]] ci_deferral` and the CLI's `ralphus review
 /// settings --ci-deferral`: which PRs/MRs in a review's stack run the full CI
 /// suite. Every other PR/MR in the stack carries [`DEFER_FULL_CI_LABEL`], which
-/// the project's CI configuration reads to skip its expensive jobs. See
-/// [`ReviewDef::ci_deferral`].
+/// the project's CI configuration reads to skip its expensive jobs. The label
+/// follows the review's branch order, so a PR/MR is labelled at creation even
+/// if later branches have no PR yet (GitHub adds it in a short follow-up call).
+/// See [`ReviewDef::ci_deferral`].
 pub const CI_DEFERRAL_EVERY: &str = "every";
 pub const CI_DEFERRAL_TOP: &str = "top";
 pub const CI_DEFERRAL_BOTTOM_AND_TOP: &str = "bottom+top";

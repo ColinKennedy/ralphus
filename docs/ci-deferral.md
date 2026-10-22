@@ -58,8 +58,13 @@ The labels follow the stack, not only the setting:
 
 - changing the setting on a review, or changing a project default for the
   reviews that inherit it;
-- submitting a PR/MR (it is labelled against the setting at that moment, and
-  the previous top stops being exempt);
+- submitting a PR/MR. It is labelled at creation by its place in the review's
+  branch order (enabled branches that are not merged or closed), even when
+  later branches have no PR yet, so a middle PR is not left running full CI
+  while it waits for the next one. If those later branches never join (they
+  are disabled), the last PR becomes the top, loses the label and gets a full
+  run. GitLab sends the label with the create request; GitHub adds it in a
+  follow-up call, so a short unlabelled window remains there;
 - reordering the review's branches, and enabling or disabling a branch;
 - moving a branch to another review.
 
