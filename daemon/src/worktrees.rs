@@ -2911,6 +2911,7 @@ fn provision_remote_with_targets(
             .with_store(std::sync::Arc::clone(store));
         sync_commit_metadata_hook_best_effort(&workspace, Path::new(&project.path));
         if project.vcs == "git" {
+            crate::remote_projects::refresh_config(Path::new(&project.path), &workspace);
             if let Err(e) = pin_remote_upstream_and_baseline(&workspace, branch, upstream) {
                 crate::rlog!(
                     WARNING,
@@ -3662,6 +3663,7 @@ static REMOTE_INIT: LazyLock<parking_lot::Mutex<HashMap<String, Arc<parking_lot:
 pub(crate) fn initialize_remote_worktree(
     store: &StoreHandle,
     squad_id: &str,
+    cell: &crate::store::CellRow,
     cwd: &str,
     machine: Option<&str>,
 ) -> Result<(), String> {
@@ -3677,7 +3679,9 @@ pub(crate) fn initialize_remote_worktree(
     if !spec.rerun_existing {
         return Ok(());
     }
-    let ws = crate::workspace::Workspace::on(cwd, machine).with_store(Arc::clone(store));
+    let ws = crate::workspace::Workspace::on(cwd, machine)
+        .with_store(Arc::clone(store))
+        .for_cell(squad_id, &cell.task_name, &cell.cell_id);
     crate::worktree_init::run_in(&ws, &spec).map(|_| ())
 }
 

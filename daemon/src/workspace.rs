@@ -63,6 +63,19 @@ pub struct Workspace {
     /// calls are logged and recorded under that review (see
     /// [`machine_call_spec`]). `None` for a workspace no review owns.
     guardian_id: Option<String>,
+    /// The cell this workspace belongs to, when it does: its machine calls
+    /// are logged under that cell's squad, task and id. `None` for a
+    /// workspace no cell owns.
+    cell: Option<Arc<CellCallOwner>>,
+}
+
+/// The cell a workspace's machine calls are made for (see
+/// [`Workspace::for_cell`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CellCallOwner {
+    squad_id: String,
+    task: String,
+    cell_id: String,
 }
 
 /// The [`crate::runner::RunnerSpec`] a machine call that belongs to no cell
@@ -382,6 +395,7 @@ impl Workspace {
             path_map: None,
             forge_credentials: None,
             guardian_id: None,
+            cell: None,
         }
     }
 
@@ -404,6 +418,7 @@ impl Workspace {
             path_map: None,
             forge_credentials: None,
             guardian_id: None,
+            cell: None,
         }
     }
 
@@ -508,6 +523,10 @@ impl Workspace {
             )
             .map(Arc::new);
             workspace.root = workspace.map_path(&workspace.root);
+            // A remote-only project's settings live only in the machine's clone.
+            if workspace.path_map.is_some() {
+                crate::remote_projects::refresh_config(Path::new(&review.git_root), &workspace);
+            }
             // Pushes and fetches on the machine authenticate as the review's
             // owner when the project is cloned over HTTPS.
             let clone_url = {
@@ -539,6 +558,19 @@ impl Workspace {
         self
     }
 
+    /// Mark this workspace as cell `cell_id`'s (of `task` in squad
+    /// `squad_id`), so its machine calls are logged under that squad rather
+    /// than as unowned workspace calls.
+    #[must_use]
+    pub fn for_cell(mut self, squad_id: &str, task: &str, cell_id: &str) -> Self {
+        self.cell = Some(Arc::new(CellCallOwner {
+            squad_id: squad_id.to_string(),
+            task: task.to_string(),
+            cell_id: cell_id.to_string(),
+        }));
+        self
+    }
+
     /// Attach the store handle a remote workspace needs to resolve its
     /// provider. A no-op in effect for a local workspace, which never looks.
     #[must_use]
@@ -556,6 +588,13 @@ impl Workspace {
     #[must_use]
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// The store handle this workspace resolves its provider through, when it
+    /// was given one.
+    #[must_use]
+    pub fn store(&self) -> Option<&crate::store_lock::StoreHandle> {
+        self.store.as_ref()
     }
 
     /// The machine this workspace lives on, or `None` for the daemon's host.
@@ -585,6 +624,7 @@ impl Workspace {
             local_root,
             forge_credentials: self.forge_credentials.clone(),
             guardian_id: self.guardian_id.clone(),
+            cell: self.cell.clone(),
         }
     }
 
@@ -1005,10 +1045,21 @@ impl Workspace {
         f(&provider, &self.machine_call_spec(machine))
     }
 
-    /// The spec this workspace's machine calls are made with: these
-    /// operations belong to no cell, so it carries only their owner (see
-    /// [`machine_call_spec`]).
-    fn machine_call_spec(&self, machine: &str) -> crate::runner::RunnerSpec {
+    /// The spec this workspace's machine calls are made with. A cell's
+    /// workspace carries that cell's identity; any other carries only its
+    /// owner (see [`machine_call_spec`]).
+    pub(crate) fn machine_call_spec(&self, machine: &str) -> crate::runner::RunnerSpec {
+        if let Some(cell) = &self.cell {
+            return crate::runner::RunnerSpec::for_command_proof(
+                &cell.squad_id,
+                &cell.task,
+                &cell.cell_id,
+                ".",
+                "",
+                "claude",
+                None,
+            );
+        }
         let task = if self.guardian_id.is_some() {
             "review-merge"
         } else {
@@ -1070,6 +1121,9 @@ impl Workspace {
     fn git_remote(&self, machine: &str, args: &[&str]) -> Result<String, String> {
         let mut env = non_interactive_git_env();
         let verb = args.first().copied().unwrap_or_default();
+        if verb == "fetch" {
+            crate::remote_probe::note_fetch(machine, &remote_path_string(&self.root), args);
+        }
         if let (true, Some(credentials), Some(store)) = (
             NETWORK_GIT_COMMANDS.contains(&verb),
             &self.forge_credentials,
@@ -1083,6 +1137,58 @@ impl Workspace {
             }
         }
         self.run_git_remote(args, env)
+    }
+
+    /// Probe this workspace's repository on its machine in one provider call
+    /// ([`crate::remote_probe`]): its local refs, worktrees and config, and
+    /// the remote tips of every ref it has been fetching. `None` for a
+    /// workspace on the daemon's host. A successful probe is also kept as the
+    /// repository's latest ([`crate::remote_probe::recent`]).
+    ///
+    /// # Errors
+    /// The probe could not be written for this repository's remotes, the
+    /// call failed, or its output was not a probe's.
+    pub fn probe_refs(&self) -> Option<Result<crate::remote_probe::RefProbe, String>> {
+        let machine = self.machine.as_deref()?;
+        let root = remote_path_string(&self.root);
+        let sources = crate::remote_probe::sources(machine, &root);
+        let Some(command) = crate::remote_probe::command(&sources) else {
+            return Some(Err(
+                "a fetched remote or ref name cannot be written into a probe".to_string(),
+            ));
+        };
+        let mut env = non_interactive_git_env();
+        if let (Some(credentials), Some(store)) = (&self.forge_credentials, &self.store) {
+            env.extend(credentials.env(store));
+        }
+        let req = crate::remote_runner::RunRequest {
+            cwd: root.clone(),
+            program: String::new(),
+            args: vec![command],
+            env,
+            shell: None,
+        };
+        let result = self
+            .with_provider(|p, spec| p.run_vcs(&req, spec))
+            .and_then(|out| {
+                crate::remote_probe::parse(&out, &sources)
+                    .ok_or_else(|| "the probe's output was not in its expected form".to_string())
+            });
+        match &result {
+            Ok(probe) => crate::remote_probe::remember(machine, &root, probe),
+            Err(_) => crate::remote_probe::forget_sources(machine, &root),
+        }
+        Some(result)
+    }
+
+    /// Where this workspace's repository is on its machine, as the key
+    /// [`crate::remote_probe`] keeps it under: `(machine, path)`. `None` on
+    /// the daemon's host.
+    #[must_use]
+    pub fn probe_key(&self) -> Option<(String, String)> {
+        self.machine
+            .as_deref()
+            .map(|machine| (machine.to_string(), remote_path_string(&self.root)))
     }
 
     fn run_git_remote(
@@ -1942,6 +2048,19 @@ echo {json}
         let unowned = Workspace::on("/remote/repo", Some("ib:A")).machine_call_spec("ib:A");
         assert_eq!(unowned.squad_id, "workspace");
         assert_ne!(unowned.task, "review-merge");
+    }
+
+    #[test]
+    fn a_cells_machine_calls_are_logged_under_its_squad() {
+        let cell = Workspace::on("/remote/wt", Some("ib:A")).for_cell("squad-7", "build", "c1");
+        for spec in [
+            cell.machine_call_spec("ib:A"),
+            cell.at("/remote/wt/sub").machine_call_spec("ib:A"),
+        ] {
+            assert_eq!(spec.squad_id, "squad-7");
+            assert_eq!(spec.task, "build");
+            assert_eq!(spec.cell_id, "c1");
+        }
     }
 
     /// A fake provider that answers every verb with `json` and appends each

@@ -36,6 +36,12 @@ tag = "command-shell"
 id = "ralphus-daemon guardian_merge::branch_diff_tests::diff_summary_counts_worktree_edits_against_the_base"
 tag = "branch-diff-summary"
 
+# The same summary for a remote review: every git call and untracked-file read
+# goes to the review's machine provider.
+[[test]]
+id = "ralphus-daemon guardian_merge::branch_diff_tests::diff_summary_of_a_remote_review_runs_on_its_machine"
+tag = "branch-diff-summary-remote"
+
 # Prompt cells (runner-side `run_with_backend`, scripted backend).
 [[test]]
 id = "ralphus-runner execute::tests::run_with_backend_succeeds_normally_when_no_thrash_is_reported"
@@ -188,3 +194,32 @@ tag = "ssh-windows"
 [[test]]
 id = "ralphus-outpost::loopback an_outpost_serves_an_allocations_machine_api_over_its_outbound_connection"
 tag = "outpost-loopback"
+
+# Agent preflight on a provider machine: the `preflight` verb asked through the
+# provider, once per machine and agent while it passes, again after a failure.
+[[test]]
+id = "ralphus-daemon remote_runner::tests::a_passing_preflight_is_asked_once_per_machine_and_agent"
+tag = "agent-preflight-remote"
+
+[[test]]
+id = "ralphus-daemon remote_runner::tests::an_agent_missing_on_a_provider_machine_fails_its_preflight_with_a_remedy_every_time"
+tag = "agent-preflight-remote"
+
+# A remote-only project's .ralphus.toml read from a machine's clone (`git
+# rev-parse` + `git show` through the provider), cached per commit.
+[[test]]
+id = "ralphus-daemon remote_projects::tests::a_remote_only_projects_config_is_read_from_its_machine_per_commit"
+tag = "remote-project-config"
+# A collecting remote review's preliminary summary while its page is polled.
+[[test]]
+id = "ralphus-daemon guardian_merge::tests::polling_a_collecting_remote_review_does_not_recompute_its_summary_each_time"
+tag = "review-summary-poll-remote"
+
+# An idle remote review's per-tick ref probe, and the passes a base move or PR push triggers.
+[[test]]
+id = "ralphus-daemon guardian_merge::tests::an_idle_remote_review_costs_one_probe_per_tick_and_still_notices_moves"
+tag = "review-maintenance-remote-probe"
+# Live-ref retirement on a remote machine (orphan sweep through the provider).
+[[test]]
+id = "ralphus-daemon live_runs::tests::orphan_live_refs_on_a_remote_machine_are_removed"
+tag = "live-ref-retirement-remote"

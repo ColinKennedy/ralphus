@@ -40,6 +40,7 @@ pub mod fileops;
 pub mod job;
 pub mod materialize;
 pub mod ping;
+pub mod preflight;
 pub mod protocol;
 pub mod provision;
 pub mod runner_install;

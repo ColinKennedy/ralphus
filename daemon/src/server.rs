@@ -13444,7 +13444,11 @@ fn guardian_branch_diff_summary(daemon: &Daemon, id: &str, branch_id: &str) -> R
     if !guardian.branches.iter().any(|b| b.id == branch_id) {
         return error(404, "not_found", "no such branch", vec![]);
     }
-    match crate::guardian_merge::branch_diff_summary(&guardian, branch_id) {
+    // The worktree is on the review's machine, so every git call goes there.
+    let store = daemon.store_handle();
+    match crate::guardian_merge::branch_diff_summary(&guardian, branch_id, |worktree| {
+        crate::workspace::Workspace::for_guardian(&store, id, worktree)
+    }) {
         Ok(d) => json(200, &d),
         Err(e) => error(409, "diff_summary_unavailable", &e, vec![]),
     }
@@ -19253,6 +19257,7 @@ fn delete_guardian_and_defer_cleanup(daemon: &Daemon, id: &str) -> Result<(), St
             }
             for (root, ws) in &workspaces {
                 crate::guardian_merge::purge_worktrees_in(&store_handle, ws, root, &id);
+                crate::live_runs::delete_review_live_refs(&store_handle, ws, &id);
             }
         }
         // RAL-154: same scoping as `kill_guardian_cell_sessions` — a
@@ -36370,6 +36375,40 @@ remediation_attempts=1
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    /// Deleting a review deletes its live refs in its repository right away
+    /// (not only at the next orphan sweep), and leaves other reviews' alone.
+    #[test]
+    fn delete_review_deletes_its_live_refs() {
+        let repo = tmp_git_repo("delete-live-refs");
+        let d = daemon();
+        let gid = d
+            .lock()
+            .create_guardian("demo", "main", repo.to_str().unwrap())
+            .unwrap();
+        let mine = crate::live_actions::live_ref_name(&gid, "run-1");
+        let other = crate::live_actions::live_ref_name("guardian-other", "run-2");
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(&repo)
+                .status()
+                .expect("git")
+                .success()
+        };
+        assert!(git(&["update-ref", &mine, "HEAD"]));
+        assert!(git(&["update-ref", &other, "HEAD"]));
+
+        let r = route(&d, "DELETE", &format!("/api/guardians/{gid}"), "");
+        assert_eq!(r.status, 200, "{}", r.body);
+
+        assert!(
+            !git(&["rev-parse", "--verify", "--quiet", &mine]),
+            "the deleted review's live ref is gone"
+        );
+        assert!(git(&["rev-parse", "--verify", "--quiet", &other]));
+        let _ = std::fs::remove_dir_all(&repo);
     }
 
     #[test]

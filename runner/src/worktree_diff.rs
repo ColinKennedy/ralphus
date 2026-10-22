@@ -234,23 +234,39 @@ fn summarize_polled(
 }
 
 fn summarize_subprocess(root: &Path, baseline: &str) -> Result<DiffSummary, String> {
+    summarize_via(
+        |args| git_detailed(root, args),
+        |rel| count_lines(&root.join(rel)),
+        baseline,
+    )
+}
+
+/// Summarise a worktree since `baseline` through `git` (runs git with the
+/// given arguments in the worktree, returning stdout) and `untracked_lines`
+/// (the line count of one untracked file, by worktree-relative path), so a
+/// caller whose worktree is on another machine can supply both.
+///
+/// # Errors
+/// The first failing `git` call's error.
+pub fn summarize_via(
+    git: impl Fn(&[&str]) -> Result<String, String>,
+    mut untracked_lines: impl FnMut(&str) -> u64,
+    baseline: &str,
+) -> Result<DiffSummary, String> {
     // `--numstat --summary` gives per-file line counts plus a
     // ` create mode ...` / ` delete mode ...` line per added/removed file, so
     // one diff covers both. No external diff driver or textconv filter can
     // affect numstat output, and ruling them out keeps the call spawn-free.
-    let diff = git_detailed(
-        root,
-        &[
-            "diff",
-            "--numstat",
-            "--summary",
-            "--no-renames",
-            "--no-ext-diff",
-            "--no-textconv",
-            baseline,
-        ],
-    )?;
-    let untracked = git_detailed(root, &["ls-files", "--others", "--exclude-standard", "-z"])?;
+    let diff = git(&[
+        "diff",
+        "--numstat",
+        "--summary",
+        "--no-renames",
+        "--no-ext-diff",
+        "--no-textconv",
+        baseline,
+    ])?;
+    let untracked = git(&["ls-files", "--others", "--exclude-standard", "-z"])?;
 
     let mut summary = DiffSummary::default();
     for line in diff.lines() {
@@ -277,9 +293,21 @@ fn summarize_subprocess(root: &Path, baseline: &str) -> Result<DiffSummary, Stri
     for rel in untracked.split('\0').filter(|p| !p.is_empty()) {
         summary.files_changed += 1;
         summary.files_added += 1;
-        summary.lines_added += count_lines(&root.join(rel));
+        summary.lines_added += untracked_lines(rel);
     }
     Ok(summary)
+}
+
+/// Lines in an untracked file's `text`, counted as [`summarize`] counts them:
+/// zero for text over the read cap or containing a NUL byte (binary).
+#[must_use]
+pub fn count_text_lines(text: &str) -> u64 {
+    let bytes = text.as_bytes();
+    if bytes.len() as u64 > MAX_UNTRACKED_READ_BYTES || bytes.contains(&0) {
+        return 0;
+    }
+    let newlines = bytes.iter().filter(|&&b| b == b'\n').count() as u64;
+    newlines + u64::from(bytes.last().is_some_and(|&b| b != b'\n'))
 }
 
 /// A watcher thread scoped to one backend run. Dropping it (success, error,

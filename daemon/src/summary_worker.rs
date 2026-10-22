@@ -18,9 +18,16 @@ use std::time::{Duration, Instant};
 /// ago is dropped. Low requests come from the board's list endpoints, which
 /// re-ask on every refresh (several times a minute per open tab) whether or
 /// not anything changed; events that do change a summary (a branch becoming
-/// ready) and the user opening a review use `High`/`promote`, which are never
-/// throttled.
+/// ready) use `High`, which is never throttled.
 const LOW_PRIORITY_MIN_INTERVAL: Duration = Duration::from_secs(10);
+
+/// A [`SummaryQueue::promote`] for a guardian recomputed less than this long
+/// ago, and not queued, is dropped. Promote is the review page's "this one is
+/// open" signal, sent on every poll of that page (every couple of seconds);
+/// on a review whose branches live on a remote machine each recompute runs
+/// `git log` and `rev-parse` there, one SSH session apiece. A change that
+/// alters the summary enqueues at `High` regardless.
+const PROMOTE_MIN_INTERVAL: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Priority {
@@ -38,6 +45,10 @@ struct Inner {
     /// When each guardian's last recompute finished, for
     /// [`LOW_PRIORITY_MIN_INTERVAL`].
     last_done: HashMap<String, Instant>,
+    /// Guardian ids a worker has popped and is recomputing right now; a
+    /// [`SummaryQueue::promote`] for one of them is dropped, since the
+    /// running recompute already answers it.
+    in_flight: HashSet<String>,
     shutdown: bool,
 }
 
@@ -58,6 +69,7 @@ impl SummaryQueue {
                 low: VecDeque::new(),
                 queued: HashSet::new(),
                 last_done: HashMap::new(),
+                in_flight: HashSet::new(),
                 shutdown: false,
             }),
             cv: Condvar::new(),
@@ -105,7 +117,8 @@ impl SummaryQueue {
     /// picked up next rather than waiting behind other High entries). If it
     /// isn't queued at all (never enqueued, or already finished), wakes it up
     /// by enqueueing fresh at High — never runs synchronously on the caller's
-    /// thread.
+    /// thread — unless it is being recomputed right now or finished within
+    /// [`PROMOTE_MIN_INTERVAL`].
     pub fn promote(&self, id: &str) {
         let mut inner = self.inner.lock().expect("summary queue mutex poisoned");
         if let Some(pos) = inner.low.iter().position(|x| x == id) {
@@ -118,6 +131,14 @@ impl SummaryQueue {
             inner.high.remove(pos);
             inner.high.push_front(id.to_string());
             self.cv.notify_all();
+            return;
+        }
+        if inner.in_flight.contains(id)
+            || inner
+                .last_done
+                .get(id)
+                .is_some_and(|at| at.elapsed() < PROMOTE_MIN_INTERVAL)
+        {
             return;
         }
         inner.queued.insert(id.to_string());
@@ -133,6 +154,7 @@ impl SummaryQueue {
         loop {
             if let Some(id) = inner.high.pop_front().or_else(|| inner.low.pop_front()) {
                 inner.queued.remove(&id);
+                inner.in_flight.insert(id.clone());
                 return Some(id);
             }
             if inner.shutdown {
@@ -148,8 +170,9 @@ impl SummaryQueue {
         let now = Instant::now();
         inner
             .last_done
-            .retain(|_, at| now.duration_since(*at) < LOW_PRIORITY_MIN_INTERVAL);
+            .retain(|_, at| now.duration_since(*at) < PROMOTE_MIN_INTERVAL);
         inner.last_done.insert(id.to_string(), now);
+        inner.in_flight.remove(id);
     }
 
     /// Stop the queue once everything already queued has been popped — lets
@@ -192,7 +215,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_recent_recompute_drops_low_but_not_high_or_promote() {
+    fn a_recent_recompute_drops_low_but_not_high() {
         let q = SummaryQueue::new();
         q.mark_done("a");
         q.enqueue("a", Priority::Low);
@@ -201,10 +224,46 @@ mod tests {
         q.enqueue("a", Priority::High);
         assert_eq!(q.pop().as_deref(), Some("a"));
         q.mark_done("a");
-        q.promote("a");
+        q.enqueue("a", Priority::High);
         assert_eq!(q.pop().as_deref(), Some("a"));
         q.shutdown();
         assert_eq!(q.pop(), None);
+    }
+
+    #[test]
+    fn repeated_promotes_of_a_recently_recomputed_guardian_are_dropped() {
+        // The review page promotes on every poll; a recompute that just
+        // finished must not be redone for each one.
+        let q = SummaryQueue::new();
+        q.promote("a");
+        assert_eq!(q.pop().as_deref(), Some("a"));
+        q.mark_done("a");
+        for _ in 0..20 {
+            q.promote("a");
+        }
+        q.promote("b");
+        assert_eq!(
+            q.pop().as_deref(),
+            Some("b"),
+            "a never-computed review still runs"
+        );
+        q.shutdown();
+        assert_eq!(q.pop(), None, "no recompute was queued for the recent one");
+    }
+
+    #[test]
+    fn promotes_while_a_recompute_is_running_are_dropped() {
+        // A slow remote recompute outlasts several page polls; each poll's
+        // promote must not queue a second recompute behind the running one.
+        let q = SummaryQueue::new();
+        q.promote("a");
+        assert_eq!(q.pop().as_deref(), Some("a"));
+        q.promote("a");
+        q.promote("b");
+        assert_eq!(q.pop().as_deref(), Some("b"));
+        q.mark_done("a");
+        q.shutdown();
+        assert_eq!(q.pop(), None, "no second recompute was queued for a");
     }
 
     #[test]

@@ -36,6 +36,7 @@ const SUPPORTED_OPS: &[&str] = &[
     "cleanup",
     "capabilities",
     "channel",
+    "preflight",
 ];
 
 /// Run `capabilities`: best-effort OS/arch probe plus static/derived facts

@@ -2749,7 +2749,7 @@ fn saturating_cap_ms(cap_sec: u64) -> i64 {
 /// through Phase 2C's wiring yet, or some other read failure) — so terminal-
 /// log coverage never regresses for a session that, for whatever reason,
 /// never got a `.raw` file.
-fn write_terminal_log_preferring_raw_transcript(
+pub(crate) fn write_terminal_log_preferring_raw_transcript(
     session_name: &str,
     attempt: u32,
     fallback_content: &str,

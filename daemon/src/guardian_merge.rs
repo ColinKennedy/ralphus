@@ -700,21 +700,19 @@ pub(crate) fn branch_diff_base(
 
 /// The git revision in `worktree` that `base` names, if it resolves.
 fn resolve_branch_diff_rev(
-    worktree: &Path,
+    worktree: &Workspace,
     guardian: &crate::guardian::GuardianView,
     base: &BranchDiffBase,
 ) -> Option<String> {
     let resolves = |rev: &str| {
-        git(
-            worktree,
-            &[
+        worktree
+            .git(&[
                 "rev-parse",
                 "--verify",
                 "--quiet",
                 &format!("{rev}^{{commit}}"),
-            ],
-        )
-        .is_ok_and(|s| !s.trim().is_empty())
+            ])
+            .is_ok_and(|s| !s.trim().is_empty())
     };
     match base {
         BranchDiffBase::Review { git_ref, .. } => resolves(git_ref).then(|| git_ref.clone()),
@@ -753,10 +751,13 @@ pub(crate) struct BranchDiffSummary {
     pub lines_removed: u64,
 }
 
-/// Compute [`BranchDiffSummary`] for `branch_id`. `Err` is a user-facing message.
+/// Compute [`BranchDiffSummary`] for `branch_id`, whose worktree path
+/// `workspace_for` turns into a [`Workspace`] on the review's machine. `Err`
+/// is a user-facing message.
 pub(crate) fn branch_diff_summary(
     guardian: &crate::guardian::GuardianView,
     branch_id: &str,
+    workspace_for: impl FnOnce(&str) -> Workspace,
 ) -> std::result::Result<BranchDiffSummary, String> {
     let base = branch_diff_base(guardian, branch_id)
         .ok_or_else(|| "this branch is disabled, so it has no diff summary".to_string())?;
@@ -765,13 +766,26 @@ pub(crate) fn branch_diff_summary(
         .iter()
         .find(|b| b.id == branch_id)
         .and_then(|b| b.worktree.as_deref())
-        .map(PathBuf::from)
-        .filter(|p| p.is_dir())
-        .ok_or_else(|| "no review worktree on this host yet".to_string())?;
+        .map(workspace_for)
+        .filter(|ws| !ws.is_local() || ws.root().is_dir())
+        .ok_or_else(|| "no review worktree yet".to_string())?;
     let base_rev = resolve_branch_diff_rev(&worktree, guardian, &base)
         .ok_or_else(|| "the diff base does not resolve in this worktree".to_string())?;
-    let counts = ralphus_runner::worktree_diff::summarize(&worktree, &base_rev)
-        .ok_or_else(|| "git could not diff this worktree".to_string())?;
+    let counts = if worktree.is_local() {
+        ralphus_runner::worktree_diff::summarize(worktree.root(), &base_rev)
+    } else {
+        ralphus_runner::worktree_diff::summarize_via(
+            |args| worktree.git(args),
+            |rel| {
+                worktree.read_file(rel).map_or(0, |text| {
+                    ralphus_runner::worktree_diff::count_text_lines(&text)
+                })
+            },
+            &base_rev,
+        )
+        .ok()
+    }
+    .ok_or_else(|| "git could not diff this worktree".to_string())?;
     let (base_kind, base_branch_id) = match &base {
         BranchDiffBase::Remote => ("remote", None),
         BranchDiffBase::Review { branch_id, .. } => ("review", Some(branch_id.clone())),
@@ -8049,6 +8063,10 @@ pub struct FeedbackOutcome {
     /// covers both an explicit `RALPHUS_PROOF: FAIL` and an agent run that
     /// errored or reported no verdict at all.
     pub proof_passed: Option<bool>,
+    /// Why nothing could be applied, when the pass failed for a reason its
+    /// caller should report as-is (a live run's commits that git could not
+    /// commit for want of an identity); `None` otherwise.
+    pub failure: Option<String>,
 }
 
 /// Outcome of [`run_commit_step`]: whether it produced a real commit, and
@@ -8415,27 +8433,45 @@ pub fn run_live_action_integration(
     outcome
 }
 
+/// What [`cherry_pick_live_commits`] made of a live run's commits.
+#[derive(Debug, PartialEq, Eq)]
+enum LivePick {
+    /// Every commit applied (or was already on the branch); how many applied.
+    Applied(usize),
+    /// A commit conflicted with the branch: the resolver applies the change.
+    Conflict,
+    /// Git could not commit a pick because it has no committer identity on
+    /// the worktree's machine -- not a conflict, so no resolver can help.
+    /// Carries git's error.
+    NoIdentity(String),
+}
+
 /// Cherry-pick `commits` (oldest first) onto `wt`'s HEAD, one at a time. A
 /// commit whose change is already on the branch (feedback or an auto-fix made
-/// the same fix) is skipped rather than failing the pick. On a real conflict
-/// the pick is aborted and the worktree reset to `start`, so whatever handles
-/// the change next sees the branch exactly as it was. Returns how many commits
-/// were applied, or `None` on a conflict.
-fn cherry_pick_live_commits(wt: &Workspace, commits: &[String], start: &str) -> Option<usize> {
+/// the same fix) is skipped rather than failing the pick. On a real conflict,
+/// or when git cannot commit for want of an identity, the pick is aborted and
+/// the worktree reset to `start`, so whatever handles the change next sees the
+/// branch exactly as it was.
+fn cherry_pick_live_commits(wt: &Workspace, commits: &[String], start: &str) -> LivePick {
     let mut applied = 0;
     for commit in commits {
-        if wt
-            .git(&[
-                "-c",
-                "core.editor=true",
-                "cherry-pick",
-                "--allow-empty-message",
-                commit,
-            ])
-            .is_ok()
-        {
-            applied += 1;
-            continue;
+        let error = match wt.git(&[
+            "-c",
+            "core.editor=true",
+            "cherry-pick",
+            "--allow-empty-message",
+            commit,
+        ]) {
+            Ok(_) => {
+                applied += 1;
+                continue;
+            }
+            Err(error) => error,
+        };
+        if crate::workspace::is_git_identity_error(&error) {
+            let _ = wt.git(&["cherry-pick", "--abort"]);
+            let _ = wt.git(&["reset", "--hard", start]);
+            return LivePick::NoIdentity(error);
         }
         let conflicted = wt
             .git(&["diff", "--name-only", "--diff-filter=U"])
@@ -8451,9 +8487,9 @@ fn cherry_pick_live_commits(wt: &Workspace, commits: &[String], start: &str) -> 
         }
         let _ = wt.git(&["cherry-pick", "--abort"]);
         let _ = wt.git(&["reset", "--hard", start]);
-        return None;
+        return LivePick::Conflict;
     }
-    Some(applied)
+    LivePick::Applied(applied)
 }
 
 /// Persist [`run_feedback`]'s outcome on the branch's open PR rows. A branch
@@ -8855,8 +8891,16 @@ fn run_feedback_pass(
     record_action_baseline(id, branch_id, before_resolver_sha.as_deref());
     // Live actions: a live run's commits are cherry-picked first; only a
     // conflict hands the change (carried in `feedback`) to the resolver.
-    let cleanly_picked = match (live_commits, before_resolver_sha.as_deref()) {
+    let pick = match (live_commits, before_resolver_sha.as_deref()) {
         (Some(commits), Some(start)) => cherry_pick_live_commits(&wt, commits, start),
+        _ => LivePick::Conflict,
+    };
+    let cleanly_picked = match pick {
+        LivePick::Applied(applied) => Some(applied),
+        _ => None,
+    };
+    let identity_failure = match &pick {
+        LivePick::NoIdentity(error) => Some(git_identity_detail(&feature, wt.machine(), error)),
         _ => None,
     };
     if live_commits.is_some() {
@@ -8870,7 +8914,8 @@ fn run_feedback_pass(
                     "branch_id": branch_id,
                     "commits": live_commits.map(<[String]>::len),
                     "cherry_picked": cleanly_picked,
-                    "resolver_fallback": cleanly_picked.is_none(),
+                    "resolver_fallback": cleanly_picked.is_none() && identity_failure.is_none(),
+                    "identity_failure": identity_failure,
                 }),
             );
     }
@@ -8880,6 +8925,9 @@ fn run_feedback_pass(
         picked.error = None;
         picked.summary = format!("cherry-picked {applied} live-action commit(s)");
         picked
+    } else if let Some(detail) = &identity_failure {
+        // The resolver would commit on the same machine and fail the same way.
+        crate::runner::RunnerResult::failure(detail)
     } else {
         let result = run_agent_with_stall_recovery(
             store,
@@ -9223,7 +9271,9 @@ fn run_feedback_pass(
     // reported as an explicit failure, surfaced on the branch/PR status
     // rather than silently consuming the single-attempt-per-failure budget
     // while looking like success (the bug `run_commit_step` exists to fix).
-    let (branch_status, detail) = if !result.is_done() {
+    let (branch_status, detail) = if let Some(detail) = &identity_failure {
+        (MergeStatus::Failed, detail.clone())
+    } else if !result.is_done() {
         (
             MergeStatus::Failed,
             format!(
@@ -9321,6 +9371,7 @@ fn run_feedback_pass(
         pushed,
         pushed_sha,
         proof_passed,
+        failure: identity_failure,
     };
     crate::rlog!(
         INFO,
@@ -10334,6 +10385,171 @@ fn filter_by_idle_cadence(candidates: &[(String, String)]) -> Vec<String> {
         .collect()
 }
 
+/// What a review's maintenance pass does this tick ([`remote_pass_gate`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RemotePass {
+    /// The review is on the daemon's host: the full pass, as always.
+    Local,
+    /// The review is on a remote machine and nothing the pass reads moved
+    /// since its last complete pass: only the forge-side checks run.
+    Idle,
+    /// The review is on a remote machine and something moved, or could not
+    /// be checked: the full pass.
+    Full,
+}
+
+/// What [`remote_pass_gate`] knows of a remote review's last full pass.
+#[derive(Debug, Clone, Copy)]
+struct RemotePassMemo {
+    /// The fingerprint taken just before that pass started.
+    fingerprint: u64,
+    /// Whether that pass ran to its end (an early return on a failure
+    /// leaves this `false`, so the next tick retries in full).
+    completed: bool,
+    /// When that pass started.
+    full_at: std::time::Instant,
+}
+
+/// [`RemotePassMemo`] per remote review id. Pruned on every
+/// [`review_maintenance`] tick to the reviews still maintained.
+static REMOTE_PASS_MEMO: LazyLock<Mutex<HashMap<String, RemotePassMemo>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Decide whether review `id`'s maintenance pass has anything to do on its
+/// machine this tick.
+///
+/// Every git command of a review on a remote machine is its own provider
+/// call, and an idle review's pass is about a dozen of them, so a remote
+/// review is first probed in one call per repository
+/// ([`Workspace::probe_refs`]): local refs, worktrees, config and the remote
+/// tips of everything the repository fetches. Its fingerprint -- that probe
+/// plus the review's and its PRs' rows -- is compared with the one taken
+/// before the last full pass; when they match, that pass completed, no merge
+/// check is waiting on the forge, and the last full pass is younger than
+/// [`crate::scheduler::REVIEW_IDLE_MAINT_INTERVAL`], the pass is
+/// [`RemotePass::Idle`]. Anything else -- including a probe that failed --
+/// is [`RemotePass::Full`].
+///
+/// Along the way the probe stands in for two fetches: each open PR's remote
+/// head is recorded as its current head ([`crate::pr::note_probed_pr_heads`]),
+/// so the pass fetches a PR branch exactly when it moved, and a base the
+/// probe shows behind its remote is fetched now rather than at the next
+/// base-branch poll.
+fn remote_pass_gate(store: &crate::store_lock::StoreHandle, id: &str) -> RemotePass {
+    let Ok(guardian) = store.with_read_snapshot(|conn| Store::get_guardian_conn(conn, id)) else {
+        return RemotePass::Local;
+    };
+    if Workspace::for_guardian(store, id, Path::new(&guardian.git_root))
+        .machine()
+        .is_none()
+    {
+        return RemotePass::Local;
+    }
+    let mut roots: Vec<&str> = vec![guardian.git_root.as_str()];
+    for project in &guardian.projects {
+        if !roots.contains(&project.as_str()) {
+            roots.push(project);
+        }
+    }
+    let prs = store
+        .lock()
+        .list_pull_requests_for_guardian(id)
+        .unwrap_or_default();
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    let mut probes = Vec::new();
+    for root in roots {
+        let ws = Workspace::for_guardian(store, id, Path::new(root));
+        let (Some(key), Some(Ok(probe))) = (ws.probe_key(), ws.probe_refs()) else {
+            // A failed probe forgets what its repository fetches; the full
+            // pass fetches every PR branch again so the next probe covers
+            // them (the base is fetched again by the base-branch poll).
+            crate::pr::forget_pr_fetches(&prs);
+            REMOTE_PASS_MEMO.lock().expect("poisoned").remove(id);
+            return RemotePass::Full;
+        };
+        std::hash::Hash::hash(&probe.digest, &mut hasher);
+        probes.push((key, probe));
+    }
+    std::hash::Hash::hash(&format!("{guardian:?}"), &mut hasher);
+    std::hash::Hash::hash(&format!("{prs:?}"), &mut hasher);
+    let fingerprint = std::hash::Hasher::finish(&hasher);
+
+    for (_, probe) in &probes {
+        crate::pr::note_probed_pr_heads(&prs, probe);
+    }
+    let mut fetched_base = false;
+    let infos: Vec<GuardianBaseFetchInfo> = store
+        .with_read_snapshot(Store::list_guardian_base_fetch_rows_conn)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|info| info.guardian_id == id)
+        .collect();
+    for target in collect_base_fetch_targets(&infos) {
+        let key = base_fetch_key(&target);
+        let Some(spec) = BASE_FETCH_SPECS
+            .lock()
+            .expect("poisoned")
+            .get(&key)
+            .cloned()
+        else {
+            continue;
+        };
+        let behind = probes
+            .iter()
+            .find(|(probed, _)| *probed == spec.probe_key)
+            .is_some_and(|(_, probe)| !spec.in_sync(probe));
+        if !behind {
+            continue;
+        }
+        if let Some(_claim) = InFlightClaim::acquire(&BASE_FETCH_IN_FLIGHT, &key) {
+            // The fetch that last succeeded for this target, made again
+            // directly; the full resolution only when that fails.
+            let ws = Workspace::for_guardian(store, id, &target.root);
+            let branch = spec.src.strip_prefix("refs/heads/").unwrap_or(&spec.src);
+            let repeated = fetch_base_ref(&ws, &key, &spec.remote, branch, &spec.dst);
+            if let Err(e) = repeated.or_else(|_| fetch_base_branch(store, &target, Some(id))) {
+                crate::rlog!(
+                    DEBUG,
+                    "ralphus [guardian] review {id} base-branch fetch after a probe failed: {e}"
+                );
+            }
+            fetched_base = true;
+        }
+    }
+
+    let unanswered = MERGE_CHECK_UNANSWERED
+        .lock()
+        .expect("poisoned")
+        .contains_key(id);
+    let mut memo = REMOTE_PASS_MEMO.lock().expect("poisoned");
+    let idle = !fetched_base
+        && !unanswered
+        && memo.get(id).is_some_and(|last| {
+            last.completed
+                && last.fingerprint == fingerprint
+                && last.full_at.elapsed() < crate::scheduler::REVIEW_IDLE_MAINT_INTERVAL
+        });
+    if idle {
+        return RemotePass::Idle;
+    }
+    memo.insert(
+        id.to_string(),
+        RemotePassMemo {
+            fingerprint,
+            completed: false,
+            full_at: std::time::Instant::now(),
+        },
+    );
+    RemotePass::Full
+}
+
+/// Record that review `id`'s full maintenance pass ran to its end.
+fn mark_remote_pass_completed(id: &str) {
+    if let Some(memo) = REMOTE_PASS_MEMO.lock().expect("poisoned").get_mut(id) {
+        memo.completed = true;
+    }
+}
+
 /// Releases a claim from one of the in-flight sets on drop, so an early
 /// `return` inside a worker cannot strand an id and lock that guardian out of
 /// all future passes.
@@ -10561,6 +10777,13 @@ fn review_maintenance_staggered(
     }
 
     let candidates: Vec<(String, String)> = full_maintenance_candidates(all_status_pairs);
+    {
+        let live: HashSet<&str> = candidates.iter().map(|(id, _)| id.as_str()).collect();
+        REMOTE_PASS_MEMO
+            .lock()
+            .expect("poisoned")
+            .retain(|id, _| live.contains(id.as_str()));
+    }
     spawn_merge_checks(store, &candidates);
     // Store lock released. Now apply the per-status cadence: an idle-tier
     // guardian is visited at most once per `REVIEW_IDLE_MAINT_INTERVAL`.
@@ -10595,6 +10818,19 @@ fn review_maintenance_staggered(
                 cancellations: cancellations.clone(),
                 key: format!("guardian:{id}"),
             };
+            // A review on a remote machine whose probe shows nothing moved
+            // since its last complete pass keeps only the forge-side checks,
+            // which make no call to its machine.
+            if remote_pass_gate(&store, &id) == RemotePass::Idle {
+                crate::pr::reconcile_ci_deferral_if_stack_changed(&store, &id);
+                crate::ci_watch::poll_open_pr_ci_status(
+                    &store,
+                    runner.as_ref(),
+                    &cancellations,
+                    &id,
+                );
+                return;
+            }
             // RAL-300: ask "have the linked PRs merged?" before deciding to
             // rebase at all -- but only when the base branch has moved since
             // the forge last answered, which is the only time a rebuild can
@@ -10698,6 +10934,7 @@ fn review_maintenance_staggered(
                         ),
                         serde_json::json!({"deferred": "stack_partially_merged"}),
                     );
+                mark_remote_pass_completed(&id);
                 return;
             }
             // A base-shift rebuild (full re-derive) subsumes any manual push via
@@ -10723,6 +10960,7 @@ fn review_maintenance_staggered(
             // same sweep that already reconciles every settled review.
             crate::pr::verify_and_repair_stack_ancestry(&store, runner.as_ref(), &id);
             repair_missing_final_summary(&store, &id);
+            mark_remote_pass_completed(&id);
         });
     }
 }
@@ -15878,21 +16116,20 @@ fn fetch_base_branch(
         }
     };
     let base = &target.base_branch;
+    let key = base_fetch_key(target);
 
     if let Some((remote, branch)) = base.split_once('/') {
         if ws.git(&["remote", "get-url", remote]).is_ok() {
-            let refspec = format!("+refs/heads/{branch}:refs/remotes/{remote}/{branch}");
-            return ws
-                .git(&["fetch", "--no-write-fetch-head", remote, &refspec])
-                .map(|_| ());
+            let tracking = format!("refs/remotes/{remote}/{branch}");
+            return fetch_base_ref(&ws, &key, remote, branch, &tracking);
         }
     }
     if let Ok(upstream) = ws.git(&["rev-parse", "--abbrev-ref", &format!("{base}@{{upstream}}")]) {
         let upstream = upstream.trim();
         if let Some((remote, branch)) = upstream.split_once('/') {
-            let refspec = format!("+refs/heads/{branch}:refs/heads/{base}");
-            return match ws.git(&["fetch", "--no-write-fetch-head", remote, &refspec]) {
-                Ok(_) => Ok(()),
+            let local = format!("refs/heads/{base}");
+            return match fetch_base_ref(&ws, &key, remote, branch, &local) {
+                Ok(()) => Ok(()),
                 // Git 2.40+ says "refusing to fetch into branch ... checked
                 // out at"; older git "Refusing to fetch into current branch".
                 Err(e) if e.to_ascii_lowercase().contains("refusing to fetch into") => {
@@ -15900,22 +16137,98 @@ fn fetch_base_branch(
                     // which nobody works in: detach it so the base can move.
                     if ws.machine().is_some()
                         && ws.git(&["checkout", "--quiet", "--detach"]).is_ok()
-                        && ws
-                            .git(&["fetch", "--no-write-fetch-head", remote, &refspec])
-                            .is_ok()
+                        && fetch_base_ref(&ws, &key, remote, branch, &local).is_ok()
                     {
                         return Ok(());
                     }
                     warn_checked_out_base_once(store, target);
-                    let tracking = format!("+refs/heads/{branch}:refs/remotes/{remote}/{branch}");
-                    ws.git(&["fetch", "--no-write-fetch-head", remote, &tracking])
-                        .map(|_| ())
+                    let tracking = format!("refs/remotes/{remote}/{branch}");
+                    fetch_base_ref(&ws, &key, remote, branch, &tracking)
                 }
                 Err(e) => Err(e),
             };
         }
     }
     Ok(())
+}
+
+/// The key a base-branch fetch target is claimed and remembered under.
+fn base_fetch_key(target: &BaseFetchTarget) -> String {
+    format!(
+        "{}|{}|{}",
+        target.root.display(),
+        target.machine.as_deref().unwrap_or(""),
+        target.base_branch
+    )
+}
+
+/// The fetch a base-branch target on a remote machine last made, so a probe
+/// of that repository ([`crate::remote_probe`]) can tell whether making it
+/// again would change anything.
+#[derive(Debug, Clone)]
+struct BaseFetchSpec {
+    /// The repository's `(machine, path)` ([`Workspace::probe_key`]).
+    probe_key: (String, String),
+    /// The remote fetched from.
+    remote: String,
+    /// The full ref fetched there.
+    src: String,
+    /// The local ref fetched into.
+    dst: String,
+}
+
+impl BaseFetchSpec {
+    /// Whether `probe` shows the local ref already at the remote's tip.
+    fn in_sync(&self, probe: &crate::remote_probe::RefProbe) -> bool {
+        matches!(
+            (probe.remote_tip(&self.remote, &self.src), probe.local_tip(&self.dst)),
+            (Some(remote), Some(local)) if remote == local
+        )
+    }
+}
+
+/// [`BaseFetchSpec`] per [`base_fetch_key`].
+static BASE_FETCH_SPECS: LazyLock<Mutex<HashMap<String, BaseFetchSpec>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Fetch `branch` of `remote` into `dst` (a full ref) in `ws`, remembering
+/// the fetch under `key` when `ws` is on a remote machine.
+fn fetch_base_ref(
+    ws: &Workspace,
+    key: &str,
+    remote: &str,
+    branch: &str,
+    dst: &str,
+) -> std::result::Result<(), String> {
+    let src = format!("refs/heads/{branch}");
+    ws.git(&[
+        "fetch",
+        "--no-write-fetch-head",
+        remote,
+        &format!("+{src}:{dst}"),
+    ])?;
+    if let Some(probe_key) = ws.probe_key() {
+        BASE_FETCH_SPECS.lock().expect("poisoned").insert(
+            key.to_string(),
+            BaseFetchSpec {
+                probe_key,
+                remote: remote.to_string(),
+                src,
+                dst: dst.to_string(),
+            },
+        );
+    }
+    Ok(())
+}
+
+/// Whether the latest probe of `key`'s repository, taken within `max_age`,
+/// shows its base already at the tip its last fetch would bring.
+fn base_in_sync_on_recent_probe(key: &str, max_age: std::time::Duration) -> bool {
+    let Some(spec) = BASE_FETCH_SPECS.lock().expect("poisoned").get(key).cloned() else {
+        return false;
+    };
+    crate::remote_probe::recent(&spec.probe_key.0, &spec.probe_key.1, max_age)
+        .is_some_and(|probe| spec.in_sync(&probe))
 }
 
 /// Base-fetch targets (`"{root}|{base_branch}"`) already warned about by
@@ -15987,16 +16300,25 @@ pub fn poll_base_branch_freshness_once(store: &crate::store_lock::StoreHandle) {
         .with_read_snapshot(Store::list_guardian_base_fetch_rows_conn)
         .unwrap_or_default();
     for target in collect_base_fetch_targets(&inputs) {
-        let key = format!(
-            "{}|{}|{}",
-            target.root.display(),
-            target.machine.as_deref().unwrap_or(""),
-            target.base_branch
-        );
+        let key = base_fetch_key(&target);
+        let guardian_ids = guardian_ids_for_target(&inputs, &target);
+        // A base on a remote machine that a maintenance probe has just seen
+        // at its remote's tip has nothing to fetch; the probe of the next
+        // maintenance pass fetches it itself once that tip moves.
+        if base_in_sync_on_recent_probe(&key, crate::scheduler::BASE_BRANCH_FRESHNESS_POLL_INTERVAL)
+        {
+            for guardian_id in &guardian_ids {
+                let _ = store.lock().record_poll_outcome(
+                    crate::poller_health::PollerKind::BaseBranchFetch,
+                    guardian_id,
+                    &crate::poller_health::PollOutcome::Healthy,
+                );
+            }
+            continue;
+        }
         let Some(claim) = InFlightClaim::acquire(&BASE_FETCH_IN_FLIGHT, &key) else {
             continue;
         };
-        let guardian_ids = guardian_ids_for_target(&inputs, &target);
         let store = Arc::clone(store);
         std::thread::spawn(move || {
             let _claim = claim;
@@ -20436,6 +20758,99 @@ mod tests {
     }
 
     #[test]
+    fn live_commits_that_cannot_be_committed_for_want_of_an_identity_are_not_a_conflict() {
+        // A live run's commits apply cleanly to the review's top branch, but
+        // git there has no committer identity: the integration must fail with
+        // the identity named, with no resolver run and the branch untouched.
+        if ["GIT_COMMITTER_NAME", "GIT_AUTHOR_NAME"]
+            .iter()
+            .any(|key| std::env::var_os(key).is_some())
+        {
+            eprintln!("skipped: the environment names a git identity");
+            return;
+        }
+        let (base, repo, _fwt) = make_repo("live-pick-no-identity");
+        g(&repo, &["checkout", "-b", "live", "main"]);
+        std::fs::write(repo.join("live.txt"), "live\n").unwrap();
+        g(&repo, &["add", "live.txt"]);
+        g(&repo, &["commit", "--message", "live fix"]);
+        let live_commit = git(&repo, &["rev-parse", "HEAD"])
+            .unwrap()
+            .trim()
+            .to_string();
+        g(&repo, &["checkout", "main"]);
+        let store = Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
+        let id = {
+            let guard = store.lock();
+            let id = guard
+                .create_guardian("r", "main", repo.to_str().unwrap())
+                .unwrap();
+            guard.add_guardian_branch(&id, "feature/a").unwrap();
+            id
+        };
+        struct MustNotRunRunner;
+        impl Runner for MustNotRunRunner {
+            fn run(&self, _: &RunnerSpec) -> RunnerResult {
+                panic!("no resolver may run for a missing git identity")
+            }
+        }
+        struct NoProofRunner;
+        impl Runner for NoProofRunner {
+            fn run(&self, _: &RunnerSpec) -> RunnerResult {
+                RunnerResult::failure("no agent in this test")
+            }
+        }
+        run_merge(&store, &NoProofRunner, &id);
+        let branch = store.lock().get_guardian(&id).unwrap().branches[0].clone();
+        let worktree = PathBuf::from(branch.worktree.expect("run_merge builds a worktree"));
+        let head_before = git(&worktree, &["rev-parse", "HEAD"]).unwrap();
+        g(&repo, &["config", "user.name", ""]);
+
+        let outcome = run_live_action_integration(
+            &store,
+            &MustNotRunRunner,
+            &id,
+            &branch.id,
+            "carry the live fix",
+            std::slice::from_ref(&live_commit),
+            &CancelToken::never(),
+        );
+
+        assert!(!outcome.committed);
+        let failure = outcome.failure.expect("the identity is reported");
+        assert!(failure.contains("no committer identity"), "{failure}");
+        assert!(failure.contains("not a merge conflict"), "{failure}");
+        assert!(failure.contains("user.email"), "{failure}");
+        assert!(failure.contains("\"ralphus\""), "{failure}");
+        assert_eq!(
+            git(&worktree, &["rev-parse", "HEAD"]).unwrap(),
+            head_before,
+            "the branch is left as it was"
+        );
+        assert!(
+            git(&worktree, &["status", "--porcelain"])
+                .unwrap()
+                .trim()
+                .is_empty(),
+            "the pick is aborted"
+        );
+        let view = store.lock().get_guardian(&id).unwrap();
+        assert_eq!(view.branches[0].merge_status, "failed");
+        assert!(
+            view.branches[0]
+                .detail
+                .as_deref()
+                .is_some_and(|d| d.contains("no committer identity")),
+            "{:?}",
+            view.branches[0].detail
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
     fn advance_rebase_keeps_a_clean_pick_that_could_not_be_committed() {
         // With no committer identity a pick that applies cleanly cannot be
         // committed: the rebase pauses with the pick staged and no
@@ -22307,6 +22722,336 @@ mod tests {
                 rusqlite::params![squad_id, cwd.to_str().unwrap(), branch],
             )
             .unwrap();
+    }
+
+    /// A fake machine provider answering every verb with a successful command
+    /// whose output is a fixed sha, appending each request it receives to
+    /// `requests.log` beside it. Returns the script and the log path.
+    fn recording_provider(dir: &Path) -> (PathBuf, PathBuf) {
+        std::fs::create_dir_all(dir).unwrap();
+        let log = dir.join("requests.log");
+        let json = r#"{"ok":true,"protocol_version":1,"exit_code":0,"stdout":"0123456789012345678901234567890123456789"}"#;
+        let (script, body) = if cfg!(windows) {
+            (
+                dir.join("p.cmd"),
+                format!(
+                    "@echo off\r\nmore >> \"{}\"\r\necho {json}\r\n",
+                    log.display()
+                ),
+            )
+        } else {
+            (
+                dir.join("p.sh"),
+                format!("#!/bin/sh\ncat >> '{}'\necho '{json}'\n", log.display()),
+            )
+        };
+        std::fs::write(&script, body).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        (script, log)
+    }
+
+    /// The `run` requests (one per remote command) `log` has recorded so far.
+    fn recorded_run_calls(log: &Path) -> usize {
+        std::fs::read_to_string(log)
+            .unwrap_or_default()
+            .lines()
+            .filter(|l| l.contains("\"program\""))
+            .count()
+    }
+
+    #[test]
+    fn polling_a_collecting_remote_review_does_not_recompute_its_summary_each_time() {
+        // The review page (and the fleet harness) polls GET /api/guardians/{id}
+        // every couple of seconds. On a collecting review each poll promoted
+        // its preliminary summary, which for a remote review is git commands
+        // on the machine -- one SSH session apiece, every poll, for as long as
+        // the review stayed collecting.
+        let dir = ralphus_test_support::scratch(format!("summary-poll-{}", std::process::id()));
+        let (script, log) = recording_provider(&dir);
+        let daemon = crate::server::Daemon::new(Store::open_in_memory().unwrap(), 4);
+        let store = daemon.store_handle();
+        let id = {
+            let guard = store.lock();
+            guard
+                .register_machine_provider(
+                    "ib",
+                    "",
+                    &script.to_string_lossy(),
+                    &[],
+                    crate::machines::PROTOCOL_VERSION,
+                    false,
+                )
+                .unwrap();
+            let id = guard.create_guardian("r", "main", "/srv/repo").unwrap();
+            guard.add_guardian_branch(&id, "feature/a").unwrap();
+            guard.set_guardian_machine(&id, Some("ib:A")).unwrap();
+            insert_done_cell(&guard, "squad-a", Path::new("/srv/wt-a"), "feature/a");
+            guard
+                .conn
+                .execute("UPDATE cells SET machine='ib:A'", [])
+                .unwrap();
+            let branch = guard.get_guardian(&id).unwrap().branches[0].id.clone();
+            guard
+                .set_branch_status(&id, &branch, MergeStatus::Ready, None)
+                .unwrap();
+            id
+        };
+        assert_eq!(store.lock().get_guardian(&id).unwrap().status, "collecting");
+        let queue = daemon.summary_queue_handle();
+        let workers = crate::summary_worker::spawn_workers(&queue, &store, 1);
+
+        for _ in 0..10 {
+            let reply = crate::server::route(&daemon, "GET", &format!("/api/guardians/{id}"), "");
+            assert_eq!(reply.status, 200);
+            std::thread::sleep(std::time::Duration::from_millis(600));
+        }
+        queue.shutdown();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+
+        let summaries = std::fs::read_to_string(&log)
+            .unwrap_or_default()
+            .lines()
+            .filter(|l| l.contains(r#""args":["log","#))
+            .count();
+        assert!(
+            recorded_run_calls(&log) > 0,
+            "the first poll computes the summary on the machine"
+        );
+        assert_eq!(
+            summaries, 1,
+            "polls within the promote interval must compute the summary once, not once per poll"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A fake machine provider like [`recording_provider`], except that a
+    /// ref probe ([`crate::remote_probe`]) is answered with whatever reply
+    /// the test last wrote to the returned probe file, and an `--abbrev-ref`
+    /// lookup with `origin/main`. Returns the script, the request log and
+    /// the probe file.
+    fn probing_provider(dir: &Path) -> (PathBuf, PathBuf, PathBuf) {
+        std::fs::create_dir_all(dir).unwrap();
+        let log = dir.join("requests.log");
+        let probe = dir.join("probe.json");
+        let reply = |stdout: &str| {
+            serde_json::json!({"ok": true, "protocol_version": 1, "exit_code": 0, "stdout": stdout})
+                .to_string()
+        };
+        let sha = reply(PROBE_SHA);
+        let upstream = reply("origin/main");
+        let (script, body) = if cfg!(windows) {
+            (
+                dir.join("p.cmd"),
+                format!(
+                    "@echo off\r\nsetlocal EnableDelayedExpansion\r\nset \"req=\"\r\nset /p req=\r\n\
+                     >>\"{log}\" echo(!req!\r\n\
+                     if not \"!req:ralphus-probe-section=!\"==\"!req!\" (\r\n  type \"{probe}\"\r\n  exit /b 0\r\n)\r\n\
+                     if not \"!req:--abbrev-ref=!\"==\"!req!\" (\r\n  echo {upstream}\r\n  exit /b 0\r\n)\r\n\
+                     echo {sha}\r\n",
+                    log = log.display(),
+                    probe = probe.display(),
+                ),
+            )
+        } else {
+            (
+                dir.join("p.sh"),
+                format!(
+                    "#!/bin/sh\nreq=$(cat)\nprintf '%s\\n' \"$req\" >> '{log}'\n\
+                     case \"$req\" in\n  *ralphus-probe-section*) cat '{probe}' ;;\n  \
+                     *--abbrev-ref*) echo '{upstream}' ;;\n  *) echo '{sha}' ;;\nesac\n",
+                    log = log.display(),
+                    probe = probe.display(),
+                ),
+            )
+        };
+        std::fs::write(&script, body).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        (script, log, probe)
+    }
+
+    /// The sha [`probing_provider`] answers every other command with.
+    const PROBE_SHA: &str = "0123456789012345678901234567890123456789";
+
+    /// Write the reply [`probing_provider`] gives a probe: every local ref at
+    /// [`PROBE_SHA`], and `main` and `feature/a-review` on `origin` at the
+    /// given shas.
+    fn write_probe_reply(path: &Path, remote_main: &str, remote_branch: &str) {
+        let section = "ralphus-probe-section";
+        let stdout = format!(
+            "{PROBE_SHA} commit\trefs/heads/main\n\
+             {PROBE_SHA} commit\trefs/heads/feature/a-review\n\
+             {PROBE_SHA} commit\trefs/ralphus/sync/pr-000000000001\n\
+             {section}\nworktree /srv/repo\n{section}\nremote.origin.url=https://example.invalid/w.git\n\
+             {section}\n{remote_main}\trefs/heads/main\n{remote_branch}\trefs/heads/feature/a-review\n"
+        );
+        let reply = serde_json::json!({
+            "ok": true, "protocol_version": 1, "exit_code": 0, "stdout": stdout,
+        });
+        std::fs::write(path, format!("{reply}\n")).unwrap();
+    }
+
+    /// Wait until no maintenance, merge-check or base-fetch work is in flight.
+    fn wait_for_background_review_work() {
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+        while std::time::Instant::now() < deadline {
+            let busy = !MAINTAINING.lock().unwrap().is_empty()
+                || !MERGE_CHECKING.lock().unwrap().is_empty()
+                || !BASE_FETCH_IN_FLIGHT.lock().unwrap().is_empty();
+            if !busy {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        panic!("background review work did not finish");
+    }
+
+    #[test]
+    fn an_idle_remote_review_costs_one_probe_per_tick_and_still_notices_moves() {
+        // An idle in_review review on a remote machine re-ran its whole
+        // maintenance pass there on every 5 s tick -- about a dozen git
+        // commands, each its own provider call -- plus a base-branch fetch
+        // every 10 s. At the same cadence it must now cost at most one call
+        // (the probe) per tick, while a base move or a push to its PR branch
+        // is still acted on within one tick.
+        let dir = ralphus_test_support::scratch(format!("remote-probe-{}", std::process::id()));
+        let (script, log, probe) = probing_provider(&dir);
+        write_probe_reply(&probe, PROBE_SHA, PROBE_SHA);
+        let store = Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
+        {
+            let guard = store.lock();
+            guard
+                .register_machine_provider(
+                    "ib",
+                    "",
+                    &script.to_string_lossy(),
+                    &[],
+                    crate::machines::PROTOCOL_VERSION,
+                    false,
+                )
+                .unwrap();
+            let id = guard.create_guardian("r", "main", "/srv/repo").unwrap();
+            guard.add_guardian_branch(&id, "feature/a").unwrap();
+            guard.set_guardian_machine(&id, Some("ib:A")).unwrap();
+            let branch = guard.get_guardian(&id).unwrap().branches[0].id.clone();
+            guard
+                .set_branch_review(&id, &branch, "feature/a-review", "/srv/wt-a")
+                .unwrap();
+            guard
+                .set_branch_status(&id, &branch, MergeStatus::Done, None)
+                .unwrap();
+            guard
+                .create_pull_request(
+                    &id,
+                    Some(&branch),
+                    "github",
+                    "acme/w",
+                    "feature/a-review",
+                    "main",
+                    "t",
+                    "d",
+                    Some(1),
+                    Some("http://x/1"),
+                )
+                .unwrap();
+            guard
+                .set_guardian_status(&id, GuardianStatus::InReview, None)
+                .unwrap();
+        }
+        let runners: RunnerFactory = Arc::new(|_: &crate::store_lock::StoreHandle| {
+            Arc::new(CapturingRunner::new()) as Arc<dyn Runner>
+        });
+        let sem = Arc::new(Semaphore::new(4));
+        let cancellations = crate::cancel::Cancellations::new();
+        let mut seen = 0;
+        // One scheduler tick at the original cadence: the maintenance pass
+        // and the base-branch poll. Returns the provider calls it made.
+        let mut tick = || {
+            review_maintenance_with(&store, &sem, &cancellations, &runners);
+            poll_base_branch_freshness_once(&store);
+            wait_for_background_review_work();
+            let text = std::fs::read_to_string(&log).unwrap_or_default();
+            let calls: Vec<String> = text
+                .lines()
+                .filter(|l| l.contains("\"program\""))
+                .map(str::to_string)
+                .collect();
+            let new = calls[seen..].to_vec();
+            seen = calls.len();
+            new
+        };
+
+        // The first passes do the work, and learn what the review fetches.
+        let first = tick();
+        assert!(
+            first.len() > 1,
+            "the first tick maintains the review on its machine: {first:#?}"
+        );
+        for _ in 0..3 {
+            tick();
+        }
+        for n in 0..5 {
+            let calls = tick();
+            assert!(
+                calls.len() <= 1 && calls.iter().all(|c| c.contains("ralphus-probe-section")),
+                "idle tick {n} must cost at most the probe, made {}: {calls:#?}",
+                calls.len()
+            );
+        }
+
+        // The base branch moves on the remote: fetched within one tick.
+        write_probe_reply(
+            &probe,
+            "4444444444444444444444444444444444444444",
+            PROBE_SHA,
+        );
+        let calls = tick();
+        assert!(
+            calls
+                .iter()
+                .any(|c| c.contains("\"fetch\"") && c.contains("refs/heads/main")),
+            "a moved base is fetched on the next tick: {calls:#?}"
+        );
+
+        // A reviewer pushes to the PR branch: pulled within one tick.
+        write_probe_reply(
+            &probe,
+            PROBE_SHA,
+            "5555555555555555555555555555555555555555",
+        );
+        let calls = tick();
+        assert!(
+            calls
+                .iter()
+                .any(|c| c.contains("\"fetch\"")
+                    && c.contains("feature/a-review:refs/ralphus/sync/")),
+            "a push to the PR branch is fetched on the next tick: {calls:#?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_review_on_the_daemons_host_is_never_probed() {
+        let store = Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
+        let id = store
+            .lock()
+            .create_guardian("r", "main", "/srv/repo")
+            .unwrap();
+        assert_eq!(remote_pass_gate(&store, &id), RemotePass::Local);
     }
 
     #[test]
@@ -25479,7 +26224,7 @@ mod branch_diff_tests {
         guardian.base_branch = "main".to_string();
         guardian.branches[0].worktree = Some(dir.to_string_lossy().to_string());
 
-        let none = branch_diff_summary(&guardian, &ids[0]).unwrap();
+        let none = branch_diff_summary(&guardian, &ids[0], |wt| Workspace::local(wt)).unwrap();
         assert_eq!(
             (none.files_changed, none.lines_added, none.lines_removed),
             (0, 0, 0)
@@ -25487,12 +26232,103 @@ mod branch_diff_tests {
 
         std::fs::write(dir.join("a.txt"), "two\nthree\n").unwrap();
         std::fs::write(dir.join("new.txt"), "x\n").unwrap();
-        let some = branch_diff_summary(&guardian, &ids[0]).unwrap();
+        let some = branch_diff_summary(&guardian, &ids[0], |wt| Workspace::local(wt)).unwrap();
         assert_eq!(some.files_changed, 2);
         assert_eq!(some.files_added, 1);
         assert_eq!(some.lines_added, 3);
         assert_eq!(some.lines_removed, 1);
         assert_eq!(some.base_kind, "remote");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A machine provider whose `run` verb runs the program in `real` when
+    /// asked for the machine path `/remote/wt`, and whose `read-file` reads
+    /// under `real` the same way: a remote worktree that exists only "over
+    /// there".
+    fn proxy_git_provider(dir: &Path, real: &Path) -> PathBuf {
+        let py = dir.join("provider.py");
+        std::fs::write(
+            &py,
+            format!(
+                r#"import json, os, subprocess, sys
+verb = sys.argv[1]
+real = {real:?}
+req = json.load(sys.stdin)
+def local(p):
+    p = p.replace("\\", "/")
+    assert p.startswith("/remote/wt"), p
+    return os.path.join(real, p[len("/remote/wt"):].lstrip("/"))
+if verb == "run":
+    out = subprocess.run([req["program"]] + req["args"], cwd=local(req["cwd"]), capture_output=True, text=True)
+    print(json.dumps({{"ok": True, "protocol_version": 1, "exit_code": out.returncode, "stdout": out.stdout}}))
+elif verb == "read-file":
+    print(json.dumps({{"ok": True, "protocol_version": 1, "stdout": open(local(req["path"])).read()}}))
+else:
+    print(json.dumps({{"ok": False, "protocol_version": 1, "error": "unexpected verb " + verb}}))
+"#,
+                real = real.to_string_lossy(),
+            ),
+        )
+        .unwrap();
+        py
+    }
+
+    #[test]
+    fn diff_summary_of_a_remote_review_runs_on_its_machine() {
+        let dir = ralphus_test_support::scratch(format!(
+            "ralphus-remote-branch-diff-{}",
+            std::process::id()
+        ));
+        let repo = dir.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let g = |args: &[&str]| {
+            git(&repo, args).unwrap();
+        };
+        g(&["init", "--initial-branch", "main"]);
+        g(&["config", "user.email", "t@example.com"]);
+        g(&["config", "user.name", "t"]);
+        g(&["config", "commit.gpgsign", "false"]);
+        std::fs::write(repo.join("a.txt"), "one\n").unwrap();
+        g(&["add", "."]);
+        g(&["commit", "-m", "base"]);
+        std::fs::write(repo.join("a.txt"), "two\nthree\n").unwrap();
+        std::fs::write(repo.join("new.txt"), "x\ny\n").unwrap();
+
+        let py = proxy_git_provider(&dir, &repo);
+        let store = Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
+        store
+            .lock()
+            .register_machine_provider(
+                "difftest",
+                "",
+                "python",
+                &[py.to_string_lossy().into_owned()],
+                crate::machines::PROTOCOL_VERSION,
+                false,
+            )
+            .unwrap();
+
+        let (mut guardian, ids) = review_with_branches(&[true]);
+        guardian.base_branch = "main".to_string();
+        // A path on the machine only: nothing exists at it on this host.
+        guardian.branches[0].worktree = Some("/remote/wt".to_string());
+
+        let summary = branch_diff_summary(&guardian, &ids[0], |wt| {
+            Workspace::on(wt, Some("difftest:A")).with_store(Arc::clone(&store))
+        })
+        .unwrap();
+        assert_eq!(
+            (
+                summary.files_changed,
+                summary.files_added,
+                summary.lines_added,
+                summary.lines_removed
+            ),
+            (2, 1, 4, 1)
+        );
+        assert_eq!(summary.base_ref, "main");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

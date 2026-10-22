@@ -91,7 +91,14 @@ these right:
 - **Fill in what you own.** The daemon sends `provision` and `cleanup` without
   a `remote_root` and `provision` without a `runner` policy for a provider
   machine; the provider supplies its own. `ralphus-fleet` also sets `exec`'s
-  `executable` from the machine's `[machine.agents]` (`complete_request`).
+  and `preflight`'s `executable` from the machine's `[machine.agents]`
+  (`complete_request`).
+- **Answer `preflight` if you can.** It is optional, but serving it lets a
+  missing agent fail a cell up front with a remedy instead of mid-run: run
+  `ralphus-runner preflight --agent <agent> [--executable <path>]` on the
+  machine and reply `{"available": true}` or `{"available": false, "detail":
+  "<its stderr>"}` (see
+  [`machine-provider-service.md`](machine-provider-service.md)).
 - **Return events in the reply.** A runner's `RALPHUS_EVENT: {json}` lines
   (stderr, for a v1 program) go into the reply's `events` array, oldest first.
   The daemon records them in Cartographer and enforces the live cost cap from

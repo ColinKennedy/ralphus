@@ -1242,13 +1242,11 @@ pub fn integrate_run(store: &crate::store_lock::StoreHandle, runner: &dyn Runner
         &CancelToken::never(),
     );
     if !outcome.committed {
-        fail_integration(
-            store,
-            &g,
-            &run,
+        let reason = outcome.failure.as_deref().unwrap_or(
             "the commits could not be applied to the top branch (the cherry-pick conflicted and \
              the resolver made no change)",
         );
+        fail_integration(store, &g, &run, reason);
         return;
     }
     let head = ws
@@ -1457,8 +1455,10 @@ pub fn sweep_automatic_runs(store: &crate::store_lock::StoreHandle, runners: &Li
 
 /// Daily cleanup of live refs (called with the worktree retirement sweep).
 ///
-/// For a review that has finished (`deployed`, `cancelled`, `merge_failed`):
-/// a live ref whose commits were carried (or that never had any) is deleted.
+/// For a review in a terminal state (`merged`, `approved`, `cancelled`,
+/// `deployed`): a live ref whose commits were carried (or that never had any)
+/// is deleted. A `merge_failed` review can still be restarted, so its refs --
+/// and any integration still pending on them -- are left alone.
 /// One whose commits never landed is kept -- it may be the only copy of a fix
 /// -- and the review's watchers are told once, with what to do.
 ///
@@ -1471,7 +1471,7 @@ pub fn retire_live_refs(store: &crate::store_lock::StoreHandle) {
             "SELECT r.run_id, r.live_ref, r.integration, g.id, g.git_root
              FROM guardian_live_runs r JOIN guardians g ON g.id = r.guardian_id
              WHERE r.live_ref IS NOT NULL
-               AND g.status IN ('deployed', 'cancelled', 'merge_failed')",
+               AND g.status IN ('merged', 'approved', 'cancelled', 'deployed')",
         ) else {
             return;
         };
@@ -1528,9 +1528,14 @@ pub fn retire_live_refs(store: &crate::store_lock::StoreHandle) {
 }
 
 /// Delete live refs whose review no longer exists, in every repository a
-/// review or registered project lives in.
+/// review or registered project lives in -- on the daemon's host, and on each
+/// remote machine a review still uses.
 fn retire_orphan_live_refs(store: &crate::store_lock::StoreHandle) {
-    let (roots, known): (Vec<String>, std::collections::HashSet<String>) = {
+    let (roots, known, remote): (
+        Vec<String>,
+        std::collections::HashSet<String>,
+        Vec<(String, String)>,
+    ) = {
         let guard = store.lock();
         let mut roots: Vec<String> = Vec::new();
         if let Ok(mut stmt) = guard
@@ -1552,41 +1557,147 @@ fn retire_orphan_live_refs(store: &crate::store_lock::StoreHandle) {
                 known.extend(rows.flatten());
             }
         }
-        (roots, known)
+        let mut remote = Vec::new();
+        if let Ok(mut stmt) = guard.conn.prepare(
+            "SELECT id, git_root FROM guardians
+             WHERE machine IS NOT NULL AND TRIM(machine) != '' AND LOWER(machine) != 'local'",
+        ) {
+            if let Ok(rows) = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?))) {
+                remote.extend(rows.flatten());
+            }
+        }
+        (roots, known, remote)
     };
     for root in roots {
         if !std::path::Path::new(&root).is_dir() {
             continue;
         }
         let ws = crate::workspace::Workspace::local(&root);
-        let Ok(refs) = ws.git(&[
-            "for-each-ref",
-            "--format=%(refname)",
-            crate::live_actions::LIVE_REF_PREFIX,
-        ]) else {
+        delete_live_refs_where(store, &ws, |owner| !known.contains(owner));
+    }
+    // A remote machine's repository is reached through a review that uses it;
+    // each (machine, repository) is swept once.
+    let mut swept = std::collections::HashSet::new();
+    for (gid, git_root) in remote {
+        let ws = crate::workspace::Workspace::for_guardian(store, &gid, git_root.as_str());
+        let Some(machine) = ws.machine().map(str::to_string) else {
             continue;
         };
-        for name in refs.lines().map(str::trim).filter(|l| !l.is_empty()) {
-            let owner = name
-                .strip_prefix(crate::live_actions::LIVE_REF_PREFIX)
-                .and_then(|rest| rest.trim_start_matches('/').split('/').next())
-                .unwrap_or_default();
-            if owner.is_empty() || known.contains(owner) {
-                continue;
-            }
-            let _ = ws.git(&["update-ref", "-d", name]);
-            crate::rlog!(
-                INFO,
-                "ralphus [guardian] deleted orphan live ref {name} in {root} (its review no longer exists)"
-            );
-            crate::cartographer::Note::new("guardian")
-                .scope("live_action")
-                .emit(
-                    &store.lock(),
-                    "orphan live ref retired",
-                    serde_json::json!({"live_ref": name, "repository": root, "review": owner}),
-                );
+        if !swept.insert((machine, ws.root().to_path_buf())) {
+            continue;
         }
+        delete_live_refs_where(store, &ws, |owner| !known.contains(owner));
+    }
+}
+
+/// Delete every live ref of review `guardian_id` in `ws`'s repository --
+/// the review is being deleted, which discards its work. Returns how many
+/// were deleted.
+pub fn delete_review_live_refs(
+    store: &crate::store_lock::StoreHandle,
+    ws: &crate::workspace::Workspace,
+    guardian_id: &str,
+) -> usize {
+    delete_live_refs_where(store, ws, |owner| owner == guardian_id)
+}
+
+/// Delete the live refs in `ws`'s repository whose owning review id
+/// satisfies `doomed`. Returns how many were deleted.
+fn delete_live_refs_where(
+    store: &crate::store_lock::StoreHandle,
+    ws: &crate::workspace::Workspace,
+    doomed: impl Fn(&str) -> bool,
+) -> usize {
+    let Ok(refs) = ws.git(&[
+        "for-each-ref",
+        "--format=%(refname)",
+        crate::live_actions::LIVE_REF_PREFIX,
+    ]) else {
+        return 0;
+    };
+    let repository = ws.root().to_string_lossy().into_owned();
+    let mut deleted = 0;
+    for name in refs.lines().map(str::trim).filter(|l| !l.is_empty()) {
+        let owner = name
+            .strip_prefix(crate::live_actions::LIVE_REF_PREFIX)
+            .and_then(|rest| rest.trim_start_matches('/').split('/').next())
+            .unwrap_or_default();
+        if owner.is_empty() || !doomed(owner) {
+            continue;
+        }
+        if ws.git(&["update-ref", "-d", name]).is_err() {
+            continue;
+        }
+        deleted += 1;
+        crate::rlog!(
+            INFO,
+            "ralphus [guardian] deleted live ref {name} in {repository} on {} (its review no \
+             longer exists)",
+            ws.machine().unwrap_or("the daemon's host")
+        );
+        crate::cartographer::Note::new("guardian")
+            .scope("live_action")
+            .emit(
+                &store.lock(),
+                "orphan live ref retired",
+                serde_json::json!({
+                    "live_ref": name,
+                    "repository": repository,
+                    "machine": ws.machine(),
+                    "review": owner,
+                }),
+            );
+    }
+    deleted
+}
+
+/// Record the live ref of each run the previous daemon left `running`, when
+/// that run had already pinned its commits: a stop between pinning and saving
+/// the run leaves the ref in the repository with no row naming it, so it
+/// would never be retired or reported. Such a run's commits were never
+/// reviewed or carried; they are marked `unrecorded`, so when the review
+/// finishes they are kept and reported like any other uncarried commits.
+/// Call before [`crate::store::Store::interrupt_running_live_runs`].
+pub fn adopt_interrupted_live_refs(store: &crate::store_lock::StoreHandle) {
+    let running: Vec<(String, String, String)> = {
+        let guard = store.lock();
+        let Ok(mut stmt) = guard.conn.prepare(
+            "SELECT r.run_id, g.id, g.git_root
+             FROM guardian_live_runs r JOIN guardians g ON g.id = r.guardian_id
+             WHERE r.state = 'running' AND r.live_ref IS NULL",
+        ) else {
+            return;
+        };
+        stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .map(|rows| rows.flatten().collect())
+            .unwrap_or_default()
+    };
+    for (run_id, gid, git_root) in running {
+        let ws = crate::workspace::Workspace::for_guardian(store, &gid, git_root.as_str());
+        let live_ref = crate::live_actions::live_ref_name(&gid, &run_id);
+        if ws
+            .git(&["rev-parse", "--verify", "--quiet", &live_ref])
+            .is_err()
+        {
+            continue;
+        }
+        let guard = store.lock();
+        let _ = guard.conn.execute(
+            "UPDATE guardian_live_runs SET live_ref=?, integration='unrecorded',
+                 integration_detail='the daemon stopped after this run pinned its commits; \
+                 they were never carried'
+             WHERE run_id=? AND live_ref IS NULL",
+            rusqlite::params![live_ref, run_id],
+        );
+        crate::cartographer::Note::new("guardian")
+            .guardian(&gid)
+            .scope("live_action")
+            .level(crate::logging::LogLevel::WARNING)
+            .emit(
+                &guard,
+                "interrupted live run's ref recorded",
+                serde_json::json!({"run_id": run_id, "live_ref": live_ref}),
+            );
     }
 }
 
@@ -2474,5 +2585,159 @@ prompt = "second"
         let run = live_run_conn(&f.store.lock().conn, &id).unwrap();
         assert_eq!(run.state, "interrupted");
         assert!(run.error.unwrap().contains("rerun"));
+    }
+
+    fn set_review_status(f: &Fixture, status: &str) {
+        f.store
+            .lock()
+            .conn
+            .execute(
+                "UPDATE guardians SET status=? WHERE id=?",
+                rusqlite::params![status, f.gid],
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn a_merged_or_approved_reviews_spent_live_refs_are_retired() {
+        for status in ["merged", "approved"] {
+            let f = fixture(&format!("retire-{status}"), "ok");
+            let (_, done_ref) = run_with_ref(&f, "integrated");
+            set_review_status(&f, status);
+            retire_live_refs(&f.store);
+            assert!(!ref_exists(&f.dir, &done_ref), "{status}: ref retired");
+        }
+    }
+
+    #[test]
+    fn a_merge_failed_reviews_pending_integration_stays_retryable() {
+        let f = fixture("retire-merge-failed", "ok");
+        let (id, live_ref) = run_with_ref(&f, "pending");
+        set_review_status(&f, "merge_failed");
+        retire_live_refs(&f.store);
+        assert!(ref_exists(&f.dir, &live_ref));
+        let run = f.store.lock().live_run(&id).unwrap();
+        assert_eq!(run.integration, "pending");
+        assert_eq!(run.live_ref.as_deref(), Some(live_ref.as_str()));
+    }
+
+    #[test]
+    fn deleting_a_review_deletes_only_its_live_refs() {
+        let f = fixture("delete-refs", "ok");
+        let (_, mine) = run_with_ref(&f, "failed");
+        let other = format!("{}/guardian-other/r1", crate::live_actions::LIVE_REF_PREFIX);
+        git(&f.dir, &["update-ref", &other, "HEAD"]);
+        let ws = crate::workspace::Workspace::local(&f.dir);
+        assert_eq!(delete_review_live_refs(&f.store, &ws, &f.gid), 1);
+        assert!(!ref_exists(&f.dir, &mine));
+        assert!(ref_exists(&f.dir, &other));
+    }
+
+    #[test]
+    fn a_ref_pinned_by_a_run_the_daemon_stopped_is_kept_and_reported() {
+        let f = fixture("adopt-interrupted", "ok");
+        let id = f
+            .store
+            .lock()
+            .queue_live_run(&f.gid, LiveRunKind::Live, 0, "x", "auto")
+            .unwrap();
+        f.store
+            .lock()
+            .start_live_run(&id, "/somewhere", "live-0-x")
+            .unwrap();
+        // The run pinned its commits, then the daemon stopped before saving.
+        let live_ref = crate::live_actions::live_ref_name(&f.gid, &id);
+        git(&f.dir, &["update-ref", &live_ref, "HEAD"]);
+
+        adopt_interrupted_live_refs(&f.store);
+        f.store.lock().interrupt_running_live_runs().unwrap();
+        let run = f.store.lock().live_run(&id).unwrap();
+        assert_eq!(run.live_ref.as_deref(), Some(live_ref.as_str()));
+        assert_eq!(run.integration, "unrecorded");
+
+        set_review_status(&f, "deployed");
+        retire_live_refs(&f.store);
+        assert!(ref_exists(&f.dir, &live_ref), "uncarried commits are kept");
+        assert_eq!(f.store.lock().live_run(&id).unwrap().integration, "kept");
+    }
+
+    #[test]
+    fn orphan_live_refs_on_a_remote_machine_are_removed() {
+        let dir = ralphus_test_support::scratch(format!(
+            "ralphus-live-runs-remote-orphan-{}-{}",
+            std::process::id(),
+            crate::store::now_ms()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store: crate::store_lock::StoreHandle = Arc::new(crate::store_lock::StoreMutex::new(
+            crate::store::Store::open_in_memory().unwrap(),
+        ));
+        let gid = store
+            .lock()
+            .create_guardian("live", "main", "/remote/repo")
+            .unwrap();
+        store
+            .lock()
+            .set_guardian_machine(&gid, Some("ib:A"))
+            .unwrap();
+        // The machine's repository holds a ref of a deleted review and one of
+        // the live review; the fake provider answers every call with them.
+        let prefix = crate::live_actions::LIVE_REF_PREFIX;
+        let json = format!(
+            r#"{{"ok":true,"protocol_version":1,"exit_code":0,"stdout":"{prefix}/guardian-gone/r1\n{prefix}/{gid}/r2\n"}}"#
+        );
+        let log = dir.join("requests.log");
+        let script = if cfg!(windows) {
+            let script = dir.join("p.cmd");
+            std::fs::write(
+                &script,
+                format!(
+                    "@echo off\r\nmore >> \"{}\"\r\necho {json}\r\n",
+                    log.display()
+                ),
+            )
+            .unwrap();
+            script
+        } else {
+            let script = dir.join("p.sh");
+            std::fs::write(
+                &script,
+                // `printf %s`, not `echo`: dash's `echo` turns the JSON's `\n`
+                // escapes into real newlines, which breaks the reply.
+                format!(
+                    "#!/bin/sh\ncat >> '{}'\nprintf '%s\\n' '{json}'\n",
+                    log.display()
+                ),
+            )
+            .unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+            script
+        };
+        store
+            .lock()
+            .register_machine_provider(
+                "ib",
+                "",
+                &script.to_string_lossy(),
+                &[],
+                crate::machines::PROTOCOL_VERSION,
+                false,
+            )
+            .unwrap();
+
+        retire_live_refs(&store);
+
+        let requests = std::fs::read_to_string(&log).unwrap();
+        let deletes: Vec<&str> = requests
+            .lines()
+            .filter(|l| l.contains("\"update-ref\""))
+            .collect();
+        assert_eq!(deletes.len(), 1, "{requests}");
+        assert!(deletes[0].contains("guardian-gone/r1"), "{requests}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

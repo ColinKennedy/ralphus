@@ -654,7 +654,9 @@ pub fn run_loop(
         // Live actions: nothing can still be running a live run in this
         // process, so a row left `running` by the previous daemon was
         // interrupted. It counts as the review's one automatic run; the user
-        // reruns it by hand.
+        // reruns it by hand. A run that already pinned its commits keeps its
+        // live ref on record first.
+        crate::live_runs::adopt_interrupted_live_refs(&store);
         match store.lock().interrupt_running_live_runs() {
             Ok(0) | Err(_) => {}
             Ok(n) => crate::rlog!(
@@ -3835,7 +3837,7 @@ fn run_cell_worker(
     if let (Some(machine), Some(cwd)) = (remote_machine(row.machine.as_deref()), row.cwd.as_deref())
     {
         if let Err(message) =
-            crate::worktrees::initialize_remote_worktree(store, squad_id, cwd, Some(machine))
+            crate::worktrees::initialize_remote_worktree(store, squad_id, row, cwd, Some(machine))
         {
             fail_cell_for_worktree(store, squad_id, row, &message);
             let mut prog = progress.lock().expect("progress mutex poisoned");
@@ -3963,7 +3965,7 @@ fn run_cell_worker(
                     // carrying context across an attempt boundary, so the
                     // guidance rides in on it.
                     let uri = crate::ghost::cell_uri(squad_id, row.task_idx, row.idx);
-                    let revision = cell_revision(store, row);
+                    let revision = cell_revision(store, squad_id, row);
                     store_ok(
                         &guard,
                         squad_id,
@@ -4112,6 +4114,28 @@ fn run_cell_worker(
     }
     spec.agent = selection.backend.clone();
     spec.executable = selection.executable.clone();
+    // A prompt cell on a provider machine asks that machine whether its agent
+    // can start there (remembered per machine and agent while it passes), so
+    // a missing agent fails the cell now with a remedy rather than mid-run.
+    if spec.prompt.is_some() && is_remote_machine(row.machine.as_deref()) {
+        if let Err(message) = runner.preflight_agent(
+            &spec.agent,
+            spec.executable.as_deref(),
+            row.machine.as_deref(),
+        ) {
+            fail_cell_before_dispatch(
+                store,
+                squad_id,
+                row,
+                &message,
+                "cell failed: agent unavailable on its machine",
+            );
+            let mut prog = progress.lock().expect("progress mutex poisoned");
+            prog.status[i] = CellState::Failed;
+            prog.failed.insert(row.task_idx);
+            return;
+        }
+    }
     if spec.prompt.is_some() {
         spec.capabilities = capabilities_for_agent(store, &row.agent, &selection.backend);
         if spec.closing_turn_prompt.is_some() {
@@ -4660,7 +4684,7 @@ fn run_cell_worker(
                 if let Some(bearing_text) = crate::waypoints::render_bearing_block(wp_id, &bearings)
                 {
                     let uri = crate::ghost::cell_uri(squad_id, row.task_idx, row.idx);
-                    let revision = cell_revision(store, row);
+                    let revision = cell_revision(store, squad_id, row);
                     store_ok(
                         &guard,
                         squad_id,
@@ -4849,7 +4873,7 @@ fn run_cell_worker(
     if let Some(ghost_text) = result.ghost.as_deref().map(str::trim) {
         if !ghost_text.is_empty() {
             let uri = crate::ghost::cell_uri(squad_id, row.task_idx, row.idx);
-            let revision = cell_revision(store, row);
+            let revision = cell_revision(store, squad_id, row);
             let guard = store.lock();
             if guard
                 .upsert_ghost(
@@ -4883,7 +4907,7 @@ fn run_cell_worker(
     // live as `prophecy` events dedupe against these on the store's unique
     // key, so this only fills in whatever the live path missed.
     if !result.prophecies.is_empty() {
-        let revision = cell_revision(store, row);
+        let revision = cell_revision(store, squad_id, row);
         let guard = store.lock();
         let target = crate::prophecy::CellProphecyTarget {
             task_idx: row.task_idx,
@@ -5211,10 +5235,9 @@ fn check_task_no_commits_guard(
         .iter()
         .filter(|s| s.task_idx == task_idx)
         .filter_map(|s| {
-            s.cwd.as_deref().map(|cwd| {
-                crate::workspace::Workspace::on(cwd, s.machine.as_deref())
-                    .with_store(Arc::clone(store))
-            })
+            s.cwd
+                .as_deref()
+                .map(|cwd| cell_workspace(store, squad_id, s, cwd))
         })
         .collect();
     if crate::reviews::any_workspace_ahead_of_upstream(&workspaces) {
@@ -5254,16 +5277,28 @@ fn check_task_no_commits_guard(
     false
 }
 
+/// Cell `row`'s (of squad `squad_id`) worktree at `cwd`, on the cell's own
+/// machine. Its machine calls are logged under the cell.
+fn cell_workspace(
+    store: &crate::store_lock::StoreHandle,
+    squad_id: &str,
+    row: &crate::store::CellRow,
+    cwd: &str,
+) -> crate::workspace::Workspace {
+    crate::workspace::Workspace::on(cwd, row.machine.as_deref())
+        .with_store(Arc::clone(store))
+        .for_cell(squad_id, &row.task_name, &row.cell_id)
+}
+
 /// The commit a cell's worktree is at, read on the cell's own machine (see
 /// [`crate::ghost::current_revision`]).
 fn cell_revision(
     store: &crate::store_lock::StoreHandle,
+    squad_id: &str,
     row: &crate::store::CellRow,
 ) -> Option<String> {
     let cwd = row.cwd.as_deref().filter(|c| !c.is_empty())?;
-    crate::ghost::current_revision_in(
-        &crate::workspace::Workspace::on(cwd, row.machine.as_deref()).with_store(Arc::clone(store)),
-    )
+    crate::ghost::current_revision_in(&cell_workspace(store, squad_id, row, cwd))
 }
 
 /// `machine` with the daemon's own host (unset, blank or `local`) as `None`.
@@ -5322,9 +5357,8 @@ fn publish_remote_task_branches(
         if !published.insert((machine.to_string(), cwd.to_string())) {
             continue;
         }
-        let ws = crate::workspace::Workspace::on(cwd, Some(machine))
-            .with_store(Arc::clone(store))
-            .with_forge_credentials(credentials.clone());
+        let ws =
+            cell_workspace(store, squad_id, cell, cwd).with_forge_credentials(credentials.clone());
         let Ok(branch) = ws
             .git(&["rev-parse", "--abbrev-ref", "HEAD"])
             .map(|b| b.trim().to_string())
@@ -6012,6 +6046,55 @@ fn guardian_blocking_tasks(
         })
         .map(|s| s.task_idx)
         .collect()
+}
+
+/// Fail `row` before its runner starts: record the result, log `headline`
+/// with `message` to Cartographer, and mail its watchers.
+fn fail_cell_before_dispatch(
+    store: &crate::store_lock::StoreHandle,
+    squad_id: &str,
+    row: &crate::store::CellRow,
+    message: &str,
+    headline: &'static str,
+) {
+    crate::rlog!(
+        ERROR,
+        "ralphus [scheduler] cell {squad_id}/{} {headline}: {message}",
+        row.cell_id,
+    );
+    let outcome = crate::store::CellOutcome {
+        state: crate::store::NodeState::Failed,
+        usage: crate::store::RecordedUsage::default(),
+        error: Some(message.to_string()),
+        agent_session_id: None,
+    };
+    let guard = store.lock();
+    store_ok(
+        &guard,
+        squad_id,
+        "record_cell_result",
+        guard.record_cell_result(squad_id, row.task_idx, row.idx, &outcome),
+    );
+    let _ = guard.cartographer_log(crate::cartographer::CartographerEntry {
+        level: crate::logging::LogLevel::ERROR,
+        source: "scheduler",
+        message: headline,
+        scope: Some("cell"),
+        squad_id: Some(squad_id),
+        guardian_id: None,
+        cell_id: Some(&row.cell_id),
+        task: Some(&row.task_name),
+        log_path: None,
+        payload: serde_json::json!({"error": message}),
+        admin_only: false,
+    });
+    enqueue_cell_failure_mailbox(
+        &guard,
+        squad_id,
+        &row.cell_id,
+        &row.task_name,
+        Some(message),
+    );
 }
 
 /// Whether `machine` names a provider-backed machine rather than the daemon's
@@ -11770,6 +11853,21 @@ prompt = "anything"
             mode: None,
             remediation_attempts: None,
         }
+    }
+
+    #[test]
+    fn a_remote_cells_machine_calls_are_logged_under_its_squad() {
+        let store = Arc::new(crate::store_lock::StoreMutex::new(
+            crate::store::Store::open_in_memory().unwrap(),
+        ));
+        let mut row = make_cell_row_no_cwd(2);
+        row.machine = Some("ib:A".to_string());
+        let ws = cell_workspace(&store, "squad-000000000042", &row, "/remote/wt");
+        assert_eq!(ws.machine(), Some("ib:A"));
+        let spec = ws.machine_call_spec("ib:A");
+        assert_eq!(spec.squad_id, "squad-000000000042");
+        assert_eq!(spec.task, "task2");
+        assert_eq!(spec.cell_id, "s2");
     }
 
     #[test]
