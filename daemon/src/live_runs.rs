@@ -685,6 +685,7 @@ pub fn ensure_live_actions(
     runners: &LiveRunnerFactory,
     guardian_id: &str,
 ) -> Vec<crate::live_actions::LiveAction> {
+    let _remote_scope = crate::machine_strict::enter_for_guardian(store, guardian_id);
     let existing = store
         .lock()
         .guardian_live_actions(guardian_id)
@@ -780,6 +781,7 @@ pub fn drain_queue(
     guardian_id: &str,
     claim: crate::store_memory::LiveRunWorkerClaim,
 ) {
+    let _remote_scope = crate::machine_strict::enter_for_guardian(store, guardian_id);
     let mut claim = Some(claim);
     loop {
         // Commits are carried only once the queue is empty: carrying one
@@ -1347,6 +1349,7 @@ pub fn retry_pending_integrations(
             // That review's worker integrates its own runs.
             continue;
         }
+        let _remote_scope = crate::machine_strict::enter_for_guardian(store, &gid);
         let runner = runners(store);
         integrate_run(store, runner.as_ref(), &run_id);
     }

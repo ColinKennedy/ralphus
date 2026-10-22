@@ -7546,8 +7546,9 @@ fn project_branches(daemon: &Daemon, name: &str) -> Reply {
     let project = daemon.with_read_snapshot(|c| Store::get_project_conn(c, name));
     match project {
         Ok(Some(p)) if p.vcs == "git" => {
-            let mut branches = crate::guardian_merge::list_base_branches(&p.path, "main");
-            for b in crate::guardian_merge::list_base_branches(&p.path, "origin/HEAD") {
+            let mut branches =
+                crate::guardian_merge::list_base_branches(Path::new(&p.path), "main");
+            for b in crate::guardian_merge::list_base_branches(Path::new(&p.path), "origin/HEAD") {
                 if !branches.contains(&b) {
                     branches.push(b);
                 }
@@ -13284,17 +13285,18 @@ fn guardian_branch_conflicts(daemon: &Daemon, id: &str, branch_id: &str) -> Repl
     let Some(worktree) = worktree else {
         return empty();
     };
-    let wt = std::path::Path::new(&worktree);
-    if !wt.exists() {
+    // The worktree is on the review's machine; a local one that is gone has
+    // nothing to report.
+    let ws =
+        crate::workspace::Workspace::for_guardian(&daemon.store_handle(), id, worktree.as_str());
+    if ws.is_local() && !std::path::Path::new(&worktree).exists() {
         return empty();
     }
     json(
         200,
         &BranchConflictsView {
-            files: crate::guardian_merge::conflicted_files(&crate::workspace::Workspace::local(wt)),
-            rebase_in_progress: crate::guardian_merge::rebase_in_progress(
-                &crate::workspace::Workspace::local(wt),
-            ),
+            files: crate::guardian_merge::conflicted_files(&ws),
+            rebase_in_progress: crate::guardian_merge::rebase_in_progress(&ws),
         },
     )
 }
@@ -17329,7 +17331,7 @@ fn guardian_unlink_prs(daemon: &Daemon, id: &str) -> Reply {
         // sent to the parent repo.
         match crate::pr::forge_client_for_stack(
             &daemon.store_handle(),
-            root,
+            &crate::workspace::Workspace::for_guardian(&daemon.store_handle(), &guardian.id, root),
             &guardian.base_branch,
             &forge_cfg,
             guardian.owner.as_deref(),
@@ -19000,6 +19002,7 @@ fn guardian_squash(daemon: &Daemon, id: &str, body: &str) -> Reply {
 /// `daemon.background()`'s `Immediate` mode in tests, so existing synchronous
 /// assertions about cleanup still see it happen before `route()` returns.
 fn delete_guardian_and_defer_cleanup(daemon: &Daemon, id: &str) -> Result<(), StoreError> {
+    let store_handle = daemon.store_handle();
     let store = daemon.lock();
     // Snapshot everything needed for cleanup before the row is gone
     // (multi-project guardians span >1 root).
@@ -19008,9 +19011,25 @@ fn delete_guardian_and_defer_cleanup(daemon: &Daemon, id: &str) -> Result<(), St
     // while the row -- and the fork routing it is resolved from -- still
     // exists.
     let dual_root_branch = store.guardian_dual_root_stack_branch(id).ok().flatten();
-    store.delete_guardian(id)?;
     drop(store);
-    let store_handle = daemon.store_handle();
+    // Each project's workspace, resolved while the review still records its
+    // machine: once the row is gone, cleanup could only fall back to the
+    // daemon's host and would leave a remote review's worktrees behind.
+    let workspaces: Vec<(String, crate::workspace::Workspace)> = snapshot
+        .as_ref()
+        .map(|g| {
+            g.projects
+                .iter()
+                .map(|root| {
+                    (
+                        root.clone(),
+                        crate::workspace::Workspace::for_guardian(&store_handle, id, root.as_str()),
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    daemon.lock().delete_guardian(id)?;
     let id = id.to_string();
     daemon.background().spawn(move || {
         if let Some(g) = snapshot {
@@ -19026,8 +19045,8 @@ fn delete_guardian_and_defer_cleanup(daemon: &Daemon, id: &str) -> Result<(), St
                     "review deleted",
                 );
             }
-            for root in &g.projects {
-                crate::guardian_merge::purge_worktrees(&store_handle, root, &id);
+            for (root, ws) in &workspaces {
+                crate::guardian_merge::purge_worktrees_in(&store_handle, ws, root, &id);
             }
         }
         // RAL-154: same scoping as `kill_guardian_cell_sessions` — a
@@ -19573,10 +19592,130 @@ fn build_check_command_body(
     Some((resolved, body))
 }
 
-/// Why a board-launched check cannot run on the review's machine: that path
-/// relied on a provider terminal relay, which no longer exists.
-const REMOTE_CHECK_UNSUPPORTED: &str =
-    "running a check on the review machine is not supported; run it locally";
+/// Whether `check` runs on its review's own machine rather than in a terminal
+/// on the daemon's host: the review has a remote machine and the check says
+/// `run_on = "review_machine"` or nothing at all.
+fn check_runs_on_review_machine(
+    g: &crate::guardian::GuardianView,
+    check: &crate::guardian::GuardianCheck,
+) -> bool {
+    let review_remote = g.machine.as_deref().map(str::trim).is_some_and(|m| {
+        !m.is_empty() && !m.eq_ignore_ascii_case(ralphus_core::schema::LOCAL_MACHINE)
+    });
+    review_remote && matches!(check.run_on.as_deref(), None | Some("review_machine"))
+}
+
+/// Run a check on its review's machine (see [`check_runs_on_review_machine`]).
+///
+/// There is no terminal there to watch: the body runs through the machine's
+/// provider in the check's working directory, its combined output is written
+/// to the same daemon-side log [`guardian_check_run_output`] serves, and the
+/// result and Cartographer rows are recorded exactly as [`watch_check_run`]
+/// records a local run. The provider reports success or failure, not a code,
+/// so a failure is recorded as exit code `1`.
+#[allow(clippy::too_many_arguments)]
+fn run_check_on_review_machine(
+    store: crate::store_lock::StoreHandle,
+    g: &crate::guardian::GuardianView,
+    check: &crate::guardian::GuardianCheck,
+    kind: &'static str,
+    index: usize,
+    submitted_inputs: &std::collections::HashMap<String, String>,
+    run_cleanup: bool,
+    auto: bool,
+) -> Option<std::thread::JoinHandle<Option<i32>>> {
+    run_check_on_review_machine_into(
+        store,
+        g,
+        check,
+        kind,
+        index,
+        submitted_inputs,
+        run_cleanup,
+        auto,
+        check_run_log_path(&g.id, kind, index),
+        check_run_result_path(&g.id, kind, index),
+    )
+}
+
+/// [`run_check_on_review_machine`] writing its output to `log_path` and its
+/// result to `result_path`.
+#[allow(clippy::too_many_arguments)]
+fn run_check_on_review_machine_into(
+    store: crate::store_lock::StoreHandle,
+    g: &crate::guardian::GuardianView,
+    check: &crate::guardian::GuardianCheck,
+    kind: &'static str,
+    index: usize,
+    submitted_inputs: &std::collections::HashMap<String, String>,
+    run_cleanup: bool,
+    auto: bool,
+    log_path: std::path::PathBuf,
+    result_path: std::path::PathBuf,
+) -> Option<std::thread::JoinHandle<Option<i32>>> {
+    let (resolved, body) =
+        build_check_command_body(check, submitted_inputs, &g.input_values, run_cleanup)?;
+    let cwd = check
+        .prepared_cwd
+        .clone()
+        .or_else(|| g.combined_worktree.clone())
+        .unwrap_or_else(|| g.git_root.clone());
+    // A daemon-side path (the `git_root` fallback) is translated onto the
+    // machine; a path already on the machine passes through unchanged.
+    let ws = crate::workspace::Workspace::for_guardian(&store, &g.id, cwd.as_str());
+    let _ = std::fs::remove_file(&result_path);
+    check_run_note(
+        &store,
+        &g.id,
+        crate::logging::LogLevel::INFO,
+        "check run started",
+        serde_json::json!({
+            "kind": kind,
+            "index": index,
+            "command": resolved,
+            "auto": auto,
+            "machine": ws.machine(),
+        }),
+    );
+    let guardian_id = g.id.clone();
+    let env = g.manual_checks_env.clone();
+    Some(std::thread::spawn(move || {
+        let _remote_scope = crate::machine_strict::enter(ws.machine());
+        let started = std::time::Instant::now();
+        let (ok, output) = ws.run_command_with_env(&body, &env, &crate::cancel::CancelToken::new());
+        let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        let _ = std::fs::write(&log_path, &output);
+        let exit_code = if ok { 0 } else { 1 };
+        let result = CheckRunResult {
+            exit_code: Some(exit_code),
+            elapsed_ms,
+            timed_out: false,
+            auto,
+        };
+        if let Ok(encoded) = serde_json::to_string(&result) {
+            let _ = std::fs::write(&result_path, encoded);
+        }
+        check_run_note(
+            &store,
+            &guardian_id,
+            if ok {
+                crate::logging::LogLevel::INFO
+            } else {
+                crate::logging::LogLevel::WARNING
+            },
+            "check run finished",
+            serde_json::json!({
+                "kind": kind,
+                "index": index,
+                "elapsed_ms": elapsed_ms,
+                "has_output": !output.is_empty(),
+                "auto": auto,
+                "exit_code": exit_code,
+            }),
+        );
+        Some(exit_code)
+    }))
+}
 
 /// Gap between polls of a launched check's exit-code marker file. Short enough
 /// that a quick check's recorded duration is accurate to well under a second,
@@ -19952,6 +20091,19 @@ pub(crate) fn run_check_unattended(
     kind: &'static str,
     index: usize,
 ) -> Option<Option<i32>> {
+    if check_runs_on_review_machine(g, check) {
+        return run_check_on_review_machine(
+            store.clone(),
+            g,
+            check,
+            kind,
+            index,
+            &std::collections::HashMap::new(),
+            true,
+            true,
+        )
+        .map(|handle| handle.join().unwrap_or(None));
+    }
     let id = g.id.as_str();
     let cwd = check
         .prepared_cwd
@@ -20056,10 +20208,17 @@ fn guardian_run_manual_commands(daemon: &Daemon, id: &str, body: &str) -> Reply 
             .unwrap_or_else(|| g.git_root.clone());
         let marker = new_check_run_marker(id, "manual", *index);
         let log = check_run_log_path(id, "manual", *index);
-        let run_remote = check.run_on.as_deref() == Some("review_machine")
-            || (check.run_on.is_none() && g.machine.is_some());
-        let prepared = if run_remote {
-            errors.push(REMOTE_CHECK_UNSUPPORTED.to_string());
+        let prepared = if check_runs_on_review_machine(&g, check) {
+            run_check_on_review_machine(
+                daemon.store_handle(),
+                &g,
+                check,
+                "manual",
+                *index,
+                &req.inputs,
+                req.run_cleanup,
+                false,
+            );
             continue;
         } else {
             let Some(prepared) = build_check_command_line(
@@ -20294,10 +20453,30 @@ fn guardian_run_action_hint(daemon: &Daemon, id: &str, body: &str) -> Reply {
         .unwrap_or_else(|| g.git_root.clone());
     let marker = new_check_run_marker(id, "action", req.index);
     let log = check_run_log_path(id, "action", req.index);
-    let run_remote = hint.run_on.as_deref() == Some("review_machine")
-        || (hint.run_on.is_none() && g.machine.is_some());
-    let prepared = if run_remote {
-        return error(500, "terminal_error", REMOTE_CHECK_UNSUPPORTED, vec![]);
+    let prepared = if check_runs_on_review_machine(&g, &hint) {
+        let started = run_check_on_review_machine(
+            daemon.store_handle(),
+            &g,
+            &hint,
+            "action",
+            req.index,
+            &req.inputs,
+            req.run_cleanup,
+            false,
+        );
+        if !req.inputs.is_empty() {
+            let _ = daemon.lock().merge_guardian_input_values(id, &req.inputs);
+        }
+        return if started.is_some() {
+            json(200, &OpenTerminalResponse { ok: true })
+        } else {
+            error(
+                409,
+                "action_not_prepared",
+                "prompt action has not expanded into a runnable command",
+                vec![],
+            )
+        };
     } else {
         build_check_command_line(
             &cwd,
@@ -20374,8 +20553,14 @@ fn guardian_base_branches(daemon: &Daemon, id: &str) -> Reply {
         Ok(g) => g,
         Err(e) => return store_error(&e),
     };
-    let branches =
-        crate::guardian_merge::list_base_branches(&guardian.git_root, &guardian.base_branch);
+    // The review's branches live where its repository does: its machine for
+    // a remote review.
+    let ws = crate::workspace::Workspace::for_guardian(
+        &daemon.store_handle(),
+        id,
+        guardian.git_root.as_str(),
+    );
+    let branches = crate::guardian_merge::list_base_branches(&ws, &guardian.base_branch);
     json(200, &branches)
 }
 
@@ -21293,6 +21478,7 @@ pub fn serve<A: ToSocketAddrs>(
         std::io::Error::other(e.to_string())
     })?;
     let schema_open_ms = startup_started.elapsed().as_millis();
+    crate::machine_strict::announce(&store);
     crate::cartographer::Note::new("daemon").emit(
         &store,
         format!(
@@ -21520,10 +21706,12 @@ pub fn serve<A: ToSocketAddrs>(
     // RAL-185: the scheduler holds a router rather than the local runner
     // directly, so a cell carrying a `machine` is dispatched to its provider
     // while every local cell takes exactly the path it always did.
-    let runner: Arc<dyn Runner> = Arc::new(crate::remote_runner::MachineRouter::new(
-        local_runner,
-        daemon.store_handle(),
-    ));
+    let runner: Arc<dyn Runner> = Arc::new(
+        crate::remote_runner::MachineRouter::new(local_runner, daemon.store_handle()).with_halts(
+            daemon.waypoint_halts_handle(),
+            daemon.arbiter_stops_handle(),
+        ),
+    );
     let handle = daemon.store_handle();
     let cancellations = daemon.cancellations_handle();
     let waypoint_halts = daemon.waypoint_halts_handle();
@@ -23857,6 +24045,100 @@ mod tests {
         assert_eq!(read_check_run_marker(&path), Some(-1_073_741_819));
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_check_on_a_remote_review_runs_on_its_machine_and_records_the_result() {
+        // No terminal exists on the review's machine; the check runs through
+        // its provider and the board reads the same log and result files a
+        // local run leaves.
+        let dir = check_run_scratch("remote");
+        let json =
+            r#"{"ok":true,"protocol_version":1,"exit_code":0,"stdout":"remote check output"}"#;
+        let (script, body) = if cfg!(windows) {
+            (dir.join("p.cmd"), format!("@echo off\r\necho {json}\r\n"))
+        } else {
+            (dir.join("p.sh"), format!("#!/bin/sh\necho '{json}'\n"))
+        };
+        std::fs::write(&script, body).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let store = std::sync::Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
+        let id = {
+            let guard = store.lock();
+            guard
+                .register_machine_provider(
+                    "ib",
+                    "",
+                    &script.to_string_lossy(),
+                    &[],
+                    crate::machines::PROTOCOL_VERSION,
+                    false,
+                )
+                .unwrap();
+            let id = guard.create_guardian("r", "main", "/repo").unwrap();
+            guard.set_guardian_machine(&id, Some("ib:A")).unwrap();
+            id
+        };
+        let mut g = store.lock().get_guardian(&id).unwrap();
+        g.combined_worktree = Some("/srv/work/review".to_string());
+        let check = crate::guardian::GuardianCheck {
+            command: Some("make test".to_string()),
+            ..Default::default()
+        };
+        assert!(check_runs_on_review_machine(&g, &check));
+
+        let log = dir.join("r.log");
+        let result = dir.join("r.json");
+        let code = run_check_on_review_machine_into(
+            std::sync::Arc::clone(&store),
+            &g,
+            &check,
+            "manual",
+            0,
+            &std::collections::HashMap::new(),
+            false,
+            true,
+            log.clone(),
+            result.clone(),
+        )
+        .expect("a command check runs")
+        .join()
+        .unwrap();
+
+        assert_eq!(code, Some(0));
+        assert!(
+            std::fs::read_to_string(&log)
+                .unwrap()
+                .contains("remote check output")
+        );
+        let recorded: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&result).unwrap()).unwrap();
+        assert_eq!(recorded["exit_code"], serde_json::json!(0));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_check_pinned_to_the_daemon_stays_local_on_a_remote_review() {
+        let store = Store::open_in_memory().unwrap();
+        let id = store.create_guardian("r", "main", "/repo").unwrap();
+        store.set_guardian_machine(&id, Some("ib:A")).unwrap();
+        let g = store.get_guardian(&id).unwrap();
+        let mut check = crate::guardian::GuardianCheck {
+            command: Some("make test".to_string()),
+            ..Default::default()
+        };
+        check.run_on = Some("daemon".to_string());
+        assert!(!check_runs_on_review_machine(&g, &check));
+        let local = store.create_guardian("l", "main", "/repo").unwrap();
+        let local = store.get_guardian(&local).unwrap();
+        check.run_on = None;
+        assert!(!check_runs_on_review_machine(&local, &check));
     }
 
     #[test]

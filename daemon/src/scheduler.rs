@@ -301,6 +301,25 @@ enum SessionShare {
 /// surprised a user running Codex under two different models on dependent
 /// cells (see [`sharing_blocked_reason`]'s doc comment for that report). A
 /// cell that hasn't opted in never even reaches the dependency scan below.
+/// Why a dependency's agent session cannot be shared with a cell on another
+/// machine: the session lives where it ran. `None` when both run on the same
+/// machine (or both on the daemon host).
+fn machine_sharing_blocked_reason(
+    dep_cell: &str,
+    dep_machine: Option<&str>,
+    cell_machine: Option<&str>,
+) -> Option<String> {
+    let (dep, cell) = (remote_machine(dep_machine), remote_machine(cell_machine));
+    (dep != cell).then(|| {
+        format!(
+            "dependency {dep_cell} ran on {} and this cell runs on {}; an agent session cannot \
+             be resumed across machines",
+            dep.unwrap_or("the daemon host"),
+            cell.unwrap_or("the daemon host"),
+        )
+    })
+}
+
 fn resolve_shared_session_id(
     store: &crate::store_lock::StoreHandle,
     squad_id: &str,
@@ -335,6 +354,14 @@ fn resolve_shared_session_id(
     let mut blocked_reason: Option<String> = None;
     for (d, session_id) in dep_sessions {
         let dep = &cells[d];
+        if let Some(reason) = machine_sharing_blocked_reason(
+            &dep.cell_id,
+            dep.machine.as_deref(),
+            row.machine.as_deref(),
+        ) {
+            blocked_reason = Some(reason);
+            continue;
+        }
         let dep_backend =
             resolve_agent_selection(store, &dep.agent, dep.cwd.as_deref().unwrap_or("."))
                 .map(|s| s.backend)
@@ -3714,6 +3741,7 @@ fn run_cell_worker(
     worktree_claims: &WorktreeClaims,
 ) {
     let row = &cells[i];
+    let _remote_scope = crate::machine_strict::enter(row.machine.as_deref());
     // Held for the worker's whole lifetime so every early return below still
     // ends the span (RAII), and so the span's own traceparent — not the raw
     // `trace_context` string — becomes the parent of this cell's runner
@@ -3764,6 +3792,23 @@ fn run_cell_worker(
     // taking a scheduler slot so the wait does not hold one.
     if let Some(claim) = worktree_claims.for_cell(i) {
         if let Err(message) = ensure_cell_worktree(store, squad_id, row, claim) {
+            fail_cell_for_worktree(store, squad_id, row, &message);
+            let mut prog = progress.lock().expect("progress mutex poisoned");
+            prog.status[i] = CellState::Failed;
+            prog.failed.insert(row.task_idx);
+            return;
+        }
+        if cancel.is_cancelled() {
+            return;
+        }
+    }
+    // RAL-615 on a remote machine: the worktree was provisioned there at
+    // submit, so its initialization commands run there now, before the cell.
+    if let (Some(machine), Some(cwd)) = (remote_machine(row.machine.as_deref()), row.cwd.as_deref())
+    {
+        if let Err(message) =
+            crate::worktrees::initialize_remote_worktree(store, squad_id, cwd, Some(machine))
+        {
             fail_cell_for_worktree(store, squad_id, row, &message);
             let mut prog = progress.lock().expect("progress mutex poisoned");
             prog.status[i] = CellState::Failed;
@@ -3890,8 +3935,7 @@ fn run_cell_worker(
                     // carrying context across an attempt boundary, so the
                     // guidance rides in on it.
                     let uri = crate::ghost::cell_uri(squad_id, row.task_idx, row.idx);
-                    let revision =
-                        crate::ghost::current_revision(row.cwd.as_deref().unwrap_or_default());
+                    let revision = cell_revision(store, row);
                     store_ok(
                         &guard,
                         squad_id,
@@ -4588,8 +4632,7 @@ fn run_cell_worker(
                 if let Some(bearing_text) = crate::waypoints::render_bearing_block(wp_id, &bearings)
                 {
                     let uri = crate::ghost::cell_uri(squad_id, row.task_idx, row.idx);
-                    let revision =
-                        crate::ghost::current_revision(row.cwd.as_deref().unwrap_or_default());
+                    let revision = cell_revision(store, row);
                     store_ok(
                         &guard,
                         squad_id,
@@ -4778,7 +4821,7 @@ fn run_cell_worker(
     if let Some(ghost_text) = result.ghost.as_deref().map(str::trim) {
         if !ghost_text.is_empty() {
             let uri = crate::ghost::cell_uri(squad_id, row.task_idx, row.idx);
-            let revision = crate::ghost::current_revision(row.cwd.as_deref().unwrap_or_default());
+            let revision = cell_revision(store, row);
             let guard = store.lock();
             if guard
                 .upsert_ghost(
@@ -4812,7 +4855,7 @@ fn run_cell_worker(
     // live as `prophecy` events dedupe against these on the store's unique
     // key, so this only fills in whatever the live path missed.
     if !result.prophecies.is_empty() {
-        let revision = crate::ghost::current_revision(row.cwd.as_deref().unwrap_or_default());
+        let revision = cell_revision(store, row);
         let guard = store.lock();
         let target = crate::prophecy::CellProphecyTarget {
             task_idx: row.task_idx,
@@ -4961,6 +5004,7 @@ fn run_proof_only_worker(
     trace_context: Option<&str>,
 ) {
     let row = &cells[i];
+    let _remote_scope = crate::machine_strict::enter(row.machine.as_deref());
     let cx = otel::context_from_traceparent(trace_context);
     let _span = otel::start_span("scheduler.proof_only_cell", &cx, SpanKind::Internal);
     _span.set_attribute("cell_id", row.cell_id.clone());
@@ -5182,6 +5226,129 @@ fn check_task_no_commits_guard(
     false
 }
 
+/// The commit a cell's worktree is at, read on the cell's own machine (see
+/// [`crate::ghost::current_revision`]).
+fn cell_revision(
+    store: &crate::store_lock::StoreHandle,
+    row: &crate::store::CellRow,
+) -> Option<String> {
+    let cwd = row.cwd.as_deref().filter(|c| !c.is_empty())?;
+    crate::ghost::current_revision_in(
+        &crate::workspace::Workspace::on(cwd, row.machine.as_deref()).with_store(Arc::clone(store)),
+    )
+}
+
+/// `machine` with the daemon's own host (unset, blank or `local`) as `None`.
+fn remote_machine(machine: Option<&str>) -> Option<&str> {
+    machine
+        .map(str::trim)
+        .filter(|m| !m.is_empty() && !m.eq_ignore_ascii_case(ralphus_core::schema::LOCAL_MACHINE))
+}
+
+/// Push each remote cell's committed branch from its machine to
+/// [`crate::vcs::published_cell_ref`] on `origin` when a review that stacks it
+/// runs somewhere else -- another machine or the daemon's host -- and so can
+/// only get it through the shared remote. Ralphus pushes only what the cell
+/// already committed. A review on the cell's own machine reads the branch in
+/// place, so nothing is pushed for it.
+///
+/// `origin` is the remote a provider's clone of the project's registered
+/// clone URL creates. Returns `false` (with the task error set) when a needed
+/// push fails, so the task fails here rather than its review failing later
+/// with a missing branch.
+fn publish_remote_task_branches(
+    store: &crate::store_lock::StoreHandle,
+    squad_id: &str,
+    task_idx: i64,
+    task_name: &str,
+    cells: &[crate::store::CellRow],
+) -> bool {
+    let mut published = std::collections::HashSet::new();
+    for cell in cells.iter().filter(|c| c.task_idx == task_idx) {
+        let (Some(machine), Some(cwd)) =
+            (remote_machine(cell.machine.as_deref()), cell.cwd.as_deref())
+        else {
+            continue;
+        };
+        if !published.insert((machine.to_string(), cwd.to_string())) {
+            continue;
+        }
+        let ws = crate::workspace::Workspace::on(cwd, Some(machine)).with_store(Arc::clone(store));
+        let Ok(branch) = ws
+            .git(&["rev-parse", "--abbrev-ref", "HEAD"])
+            .map(|b| b.trim().to_string())
+        else {
+            continue;
+        };
+        if branch.is_empty() || branch == "HEAD" {
+            continue;
+        }
+        let consumers = store
+            .with_read_snapshot(|conn| {
+                crate::store::Store::review_machines_for_branch_conn(conn, &branch)
+            })
+            .unwrap_or_default();
+        if !consumers
+            .iter()
+            .any(|m| remote_machine(m.as_deref()) != Some(machine))
+        {
+            continue;
+        }
+        let target = crate::vcs::published_cell_ref(&branch);
+        let refspec = format!("+HEAD:{target}");
+        match ws.git(&["push", "origin", &refspec]) {
+            Ok(_) => {
+                crate::cartographer::Note::new("scheduler")
+                    .scope("task")
+                    .squad(squad_id)
+                    .emit(
+                        &store.lock(),
+                        format!("published remote branch {branch} from {machine}"),
+                        serde_json::json!({
+                            "task": task_name,
+                            "branch": branch,
+                            "machine": machine,
+                            "ref": target,
+                        }),
+                    );
+            }
+            Err(e) => {
+                let error = format!(
+                    "task failed: could not publish branch {branch} from machine {machine} to \
+                     {target} on origin, which a review on another machine needs: {e}"
+                );
+                crate::rlog!(
+                    WARNING,
+                    "ralphus [scheduler] {squad_id}/{task_name} {error}"
+                );
+                let guard = store.lock();
+                crate::cartographer::Note::new("scheduler")
+                    .level(crate::logging::LogLevel::WARNING)
+                    .scope("task")
+                    .squad(squad_id)
+                    .emit(
+                        &guard,
+                        "remote branch publish failed",
+                        serde_json::json!({
+                            "task": task_name,
+                            "branch": branch,
+                            "machine": machine,
+                            "error": e,
+                        }),
+                    );
+                store_ok(
+                    &guard,
+                    squad_id,
+                    "set_task_error",
+                    guard.set_task_error(squad_id, task_idx, Some(&error)),
+                );
+                return false;
+            }
+        }
+    }
+    true
+}
+
 /// Finalize a single task once all its cells are terminal: run its
 /// task-level proof steps (skipped if any cell already failed) in the
 /// task's first cell's working directory and resolved backend, then flip the
@@ -5285,6 +5452,8 @@ fn run_task_finalizer(
         // rule), so borrowing the representative cell's value is exact
         // rather than approximate.
         let machine = task_cell.and_then(|s| s.machine.clone());
+        // Ends with this block, before the review hand-off below.
+        let _remote_scope = crate::machine_strict::enter(machine.as_deref());
         // RAL-308: a task-scope proof has no owning cell, so only the task's
         // own cumulative cap applies (alongside the step's own, resolved
         // inside `run_proofs`). Same representative-cell borrow as `machine`
@@ -5413,7 +5582,9 @@ fn run_task_finalizer(
             .find(|s| s.task_idx == task_idx)
             .map(|s| s.task_name.clone())
             .unwrap_or_default();
-        if !check_task_no_commits_guard(store, squad_id, task_idx, &task_name, cells) {
+        if !check_task_no_commits_guard(store, squad_id, task_idx, &task_name, cells)
+            || !publish_remote_task_branches(store, squad_id, task_idx, &task_name, cells)
+        {
             failed = true;
             progress
                 .lock()
@@ -12758,6 +12929,17 @@ prompt = "anything"
         };
         execute_squad(&store, &runner, &id);
         assert_eq!(session_share_recorded(&seen, "consumer"), None);
+    }
+
+    #[test]
+    fn a_session_is_not_shared_across_machines() {
+        assert!(machine_sharing_blocked_reason("dep", None, Some("local")).is_none());
+        assert!(machine_sharing_blocked_reason("dep", Some("ib:A"), Some(" ib:A ")).is_none());
+        let reason = machine_sharing_blocked_reason("dep", Some("ib:A"), None)
+            .expect("remote dependency, local cell");
+        assert!(reason.contains("ib:A"), "{reason}");
+        assert!(reason.contains("daemon host"), "{reason}");
+        assert!(machine_sharing_blocked_reason("dep", Some("ib:A"), Some("ib:B")).is_some());
     }
 
     #[test]

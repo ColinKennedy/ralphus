@@ -60,6 +60,7 @@ pub mod live_command_units;
 pub mod live_results;
 pub mod live_runs;
 pub mod logging;
+pub mod machine_strict;
 pub mod machine_targets;
 pub mod machines;
 pub mod mailbox;

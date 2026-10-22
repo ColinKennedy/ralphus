@@ -21,8 +21,9 @@ use crate::store::{CellRow, NodeState};
 
 mod direct;
 pub(crate) use direct::{
-    CappedSink as TranscriptSink, is_active as direct_session_active,
-    live_tail as direct_live_tail, request_stop as direct_request_stop,
+    ActiveGuard as LiveSessionGuard, CappedSink as TranscriptSink,
+    is_active as direct_session_active, live_tail as direct_live_tail,
+    request_stop as direct_request_stop,
     request_stop_with_any_prefix as direct_request_stop_with_any_prefix,
 };
 
@@ -1754,7 +1755,7 @@ const DRAIN_POLL_INTERVAL: Duration = Duration::from_millis(500);
 /// `RALPHUS_MAILBOX_STALL_SECS` — the ticket's own manual-verification repro
 /// task needs a window far shorter than the 5-real-minute default to be
 /// practical to sit and watch.
-fn mailbox_stall_threshold() -> Duration {
+pub(crate) fn mailbox_stall_threshold() -> Duration {
     std::env::var("RALPHUS_MAILBOX_STALL_SECS")
         .ok()
         .and_then(|s| s.trim().parse::<u64>().ok())
@@ -2153,57 +2154,68 @@ impl SubprocessRunner {
     /// still `NULL`). A no-op when no cartographer store is attached,
     /// mirroring [`Self::check_stall_escalation`].
     fn maximum_timeout_exceeded(&self, spec: &RunnerSpec, elapsed: Duration) -> Option<String> {
-        let caps = spec.maximum_timeout.as_ref()?;
-        if spec.proof {
-            // A proof step has no descendants -- its own cap is a simple
-            // single-attempt deadline, exactly like `timeout_sec` above.
-            if let Some(cap_sec) = caps.self_cap_sec {
-                if elapsed.as_secs() >= cap_sec {
-                    return Some(format!(
-                        "proof step's own maximum_timeout_seconds ({cap_sec}s) exceeded"
-                    ));
-                }
-            }
-        }
-        let store = self.cartographer.as_ref()?;
-        let guard = store.lock();
-        let now = crate::store::now_ms();
-        // For a cell run, its own `maximum_timeout_seconds` (`self_cap_sec`)
-        // is already the cumulative cell+proofs cap; for a cell-scope proof,
-        // it's the owning cell's separate `cell_cap_sec`. Either way this is
-        // "the cell-scope cumulative cap to check", checked the same way.
-        let cell_cap = if spec.proof {
-            caps.cell_cap_sec
-        } else {
-            caps.self_cap_sec
-        };
-        if let (Some(cap_sec), Some(cell_idx)) = (cell_cap, caps.cell_idx) {
-            if let Ok(used_ms) =
-                guard.cell_cumulative_runtime_ms(&caps.squad_id, caps.task_idx, cell_idx, now)
-            {
-                if used_ms >= saturating_cap_ms(cap_sec) {
-                    return Some(format!(
-                        "cell's maximum_timeout_seconds ({cap_sec}s) exceeded (cumulative {}s across the cell and its proofs)",
-                        used_ms / 1000
-                    ));
-                }
-            }
-        }
-        if let Some(cap_sec) = caps.task_cap_sec {
-            if let Ok(used_ms) =
-                guard.task_cumulative_runtime_ms(&caps.squad_id, caps.task_idx, now)
-            {
-                if used_ms >= saturating_cap_ms(cap_sec) {
-                    return Some(format!(
-                        "task's maximum_timeout_seconds ({cap_sec}s) exceeded (cumulative {}s across the task)",
-                        used_ms / 1000
-                    ));
-                }
-            }
-        }
-        None
+        maximum_timeout_reason(self.cartographer.as_ref(), spec, elapsed)
     }
+}
 
+/// [`SubprocessRunner::maximum_timeout_exceeded`] for any runner holding a
+/// store: shared with the remote runner's poll loop so a remote cell's
+/// `maximum_timeout_seconds` caps apply exactly as a local one's do.
+pub(crate) fn maximum_timeout_reason(
+    store: Option<&crate::store_lock::StoreHandle>,
+    spec: &RunnerSpec,
+    elapsed: Duration,
+) -> Option<String> {
+    let caps = spec.maximum_timeout.as_ref()?;
+    if spec.proof {
+        // A proof step has no descendants -- its own cap is a simple
+        // single-attempt deadline, exactly like `timeout_sec` above.
+        if let Some(cap_sec) = caps.self_cap_sec {
+            if elapsed.as_secs() >= cap_sec {
+                return Some(format!(
+                    "proof step's own maximum_timeout_seconds ({cap_sec}s) exceeded"
+                ));
+            }
+        }
+    }
+    let store = store?;
+    let guard = store.lock();
+    let now = crate::store::now_ms();
+    // For a cell run, its own `maximum_timeout_seconds` (`self_cap_sec`)
+    // is already the cumulative cell+proofs cap; for a cell-scope proof,
+    // it's the owning cell's separate `cell_cap_sec`. Either way this is
+    // "the cell-scope cumulative cap to check", checked the same way.
+    let cell_cap = if spec.proof {
+        caps.cell_cap_sec
+    } else {
+        caps.self_cap_sec
+    };
+    if let (Some(cap_sec), Some(cell_idx)) = (cell_cap, caps.cell_idx) {
+        if let Ok(used_ms) =
+            guard.cell_cumulative_runtime_ms(&caps.squad_id, caps.task_idx, cell_idx, now)
+        {
+            if used_ms >= saturating_cap_ms(cap_sec) {
+                return Some(format!(
+                    "cell's maximum_timeout_seconds ({cap_sec}s) exceeded (cumulative {}s across the cell and its proofs)",
+                    used_ms / 1000
+                ));
+            }
+        }
+    }
+    if let Some(cap_sec) = caps.task_cap_sec {
+        if let Ok(used_ms) = guard.task_cumulative_runtime_ms(&caps.squad_id, caps.task_idx, now) {
+            if used_ms >= saturating_cap_ms(cap_sec) {
+                return Some(format!(
+                    "task's maximum_timeout_seconds ({cap_sec}s) exceeded (cumulative {}s across the task)",
+                    used_ms / 1000
+                ));
+            }
+        }
+    }
+    None
+}
+
+impl SubprocessRunner {
     /// RAL-241: check whether `session_name` has shown no activity (pane
     /// growth, per `Store::live_activity_ms`) for at least `threshold`, and
     /// if so, broadcast a `high`-priority mailbox message once for this
@@ -2226,100 +2238,113 @@ impl SubprocessRunner {
         attempt_started_ms: i64,
         threshold: Duration,
     ) {
-        let Some(store) = &self.cartographer else {
-            return;
-        };
-        let threshold_ms = threshold.as_millis() as i64;
-        // WS-E.1: both checks read `StoreMemory`, so the overwhelmingly common
-        // outcome -- not stalled, or already escalated -- now returns without
-        // touching the store lock at all. This is called on every stall poll for
-        // every running cell.
-        let memory = store.lock_free_memory();
-        // `None` (no pane growth observed yet this attempt) falls back to
-        // when this attempt started, not epoch 0 -- otherwise a cell that
-        // simply hasn't produced its first line of output yet would appear
-        // to have been stalled since 1970 and escalate immediately.
-        let last_activity_ms = memory
-            .live_activity_ms(session_name)
-            .unwrap_or(attempt_started_ms);
-        if crate::store::now_ms().saturating_sub(last_activity_ms) < threshold_ms {
-            return;
+        if let Some(store) = &self.cartographer {
+            escalate_stall_if_due(store, spec, session_name, attempt_started_ms, threshold);
         }
-        if memory.is_stall_escalated(session_name, last_activity_ms) {
-            return;
-        }
-        // Actually escalating needs the store: a mailbox row and a note.
-        let guard = store.lock();
-        let text = format!(
-            "cell '{}' in task '{}' (squad {}) has been stalled for over {}s with no activity",
-            spec.cell_id,
-            spec.task,
-            spec.squad_id,
-            threshold_ms / 1000,
-        );
-        let entity_uri = guard.cell_entity_uri(&spec.squad_id, &spec.task, &spec.cell_id);
-        if let Ok(message_id) = guard.enqueue_error_mailbox_message(
-            crate::mailbox::MailboxPriority::High,
-            &text,
-            &crate::mailbox::Remediation::ManualInterventionRequired {
-                guidance: format!(
-                    "inspect the live terminal for cell '{}' (`ralphus cell terminal \
+    }
+}
+
+/// [`SubprocessRunner::check_stall_escalation`]'s body, shared with the remote
+/// runner's poll loop so a hung remote cell is escalated the same way.
+pub(crate) fn escalate_stall_if_due(
+    store: &crate::store_lock::StoreHandle,
+    spec: &RunnerSpec,
+    session_name: &str,
+    attempt_started_ms: i64,
+    threshold: Duration,
+) {
+    let threshold_ms = threshold.as_millis() as i64;
+    // WS-E.1: both checks read `StoreMemory`, so the overwhelmingly common
+    // outcome -- not stalled, or already escalated -- now returns without
+    // touching the store lock at all. This is called on every stall poll for
+    // every running cell.
+    let memory = store.lock_free_memory();
+    // `None` (no pane growth observed yet this attempt) falls back to
+    // when this attempt started, not epoch 0 -- otherwise a cell that
+    // simply hasn't produced its first line of output yet would appear
+    // to have been stalled since 1970 and escalate immediately.
+    let last_activity_ms = memory
+        .live_activity_ms(session_name)
+        .unwrap_or(attempt_started_ms);
+    if crate::store::now_ms().saturating_sub(last_activity_ms) < threshold_ms {
+        return;
+    }
+    if memory.is_stall_escalated(session_name, last_activity_ms) {
+        return;
+    }
+    // Actually escalating needs the store: a mailbox row and a note.
+    let guard = store.lock();
+    let text = format!(
+        "cell '{}' in task '{}' (squad {}) has been stalled for over {}s with no activity",
+        spec.cell_id,
+        spec.task,
+        spec.squad_id,
+        threshold_ms / 1000,
+    );
+    let entity_uri = guard.cell_entity_uri(&spec.squad_id, &spec.task, &spec.cell_id);
+    if let Ok(message_id) = guard.enqueue_error_mailbox_message(
+        crate::mailbox::MailboxPriority::High,
+        &text,
+        &crate::mailbox::Remediation::ManualInterventionRequired {
+            guidance: format!(
+                "inspect the live terminal for cell '{}' (`ralphus cell terminal \
                      {}/{}/{}`); if it is truly hung, cancel and restart it \
                      (`ralphus cell restart {}/{}/{}`)",
-                    spec.cell_id,
-                    spec.squad_id,
-                    spec.task,
-                    spec.cell_id,
-                    spec.squad_id,
-                    spec.task,
-                    spec.cell_id,
-                ),
-            },
-            Some(&spec.squad_id),
-            Some(&spec.task),
-            Some(&spec.cell_id),
-            entity_uri.as_deref(),
-            None,
-        ) {
-            crate::cartographer::Note::new("runner")
-                .level(crate::logging::LogLevel::WARNING)
-                .squad(&spec.squad_id)
-                .cell(&spec.cell_id)
-                .task(&spec.task)
-                .scope("mailbox")
-                .emit(
-                    &guard,
-                    format!("mailbox message enqueued for stalled session ({session_name})"),
-                    serde_json::json!({
-                        "message_id": message_id,
-                        "priority": "high",
-                        "session_name": session_name,
-                        "stall_secs": threshold_ms / 1000,
-                    }),
-                );
-        } else {
-            crate::cartographer::Note::new("runner")
-                .level(crate::logging::LogLevel::WARNING)
-                .squad(&spec.squad_id)
-                .cell(&spec.cell_id)
-                .task(&spec.task)
-                .scope("mailbox")
-                .emit(
-                    &guard,
-                    format!(
-                        "session {session_name} stalled for over {}s; could not enqueue its \
+                spec.cell_id,
+                spec.squad_id,
+                spec.task,
+                spec.cell_id,
+                spec.squad_id,
+                spec.task,
+                spec.cell_id,
+            ),
+        },
+        Some(&spec.squad_id),
+        Some(&spec.task),
+        Some(&spec.cell_id),
+        entity_uri.as_deref(),
+        None,
+    ) {
+        crate::cartographer::Note::new("runner")
+            .level(crate::logging::LogLevel::WARNING)
+            .squad(&spec.squad_id)
+            .cell(&spec.cell_id)
+            .task(&spec.task)
+            .scope("mailbox")
+            .emit(
+                &guard,
+                format!("mailbox message enqueued for stalled session ({session_name})"),
+                serde_json::json!({
+                    "message_id": message_id,
+                    "priority": "high",
+                    "session_name": session_name,
+                    "stall_secs": threshold_ms / 1000,
+                }),
+            );
+    } else {
+        crate::cartographer::Note::new("runner")
+            .level(crate::logging::LogLevel::WARNING)
+            .squad(&spec.squad_id)
+            .cell(&spec.cell_id)
+            .task(&spec.task)
+            .scope("mailbox")
+            .emit(
+                &guard,
+                format!(
+                    "session {session_name} stalled for over {}s; could not enqueue its \
                          mailbox message",
-                        threshold_ms / 1000
-                    ),
-                    serde_json::json!({
-                        "session_name": session_name,
-                        "stall_secs": threshold_ms / 1000,
-                    }),
-                );
-        }
-        guard.note_stall_escalated(session_name, last_activity_ms);
+                    threshold_ms / 1000
+                ),
+                serde_json::json!({
+                    "session_name": session_name,
+                    "stall_secs": threshold_ms / 1000,
+                }),
+            );
     }
+    guard.note_stall_escalated(session_name, last_activity_ms);
+}
 
+impl SubprocessRunner {
     /// Emit a Cartographer note recording that a durable terminal-log attempt
     /// file was (re)written (RAL-154's `crate::terminal_log::write_attempt`),
     /// carrying the file's path so RAL-155's uber-log-viewer
@@ -2669,7 +2694,7 @@ fn redact_event(event: &mut RunnerEvent) {
 /// numbers are authoritative and are never overwritten by a stale snapshot.
 /// [`RunnerResult::cost_exceeded`] already carries real figures, so this is a
 /// no-op for it.
-fn backfill_live_usage(result: &mut RunnerResult, live: LiveUsage) {
+pub(crate) fn backfill_live_usage(result: &mut RunnerResult, live: LiveUsage) {
     if result.tokens_in == 0
         && result.tokens_out == 0
         && result.cache_creation_tokens == 0

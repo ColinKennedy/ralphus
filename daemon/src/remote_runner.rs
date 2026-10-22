@@ -417,6 +417,38 @@ struct ProviderResponse {
     retry_at_ms: Option<i64>,
 }
 
+/// Releases a remote run's waypoint-halt and Arbiter-stop registrations when
+/// its poll loop ends, by any path.
+struct HaltRegistrations<'a> {
+    halts: Option<&'a (crate::cancel::WaypointHalts, crate::cancel::ArbiterStops)>,
+    squad_id: &'a str,
+    arbiter_key: &'a str,
+}
+
+impl Drop for HaltRegistrations<'_> {
+    fn drop(&mut self) {
+        if let Some((waypoint, arbiter)) = self.halts {
+            waypoint.remove(self.squad_id);
+            arbiter.remove(self.arbiter_key);
+        }
+    }
+}
+
+/// Clears a remote run's liveness and stall-escalation entries when its poll
+/// loop ends, as the local runner does when a run is final.
+struct LivenessEntry<'a> {
+    store: &'a crate::store_lock::StoreHandle,
+    session_name: &'a str,
+}
+
+impl Drop for LivenessEntry<'_> {
+    fn drop(&mut self) {
+        let memory = self.store.lock_free_memory();
+        memory.clear_live_activity(self.session_name);
+        memory.clear_stall_escalated(self.session_name);
+    }
+}
+
 /// Runs cells on one machine by invoking a registered provider program.
 pub struct ProviderRunner {
     /// Provider program path.
@@ -450,6 +482,10 @@ pub struct ProviderRunner {
     /// remainder), keyed by agent name. Consulted, never forwarded to the
     /// provider directly — see [`Self::resolve_remote_executable`].
     agent_executables: BTreeMap<String, String>,
+    /// The daemon's waypoint-halt and Arbiter-stop registries (see
+    /// [`MachineRouter::with_halts`]). `None` for a runner built outside the
+    /// scheduler, which then only stops on cancel, timeout and cost cap.
+    halts: Option<(crate::cancel::WaypointHalts, crate::cancel::ArbiterStops)>,
 }
 
 impl ProviderRunner {
@@ -471,7 +507,20 @@ impl ProviderRunner {
             live_usage: Arc::new(Mutex::new(None)),
             target_runner: None,
             agent_executables: BTreeMap::new(),
+            halts: None,
         }
+    }
+
+    /// Honour the daemon's waypoint halts and Arbiter stops while polling a
+    /// remote cell, as the local runner does.
+    #[must_use]
+    pub fn with_halts(
+        mut self,
+        waypoint_halts: crate::cancel::WaypointHalts,
+        arbiter_stops: crate::cancel::ArbiterStops,
+    ) -> Self {
+        self.halts = Some((waypoint_halts, arbiter_stops));
+        self
     }
 
     /// Attach this target's per-agent executable overrides
@@ -771,6 +820,55 @@ impl ProviderRunner {
 }
 
 impl ProviderRunner {
+    /// `result` with the usage this handle's streamed `llm-invoke` events
+    /// reported, when the result itself carries none -- the remote twin of the
+    /// local runner's backfill, so a cancelled or timed-out remote cell still
+    /// records the tokens it spent.
+    fn with_live_usage(&self, mut result: RunnerResult) -> RunnerResult {
+        let usage = *self.live_usage.lock().expect("poisoned");
+        if let Some(usage) = usage {
+            crate::runner::backfill_live_usage(&mut result, usage);
+        }
+        result
+    }
+
+    /// Why a running remote cell must stop now, beyond cancel, its own timeout
+    /// and its cost cap: a waypoint halt on its squad, an Arbiter stop on the
+    /// cell, or a `maximum_timeout_seconds` cap -- the same reasons, and the
+    /// same results, as a local run (`runner::direct`).
+    fn halt_reason(
+        &self,
+        spec: &RunnerSpec,
+        tokens: Option<&(CancelToken, CancelToken)>,
+        started: Instant,
+    ) -> Option<(String, RunnerResult)> {
+        let usage = (*self.live_usage.lock().expect("poisoned")).unwrap_or_default();
+        if let Some((waypoint, arbiter)) = tokens {
+            if waypoint.is_cancelled() {
+                return Some((
+                    "waypoint halt".to_string(),
+                    RunnerResult::waypoint_halted(usage, None),
+                ));
+            }
+            if arbiter.is_cancelled() {
+                return Some((
+                    "stopped by Arbiter".to_string(),
+                    RunnerResult::arbiter_stopped(
+                        usage,
+                        "terminated by Arbiter after a suspicious large diff".to_string(),
+                    ),
+                ));
+            }
+        }
+        crate::runner::maximum_timeout_reason(self.cartographer.as_ref(), spec, started.elapsed())
+            .map(|reason| {
+                (
+                    format!("maximum_timeout_seconds exceeded: {reason}"),
+                    RunnerResult::maximum_timeout_exceeded(usage, reason),
+                )
+            })
+    }
+
     /// Invoke a handle-scoped verb (`status`/`stream`/`cancel`).
     fn invoke_handle(
         &self,
@@ -815,8 +913,64 @@ impl ProviderRunner {
             }
         };
         let mut cursor: Option<i64> = None;
+        // Registered like a local run for as long as this loop polls: a
+        // per-cell stop (status change, cancel) reaches it, and Live View
+        // reports the cell as running.
+        let live = crate::runner::LiveSessionGuard::new(&session_name);
+        // The same waypoint-halt (per squad) and Arbiter-stop (per cell)
+        // registrations a local run holds, released when polling ends.
+        let arbiter_key = crate::store_memory::StoreMemory::cell_diff_key(
+            &spec.squad_id,
+            &spec.task,
+            &spec.cell_id,
+        );
+        let halt_tokens = self.halts.as_ref().map(|(waypoint, arbiter)| {
+            (
+                waypoint.register(&spec.squad_id),
+                arbiter.register(&arbiter_key),
+            )
+        });
+        let _halt_registrations = HaltRegistrations {
+            halts: self.halts.as_ref(),
+            squad_id: &spec.squad_id,
+            arbiter_key: &arbiter_key,
+        };
+        // Liveness (fresh streamed output) and stall escalation, as a local
+        // run records them; the entry is cleared when polling ends.
+        let attempt_started_ms = crate::store::now_ms();
+        let stall_threshold = crate::runner::mailbox_stall_threshold();
+        let _liveness = self.cartographer.as_ref().map(|store| LivenessEntry {
+            store,
+            session_name: &session_name,
+        });
         loop {
-            if cancel.is_some_and(CancelToken::is_cancelled) {
+            if let Some(store) = &self.cartographer {
+                crate::runner::escalate_stall_if_due(
+                    store,
+                    spec,
+                    &session_name,
+                    attempt_started_ms,
+                    stall_threshold,
+                );
+            }
+            if let Some((reason, stopped)) = self.halt_reason(spec, halt_tokens.as_ref(), started) {
+                if let Err(e) = self.invoke_handle(VERB_CANCEL, handle, None, spec) {
+                    crate::rlog!(
+                        WARNING,
+                        "ralphus [remote] provider {} could not cancel handle {handle}: {e}",
+                        self.scheme
+                    );
+                }
+                crate::cell_session::write_pane_snapshot(&session_name, &transcript);
+                self.note(
+                    spec,
+                    crate::logging::LogLevel::WARNING,
+                    &format!("remote cell stopped: {reason}"),
+                    serde_json::json!({"handle": handle, "scheme": self.scheme}),
+                );
+                return stopped;
+            }
+            if cancel.is_some_and(CancelToken::is_cancelled) || live.stop_requested() {
                 // Best-effort: a provider that can't cancel still leaves us
                 // reporting the cell cancelled, which matches how a local
                 // kill that races the process exit behaves.
@@ -834,7 +988,7 @@ impl ProviderRunner {
                     "remote cell cancelled",
                     serde_json::json!({"handle": handle, "scheme": self.scheme}),
                 );
-                return RunnerResult::failure("cancelled");
+                return self.with_live_usage(RunnerResult::failure("cancelled"));
             }
             if let Some(budget) = budget {
                 if started.elapsed() >= budget {
@@ -861,11 +1015,11 @@ impl ProviderRunner {
                             "timeout_sec": budget.as_secs(),
                         }),
                     );
-                    return RunnerResult::failure(format!(
+                    return self.with_live_usage(RunnerResult::failure(format!(
                         "timed out after {}s on machine provider {:?}",
                         budget.as_secs(),
                         self.scheme
-                    ));
+                    )));
                 }
             }
             // RAL-161/RAL-201: mirror `SubprocessRunner`'s live cost-cap kill.
@@ -914,6 +1068,11 @@ impl ProviderRunner {
             match self.invoke_handle(VERB_STREAM, handle, cursor, spec) {
                 Ok(resp) => {
                     if let Some(chunk) = resp.output.filter(|c| !c.is_empty()) {
+                        if let Some(store) = &self.cartographer {
+                            store
+                                .lock_free_memory()
+                                .note_live_activity(&session_name, crate::store::now_ms());
+                        }
                         if let Some(sink) = raw_transcript.as_mut() {
                             sink.write(chunk.as_bytes());
                         }
@@ -1479,7 +1638,7 @@ impl ProviderRunner {
                 "{} {} failed on machine {:?} (exit {code}): {}",
                 req.program,
                 req.args.join(" "),
-                self.scheme,
+                format!("{}:{}", self.scheme, self.uri),
                 resp.stdout.unwrap_or_default().trim()
             )),
         }
@@ -1652,6 +1811,9 @@ pub fn reconcile_remote_exec_handles(store: &Store) {
 pub struct MachineRouter {
     local: Arc<dyn Runner>,
     store: crate::store_lock::StoreHandle,
+    /// The daemon's waypoint-halt and Arbiter-stop registries, handed to every
+    /// remote run so it stops for the same reasons a local one does.
+    halts: Option<(crate::cancel::WaypointHalts, crate::cancel::ArbiterStops)>,
 }
 
 impl MachineRouter {
@@ -1659,7 +1821,23 @@ impl MachineRouter {
     /// `store` to resolve machine values against the provider registry.
     #[must_use]
     pub fn new(local: Arc<dyn Runner>, store: crate::store_lock::StoreHandle) -> Self {
-        Self { local, store }
+        Self {
+            local,
+            store,
+            halts: None,
+        }
+    }
+
+    /// Let remote runs honour the daemon's waypoint halts and Arbiter stops,
+    /// the registries the local runner is given.
+    #[must_use]
+    pub fn with_halts(
+        mut self,
+        waypoint_halts: crate::cancel::WaypointHalts,
+        arbiter_stops: crate::cancel::ArbiterStops,
+    ) -> Self {
+        self.halts = Some((waypoint_halts, arbiter_stops));
+        self
     }
 
     /// The runner a review's background jobs use (straggler reopen, CI poll
@@ -1683,7 +1861,13 @@ impl MachineRouter {
             let guard = self.store.lock();
             provider_from_store(&guard, machine)?
         };
-        Ok(built.map(|p| p.with_cartographer(Arc::clone(&self.store))))
+        Ok(built.map(|p| {
+            let p = p.with_cartographer(Arc::clone(&self.store));
+            match &self.halts {
+                Some((waypoint, arbiter)) => p.with_halts(waypoint.clone(), arbiter.clone()),
+                None => p,
+            }
+        }))
     }
 
     /// Provision a workspace for a remote cell, returning its path on that
@@ -1718,10 +1902,20 @@ impl MachineRouter {
     }
 }
 
+/// Whether a spec the router is about to run on the daemon host may run
+/// there: refused under machine strict mode when the calling thread is doing
+/// remote work (see [`crate::machine_strict`]).
+fn local_agent_allowed(spec: &RunnerSpec) -> Result<(), String> {
+    crate::machine_strict::check_local("agent", || format!("cell {} in {}", spec.cell_id, spec.cwd))
+}
+
 impl Runner for MachineRouter {
     fn run(&self, spec: &RunnerSpec) -> RunnerResult {
         match self.route(spec) {
-            Ok(None) => self.local.run(spec),
+            Ok(None) => match local_agent_allowed(spec) {
+                Ok(()) => self.local.run(spec),
+                Err(e) => RunnerResult::failure(e),
+            },
             Ok(Some(remote)) => remote.run(spec),
             Err(e) => RunnerResult::failure(e),
         }
@@ -1729,7 +1923,10 @@ impl Runner for MachineRouter {
 
     fn run_cancellable(&self, spec: &RunnerSpec, cancel: &CancelToken) -> RunnerResult {
         match self.route(spec) {
-            Ok(None) => self.local.run_cancellable(spec, cancel),
+            Ok(None) => match local_agent_allowed(spec) {
+                Ok(()) => self.local.run_cancellable(spec, cancel),
+                Err(e) => RunnerResult::failure(e),
+            },
             Ok(Some(remote)) => remote.run_cancellable(spec, cancel),
             Err(e) => RunnerResult::failure(e),
         }
@@ -2613,6 +2810,83 @@ else:
         let r = router.run_cancellable(&spec(Some("ib:A")), &cancel);
         assert_eq!(r.status, "failed");
         assert_eq!(r.error.as_deref(), Some("cancelled"), "{r:?}");
+    }
+
+    #[test]
+    fn a_per_cell_stop_reaches_a_running_remote_cell() {
+        // A status change on one cell (not a squad cancel) stops it through
+        // the live-session registry; a remote cell must be in it too, or the
+        // job keeps running on the machine.
+        let script = fake_async_provider(
+            "async-stop",
+            &[
+                ("exec", r#"{"ok":true,"protocol_version":1,"handle":"h1"}"#),
+                (
+                    "status",
+                    r#"{"ok":true,"protocol_version":1,"state":"running"}"#,
+                ),
+                ("cancel", r#"{"ok":true,"protocol_version":1}"#),
+            ],
+        );
+        let s = store();
+        register(&s, "ib", &script);
+        let (router, _local) = router(Arc::clone(&s));
+        let cell = spec(Some("ib:A"));
+        let session = crate::cell_session::session_name(&cell.squad_id, &cell.task, &cell.cell_id);
+        let watcher = {
+            let session = session.clone();
+            std::thread::spawn(move || {
+                let deadline = Instant::now() + Duration::from_secs(20);
+                while !crate::runner::direct_session_active(&session) {
+                    assert!(Instant::now() < deadline, "remote cell never registered");
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                assert!(crate::runner::direct_request_stop(&session));
+            })
+        };
+        let r = router.run_cancellable(&cell, &CancelToken::new());
+        watcher.join().unwrap();
+        assert_eq!(r.error.as_deref(), Some("cancelled"), "{r:?}");
+        assert!(!crate::runner::direct_session_active(&session));
+    }
+
+    #[test]
+    fn a_waypoint_halt_stops_a_running_remote_cell() {
+        // A waypoint halt on the squad must stop its remote cells too, with
+        // the same `waypoint_halted` result a local cell gets.
+        let script = fake_async_provider(
+            "async-halt",
+            &[
+                ("exec", r#"{"ok":true,"protocol_version":1,"handle":"h1"}"#),
+                (
+                    "status",
+                    r#"{"ok":true,"protocol_version":1,"state":"running"}"#,
+                ),
+                ("cancel", r#"{"ok":true,"protocol_version":1}"#),
+            ],
+        );
+        let s = store();
+        register(&s, "ib", &script);
+        let waypoint_halts = crate::cancel::WaypointHalts::default();
+        let (router, _local) = router(Arc::clone(&s));
+        let router = router.with_halts(
+            waypoint_halts.clone(),
+            crate::cancel::ArbiterStops::default(),
+        );
+        let cell = spec(Some("ib:A"));
+        let session = crate::cell_session::session_name(&cell.squad_id, &cell.task, &cell.cell_id);
+        let squad_id = cell.squad_id.clone();
+        let halter = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(20);
+            while !crate::runner::direct_session_active(&session) {
+                assert!(Instant::now() < deadline, "remote cell never registered");
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            waypoint_halts.cancel(&squad_id);
+        });
+        let r = router.run_cancellable(&cell, &CancelToken::new());
+        halter.join().unwrap();
+        assert_eq!(r.status, "waypoint_halted", "{r:?}");
     }
 
     #[test]

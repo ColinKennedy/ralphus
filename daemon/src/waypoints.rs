@@ -5215,28 +5215,36 @@ fn direct_chat_handles(backend: &str) -> bool {
     )
 }
 
-/// The working directory a survey classification should run in: the
-/// candidate's own, so `.ralphus.toml` agent profiles and project config
-/// resolve the same way they would for that work's real cells.
+/// Where a survey classification should run: the candidate's own working
+/// directory, so `.ralphus.toml` agent profiles and project config resolve
+/// the same way they would for that work's real cells, on the machine that
+/// work runs on.
 ///
-/// A squad uses its first cell's `cwd`; a review uses its guardian's
-/// `git_root`. `None` when neither is recorded, which makes the caller fall
-/// back to the direct-chat transport (a terminal agent cannot be spawned
-/// without somewhere to spawn it).
-fn survey_candidate_cwd(store: &Store, kind: WaypointEntryKind, entry_id: &str) -> Option<String> {
+/// A squad uses its first cell's `cwd` and machine; a review uses its
+/// guardian's `git_root` and machine. `None` when no directory is recorded,
+/// which makes the caller fall back to the direct-chat transport (a terminal
+/// agent cannot be spawned without somewhere to spawn it).
+fn survey_candidate_cwd(
+    store: &Store,
+    kind: WaypointEntryKind,
+    entry_id: &str,
+) -> Option<(String, Option<String>)> {
     match kind {
         WaypointEntryKind::Squad => store.get_squad(entry_id).ok().and_then(|squad| {
             squad.tasks.iter().find_map(|task| {
-                task.cells
-                    .iter()
-                    .find_map(|cell| cell.cwd.clone().filter(|c| !c.trim().is_empty()))
+                task.cells.iter().find_map(|cell| {
+                    cell.cwd
+                        .clone()
+                        .filter(|c| !c.trim().is_empty())
+                        .map(|cwd| (cwd, cell.machine.clone()))
+                })
             })
         }),
         WaypointEntryKind::Review => store
             .get_guardian(entry_id)
             .ok()
-            .map(|g| g.git_root)
-            .filter(|r| !r.trim().is_empty()),
+            .filter(|g| !g.git_root.trim().is_empty())
+            .map(|g| (g.git_root, g.machine)),
     }
 }
 
@@ -5275,7 +5283,7 @@ fn call_survey_agent(
     };
     // No cwd means no profile/config context to resolve against and nowhere to
     // spawn a process, so the only transport left is the direct API.
-    let Some(cwd) = cwd else {
+    let Some((cwd, machine)) = cwd else {
         return chat_client::call_direct(
             agent,
             model,
@@ -5301,12 +5309,25 @@ fn call_survey_agent(
         );
     }
 
-    runner.preflight_agent(&selection.backend, selection.executable.as_deref(), None)?;
+    // A review records the daemon's path for its project; on a remote machine
+    // the agent runs in that project's repository there instead.
+    let run_cwd = match candidate.kind {
+        WaypointEntryKind::Review if machine.is_some() => {
+            crate::workspace::Workspace::for_guardian(store, &candidate.entry_id, cwd.as_str())
+                .root_string()
+        }
+        _ => cwd.clone(),
+    };
+    runner.preflight_agent(
+        &selection.backend,
+        selection.executable.as_deref(),
+        machine.as_deref(),
+    )?;
     let mut spec = crate::runner::RunnerSpec::for_proof(
         &candidate.entry_id,
         crate::runner::WAYPOINT_SURVEY_TASK,
         &format!("survey-{waypoint_id}"),
-        &cwd,
+        &run_cwd,
         user,
         &selection.backend,
         model.or(selection.model.as_deref()),
@@ -5317,6 +5338,8 @@ fn call_survey_agent(
     spec.system_prompt = Some(system.to_string());
     spec.executable = selection.executable.clone();
     spec.env_overrides = selection.env.clone().into_iter().collect();
+    spec.machine.clone_from(&machine);
+    let _remote_scope = crate::machine_strict::enter(machine.as_deref());
     let result = runner.run(&spec);
     if let Some(error) = result.error.as_deref().filter(|e| !e.trim().is_empty()) {
         return Err(error.to_string());
@@ -9400,6 +9423,49 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_survey_of_remote_work_runs_its_agent_on_that_machine() {
+        // The survey agent reads the candidate's checkout; for work on a
+        // remote machine that checkout only exists over there.
+        let store = Store::open_in_memory().unwrap();
+        store
+            .create_waypoint(
+                "waypoint-1",
+                Some("rename"),
+                "greet() is being renamed",
+                Some("claude-code"),
+                Some("sonnet"),
+                false,
+            )
+            .unwrap();
+        insert_squad_with_cwd(&store, "squad-1", "/srv/work/repo");
+        store
+            .conn
+            .execute(
+                "UPDATE cells SET machine='fleet:box' WHERE squad_id='squad-1'",
+                [],
+            )
+            .unwrap();
+        let handle = handle(store);
+        let runner = SurveyTestRunner::new("IMPACTED: no\nRATIONALE: docs only");
+        let as_runner: Arc<dyn Runner> = runner.clone();
+
+        survey_candidate(
+            &handle,
+            "waypoint-1",
+            &squad_candidate("squad-1"),
+            &Cancellations::new(),
+            &as_runner,
+        )
+        .unwrap()
+        .expect("the reply is a verdict");
+
+        let seen = runner.seen.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].machine.as_deref(), Some("fleet:box"));
+        assert_eq!(seen[0].cwd, "/srv/work/repo");
+    }
+
     fn squad_candidate(id: &str) -> SurveyCandidate {
         SurveyCandidate {
             kind: WaypointEntryKind::Squad,
@@ -10029,8 +10095,8 @@ mod tests {
         let store = Store::open_in_memory().unwrap();
         insert_squad_with_cwd(&store, "squad-1", "/repo/checkout");
         assert_eq!(
-            survey_candidate_cwd(&store, WaypointEntryKind::Squad, "squad-1").as_deref(),
-            Some("/repo/checkout")
+            survey_candidate_cwd(&store, WaypointEntryKind::Squad, "squad-1"),
+            Some(("/repo/checkout".to_string(), None))
         );
         insert_bare_guardian(&store, "guardian-1");
         assert!(

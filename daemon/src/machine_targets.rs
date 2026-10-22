@@ -79,10 +79,7 @@ pub struct MachineTarget {
 }
 
 /// How a target's runner gets onto the remote machine (RAL-355 Phase 5).
-/// Only [`RunnerMode::Installed`] has an implementation today —
-/// [`RunnerMode::Upload`] is accepted and stored now so a target's config
-/// doesn't need to change shape once Phase 5 lands, but nothing yet acts on
-/// it.
+/// The provider carries out the policy (`ssh-provider/src/runner_install.rs`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RunnerMode {
     /// The configured `runner_command` already resolves to a working
@@ -90,8 +87,8 @@ pub enum RunnerMode {
     /// path there). The safe default — never copies anything to the
     /// remote machine.
     Installed,
-    /// The daemon uploads a matching runner artifact to the remote machine
-    /// before first use. Not implemented yet.
+    /// The provider uploads the matching `runner_artifacts` entry to the
+    /// remote machine (checksummed, content-addressed) before first use.
     Upload,
 }
 
@@ -674,7 +671,7 @@ remote_root = "/tmp/ralphus-work"
     }
 
     #[test]
-    fn windows_temp_remote_root_is_rejected_by_default() {
+    fn an_expanded_windows_temp_remote_root_is_not_caught_by_the_textual_check() {
         let dir = tempdir("windows-temp-root");
         let file = dir.join(".ralphus.toml");
         fs::write(

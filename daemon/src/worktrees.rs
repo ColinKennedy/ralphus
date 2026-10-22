@@ -777,6 +777,74 @@ fn resolve_squad_branch(
     })?
 }
 
+/// The default branch of `project`'s repository as its forge reports it, from
+/// the registered clone URL -- no git, no checkout. Fails rather than guessing
+/// `main`/`master`, like [`default_branch`].
+fn forge_default_branch(store: &StoreHandle, project: &ProjectView) -> Result<String, String> {
+    let url = project.clone_url.as_deref().ok_or_else(|| {
+        format!(
+            "project {:?} has no registered clone URL to ask its forge for the default branch",
+            project.name
+        )
+    })?;
+    // A clone URL that is a path names a repository on a filesystem the
+    // daemon and the machine share; its `HEAD` file says which branch is the
+    // default, with no forge to ask.
+    if let Some(branch) = local_repository_default_branch(Path::new(url)) {
+        return Ok(branch);
+    }
+    let cfg = crate::config::resolve_forge(Path::new(&project.path));
+    crate::forge::resolve_url_with_store(store, url, &cfg, None)
+        .map_err(|e| {
+            format!(
+                "{e}; name the upstream branch explicitly (e.g. \"?upstream=main\") for a \
+                 project whose clone URL is not on a supported forge"
+            )
+        })?
+        .default_branch()
+        .ok_or_else(|| format!("the forge for {url} did not report a default branch"))
+}
+
+/// The branch `HEAD` points at in the repository at `path` (bare or not), if
+/// `path` is one.
+fn local_repository_default_branch(path: &Path) -> Option<String> {
+    let head = [path.join("HEAD"), path.join(".git").join("HEAD")]
+        .into_iter()
+        .find(|p| p.is_file())?;
+    std::fs::read_to_string(head)
+        .ok()?
+        .trim()
+        .strip_prefix("ref: refs/heads/")
+        .map(str::to_string)
+}
+
+/// Whether `machine` names a remote machine rather than the daemon's own host
+/// (unset, blank, or `local`).
+fn is_remote_machine(machine: Option<&str>) -> bool {
+    machine.map(str::trim).is_some_and(|m| {
+        !m.is_empty() && !m.eq_ignore_ascii_case(ralphus_core::schema::LOCAL_MACHINE)
+    })
+}
+
+/// [`resolve_squad_branch`] for a cell on a remote machine: allocate from the
+/// store's claims alone. The daemon's checkout (its worktree list, its
+/// remote-tracking refs) does not describe the machine, and reading it would
+/// be daemon-host work for a remote cell. An `origin/<branch>` base -- the
+/// remote a provider's clone creates -- is a remote-tracking branch and needs
+/// no claim, as locally.
+fn resolve_remote_squad_branch(
+    store: &StoreHandle,
+    project: &ProjectView,
+    base_branch: &str,
+    squad_id: &str,
+) -> Result<String, String> {
+    if base_branch.starts_with("origin/") {
+        return Ok(base_branch.to_string());
+    }
+    let guard = store.lock();
+    resolve_squad_branch_claim(&guard, project, base_branch, squad_id, &HashMap::new())
+}
+
 /// [`resolve_squad_branch`]'s claim decision.
 ///
 /// Takes a live `&Store` rather than the handle **on purpose**: this reads every
@@ -2229,7 +2297,30 @@ impl ProjectStartupAdapter for GitProjectStartupAdapter {
         // adapter without any equivalent wrap, so this is the one place that
         // reliably preserves which cell and placeholder a resolution failure
         // came from regardless of caller.
-        let upstream = resolve_upstream(Path::new(&project.path), upstream).map_err(|e| {
+        if upstream == ralphus_core::schema::WORKTREE_UPSTREAM_CURRENT_BRANCH
+            && is_remote_machine(ctx.machine)
+        {
+            return Err(format!(
+                "cell '{}': \"?upstream={upstream}\" names the branch checked out in the \
+                 daemon's own copy of the project, which says nothing about machine \"{}\"; \
+                 name the upstream branch explicitly (e.g. \"?upstream=main\") or use \
+                 \"?upstream={}\"",
+                ctx.cell_id,
+                ctx.machine.unwrap_or_default(),
+                ralphus_core::schema::WORKTREE_UPSTREAM_DEFAULT
+            ));
+        }
+        // A remote cell's `<<default>>` comes from the forge: the daemon's
+        // checkout's `origin/HEAD` says nothing about the machine (and the
+        // daemon may have no checkout at all).
+        let upstream = if is_remote_machine(ctx.machine)
+            && upstream == ralphus_core::schema::WORKTREE_UPSTREAM_DEFAULT
+        {
+            forge_default_branch(store, project)
+        } else {
+            resolve_upstream(Path::new(&project.path), upstream)
+        }
+        .map_err(|e| {
             format!(
                 "cell '{}': could not resolve upstream for \"{placeholder}\": {e}",
                 ctx.cell_id
@@ -2244,14 +2335,19 @@ impl ProjectStartupAdapter for GitProjectStartupAdapter {
         // below needs again) is queried at most once per project root for
         // this whole submission, via `ctx.on_disk_worktrees` -- not once per
         // branch -- see `PlaceholderContext::on_disk_worktrees`'s doc comment.
+        // A remote cell's worktree lives on its machine, so the daemon's own
+        // checkout says nothing about which branches are taken there.
+        let remote = is_remote_machine(ctx.machine);
         let root_key = Path::new(&project.path).to_path_buf();
-        if !ctx.on_disk_worktrees.borrow().contains_key(&root_key) {
+        if !remote && !ctx.on_disk_worktrees.borrow().contains_key(&root_key) {
             let snapshot = existing_and_reserved_worktree_branches(&root_key);
             ctx.on_disk_worktrees
                 .borrow_mut()
                 .insert(root_key.clone(), snapshot);
         }
-        let branch = {
+        let branch = if remote {
+            resolve_remote_squad_branch(store, project, branch, ctx.squad_id)
+        } else {
             let all = ctx.on_disk_worktrees.borrow();
             let on_disk = all.get(&root_key).expect("populated just above");
             resolve_squad_branch(store, project, branch, ctx.squad_id, on_disk)
@@ -2264,7 +2360,7 @@ impl ProjectStartupAdapter for GitProjectStartupAdapter {
         })?;
         let branch = branch.as_str();
         let resolved = match ctx.machine {
-            Some(machine) if !machine.trim().is_empty() => provision_remote_with_targets(
+            Some(machine) if remote => provision_remote_with_targets(
                 store,
                 machine,
                 project,
@@ -2770,70 +2866,18 @@ fn provision_remote_with_targets(
     squad_id: &str,
     targets: &std::collections::BTreeMap<String, crate::machine_targets::MachineTarget>,
 ) -> Result<String, String> {
-    // allow-lock-io: registry lookups only, no network/subprocess work here.
-    let provider = crate::remote_runner::provider_from_store(&store.lock(), machine)
-        .map_err(|e| format!("cell '{}': {e}", cell.cell_id))?
-        .ok_or_else(|| {
-            // `provision_remote_with_targets` is only called for a non-empty
-            // machine, so a local resolution here means the value changed
-            // under us.
-            format!(
-                "cell '{}': machine \"{machine}\" resolved to the local host",
-                cell.cell_id
-            )
-        })?;
-    // Only git has a clone URL to resolve; every other kind gets `None` and
-    // the provider decides how to obtain the source.
-    let url = if project.vcs == "git" {
-        Some(project.clone_url.clone().ok_or_else(|| {
-            format!(
-                "cell '{}': git project {:?} has no registered clone URL; re-register it with `ralphus project git --name {} --path <local-path> --url <clone-url>` before using it on a remote machine",
-                cell.cell_id, project.name, project.name
-            )
-        })?)
-    } else {
-        None
-    };
-    // RAL-355 Phase 2/4: a git project's remote workspace needs a durable
-    // `remote_root` to provision persistent storage under -- refused here,
-    // before ever dispatching to the provider, the same "fail before
-    // provider dispatch" shape the missing-clone-URL check above already
-    // uses, rather than letting the provider discover the gap at its own
-    // runtime and report a less actionable error.
-    let target = crate::machine_targets::find_by_machine(targets, machine);
-    let remote_root = if project.vcs == "git" {
-        let target = target.ok_or_else(|| {
-            format!(
-                "cell '{}': machine {machine:?} has no [machine.targets.*] entry configured with a remote_root; register one before provisioning a git project there",
-                cell.cell_id
-            )
-        })?;
-        Some(target.remote_root.clone())
-    } else {
-        None
-    };
-    let req = crate::remote_runner::ProvisionRequest {
-        project: project.name.clone(),
-        source: crate::remote_runner::WorkspaceSource {
-            kind: project.vcs.clone(),
-            url,
-            branch: Some(branch.to_string()),
-            upstream: Some(upstream.to_string()),
-        },
-        squad_id: squad_id.to_string(),
-        cell_id: cell.cell_id.clone(),
-        remote_root,
-        runner: target.map(|target| crate::remote_runner::TargetRunnerConfig {
-            mode: match target.runner_mode {
-                crate::machine_targets::RunnerMode::Installed => "installed",
-                crate::machine_targets::RunnerMode::Upload => "upload",
-            }
-            .to_string(),
-            command: target.runner_command.clone(),
-            artifacts: target.runner_artifacts.clone(),
-            remote_root: target.remote_root.clone(),
-        }),
-    };
+    let who = format!("cell '{}'", cell.cell_id);
+    let provider = remote_provider(store, machine, &who)?;
+    let req = provision_request(
+        &who,
+        machine,
+        project,
+        branch,
+        upstream,
+        squad_id,
+        &cell.cell_id,
+        targets,
+    )?;
     let spec = crate::runner::RunnerSpec::from_row(squad_id, cell);
     let result = provider
         .provision(&req, &spec)
@@ -2890,6 +2934,172 @@ fn provision_remote_with_targets(
         }
     }
     result
+}
+
+/// The provider behind `machine`. `who` ("cell 'x'", "review guardian-3")
+/// prefixes the error.
+fn remote_provider(
+    store: &StoreHandle,
+    machine: &str,
+    who: &str,
+) -> Result<crate::remote_runner::ProviderRunner, String> {
+    // allow-lock-io: registry lookups only, no network/subprocess work here.
+    crate::remote_runner::provider_from_store(&store.lock(), machine)
+        .map_err(|e| format!("{who}: {e}"))?
+        // Only called for a non-empty machine, so a local resolution here
+        // means the value changed under us.
+        .ok_or_else(|| format!("{who}: machine \"{machine}\" resolved to the local host"))
+}
+
+/// The `provision` request for `branch` of `project` on `machine`, refusing
+/// before any provider dispatch when a git project lacks what a remote clone
+/// needs. `who` prefixes the errors.
+#[allow(clippy::too_many_arguments)]
+fn provision_request(
+    who: &str,
+    machine: &str,
+    project: &crate::store::ProjectView,
+    branch: &str,
+    upstream: &str,
+    squad_id: &str,
+    cell_id: &str,
+    targets: &std::collections::BTreeMap<String, crate::machine_targets::MachineTarget>,
+) -> Result<crate::remote_runner::ProvisionRequest, String> {
+    // Only git has a clone URL to resolve; every other kind gets `None` and
+    // the provider decides how to obtain the source.
+    let url = if project.vcs == "git" {
+        Some(project.clone_url.clone().ok_or_else(|| {
+            format!(
+                "{who}: git project {:?} has no registered clone URL; re-register it with `ralphus project git --name {} --path <local-path> --url <clone-url>` before using it on a remote machine",
+                project.name, project.name
+            )
+        })?)
+    } else {
+        None
+    };
+    // RAL-355 Phase 2/4: a git project's remote workspace needs a durable
+    // `remote_root` to provision persistent storage under -- refused here,
+    // before ever dispatching to the provider, the same "fail before
+    // provider dispatch" shape the missing-clone-URL check above already
+    // uses, rather than letting the provider discover the gap at its own
+    // runtime and report a less actionable error.
+    let target = crate::machine_targets::find_by_machine(targets, machine);
+    let remote_root = if project.vcs == "git" {
+        let target = target.ok_or_else(|| {
+            format!(
+                "{who}: machine {machine:?} has no [machine.targets.*] entry configured with a remote_root; register one before provisioning a git project there"
+            )
+        })?;
+        Some(target.remote_root.clone())
+    } else {
+        None
+    };
+    Ok(crate::remote_runner::ProvisionRequest {
+        project: project.name.clone(),
+        source: crate::remote_runner::WorkspaceSource {
+            kind: project.vcs.clone(),
+            url,
+            branch: Some(branch.to_string()),
+            upstream: Some(upstream.to_string()),
+        },
+        squad_id: squad_id.to_string(),
+        cell_id: cell_id.to_string(),
+        remote_root,
+        runner: target.map(|target| crate::remote_runner::TargetRunnerConfig {
+            mode: match target.runner_mode {
+                crate::machine_targets::RunnerMode::Installed => "installed",
+                crate::machine_targets::RunnerMode::Upload => "upload",
+            }
+            .to_string(),
+            command: target.runner_command.clone(),
+            artifacts: target.runner_artifacts.clone(),
+            remote_root: target.remote_root.clone(),
+        }),
+    })
+}
+
+/// The branch a review provisions on its machine when none of its cells ran
+/// there: a review-owned name no merge ever checks out, so the anchor
+/// worktree it lives in never blocks one.
+#[must_use]
+pub(crate) fn review_anchor_branch(guardian_id: &str) -> String {
+    format!("ralphus-review-anchor/{guardian_id}")
+}
+
+/// Provision the project at daemon path `project_root` on `machine` for
+/// review `guardian_id`, and return that project's repository **on the
+/// machine** (the parent of its git common dir).
+///
+/// A review assigned a machine its cells never ran on has no workspace
+/// there to discover the repository from; this gives it one, through the
+/// same provider `provision` verb cells use, anchored on
+/// [`review_anchor_branch`] at `base_branch`.
+pub(crate) fn provision_review_repository(
+    store: &StoreHandle,
+    guardian_id: &str,
+    machine: &str,
+    project_root: &str,
+    base_branch: &str,
+) -> Result<String, String> {
+    let who = format!("review {guardian_id}");
+    let project = {
+        let guard = store.lock();
+        guard
+            .project_name_for_path(project_root)
+            .and_then(|name| guard.get_project(&name).ok().flatten())
+    }
+    .ok_or_else(|| {
+        format!(
+            "{who}: no registered project at {project_root:?}, so it cannot be provisioned on \
+             machine \"{machine}\"; register it with `ralphus project git`"
+        )
+    })?;
+    let targets = crate::machine_targets::load_machine_targets()
+        .map_err(|e| format!("{who}: could not load machine targets: {e}"))?;
+    let provider = remote_provider(store, machine, &who)?;
+    let branch = review_anchor_branch(guardian_id);
+    let req = provision_request(
+        &who,
+        machine,
+        &project,
+        &branch,
+        base_branch,
+        guardian_id,
+        "review-anchor",
+        &targets,
+    )?;
+    let spec = crate::runner::RunnerSpec::for_command_proof(
+        "review-merge",
+        "review-merge",
+        machine,
+        ".",
+        "",
+        "claude",
+        None,
+    );
+    let workspace = provider
+        .provision(&req, &spec)
+        .map_err(|e| format!("{who}: {e}"))?;
+    let common = crate::workspace::Workspace::on(workspace.as_str(), Some(machine))
+        .with_store(std::sync::Arc::clone(store))
+        .git(&["rev-parse", "--path-format=absolute", "--git-common-dir"])
+        .map_err(|e| format!("{who}: could not find the repository behind {workspace}: {e}"))?;
+    let repository = Path::new(common.trim())
+        .parent()
+        .map(|p| p.to_string_lossy().replace('\\', "/"))
+        .filter(|p| !p.is_empty())
+        .ok_or_else(|| format!("{who}: unexpected git common dir {:?}", common.trim()))?;
+    // A provider's clone usually has the base branch checked out, and git
+    // refuses to fetch into a checked-out branch, so the review's base could
+    // never advance to its upstream. Nobody works in this checkout: detach it.
+    let repo_ws = crate::workspace::Workspace::on(repository.as_str(), Some(machine))
+        .with_store(std::sync::Arc::clone(store));
+    if repo_ws.git(&["symbolic-ref", "-q", "HEAD"]).is_ok() {
+        repo_ws
+            .git(&["checkout", "--quiet", "--detach"])
+            .map_err(|e| format!("{who}: could not detach HEAD in {repository}: {e}"))?;
+    }
+    Ok(repository)
 }
 
 /// The remote counterpart of [`set_explicit_upstream`] +
@@ -3195,6 +3405,11 @@ pub fn collect_remote_upstream_prefetch_targets(
         let Some(cwd) = cell.cwd.as_deref() else {
             continue;
         };
+        // A remote cell's machine clones and fetches the project itself; its
+        // upstream is never fetched into the daemon's checkout.
+        if is_remote_machine(cell.machine.as_deref()) {
+            continue;
+        }
         let mut placeholders = Vec::new();
         if classify_placeholder(cwd).ok().flatten().is_some() {
             placeholders.push(cwd);
@@ -3401,6 +3616,40 @@ pub(crate) fn ensure_claimed_worktree(
 /// RAL-615: the initialization the cells bound to `wt` carry, as a spec whose
 /// recorder persists each run's outcome on those cells and logs it to
 /// Cartographer. `None` when no cell sharing the worktree has a command.
+/// One lock per remote worktree, so cells sharing it initialize it once.
+static REMOTE_INIT: LazyLock<parking_lot::Mutex<HashMap<String, Arc<parking_lot::Mutex<()>>>>> =
+    LazyLock::new(|| parking_lot::Mutex::new(HashMap::new()));
+
+/// Run a remote cell's worktree `initialization_commands` on its machine when
+/// they are still due (never run, or failed/edited since), before the cell
+/// starts. A remote worktree is provisioned at submit rather than through the
+/// claimed-worktree path that initializes a local one, so this is its
+/// counterpart. `Ok` when there is nothing to run.
+///
+/// # Errors
+/// The initialization failure message ([`crate::worktree_init::FAILURE_PREFIX`]).
+pub(crate) fn initialize_remote_worktree(
+    store: &StoreHandle,
+    squad_id: &str,
+    cwd: &str,
+    machine: Option<&str>,
+) -> Result<(), String> {
+    let lock = REMOTE_INIT
+        .lock()
+        .entry(cwd.to_string())
+        .or_default()
+        .clone();
+    let _initializing = lock.lock();
+    let Some(spec) = init_spec_for_worktree(store, squad_id, Path::new(cwd)) else {
+        return Ok(());
+    };
+    if !spec.rerun_existing {
+        return Ok(());
+    }
+    let ws = crate::workspace::Workspace::on(cwd, machine).with_store(Arc::clone(store));
+    crate::worktree_init::run_in(&ws, &spec).map(|_| ())
+}
+
 fn init_spec_for_worktree(
     store: &StoreHandle,
     squad_id: &str,
@@ -4110,6 +4359,34 @@ mod tests {
         });
         assert!(exhausted.is_err());
         assert_eq!(calls, 4);
+    }
+
+    #[test]
+    fn a_path_clone_urls_default_branch_comes_from_its_head_file() {
+        // A remote cell on a machine that shares the daemon's filesystem (the
+        // loopback provider) may name an origin by path; there is no forge
+        // to ask, so its HEAD says which branch is the default.
+        let dir = tmp_dir("path-origin-head");
+        let bare = dir.join("origin.git");
+        std::fs::create_dir_all(&bare).unwrap();
+        std::fs::write(bare.join("HEAD"), "ref: refs/heads/trunk\n").unwrap();
+        let checkout = dir.join("checkout");
+        std::fs::create_dir_all(checkout.join(".git")).unwrap();
+        std::fs::write(checkout.join(".git").join("HEAD"), "ref: refs/heads/main\n").unwrap();
+
+        assert_eq!(
+            local_repository_default_branch(&bare).as_deref(),
+            Some("trunk")
+        );
+        assert_eq!(
+            local_repository_default_branch(&checkout).as_deref(),
+            Some("main")
+        );
+        assert_eq!(
+            local_repository_default_branch(Path::new("https://github.com/o/r")),
+            None
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn tmp_dir(tag: &str) -> PathBuf {
@@ -5396,6 +5673,121 @@ mod tests {
             !worktree_dir(&repo, "feat-r").exists(),
             "a remote cell must not materialize a local worktree"
         );
+    }
+
+    #[test]
+    fn a_remote_cell_refuses_the_current_branch_upstream_sentinel() {
+        let repo = init_repo("remote-current-branch");
+        let script = fake_provisioner(
+            "remote-current-branch-p",
+            r#"{"ok":true,"protocol_version":1,"workspace":"/remote/wt/feat-r"}"#,
+        );
+        let store = std::sync::Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
+        store
+            .lock()
+            .register_project_with_clone_url_ex(
+                "proj",
+                "",
+                &repo.to_string_lossy(),
+                "git",
+                Some(&repo.to_string_lossy()),
+                None,
+            )
+            .unwrap();
+        store
+            .lock()
+            .register_machine_provider(
+                "ib",
+                "",
+                &script.to_string_lossy(),
+                &[],
+                crate::machines::PROTOCOL_VERSION,
+                false,
+            )
+            .unwrap();
+        let mut cells = vec![cell_row_on(
+            0,
+            0,
+            "s0",
+            Some("ralphus:new-worktree/feat-r?upstream=<<current_branch>>"),
+            Some("ib:A"),
+        )];
+        let tasks = vec![task_row(0, Some("proj"))];
+        let targets = targets_map(&[target_for("ib:A", "/srv/ralphus")]);
+        let err =
+            resolve_placeholders_with_targets(&store, "squad-1", &mut cells, &tasks, &targets)
+                .expect_err("a remote cell cannot use the daemon checkout's branch");
+        assert!(err.contains("<<current_branch>>"), "{err}");
+        assert!(err.contains("ib:A"), "{err}");
+    }
+
+    #[test]
+    fn a_remote_cells_branch_ignores_worktrees_in_the_daemons_checkout() {
+        // The daemon's checkout says nothing about which branches are taken
+        // on the cell's machine: a local worktree on `feat-r` must not push a
+        // remote cell onto `feat-r-2`.
+        let repo = init_repo("remote-branch-alloc");
+        let local_wt = repo.parent().unwrap().join("remote-branch-alloc-local-wt");
+        crate::guardian_merge::git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "feat-r",
+                &local_wt.to_string_lossy(),
+            ],
+        )
+        .expect("local worktree on feat-r");
+        let script = fake_provisioner(
+            "remote-branch-alloc-p",
+            r#"{"ok":true,"protocol_version":1,"workspace":"/remote/wt/feat-r"}"#,
+        );
+        let store = std::sync::Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
+        store
+            .lock()
+            .register_project_with_clone_url_ex(
+                "proj",
+                "",
+                &repo.to_string_lossy(),
+                "git",
+                Some(&repo.to_string_lossy()),
+                None,
+            )
+            .unwrap();
+        store
+            .lock()
+            .register_machine_provider(
+                "ib",
+                "",
+                &script.to_string_lossy(),
+                &[],
+                crate::machines::PROTOCOL_VERSION,
+                false,
+            )
+            .unwrap();
+        let mut cells = vec![cell_row_on(
+            0,
+            0,
+            "s0",
+            Some("ralphus:new-worktree/feat-r?upstream=main"),
+            Some("ib:A"),
+        )];
+        let tasks = vec![task_row(0, Some("proj"))];
+        let targets = targets_map(&[target_for("ib:A", "/srv/ralphus")]);
+        resolve_placeholders_with_targets(&store, "squad-1", &mut cells, &tasks, &targets)
+            .expect("remote provision");
+
+        let claims = store.lock().task_worktree_claims("proj", "feat-r").unwrap();
+        assert_eq!(
+            claims.iter().map(|c| c.branch.as_str()).collect::<Vec<_>>(),
+            vec!["feat-r"]
+        );
+        let _ = std::fs::remove_dir_all(&local_wt);
     }
 
     #[test]

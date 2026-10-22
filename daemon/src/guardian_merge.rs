@@ -1285,18 +1285,16 @@ fn is_ancestor(root: &Workspace, ancestor: &str, descendant: &str) -> bool {
 #[must_use]
 fn purge_carry_refs(root: &Workspace, id: &str) -> Vec<String> {
     let mut failures = Vec::new();
-    let listed = git(
-        root.root(),
-        &[
+    let listed = root
+        .git(&[
             "for-each-ref",
             "--format=%(refname)",
             &format!("refs/ralphus/carry/{id}"),
-        ],
-    )
-    .unwrap_or_else(|e| {
-        failures.push(format!("list refs/ralphus/carry/{id}: {e}"));
-        String::new()
-    });
+        ])
+        .unwrap_or_else(|e| {
+            failures.push(format!("list refs/ralphus/carry/{id}: {e}"));
+            String::new()
+        });
     for name in listed.lines().map(str::trim).filter(|s| !s.is_empty()) {
         if let Err(e) = root.git(&["update-ref", "-d", name]) {
             failures.push(format!("{name}: {e}"));
@@ -1313,7 +1311,7 @@ fn purge_carry_refs(root: &Workspace, id: &str) -> Vec<String> {
 /// ref it created, covering normal completion, early return, and panic-unwind, so
 /// a build never leaks protection refs.
 struct CarryRefs {
-    pins: Vec<(PathBuf, String)>,
+    pins: Vec<(Workspace, String)>,
 }
 
 impl CarryRefs {
@@ -1321,13 +1319,14 @@ impl CarryRefs {
         Self { pins: Vec::new() }
     }
 
-    /// Pin `sha` under `refs/ralphus/carry/<id>/<slug>` in `root`. Best-effort:
-    /// on failure the commit simply falls back to bare-SHA reachability (still
-    /// valid until gc), so pinning never blocks a merge.
-    fn pin(&mut self, root: &Path, id: &str, slug: &str, sha: &str) {
+    /// Pin `sha` under `refs/ralphus/carry/<id>/<slug>` in `root` (on its
+    /// machine). Best-effort: on failure the commit simply falls back to
+    /// bare-SHA reachability (still valid until gc), so pinning never blocks a
+    /// merge.
+    fn pin(&mut self, root: &Workspace, id: &str, slug: &str, sha: &str) {
         let name = format!("refs/ralphus/carry/{id}/{slug}");
-        if git(root, &["update-ref", &name, sha]).is_ok() {
-            self.pins.push((root.to_path_buf(), name));
+        if root.git(&["update-ref", &name, sha]).is_ok() {
+            self.pins.push((root.clone(), name));
         }
     }
 }
@@ -1335,7 +1334,7 @@ impl CarryRefs {
 impl Drop for CarryRefs {
     fn drop(&mut self) {
         for (root, name) in &self.pins {
-            let _ = git(root, &["update-ref", "-d", name]);
+            let _ = root.git(&["update-ref", "-d", name]);
         }
     }
 }
@@ -1376,10 +1375,12 @@ fn regen_from_feature_worktree(
     wt: &Workspace,
     branch: &str,
 ) -> std::result::Result<(), String> {
-    let wt_str = wt.root().to_string_lossy().to_string();
+    let wt_str = wt.root_string();
     match find_worktree_for_branch(root, branch) {
         Some(feature_wt) => {
-            let sha = git(&feature_wt, &["rev-parse", "HEAD"])
+            let sha = root
+                .at(&feature_wt)
+                .git(&["rev-parse", "HEAD"])
                 .map(|s| s.trim().to_string())
                 .map_err(|e| {
                     format!(
@@ -1523,9 +1524,9 @@ fn worktree_add_or_reset_with_faults<F>(
 where
     F: RecoveryFaults,
 {
-    let wt_str = wt.root().to_string_lossy().to_string();
+    let wt_str = wt.root_string();
 
-    if !wt.root().exists() {
+    if !wt.worktree_present() {
         // [State 1] Directory missing — fast path.
         // [State 7] Unlock first: a locked tracking entry survives both the
         // `remove` below (single `-f` does not override a lock) and `prune`
@@ -1603,7 +1604,7 @@ where
     // disk, so that `git worktree add` does not reject the path as registered.
     let _ = root.git(&["worktree", "prune"]);
 
-    if !wt.root().exists() {
+    if !wt.worktree_present() {
         // Removal succeeded; add fresh.
         if branch_exists(root, branch) {
             return add_worktree_with_prune_retry(root, rev, &wt_str, branch, faults);
@@ -1708,23 +1709,28 @@ fn git_path(wt: &Workspace, rel: &str) -> Option<PathBuf> {
     if p.is_empty() {
         return None;
     }
-    let path = Path::new(p);
-    Some(if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        wt.root().join(path)
-    })
+    Some(wt.resolve(p))
 }
 
 /// Whether a rebase is currently in progress in `wt` (its state directory
 /// exists). Used to decide whether `rebase --continue` still has work to do.
 ///
+/// On a remote machine the directory is detected by the `head-name` file
+/// git writes into it for every rebase: a provider can read a file but has no
+/// way to test for a directory.
+///
 /// `pub(crate)`: also read by `server.rs`'s live conflicting-files endpoint
 /// (RAL-148) to report whether a branch's worktree is mid-rebase.
 pub(crate) fn rebase_in_progress(wt: &Workspace) -> bool {
-    ["rebase-merge", "rebase-apply"]
-        .iter()
-        .any(|d| git_path(wt, d).is_some_and(|p| p.exists()))
+    ["rebase-merge", "rebase-apply"].iter().any(|d| {
+        git_path(wt, d).is_some_and(|p| {
+            if wt.is_local() {
+                p.exists()
+            } else {
+                wt.exists(p.join("head-name"))
+            }
+        })
+    })
 }
 
 /// Git's own interactive-rebase todo-list progress for an in-progress rebase
@@ -1737,15 +1743,15 @@ pub(crate) fn rebase_in_progress(wt: &Workspace) -> bool {
 /// must treat that as "no progress to report", not an error.
 pub fn rebase_command_progress(wt: &Workspace) -> Option<(i64, i64)> {
     let state_dir = git_path(wt, "rebase-merge")?;
-    let done = count_command_lines(&state_dir.join("done"))?;
-    let remaining = count_command_lines(&state_dir.join("git-rebase-todo")).unwrap_or(0);
+    let done = count_command_lines(wt, &state_dir.join("done"))?;
+    let remaining = count_command_lines(wt, &state_dir.join("git-rebase-todo")).unwrap_or(0);
     Some((done, done + remaining))
 }
 
-/// Count non-blank, non-comment lines in a rebase-todo-style file. `None` if
-/// the file can't be read (missing, or a transient race).
-fn count_command_lines(path: &Path) -> Option<i64> {
-    let content = std::fs::read_to_string(path).ok()?;
+/// Count non-blank, non-comment lines in a rebase-todo-style file in `wt`.
+/// `None` if the file can't be read (missing, or a transient race).
+fn count_command_lines(wt: &Workspace, path: &Path) -> Option<i64> {
+    let content = wt.read_file(path)?;
     Some(
         content
             .lines()
@@ -2542,6 +2548,13 @@ fn synthesize_proof_instructions(
     let retry_after_unknown_default_seconds =
         crate::config::resolve(std::path::Path::new(&git_root))
             .retry_after_unknown_default_seconds();
+    // The agent runs on the review's machine, in the repository there; the
+    // daemon's `git_root` names nothing on a remote machine.
+    let cwd = if review_machine.is_some() {
+        Workspace::for_guardian(store, id, git_root.as_str()).root_string()
+    } else {
+        git_root
+    };
     let mut spec = RunnerSpec {
         // RAL-102: squad_id/cell_id together key the cell session name
         // (see `crate::cell_session::session_name`) — must be unique per guardian so
@@ -2550,7 +2563,7 @@ fn synthesize_proof_instructions(
         squad_id: format!("guardian-{id}"),
         task: "proof-synthesis".to_string(),
         cell_id: format!("synthesizer-{}", branch.replace(['/', '.'], "-")),
-        cwd: git_root,
+        cwd,
         prompt: Some(lines.join("\n")),
         command: None,
         shell: None,
@@ -3154,7 +3167,7 @@ fn resolve_conflicts_with_agent(
         // agent resumes its own conversation instead of starting cold. Count
         // only a completed agent pass below: a runner/backend invocation that
         // cannot produce a result is not an attempt to resolve conflicts.
-        let resolver_cwd = wt.root().to_string_lossy().into_owned();
+        let resolver_cwd = wt.root_string();
         // RAL-517: resolve before `cwd: resolver_cwd` moves the string below.
         let retry_after_unknown_default_seconds =
             crate::config::resolve(std::path::Path::new(&resolver_cwd))
@@ -3265,6 +3278,7 @@ fn resolve_conflicts_with_agent(
         let marker_id = id.to_string();
         let marker_branch_id = branch_id.to_string();
         let marker_watcher = std::thread::spawn(move || {
+            let _remote_scope = crate::machine_strict::enter(marker_wt.machine());
             while !marker_stop_clone.load(Ordering::Relaxed) {
                 sleep_unless_stopped(&marker_stop_clone, std::time::Duration::from_millis(2000));
                 if marker_stop_clone.load(Ordering::Relaxed) {
@@ -3365,7 +3379,7 @@ fn resolve_conflicts_with_agent(
         // overwriting it, so notes from earlier passes/rebuilds accumulate.
         if let Some(ghost_text) = result.ghost.as_deref().map(str::trim) {
             if !ghost_text.is_empty() {
-                let revision = crate::ghost::current_revision(&wt.root().to_string_lossy());
+                let revision = crate::ghost::current_revision_in(wt);
                 let guard = store.lock();
                 if guard
                     .upsert_ghost(
@@ -3601,7 +3615,7 @@ fn run_final_proof(
             admin_only: false,
         });
     }
-    let proof_cwd = wt.root().to_string_lossy().into_owned();
+    let proof_cwd = wt.root_string();
     // RAL-517: resolve before `cwd: proof_cwd` moves the string below.
     let retry_after_unknown_default_seconds =
         crate::config::resolve(std::path::Path::new(&proof_cwd))
@@ -3816,11 +3830,10 @@ fn run_commit_checks(
             }),
         );
     }
-    let wt_str = wt.root().to_string_lossy().into_owned();
     if !checks.is_empty() {
         let uri = crate::ghost::review_uri(id, Some(branch_id));
         let note = crate::ghost::proof_outcome_note(checks.len(), checks.len());
-        let revision = crate::ghost::current_revision(&wt_str);
+        let revision = crate::ghost::current_revision_in(wt);
         let guard = store.lock();
         if guard
             .upsert_ghost(
@@ -4215,6 +4228,7 @@ pub(crate) fn restack_from_position<F: Fn(GuardianStatus, Option<&str>)>(
     cancel: &CancelToken,
 ) {
     let _git_operation = git_review_operation_guard(root.root(), root.machine());
+    let _remote_scope = crate::machine_strict::enter(root.machine());
     // Queue this restack and try to claim it immediately -- claiming only
     // succeeds once every branch's worktree lease is free (see the
     // `worktree lease` glossary entry), so a restack can never rebase a
@@ -4348,7 +4362,7 @@ pub(crate) fn restack_from_position<F: Fn(GuardianStatus, Option<&str>)>(
             store,
             root,
             id,
-            &root.root().to_string_lossy(),
+            &root.root_string(),
             &ob.id,
             &ob.branch,
             ob.readable_review_branch,
@@ -4361,7 +4375,7 @@ pub(crate) fn restack_from_position<F: Fn(GuardianStatus, Option<&str>)>(
             }
         };
         let wt_j = branch_wt_dir(wt_base, &short_names, &ob.branch);
-        let wt_j_str = wt_j.root().to_string_lossy().to_string();
+        let wt_j_str = wt_j.root_string();
         let old_tip = resolve_commit(root, &rev);
         let old_upstream = restack_branch_upstream(
             store,
@@ -4821,14 +4835,27 @@ fn claim_combined_review_ref(
 /// starts) forces that rebuild to fall back to its from-scratch path and
 /// re-derive every remaining branch purely from its own feature-branch tip.
 pub fn purge_worktrees(store: &crate::store_lock::StoreHandle, git_root: &str, id: &str) {
-    let num = id.replace("guardian-", "");
     let root = Workspace::for_guardian(store, id, Path::new(git_root));
+    purge_worktrees_in(store, &root, git_root, id);
+}
+
+/// [`purge_worktrees`] in a workspace the caller already resolved -- for a
+/// review being deleted, whose machine can no longer be looked up once its
+/// row is gone.
+pub fn purge_worktrees_in(
+    store: &crate::store_lock::StoreHandle,
+    root: &Workspace,
+    git_root: &str,
+    id: &str,
+) {
+    let _remote_scope = crate::machine_strict::enter(root.machine());
+    let num = id.replace("guardian-", "");
     let wt_base = root.at(worktree_dir(git_root, id));
     let claimed = claimed_review_branches(store, id, Some(git_root));
-    let mut summary = cleanup_review_worktrees(&root, &wt_base, id, &num, &claimed);
+    let mut summary = cleanup_review_worktrees(root, &wt_base, id, &num, &claimed);
     // Also drop any carry-forward protection refs so a deleted guardian leaves
     // nothing pinning otherwise-unreachable commits.
-    summary.failures.extend(purge_carry_refs(&root, id));
+    summary.failures.extend(purge_carry_refs(root, id));
     let guard = store.lock();
     let payload = serde_json::json!({
         "git_root": git_root,
@@ -4961,6 +4988,7 @@ pub(crate) fn kickoff_merge(
     sem: Arc<Semaphore>,
     cancellations: Cancellations,
 ) -> Result<StartMergeOutcome, StartMergeError> {
+    let _remote_scope = crate::machine_strict::enter_for_guardian(&store, id);
     let kickoff_started = std::time::Instant::now();
     // A nonexistent guardian must 404 before any preflight work runs.
     // `sync_remote_pr_commits` below also looks the guardian up, but maps
@@ -5565,6 +5593,7 @@ pub fn stop_actioning(
     cancellations: Cancellations,
     id: &str,
 ) -> Reply {
+    let _remote_scope = crate::machine_strict::enter_for_guardian(&store, id);
     let key = format!("guardian:{id}");
     let (review_status, project_root, active_before, has_leases) = {
         let guard = store.lock();
@@ -6264,6 +6293,7 @@ pub fn run_merge_staged(
     }
     let _git_operation =
         git_review_operation_guard(Path::new(&guardian.git_root), guardian.machine.as_deref());
+    let _remote_scope = crate::machine_strict::enter(guardian.machine.as_deref());
     let set_status = |s: GuardianStatus, detail: Option<&str>| {
         write_merge_status(store, id, s, detail);
     };
@@ -6655,7 +6685,7 @@ fn staged_merge_pass(
                 }
             };
             let wt = branch_wt_dir(&wt_base, &short_names, &bv.branch);
-            let wt_str = wt.root().to_string_lossy().to_string();
+            let wt_str = wt.root_string();
             let old_tip = old_tips.get(&bv.id).cloned();
             let old_upstream = old_tip.as_deref().and_then(|tip| {
                 // A branch that added nothing (empty, or its work landed
@@ -7001,6 +7031,7 @@ pub fn run_merge_cancellable(
     let stored_signature = store.lock().guardian_build_signature(id).unwrap_or(None);
     let _git_operation =
         git_review_operation_guard(Path::new(&guardian.git_root), guardian.machine.as_deref());
+    let _remote_scope = crate::machine_strict::enter(guardian.machine.as_deref());
     // RAL-193: every call is its own merge/rebase attempt -- bump the
     // counter so cost line items recorded during it (conflict resolution,
     // proving) are attributed to this attempt, distinct from the
@@ -7196,7 +7227,7 @@ pub fn run_merge_cancellable(
         let proot = ws_root.at(PathBuf::from(proj));
         cleanup_failures.extend(purge_carry_refs(&proot, id));
         if let Some(sha) = old_base_by_proj.get(proj) {
-            carry.pin(proot.root(), id, "base", sha);
+            carry.pin(&proot, id, "base", sha);
         }
         for ob in proj_branches {
             // A shared-worktree review keeps every branch on its one combined
@@ -7209,7 +7240,7 @@ pub fn run_merge_cancellable(
             };
             if let Ok(sha) = proot.git(&["rev-parse", "--verify", &rev]) {
                 let sha = sha.trim().to_string();
-                carry.pin(proot.root(), id, &ob.position.to_string(), &sha);
+                carry.pin(&proot, id, &ob.position.to_string(), &sha);
                 old_tips_by_proj
                     .entry(proj.clone())
                     .or_default()
@@ -7232,7 +7263,7 @@ pub fn run_merge_cancellable(
                 .cloned()
                 .filter(|sha| resolve_commit(&proot, sha).is_some())
             {
-                carry.pin(proot.root(), id, &format!("baseline-{}", ob.position), &sha);
+                carry.pin(&proot, id, &format!("baseline-{}", ob.position), &sha);
                 old_tips_by_proj.entry(proj.clone()).or_default().push(sha);
             }
         }
@@ -7247,7 +7278,7 @@ pub fn run_merge_cancellable(
                     == *proj
         }) {
             if let Some(sha) = resolve_commit(&proot, &review_ref_of(id, ob)) {
-                carry.pin(proot.root(), id, &format!("disabled-{}", ob.position), &sha);
+                carry.pin(&proot, id, &format!("disabled-{}", ob.position), &sha);
                 old_tips_by_proj.entry(proj.clone()).or_default().push(sha);
             }
         }
@@ -7430,7 +7461,7 @@ pub fn run_merge_cancellable(
                 }
             };
             let wt = branch_wt_dir(&wt_base, &short_names, &ob.branch);
-            let wt_str = wt.root().to_string_lossy().to_string();
+            let wt_str = wt.root_string();
             if let Err(e) = worktree_add_or_reset(&root, &rev, &wt, &ob.branch) {
                 fail_branch(store, id, &ob.id, &ob.branch, &e, &set_status);
                 return;
@@ -7727,7 +7758,7 @@ fn run_merge_shared<F: Fn(GuardianStatus, Option<&str>)>(
         }
     };
     let wt = wt_base.join("review");
-    let wt_str = wt.root().to_string_lossy().to_string();
+    let wt_str = wt.root_string();
     let carried = carry_from.is_some();
     if let Some((old_tip, old_base)) = carry_from {
         if carry_shared_stack(
@@ -8461,6 +8492,7 @@ fn run_feedback_pass(
     }
     let _git_operation =
         git_review_operation_guard(Path::new(&guardian.git_root), guardian.machine.as_deref());
+    let _remote_scope = crate::machine_strict::enter(guardian.machine.as_deref());
     let base = guardian.base_branch.clone();
     let Some(branch) = guardian.branches.iter().find(|b| b.id == branch_id) else {
         fail_message();
@@ -8971,7 +9003,7 @@ fn run_feedback_pass(
                 let clone_url =
                     crate::pr::project_clone_url_for_root(store, Path::new(&branch_project));
                 Some(crate::forge::resolve_parent_remote_name(
-                    Path::new(&branch_project),
+                    &root,
                     &base,
                     &forge_cfg,
                     clone_url.as_deref(),
@@ -9057,7 +9089,7 @@ fn run_feedback_pass(
                             crate::forge::effective_forge_identity(None, owner.as_deref());
                         match crate::forge::resolve_remote_with_store(
                             store,
-                            Path::new(&branch_project),
+                            &root,
                             remote_name,
                             &forge_cfg,
                             identity.as_deref(),
@@ -9477,7 +9509,7 @@ fn run_feedback_pass(
             }
         };
         let wt_j = branch_wt_dir(&wt_base, &short_names, &ob.branch);
-        let wt_j_str = wt_j.root().to_string_lossy().to_string();
+        let wt_j_str = wt_j.root_string();
         // Reset the review branch to what it replays (its old tip, so its own
         // review-only commits survive, else the feature tip); drive_rebase
         // replays those commits onto the revised upstream (`prev_ref`).
@@ -9622,6 +9654,7 @@ pub fn pull_pr_commits(
     alias: &str,
     last_synced_sha: Option<&str>,
 ) -> std::result::Result<Option<String>, String> {
+    let _remote_scope = crate::machine_strict::enter_for_guardian(store, id);
     let guardian = store.lock().get_guardian(id).map_err(|e| e.to_string())?;
     let branch = guardian
         .branches
@@ -10124,6 +10157,7 @@ fn spawn_merge_checks(store: &crate::store_lock::StoreHandle, candidates: &[(Str
     for id in due {
         let store = Arc::clone(store);
         std::thread::spawn(move || {
+            let _remote_scope = crate::machine_strict::enter_for_guardian(&store, &id);
             check_merges_claimed(&store, &id);
         });
     }
@@ -10416,6 +10450,7 @@ fn review_maintenance_staggered(
         std::thread::spawn(move || {
             // Released when this worker exits, by any path.
             let _claim = claim;
+            let _remote_scope = crate::machine_strict::enter_for_guardian(&store, &id);
             let runner = runners(&store);
             // RAL-213: register/remove around the merge this may trigger, same
             // shape as `scheduler::tick`'s squad-level wrapping, so a guardian
@@ -10459,6 +10494,7 @@ fn review_maintenance_staggered(
         let runners = Arc::clone(runners);
         std::thread::spawn(move || {
             let _claim = claim;
+            let _remote_scope = crate::machine_strict::enter_for_guardian(&store, &id);
             let runner = runners(&store);
             // PRs of a still-collecting review are already a stack to label.
             crate::pr::reconcile_ci_deferral_if_stack_changed(&store, &id);
@@ -10491,6 +10527,7 @@ fn review_maintenance_staggered(
             let _claim = claim;
             let _clock = MaintenanceClock::start(&id);
             std::thread::sleep(offset);
+            let _remote_scope = crate::machine_strict::enter_for_guardian(&store, &id);
             let runner = runners(&store);
             // RAL-213: one token covers both the base-shift rebuild and (if
             // that didn't run) the manual-push restack below -- either may
@@ -10688,10 +10725,11 @@ fn current_review_heads(
             .project
             .clone()
             .unwrap_or_else(|| guardian.git_root.clone());
-        if let Ok(sha) = Workspace::on(Path::new(&proj), guardian.machine.as_deref())
-            .with_store(Arc::clone(store))
-            .git(&["rev-parse", "--verify", rev])
-        {
+        if let Ok(sha) = Workspace::for_guardian(store, &guardian.id, Path::new(&proj)).git(&[
+            "rev-parse",
+            "--verify",
+            rev,
+        ]) {
             out.push((b.position, b.id.clone(), sha.trim().to_string()));
         }
     }
@@ -10836,6 +10874,7 @@ pub fn rebase_on_manual_push(
     id: &str,
     sem: &Semaphore,
 ) -> bool {
+    let _remote_scope = crate::machine_strict::enter_for_guardian(store, id);
     let guardian = match store.lock().get_guardian(id) {
         Ok(g) => g,
         Err(_) => return false,
@@ -11085,6 +11124,7 @@ fn guardian_base_already_has_every_branch(
             .iter()
             .map(|proj| {
                 scope.spawn(move || {
+                    let _remote_scope = crate::machine_strict::enter(guardian.machine.as_deref());
                     let root = Workspace::for_guardian(store, id, Path::new(proj));
                     match resolve_base(&root, &guardian.base_branch) {
                         Ok(sha) => project_already_in_base(&root, guardian, proj, &sha),
@@ -11295,6 +11335,7 @@ pub fn rebuild_on_base_shift_with_debounce(
     cancel: &CancelToken,
     debounce: std::time::Duration,
 ) -> bool {
+    let _remote_scope = crate::machine_strict::enter_for_guardian(store, id);
     let guardian = match store.lock().get_guardian(id) {
         Ok(g) => g,
         Err(_) => return false,
@@ -12251,6 +12292,7 @@ pub fn run_guardian_post_merge_for(
 
     let _review_op =
         git_review_operation_guard(Path::new(&guardian.git_root), guardian.machine.as_deref());
+    let _remote_scope = crate::machine_strict::enter(guardian.machine.as_deref());
     let started_at = match store.lock().start_guardian_post_merge(id) {
         Ok(stamp) => stamp,
         Err(_) => crate::store::now_ms(),
@@ -13137,23 +13179,26 @@ fn claim_post_merge_checkout_with(
             parent.join(format!("{POST_MERGE_WORKTREE_DIR}-{attempt}"))
         };
         let ws = ws_root.at(&dir);
-        let dir_str = dir.to_string_lossy().to_string();
+        // The directory as its machine names it: what git is told and what the
+        // review records.
+        let dir_str = ws.root_string();
         if is_held(&dir) {
             held.push(dir_str);
             continue;
         }
-        if ws.root().exists() {
+        let present = Workspace::worktree_present;
+        if present(&ws) {
             let _ = combined_ws.git(&["worktree", "remove", "--force", &dir_str]);
         }
-        if ws.root().exists() && !is_valid_linked_worktree(&ws) {
+        if present(&ws) && !is_valid_linked_worktree(&ws) {
             let _ = combined_ws.git(&["worktree", "prune"]);
             if ws.is_local() {
                 let _ = std::fs::remove_dir_all(&dir);
             }
         }
-        if !ws.root().exists() {
+        if !present(&ws) {
             match combined_ws.git(&["worktree", "add", "--detach", &dir_str, tip]) {
-                Ok(_) => return Ok(dir),
+                Ok(_) => return Ok(PathBuf::from(dir_str)),
                 Err(error) => {
                     last_error = format!("post-merge scratch checkout failed: {error}");
                     continue;
@@ -13164,7 +13209,7 @@ fn claim_post_merge_checkout_with(
             match ws.git(&["checkout", "-f", "--detach", tip]) {
                 Ok(_) => {
                     let _ = ws.git(&["clean", "-fdx"]);
-                    return Ok(dir);
+                    return Ok(PathBuf::from(dir_str));
                 }
                 Err(error) => {
                     last_error = format!("post-merge scratch reset failed: {error}");
@@ -13287,12 +13332,25 @@ fn prepare_action_hints(
                 .transpose()?;
             let mut action_env = env.clone();
             let workspace_identity = format!("{:x}", Sha256::digest(combined_str.as_bytes()));
+            // The build root lives where the action runs: a temp directory on
+            // the daemon's host, or under the review repository's
+            // `.git/.ralphus` on its machine (a remote review's commands never
+            // see the daemon's disk).
             let build_root = std::env::temp_dir()
                 .join("ralphus")
                 .join("prepared-builds")
                 .join(id)
                 .join(&workspace_identity[..16])
                 .join(format!("action-{index}"));
+            let build_root = if root.is_local() {
+                build_root
+            } else {
+                PathBuf::from(format!(
+                    "{}/.git/.ralphus/prepared-builds/{id}/{}/action-{index}",
+                    root.root_string(),
+                    &workspace_identity[..16]
+                ))
+            };
             let lifecycle = hints[index].lifecycle.as_ref();
             let preserve_build_root = lifecycle
                 .and_then(|value| value.build_root_policy.as_deref())
@@ -13343,7 +13401,15 @@ fn prepare_action_hints(
                         }
                     }
                 }
-                if !preserve_build_root && build_root.exists() {
+                if !root.is_local() {
+                    if !preserve_build_root {
+                        root.remove_path(&build_root, true);
+                    }
+                    // A provider creates parent directories when it writes a
+                    // file; it has no verb for creating a bare directory.
+                    root.write_file(build_root.join(".ralphus-build-root"), "")
+                        .map_err(|error| format!("failed to create build root: {error}"))?;
+                } else if !preserve_build_root && build_root.exists() {
                     std::fs::remove_dir_all(&build_root).map_err(|error| {
                         format!(
                             "failed to reset build root {}: {error}",
@@ -13351,12 +13417,14 @@ fn prepare_action_hints(
                         )
                     })?;
                 }
-                std::fs::create_dir_all(&build_root).map_err(|error| {
-                    format!(
-                        "failed to create build root {}: {error}",
-                        build_root.display()
-                    )
-                })?;
+                if root.is_local() {
+                    std::fs::create_dir_all(&build_root).map_err(|error| {
+                        format!(
+                            "failed to create build root {}: {error}",
+                            build_root.display()
+                        )
+                    })?;
+                }
                 if !preserve_build_root {
                     if let Some(shared_root) = &shared_store_cwd {
                         if shared_root.exists() {
@@ -13795,7 +13863,10 @@ fn materialize_action_artifacts(
         .join(guardian_id)
         .join(stage_key);
     let mut uses_daemon_stage = false;
-    let action_platform = if action.run_on.as_deref() == Some("review_machine") {
+    // An action runs on a remote review's machine unless it is pinned to the
+    // daemon (`run_on = "daemon"`), so that machine's platform is the one its
+    // artifacts must match.
+    let action_platform = if !workspace.is_local() && action.run_on.as_deref() != Some("daemon") {
         workspace.target_platform()?
     } else {
         (
@@ -13813,7 +13884,13 @@ fn materialize_action_artifacts(
                         artifact.source
                     ));
                 }
-                let probe = artifact_exists_command(&artifact.source);
+                let probe = artifact_exists_command(
+                    &artifact.source,
+                    action_platform
+                        .0
+                        .as_deref()
+                        .is_some_and(|os| normalize_target_os(os) == "windows"),
+                );
                 if !workspace.run_command_with_env(&probe, env, cancel).0 {
                     return Err(format!(
                         "retained artifact {:?} does not exist",
@@ -13992,16 +14069,16 @@ fn anchor_command_executable(
     Ok(Some(format!("{absolute}{rest}")))
 }
 
-fn artifact_exists_command(relative: &str) -> String {
-    #[cfg(windows)]
-    {
+/// A shell command that succeeds when `relative` exists, in the syntax of the
+/// machine it runs on (`windows`: `cmd`; otherwise POSIX `sh`) -- not the
+/// daemon's, which differs for a remote review.
+fn artifact_exists_command(relative: &str, windows: bool) -> String {
+    if windows {
         format!(
             "if exist \"{}\" (exit /b 0) else (exit /b 1)",
             relative.replace('"', "\"\"")
         )
-    }
-    #[cfg(not(windows))]
-    {
+    } else {
         format!("test -e '{}'", relative.replace('\'', "'\"'\"'"))
     }
 }
@@ -14009,21 +14086,19 @@ fn artifact_exists_command(relative: &str) -> String {
 /// Fetch a branch produced on another machine into this repository, so the
 /// review can stack it (RAL-185 Phase 3b).
 ///
-/// Per **D2** the daemon never *publishes* — deciding what to commit is
-/// judgment, and a generic `add -A && commit && push` would sweep up build
-/// artifacts and contradict the per-cell control task files already
-/// exercise. The task's own cell is responsible for pushing. Fetching a
-/// branch whose name and remote are both already known is the opposite: fully
-/// deterministic, so it belongs here.
+/// The cell commits; ralphus never decides what to commit. When the task
+/// finishes, ralphus pushes those commits from the producing machine to
+/// [`crate::vcs::published_cell_ref`] on the shared remote if a review on a
+/// different machine needs them (the scheduler's task finalizer). This fetches
+/// that ref, whose name and remote are both already known.
 ///
 /// A no-op for a locally-produced branch, which is every pre-RAL-185 branch.
 ///
-/// **This is the check that catches a task that never pushed.** Without it the
-/// review would either fail deep inside `worktree add` with an opaque "invalid
-/// reference" message, or — worse, when a *previous* squad did push — quietly
-/// stack that older revision and present a plausible but stale review. The
-/// error names the branch, its machine, and the fact that publishing is the
-/// task's own job.
+/// **This is the check that catches a branch that was never published.**
+/// Without it the review would either fail deep inside `worktree add` with an
+/// opaque "invalid reference" message, or — worse, when a *previous* squad did
+/// publish — quietly stack that older revision and present a plausible but
+/// stale review. The error names the branch and its machine.
 ///
 /// Note the limit, honestly: this proves the branch *exists* on the remote,
 /// not that it is the newest thing the task machine has. Detecting "pushed,
@@ -14060,8 +14135,10 @@ fn fetch_branch_for_remote_cell(
         .map(|g| g.base_branch.as_str())
         .unwrap_or_default();
     let clone_url = crate::pr::project_clone_url_for_root(store, root);
+    // The remote is resolved in the repository the branch is fetched into:
+    // the review machine's for a remote review, the daemon's otherwise.
     let remote = crate::forge::resolve_parent_remote_name(
-        root,
+        &Workspace::for_guardian(store, guardian_id, root),
         base_branch,
         &crate::config::resolve_forge(root),
         clone_url.as_deref(),
@@ -14070,10 +14147,10 @@ fn fetch_branch_for_remote_cell(
     let not_published = |e: &str| {
         format!(
             "branch \"{}\" was produced on machine \"{machine}\" but could not be fetched from \
-             \"{remote}\": {e}. The task that owns this branch is responsible for pushing it \
-             before it completes — ralphus never commits or pushes on a cell's behalf. Check \
-             that cell's output, confirm it pushed, then restart this review.",
-            branch.branch
+             \"{remote}\" ({}): {e}. Ralphus publishes it there when its task finishes; check \
+             that task's error for a failed publish, then restart this review.",
+            branch.branch,
+            crate::vcs::published_cell_ref(&branch.branch)
         )
     };
     let review_machine = review
@@ -14088,7 +14165,10 @@ fn fetch_branch_for_remote_cell(
         let ws = Workspace::for_guardian(store, guardian_id, root);
         let head_ref = format!("refs/heads/{}", branch.branch);
         if review_machine != machine {
-            let refspec = format!("+{head_ref}:{head_ref}");
+            let refspec = format!(
+                "+{}:{head_ref}",
+                crate::vcs::published_cell_ref(&branch.branch)
+            );
             ws.git(&["fetch", "--no-write-fetch-head", &remote, &refspec])
                 .map_err(|e| not_published(&e))?;
         }
@@ -14259,15 +14339,25 @@ fn hold_branch_for_unfinished_task<F: Fn(GuardianStatus, Option<&str>)>(
 /// unanswerable comparison must not silently pick a side.
 pub(crate) fn branch_diff_is_empty(
     store: &crate::store_lock::StoreHandle,
-    root: &Path,
+    root: &Workspace,
     upstream: &str,
     head: &str,
 ) -> Result<bool, String> {
+    if !root.is_local() {
+        // A remote review's repository is on its machine (always git: a
+        // review stacks git branches). `--name-only` separates "no
+        // difference" (empty output) from a failure, which `--quiet`'s exit
+        // code cannot through a provider.
+        return root
+            .git(&["diff", "--name-only", upstream, head])
+            .map(|names| names.trim().is_empty());
+    }
     let vcs = {
         let guard = store.lock();
-        crate::vcs::for_project_root(&guard, root)?
+        crate::vcs::for_project_root(&guard, root.root())?
     };
-    vcs.differs(root, upstream, head).map(|differs| !differs)
+    vcs.differs(root.root(), upstream, head)
+        .map(|differs| !differs)
 }
 
 /// The post-build empty check for a branch built from `carry` (`carried`:
@@ -14295,7 +14385,7 @@ fn built_branch_is_empty(
     }
     let range_empty = carry.source == carry.upstream
         || matches!(
-            branch_diff_is_empty(store, root.root(), &carry.upstream, &carry.source),
+            branch_diff_is_empty(store, root, &carry.upstream, &carry.source),
             Ok(true)
         );
     if !range_empty || carry.new_since.is_some() {
@@ -14321,7 +14411,7 @@ fn note_if_branch_is_empty(
 ) -> bool {
     // An unanswerable comparison must never fail a review on a guess, so it
     // reports "not empty" and leaves the stored flag untouched.
-    let is_empty = match branch_diff_is_empty(store, root.root(), upstream, branch) {
+    let is_empty = match branch_diff_is_empty(store, root, upstream, branch) {
         Ok(is_empty) => is_empty,
         Err(e) => {
             crate::rlog!(
@@ -14370,7 +14460,7 @@ fn rebuild_combined(
 ) -> std::result::Result<String, String> {
     let combined_branch = claim_combined_review_ref_by_id(store, root, id)?;
     let combined_wt = wt_base.join("review");
-    let combined_str = combined_wt.root().to_string_lossy().to_string();
+    let combined_str = combined_wt.root_string();
     worktree_add_or_reset(root, &combined_branch, &combined_wt, prev_ref)?;
     {
         let guard = store.lock();
@@ -14705,6 +14795,7 @@ pub fn retire_stale_worktrees(store: &crate::store_lock::StoreHandle) {
             &record.guardian_id,
             PathBuf::from(&record.project_root),
         );
+        let _remote_scope = crate::machine_strict::enter(root.machine());
         let wt_base = root.at(worktree_dir(&record.project_root, &record.guardian_id));
         if !crate::short_paths::worktree_belongs_to_guardian(
             &record.path,
@@ -15081,6 +15172,7 @@ pub fn run_periodic_git_maintenance(store: &crate::store_lock::StoreHandle) {
             .unwrap_or_default()
             .into_iter()
             .map(|g| GuardianRootInfo {
+                id: g.id,
                 git_root: g.git_root,
                 machine: g.machine,
                 status: g.status,
@@ -15093,6 +15185,12 @@ pub fn run_periodic_git_maintenance(store: &crate::store_lock::StoreHandle) {
             log_git_maintenance_skipped(store, &root, machine.as_deref());
             continue;
         }
+        // Any review on this (root, machine) can translate the daemon-side
+        // root onto the machine's repository.
+        let guardian_id = guardians
+            .iter()
+            .find(|g| Path::new(&g.git_root) == root && g.machine == machine)
+            .map(|g| g.id.clone());
         let store = Arc::clone(store);
         let emit_store = Arc::clone(&store);
         std::thread::spawn(move || {
@@ -15106,7 +15204,10 @@ pub fn run_periodic_git_maintenance(store: &crate::store_lock::StoreHandle) {
                 log_git_maintenance_skipped(&emit_store, &root, machine.as_deref());
                 return;
             };
-            let ws = Workspace::on(&root, machine.as_deref()).with_store(store);
+            let ws = match &guardian_id {
+                Some(id) => Workspace::for_guardian(&store, id, &root),
+                None => Workspace::on(&root, machine.as_deref()).with_store(store),
+            };
             // The store lock is taken only to record the outcome below --
             // never held across the `git gc` call itself, which can run for
             // minutes on a bloated repo and must not stall the rest of the
@@ -15161,6 +15262,7 @@ fn log_git_maintenance_skipped(
 /// narrows it for `collect_base_fetch_targets`, so the pure dedup/filter
 /// logic can be unit-tested without constructing a whole view.
 pub(crate) struct GuardianRootInfo {
+    pub id: String,
     pub git_root: String,
     pub machine: Option<String>,
     pub status: String,
@@ -15563,18 +15665,17 @@ fn rebased_branch_status(
 /// the current `base_branch`.  If `base_branch` looks like a remote-tracking ref
 /// (e.g. `origin/main`) only refs under that remote are returned; otherwise local
 /// branches are returned.  Returns an empty list on any git error.
-pub fn list_base_branches(git_root: &str, base_branch: &str) -> Vec<String> {
-    let root = Path::new(git_root);
+pub fn list_base_branches(
+    root: &(impl crate::workspace::GitAt + ?Sized),
+    base_branch: &str,
+) -> Vec<String> {
     let ref_prefix = if let Some(slash) = base_branch.find('/') {
         let remote = &base_branch[..slash];
         format!("refs/remotes/{remote}/")
     } else {
         "refs/heads/".to_string()
     };
-    match git(
-        root,
-        &["for-each-ref", "--format=%(refname:short)", &ref_prefix],
-    ) {
+    match root.git_at(&["for-each-ref", "--format=%(refname:short)", &ref_prefix]) {
         Ok(s) => s
             .lines()
             .map(str::trim)
@@ -15708,8 +15809,16 @@ fn guardian_ids_for_target(
 fn fetch_base_branch(
     store: &crate::store_lock::StoreHandle,
     target: &BaseFetchTarget,
+    guardian_id: Option<&str>,
 ) -> std::result::Result<(), String> {
-    let ws = Workspace::on(&target.root, target.machine.as_deref()).with_store(Arc::clone(store));
+    // A review served by this target translates its daemon-side project root
+    // onto the review's machine; without one the root is used as given.
+    let ws = match guardian_id {
+        Some(id) => Workspace::for_guardian(store, id, &target.root),
+        None => {
+            Workspace::on(&target.root, target.machine.as_deref()).with_store(Arc::clone(store))
+        }
+    };
     let base = &target.base_branch;
 
     if let Some((remote, branch)) = base.split_once('/') {
@@ -15726,7 +15835,9 @@ fn fetch_base_branch(
             let refspec = format!("+refs/heads/{branch}:refs/heads/{base}");
             return match ws.git(&["fetch", "--no-write-fetch-head", remote, &refspec]) {
                 Ok(_) => Ok(()),
-                Err(e) if e.contains("refusing to fetch into branch") => {
+                // Git 2.40+ says "refusing to fetch into branch ... checked
+                // out at"; older git "Refusing to fetch into current branch".
+                Err(e) if e.to_ascii_lowercase().contains("refusing to fetch into") => {
                     warn_checked_out_base_once(store, target);
                     let tracking = format!("+refs/heads/{branch}:refs/remotes/{remote}/{branch}");
                     ws.git(&["fetch", "--no-write-fetch-head", remote, &tracking])
@@ -15821,7 +15932,9 @@ pub fn poll_base_branch_freshness_once(store: &crate::store_lock::StoreHandle) {
         let store = Arc::clone(store);
         std::thread::spawn(move || {
             let _claim = claim;
-            let result = fetch_base_branch(&store, &target);
+            let _remote_scope = crate::machine_strict::enter(target.machine.as_deref());
+            let result =
+                fetch_base_branch(&store, &target, guardian_ids.first().map(String::as_str));
             let outcome = match &result {
                 Ok(()) => crate::poller_health::PollOutcome::Healthy,
                 Err(e) => {
@@ -15875,6 +15988,8 @@ pub fn poll_base_branch_freshness_once(store: &crate::store_lock::StoreHandle) {
         let info = info.clone();
         std::thread::spawn(move || {
             let _claim = claim;
+            let _remote_scope =
+                crate::machine_strict::enter_for_guardian(&store, &info.guardian_id);
             crate::pr::refresh_dual_root_upstream_branch(
                 &store,
                 &info.guardian_id,
@@ -15939,7 +16054,9 @@ pub(crate) fn resolve_base(
     root: &Workspace,
     base_branch: &str,
 ) -> std::result::Result<String, String> {
-    let qualified = qualify_ambiguous_ref(root.root(), base_branch);
+    // Qualified where it is resolved: on the review's machine for a remote
+    // review, whose refs the daemon's checkout does not have.
+    let qualified = qualify_ambiguous_ref_in(root, base_branch);
     let spec = format!("{qualified}^{{commit}}");
     Ok(root
         .git(&["rev-parse", "--verify", &spec])?
@@ -16710,6 +16827,7 @@ fn generate_final_summary(
     id: &str,
     signature: &str,
 ) {
+    let _remote_scope = crate::machine_strict::enter_for_guardian(store, id);
     let Ok(guardian) = store.lock().get_guardian(id) else {
         return;
     };
@@ -16795,7 +16913,7 @@ fn generate_final_summary(
         .collect::<Vec<_>>()
         .join(", ");
 
-    let cwd = ws_root.root().to_string_lossy().into_owned();
+    let cwd = ws_root.root_string();
     let resolved = match resolve_resolver_agent(
         guardian.resolver_agent.as_deref(),
         guardian.resolver_model.as_deref(),
@@ -17304,7 +17422,7 @@ fn generate_manual_commands(
             repository_guidance(wt)
         );
         (
-            wt.root().to_string_lossy().into_owned(),
+            wt.root_string(),
             wt.machine().map(str::to_string),
             manual_commands_prompt(&tail, steering.as_deref()),
         )
@@ -17336,7 +17454,7 @@ fn generate_manual_commands(
             repository_guidance(root)
         );
         (
-            root.root().to_string_lossy().into_owned(),
+            root.root_string(),
             root.machine().map(str::to_string),
             manual_commands_prompt(&tail, steering.as_deref()),
         )
@@ -17640,6 +17758,7 @@ pub(crate) fn resolve_check_input(
     command: &str,
     input: &CheckInput,
 ) {
+    let _remote_scope = crate::machine_strict::enter_for_guardian(store, guardian_id);
     let Some((cwd, stored_agent, stored_model, machine)) = ({
         let guard = store.lock();
         guard.get_guardian(guardian_id).ok().map(|g| {
@@ -18562,7 +18681,7 @@ mod tests {
             machine: None,
             base_branch: "main".to_string(),
         };
-        fetch_base_branch(&store, &target).expect("falls back instead of failing");
+        fetch_base_branch(&store, &target, None).expect("falls back instead of failing");
         assert_eq!(g_out(&repo, &["rev-parse", "main"]), local_before);
         assert_eq!(g_out(&repo, &["rev-parse", "origin/main"]), pushed);
         let after = current_base_tips(&store, &id).unwrap();
@@ -18814,6 +18933,7 @@ mod tests {
 
     fn root_info(git_root: &str, machine: Option<&str>, status: &str) -> GuardianRootInfo {
         GuardianRootInfo {
+            id: format!("guardian-{git_root}"),
             git_root: git_root.to_string(),
             machine: machine.map(str::to_string),
             status: status.to_string(),
@@ -22393,6 +22513,65 @@ mod tests {
     }
 
     #[test]
+    fn the_artifact_probe_uses_the_machines_shell_not_the_daemons() {
+        // A Windows daemon checking a Linux review machine must send POSIX
+        // `sh`, and the other way round.
+        assert_eq!(
+            artifact_exists_command("out/app", false),
+            "test -e 'out/app'"
+        );
+        assert_eq!(
+            artifact_exists_command("out\\app.exe", true),
+            "if exist \"out\\app.exe\" (exit /b 0) else (exit /b 1)"
+        );
+    }
+
+    #[test]
+    fn a_published_remote_branch_is_fetched_from_its_hidden_ref() {
+        // The task finalizer publishes a remote cell's branch outside
+        // `refs/heads/` so it never clutters the forge's branch list; the
+        // review must read it from there.
+        let (base, repo, fwt) = make_repo("fetch-published");
+        let origin = base.join("origin.git");
+        g(&base, &["init", "--bare", origin.to_str().unwrap()]);
+        g(
+            &repo,
+            &["remote", "add", "origin", origin.to_str().unwrap()],
+        );
+        g(
+            &fwt,
+            &[
+                "push",
+                "origin",
+                &format!("HEAD:{}", crate::vcs::published_cell_ref("feature/remote")),
+            ],
+        );
+        let store = Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
+        let id = {
+            let guard = store.lock();
+            let id = guard
+                .create_guardian("r", "main", repo.to_str().unwrap())
+                .unwrap();
+            guard.add_guardian_branch(&id, "feature/remote").unwrap();
+            id
+        };
+        let mut b = store.lock().get_guardian(&id).unwrap().branches[0].clone();
+        b.source_cell_machine = Some("incredibuild:A".to_string());
+
+        fetch_branch_for_remote_cell(&store, &id, &b).expect("published branch must fetch");
+
+        assert_eq!(
+            git(&repo, &["rev-parse", "refs/heads/feature/remote"])
+                .unwrap()
+                .trim(),
+            git(&fwt, &["rev-parse", "HEAD"]).unwrap().trim(),
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
     fn a_remote_branch_that_was_never_pushed_fails_with_an_actionable_message() {
         // The quietly-wrong case Q6 exists for: the task ran on another machine
         // and never pushed, so its commits are nowhere this repo can see them.
@@ -22422,8 +22601,12 @@ mod tests {
             "must name the machine: {err}"
         );
         assert!(
-            err.contains("responsible for pushing"),
-            "must say whose job publishing is: {err}"
+            err.contains("refs/ralphus/cells/feature/a"),
+            "must name the published ref it looked for: {err}"
+        );
+        assert!(
+            err.contains("publish"),
+            "must point at the task's publish step: {err}"
         );
 
         let _ = std::fs::remove_dir_all(&base);

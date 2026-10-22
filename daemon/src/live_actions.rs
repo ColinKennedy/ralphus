@@ -1628,7 +1628,7 @@ fn upload_destination(
     let root = Path::new(&guardian.git_root);
     let client = crate::pr::forge_client_for_stack(
         store,
-        root,
+        &crate::workspace::Workspace::for_guardian(store, &guardian.id, root),
         &guardian.base_branch,
         &crate::config::resolve_forge(root),
         guardian.owner.as_deref(),

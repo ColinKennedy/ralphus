@@ -2498,6 +2498,43 @@ impl Store {
         Ok(cwd.flatten())
     }
 
+    /// The assigned machine (`None` = the daemon's host) of every
+    /// non-terminal review that stacks `branch` as an enabled branch.
+    pub(crate) fn review_machines_for_branch_conn(
+        conn: &Connection,
+        branch: &str,
+    ) -> Result<Vec<Option<String>>> {
+        let mut stmt = conn.prepare(
+            "SELECT g.machine, g.status FROM guardian_branches gb
+             JOIN guardians g ON g.id = gb.guardian_id
+             WHERE gb.branch = ? AND gb.enabled = 1",
+        )?;
+        let rows = stmt.query_map(params![branch], |r| {
+            Ok((r.get::<_, Option<String>>(0)?, r.get::<_, String>(1)?))
+        })?;
+        let mut machines = Vec::new();
+        for row in rows {
+            let (machine, status) = row?;
+            if !GuardianStatus::is_terminal_status(&status) {
+                machines.push(machine);
+            }
+        }
+        Ok(machines)
+    }
+
+    /// The machine a guardian's review is assigned (`None` when unset or the
+    /// guardian does not exist), without hydrating the whole review.
+    pub(crate) fn guardian_machine_conn(conn: &Connection, id: &str) -> Result<Option<String>> {
+        let machine: Option<Option<String>> = conn
+            .query_row(
+                "SELECT machine FROM guardians WHERE id=?",
+                params![id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(machine.flatten())
+    }
+
     /// Atomically reopen a guardian already out of `collecting` (`in_review` or
     /// `merge_failed`) back to `merging`, to pick up a straggler branch. Since
     /// RAL-108, [`Self::claim_guardian_merge`] also claims `in_review` guardians
@@ -6766,9 +6803,14 @@ impl Store {
         }
         // RAL-145: git's own rebase-todo progress is a live filesystem read,
         // so it's gated to the (normally singular) branch actually mid-rebase
-        // rather than scanned across every branch on every board poll.
+        // rather than scanned across every branch on every board poll. A
+        // remote review's worktrees are on its machine, and hydration is no
+        // place for a provider round trip, so it reports no progress.
+        let remote_review = row.machine.as_deref().map(str::trim).is_some_and(|m| {
+            !m.is_empty() && !m.eq_ignore_ascii_case(ralphus_core::schema::LOCAL_MACHINE)
+        });
         for b in &mut branches {
-            if b.merge_status != "in_progress" {
+            if remote_review || b.merge_status != "in_progress" {
                 continue;
             }
             let Some(wt) = b.worktree.as_deref() else {
@@ -7905,6 +7947,32 @@ struct GuardianRow {
 mod tests {
     use super::*;
     use crate::store::NodeState;
+
+    #[test]
+    fn review_machines_for_a_branch_skip_finished_reviews() {
+        let store = Store::open_in_memory().unwrap();
+        let remote = store.create_guardian("r", "main", "/repo").unwrap();
+        store.add_guardian_branch(&remote, "feat").unwrap();
+        store
+            .set_guardian_machine(&remote, Some("fleet:box"))
+            .unwrap();
+        let local = store.create_guardian("l", "main", "/repo").unwrap();
+        store.add_guardian_branch(&local, "feat").unwrap();
+        let done = store.create_guardian("d", "main", "/repo").unwrap();
+        store.add_guardian_branch(&done, "feat").unwrap();
+        store
+            .set_guardian_status(&done, GuardianStatus::Cancelled, None)
+            .unwrap();
+
+        let mut machines = Store::review_machines_for_branch_conn(&store.conn, "feat").unwrap();
+        machines.sort();
+        assert_eq!(machines, vec![None, Some("fleet:box".to_string())]);
+        assert!(
+            Store::review_machines_for_branch_conn(&store.conn, "other")
+                .unwrap()
+                .is_empty()
+        );
+    }
 
     // ── CLI_PARITY_PLAN.local.md Phase 5: ported board.html domain logic ────────
 

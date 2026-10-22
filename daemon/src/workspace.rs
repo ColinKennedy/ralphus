@@ -51,6 +51,10 @@ pub struct Workspace {
     /// combined checkout, ...) are translated through it in [`Self::at`] and
     /// when resolving an absolute path. `None` everywhere else.
     path_map: Option<Arc<(PathBuf, PathBuf)>>,
+    /// The path as the daemon names it, before any `path_map` translation:
+    /// the registered project path config and project lookups are keyed by.
+    /// Equal to `root` for every workspace that was not translated.
+    local_root: PathBuf,
 }
 
 /// One remote-produced branch of a review: the daemon-local project root it
@@ -125,13 +129,16 @@ static MACHINE_REPOSITORIES: std::sync::LazyLock<
 /// cell's own workspace there (`git rev-parse --git-common-dir`), so no
 /// provider has to report its storage layout.
 ///
-/// `None` when no contributing cell ran on `machine` (e.g. a remote review fed
-/// only by local cells), which leaves the workspace's paths untouched.
+/// When no contributing cell ran on `machine` (e.g. a remote review fed only
+/// by local cells), the project is provisioned there for the review itself
+/// ([`crate::worktrees::provision_review_repository`]). `None` only when that
+/// fails too, which leaves the workspace's paths untouched.
 fn machine_repository_for(
     guardian_id: &str,
     machine: &str,
     root: &Path,
     sources: &[RemoteBranchSource],
+    review: &ReviewProjects,
     store: &crate::store_lock::StoreHandle,
 ) -> Option<(PathBuf, PathBuf)> {
     for source in sources.iter().filter(|s| s.machine == machine) {
@@ -154,7 +161,58 @@ fn machine_repository_for(
         MACHINE_REPOSITORIES.lock().insert(key, repository.clone());
         return Some((source.local_root.clone(), repository));
     }
-    None
+    let local_root = review.local_root_for(root)?;
+    let key = (guardian_id.to_string(), local_root.clone());
+    if let Some(repository) = MACHINE_REPOSITORIES.lock().get(&key).cloned() {
+        return Some((local_root, repository));
+    }
+    match crate::worktrees::provision_review_repository(
+        store,
+        guardian_id,
+        machine,
+        &local_root.to_string_lossy(),
+        &review.base_branch,
+    ) {
+        Ok(repository) => {
+            let repository = PathBuf::from(repository);
+            MACHINE_REPOSITORIES.lock().insert(key, repository.clone());
+            Some((local_root, repository))
+        }
+        Err(e) => {
+            // ralphus[ignore-rlog-pair]: resolved while building a workspace, whose callers may hold the store lock
+            crate::rlog!(
+                WARNING,
+                "ralphus [workspace] review {guardian_id} could not be provisioned on machine \
+                 {machine}: {e}"
+            );
+            None
+        }
+    }
+}
+
+/// The project roots a review spans and the base branch it builds on, for
+/// provisioning it on a machine none of its cells ran on.
+#[derive(Default)]
+struct ReviewProjects {
+    git_root: String,
+    projects: Vec<String>,
+    base_branch: String,
+}
+
+impl ReviewProjects {
+    /// The review project `root` belongs to: the longest project root it is
+    /// under, or the review's own `git_root`.
+    fn local_root_for(&self, root: &Path) -> Option<PathBuf> {
+        self.projects
+            .iter()
+            .map(PathBuf::from)
+            .filter(|p| root.starts_with(p))
+            .max_by_key(|p| p.as_os_str().len())
+            .or_else(|| {
+                let git_root = PathBuf::from(&self.git_root);
+                (!self.git_root.is_empty() && root.starts_with(&git_root)).then_some(git_root)
+            })
+    }
 }
 
 impl std::fmt::Debug for Workspace {
@@ -173,8 +231,10 @@ impl Workspace {
     /// overhead — see the module doc.
     #[must_use]
     pub fn local(root: impl Into<PathBuf>) -> Self {
+        let root = root.into();
         Self {
-            root: root.into(),
+            local_root: root.clone(),
+            root,
             machine: None,
             store: None,
             path_map: None,
@@ -191,8 +251,10 @@ impl Workspace {
                 !m.is_empty() && !m.eq_ignore_ascii_case(ralphus_core::schema::LOCAL_MACHINE)
             })
             .map(str::to_string);
+        let root = root.into();
         Self {
-            root: root.into(),
+            local_root: root.clone(),
+            root,
             machine,
             store: None,
             path_map: None,
@@ -218,9 +280,14 @@ impl Workspace {
         let loaded = store.with_read_snapshot_or_lock_when_shared_cache(|conn| {
             let g = crate::store::Store::get_guardian_conn(conn, guardian_id)?;
             let sources = remote_branch_sources(conn, &g);
-            Ok((g.machine, sources))
+            let review = ReviewProjects {
+                git_root: g.git_root,
+                projects: g.projects,
+                base_branch: g.base_branch,
+            };
+            Ok((g.machine, sources, review))
         });
-        let (machine, sources) = {
+        let (machine, sources, review) = {
             match loaded {
                 Ok(found) => found,
                 Err(e) => {
@@ -244,15 +311,21 @@ impl Workspace {
                             ),
                             serde_json::json!({ "error": e.to_string() }),
                         );
-                    (None, Vec::new())
+                    (None, Vec::new(), ReviewProjects::default())
                 }
             }
         };
         let mut workspace = Self::on(root, machine.as_deref()).with_store(Arc::clone(store));
         if let Some(machine) = workspace.machine.clone() {
-            workspace.path_map =
-                machine_repository_for(guardian_id, &machine, &workspace.root, &sources, store)
-                    .map(Arc::new);
+            workspace.path_map = machine_repository_for(
+                guardian_id,
+                &machine,
+                &workspace.root,
+                &sources,
+                &review,
+                store,
+            )
+            .map(Arc::new);
             workspace.root = workspace.map_path(&workspace.root);
         }
         workspace
@@ -295,12 +368,22 @@ impl Workspace {
     /// the derived directory is on the same host by construction.
     #[must_use]
     pub fn at(&self, path: impl Into<PathBuf>) -> Self {
+        let local_root = path.into();
         Self {
-            root: self.map_path(&path.into()),
+            root: self.map_path(&local_root),
             machine: self.machine.clone(),
             store: self.store.clone(),
             path_map: self.path_map.clone(),
+            local_root,
         }
+    }
+
+    /// The path the daemon knows this workspace by -- the registered project
+    /// path config and project lookups are keyed by -- as opposed to
+    /// [`Self::root`], where it is on its machine.
+    #[must_use]
+    pub fn local_root(&self) -> &Path {
+        &self.local_root
     }
 
     /// Translate a daemon-local path under this review's project root to the
@@ -388,7 +471,7 @@ impl Workspace {
                 // shell on its own side -- the one place the args-already-split
                 // rule cannot apply, because the author wrote shell syntax.
                 let req = crate::remote_runner::RunRequest {
-                    cwd: self.root.to_string_lossy().into_owned(),
+                    cwd: remote_path_string(&self.root),
                     program: String::new(),
                     args: vec![command.to_string()],
                     env: env.clone(),
@@ -442,7 +525,7 @@ impl Workspace {
         match &self.machine {
             None => std::fs::read_to_string(&full).ok(),
             Some(_) => self
-                .with_provider(|p, spec| p.read_file(&full.to_string_lossy(), spec))
+                .with_provider(|p, spec| p.read_file(&remote_path_string(&full), spec))
                 .ok(),
         }
     }
@@ -463,9 +546,8 @@ impl Workspace {
                 std::fs::write(&full, content)
                     .map_err(|e| format!("could not write {}: {e}", full.display()))
             }
-            Some(_) => {
-                self.with_provider(|p, spec| p.write_file(&full.to_string_lossy(), content, spec))
-            }
+            Some(_) => self
+                .with_provider(|p, spec| p.write_file(&remote_path_string(&full), content, spec)),
         }
     }
 
@@ -489,7 +571,7 @@ impl Workspace {
                 set_executable(&full)
             }
             Some(_) => self.with_provider(|p, spec| {
-                p.write_executable_file(&full.to_string_lossy(), content, spec)
+                p.write_executable_file(&remote_path_string(&full), content, spec)
             }),
         }
     }
@@ -522,7 +604,7 @@ impl Workspace {
             }
             Some(machine) => {
                 if let Err(e) = self.with_provider(|p, spec| {
-                    p.remove_path(&full.to_string_lossy(), recursive, spec)
+                    p.remove_path(&remote_path_string(&full), recursive, spec)
                 }) {
                     // ralphus[ignore-rlog-pair]: callers may already hold the store lock, so locking it here to emit could deadlock
                     crate::rlog!(
@@ -545,6 +627,19 @@ impl Workspace {
         match &self.machine {
             None => self.resolve(path).exists(),
             Some(_) => self.read_file(path).is_some(),
+        }
+    }
+
+    /// Whether this workspace's directory exists on its machine: the directory
+    /// itself for a local workspace; the `.git` entry a worktree keeps for a
+    /// remote one, since a provider can read a file but has no verb that
+    /// tests for a directory. Meant for worktree directories.
+    #[must_use]
+    pub fn worktree_present(&self) -> bool {
+        if self.is_local() {
+            self.root.exists()
+        } else {
+            self.exists(".git")
         }
     }
 
@@ -607,7 +702,7 @@ impl Workspace {
             }
             Some(_) => self.with_provider(|provider, spec| {
                 provider.materialize(
-                    &source.to_string_lossy(),
+                    &remote_path_string(&source),
                     &destination.to_string_lossy(),
                     executable,
                     spec,
@@ -634,12 +729,34 @@ impl Workspace {
 
     /// Resolve `path` against this workspace's root when relative, or take it
     /// as-is when already absolute.
-    fn resolve(&self, path: impl AsRef<Path>) -> PathBuf {
+    ///
+    /// "Absolute" follows the machine, not the daemon: on a remote workspace
+    /// `/srv/repo` is absolute even when the daemon runs on Windows, where
+    /// [`Path::is_absolute`] would call it relative and join it onto the root.
+    pub fn resolve(&self, path: impl AsRef<Path>) -> PathBuf {
         let p = path.as_ref();
-        if p.is_absolute() {
+        let absolute = if self.machine.is_some() {
+            is_absolute_anywhere(p)
+        } else {
+            p.is_absolute()
+        };
+        if absolute {
             self.map_path(p)
         } else {
             self.root.join(p)
+        }
+    }
+
+    /// This workspace's root as a string that names it on its own machine:
+    /// the native form for a local workspace, `/`-separated for a remote one
+    /// (see [`remote_path_string`]). Use it wherever the root is stored or
+    /// handed on as text.
+    #[must_use]
+    pub fn root_string(&self) -> String {
+        if self.machine.is_some() {
+            remote_path_string(&self.root)
+        } else {
+            self.root.to_string_lossy().into_owned()
         }
     }
 
@@ -735,13 +852,88 @@ impl Workspace {
     /// it forever.
     fn git_remote(&self, _machine: &str, args: &[&str]) -> Result<String, String> {
         let req = crate::remote_runner::RunRequest {
-            cwd: self.root.to_string_lossy().into_owned(),
+            cwd: remote_path_string(&self.root),
             program: "git".to_string(),
             args: args.iter().map(|a| (*a).to_string()).collect(),
             env: non_interactive_git_env(),
             shell: None,
         };
         self.with_provider(|p, spec| p.run_vcs(&req, spec))
+    }
+}
+
+/// `path` as text for a remote machine, with every separator a `/`.
+///
+/// A remote path is built with [`Path::join`], which uses the *daemon's*
+/// separator: a Windows daemon joining onto a Linux machine's `/srv/repo`
+/// yields `/srv/repo\.git\worktrees`, which names nothing over there. `/` is
+/// read correctly by POSIX machines and by Windows ones (git and the Win32
+/// file APIs both accept it), so normalising to it works for either. A
+/// backslash inside a POSIX file name is the one casualty, and ralphus never
+/// creates such a name.
+fn remote_path_string(path: &Path) -> String {
+    path.to_string_lossy().replace('\\', "/")
+}
+
+/// Whether `path` is absolute on POSIX (`/x`) or Windows (`C:\x`, `C:/x`,
+/// `\\server\x`), whatever OS the daemon itself runs on.
+fn is_absolute_anywhere(path: &Path) -> bool {
+    let text = path.to_string_lossy();
+    let bytes = text.as_bytes();
+    path.is_absolute()
+        || bytes.first().is_some_and(|b| *b == b'/' || *b == b'\\')
+        || (bytes.len() >= 3
+            && bytes[0].is_ascii_alphabetic()
+            && bytes[1] == b':'
+            && (bytes[2] == b'/' || bytes[2] == b'\\'))
+}
+
+/// Somewhere `git` can run: a directory on the daemon's host, or a
+/// [`Workspace`] on whatever machine it names.
+///
+/// Lets a helper that only *runs git* (resolving a remote name, reading a
+/// remote's URL) take either, so local callers keep passing a path while a
+/// remote review's callers pass its workspace and the commands run there.
+pub trait GitAt {
+    /// Run `git` with `args` here, returning stdout.
+    ///
+    /// # Errors
+    /// The command's failure message.
+    fn git_at(&self, args: &[&str]) -> Result<String, String>;
+
+    /// The path the daemon knows this place by, for config, project and
+    /// cache lookups keyed by the registered project path -- never for
+    /// running anything.
+    fn local_path(&self) -> &Path;
+}
+
+impl GitAt for Path {
+    fn git_at(&self, args: &[&str]) -> Result<String, String> {
+        crate::guardian_merge::git(self, args)
+    }
+
+    fn local_path(&self) -> &Path {
+        self
+    }
+}
+
+impl GitAt for PathBuf {
+    fn git_at(&self, args: &[&str]) -> Result<String, String> {
+        crate::guardian_merge::git(self, args)
+    }
+
+    fn local_path(&self) -> &Path {
+        self
+    }
+}
+
+impl GitAt for Workspace {
+    fn git_at(&self, args: &[&str]) -> Result<String, String> {
+        self.git(args)
+    }
+
+    fn local_path(&self) -> &Path {
+        self.local_root()
     }
 }
 
@@ -947,6 +1139,67 @@ mod tests {
     }
 
     #[test]
+    fn remote_paths_are_sent_with_forward_slashes() {
+        assert_eq!(
+            remote_path_string(Path::new(r"/srv/repo\.git\worktrees")),
+            "/srv/repo/.git/worktrees"
+        );
+        assert_eq!(
+            remote_path_string(Path::new(r"C:\work\repo")),
+            "C:/work/repo"
+        );
+    }
+
+    #[test]
+    fn a_subdirectory_of_a_posix_remote_root_is_named_with_forward_slashes() {
+        // On a Windows daemon `Path::join` writes `\`, which a Linux machine
+        // reads as part of a file name.
+        let ws = Workspace::on("/srv/repo", Some("incredibuild:A")).join(".git/worktrees/feat");
+        assert_eq!(ws.root_string(), "/srv/repo/.git/worktrees/feat");
+    }
+
+    #[test]
+    fn a_mapped_review_path_is_named_with_forward_slashes_on_the_machine() {
+        // The review derives `.git/.ralphus/...` from the daemon's own project
+        // root and translates it onto the machine's repository; the suffix
+        // carries the daemon's separators until it is normalised.
+        let local = ralphus_test_support::scratch("ralphus-ws-map");
+        let mut ws = Workspace::on(local.clone(), Some("incredibuild:A"));
+        ws.path_map = Some(Arc::new((local.clone(), PathBuf::from("/srv/repo"))));
+        let derived = ws.at(local.join(".git").join(".ralphus").join("g"));
+        assert_eq!(derived.root_string(), "/srv/repo/.git/.ralphus/g");
+    }
+
+    #[test]
+    fn a_remote_workspace_treats_any_os_absolute_path_as_absolute() {
+        // `Path::is_absolute` follows the daemon's OS: on Windows `/srv/x` is
+        // relative and would be joined onto the workspace root.
+        let ws = Workspace::on("/srv/repo", Some("incredibuild:A"));
+        assert_eq!(
+            remote_path_string(&ws.resolve("/srv/repo/.git/hooks")),
+            "/srv/repo/.git/hooks"
+        );
+        assert_eq!(
+            remote_path_string(&ws.resolve(r"C:\work\hooks")),
+            "C:/work/hooks"
+        );
+        assert_eq!(
+            remote_path_string(&ws.resolve(".git/hooks")),
+            "/srv/repo/.git/hooks"
+        );
+    }
+
+    #[test]
+    fn absolute_paths_are_recognised_for_every_os() {
+        for absolute in ["/srv/x", r"\srv\x", r"C:\x", "c:/x", r"\\server\share"] {
+            assert!(is_absolute_anywhere(Path::new(absolute)), "{absolute}");
+        }
+        for relative in ["x", ".git/hooks", r"x\y", "C:x", ""] {
+            assert!(!is_absolute_anywhere(Path::new(relative)), "{relative}");
+        }
+    }
+
+    #[test]
     fn a_local_workspace_actually_runs_git() {
         // Proves the local path is a real passthrough, not a stub.
         let ws = Workspace::local(ralphus_test_support::scratch_root());
@@ -1073,12 +1326,210 @@ echo {json}
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    fn worktree_initialization_runs_on_a_remote_cells_machine() {
+        let dir = ralphus_test_support::scratch(format!("ral-d6-init-{}", std::process::id()));
+        let script = write_script(
+            &dir,
+            r#"{"ok":true,"protocol_version":1,"exit_code":0,"stdout":"installed"}"#,
+        );
+        let store = Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
+        store
+            .lock()
+            .register_machine_provider(
+                "ib",
+                "",
+                &script.to_string_lossy(),
+                &[],
+                crate::machines::PROTOCOL_VERSION,
+                false,
+            )
+            .unwrap();
+        let ws = Workspace::on("/srv/wt", Some("ib:A")).with_store(store);
+        let events = Arc::new(parking_lot::Mutex::new(0_usize));
+        let seen = Arc::clone(&events);
+        let spec = crate::worktree_init::InitSpec {
+            commands: vec!["npm ci".to_string()],
+            timeout: std::time::Duration::from_secs(60),
+            env: std::collections::BTreeMap::new(),
+            rerun_existing: true,
+            recorder: Arc::new(move |_| *seen.lock() += 1),
+        };
+        let outcome = crate::worktree_init::run_in(&ws, &spec).expect("init succeeds");
+        assert!(outcome.ok);
+        assert!(outcome.output.contains("installed"), "{outcome:?}");
+        assert_eq!(*events.lock(), 2, "started + finished");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_remote_branchs_emptiness_is_judged_on_its_machine() {
+        // The daemon has no such repository; only the machine can answer.
+        let dir = ralphus_test_support::scratch(format!("ral-b3-empty-{}", std::process::id()));
+        let script = write_script(
+            &dir,
+            r#"{"ok":true,"protocol_version":1,"exit_code":0,"stdout":"src/changed.rs"}"#,
+        );
+        let store = Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
+        store
+            .lock()
+            .register_machine_provider(
+                "ib",
+                "",
+                &script.to_string_lossy(),
+                &[],
+                crate::machines::PROTOCOL_VERSION,
+                false,
+            )
+            .unwrap();
+        let ws = Workspace::on("/srv/repo", Some("ib:A")).with_store(Arc::clone(&store));
+        assert_eq!(
+            crate::guardian_merge::branch_diff_is_empty(&store, &ws, "main", "feature"),
+            Ok(false)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_rebase_on_a_remote_machine_is_detected_there() {
+        // The state directory exists only on the machine; a local
+        // `Path::exists` would always say no rebase is running.
+        let dir = ralphus_test_support::scratch(format!("ral-b1-rebase-{}", std::process::id()));
+        let script = write_script(
+            &dir,
+            r#"{"ok":true,"protocol_version":1,"exit_code":0,"stdout":"/srv/repo/.git/worktrees/wt/rebase-merge"}"#,
+        );
+        let store = Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
+        store
+            .lock()
+            .register_machine_provider(
+                "ib",
+                "",
+                &script.to_string_lossy(),
+                &[],
+                crate::machines::PROTOCOL_VERSION,
+                false,
+            )
+            .unwrap();
+        let ws = Workspace::on("/srv/wt", Some("ib:A")).with_store(store);
+        assert!(crate::guardian_merge::rebase_in_progress(&ws));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_remote_reviews_forge_remote_is_resolved_on_its_machine() {
+        // PR routing reads remote names from the review's repository. For a
+        // remote review that is the machine's, whose git answers here with an
+        // upstream on a remote the daemon's own checkout does not have.
+        let dir = ralphus_test_support::scratch(format!("ral-a1-remote-{}", std::process::id()));
+        let script = write_script(
+            &dir,
+            r#"{"ok":true,"protocol_version":1,"exit_code":0,"stdout":"machine-remote/main"}"#,
+        );
+        let store = Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
+        store
+            .lock()
+            .register_machine_provider(
+                "ib",
+                "",
+                &script.to_string_lossy(),
+                &[],
+                crate::machines::PROTOCOL_VERSION,
+                false,
+            )
+            .unwrap();
+        let ws = Workspace::on("/srv/repo", Some("ib:A")).with_store(store);
+
+        let remote = crate::forge::resolve_parent_remote_name(
+            &ws,
+            "main",
+            &crate::config::ForgeConfig::default(),
+            None,
+            None,
+        );
+
+        assert_eq!(remote, "machine-remote");
+        assert_eq!(GitAt::local_path(&ws), Path::new("/srv/repo"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_review_on_a_machine_none_of_its_cells_used_is_provisioned_there() {
+        // With no contributing cell on the review's machine there is no
+        // workspace to discover the repository from; the review provisions
+        // the project itself instead of sending the daemon's own paths.
+        let dir = ralphus_test_support::scratch(format!("ral-a8-ws-{}", std::process::id()));
+        // One reply answers both verbs the fallback makes: `provision` reads
+        // `workspace`, the follow-up `git rev-parse --git-common-dir` reads
+        // `stdout`.
+        let script = write_script(
+            &dir,
+            r#"{"ok":true,"protocol_version":1,"workspace":"/m/root/wt","exit_code":0,"stdout":"/m/root/repo/.git"}"#,
+        );
+        let store = Arc::new(crate::store_lock::StoreMutex::new(
+            Store::open_in_memory().unwrap(),
+        ));
+        let local_root = dir.join("project");
+        let local_root_str = local_root.to_string_lossy().into_owned();
+        let id = {
+            let guard = store.lock();
+            guard
+                .register_machine_provider(
+                    "ib",
+                    "",
+                    &script.to_string_lossy(),
+                    &[],
+                    crate::machines::PROTOCOL_VERSION,
+                    false,
+                )
+                .unwrap();
+            // Not git, so no clone URL or machine target is required -- the
+            // fallback itself is what is under test.
+            guard
+                .register_project("p", "", &local_root_str, "svn")
+                .unwrap();
+            let id = guard.create_guardian("r", "main", &local_root_str).unwrap();
+            guard.set_guardian_machine(&id, Some("ib:A")).unwrap();
+            id
+        };
+
+        let ws = Workspace::for_guardian(&store, &id, local_root.join(".git").join(".ralphus"));
+
+        assert_eq!(ws.machine(), Some("ib:A"));
+        assert_eq!(ws.root_string(), "/m/root/repo/.git/.ralphus");
+        // A provider clone has its base branch checked out, which git refuses
+        // to fetch into; provisioning detaches it so the base can advance.
+        let requests = std::fs::read_to_string(dir.join("requests.log")).unwrap();
+        assert!(requests.contains("\"--detach\""), "{requests}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A fake provider that answers every verb with `json` and appends each
+    /// request payload it receives to `requests.log` beside it.
     fn write_script(dir: &Path, json: &str) -> PathBuf {
         std::fs::create_dir_all(dir).unwrap();
+        let log = dir.join("requests.log");
         let (script, body) = if cfg!(windows) {
-            (dir.join("p.cmd"), format!("@echo off\r\necho {json}\r\n"))
+            (
+                dir.join("p.cmd"),
+                format!(
+                    "@echo off\r\nmore >> \"{}\"\r\necho {json}\r\n",
+                    log.display()
+                ),
+            )
         } else {
-            (dir.join("p.sh"), format!("#!/bin/sh\necho '{json}'\n"))
+            (
+                dir.join("p.sh"),
+                format!("#!/bin/sh\ncat >> '{}'\necho '{json}'\n", log.display()),
+            )
         };
         std::fs::write(&script, body).unwrap();
         #[cfg(unix)]

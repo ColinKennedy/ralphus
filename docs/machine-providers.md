@@ -23,11 +23,13 @@ provider's business.
 > branching on scheme. Guardian
 > reviews now dispatch to a remote review's assigned machine too (RAL-185
 > Phase 3/RAL-201) — the merge worktree, stacked rebase, conflict-resolution
-> agent, chat/feedback/summary agent invocations, and manual preparation all route
-> through the review's machine. See `REMOTE.local.md` for the full phase
-> history and its "Known limitations" section for what still runs local-only
-> even on a remote review (build-config resolution, the empty-branch VCS
-> check, and a couple of local-fs reads around rebase-state detection).
+> agent, chat/feedback/summary agent invocations, PR submission and sync,
+> checks and actions (board-launched and auto-run), and manual preparation
+> all route through the review's machine. A remote review's project
+> `.ralphus.toml` is still resolved from the daemon's own copy of the project
+> rather than read from the machine. [Machine strict mode](#machine-strict-mode-development-only)
+> turns any remaining daemon-host fallback into a visible failure while
+> developing ralphus.
 
 > **Platform support:** Linux and Windows daemon hosts are fully supported.
 > macOS as a daemon host is **experimental** (RAL-398) — see "Platform
@@ -82,6 +84,45 @@ placeholder (`ralphus:new-worktree/<branch>`) and the entity URI
 (`ralphus:/SQUAD[...]`), so registering it as a third thing is rejected.
 
 Attempting to register a provider under either name is rejected.
+
+## Machine strict mode (development only)
+
+> **You probably do not want this on a production server.** Strict mode
+> exists for developing ralphus's remote support. It turns every place ralphus
+> still falls back to the daemon's own host into a failed step, so a gap
+> ralphus has not closed yet stops real work instead of degrading quietly.
+
+Work assigned to a remote machine should never run a `git` command, a shell
+command, or an agent on the daemon's host. When some code path still does,
+the work usually "succeeds" -- against the daemon's own checkout -- and
+nothing says so. Strict mode makes that visible:
+
+| | Work assigned to a remote machine runs something locally |
+|---|---|
+| **strict mode off** (default) | Allowed. Logged once per kind (`git`, `command`, `agent`) and machine as a WARNING, so the leak stays visible. |
+| **strict mode on** | Refused. The step fails with a message naming what it tried to run, where, and for which machine. |
+
+Work assigned to `local` (or to no machine) is never checked, and neither is
+work that legitimately belongs on the daemon: forge REST calls, its database,
+Cartographer, reading its own configuration, and invoking providers.
+
+Turn it on in the global `config.toml`:
+
+```toml
+[machine]
+strict = true
+```
+
+`RALPHUS_MACHINE_STRICT=1` (or `0`) overrides the config key, which is how
+tests and CI enable it. Both are read once, so a change needs a daemon
+restart. While it is on, the daemon logs a WARNING at startup saying so.
+
+How it decides: the thread doing a remote-assigned unit of work holds a
+**remote scope** naming the machine (`crate::machine_strict`), and the
+daemon's local `git`, command and agent entry points check it before running
+anything. A scope belongs to one thread, so work handed to another thread is
+not checked -- strict mode can miss a leak that way, but it never fails
+purely local work.
 
 ## Registering a provider
 

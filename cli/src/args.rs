@@ -9,6 +9,31 @@
 
 use crate::client::DaemonClient;
 
+/// A command-line value that must never be printed, such as a forge token.
+/// Its `Debug` says only that a value is present, so a parsed command can be
+/// logged whole without leaking it.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Secret(String);
+
+impl Secret {
+    #[must_use]
+    pub fn new(value: String) -> Self {
+        Self(value)
+    }
+
+    /// The secret itself, for sending to the daemon.
+    #[must_use]
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for Secret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("<redacted>")
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct GlobalOpts {
     pub daemon_url: String,

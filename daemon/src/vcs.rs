@@ -95,12 +95,13 @@ pub trait Vcs: Send + Sync {
     /// When the underlying tool fails or the revisions cannot be resolved.
     fn differs(&self, root: &Path, base: &str, head: &str) -> Result<bool, String>;
 
-    /// Pull `branch` from the shared remote into the checkout at `root`,
-    /// overwriting any local ref of that name.
+    /// Pull `branch`, as published from the machine that produced it
+    /// ([`published_cell_ref`]), from the shared remote into the checkout at
+    /// `root` as `refs/heads/<branch>`, overwriting any local ref of that name.
     ///
-    /// Used when a branch's work was produced on another machine and published
-    /// there (RAL-185 D2): the daemon never publishes, but fetching a branch
-    /// whose name and remote are both already known is fully deterministic.
+    /// Used when a branch's work was produced on another machine: ralphus
+    /// pushes the cell's commits there, and fetching a ref whose name and
+    /// remote are both already known is fully deterministic.
     ///
     /// # Errors
     /// When the branch cannot be retrieved — most often because it was never
@@ -187,6 +188,9 @@ impl GitVcs {
     /// reason `std::process::Command::output()` normally does this itself;
     /// this hand-rolls it only because `output()` has no timeout variant.
     fn exec_raw(root: &Path, args: &[&str]) -> Result<std::process::Output, String> {
+        crate::machine_strict::check_local("git", || {
+            format!("git {} in {}", args.join(" "), root.display())
+        })?;
         // A plain ref lookup is a file read; answer it without a process when
         // the answer is exact (see `crate::vcs_refs`).
         if let Some(output) = crate::vcs_refs::try_rev_parse(root, args) {
@@ -340,7 +344,7 @@ impl Vcs for GitVcs {
     fn fetch_branch(&self, root: &Path, remote: &str, branch: &str) -> Result<(), String> {
         // `+` forces the update, so a force-push on the producing machine is
         // honoured rather than rejected as a non-fast-forward.
-        let refspec = format!("+refs/heads/{branch}:refs/heads/{branch}");
+        let refspec = format!("+{}:refs/heads/{branch}", published_cell_ref(branch));
         let out = Self::exec_raw(root, &["fetch", "--no-write-fetch-head", remote, &refspec])?;
         if out.status.success() {
             return Ok(());
@@ -490,6 +494,14 @@ impl GitOps for GitVcs {
             ))
         }
     }
+}
+
+/// The ref a remote cell's branch is published to on the shared git remote
+/// when a review on another machine needs it. Outside `refs/heads/`, so it
+/// never shows up in the forge's branch list.
+#[must_use]
+pub fn published_cell_ref(branch: &str) -> String {
+    format!("refs/ralphus/cells/{branch}")
 }
 
 /// The adapter for a registered project's `vcs` kind, or `None` when no adapter

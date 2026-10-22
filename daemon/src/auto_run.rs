@@ -111,9 +111,8 @@ fn missing_inputs(g: &GuardianView, check: &GuardianCheck) -> Vec<String> {
 /// Which checks of `g` should start on their own right now. A check qualifies
 /// when its own `auto_run` -- falling back to the review's resolved default --
 /// is on, it is ready, runnable (a command, or a user action's agent prompt),
-/// local, and the review is not in a
-/// terminal state. Remote reviews are out of scope: a check bound for a review
-/// machine never auto-runs.
+/// and the review is not in a terminal state. A check bound for the review's
+/// machine runs there ([`crate::server::run_check_unattended`]).
 pub(crate) fn plan(g: &GuardianView) -> Plan {
     let mut out = Plan::default();
     if GuardianStatus::is_terminal_status(&g.status) {
@@ -123,9 +122,7 @@ pub(crate) fn plan(g: &GuardianView) -> Plan {
         for (index, check) in checks_of(g, kind).iter().enumerate() {
             let eligible = check.auto_run.unwrap_or(g.effective_auto_run)
                 && check.preparation_state.as_deref() == Some("ready")
-                && (check.command.is_some() || (kind == "action" && check.prompt.is_some()))
-                && check.run_on.as_deref() != Some("review_machine")
-                && !(check.run_on.is_none() && g.machine.is_some());
+                && (check.command.is_some() || (kind == "action" && check.prompt.is_some()));
             if !eligible {
                 continue;
             }
@@ -289,6 +286,7 @@ pub(crate) fn run_ready_checks(store: &StoreHandle, id: &str) {
 
 /// Run one claimed check to completion and report a failure.
 fn run_one(store: &StoreHandle, id: &str, g: &GuardianView, check: &GuardianCheck, at: CheckRef) {
+    let _remote_scope = crate::machine_strict::enter(g.machine.as_deref());
     let label = display_label(check, at);
     // A `prompt` action is agent-run: it goes onto the review's live-run
     // queue (followed in Live View) instead of opening a terminal.
@@ -551,13 +549,14 @@ mod tests {
     }
 
     #[test]
-    fn a_check_for_the_review_machine_never_auto_runs() {
+    fn a_check_for_the_review_machine_auto_runs_like_any_other() {
+        // It runs on that machine instead of in a daemon-side terminal.
         let mut remote = check("remote", Some(true), "ready");
         remote.run_on = Some("review_machine".to_string());
         let local = check("local", Some(true), "ready");
         assert_eq!(
             plan(&view(None, &[remote, local])).runnable,
-            vec![action(1)]
+            vec![action(0), action(1)]
         );
     }
 

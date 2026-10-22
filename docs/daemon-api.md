@@ -1430,7 +1430,7 @@ safe non-mutating check exists yet for either.
         { "name": "git_user.name", "status": "pass", "detail": "Ralphus Bot", "id": "remote-git-identity-name" },
         { "name": "git_user.email", "status": "warn", "detail": "no global git user.email is set for the remote account -- commits will fail until it is, unless every repository sets it per-repo instead", "id": "remote-git-identity-email" },
         { "name": "push_credentials", "status": "warn", "detail": "not verified -- no safe, non-mutating way to confirm push authorization exists yet", "id": "remote-push-credentials" },
-        { "name": "runner", "status": "warn", "detail": "not verified -- confirming 'ralphus-runner' resolves on the remote would require the SSH provider's run verb to accept an arbitrary program, which is deliberately scoped to git only", "id": "remote-runner" }
+        { "name": "runner", "status": "pass", "detail": "ralphus-runner 0.1.0", "id": "remote-runner" }
       ]
     }
   ]

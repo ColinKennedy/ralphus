@@ -200,7 +200,14 @@ pub fn current_revision(cwd: &str) -> Option<String> {
     if cwd.is_empty() {
         return None;
     }
-    let sha = crate::guardian_merge::git(Path::new(cwd), &["rev-parse", "HEAD"]).ok()?;
+    current_revision_in(Path::new(cwd))
+}
+
+/// [`current_revision`] wherever `at` is -- a remote cell's or review's
+/// [`crate::workspace::Workspace`] answers on its machine.
+#[must_use]
+pub fn current_revision_in(at: &(impl crate::workspace::GitAt + ?Sized)) -> Option<String> {
+    let sha = at.git_at(&["rev-parse", "HEAD"]).ok()?;
     let sha = sha.trim();
     if sha.is_empty() {
         None
