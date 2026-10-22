@@ -8411,16 +8411,18 @@ fn log_dual_root_no_fork(
 /// first submission creates it), and a dual-root review with no fork in use
 /// is silently skipped -- that no-op is logged at submission time instead of
 /// spamming every poll cycle.
+///
+/// Returns the parent base tip it mirrored, when it did.
 pub(crate) fn refresh_dual_root_upstream_branch(
     store: &crate::store_lock::StoreHandle,
     guardian_id: &str,
     git_root: &str,
     owner: Option<&str>,
     base_branch: &str,
-) {
+) -> Option<String> {
     let branch = match store.lock().guardian_dual_root_stack_branch(guardian_id) {
         Ok(Some(branch)) => branch,
-        Ok(None) | Err(_) => return,
+        Ok(None) | Err(_) => return None,
     };
     let root = PathBuf::from(git_root);
     let forge_cfg = crate::config::resolve_forge(&root);
@@ -8428,22 +8430,17 @@ pub(crate) fn refresh_dual_root_upstream_branch(
     // git root, then the owner's row (falling back to the project-wide
     // default) -- but without any forge REST client: refreshing the branch
     // is pure git.
-    let Some(project_name) = store.lock().project_name_for_path(git_root) else {
-        return;
-    };
+    let project_name = store.lock().project_name_for_path(git_root)?;
     let user = owner.unwrap_or("");
     // The owner's own row, else the project-wide default row (`user=""`) --
     // the same order `resolve_pr_repo_routing` and `resolve_feedback_fork_remote`
     // use. Without the fallback a review whose owner has no personal fork row
     // (but whose project has a default one, which is what filed its PRs on the
     // fork) never had its transient upstream branch refreshed.
-    let Some(fork) = Some(user)
+    let fork = Some(user)
         .filter(|u| !u.is_empty())
         .and_then(|u| store.lock().resolve_fork(&project_name, u).ok().flatten())
-        .or_else(|| store.lock().resolve_fork(&project_name, "").ok().flatten())
-    else {
-        return;
-    };
+        .or_else(|| store.lock().resolve_fork(&project_name, "").ok().flatten())?;
     if let Err(e) = prepare_fork_worktree(store, &root, &fork, user) {
         // ralphus[ignore-rlog-pair]: poll-time fork wiring diagnostic; a successful refresh logs its structured outcome
         crate::rlog!(
@@ -8451,7 +8448,7 @@ pub(crate) fn refresh_dual_root_upstream_branch(
             "ralphus [pr] review {guardian_id} could not wire the fork remote for its dual-root \
              upstream refresh: {e}"
         );
-        return;
+        return None;
     }
     let clone_url = project_clone_url(store, Some(project_name.as_str()));
     let parent_remote_name = crate::forge::resolve_parent_remote_name(
@@ -8470,6 +8467,7 @@ pub(crate) fn refresh_dual_root_upstream_branch(
         &branch,
     ) {
         Ok(Some(sha)) => {
+            let synced = sha.clone();
             crate::rlog!(
                 INFO,
                 "ralphus [pr] review {guardian_id} force-pushed {parent_remote_name}/{} to fork \
@@ -8526,8 +8524,9 @@ pub(crate) fn refresh_dual_root_upstream_branch(
                     );
                 }
             }
+            Some(synced)
         }
-        Ok(None) => {}
+        Ok(None) => None,
         Err(e) => {
             // ralphus[ignore-rlog-pair]: poll-time refresh diagnostic; the next cycle retries
             crate::rlog!(
@@ -8535,6 +8534,7 @@ pub(crate) fn refresh_dual_root_upstream_branch(
                 "ralphus [pr] review {guardian_id} could not refresh its transient fork upstream \
                  branch {branch}: {e}"
             );
+            None
         }
     }
 }

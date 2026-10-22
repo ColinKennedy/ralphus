@@ -395,6 +395,8 @@
        * @property {number} action_idx - The live action's `idx` (kind "live") or the user action's index (kind "action").
        * @property {string} label
        * @property {"auto"|"manual"} trigger
+       * @property {"after"|"review-upstream"} [role] - "review-upstream" runs capture the PR's before-state against the base and never commit.
+       * @property {string|null} [upstream_sha]
        * @property {"queued"|"running"|"finished"|"failed"|"cancelled"|"over_budget"|"interrupted"} state
        * @property {string} cwd
        * @property {string} base_tip
@@ -443,6 +445,19 @@
        * @property {string|null} missing_reason - Why nothing was delivered (or why an upload failed).
        * @property {boolean} has_file - Whether a captured file is kept on the daemon (previewable).
        * @property {number|null} updated_at_ms
+       * @property {ReviewUpstreamSide|null} [review_upstream] - The `review-upstream` side; null until a PR marker asks for it.
+       */
+      /**
+       * A slot's `review-upstream` side: the same slot captured against the
+       * review's fetched base instead of its tip.
+       * @typedef {object} ReviewUpstreamSide
+       * @property {"pending"|"captured"|"absent"|"not_runnable"|"failed"|"skipped_budget"|"stale"} state
+       * @property {string} upstream_sha - The base commit it was captured (or is due) against.
+       * @property {string|null} url
+       * @property {string|null} caption
+       * @property {string|null} text
+       * @property {string|null} missing_reason
+       * @property {boolean} has_file
        */
       /**
        * `GET /api/guardians/{id}/exhibits`.

@@ -228,3 +228,8 @@ tag = "live-ref-retirement-remote"
 [[test]]
 id = "ralphus-outpost::loopback an_allocation_needing_an_agent_the_machine_lacks_is_refused_up_front_with_the_fix"
 tag = "outpost-readiness"
+
+# The detached checkout a `review-upstream` live run executes in (RAL-710).
+[[test]]
+id = "ralphus-daemon guardian_merge::tests::the_review_upstream_checkout_is_a_detached_sibling_at_the_given_commit"
+tag = "review-upstream-checkout"

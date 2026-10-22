@@ -976,6 +976,23 @@ pub struct LiveRunRequest<'a> {
     /// The exhibit slots of the live action being run, which this run (and
     /// only this run) fills. Empty for user actions.
     pub exhibit_slots: Vec<crate::exhibits::ExhibitSlot>,
+    /// Set for a `review-upstream` run: the fetched base commit it is checked
+    /// out at. Such a run is read-only, fills only the `review-upstream` side
+    /// of its slots, and never produces commits.
+    pub upstream_sha: Option<&'a str>,
+}
+
+/// The preamble a `review-upstream` run's prompt and system prompt open with.
+pub fn upstream_preamble(sha: &str) -> String {
+    format!(
+        "This is the before state: this checkout is the review's upstream base (commit {sha}), \
+         without the review's changes. Run the same steps as written; the feature under review \
+         may not exist here yet. For each exhibit slot, report what you can capture. If the \
+         feature or screen does not exist at this commit, report the slot as missing with a \
+         reason that begins `absent:`. If it exists but this checkout cannot be built or run, \
+         report it as missing with a reason that begins `not runnable:` and name the failing \
+         step. Do not edit, stage or commit anything."
+    )
 }
 
 /// How a live run ended.
@@ -1161,14 +1178,22 @@ pub fn execute_live_run(
     // the agent profile's, which carries the agent's own credentials.
     let mut env = req.guardian.manual_checks_env.clone();
     env.extend(resolved.env.clone());
-    let system_prompt = if req.allow_commits {
-        LIVE_ACTION_COMMIT_SYSTEM_PROMPT
+    let system_prompt = if let Some(sha) = req.upstream_sha {
+        format!(
+            "{}\n\n{LIVE_ACTION_READ_ONLY_SYSTEM_PROMPT}",
+            upstream_preamble(sha)
+        )
+    } else if req.allow_commits {
+        LIVE_ACTION_COMMIT_SYSTEM_PROMPT.to_string()
     } else {
-        LIVE_ACTION_READ_ONLY_SYSTEM_PROMPT
+        LIVE_ACTION_READ_ONLY_SYSTEM_PROMPT.to_string()
     };
     let exhibit_settings = crate::exhibit_settings::resolve(store, req.guardian);
     let exhibits = ExhibitRun::start(req, &exhibit_settings, ws.machine());
     let mut prompt = format!("Live action: {}\n\n{}", req.label, req.prompt);
+    if let Some(sha) = req.upstream_sha {
+        prompt = format!("{}\n\n{prompt}", upstream_preamble(sha));
+    }
     if exhibits.active {
         if let Some(dir) = exhibits.local_dir() {
             env.insert(
@@ -1194,7 +1219,7 @@ pub fn execute_live_run(
         agent: resolved.backend.clone(),
         executable: resolved.executable.clone(),
         model: resolved.model.clone(),
-        system_prompt: Some(system_prompt.to_string()),
+        system_prompt: Some(system_prompt),
         system_prompt_position: None,
         timeout_sec: None,
         budget_tokens: None,
@@ -1302,7 +1327,7 @@ pub fn execute_live_run(
         done.cost_usd += exhibits.finish(store, runner, cancel, &spec, &result, &exhibit_settings);
     }
 
-    if let Some(base) = base_tip.as_deref() {
+    if let Some(base) = base_tip.as_deref().filter(|_| req.upstream_sha.is_none()) {
         if req.allow_commits && done.end != LiveRunEnd::Cancelled {
             commit_leftover_edits(&ws, req.label);
         }
@@ -1365,6 +1390,8 @@ struct ExhibitRun<'a> {
     /// Whether the run captures exhibits at all (it has slots and exhibits
     /// are on).
     active: bool,
+    /// The base commit of a `review-upstream` run.
+    upstream_sha: Option<&'a str>,
 }
 
 impl<'a> ExhibitRun<'a> {
@@ -1381,6 +1408,7 @@ impl<'a> ExhibitRun<'a> {
             guardian: req.guardian,
             machine: machine.map(str::to_string),
             active: !req.exhibit_slots.is_empty() && settings.enabled,
+            upstream_sha: req.upstream_sha,
         }
     }
 
@@ -1500,15 +1528,28 @@ impl<'a> ExhibitRun<'a> {
                 upload_destination(store, self.guardian),
             )
         };
-        let summary = crate::exhibit_delivery::record_run(
-            store,
-            self.guardian_id,
-            self.run_id,
-            self.slots,
-            &reports,
-            &outcomes,
-            &undelivered,
-        );
+        let summary = if let Some(sha) = self.upstream_sha {
+            crate::exhibit_delivery::record_upstream_run(
+                store,
+                self.guardian_id,
+                self.run_id,
+                sha,
+                self.slots,
+                &reports,
+                &outcomes,
+                &undelivered,
+            )
+        } else {
+            crate::exhibit_delivery::record_run(
+                store,
+                self.guardian_id,
+                self.run_id,
+                self.slots,
+                &reports,
+                &outcomes,
+                &undelivered,
+            )
+        };
         let kept: Vec<_> = outcomes
             .iter()
             .filter_map(|o| {
@@ -1795,6 +1836,7 @@ mod tests {
             cwd,
             allow_commits,
             exhibit_slots: Vec::new(),
+            upstream_sha: None,
         }
     }
 

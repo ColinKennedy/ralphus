@@ -12800,29 +12800,25 @@ fn notify_manual_preparation_outcome(
     }
 }
 
-/// The worker's body: check out a scratch worktree at the combined review
-/// branch's tip and run the requested jobs there concurrently.
-#[allow(clippy::too_many_arguments)]
-fn post_merge_jobs_inner(
+/// The daemon-side project root of a review's combined worktree
+/// (`<proj>/.git/.ralphus/g/<short>/review`).
+///
+/// Sanity: it must be a project this review actually covers (or its git root)
+/// -- otherwise the path layout assumption broke. On a remote review the
+/// combined worktree lives in the project's repository on the machine, so a
+/// candidate also matches through its machine mapping; the daemon-local root is
+/// what the rest of the merge code keys on either way.
+fn combined_project_root(
     store: &crate::store_lock::StoreHandle,
-    runner: &dyn Runner,
     id: &str,
     guardian: &crate::guardian::GuardianView,
     combined_str: &str,
-    jobs: PostMergeJobs,
-    trigger: RebuildTrigger,
-    cancel: &CancelToken,
-    prepared_checkout: &mut Option<String>,
-) -> std::result::Result<Option<String>, String> {
-    let combined_path = PathBuf::from(combined_str);
-    // Project root of the combined worktree: `<proj>/.git/.ralphus/g/<short>/review`.
-    // Sanity: it must be a project this review actually covers (or its git
-    // root) -- otherwise the path layout assumption broke. On a remote review
-    // the combined worktree lives in the project's repository on the machine,
-    // so a candidate also matches through its machine mapping; the daemon-local
-    // root is what the rest of this function keys on either way.
-    let layout_root = combined_path.ancestors().nth(5).map(Path::to_path_buf);
-    let proj = layout_root
+) -> std::result::Result<PathBuf, String> {
+    let layout_root = Path::new(combined_str)
+        .ancestors()
+        .nth(5)
+        .map(Path::to_path_buf);
+    layout_root
         .and_then(|root| {
             guardian
                 .branches
@@ -12841,7 +12837,25 @@ fn post_merge_jobs_inner(
         })
         .ok_or_else(|| {
             format!("could not derive the project root from combined worktree path {combined_str}")
-        })?;
+        })
+}
+
+/// The worker's body: check out a scratch worktree at the combined review
+/// branch's tip and run the requested jobs there concurrently.
+#[allow(clippy::too_many_arguments)]
+fn post_merge_jobs_inner(
+    store: &crate::store_lock::StoreHandle,
+    runner: &dyn Runner,
+    id: &str,
+    guardian: &crate::guardian::GuardianView,
+    combined_str: &str,
+    jobs: PostMergeJobs,
+    trigger: RebuildTrigger,
+    cancel: &CancelToken,
+    prepared_checkout: &mut Option<String>,
+) -> std::result::Result<Option<String>, String> {
+    let combined_path = PathBuf::from(combined_str);
+    let proj = combined_project_root(store, id, guardian, combined_str)?;
     let ws_root = Workspace::for_guardian(store, id, &proj);
     let combined_ws = ws_root.at(&combined_path);
 
@@ -13120,45 +13134,77 @@ fn final_checks_inner(
     // whenever `.ralphus.toml` already declares one, so `preparation` being
     // non-empty does not by itself mean a review actually opted into it --
     // only the absence of explicit checks does.
-    let mut notes = Vec::new();
-    if checks.is_empty() {
-        for def in &preparation {
-            if cancel.is_cancelled() {
-                return Err("preparation cancelled because the review changed".to_string());
-            }
-            notes.push(run_review_auto_build(
-                store,
-                runner,
-                id,
-                root,
-                combined_str,
-                &env,
-                def,
-                cancel,
-            )?);
-        }
-        // With no explicit preparation either, use the project's default
-        // preparation command. Resolve it before launching the subprocess so
-        // the global store lock is never held for the duration of a build.
-        if preparation.is_empty() {
-            let auto_build_cmd = store.lock().resolve_review_config(root.root()).auto_build;
-            if let Some(cmd) = auto_build_cmd {
-                if !root
-                    .at(combined_str)
-                    .run_command_with_env(&cmd, &env, cancel)
-                    .0
-                {
-                    return Err(format!("preparation failed: {cmd}"));
-                }
-                notes.push(format!("prepared via project default: {cmd}"));
-            }
-        }
-    }
+    let notes = if checks.is_empty() {
+        run_review_preparation(
+            store,
+            runner,
+            id,
+            root,
+            combined_str,
+            &env,
+            &preparation,
+            cancel,
+            true,
+        )?
+    } else {
+        Vec::new()
+    };
     prepare_action_hints(store, runner, id, root, combined_str, &env, cancel)?;
     if prepare_generated {
         prepare_generated_manual_checks(store, runner, id, root, combined_str, &env, cancel)?;
     }
     Ok((!notes.is_empty()).then(|| notes.join("; ")))
+}
+
+/// Run the review-level preparation in `combined_str`: each declared step, or
+/// the project's default command when the review declares none. `notify` is
+/// false for a `review-upstream` checkout, whose failures are not the review's.
+#[allow(clippy::too_many_arguments)]
+fn run_review_preparation(
+    store: &crate::store_lock::StoreHandle,
+    runner: &dyn Runner,
+    id: &str,
+    root: &Workspace,
+    combined_str: &str,
+    env: &std::collections::BTreeMap<String, String>,
+    preparation: &[crate::guardian::GuardianAutoBuild],
+    cancel: &CancelToken,
+    notify: bool,
+) -> std::result::Result<Vec<String>, String> {
+    let mut notes = Vec::new();
+    for def in preparation {
+        if cancel.is_cancelled() {
+            return Err("preparation cancelled because the review changed".to_string());
+        }
+        notes.push(run_review_auto_build_notifying(
+            store,
+            runner,
+            id,
+            root,
+            combined_str,
+            env,
+            def,
+            cancel,
+            notify,
+        )?);
+    }
+    // With no explicit preparation either, use the project's default
+    // preparation command. Resolve it before launching the subprocess so
+    // the global store lock is never held for the duration of a build.
+    if preparation.is_empty() {
+        let auto_build_cmd = store.lock().resolve_review_config(root.root()).auto_build;
+        if let Some(cmd) = auto_build_cmd {
+            if !root
+                .at(combined_str)
+                .run_command_with_env(&cmd, env, cancel)
+                .0
+            {
+                return Err(format!("preparation failed: {cmd}"));
+            }
+            notes.push(format!("prepared via project default: {cmd}"));
+        }
+    }
+    Ok(notes)
 }
 
 /// Remediation attached to every auto_build failure mailbox notice (RAL-502).
@@ -13231,6 +13277,34 @@ fn run_review_auto_build(
     def: &crate::guardian::GuardianAutoBuild,
     cancel: &CancelToken,
 ) -> std::result::Result<String, String> {
+    run_review_auto_build_notifying(
+        store,
+        runner,
+        id,
+        root,
+        combined_str,
+        env,
+        def,
+        cancel,
+        true,
+    )
+}
+
+/// [`run_review_auto_build`] with the review-notice side effect optional: the
+/// notices say the review "has still moved to In Review", which is only true of
+/// the review's own preparation, not of a `review-upstream` checkout's.
+#[allow(clippy::too_many_arguments)]
+fn run_review_auto_build_notifying(
+    store: &crate::store_lock::StoreHandle,
+    runner: &dyn Runner,
+    id: &str,
+    root: &Workspace,
+    combined_str: &str,
+    env: &std::collections::BTreeMap<String, String>,
+    def: &crate::guardian::GuardianAutoBuild,
+    cancel: &CancelToken,
+    notify: bool,
+) -> std::result::Result<String, String> {
     let mut preparation_env = env.clone();
     for (key, value) in &def.environment {
         preparation_env.insert(key.clone(), expand_worktree_text(value)?);
@@ -13269,7 +13343,7 @@ fn run_review_auto_build(
                     payload: serde_json::json!({"command": cmd}),
                     admin_only: false,
                 });
-            if !ok {
+            if !ok && notify {
                 let _ = store.lock().enqueue_guardian_notice(
                     id,
                     &format!(
@@ -13313,14 +13387,16 @@ fn run_review_auto_build(
     ) {
         Ok(r) => r,
         Err(message) => {
-            let _ = store.lock().enqueue_guardian_notice(
-                id,
-                &format!(
-                    "This review's declared auto_build agent could not be resolved: {message}. \
-                     The review has still moved to In Review."
-                ),
-                Some(&auto_build_remediation()),
-            );
+            if notify {
+                let _ = store.lock().enqueue_guardian_notice(
+                    id,
+                    &format!(
+                        "This review's declared auto_build agent could not be resolved: \
+                         {message}. The review has still moved to In Review."
+                    ),
+                    Some(&auto_build_remediation()),
+                );
+            }
             return Err(format!(
                 "preparation agent could not be resolved: {message}"
             ));
@@ -13400,7 +13476,7 @@ fn run_review_auto_build(
             payload: serde_json::json!({"summary": result.summary}),
             admin_only: false,
         });
-    if !ok {
+    if !ok && notify {
         let _ = store.lock().enqueue_guardian_notice(
             id,
             &format!(
@@ -13466,13 +13542,145 @@ fn claim_post_merge_checkout_with(
     tip: &str,
     is_held: &dyn Fn(&Path) -> bool,
 ) -> std::result::Result<PathBuf, String> {
+    claim_named_checkout(
+        POST_MERGE_WORKTREE_DIR,
+        ws_root,
+        combined_ws,
+        parent,
+        tip,
+        is_held,
+    )
+}
+
+/// Directory name of the detached checkout a `review-upstream` live run
+/// executes in, a sibling of the review's prepared checkout.
+const UPSTREAM_WORKTREE_DIR: &str = "review-upstream";
+
+/// Why a `review-upstream` checkout could not be made ready.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum UpstreamPrepError {
+    /// The base could not be fetched, resolved or checked out.
+    Setup(String),
+    /// The checkout exists but the review's preparation failed in it; the text
+    /// names the failing step.
+    NotRunnable(String),
+}
+
+/// The commit a `review-upstream` run should check out: the review's base
+/// branch on its remote, freshly fetched. For a fork review with
+/// `dual_root_pr` it is the parent repo's base branch, fetched through
+/// `sync_review_upstream_branch`.
+pub(crate) fn resolve_upstream_base(
+    store: &crate::store_lock::StoreHandle,
+    guardian: &crate::guardian::GuardianView,
+) -> std::result::Result<String, String> {
+    let id = guardian.id.as_str();
+    let combined_str = guardian
+        .combined_worktree
+        .as_deref()
+        .ok_or_else(|| "the review has no combined worktree yet".to_string())?;
+    let proj = combined_project_root(store, id, guardian, combined_str)?;
+    let ws_root = Workspace::for_guardian(store, id, &proj);
+    let target = BaseFetchTarget {
+        root: proj,
+        machine: guardian.machine.clone(),
+        base_branch: guardian.base_branch.clone(),
+    };
+    fetch_base_branch(store, &target, Some(id))
+        .map_err(|e| format!("could not fetch {}: {e}", guardian.base_branch))?;
+    if guardian.effective_dual_root_pr {
+        if let Some(sha) = crate::pr::refresh_dual_root_upstream_branch(
+            store,
+            id,
+            &guardian.git_root,
+            guardian.owner.as_deref(),
+            &guardian.base_branch,
+        ) {
+            return Ok(sha);
+        }
+    }
+    resolve_base(&ws_root.at(combined_str), &guardian.base_branch)
+}
+
+/// Check out `sha` detached in the review's `review-upstream` directory and run
+/// the review-level preparation there, returning the checkout's directory.
+/// Manual-check discovery and per-action preparation are skipped: only the
+/// build a live run needs. A directory a running live run holds is never reset.
+pub(crate) fn prepare_upstream_checkout(
+    store: &crate::store_lock::StoreHandle,
+    runner: &dyn Runner,
+    guardian: &crate::guardian::GuardianView,
+    sha: &str,
+    cancel: &CancelToken,
+) -> std::result::Result<String, UpstreamPrepError> {
+    let id = guardian.id.as_str();
+    let combined_str = guardian.combined_worktree.as_deref().ok_or_else(|| {
+        UpstreamPrepError::Setup("the review has no combined worktree yet".into())
+    })?;
+    let proj = combined_project_root(store, id, guardian, combined_str)
+        .map_err(UpstreamPrepError::Setup)?;
+    let ws_root = Workspace::for_guardian(store, id, &proj);
+    let combined_ws = ws_root.at(combined_str);
+    let parent = Path::new(combined_str)
+        .parent()
+        .ok_or_else(|| UpstreamPrepError::Setup("combined worktree path has no parent".into()))?;
+    let dir = claim_named_checkout(
+        UPSTREAM_WORKTREE_DIR,
+        &ws_root,
+        &combined_ws,
+        parent,
+        sha,
+        &|dir| crate::checkout_hold::is_held(&dir.to_string_lossy()),
+    )
+    .map_err(UpstreamPrepError::Setup)?;
+    let dir_str = dir.to_string_lossy().to_string();
+    let (preparation, checks, env) = {
+        let guard = store.lock();
+        (
+            guard.guardian_preparation(id).unwrap_or_default(),
+            guard.guardian_checks(id).unwrap_or_default(),
+            guard
+                .get_guardian(id)
+                .map(|g| g.build_env)
+                .unwrap_or_default(),
+        )
+    };
+    if checks.is_empty() {
+        run_review_preparation(
+            store,
+            runner,
+            id,
+            &ws_root.at(&proj),
+            &dir_str,
+            &env,
+            &preparation,
+            cancel,
+            false,
+        )
+        .map_err(UpstreamPrepError::NotRunnable)?;
+    }
+    Ok(dir_str)
+}
+
+/// Produce a detached checkout of `sha` named `<dir_name>[-N]` under `parent`,
+/// by the same claim rules as [`claim_post_merge_checkout`]: a directory a
+/// running action or live run still holds is skipped, a leftover one is reset
+/// in place, and an unusable one is replaced by the next sibling.
+fn claim_named_checkout(
+    dir_name: &str,
+    ws_root: &Workspace,
+    combined_ws: &Workspace,
+    parent: &Path,
+    tip: &str,
+    is_held: &dyn Fn(&Path) -> bool,
+) -> std::result::Result<PathBuf, String> {
     let mut last_error = String::new();
     let mut held = Vec::new();
     for attempt in 0..POST_MERGE_CHECKOUT_ATTEMPTS {
         let dir = if attempt == 0 {
-            parent.join(POST_MERGE_WORKTREE_DIR)
+            parent.join(dir_name)
         } else {
-            parent.join(format!("{POST_MERGE_WORKTREE_DIR}-{attempt}"))
+            parent.join(format!("{dir_name}-{attempt}"))
         };
         let ws = ws_root.at(&dir);
         // The directory as its machine names it: what git is told and what the
@@ -25327,6 +25535,55 @@ mod tests {
         let second = claim_post_merge_checkout(&root, &root, &parent, &tip).unwrap();
         assert_eq!(second, first, "an intact checkout is reused, not replaced");
         assert!(is_valid_linked_worktree(&Workspace::local(&second)));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn the_review_upstream_checkout_is_a_detached_sibling_at_the_given_commit() {
+        let (base, repo, _fwt) = make_repo("claim-upstream");
+        let root = Workspace::local(&repo);
+        let parent = base.join("pm-parent");
+        std::fs::create_dir_all(&parent).unwrap();
+        let before = head_of(&repo);
+        std::fs::write(repo.join("later.txt"), "x").unwrap();
+        root.git(&["add", "."]).unwrap();
+        root.git(&[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@example.com",
+            "commit",
+            "-q",
+            "-m",
+            "later",
+        ])
+        .unwrap();
+        let tip = head_of(&repo);
+        let post_merge = claim_post_merge_checkout(&root, &root, &parent, &tip).unwrap();
+        let branches_before = root
+            .git(&["for-each-ref", "--format=%(refname)", "refs/heads"])
+            .unwrap();
+
+        let dir = claim_named_checkout(
+            UPSTREAM_WORKTREE_DIR,
+            &root,
+            &root,
+            &parent,
+            &before,
+            &|_| false,
+        )
+        .unwrap();
+        assert_eq!(dir, parent.join(UPSTREAM_WORKTREE_DIR));
+        assert_ne!(dir, post_merge);
+        assert_eq!(head_of(&dir), before);
+        assert_eq!(head_of(&post_merge), tip, "the other checkout is untouched");
+        assert_eq!(head_of(&repo), tip, "the review's own branch does not move");
+        assert_eq!(
+            root.git(&["for-each-ref", "--format=%(refname)", "refs/heads"])
+                .unwrap(),
+            branches_before,
+            "no branch was created or removed for it"
+        );
         let _ = std::fs::remove_dir_all(&base);
     }
 

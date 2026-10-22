@@ -14052,6 +14052,15 @@ fn guardian_exhibits(daemon: &Daemon, id: &str) -> Reply {
                 "missing_reason": s.fill.as_ref().and_then(|f| f.missing_reason.clone()),
                 "has_file": s.fill.as_ref().is_some_and(|f| f.local_path.is_some()),
                 "updated_at_ms": s.fill.as_ref().map(|f| f.updated_at_ms),
+                "review_upstream": s.upstream.as_ref().map(|u| serde_json::json!({
+                    "state": u.state,
+                    "upstream_sha": u.upstream_sha,
+                    "url": u.fill.url,
+                    "caption": u.fill.caption,
+                    "text": u.fill.text,
+                    "missing_reason": u.fill.missing_reason,
+                    "has_file": u.fill.local_path.is_some(),
+                })),
             })
         })
         .collect();

@@ -314,7 +314,10 @@
         };
         const [cls, label, tip] = look[r.state] || ["idle", r.state, "This run's state."];
         const when = r.trigger === "auto" ? "\nStarted automatically, once every cell had finished and the build was prepared." : "";
-        return `<span class="cmd-status ${cls}" data-tip="${esc(tip + when)}">${esc(label)}</span>`;
+        const upstream = r.role === "review-upstream"
+          ? `<span class="cmd-label" data-tip="Captures the PR's before-state at the review's base. It never commits or changes the review's branches.">review-upstream</span>`
+          : "";
+        return `${upstream}<span class="cmd-status ${cls}" data-tip="${esc(tip + when)}">${esc(label)}</span>`;
       }
       /**
        * Whether a live run's commits made it onto the review's top branch, as a
@@ -650,6 +653,30 @@
             }));
       }
       /**
+       * A slot's `review-upstream` side as a status chip, with a quiet caption
+       * when the base has moved since the capture. Absent is neutral: the
+       * feature not existing at the base is an answer, not a failure.
+       * @param {ReviewUpstreamSide} u - The slot's review-upstream side.
+       * @returns {string}
+       */
+      function exhibitUpstreamHtml(u) {
+        const why = u.missing_reason ? `\n${u.missing_reason}` : "";
+        /** @type {Record<ReviewUpstreamSide["state"], [string, string, string]>} */
+        const look = {
+          pending: ["running", "pending", "Waiting for the run against the review's base; it starts after the review's own runs are carried over."],
+          captured: ["passed", "captured", "Captured against the review's base, shown in the PR description's review-upstream marker."],
+          absent: ["idle", "absent at base", "The feature does not exist at the review's base, so there is nothing to show. This is expected, not a failure."],
+          not_runnable: ["failed", "not runnable at review-upstream", "The review's base could not be prepared or run."],
+          failed: ["failed", "failed", "The run against the review's base failed."],
+          skipped_budget: ["idle", "skipped (budget)", "The review's budget was spent before this run, so it was skipped."],
+          stale: ["running", "captured", "Captured against an earlier base; a re-run against the moved base is queued."],
+        };
+        const [cls, label, tip] = look[u.state] || ["idle", u.state, "The review-upstream side."];
+        const caption = u.state === "stale" ? ` <span class="hint" data-tip="The review's base moved after this was captured.">(base moved)</span>` : "";
+        return `<span class="cmd-label" data-tip="The same exhibit captured at the review's base, for before/after comparison.">review-upstream</span>
+          <span class="cmd-status ${cls}" data-tip="${esc(tip + why)}">${esc(label)}</span>${caption}`;
+      }
+      /**
        * One live action's exhibit slots, for its expanded details.
        * @param {string} gid - The review id.
        * @param {number} actionIdx - The live action's idx.
@@ -700,7 +727,7 @@
               <span class="cmd-label" data-tip="${esc(`Kind of exhibit: what was asked for${s.delivered_kind && s.delivered_kind !== s.kind ? ", then what was delivered" : ""}.`)}">${esc(kind)}</span>
               <span class="cmd-text" data-tip="${esc(`${describe}\n\nWho asked: ${asked}.${s.caption ? `\nCaption: ${s.caption}` : ""}`)}">${esc(describe)}</span>
               ${state}${previewBtn}
-            </div>${fallbacks}${s.text && delivered ? `<div class="run-out" data-tip="The captured output, as the PR shows it.">${esc(s.text)}</div>` : ""}${media}`;
+            </div>${fallbacks}${s.review_upstream ? `<div class="exhibit-row exhibit-fallback">${exhibitUpstreamHtml(s.review_upstream)}</div>` : ""}${s.text && delivered ? `<div class="run-out" data-tip="The captured output, as the PR shows it.">${esc(s.text)}</div>` : ""}${media}`;
         }).join("");
         return `<div class="exhibits" data-tip="What a reviewer should see in this action's PR descriptions: pictures, recordings or output its runs capture.">${rows}</div>`;
       }
