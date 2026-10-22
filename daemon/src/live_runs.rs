@@ -682,11 +682,20 @@ pub fn generate_and_queue_all(
 /// handoffs when it has none yet. The set is written once and then fixed.
 /// Give the review's waiting exhibit requests their slots; best-effort.
 fn assign_pending(store: &crate::store_lock::StoreHandle, guardian_id: &str) {
-    if let Err(e) = store.lock().assign_pending_exhibits(guardian_id) {
+    let assigned = store.lock().assign_pending_exhibits(guardian_id);
+    if let Err(e) = assigned {
         crate::rlog!(
             WARNING,
             "ralphus [guardian] review {guardian_id} could not assign pending exhibit requests: {e}"
         );
+        crate::cartographer::Note::new("guardian")
+            .guardian(guardian_id)
+            .scope("exhibit")
+            .emit(
+                &store.lock(),
+                "pending exhibit requests not assigned",
+                serde_json::json!({ "error": e.to_string() }),
+            );
     }
 }
 

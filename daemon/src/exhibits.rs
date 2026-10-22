@@ -1130,6 +1130,7 @@ pub fn parse_inferred(reply: &str) -> Vec<InferredRequest> {
         if let Some(name) = raw.compare.as_deref().filter(|c| !c.trim().is_empty()) {
             request.compare = CompareTarget::parse(name);
             if request.compare.is_none() {
+                // ralphus[ignore-rlog-pair]: parse_inferred is a pure reply parser with no Store to record a Cartographer row against
                 crate::rlog!(
                     WARNING,
                     "ralphus [pr] exhibit request \"{}\" names unknown compare target \"{}\"; ignored",
