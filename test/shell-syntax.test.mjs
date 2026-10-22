@@ -74,3 +74,22 @@ test("anything but a clean parse is not usable", () => {
   assert.ok(!shellSyntaxUsable({ status: "unparsed", commands: [], spans: [] }));
   assert.ok(!shellSyntaxUsable({ status: "ok", commands: [], spans: [] }));
 });
+
+test("heredoc open state is rendered per row and ordinal", () => {
+  const text = "cat <<A\nx\nA\ncat <<B\ny\nB";
+  const p = {
+    status: "ok",
+    commands: [
+      { text: "cat <<A\nx\nA", start: 0, end: 11, sep: "" },
+      { text: "cat <<B\ny\nB", start: 12, end: 23, sep: ";" },
+    ],
+    spans: [
+      { kind: "heredoc", start: 8, end: 10 },
+      { kind: "heredoc", start: 20, end: 22 },
+    ],
+  };
+  const hd = { isOpen: (id) => id === "1:0", toggleAttr: "t(this)" };
+  const html = shellSyntaxRowsHtml(text, p, esc, hd);
+  assert.match(html, /<details class="alog-sh-heredoc" data-hd="0:0" ontoggle="t\(this\)">/);
+  assert.match(html, /<details class="alog-sh-heredoc" data-hd="1:0" open ontoggle="t\(this\)">/);
+});
