@@ -1178,7 +1178,10 @@ or `twm &`, whichever is installed) so the window has a title bar. On X11, \
 `import -frame -window <id>` keeps the title bar (plain `-window` drops it), and a \
 whole-screen shot of a bare display is cropped to its window automatically. \
 For a visual item deliver the first kind of {order} that shows it; keep any video \
-under {} seconds and any GIF short (a few seconds, small window). For a terminal-text \
+under {} seconds and any GIF short (a few seconds, small window). When you encode \
+a GIF with ffmpeg yourself, turn dithering off, since it speckles a window's flat \
+background: `-vf \"fps=10,split[a][b];[a]palettegen=max_colors=128[p];[b][p]paletteuse=dither=none\" \
+-loop 0`. For a terminal-text \
 item run the command and save the text it printed (stdout and stderr, as a terminal \
 shows it) as a .txt file, not a picture of the terminal. Keep the lines that show the \
 result and cut unrelated ones: the PR shows at most {} characters and anything past \
@@ -2111,6 +2114,7 @@ EXHIBIT: gif | a || output | C",
         assert!(text.contains("under 9 seconds"));
         assert!(text.contains(REPORT_MARKER));
         assert!(text.contains("just its window with the title bar"));
+        assert!(text.contains("paletteuse=dither=none"));
         assert!(text.contains(ralphus_runner::exhibit_upload::DIR_PLACEHOLDER));
         let env = format!("${DIR_ENV}");
         assert!(text.contains(&env));

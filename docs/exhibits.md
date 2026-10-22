@@ -93,8 +93,12 @@ a Qt desktop app, anything with output a person would look at.
    the machine that ran it fits each file to what both forges embed (see
    limits below; trimming and converting use `ffmpeg` when that machine has
    it), stepping down the review's kind preference when it cannot -- a GIF
-   that will not shrink under 10 MiB becomes a video, then a still. It then
-   uploads the file straight to the forge's REST API, into the repository the
+   that will not shrink under 10 MiB becomes a video, then a still. Every GIF
+   ralphus encodes (this shrinking, and `ralphus exhibit record`) uses an
+   undithered palette (`paletteuse=dither=none`): dithering speckles the flat
+   background of an app window. A GIF that already fits is uploaded as it
+   is, so the run's prompt hands the agent the same ffmpeg filter for GIFs it
+   encodes itself. The machine then uploads the file straight to the forge's REST API, into the repository the
    review's PRs/MRs are filed in -- an upload needs no PR/MR to exist yet.
    The daemon never receives the file: it records the URL, and when the
    description is next written the slot's block shows the image or player.
@@ -132,7 +136,7 @@ with the title for those.
 
 | OS | Stills | Recording |
 |---|---|---|
-| Windows | PowerShell + .NET; one window via `PrintWindow` (need not be in front) | ffmpeg `gdigrab`, else stills encoded into a GIF |
+| Windows | PowerShell + .NET; one window via `PrintWindow` (need not be in front), cut to its visible frame, title bar included | one window: `PrintWindow` frames from one PowerShell process (framed like the still; ends when the window is closed or minimized), encoded with ffmpeg or, without it, in-process; the screen: ffmpeg `gdigrab`, else stills encoded into a GIF |
 | macOS | `screencapture` (screen only) | ffmpeg `avfoundation`, else stills |
 | Linux | `grim` (Wayland), ImageMagick `import` (X11; one window with `xdotool`), `gnome-screenshot` | ffmpeg `x11grab`, else stills |
 
