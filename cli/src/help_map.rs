@@ -3619,6 +3619,11 @@ pub fn chip_description(chip: &str, option: bool) -> String {
             "squad_id" => "Opaque squad identifier assigned by the daemon, e.g. \
                 squad-000000000001 -- not a selector or URI; see squad list/show to find one."
                 .to_string(),
+            "run_id" | "producer_id" => {
+                "Opaque identifier assigned by the daemon -- not a selector or URI; \
+                see the command that created or lists the entity to find one."
+                    .to_string()
+            }
             "entity_uri" => {
                 format!("Entity URI addressing any node uniformly: {ENTITY_URI_GRAMMAR}.")
             }
@@ -4172,6 +4177,14 @@ mod tests {
         assert_eq!(display_chip("squad_id [str...]"), "squad_id [id...]");
         assert_eq!(display_chip("selector [str...]"), "selector [uri...]");
         assert_eq!(display_chip("--commit-id [str]"), "--commit-id [str]");
+
+        for chip in ["run_id [str]", "producer_id [str]"] {
+            let description = chip_description(chip, false);
+            assert!(
+                description.starts_with("Opaque identifier assigned by the daemon"),
+                "{chip} fell through to the generic description: {description}"
+            );
+        }
 
         fn walk(n: &HelpNode, bad: &mut Vec<String>) {
             for chip in n.positionals.iter().chain(n.options.iter()) {
