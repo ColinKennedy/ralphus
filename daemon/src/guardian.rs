@@ -1050,6 +1050,17 @@ pub struct GuardianView {
     pub live_action_agent: Option<String>,
     /// Stored per-review model for live actions; set only with an agent.
     pub live_action_model: Option<String>,
+    /// Stored per-review PR-writer guidance. `None` inherits the project's.
+    pub pr_guidance: Option<String>,
+    /// Stored globs limiting [`Self::pr_guidance`]; `None` or empty applies
+    /// it to every PR.
+    pub pr_guidance_paths: Option<Vec<String>>,
+    /// The guidance entries that do not depend on a PR's changed files, in
+    /// concatenation order: the global config, then this review's own entry
+    /// or else the project's review-settings entry. The PR writer adds the
+    /// `.ralphus.toml` entries and filters all of them by the PR's files
+    /// (see [`crate::pr_guidance`]).
+    pub effective_pr_guidance: Vec<crate::pr_guidance::GuidanceEntry>,
     /// Creation time (epoch ms).
     pub created_at_ms: i64,
     /// Shell check commands run in the review worktree before it is ready.
@@ -3425,6 +3436,27 @@ impl Store {
                 crate::store::now_ms(),
                 id
             ],
+        )?;
+        if n == 0 {
+            Err(StoreError::NotFound)
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Set (or clear, with `None`) the guardian's own PR-writer guidance and
+    /// path filter. Both columns are written together because the filter
+    /// belongs to the text.
+    pub fn set_guardian_pr_guidance(
+        &self,
+        id: &str,
+        text: Option<&str>,
+        paths: Option<&[String]>,
+    ) -> Result<()> {
+        let paths_json = paths.filter(|p| !p.is_empty()).map(crate::store::to_json);
+        let n = self.conn.execute(
+            "UPDATE guardians SET pr_guidance = ?1, pr_guidance_paths = ?2,                updated_at_ms = ?3 WHERE id = ?4",
+            params![text, paths_json, crate::store::now_ms(), id],
         )?;
         if n == 0 {
             Err(StoreError::NotFound)
@@ -6356,7 +6388,7 @@ impl Store {
     pub(crate) fn get_guardian_conn(conn: &Connection, id: &str) -> Result<GuardianView> {
         let row = conn
             .query_row(
-                "SELECT id, name, base_branch, git_root, review_branch, status, detail, checks, squad_id, combined_worktree, conflicts_found, conflicts_fixed, conflicts_committed, skip_worktree_checks, review_type, skip_worktrees, created_at_ms, resolver_agent, resolver_model, base_commit, change_summary, base_commits, manual_commands, action_hints, summary_agent, summary_model, manual_commands_agent, manual_commands_model, manual_commands_agent_session_id, squash_projects, auto_pr_feedback, input_values, proof_scope, proof_skip_auto_clean, machine, build_env_overrides, manual_checks_env_overrides, maximum_budget_usd, merge_attempt, skip_base_updates, manual_checks_started_at_ms, notice_kind, notice_message, notice_at_ms, match_pr_branch_name, auto_submit_pr_stack, origin, auto_build_json, separate_pr_branch, readable_review_branch, review_branch_name, project, auto_fix_pr_errors, auto_fix_prompt_template, manual_checks_finished_at_ms, post_merge_status, post_merge_detail, post_merge_started_at_ms, post_merge_finished_at_ms, owner, dual_root_pr, discourage_tests_during_auto_pull_request_fixes, base_shift_maximum_rebuilds, base_shift_rebuild_attempts, base_shift_rebuild_targets, base_shift_exhausted_notified_at_ms, auto_cancel_outdated_pr_pipelines, cache_manual_checks, manual_checks_cached, manual_checks_basis, manual_checks_focus, summary_format, base_shift_rebuild_attempts_by_project, rebuild_on, skip_manual_checks, auto_run, followup_enabled, followup_auto_start, post_appraisals, ci_deferral, live_actions, live_actions_auto_ran_at_ms, base_update_mode, live_actions_default_on, exhibits_enabled, exhibits_max_per_pr, infer_exhibits, exhibit_kind_preference, exhibit_max_video_seconds, live_action_agent, live_action_model
+                "SELECT id, name, base_branch, git_root, review_branch, status, detail, checks, squad_id, combined_worktree, conflicts_found, conflicts_fixed, conflicts_committed, skip_worktree_checks, review_type, skip_worktrees, created_at_ms, resolver_agent, resolver_model, base_commit, change_summary, base_commits, manual_commands, action_hints, summary_agent, summary_model, manual_commands_agent, manual_commands_model, manual_commands_agent_session_id, squash_projects, auto_pr_feedback, input_values, proof_scope, proof_skip_auto_clean, machine, build_env_overrides, manual_checks_env_overrides, maximum_budget_usd, merge_attempt, skip_base_updates, manual_checks_started_at_ms, notice_kind, notice_message, notice_at_ms, match_pr_branch_name, auto_submit_pr_stack, origin, auto_build_json, separate_pr_branch, readable_review_branch, review_branch_name, project, auto_fix_pr_errors, auto_fix_prompt_template, manual_checks_finished_at_ms, post_merge_status, post_merge_detail, post_merge_started_at_ms, post_merge_finished_at_ms, owner, dual_root_pr, discourage_tests_during_auto_pull_request_fixes, base_shift_maximum_rebuilds, base_shift_rebuild_attempts, base_shift_rebuild_targets, base_shift_exhausted_notified_at_ms, auto_cancel_outdated_pr_pipelines, cache_manual_checks, manual_checks_cached, manual_checks_basis, manual_checks_focus, summary_format, base_shift_rebuild_attempts_by_project, rebuild_on, skip_manual_checks, auto_run, followup_enabled, followup_auto_start, post_appraisals, ci_deferral, live_actions, live_actions_auto_ran_at_ms, base_update_mode, live_actions_default_on, exhibits_enabled, exhibits_max_per_pr, infer_exhibits, exhibit_kind_preference, exhibit_max_video_seconds, live_action_agent, live_action_model, pr_guidance, pr_guidance_paths
                   FROM guardians WHERE id=?", // `skip_worktree_checks` (col 13) is read-only legacy data (RAL-285) -- see `GuardianRow::legacy_skip_worktree_checks`.
                 /*
                 "SELECT id, name, base_branch, git_root, review_branch, status, detail, checks, squad_id, combined_worktree, conflicts_found, conflicts_fixed, conflicts_committed, skip_worktree_checks, review_type, skip_worktrees, created_at_ms, resolver_agent, resolver_model, base_commit, change_summary, base_commits, manual_commands, action_hints, summary_agent, summary_model, manual_commands_agent, manual_commands_model, manual_commands_agent_session_id, squash_projects, auto_pr_feedback, input_values, proof_scope, proof_skip_auto_clean, machine, build_env_overrides, manual_checks_env_overrides, maximum_budget_usd, merge_attempt, skip_base_updates, manual_checks_started_at_ms, notice_kind, notice_message, notice_at_ms, match_pr_branch_name, auto_submit_pr_stack, origin, auto_build_json, separate_pr_branch, readable_review_branch, review_branch_name, project, auto_fix_pr_errors, auto_fix_prompt_template, manual_checks_finished_at_ms, post_merge_status, post_merge_detail, post_merge_started_at_ms, post_merge_finished_at_ms, owner, dual_root_pr, discourage_tests_during_auto_pull_request_fixes, base_shift_maximum_rebuilds, base_shift_rebuild_attempts, base_shift_rebuild_targets, base_shift_exhausted_notified_at_ms, auto_cancel_outdated_pr_pipelines, cache_manual_checks, manual_checks_cached, manual_checks_basis, manual_checks_focus
@@ -6545,7 +6577,7 @@ impl Store {
     /// (`crate::store_pool`) can serve it without the writer lock.
     pub(crate) fn list_guardians_conn(conn: &Connection) -> Result<Vec<GuardianView>> {
         let mut stmt = conn.prepare(
-            "SELECT id, name, base_branch, git_root, review_branch, status, detail, checks, squad_id, combined_worktree, conflicts_found, conflicts_fixed, conflicts_committed, skip_worktree_checks, review_type, skip_worktrees, created_at_ms, resolver_agent, resolver_model, base_commit, change_summary, base_commits, manual_commands, action_hints, summary_agent, summary_model, manual_commands_agent, manual_commands_model, manual_commands_agent_session_id, squash_projects, auto_pr_feedback, input_values, proof_scope, proof_skip_auto_clean, machine, build_env_overrides, manual_checks_env_overrides, maximum_budget_usd, merge_attempt, skip_base_updates, manual_checks_started_at_ms, notice_kind, notice_message, notice_at_ms, match_pr_branch_name, auto_submit_pr_stack, origin, auto_build_json, separate_pr_branch, readable_review_branch, review_branch_name, project, auto_fix_pr_errors, auto_fix_prompt_template, manual_checks_finished_at_ms, post_merge_status, post_merge_detail, post_merge_started_at_ms, post_merge_finished_at_ms, owner, dual_root_pr, discourage_tests_during_auto_pull_request_fixes, base_shift_maximum_rebuilds, base_shift_rebuild_attempts, base_shift_rebuild_targets, base_shift_exhausted_notified_at_ms, auto_cancel_outdated_pr_pipelines, cache_manual_checks, manual_checks_cached, manual_checks_basis, manual_checks_focus, summary_format, base_shift_rebuild_attempts_by_project, rebuild_on, skip_manual_checks, auto_run, followup_enabled, followup_auto_start, post_appraisals, ci_deferral, live_actions, live_actions_auto_ran_at_ms, base_update_mode, live_actions_default_on, exhibits_enabled, exhibits_max_per_pr, infer_exhibits, exhibit_kind_preference, exhibit_max_video_seconds, live_action_agent, live_action_model
+            "SELECT id, name, base_branch, git_root, review_branch, status, detail, checks, squad_id, combined_worktree, conflicts_found, conflicts_fixed, conflicts_committed, skip_worktree_checks, review_type, skip_worktrees, created_at_ms, resolver_agent, resolver_model, base_commit, change_summary, base_commits, manual_commands, action_hints, summary_agent, summary_model, manual_commands_agent, manual_commands_model, manual_commands_agent_session_id, squash_projects, auto_pr_feedback, input_values, proof_scope, proof_skip_auto_clean, machine, build_env_overrides, manual_checks_env_overrides, maximum_budget_usd, merge_attempt, skip_base_updates, manual_checks_started_at_ms, notice_kind, notice_message, notice_at_ms, match_pr_branch_name, auto_submit_pr_stack, origin, auto_build_json, separate_pr_branch, readable_review_branch, review_branch_name, project, auto_fix_pr_errors, auto_fix_prompt_template, manual_checks_finished_at_ms, post_merge_status, post_merge_detail, post_merge_started_at_ms, post_merge_finished_at_ms, owner, dual_root_pr, discourage_tests_during_auto_pull_request_fixes, base_shift_maximum_rebuilds, base_shift_rebuild_attempts, base_shift_rebuild_targets, base_shift_exhausted_notified_at_ms, auto_cancel_outdated_pr_pipelines, cache_manual_checks, manual_checks_cached, manual_checks_basis, manual_checks_focus, summary_format, base_shift_rebuild_attempts_by_project, rebuild_on, skip_manual_checks, auto_run, followup_enabled, followup_auto_start, post_appraisals, ci_deferral, live_actions, live_actions_auto_ran_at_ms, base_update_mode, live_actions_default_on, exhibits_enabled, exhibits_max_per_pr, infer_exhibits, exhibit_kind_preference, exhibit_max_video_seconds, live_action_agent, live_action_model, pr_guidance, pr_guidance_paths
               FROM guardians ORDER BY created_at_ms DESC", // `skip_worktree_checks` (col 13) is read-only legacy data (RAL-285) -- see `GuardianRow::legacy_skip_worktree_checks`.
         )?;
         let rows = stmt
@@ -6705,6 +6737,8 @@ impl Store {
             exhibit_max_video_seconds: r.get::<_, Option<i64>>(88)?,
             live_action_agent: r.get(89)?,
             live_action_model: r.get(90)?,
+            pr_guidance: r.get(91)?,
+            pr_guidance_paths: r.get(92)?,
         })
     }
 
@@ -7219,6 +7253,27 @@ impl Store {
             .or(live_global.refine_live_recipe)
             .unwrap_or(true);
 
+        // PR guidance stacks rather than overrides: the global config, then
+        // the review's own entry (or the project's review settings when the
+        // review has none). `.ralphus.toml` files stack on at PR time.
+        let row_pr_guidance_paths: Option<Vec<String>> = row
+            .pr_guidance_paths
+            .as_deref()
+            .map(crate::store::from_json);
+        let mut effective_pr_guidance: Vec<crate::pr_guidance::GuidanceEntry> = Vec::new();
+        effective_pr_guidance.extend(crate::pr_guidance::entry(
+            live_global.pr_guidance.as_deref(),
+            live_global.pr_guidance_paths.as_deref(),
+        ));
+        effective_pr_guidance.extend(if row.pr_guidance.is_some() {
+            crate::pr_guidance::entry(row.pr_guidance.as_deref(), row_pr_guidance_paths.as_deref())
+        } else {
+            crate::pr_guidance::entry(
+                db_settings.pr_guidance.as_deref(),
+                db_settings.pr_guidance_paths.as_deref(),
+            )
+        });
+
         // Follow-up offers: per-review override > the project's
         // `.ralphus.toml [followup]` > the live global `[followup]` config > on.
         let followup = ctx
@@ -7347,6 +7402,8 @@ impl Store {
             resolver_thinking_capable,
             resolver_model: row.resolver_model,
             live_action_agent: row.live_action_agent,
+            pr_guidance: row.pr_guidance,
+            pr_guidance_paths: row_pr_guidance_paths,
             live_action_model: row.live_action_model,
             created_at_ms: row.created_at_ms,
             checks: crate::store::from_json(&row.checks),
@@ -7419,6 +7476,7 @@ impl Store {
             live_actions: row.live_actions,
             effective_live_actions,
             effective_refine_live_recipe,
+            effective_pr_guidance,
             live_actions_auto_ran_at_ms: row.live_actions_auto_ran_at_ms,
             followup_enabled: row.followup_enabled,
             effective_followup_enabled,
@@ -8014,6 +8072,9 @@ struct GuardianRow {
     exhibit_max_video_seconds: Option<i64>,
     live_action_agent: Option<String>,
     live_action_model: Option<String>,
+    /// `pr_guidance_paths` is a JSON array of globs.
+    pr_guidance: Option<String>,
+    pr_guidance_paths: Option<String>,
 }
 
 #[cfg(test)]
@@ -10190,6 +10251,59 @@ mod tests {
         store.set_guardian_live_actions(&id, None).unwrap();
         assert!(store.get_guardian(&id).unwrap().effective_live_actions);
         assert!(store.set_guardian_live_actions("nope", Some(true)).is_err());
+    }
+
+    #[test]
+    fn pr_guidance_resolves_review_entry_in_place_of_project_entry() {
+        let store = Store::open_in_memory().unwrap();
+        store.register_project("proj", "", "/repo", "git").unwrap();
+        let id = store.create_guardian("r", "main", "/repo").unwrap();
+        let texts = |store: &Store| -> Vec<String> {
+            store
+                .get_guardian(&id)
+                .unwrap()
+                .effective_pr_guidance
+                .into_iter()
+                .map(|e| e.text)
+                .collect()
+        };
+        let before = texts(&store);
+        store
+            .set_project_review_settings(
+                "proj",
+                &crate::store::ProjectReviewSettings {
+                    pr_guidance: Some("project text".into()),
+                    pr_guidance_paths: Some(vec!["svc/**".into()]),
+                    ..crate::store::ProjectReviewSettings::default()
+                },
+            )
+            .unwrap();
+        let with_project = texts(&store);
+        assert_eq!(
+            with_project.last().map(String::as_str),
+            Some("project text")
+        );
+        assert_eq!(with_project.len(), before.len() + 1);
+
+        store
+            .set_guardian_pr_guidance(&id, Some("review text"), Some(&["docs/**".to_string()]))
+            .unwrap();
+        let with_review = texts(&store);
+        assert_eq!(with_review.last().map(String::as_str), Some("review text"));
+        assert!(!with_review.iter().any(|t| t == "project text"));
+        let g = store.get_guardian(&id).unwrap();
+        assert_eq!(
+            g.effective_pr_guidance.last().unwrap().paths,
+            vec!["docs/**".to_string()]
+        );
+
+        store.set_guardian_pr_guidance(&id, None, None).unwrap();
+        assert_eq!(texts(&store), with_project);
+        assert!(
+            store
+                .set_guardian_pr_guidance("nope", Some("x"), None)
+                .is_err()
+        );
     }
 
     #[test]

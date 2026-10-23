@@ -466,6 +466,9 @@ struct Membership {
     /// post_appraisals`) for whether this review writes its judges'
     /// appraisals into the PR/MR body and tip commit.
     post_appraisals: Option<bool>,
+    /// `[[review]] pr_guidance` / `pr_guidance_paths`: this review's PR-writer guidance.
+    pr_guidance: Option<String>,
+    pr_guidance_paths: Option<Vec<String>>,
     /// RAL-521: optional override declared on the review (`[[review]]
     /// cache_manual_checks`) for whether this review's manual checks are
     /// computed once, when its review branches are first created, and then
@@ -1178,6 +1181,10 @@ pub fn derive_reviews_with_full_prefetch(
                 .and_then(|r| r.discourage_tests_during_auto_pull_request_fixes),
             auto_cancel_outdated_pr_pipelines: rv.and_then(|r| r.auto_cancel_outdated_pr_pipelines),
             post_appraisals: rv.and_then(|r| r.post_appraisals),
+            pr_guidance: rv
+                .and_then(|r| r.pr_guidance.clone())
+                .filter(|s| !s.trim().is_empty()),
+            pr_guidance_paths: rv.and_then(|r| r.pr_guidance_paths.clone()),
             cache_manual_checks: rv.and_then(|r| r.cache_manual_checks),
             skip_manual_checks: rv.and_then(|r| r.skip_manual_checks),
             auto_run: rv.and_then(|r| r.auto_run),
@@ -1680,6 +1687,17 @@ fn apply_resolver(
     {
         store
             .set_guardian_auto_cancel_outdated_pr_pipelines(gid, Some(enabled))
+            .map_err(|e| ReviewError::new(e.to_string()))?;
+    }
+    // This review's own PR guidance (and its path filter, from the same
+    // declaring member), authored via `[[review]] pr_guidance`.
+    if let Some(m) = members.iter().find(|m| m.pr_guidance.is_some()) {
+        store
+            .set_guardian_pr_guidance(
+                gid,
+                m.pr_guidance.as_deref(),
+                m.pr_guidance_paths.as_deref(),
+            )
             .map_err(|e| ReviewError::new(e.to_string()))?;
     }
     // RAL-575: this review's own appraisal-posting override, authored via
@@ -3720,6 +3738,8 @@ mod tests {
             discourage_tests_during_auto_pull_request_fixes: None,
             auto_cancel_outdated_pr_pipelines: None,
             post_appraisals: None,
+            pr_guidance: None,
+            pr_guidance_paths: None,
             cache_manual_checks: None,
             skip_manual_checks: None,
             auto_run: None,

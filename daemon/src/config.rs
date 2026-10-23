@@ -338,6 +338,19 @@ pub struct ReviewConfig {
     /// Plain boolean, type-checked only.
     #[serde(default)]
     pub refine_live_recipe: Option<bool>,
+    /// Free-text guidance appended to the prompt of the agent that writes a
+    /// PR/MR title and description. One entry per layer: this field holds
+    /// the guidance of whichever single file (or settings record) this
+    /// config was read from. Entries stack, they do not replace each other --
+    /// [`Self::merge`] only picks the higher layer's value for the merged
+    /// view, while [`crate::pr_guidance`] reads each layer on its own and
+    /// concatenates the matching ones.
+    #[serde(default)]
+    pub pr_guidance: Option<String>,
+    /// Repo-relative globs limiting [`Self::pr_guidance`] to PRs that change
+    /// a matching file; `None` or empty applies it to every PR.
+    #[serde(default)]
+    pub pr_guidance_paths: Option<Vec<String>>,
     /// Which events tear down and rebuild a review's prepared build (any of
     /// `ralphus_core::schema::REBUILD_ON_VALUES`). `None` means unset, which
     /// resolves to all three values (see [`Self::rebuild_on`]); the project
@@ -555,6 +568,8 @@ pub const DEFAULT_RETRY_AFTER_UNKNOWN_DEFAULT_SECONDS: u64 = 30;
 /// settings. The parity test compares this list with `core::validate::REVIEW_KEYS`
 /// so schema and project defaults cannot drift independently.
 pub const REVIEW_CONFIG_KEYS: &[&str] = &[
+    "pr_guidance",
+    "pr_guidance_paths",
     "default_resolver_agent",
     "default_resolver_model",
     "default_live_action_agent",
@@ -1053,6 +1068,14 @@ impl ReviewConfig {
             auto_run: over.auto_run.or(self.auto_run),
             live_actions: over.live_actions.or(self.live_actions),
             refine_live_recipe: over.refine_live_recipe.or(self.refine_live_recipe),
+            // One entry's text and its path filter belong together: a layer that
+            // states guidance brings its own filter.
+            pr_guidance: over.pr_guidance.clone().or(self.pr_guidance.clone()),
+            pr_guidance_paths: if over.pr_guidance.is_some() {
+                over.pr_guidance_paths.clone()
+            } else {
+                self.pr_guidance_paths.clone()
+            },
             rebuild_on: over.rebuild_on.or(self.rebuild_on),
             auto_fix_prompt_template: over
                 .auto_fix_prompt_template
@@ -1296,6 +1319,14 @@ pub const REVIEW_FIELD_PARITY: &[(&str, ReviewFieldDefault)] = &[
     (
         "refine_live_recipe",
         ReviewFieldDefault::ProjectDefault(|c| c.refine_live_recipe.is_some()),
+    ),
+    (
+        "pr_guidance",
+        ReviewFieldDefault::ProjectDefault(|c| c.pr_guidance.is_some()),
+    ),
+    (
+        "pr_guidance_paths",
+        ReviewFieldDefault::ProjectDefault(|c| c.pr_guidance_paths.is_some()),
     ),
     // The exhibit settings are not `[[review]]` keys: they are set per
     // review through the settings API, or as project/global defaults. They

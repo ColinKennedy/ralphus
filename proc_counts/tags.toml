@@ -233,3 +233,8 @@ tag = "outpost-readiness"
 [[test]]
 id = "ralphus-daemon guardian_merge::tests::the_review_upstream_checkout_is_a_detached_sibling_at_the_given_commit"
 tag = "review-upstream-checkout"
+
+# Building the PR-writer prompt with `.ralphus.toml` guidance (`git diff --name-only` for the changed paths).
+[[test]]
+id = "ralphus-daemon pr::tests::pr_guidance_from_ralphus_toml_reaches_the_prompt_and_keeps_template_headings"
+tag = "pr-guidance-prompt"

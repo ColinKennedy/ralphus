@@ -22,6 +22,8 @@ const PAIRS: &[(&str, &str)] = &[
     ("proof_skip_auto_clean", "proof_skip_auto_clean"),
     ("summary_format", "summary_format"),
     ("post_appraisals", "post_appraisals"),
+    ("pr_guidance", "pr_guidance"),
+    ("pr_guidance_paths", "pr_guidance_paths"),
     ("cache_manual_checks", "cache_manual_checks"),
     ("skip_manual_checks", "skip_manual_checks"),
     ("auto_run", "auto_run"),

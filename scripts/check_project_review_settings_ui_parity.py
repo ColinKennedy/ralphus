@@ -49,6 +49,8 @@ MAPPING = {
     "auto_build": "auto_build",
     "auto_fix_pr_errors": "auto_fix_pr_errors",
     "auto_fix_prompt_template": "auto_fix_prompt_template",
+    "pr_guidance": "pr_guidance",
+    "pr_guidance_paths": "pr_guidance_paths",
     "discourage_tests_during_auto_pull_request_fixes": "discourage_tests_during_auto_pull_request_fixes",
     "auto_cancel_outdated_pr_pipelines": "auto_cancel_outdated_pr_pipelines",
     "post_appraisals": "post_appraisals",

@@ -81,6 +81,8 @@ pub enum ProjectReviewSettingsCommand {
         resolver_model: Option<String>,
         live_action_agent: Option<String>,
         live_action_model: Option<String>,
+        pr_guidance: Option<String>,
+        pr_guidance_paths: Option<Vec<String>>,
         default_base_branch: Option<String>,
         machine: Option<String>,
         maximum_budget_usd: Option<f64>,
@@ -372,6 +374,15 @@ fn parse_review_settings(args: &[String]) -> ProjectReviewSettingsCommand {
     }
 }
 
+/// Split a comma-separated flag value into trimmed, non-empty parts.
+pub(super) fn split_csv(raw: &str) -> Vec<String> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
 fn parse_review_settings_set(
     scanner: &mut Scanner,
 ) -> Result<ProjectReviewSettingsCommand, UsageError> {
@@ -379,6 +390,10 @@ fn parse_review_settings_set(
     let resolver_model = scanner.take_value("--resolver-model")?;
     let live_action_agent = scanner.take_value("--live-action-agent")?;
     let live_action_model = scanner.take_value("--live-action-model")?;
+    let pr_guidance = scanner.take_value("--pr-guidance")?;
+    let pr_guidance_paths = scanner
+        .take_value("--pr-guidance-paths")?
+        .map(|raw| split_csv(&raw));
     let default_base_branch = scanner.take_value("--default-base-branch")?;
     let machine = scanner.take_value("--machine")?;
     let maximum_budget_usd_raw = scanner.take_value("--maximum-budget-usd")?;
@@ -458,6 +473,8 @@ fn parse_review_settings_set(
         resolver_model,
         live_action_agent,
         live_action_model,
+        pr_guidance,
+        pr_guidance_paths,
         default_base_branch,
         machine,
         maximum_budget_usd,
@@ -620,6 +637,8 @@ fn dispatch_review_settings(cmd: ProjectReviewSettingsCommand, opts: &GlobalOpts
             resolver_model,
             live_action_agent,
             live_action_model,
+            pr_guidance,
+            pr_guidance_paths,
             default_base_branch,
             machine,
             maximum_budget_usd,
@@ -654,6 +673,8 @@ fn dispatch_review_settings(cmd: ProjectReviewSettingsCommand, opts: &GlobalOpts
                 default_resolver_model: resolver_model.as_deref(),
                 default_live_action_agent: live_action_agent.as_deref(),
                 default_live_action_model: live_action_model.as_deref(),
+                pr_guidance: pr_guidance.as_deref(),
+                pr_guidance_paths,
                 default_base_branch: default_base_branch.as_deref(),
                 default_machine: machine.as_deref(),
                 default_maximum_budget_usd: maximum_budget_usd,
@@ -729,6 +750,18 @@ fn render_review_settings(payload: &Value) {
     row_str("resolver model:", "default_resolver_model");
     row_str("live action agent:", "default_live_action_agent");
     row_str("live action model:", "default_live_action_model");
+    row_str("pr guidance:", "pr_guidance");
+    println!(
+        "  {:<26} {}",
+        "pr guidance paths:",
+        settings["pr_guidance_paths"]
+            .as_array()
+            .map_or("(all changes)".to_string(), |a| a
+                .iter()
+                .filter_map(|v| v.as_str())
+                .collect::<Vec<_>>()
+                .join(", "))
+    );
     row_str("ingest base branch:", "default_base_branch");
     row_str("machine:", "default_machine");
     println!(

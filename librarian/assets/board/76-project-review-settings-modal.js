@@ -69,6 +69,10 @@
        * @property {boolean} originalAutoFixPrErrors
        * @property {string} autoFixPromptTemplate
        * @property {string} originalAutoFixPromptTemplate
+       * @property {string} prGuidance
+       * @property {string} originalPrGuidance
+       * @property {string} prGuidancePaths
+       * @property {string} originalPrGuidancePaths
        * @property {boolean} discourageTests
        * @property {boolean} originalDiscourageTests
        * @property {boolean} autoCancelOutdatedPrPipelines
@@ -144,6 +148,8 @@
         const autoSubmitPrStack = boolOr(s.auto_submit_pr_stack, effective.auto_submit_pr_stack);
         const autoFixPrErrors = boolOr(s.auto_fix_pr_errors, effective.auto_fix_pr_errors);
         const autoFixPromptTemplate = str(s.auto_fix_prompt_template);
+        const prGuidance = str(s.pr_guidance);
+        const prGuidancePaths = (s.pr_guidance_paths || []).join(", ");
         const discourageTests = boolOr(s.discourage_tests_during_auto_pull_request_fixes, effective.discourage_tests_during_auto_pull_request_fixes);
         const autoCancelOutdatedPrPipelines = boolOr(s.auto_cancel_outdated_pr_pipelines, effective.auto_cancel_outdated_pr_pipelines);
         const postAppraisals = boolOr(s.post_appraisals, effective.post_appraisals);
@@ -192,6 +198,8 @@
           autoSubmitPrStack, originalAutoSubmitPrStack: autoSubmitPrStack,
           autoFixPrErrors, originalAutoFixPrErrors: autoFixPrErrors,
           autoFixPromptTemplate, originalAutoFixPromptTemplate: autoFixPromptTemplate,
+          prGuidance, originalPrGuidance: prGuidance,
+          prGuidancePaths, originalPrGuidancePaths: prGuidancePaths,
           discourageTests, originalDiscourageTests: discourageTests,
           autoCancelOutdatedPrPipelines, originalAutoCancelOutdatedPrPipelines: autoCancelOutdatedPrPipelines,
           postAppraisals, originalPostAppraisals: postAppraisals,
@@ -406,6 +414,16 @@
        */
       function onProjectEditAutoFixPromptTemplate(value) { if (projectReviewSettingsDraft) projectReviewSettingsDraft.autoFixPromptTemplate = value; }
       /**
+       * @param {string} value
+       * @returns {void}
+       */
+      function onProjectEditPrGuidance(value) { if (projectReviewSettingsDraft) projectReviewSettingsDraft.prGuidance = value; }
+      /**
+       * @param {string} value
+       * @returns {void}
+       */
+      function onProjectEditPrGuidancePaths(value) { if (projectReviewSettingsDraft) projectReviewSettingsDraft.prGuidancePaths = value; }
+      /**
        * Stages the discourage-tests-during-auto-PR-fix default.
        * @param {boolean} checked
        * @returns {void}
@@ -500,7 +518,8 @@
           + renderLiveActionFieldsHtml(draft.cwd, draft.liveActionAgent, draft.liveActionModel, false, "onProjectEditLiveActionSame", "onProjectEditLiveActionAgent", "onProjectEditLiveActionModel");
         const proofScopeSection = renderProofScopeFieldsHtml(draft.proofScope, draft.proofSkipAutoClean, "onProjectEditProofScope", "onProjectEditProofSkipAutoClean", true);
         const prSettingsSection = renderPrSettingsFieldsHtml(draft.separatePrBranch, draft.matchPrBranchName, draft.autoSubmitPrStack, draft.dualRootPr, "onProjectEditSeparatePrBranch", "onProjectEditMatchPrBranchName", "onProjectEditAutoSubmitPrStack", "onProjectEditDualRootPr");
-        const autoFixSection = renderAutoFixFieldsHtml(draft.autoFixPrErrors, draft.autoFixPromptTemplate, draft.discourageTests, "onProjectEditAutoFixPrErrors", "onProjectEditAutoFixPromptTemplate", "onProjectEditDiscourageTests");
+        const autoFixSection = renderAutoFixFieldsHtml(draft.autoFixPrErrors, draft.autoFixPromptTemplate, draft.discourageTests, "onProjectEditAutoFixPrErrors", "onProjectEditAutoFixPromptTemplate", "onProjectEditDiscourageTests")
+          + renderPrGuidanceFieldsHtml(draft.prGuidance, draft.prGuidancePaths, "onProjectEditPrGuidance", "onProjectEditPrGuidancePaths");
         const err = projectReviewSettingsError ? `<div id="project-review-settings-err" class="verr">${esc(projectReviewSettingsError)}</div>` : `<div id="project-review-settings-err" class="verr"></div>`;
         byId("modal-root").innerHTML = `<div class="modal-bg" onclick="if(event.target===this)closeProjectReviewSettingsModal()"><div class="modal review-edit-modal">
             <h2>Review Settings — ${esc(draft.project)}</h2>
@@ -596,6 +615,8 @@
         if (draft.autoSubmitPrStack !== draft.originalAutoSubmitPrStack) body.auto_submit_pr_stack = draft.autoSubmitPrStack;
         if (draft.autoFixPrErrors !== draft.originalAutoFixPrErrors) body.auto_fix_pr_errors = draft.autoFixPrErrors;
         if (draft.autoFixPromptTemplate !== draft.originalAutoFixPromptTemplate) body.auto_fix_prompt_template = draft.autoFixPromptTemplate;
+        if (draft.prGuidance !== draft.originalPrGuidance) body.pr_guidance = draft.prGuidance;
+        if (draft.prGuidancePaths !== draft.originalPrGuidancePaths) body.pr_guidance_paths = splitPrGuidancePaths(draft.prGuidancePaths);
         if (draft.discourageTests !== draft.originalDiscourageTests) body.discourage_tests_during_auto_pull_request_fixes = draft.discourageTests;
         if (draft.autoCancelOutdatedPrPipelines !== draft.originalAutoCancelOutdatedPrPipelines) body.auto_cancel_outdated_pr_pipelines = draft.autoCancelOutdatedPrPipelines;
         if (draft.postAppraisals !== draft.originalPostAppraisals) body.post_appraisals = draft.postAppraisals;

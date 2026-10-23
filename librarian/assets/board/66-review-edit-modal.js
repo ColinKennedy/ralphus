@@ -77,6 +77,10 @@
        * @property {boolean} originalAutoFixPrErrors
        * @property {string} autoFixPromptTemplate
        * @property {string} originalAutoFixPromptTemplate
+       * @property {string} prGuidance
+       * @property {string} originalPrGuidance
+       * @property {string} prGuidancePaths
+       * @property {string} originalPrGuidancePaths
        * @property {boolean} discourageTests
        * @property {boolean} originalDiscourageTests
        * @property {boolean} skipManualChecks - This review's own override for whether manual-check generation is skipped.
@@ -523,6 +527,8 @@
         const dualRootPr = !!g.effective_dual_root_pr;
         const autoFixPrErrors = !!g.auto_fix_pr_errors;
         const autoFixPromptTemplate = g.auto_fix_prompt_template || "";
+        const prGuidance = g.pr_guidance || "";
+        const prGuidancePaths = (g.pr_guidance_paths || []).join(", ");
         const discourageTests = !!g.discourage_tests_during_auto_pull_request_fixes;
         const skipManualChecks = !!g.effective_skip_manual_checks;
         const autoRun = !!g.effective_auto_run;
@@ -565,6 +571,8 @@
           dualRootPr, originalDualRootPr: dualRootPr,
           autoFixPrErrors, originalAutoFixPrErrors: autoFixPrErrors,
           autoFixPromptTemplate, originalAutoFixPromptTemplate: autoFixPromptTemplate,
+          prGuidance, originalPrGuidance: prGuidance,
+          prGuidancePaths, originalPrGuidancePaths: prGuidancePaths,
           discourageTests, originalDiscourageTests: discourageTests,
           skipManualChecks, originalSkipManualChecks: skipManualChecks,
           autoRun, originalAutoRun: autoRun,
@@ -785,6 +793,16 @@
        * @returns {void}
        */
       function onEditAutoFixPromptTemplate(value) { if (reviewEditDraft) reviewEditDraft.autoFixPromptTemplate = value; }
+      /**
+       * @param {string} value
+       * @returns {void}
+       */
+      function onEditPrGuidance(value) { if (reviewEditDraft) reviewEditDraft.prGuidance = value; }
+      /**
+       * @param {string} value
+       * @returns {void}
+       */
+      function onEditPrGuidancePaths(value) { if (reviewEditDraft) reviewEditDraft.prGuidancePaths = value; }
       /**
        * Stages the discourage-tests-during-auto-PR-fix flag.
        * @param {boolean} checked
@@ -1239,6 +1257,30 @@
             <input type="checkbox" ${discourageTests ? "checked" : ""} onchange="${onDiscourageTestsChange}(this.checked)">discourage tests during auto PR fixes</label>`;
       }
 
+      const PR_GUIDANCE_TIP = "Free-text instructions appended to the prompt of the agent that writes this review's PR/MR titles and descriptions (max 2000 characters). Stacks after the global guidance and before any .ralphus.toml guidance; the PR template's headings are kept. Applies on Save.";
+      const PR_GUIDANCE_PATHS_TIP = "Optional globs: the guidance applies only to PRs whose changed files match one of them. Blank means every PR.";
+      /**
+       * @param {string} text - comma-separated globs
+       * @returns {string[]}
+       */
+      function splitPrGuidancePaths(text) { return text.split(",").map((p) => p.trim()).filter((p) => p); }
+      /**
+       * RAL-719: PR-description guidance textarea plus its optional path-glob
+       * filter, shared by the review and project settings modals.
+       * @param {string} prGuidance
+       * @param {string} prGuidancePaths - comma-separated globs
+       * @param {string} onGuidanceChange
+       * @param {string} onPathsChange
+       * @returns {string}
+       */
+      function renderPrGuidanceFieldsHtml(prGuidance, prGuidancePaths, onGuidanceChange, onPathsChange) {
+        return `<div style="margin-top:8px">
+            <label for="pr-guidance-input" style="font-size:12px;color:var(--muted);display:block;margin-bottom:4px" data-tip="${PR_GUIDANCE_TIP}">PR description guidance</label>
+            <textarea id="pr-guidance-input" rows="3" maxlength="2000" style="${REVIEW_EDIT_TEXTAREA_STYLE}" placeholder="free-text instructions for the agent that writes PR titles and descriptions" oninput="${onGuidanceChange}(this.value)" data-tip="${PR_GUIDANCE_TIP}">${esc(prGuidance)}</textarea>
+            <input id="pr-guidance-paths-input" type="text" value="${esc(prGuidancePaths)}" placeholder="only for PRs touching these paths (globs, comma-separated; blank = all)" style="${REVIEW_EDIT_TEXTAREA_STYLE}" oninput="${onPathsChange}(this.value)" data-tip="${PR_GUIDANCE_PATHS_TIP}">
+          </div>`;
+      }
+
       /**
        * Renders the Edit Details modal from `reviewEditDraft`. A one-shot
        * `innerHTML` write into `#modal-root`, matching every other modal in
@@ -1301,6 +1343,7 @@
             <h3 class="section">pull requests</h3>
             ${renderPrSettingsFieldsHtml(draft.separatePrBranch, draft.matchPrBranchName, draft.autoSubmitPrStack, draft.dualRootPr, "onEditSeparatePrBranch", "onEditMatchPrBranchName", "onEditAutoSubmitPrStack", "onEditDualRootPr")}
             ${renderAutoFixFieldsHtml(draft.autoFixPrErrors, draft.autoFixPromptTemplate, draft.discourageTests, "onEditAutoFixPrErrors", "onEditAutoFixPromptTemplate", "onEditDiscourageTests")}
+            ${renderPrGuidanceFieldsHtml(draft.prGuidance, draft.prGuidancePaths, "onEditPrGuidance", "onEditPrGuidancePaths")}
             <div id="review-edit-err" class="verr"></div>
             <div class="btn-row" style="margin-top:12px"><button class="btn" onclick="closeEditReviewDetails()">Cancel</button><button class="btn primary" onclick="saveReviewEditDetails()" data-tip="Apply every change made in this modal in a single request. At most one rebase is triggered, only if something rebase-relevant changed.">Save</button></div>
           </div></div>`;
@@ -1382,6 +1425,8 @@
         if (draft.dualRootPr !== draft.originalDualRootPr) body.dual_root_pr = draft.dualRootPr;
         if (draft.autoFixPrErrors !== draft.originalAutoFixPrErrors) body.auto_fix_pr_errors = draft.autoFixPrErrors;
         if (draft.autoFixPromptTemplate !== draft.originalAutoFixPromptTemplate) body.auto_fix_prompt_template = draft.autoFixPromptTemplate;
+        if (draft.prGuidance !== draft.originalPrGuidance) body.pr_guidance = draft.prGuidance;
+        if (draft.prGuidancePaths !== draft.originalPrGuidancePaths) body.pr_guidance_paths = splitPrGuidancePaths(draft.prGuidancePaths);
         if (draft.discourageTests !== draft.originalDiscourageTests) body.discourage_tests_during_auto_pull_request_fixes = draft.discourageTests;
         if (draft.skipManualChecks !== draft.originalSkipManualChecks) body.skip_manual_checks = draft.skipManualChecks;
         if (draft.autoRun !== draft.originalAutoRun) body.auto_run = draft.autoRun;
