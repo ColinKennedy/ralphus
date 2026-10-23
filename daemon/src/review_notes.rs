@@ -17,6 +17,7 @@
 use rusqlite::{OptionalExtension, params};
 use serde_json::{Value, json};
 
+use crate::followup::PendingFollowupItem;
 use crate::ghost::{GhostView, cell_uri, review_uri};
 use crate::live_actions::guardian_live_actions_conn;
 use crate::live_runs::guardian_live_runs_conn;
@@ -40,6 +41,22 @@ fn ghost_note(ghost: &GhostView) -> Value {
         "at_ms": ghost.updated_at_ms,
         "owner_uri": ghost.owner_uri,
         "content": ghost.content,
+    })
+}
+
+/// The deferral note JSON for `item`. `ignored` and `squad_id` let the board
+/// badge an ignored deferral and link an accepted one to its follow-up squad.
+fn deferral_note(item: &PendingFollowupItem) -> Value {
+    json!({
+        "type": "deferral",
+        "id": format!("deferral:{}", item.item.prophecy_id),
+        "title": item.task_name.clone().unwrap_or_else(|| "Deferral".to_string()),
+        "at_ms": item.created_at_ms,
+        "owner_uri": item.item.entity_uri,
+        "content": item.item.body,
+        "ignored": item.ignored,
+        "accepted": item.accepted,
+        "squad_id": item.squad_id,
     })
 }
 
@@ -152,6 +169,15 @@ impl Store {
             notes.push(ghost_note(&g));
         }
 
+        // Deferrals whose writing cell has no review branch belong to no
+        // branch and stay in the follow-up list only.
+        for d in self.pending_followup_items(guardian_id)? {
+            if d.branch.as_deref() != Some(branch.as_str()) {
+                continue;
+            }
+            notes.push(deferral_note(&d));
+        }
+
         sort_newest_first(&mut notes);
         Ok(Some(notes))
     }
@@ -204,6 +230,35 @@ mod tests {
         assert_eq!(note["id"], "cell:s:0:0");
         assert_eq!(note["at_ms"], 7);
         assert_eq!(note["content"], "body");
+    }
+
+    #[test]
+    fn deferral_note_carries_ignored_and_squad() {
+        let item = PendingFollowupItem {
+            item: crate::followup::FollowupItem {
+                prophecy_id: 4,
+                entity_uri: "cell:s:0:0".to_string(),
+                body: "later".to_string(),
+                prompt: None,
+                agent: None,
+                model: None,
+            },
+            attempt: 1,
+            ignored: true,
+            created_at_ms: 9,
+            branch: Some("b".to_string()),
+            task_name: Some("t".to_string()),
+            squad_id: Some("squad-x".to_string()),
+            accepted: true,
+        };
+        let note = deferral_note(&item);
+        assert_eq!(note["type"], "deferral");
+        assert_eq!(note["id"], "deferral:4");
+        assert_eq!(note["title"], "t");
+        assert_eq!(note["at_ms"], 9);
+        assert_eq!(note["content"], "later");
+        assert_eq!(note["ignored"], true);
+        assert_eq!(note["squad_id"], "squad-x");
     }
 
     #[test]

@@ -991,7 +991,7 @@
           ["worktree", "Worktree", "The on-disk worktree for this branch — its path, its environment layer, and what it retires with."],
           ["feedback", "Feedback", "Your conversation with the resolver agent about this branch.\nWhat you write here is routed into the branch's worktree as a change request."],
           ["live", "Live", "The resolver agent's terminal for this branch.\nNothing attaches until you open this tab."],
-          ["notes", "Notes", "Everything written down about this branch: the judges' appraisals, the live actions attributed to it, and its latest ghost handoff — read from what the daemon stored, not from the PR body.\nFilter by type to find one kind of note.\nNothing loads until you open this tab."],
+          ["notes", "Notes", "Everything written down about this branch: the judges' appraisals, the live actions attributed to it, its latest ghost handoff, and the deferrals its cells wrote — read from what the daemon stored, not from the PR body.\nFilter by type to find one kind of note.\nNothing loads until you open this tab."],
         ];
         host.innerHTML = `
           <div class="insp-head">
@@ -1096,12 +1096,23 @@
         { value: "appraisal", label: "Appraisal" },
         { value: "live_action", label: "Live action" },
         { value: "ghost", label: "Ghost" },
+        { value: "deferral", label: "Deferral" },
+        { value: "deferral_ignored", label: "Ignored deferral" },
       ];
+      /**
+       * The filter value a note is shown or hidden under: an ignored deferral
+       * has its own, so it can stay hidden while other deferrals show.
+       * @param {BranchNote} n - The note.
+       * @returns {string}
+       */
+      function noteFilterKey(n) {
+        return n.type === "deferral" && n.ignored ? "deferral_ignored" : n.type;
+      }
       /** @type {Set<string>} The note types currently shown; all of them until the user narrows it. */
-      const notesTypeFilter = new Set(NOTE_TYPE_OPTIONS.map((o) => o.value));
+      const notesTypeFilter = new Set(NOTE_TYPE_OPTIONS.map((o) => o.value).filter((v) => v !== "deferral_ignored"));
       /**
        * Fetches `GET /api/guardians/{id}/branches/{bid}/notes` -- the stored
-       * appraisals, live actions and latest ghost, not what the PR body rendered.
+       * appraisals, live actions, latest ghost and deferrals, not what the PR body rendered.
        * @param {string} gid - The review id.
        * @param {string} bid - The branch id.
        * @returns {Promise<void>}
@@ -1167,9 +1178,12 @@
           appraisal: "An appraisal: a judge's scored verdict on one of this branch's proof steps.",
           live_action: "A live action: something to try against the running program, attributed to this branch, with the outcome of its latest run.",
           ghost: "A ghost: the latest handoff note left by a cell of this branch or by its review worktree. A ghost accumulates its own history, so only the latest is listed.",
+          deferral: "A deferral: follow-up work a cell of this branch set aside for later. Accept or ignore it from the review's follow-up list.",
+          deferral_ignored: "An ignored deferral: follow-up work a cell of this branch set aside, which was ignored and is left out of the follow-up offer.",
         };
-        const opt = NOTE_TYPE_OPTIONS.find((o) => o.value === n.type);
-        return `<span class="note-badge note-badge-${esc(n.type)}" data-tip="${esc(tips[n.type] || n.type)}">${esc(opt ? opt.label : n.type)}</span>`;
+        const key = noteFilterKey(n);
+        const opt = NOTE_TYPE_OPTIONS.find((o) => o.value === key);
+        return `<span class="note-badge note-badge-${esc(key)}" data-tip="${esc(tips[key] || n.type)}">${esc(opt ? opt.label : n.type)}</span>`;
       }
       /**
        * One note: header (badge, title, time), a collapsed preview, and the
@@ -1199,6 +1213,14 @@
           details = `<div class="kv-row" data-tip="The verdict of this action's latest finished live run."><span class="k">verdict</span><span class="v">${esc(n.verdict || "not run yet")}${n.verdict_unbacked ? ` <span style="color:var(--ignored)" data-tip="The agent reported a pass or a confirmed fix, but no command it proposed matches a shell call ralphus recorded.\nIt may have tested another way (GUI, browser, MCP tools); the verdict itself is unchanged.\nTreat it as unverified until you reproduce it.">(not backed by a recorded command)</span>` : ""}</span></div>
             <div class="k" data-tip="What the live run was asked to do.">prompt</div><div class="mono" style="${block}">${esc(n.prompt)}</div>
             ${n.report ? `<div class="k" data-tip="The agent's report from the latest finished run.">report</div><div class="mono" style="${block}">${esc(n.report)}</div>` : ""}`;
+        } else if (n.type === "deferral") {
+          preview = n.content;
+          const squad = n.squad_id
+            ? `<a href="#" data-click="gotoSquad" data-squad-id="${esc(n.squad_id)}" data-tip="Open the follow-up squad accepting this deferral created.">${esc(n.squad_id)}</a>`
+            : (n.accepted ? "accepted, not submitted yet" : "none");
+          details = `<div class="kv-row" data-tip="The cell that wrote this deferral."><span class="k">from</span><span class="v mono">${esc(n.owner_uri)}</span></div>
+            <div class="kv-row" data-tip="Whether the deferral was ignored. Ignored deferrals are left out of the follow-up offer."><span class="k">ignored</span><span class="v">${n.ignored ? "yes" : "no"}</span></div>
+            <div class="kv-row" data-tip="The follow-up squad created when this deferral was accepted."><span class="k">follow-up squad</span><span class="v">${squad}</span></div>`;
         } else {
           preview = n.content;
           details = `<div class="kv-row" data-tip="The cell or review worktree that wrote this ghost."><span class="k">from</span><span class="v mono">${esc(n.owner_uri)}</span></div>`;
@@ -1217,8 +1239,8 @@
           </div>`;
       }
       /**
-       * The Notes tab: this branch's appraisals, live actions and latest ghost,
-       * filterable by type, with explicit empty states. Requests data the first
+       * The Notes tab: this branch's appraisals, live actions, latest ghost and
+       * deferrals, filterable by type, with explicit empty states. Requests data the first
        * time it renders after the tab is opened.
        * @param {GuardianView} g - The review.
        * @param {GuardianBranch} b - The selected branch.
@@ -1231,10 +1253,10 @@
         if (data === "loading") return `<div class="empty">Loading notes…</div>`;
         if (data === "error") return `<div class="empty" data-tip="The daemon could not return this branch's notes. Reopen the tab to retry.">Could not load notes.</div>`;
         const posting = data.post_appraisals ? "" : `<div class="insp-pr-sub" style="color:var(--ignored)" data-tip="This review's posting setting is off, so its PR omits appraisals on purpose. The appraisals below are still stored.\nChange it in the review's settings.">Posting disabled for this review — appraisals are not added to its PR.</div>`;
-        const shown = data.notes.filter((n) => notesTypeFilter.has(n.type));
+        const shown = data.notes.filter((n) => notesTypeFilter.has(noteFilterKey(n)));
         const bar = `<div class="notes-bar"><span id="notes-type-filter"></span><span class="insp-pr-sub" data-tip="How many of this branch's notes pass the Type filter.">${shown.length} of ${data.notes.length} notes</span></div>`;
         if (!data.notes.length) {
-          return `${posting}${bar}<div class="empty" data-tip="This branch has no appraisal, no live action attributed to it and no ghost yet.">No notes</div>`;
+          return `${posting}${bar}<div class="empty" data-tip="This branch has no appraisal, no live action attributed to it, no ghost and no deferral yet.">No notes</div>`;
         }
         if (!shown.length) {
           return `${posting}${bar}<div class="empty" data-tip="Every note type is filtered out. Use the Type filter to show some.">No notes match the filter</div>`;
