@@ -14117,8 +14117,9 @@ fn guardian_branch_appraisals(daemon: &Daemon, id: &str, branch_id: &str) -> Rep
 
 /// `GET /api/guardians/{id}/branches/{branch_id}/notes` (RAL-670) -- every
 /// note of one review branch in a single newest-first list: its appraisals,
-/// the live actions attributed to it, and its latest ghost. Each note has a
-/// `type` of `appraisal`, `live_action` or `ghost`. `post_appraisals` is the
+/// the live actions attributed to it, its latest ghost, and the deferrals its
+/// cells wrote. Each note has a `type` of `appraisal`, `live_action`, `ghost`
+/// or `deferral`. `post_appraisals` is the
 /// review's effective posting setting, as on the appraisals endpoint.
 fn guardian_branch_notes(daemon: &Daemon, id: &str, branch_id: &str) -> Reply {
     let guardian = match daemon.lock().get_guardian(id) {

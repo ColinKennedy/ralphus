@@ -62,7 +62,10 @@
        * @typedef {BranchNoteBase & {type: "ghost", owner_uri: string, content: string}} GhostNote - RAL-670: the branch's latest ghost handoff.
        */
       /**
-       * @typedef {AppraisalNote|LiveActionNote|GhostNote} BranchNote
+       * @typedef {BranchNoteBase & {type: "deferral", owner_uri: string, content: string, ignored: boolean, accepted: boolean, squad_id: string|null}} DeferralNote - A deferred follow-up written by a cell of the branch. `squad_id` is the follow-up squad once accepted.
+       */
+      /**
+       * @typedef {AppraisalNote|LiveActionNote|GhostNote|DeferralNote} BranchNote
        */
       /**
        * @typedef {object} BranchNotes

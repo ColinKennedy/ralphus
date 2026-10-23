@@ -613,6 +613,7 @@
       }
       .note-badge-appraisal { background: var(--accent-a); border-color: var(--accent-b); color: var(--accent); }
       .note-badge-live_action { background: var(--amber-a); border-color: var(--amber-b); color: var(--ignored); }
+      .note-badge-deferral { background: var(--amber-a); border-color: var(--amber-b); color: var(--ignored); }
       .fb-foot {
         display: flex; align-items: center; gap: 8px; margin-top: 8px; padding-top: 7px;
         border-top: 1px solid var(--border-soft); font-size: 10.5px; color: var(--faint);
