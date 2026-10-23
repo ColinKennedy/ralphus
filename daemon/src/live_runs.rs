@@ -422,7 +422,39 @@ impl crate::store::Store {
     }
 
     /// At daemon start: no run can still be executing in this process, so a
-    /// row left `running` was interrupted. Returns how many were.
+    /// row left `running` that had not pinned any commits goes back to
+    /// `queued` and runs again. Returns how many were requeued.
+    ///
+    /// # Errors
+    ///
+    /// On a database failure.
+    pub fn requeue_running_live_runs(&self) -> crate::store::Result<usize> {
+        Ok(self.conn.execute(
+            "UPDATE guardian_live_runs SET state='queued', started_at_ms=NULL, cwd=NULL,
+                 cell_id=NULL, error=NULL
+             WHERE state='running' AND live_ref IS NULL",
+            [],
+        )?)
+    }
+
+    /// Reviews with a queued live run: the ones a worker must be started for
+    /// after a restart.
+    ///
+    /// # Errors
+    ///
+    /// On a database failure.
+    pub fn guardians_with_queued_live_runs(&self) -> crate::store::Result<Vec<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT DISTINCT guardian_id FROM guardian_live_runs WHERE state='queued'")?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    /// At daemon start, after [`Self::requeue_running_live_runs`]: a row still
+    /// `running` had already pinned its commits, so rerunning it would repeat
+    /// work whose result is on record; it is marked interrupted instead.
+    /// Returns how many were.
     ///
     /// # Errors
     ///
@@ -3232,7 +3264,30 @@ prompt = "second"
     }
 
     #[test]
-    fn a_restart_marks_running_runs_interrupted() {
+    fn a_restart_requeues_running_runs_and_lists_their_review() {
+        let f = fixture("restart-requeue", "ok");
+        let id = f
+            .store
+            .lock()
+            .queue_live_run(&f.gid, LiveRunKind::Live, 0, "x", "auto")
+            .unwrap();
+        f.store
+            .lock()
+            .start_live_run(&id, "/somewhere", "live-0-x")
+            .unwrap();
+        assert_eq!(f.store.lock().requeue_running_live_runs().unwrap(), 1);
+        assert_eq!(f.store.lock().interrupt_running_live_runs().unwrap(), 0);
+        let run = live_run_conn(&f.store.lock().conn, &id).unwrap();
+        assert_eq!(run.state, "queued");
+        assert!(run.started_at_ms.is_none());
+        assert_eq!(
+            f.store.lock().guardians_with_queued_live_runs().unwrap(),
+            vec![f.gid.clone()]
+        );
+    }
+
+    #[test]
+    fn a_restart_marks_running_runs_that_pinned_commits_interrupted() {
         let f = fixture("restart", "ok");
         let id = f
             .store
@@ -3243,6 +3298,15 @@ prompt = "second"
             .lock()
             .start_live_run(&id, "/somewhere", "live-0-x")
             .unwrap();
+        f.store
+            .lock()
+            .conn
+            .execute(
+                "UPDATE guardian_live_runs SET live_ref='refs/x' WHERE run_id=?",
+                rusqlite::params![id],
+            )
+            .unwrap();
+        assert_eq!(f.store.lock().requeue_running_live_runs().unwrap(), 0);
         assert_eq!(f.store.lock().interrupt_running_live_runs().unwrap(), 1);
         let run = live_run_conn(&f.store.lock().conn, &id).unwrap();
         assert_eq!(run.state, "interrupted");
