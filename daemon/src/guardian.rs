@@ -6428,6 +6428,34 @@ impl Store {
         Ok(rows)
     }
 
+    /// Every guardian's `id`/`git_root`/`machine`/`status` -- exactly what
+    /// [`crate::guardian_merge::run_periodic_git_maintenance`] needs to pick
+    /// the checkouts to maintain and skip the ones mid-merge, without
+    /// [`Self::list_guardians`]'s per-branch hydration and `.ralphus.toml`
+    /// walk. That maintenance runs inline on the scheduler loop, so reading
+    /// the list under the store lock the way `list_guardians` requires held
+    /// it for seconds on a large database, which is long enough to trip the
+    /// store-guard panic and take the scheduler thread down.
+    ///
+    /// Takes a connection so the read pool can serve it without the writer
+    /// lock.
+    pub(crate) fn list_guardian_root_infos_conn(
+        conn: &Connection,
+    ) -> Result<Vec<crate::guardian_merge::GuardianRootInfo>> {
+        let mut stmt = conn.prepare("SELECT id, git_root, machine, status FROM guardians")?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok(crate::guardian_merge::GuardianRootInfo {
+                    id: r.get(0)?,
+                    git_root: r.get(1)?,
+                    machine: r.get(2)?,
+                    status: r.get(3)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
     /// Per-guardian `status`/`base_branch`/`git_root`/`machine`/`projects` --
     /// exactly what [`crate::guardian_merge::poll_base_branch_freshness_once`]
     /// needs to decide which upstream base branches to refresh, without
@@ -10769,6 +10797,29 @@ mod tests {
             guardian.auto_fix_prompt_template.as_deref(),
             Some("fix: <<prompt>>")
         );
+    }
+
+    #[test]
+    fn root_infos_match_the_full_listing_without_hydrating_it() {
+        let store = Store::open_in_memory().unwrap();
+        let first = store.create_guardian("a", "main", "/repo-a").unwrap();
+        let second = store.create_guardian("b", "main", "/repo-b").unwrap();
+        store.add_guardian_branch(&second, "feature-b").unwrap();
+
+        let mut infos = Store::list_guardian_root_infos_conn(&store.conn).unwrap();
+        infos.sort_by(|left, right| left.id.cmp(&right.id));
+        let mut full = store.list_guardians().unwrap();
+        full.sort_by(|left, right| left.id.cmp(&right.id));
+
+        assert_eq!(infos.len(), 2);
+        assert_eq!(infos[0].id, first);
+        assert_eq!(infos[1].id, second);
+        for (info, guardian) in infos.iter().zip(&full) {
+            assert_eq!(info.id, guardian.id);
+            assert_eq!(info.git_root, guardian.git_root);
+            assert_eq!(info.machine, guardian.machine);
+            assert_eq!(info.status, guardian.status);
+        }
     }
 
     #[test]

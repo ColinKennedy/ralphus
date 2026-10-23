@@ -15852,20 +15852,9 @@ fn retire_terminal_action_publications(store: &crate::store_lock::StoreHandle) {
 /// stampede has settled, is what actually reduces the collision risk;
 /// running it eagerly at startup would reliably raise it instead.
 pub fn run_periodic_git_maintenance(store: &crate::store_lock::StoreHandle) {
-    let guardians: Vec<GuardianRootInfo> = {
-        let guard = store.lock();
-        guard
-            .list_guardians()
-            .unwrap_or_default()
-            .into_iter()
-            .map(|g| GuardianRootInfo {
-                id: g.id,
-                git_root: g.git_root,
-                machine: g.machine,
-                status: g.status,
-            })
-            .collect()
-    };
+    let guardians: Vec<GuardianRootInfo> = store
+        .with_read_snapshot(Store::list_guardian_root_infos_conn)
+        .unwrap_or_default();
     let busy = busy_git_maintenance_roots(&guardians);
     for (root, machine) in collect_git_maintenance_roots(&guardians) {
         if busy.contains(&(root.clone(), machine.clone())) {
