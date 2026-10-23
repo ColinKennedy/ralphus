@@ -1188,6 +1188,15 @@ pub struct ProjectReviewSettings {
     /// recipe-refinement turn. Unset resolves to `true`.
     #[serde(default)]
     pub refine_live_recipe: Option<bool>,
+    /// Project-level PR-writer guidance (see
+    /// [`crate::config::ReviewConfig::pr_guidance`]); it needs no checked-in
+    /// file. At most `ralphus_core::schema::MAX_PR_GUIDANCE_CHARS`.
+    #[serde(default)]
+    pub pr_guidance: Option<String>,
+    /// Globs limiting [`Self::pr_guidance`] to PRs that change a matching
+    /// file; unset or empty applies it to every PR.
+    #[serde(default)]
+    pub pr_guidance_paths: Option<Vec<String>>,
     /// Project-level default for which events (`rebase`, `feedback`,
     /// `auto_fix`) tear down and rebuild a review's prepared build. Unset
     /// resolves to all three; an empty list never rebuilds automatically.
@@ -1284,6 +1293,8 @@ impl ProjectReviewSettings {
             auto_run: self.auto_run,
             live_actions: self.live_actions,
             refine_live_recipe: self.refine_live_recipe,
+            pr_guidance: self.pr_guidance,
+            pr_guidance_paths: self.pr_guidance_paths,
             rebuild_on: self.rebuild_on,
             auto_fix_max_attempts: None,
             auto_fix_weak_progress_refunds: None,
@@ -4656,6 +4667,10 @@ impl Store {
             // Per-review agent/model for live actions; NULL uses the resolver.
             "ALTER TABLE guardians ADD COLUMN live_action_agent TEXT",
             "ALTER TABLE guardians ADD COLUMN live_action_model TEXT",
+            // Per-review PR-writer guidance and its path filter (a JSON array of
+            // globs); NULL inherits the project's guidance.
+            "ALTER TABLE guardians ADD COLUMN pr_guidance TEXT",
+            "ALTER TABLE guardians ADD COLUMN pr_guidance_paths TEXT",
             // Per-review overrides of the global `[followup]` config: whether
             // this review offers follow-up work when it merges, and whether an
             // accepted follow-up squad starts at once. NULL inherits the
@@ -20899,6 +20914,8 @@ command = "e"
             auto_run: Some(true),
             live_actions: Some(true),
             refine_live_recipe: Some(false),
+            pr_guidance: Some("List the test commands.".to_string()),
+            pr_guidance_paths: Some(vec!["svc/**".to_string()]),
             rebuild_on: Some(vec!["feedback".to_string(), "auto_fix".to_string()]),
             base_shift_maximum_rebuilds: Some(5),
             exhibits_enabled: Some(false),

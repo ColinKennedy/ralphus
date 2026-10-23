@@ -74,6 +74,7 @@ pub mod plan;
 pub mod poller_health;
 pub mod pr;
 pub mod pr_attribution;
+pub mod pr_guidance;
 pub mod preset_roles;
 pub mod presets;
 pub mod procreg;

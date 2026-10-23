@@ -3366,6 +3366,12 @@ struct EffectiveReviewDefaults {
     live_action_agent: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     live_action_model: Option<String>,
+    /// Free-text PR-writer guidance and its optional path globs; see
+    /// [`crate::pr_guidance`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pr_guidance: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pr_guidance_paths: Option<Vec<String>>,
     /// The base branch `ralphus ingest` falls back to (no other review reads it).
     #[serde(skip_serializing_if = "Option::is_none")]
     default_base_branch: Option<String>,
@@ -3437,6 +3443,8 @@ impl EffectiveReviewDefaults {
             resolver_model: cfg.default_resolver_model().map(str::to_string),
             live_action_agent: cfg.default_live_action_agent().map(str::to_string),
             live_action_model: cfg.default_live_action_model().map(str::to_string),
+            pr_guidance: cfg.pr_guidance.clone(),
+            pr_guidance_paths: cfg.pr_guidance_paths.clone(),
             default_base_branch: cfg.default_base_branch().map(str::to_string),
             machine: cfg.default_machine().map(str::to_string),
             maximum_budget_usd: cfg.default_maximum_budget_usd(),
@@ -3541,6 +3549,13 @@ struct ProjectReviewSettingsBody {
     /// The model for `default_live_action_agent`; requires an agent.
     #[serde(default)]
     default_live_action_model: Option<String>,
+    /// PR-writer guidance (at most `MAX_PR_GUIDANCE_CHARS` characters); an
+    /// empty string clears it and its paths.
+    #[serde(default)]
+    pr_guidance: Option<String>,
+    /// Globs over changed paths that gate `pr_guidance`; empty means all.
+    #[serde(default)]
+    pr_guidance_paths: Option<Vec<String>>,
     /// The base branch `ralphus ingest` falls back to; an empty string clears
     /// it, a whitespace-only value is rejected.
     #[serde(default)]
@@ -3865,6 +3880,23 @@ fn set_project_review_settings(daemon: &Daemon, name: &str, body: &str) -> Reply
         std::path::Path::new(&project.path),
     ) {
         return reply;
+    }
+    if let Some(v) = req.pr_guidance {
+        if let Err(message) = crate::pr_guidance::check_size(&v) {
+            return error(400, "invalid_value", &message, vec![]);
+        }
+        let v = v.trim().to_string();
+        if v.is_empty() {
+            settings.pr_guidance_paths = None;
+        }
+        settings.pr_guidance = clear_if_empty(v);
+    }
+    if let Some(v) = req.pr_guidance_paths {
+        settings.pr_guidance_paths = if v.is_empty() || settings.pr_guidance.is_none() {
+            None
+        } else {
+            Some(v)
+        };
     }
     if let Some(v) = req.default_base_branch {
         settings.default_base_branch = clear_if_empty(v.trim().to_string());
@@ -15967,6 +15999,12 @@ struct GuardianSettingsBody {
     /// The model for `live_action_agent`; requires an agent.
     #[serde(default)]
     live_action_model: Option<String>,
+    /// This review's PR-writer guidance; an empty string clears it.
+    #[serde(default)]
+    pr_guidance: Option<String>,
+    /// Globs over changed paths that gate `pr_guidance`; empty means all.
+    #[serde(default)]
+    pr_guidance_paths: Option<Vec<String>>,
     #[serde(default)]
     base_branch: Option<String>,
     /// RAL-117: opt this review into automatically incorporating PR feedback
@@ -16337,6 +16375,11 @@ struct GuardianDetailsBody {
     live_action_agent: Option<String>,
     #[serde(default)]
     live_action_model: Option<String>,
+    /// See [`GuardianSettingsBody::pr_guidance`].
+    #[serde(default)]
+    pr_guidance: Option<String>,
+    #[serde(default)]
+    pr_guidance_paths: Option<Vec<String>>,
     #[serde(default)]
     proof_scope: Option<String>,
     /// See [`GuardianSettingsBody::ci_deferral`].
@@ -16912,6 +16955,43 @@ fn apply_live_action_fields(
         .map(|e| store_error(&e))
 }
 
+/// Validates and applies a review's PR-guidance fields: over-cap text is
+/// rejected, empty text clears the text and its paths, and paths alone only
+/// refine guidance the review already has.
+fn apply_pr_guidance_fields(
+    store: &crate::store::Store,
+    guardian: &crate::guardian::GuardianView,
+    text: Option<&str>,
+    paths: Option<&[String]>,
+) -> Option<Reply> {
+    if text.is_none() && paths.is_none() {
+        return None;
+    }
+    if let Some(text) = text {
+        if let Err(message) = crate::pr_guidance::check_size(text) {
+            return Some(error(400, "invalid_value", &message, vec![]));
+        }
+    }
+    let (new_text, new_paths) = match text.map(str::trim) {
+        Some("") => (None, None),
+        Some(t) => (
+            Some(t.to_string()),
+            paths
+                .map(<[String]>::to_vec)
+                .or(guardian.pr_guidance_paths.clone()),
+        ),
+        None => match guardian.pr_guidance.clone() {
+            Some(existing) => (Some(existing), paths.map(<[String]>::to_vec)),
+            None => (None, None),
+        },
+    };
+    let new_paths = new_paths.filter(|p| !p.is_empty());
+    store
+        .set_guardian_pr_guidance(&guardian.id, new_text.as_deref(), new_paths.as_deref())
+        .err()
+        .map(|e| store_error(&e))
+}
+
 /// Update per-review settings (opt-out flags). Only the fields present in the
 /// body are changed; the updated guardian view is returned.
 fn guardian_settings(daemon: &Daemon, id: &str, body: &str) -> Reply {
@@ -16988,6 +17068,14 @@ fn guardian_settings(daemon: &Daemon, id: &str, body: &str) -> Reply {
             &guardian,
             req.live_action_agent.as_deref(),
             req.live_action_model.as_deref(),
+        ) {
+            return reply;
+        }
+        if let Some(reply) = apply_pr_guidance_fields(
+            &store,
+            &guardian,
+            req.pr_guidance.as_deref(),
+            req.pr_guidance_paths.as_deref(),
         ) {
             return reply;
         }
@@ -17407,6 +17495,14 @@ fn guardian_details(daemon: &Daemon, id: &str, body: &str) -> Reply {
         &guardian,
         req.live_action_agent.as_deref(),
         req.live_action_model.as_deref(),
+    ) {
+        return reply;
+    }
+    if let Some(reply) = apply_pr_guidance_fields(
+        &store,
+        &guardian,
+        req.pr_guidance.as_deref(),
+        req.pr_guidance_paths.as_deref(),
     ) {
         return reply;
     }
@@ -27245,6 +27341,50 @@ triage=true
         let r = route(&d, "GET", "/api/projects/proj/review-settings", "");
         let body: serde_json::Value = serde_json::from_str(&r.body).unwrap();
         assert!(body["settings"]["default_resolver_agent"].is_null());
+    }
+
+    #[test]
+    fn project_review_settings_route_pr_guidance_roundtrips_caps_and_clears() {
+        let d = daemon();
+        let repo = tmp_git_repo("rs-guid");
+        route(
+            &d,
+            "POST",
+            "/api/projects",
+            &register_body("proj", &repo.to_string_lossy(), ""),
+        );
+        let r = route(
+            &d,
+            "POST",
+            "/api/projects/proj/review-settings",
+            r#"{"pr_guidance":"be terse","pr_guidance_paths":["svc/**"]}"#,
+        );
+        assert_eq!(r.status, 200, "{}", r.body);
+        let r = route(&d, "GET", "/api/projects/proj/review-settings", "");
+        let body: serde_json::Value = serde_json::from_str(&r.body).unwrap();
+        assert_eq!(body["settings"]["pr_guidance"], "be terse");
+        assert_eq!(body["settings"]["pr_guidance_paths"][0], "svc/**");
+
+        let over = "x".repeat(crate::pr_guidance::MAX_PR_GUIDANCE_CHARS + 1);
+        let r = route(
+            &d,
+            "POST",
+            "/api/projects/proj/review-settings",
+            &format!(r#"{{"pr_guidance":"{over}"}}"#),
+        );
+        assert_eq!(r.status, 400, "{}", r.body);
+
+        let r = route(
+            &d,
+            "POST",
+            "/api/projects/proj/review-settings",
+            r#"{"pr_guidance":""}"#,
+        );
+        assert_eq!(r.status, 200, "{}", r.body);
+        let r = route(&d, "GET", "/api/projects/proj/review-settings", "");
+        let body: serde_json::Value = serde_json::from_str(&r.body).unwrap();
+        assert!(body["settings"]["pr_guidance"].is_null());
+        assert!(body["settings"]["pr_guidance_paths"].is_null());
     }
 
     #[test]

@@ -93,6 +93,8 @@ pub enum ReviewCommand {
         resolver_model: Option<String>,
         live_action_agent: Option<String>,
         live_action_model: Option<String>,
+        pr_guidance: Option<String>,
+        pr_guidance_paths: Option<Vec<String>>,
         base_branch: Option<String>,
         auto_pr_feedback: Option<bool>,
         proof_scope: Option<String>,
@@ -498,6 +500,12 @@ pub fn parse(args: &[String]) -> ReviewCommand {
             let resolver_model = scanner.take_value("--resolver-model").ok().flatten();
             let live_action_agent = scanner.take_value("--live-action-agent").ok().flatten();
             let live_action_model = scanner.take_value("--live-action-model").ok().flatten();
+            let pr_guidance = scanner.take_value("--pr-guidance").ok().flatten();
+            let pr_guidance_paths = scanner
+                .take_value("--pr-guidance-paths")
+                .ok()
+                .flatten()
+                .map(|raw| super::project::split_csv(&raw));
             let base_branch = scanner.take_value("--base-branch").ok().flatten();
             let auto_pr_feedback = take_tri_bool(&mut scanner, "--auto-pr-feedback");
             let proof_scope = scanner.take_value("--proof-scope").ok().flatten();
@@ -547,6 +555,8 @@ pub fn parse(args: &[String]) -> ReviewCommand {
                 resolver_model,
                 live_action_agent,
                 live_action_model,
+                pr_guidance,
+                pr_guidance_paths,
                 base_branch,
                 auto_pr_feedback,
                 proof_scope,
@@ -1738,6 +1748,8 @@ pub fn dispatch(cmd: ReviewCommand, opts: &GlobalOpts) -> i32 {
             resolver_model,
             live_action_agent,
             live_action_model,
+            pr_guidance,
+            pr_guidance_paths,
             base_branch,
             auto_pr_feedback,
             proof_scope,
@@ -1770,6 +1782,8 @@ pub fn dispatch(cmd: ReviewCommand, opts: &GlobalOpts) -> i32 {
                 resolver_model: resolver_model.as_deref(),
                 live_action_agent: live_action_agent.as_deref(),
                 live_action_model: live_action_model.as_deref(),
+                pr_guidance: pr_guidance.as_deref(),
+                pr_guidance_paths,
                 base_branch: base_branch.as_deref(),
                 auto_pr_feedback,
                 proof_scope: proof_scope.as_deref(),
@@ -3160,6 +3174,14 @@ fn render_review_detail(g: &Value) {
             .as_str()
             .filter(|s| !s.is_empty())
             .unwrap_or("(resolver agent)")
+            .to_string(),
+    ));
+    rows.push((
+        "pr_guidance",
+        g["pr_guidance"]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .unwrap_or("(inherited)")
             .to_string(),
     ));
     rows.push((

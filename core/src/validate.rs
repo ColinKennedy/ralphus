@@ -394,6 +394,8 @@ pub const REVIEW_KEYS: &[&str] = &[
     "discourage_tests_during_auto_pull_request_fixes",
     "auto_cancel_outdated_pr_pipelines",
     "post_appraisals",
+    "pr_guidance",
+    "pr_guidance_paths",
     "summary_format",
     "cache_manual_checks",
     "skip_manual_checks",
@@ -2724,6 +2726,28 @@ fn validate_review_blocks(value: Option<&toml::Value>, ctx: &mut Ctx) {
             header,
         );
         check_type(ctx, table, "post_appraisals", Ty::Bool, &rpath, header);
+        check_type(ctx, table, "pr_guidance", Ty::Str, &rpath, header);
+        check_type(
+            ctx,
+            table,
+            "pr_guidance_paths",
+            Ty::StrArray,
+            &rpath,
+            header,
+        );
+        if let Some(text) = table.get("pr_guidance").and_then(toml::Value::as_str) {
+            if text.chars().count() > crate::schema::MAX_PR_GUIDANCE_CHARS {
+                ctx.error(
+                    &format!("{rpath}.pr_guidance"),
+                    ErrorKind::InvalidValue,
+                    format!(
+                        "'pr_guidance' must be at most {} characters",
+                        crate::schema::MAX_PR_GUIDANCE_CHARS
+                    ),
+                    ctx.key_line(header, "pr_guidance"),
+                );
+            }
+        }
         check_type(ctx, table, "cache_manual_checks", Ty::Bool, &rpath, header);
         check_type(ctx, table, "skip_manual_checks", Ty::Bool, &rpath, header);
         check_type(ctx, table, "auto_run", Ty::Bool, &rpath, header);
@@ -5307,6 +5331,37 @@ auto_run=false
         format!(
             "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nreview=\"<<review:r>>\"\n[[review]]\nid=\"r\"\nrebuild_on={value}\n"
         )
+    }
+
+    fn pr_guidance_src(extra: &str) -> String {
+        format!(
+            "[[task]]\nname=\"t\"\n[[task.cell]]\ncwd=\"/r\"\nprompt=\"p\"\nreview=\"<<review:r>>\"\n[[review]]\nid=\"r\"\n{extra}\n"
+        )
+    }
+
+    #[test]
+    fn review_pr_guidance_accepts_text_and_paths_up_to_the_cap() {
+        let at_cap = "x".repeat(crate::schema::MAX_PR_GUIDANCE_CHARS);
+        let src = pr_guidance_src(&format!(
+            "pr_guidance=\"{at_cap}\"\npr_guidance_paths=[\"svc/**\"]"
+        ));
+        let r = validate_toml(&src);
+        assert!(r.is_ok(), "{:?}", r.errors);
+    }
+
+    #[test]
+    fn review_pr_guidance_rejects_over_cap_and_wrong_types() {
+        let over = "x".repeat(crate::schema::MAX_PR_GUIDANCE_CHARS + 1);
+        let r = validate_toml(&pr_guidance_src(&format!("pr_guidance=\"{over}\"")));
+        assert!(
+            r.errors
+                .iter()
+                .any(|e| e.kind == ErrorKind::InvalidValue && e.message.contains("pr_guidance")),
+            "{:?}",
+            r.errors
+        );
+        assert!(!validate_toml(&pr_guidance_src("pr_guidance=3")).is_ok());
+        assert!(!validate_toml(&pr_guidance_src("pr_guidance_paths=\"a\"")).is_ok());
     }
 
     #[test]

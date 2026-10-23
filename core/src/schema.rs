@@ -2079,6 +2079,11 @@ pub fn resolve_cell_proof_maximum_tool_output_tokens(
         .or_else(|| resolve_cell_maximum_tool_output_tokens(task, cell))
 }
 
+/// The most characters one PR-guidance entry may hold. Longer guidance is
+/// rejected when set through a task file or the settings API, and truncated
+/// (with a visible marker) when it comes from a `.ralphus.toml`.
+pub const MAX_PR_GUIDANCE_CHARS: usize = 2000;
+
 /// A top-level review (guardian) declaration via `[[review]]`.
 ///
 /// Cells opt in by declaring `review = "<<review:<id>>>"`. When several cells resolve
@@ -2266,6 +2271,18 @@ pub struct ReviewDef {
     /// this directly, since they have no `[[review]]` block to read it from.
     #[serde(default)]
     pub post_appraisals: Option<bool>,
+    /// Free-text guidance appended to the prompt of the agent that writes
+    /// this review's PR/MR titles and descriptions. When set it replaces the
+    /// project's review-settings guidance for this review; the global config
+    /// and `.ralphus.toml` guidance still stack around it. At most
+    /// [`MAX_PR_GUIDANCE_CHARS`] characters.
+    #[serde(default)]
+    pub pr_guidance: Option<String>,
+    /// Glob filter for `pr_guidance`: the guidance applies only to a PR that
+    /// changes a file matching one of these repo-relative globs. Unset or
+    /// empty applies it to every PR.
+    #[serde(default)]
+    pub pr_guidance_paths: Option<Vec<String>>,
     /// RAL-521: whether this review's manual checks are computed once, when
     /// its review branches are first created, and then reused through later
     /// merges, rebases, and automated fix iterations. Unset inherits the

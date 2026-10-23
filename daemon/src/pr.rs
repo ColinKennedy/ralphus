@@ -2715,6 +2715,23 @@ fn branch_changed_paths(
     .collect()
 }
 
+/// The PR-writer prompt section for this branch's stacked PR guidance (empty
+/// when no entry applies, leaving the prompt unchanged). Settings layers come
+/// from the review's resolved entries; `.ralphus.toml` files stack after them.
+fn pr_guidance_note(
+    ws: &crate::workspace::Workspace,
+    guardian: &GuardianView,
+    position: i64,
+) -> String {
+    let changed = branch_changed_paths(ws, guardian, position);
+    let mut entries = guardian.effective_pr_guidance.clone();
+    entries.extend(crate::pr_guidance::file_entries(
+        Path::new(&guardian.git_root),
+        &changed,
+    ));
+    crate::pr_guidance::guidance_note(&entries, &changed)
+}
+
 /// Turn the project's `.ralphus.toml` exhibit recipes that match this branch's
 /// changes into exhibit slots (or pending requests), when the review shows
 /// exhibits at all.
@@ -3421,6 +3438,7 @@ fn synthesize_pr_text(
                 .to_string(),
         )
     };
+    let guidance_note = pr_guidance_note(ws, guardian, position);
     let prompt = format!(
         "Suggest a pull request title and description for one branch in a \
          stacked review. Use ONLY the commits and diff in the unique range \
@@ -3441,7 +3459,7 @@ fn synthesize_pr_text(
          appear in the PR, with no quoting or escaping of any of it>\n\n\
          The description should explain what changed and why, focused on developer \
          intent rather than file-level detail. Keep it under {MAX_PR_DESCRIPTION_CHARS} \
-         characters.{template_note}{prophecy_note}{}",
+         characters.{template_note}{guidance_note}{prophecy_note}{}",
         exhibit_note.unwrap_or_default()
     );
     let spec = pr_writer_spec(guardian, position, resolved, prompt, trace_context);
@@ -25325,6 +25343,104 @@ token_env = "RALPHUS_TEST_FORGE_TOKEN"
             *self.0.lock().unwrap() = Some(spec.clone());
             crate::runner::RunnerResult::failure("writer unavailable")
         }
+    }
+
+    fn guidance_prompt(toml: Option<&str>, tag: &str, template: Option<&str>) -> String {
+        let root = tmp_dir(tag);
+        g(&root, &["init", "--initial-branch", "main"]);
+        gwrite(
+            &root, "base.txt", "base
+",
+        );
+        g(&root, &["add", "."]);
+        g(&root, &["commit", "--message", "base"]);
+        g(&root, &["checkout", "-b", "review/x"]);
+        gwrite(
+            &root, "x.txt", "add x
+",
+        );
+        g(&root, &["add", "."]);
+        g(&root, &["commit", "--message", "add x"]);
+        g(&root, &["checkout", "main"]);
+        if let Some(t) = toml {
+            gwrite(&root, ".ralphus.toml", t);
+        }
+        let store = store();
+        let gid = store
+            .create_guardian("demo", "main", root.to_str().unwrap())
+            .unwrap();
+        store.add_guardian_branch(&gid, "x").unwrap();
+        let branch_id = store.get_guardian(&gid).unwrap().branches[0].id.clone();
+        store
+            .set_branch_review(&gid, &branch_id, "review/x", "worktree-x")
+            .unwrap();
+        let guardian = store.get_guardian(&gid).unwrap();
+        let runner = CapturingFailureRunner(Mutex::new(None));
+        let _ = synthesize_pr_text(
+            &runner,
+            &crate::workspace::Workspace::local(&guardian.git_root),
+            &guardian,
+            0,
+            template,
+            None,
+            &[],
+            None,
+        );
+        let prompt = runner.0.lock().unwrap().clone().unwrap().prompt.unwrap();
+        let _ = std::fs::remove_dir_all(root);
+        prompt
+    }
+
+    #[test]
+    fn pr_guidance_from_ralphus_toml_reaches_the_prompt_and_keeps_template_headings() {
+        let template = "## Overview
+
+## Test plan
+";
+        let with = guidance_prompt(
+            Some(
+                "[review]
+pr_guidance = \"Always list the test commands.\"
+",
+            ),
+            "pr-guidance-on",
+            Some(template),
+        );
+        assert!(with.contains("Always list the test commands."), "{with}");
+        assert!(with.contains(template), "template headings preserved");
+        let template_at = with.find(template).unwrap();
+        let guidance_at = with.find("Always list the test commands.").unwrap();
+        assert!(template_at < guidance_at, "guidance follows the template");
+    }
+
+    #[test]
+    fn pr_guidance_off_leaves_the_prompt_free_of_a_guidance_section() {
+        let without = guidance_prompt(None, "pr-guidance-off", None);
+        assert!(!without.contains("Project guidance for PR descriptions"));
+        let filtered = guidance_prompt(
+            Some(
+                "[review]
+pr_guidance = \"docs only\"
+pr_guidance_paths = [\"docs/**\"]
+",
+            ),
+            "pr-guidance-filtered",
+            None,
+        );
+        let mask = |p: &str| {
+            p.lines()
+                .filter(|l| !l.starts_with("commit "))
+                .collect::<Vec<_>>()
+                .join(
+                    "
+",
+                )
+        };
+        assert_eq!(
+            mask(&filtered),
+            mask(&without),
+            "a non-matching path glob adds nothing"
+        );
     }
 
     #[test]

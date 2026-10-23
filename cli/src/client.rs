@@ -585,6 +585,12 @@ impl DaemonClient {
             "default_live_action_model",
             patch.default_live_action_model,
         );
+        set_if_some(&mut body, "pr_guidance", patch.pr_guidance);
+        set_if_some(
+            &mut body,
+            "pr_guidance_paths",
+            patch.pr_guidance_paths.clone(),
+        );
         set_if_some(&mut body, "default_base_branch", patch.default_base_branch);
         set_if_some(&mut body, "default_machine", patch.default_machine);
         set_if_some(
@@ -2116,6 +2122,16 @@ impl DaemonClient {
         );
         set_if_some(
             &mut body,
+            "pr_guidance",
+            settings.pr_guidance.map(str::to_string),
+        );
+        set_if_some(
+            &mut body,
+            "pr_guidance_paths",
+            settings.pr_guidance_paths.clone(),
+        );
+        set_if_some(
+            &mut body,
             "base_branch",
             settings.base_branch.map(str::to_string),
         );
@@ -2752,6 +2768,12 @@ pub struct GuardianSettings<'a> {
     /// back to the resolver agent. A live model requires a live agent.
     pub live_action_agent: Option<&'a str>,
     pub live_action_model: Option<&'a str>,
+    /// Free-text guidance for the agent that writes this review's PR/MR
+    /// titles and descriptions; an empty string clears it. At most 2000
+    /// characters.
+    pub pr_guidance: Option<&'a str>,
+    /// Globs over changed paths that gate `pr_guidance`; empty means all.
+    pub pr_guidance_paths: Option<Vec<String>>,
     pub base_branch: Option<&'a str>,
     pub auto_pr_feedback: Option<bool>,
     pub proof_scope: Option<&'a str>,
@@ -2841,6 +2863,11 @@ pub struct ProjectReviewSettingsPatch<'a> {
     pub default_resolver_model: Option<&'a str>,
     pub default_live_action_agent: Option<&'a str>,
     pub default_live_action_model: Option<&'a str>,
+    /// Project default PR-writer guidance (at most 2000 characters); an empty
+    /// string clears it and its paths.
+    pub pr_guidance: Option<&'a str>,
+    /// Globs over changed paths that gate `pr_guidance`; empty means all.
+    pub pr_guidance_paths: Option<Vec<String>>,
     pub default_base_branch: Option<&'a str>,
     pub default_machine: Option<&'a str>,
     pub default_maximum_budget_usd: Option<f64>,
