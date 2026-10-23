@@ -166,6 +166,11 @@ pub struct TriageCandidateView {
     /// whether the cell would actually be included in the next drain.
     pub status: String,
     pub triage_types: Vec<String>,
+    /// RAL-721: who chose `triage_types` (`arbiter`, `inline`, `fallback`);
+    /// `None` for cells classified before this was recorded.
+    pub triage_source: Option<String>,
+    /// RAL-721: the Arbiter's short reason for the type(s), if recorded.
+    pub triage_rationale: Option<String>,
     /// Exact pool keys that currently contain this candidate. Classified
     /// candidates can remain visible after their pool has drained.
     pub pools: Vec<TriagePoolMembership>,
@@ -400,6 +405,14 @@ impl Store {
 
 // ── Per-cell resolved type (classification result) ──────────────────────────
 
+/// `triage_cell_decisions.source` for a type the Arbiter chose.
+pub const TRIAGE_SOURCE_ARBITER: &str = "arbiter";
+/// `triage_cell_decisions.source` for a type set inline by the task file's
+/// `triage_type`.
+pub const TRIAGE_SOURCE_INLINE: &str = "inline";
+/// `triage_cell_decisions.source` for a cell the Arbiter could not classify.
+pub const TRIAGE_SOURCE_FALLBACK: &str = "fallback";
+
 impl Store {
     /// Persist the resolved Triage type(s) for one cell -- either the cell's
     /// own inline `triage_type` list, or the Arbiter's classification
@@ -427,6 +440,10 @@ impl Store {
             "DELETE FROM triage_cell_types WHERE squad_id=? AND task_idx=? AND idx=?",
             params![squad_id, task_idx, idx],
         )?;
+        self.conn.execute(
+            "DELETE FROM triage_cell_decisions WHERE squad_id=? AND task_idx=? AND idx=?",
+            params![squad_id, task_idx, idx],
+        )?;
         for triage_type in triage_types {
             self.conn.execute(
                 "INSERT INTO triage_cell_types(squad_id, task_idx, idx, triage_type, created_at_ms)
@@ -435,6 +452,72 @@ impl Store {
             )?;
         }
         Ok(())
+    }
+
+    /// [`Self::set_cell_triage_types`] plus who decided (`source`: one of
+    /// [`TRIAGE_SOURCE_ARBITER`], [`TRIAGE_SOURCE_INLINE`],
+    /// [`TRIAGE_SOURCE_FALLBACK`]) and the Arbiter's `rationale` (RAL-721).
+    ///
+    /// # Errors
+    /// Propagates any SQLite failure.
+    pub fn set_cell_triage_decision(
+        &self,
+        squad_id: &str,
+        task_idx: i64,
+        idx: i64,
+        triage_types: &[String],
+        source: &str,
+        rationale: &str,
+    ) -> StoreResult<()> {
+        self.set_cell_triage_types(squad_id, task_idx, idx, triage_types)?;
+        self.conn.execute(
+            "INSERT OR REPLACE INTO triage_cell_decisions(squad_id, task_idx, idx, source, rationale, created_at_ms)
+             VALUES(?,?,?,?,?,?)",
+            params![squad_id, task_idx, idx, source, rationale, now_ms()],
+        )?;
+        Ok(())
+    }
+
+    /// `(source, rationale)` recorded for one cell by
+    /// [`Self::set_cell_triage_decision`]; `None` for cells without one.
+    ///
+    /// # Errors
+    /// Propagates any SQLite failure.
+    pub fn get_cell_triage_decision(
+        &self,
+        squad_id: &str,
+        task_idx: i64,
+        idx: i64,
+    ) -> StoreResult<Option<(String, String)>> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT source, rationale FROM triage_cell_decisions WHERE squad_id=? AND task_idx=? AND idx=?",
+        )?;
+        let mut rows = stmt.query(params![squad_id, task_idx, idx])?;
+        match rows.next()? {
+            Some(r) => Ok(Some((r.get(0)?, r.get(1)?))),
+            None => Ok(None),
+        }
+    }
+
+    /// Every cell's `(source, rationale)` for a squad, keyed by
+    /// `(task_idx, idx)` -- the bulk counterpart to
+    /// [`Self::get_cell_triage_decision`].
+    ///
+    /// # Errors
+    /// Propagates any SQLite failure.
+    pub fn triage_decisions_by_cell(
+        conn: &Connection,
+        squad_id: &str,
+    ) -> StoreResult<std::collections::HashMap<(i64, i64), (String, String)>> {
+        let mut stmt = conn.prepare_cached(
+            "SELECT task_idx, idx, source, rationale FROM triage_cell_decisions WHERE squad_id=?",
+        )?;
+        let rows = stmt
+            .query_map(params![squad_id], |r| {
+                Ok(((r.get(0)?, r.get(1)?), (r.get(2)?, r.get(3)?)))
+            })?
+            .collect::<std::result::Result<_, _>>()?;
+        Ok(rows)
     }
 
     /// Records that a Triage-opted-in cell is awaiting Arbiter classification
@@ -613,6 +696,13 @@ impl Store {
         ) in rows
         {
             let triage_types = self.get_cell_triage_types(&squad_id, task_idx, idx)?;
+            let (triage_source, triage_rationale) =
+                match self.get_cell_triage_decision(&squad_id, task_idx, idx)? {
+                    Some((source, rationale)) => {
+                        (Some(source), Some(rationale).filter(|r| !r.is_empty()))
+                    }
+                    None => (None, None),
+                };
             let project = project
                 .unwrap_or_else(|| crate::store::fallback_project_identifier(cwd.as_deref()));
             let effective = self
@@ -668,6 +758,8 @@ impl Store {
                 project,
                 status,
                 triage_types,
+                triage_source,
+                triage_rationale,
                 pools,
             });
         }
@@ -1958,6 +2050,35 @@ mod tests {
             s.deregister_triage_type("nope").unwrap(),
             DeregisterOutcome::NotFound
         );
+    }
+
+    #[test]
+    fn triage_decision_round_trips_and_is_cleared_by_plain_set() {
+        let s = store();
+        assert_eq!(s.get_cell_triage_decision("squad-1", 0, 0).unwrap(), None);
+        s.set_cell_triage_decision(
+            "squad-1",
+            0,
+            0,
+            &["bug".to_string()],
+            TRIAGE_SOURCE_ARBITER,
+            "UI refresh defect",
+        )
+        .unwrap();
+        assert_eq!(
+            s.get_cell_triage_decision("squad-1", 0, 0).unwrap(),
+            Some(("arbiter".to_string(), "UI refresh defect".to_string()))
+        );
+        assert_eq!(
+            Store::triage_decisions_by_cell(&s.conn, "squad-1")
+                .unwrap()
+                .get(&(0, 0))
+                .map(|d| d.0.as_str()),
+            Some("arbiter")
+        );
+        s.set_cell_triage_types("squad-1", 0, 0, &["bug".to_string()])
+            .unwrap();
+        assert_eq!(s.get_cell_triage_decision("squad-1", 0, 0).unwrap(), None);
     }
 
     #[test]

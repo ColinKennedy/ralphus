@@ -150,6 +150,8 @@
        * @property {string} [machine] - RAL-185/RAL-288: where this cell is routed. Absent/undefined means the daemon's own host.
        * @property {{id: string, name: string, status: string, branch?: string, origin: string}[]} [reviews]
        * @property {string[]} [triage_types] - RAL-318: this cell's resolved Triage type(s) if it opted in via `triage = true` in its TOML -- absent/empty for a cell that never opted in. Populated at submit time (inline `triage_type` or the Arbiter's own classification) whether or not the cell has run yet, so non-empty here does not by itself mean the cell is done -- check `state`. A cell with types set here and no entry in `reviews` yet is pooled, waiting for its Triage pool to drain into an actual review.
+       * @property {"arbiter"|"inline"|"fallback"} [triage_source] - RAL-721: who chose `triage_types`; absent for cells classified before this was recorded.
+       * @property {string} [triage_rationale] - RAL-721: the Arbiter's reason (80 characters or fewer) for `triage_types`.
        * @property {boolean} [triage_pending] - RAL-662: true while the cell opted into Triage and the Arbiter has not yet written its classification (`triage_types` still empty); absent otherwise.
        * @property {string[]} [subprojects] - RAL-346: this cell's resolved monorepo subproject(s), if any -- absent/empty when unresolved (a monorepo cell the Arbiter hasn't matched yet) or not applicable (a plain single-project repo). Used to key this cell's Triage pool by (project, subproject) rather than just project.
        * @property {boolean} [subprojects_inferred] - RAL-346: true when `subprojects` was written by the Arbiter's async description-matching inference step rather than seeded from the cell's own manually-declared `subprojects` TOML field. Meaningless when `subprojects` is empty. Drives the board's purple "Arbiter set this" badge (`subprojectBadge`).
@@ -1031,6 +1033,8 @@
        * @property {string} project
        * @property {"scheduled"|"queued"|"failed"} status - "scheduled" (not done yet), "queued" (done and viable, a live candidate for the next pool drain), or "failed" (done but its proof failed -- permanently excluded from ever being swept into an auto-review).
        * @property {string[]} triage_types
+       * @property {string|null} triage_source - RAL-721: who chose the type(s): "arbiter", "inline" (task file) or "fallback"; null for cells classified before this was recorded.
+       * @property {string|null} triage_rationale - RAL-721: the Arbiter's reason (80 characters or fewer), if recorded.
        * @property {TriagePoolMembership[]} pools - exact pool keys that currently contain this candidate
        */
       /**

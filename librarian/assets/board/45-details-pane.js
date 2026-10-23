@@ -1062,6 +1062,7 @@ Saving restarts the proof step and the rest of its list; an unchanged value rest
        */
       function triagePlaceholderSection(s) {
         const types = s.triage_types || [];
+        const why = triageDecisionTip(s.triage_source, s.triage_rationale);
         if ((s.reviews || []).length) return "";
         if (!types.length) {
           if (!s.triage_pending) return "";
@@ -1083,8 +1084,8 @@ Saving restarts the proof step and the rest of its list; an unchanged value rest
         const label = done ? "Queued for auto-review" : "Scheduled for auto-review";
         const icon = done ? "✓" : "⏳";
         const tip = done
-          ? `This cell finished and resolved to Triage type(s): ${typeList}.\nIt's pooled and waiting for that pool's count threshold or a cron schedule to fire -- once it does, the Arbiter drains the pool into a fresh review automatically.\nCheck the Triage tab for the pool's current count vs. threshold.`
-          : `This cell opted into Triage (type(s): ${typeList}) and is already pooled for an automatic review, but hasn't reached "done" yet.\nOnce it finishes, this will show "Queued for auto-review" instead -- a pending or running cell has nothing to contribute to a review yet.`;
+          ? `This cell finished and resolved to Triage type(s): ${typeList}.${why}\nIt's pooled and waiting for that pool's count threshold or a cron schedule to fire -- once it does, the Arbiter drains the pool into a fresh review automatically.\nCheck the Triage tab for the pool's current count vs. threshold.`
+          : `This cell opted into Triage (type(s): ${typeList}).${why}\nIt is already pooled for an automatic review, but hasn't reached "done" yet.\nOnce it finishes, this will show "Queued for auto-review" instead -- a pending or running cell has nothing to contribute to a review yet.`;
         return `<h3 class="section">in reviews</h3><div class="kv-row" data-tip="${tip}">` +
           `<span style="opacity:${done ? "1" : "0.55"}"><span class="dot" style="background:${cvar("--arbiter")}"></span></span>` +
           `<span class="v" style="flex:1"><div>${icon} ${esc(label)}</div><div class="mono" style="font-size:11px;color:var(--muted)">${esc(typeList)}</div></span>` +
