@@ -602,6 +602,81 @@ pub(crate) fn cell_config_system_prompt(
     combine_system_prompts([stored_system_prompt, addendum.as_deref()])
 }
 
+/// The configured system prompts (`[system_prompt]` in the global config)
+/// layered around a cell's own `system_prompt`: global, then per-agent, then
+/// the cell's. `delivered` is what the agent receives (it also carries the
+/// hidden global text, first); `shown` is the same without the hidden text and
+/// is what the board displays; `notice` explains why configured layers were
+/// left out for a backend with no system prompt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LayeredSystemPrompt {
+    pub delivered: Option<String>,
+    pub shown: Option<String>,
+    pub notice: Option<String>,
+}
+
+pub(crate) fn layer_configured_system_prompts(
+    config: &crate::config::SystemPromptConfig,
+    agent_name: &str,
+    backend: &str,
+    cell_system_prompt: Option<&str>,
+) -> LayeredSystemPrompt {
+    fn nonblank(s: Option<&str>) -> Option<&str> {
+        s.map(str::trim).filter(|s| !s.is_empty())
+    }
+    let visible = nonblank(config.visible.as_deref());
+    let hidden = nonblank(config.hidden.as_deref());
+    let per_agent = config.agent_prompt(agent_name, backend).map(str::trim);
+    let cell = cell_system_prompt.map(str::to_string);
+    if visible.is_none() && hidden.is_none() && per_agent.is_none() {
+        return LayeredSystemPrompt {
+            delivered: cell.clone(),
+            shown: cell,
+            notice: None,
+        };
+    }
+    if !ralphus_core::schema::agent_supports_system_prompt(backend) {
+        let mut layers = Vec::new();
+        if visible.is_some() || hidden.is_some() {
+            layers.push("global");
+        }
+        if per_agent.is_some() {
+            layers.push("per-agent");
+        }
+        return LayeredSystemPrompt {
+            delivered: cell.clone(),
+            shown: cell,
+            notice: Some(format!(
+                "Configured {} system prompt(s) were not applied: agent \"{agent_name}\" (backend \"{backend}\") does not support a system prompt.",
+                layers.join(" and ")
+            )),
+        };
+    }
+    let global_heading = visible.map(|v| {
+        format!(
+            "## Global instructions
+{v}"
+        )
+    });
+    let agent_heading = per_agent.map(|v| {
+        format!(
+            "## Instructions for {agent_name}
+{v}"
+        )
+    });
+    let shown = combine_system_prompts([
+        global_heading.as_deref(),
+        agent_heading.as_deref(),
+        cell.as_deref(),
+    ]);
+    let delivered = combine_system_prompts([hidden, shown.as_deref()]);
+    LayeredSystemPrompt {
+        delivered,
+        shown,
+        notice: None,
+    }
+}
+
 pub(crate) fn effective_cell_system_prompt(
     stored_system_prompt: Option<&str>,
     subprojects: &[String],
@@ -4711,5 +4786,57 @@ prompt = "make it build"
         assert_eq!(after.lines, vec!["short".to_string()]);
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn configured_system_prompts_layer_global_then_agent_then_cell() {
+        let cfg = crate::config::SystemPromptConfig {
+            visible: Some("be kind".into()),
+            hidden: Some("secret".into()),
+            agents: [("claude-code".to_string(), "terse".to_string())].into(),
+        };
+        let l = layer_configured_system_prompts(&cfg, "claude-code", "claude-code", Some("cell"));
+        let shown = l.shown.unwrap();
+        assert!(!shown.contains("secret"));
+        let (g, a, c) = (
+            shown.find("be kind").unwrap(),
+            shown.find("terse").unwrap(),
+            shown.find("cell").unwrap(),
+        );
+        assert!(g < a && a < c);
+        let delivered = l.delivered.unwrap();
+        assert!(delivered.starts_with("secret"));
+        assert!(delivered.ends_with(&shown));
+        assert!(l.notice.is_none());
+    }
+
+    #[test]
+    fn configured_system_prompts_skip_unsupported_backend_with_notice() {
+        let cfg = crate::config::SystemPromptConfig {
+            visible: Some("v".into()),
+            hidden: Some("h".into()),
+            agents: Default::default(),
+        };
+        let l = layer_configured_system_prompts(&cfg, "ollama", "ollama", None);
+        assert_eq!(l.delivered, None);
+        assert_eq!(l.shown, None);
+        assert!(
+            l.notice
+                .unwrap()
+                .contains("does not support a system prompt")
+        );
+    }
+
+    #[test]
+    fn empty_config_leaves_the_cell_prompt_untouched() {
+        let l = layer_configured_system_prompts(
+            &crate::config::SystemPromptConfig::default(),
+            "codex",
+            "codex",
+            Some("cell"),
+        );
+        assert_eq!(l.delivered.as_deref(), Some("cell"));
+        assert_eq!(l.shown.as_deref(), Some("cell"));
+        assert!(l.notice.is_none());
     }
 }

@@ -2532,6 +2532,60 @@ pub fn load_live_view_config() -> LiveViewConfig {
     }
 }
 
+/// Configured system prompts (`[system_prompt]` table), read from the global
+/// config only -- a project `.ralphus.toml` cannot set them.
+///
+/// ```toml
+/// [system_prompt]
+/// visible = "House rules shown in the cell's System Prompt tab."
+/// hidden = "Applied to every agent, never shown on the board."
+/// [system_prompt.agents]
+/// claude-code = "Applied only to claude-code cells."
+/// ```
+///
+/// `visible` is displayed to anyone who can open a cell's System Prompt tab,
+/// so it must hold nothing sensitive; `hidden` is delivered to the agent but
+/// never stored or displayed. Both are applied to cells whose agent backend
+/// supports a system prompt; the per-agent text is looked up by the cell's
+/// agent name, then by the backend that name resolves to.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+pub struct SystemPromptConfig {
+    #[serde(default)]
+    pub visible: Option<String>,
+    #[serde(default)]
+    pub hidden: Option<String>,
+    #[serde(default)]
+    pub agents: std::collections::BTreeMap<String, String>,
+}
+
+impl SystemPromptConfig {
+    /// The per-agent text for `agent_name`, else for `backend`.
+    #[must_use]
+    pub fn agent_prompt(&self, agent_name: &str, backend: &str) -> Option<&str> {
+        self.agents
+            .get(agent_name)
+            .or_else(|| self.agents.get(backend))
+            .map(String::as_str)
+            .filter(|s| !s.trim().is_empty())
+    }
+}
+
+/// Parse the `[system_prompt]` table out of a config file's text; the default
+/// (nothing configured) when absent or malformed.
+#[must_use]
+pub fn system_prompt_from_toml_str(s: &str) -> SystemPromptConfig {
+    parse_config_file(s).system_prompt.unwrap_or_default()
+}
+
+/// The configured system prompts from the global config file.
+#[must_use]
+pub fn load_system_prompt_config() -> SystemPromptConfig {
+    global_config_path()
+        .and_then(|p| read_config_text(&p))
+        .map(|s| system_prompt_from_toml_str(&s))
+        .unwrap_or_default()
+}
+
 /// Autocompaction-thrash detection thresholds (`[thrash]` table, RAL-339).
 /// Governs when a cell/proof's runner fails a run outright for repeatedly
 /// compacting its own context without enough real progress between
@@ -3241,6 +3295,8 @@ struct ConfigFile {
     agent: Option<AgentTableConfig>,
     #[serde(default)]
     live_view: Option<LiveViewConfig>,
+    #[serde(default)]
+    system_prompt: Option<SystemPromptConfig>,
     #[serde(default)]
     thrash: Option<ThrashConfig>,
     #[serde(default)]
@@ -5690,6 +5746,28 @@ fail_after_minutes = 5
     }
 
     // ── LiveViewConfig (RAL-232) ──────────────────────────────────────────
+
+    #[test]
+    fn system_prompt_config_parses_layers_and_resolves_agent_by_name_then_backend() {
+        let c = system_prompt_from_toml_str(
+            "[system_prompt]
+visible = \"v\"
+hidden = \"h\"
+[system_prompt.agents]
+claude-code = \"cc\"
+mine = \"m\"
+",
+        );
+        assert_eq!(c.visible.as_deref(), Some("v"));
+        assert_eq!(c.hidden.as_deref(), Some("h"));
+        assert_eq!(c.agent_prompt("mine", "claude-code"), Some("m"));
+        assert_eq!(c.agent_prompt("other", "claude-code"), Some("cc"));
+        assert_eq!(c.agent_prompt("other", "codex"), None);
+        assert_eq!(
+            system_prompt_from_toml_str(""),
+            SystemPromptConfig::default()
+        );
+    }
 
     #[test]
     fn live_view_defaults_when_absent() {
