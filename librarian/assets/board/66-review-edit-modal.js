@@ -1475,4 +1475,4 @@
         }
       }
 
-      void [onEditBaseUpdateMode, onEditResolverAgent, onEditResolverModel, onEditLiveActionSame, onEditLiveActionAgent, onEditLiveActionModel, onEditProofScope, onEditCiDeferral, onEditProofSkipAutoClean, onEditSeparatePrBranch, onEditMatchPrBranchName, onEditAutoSubmitPrStack, onEditDualRootPr, onEditAutoFixPrErrors, onEditAutoFixPromptTemplate, onEditDiscourageTests, onEditRebuildOnInherit, onEditRebuildOnTrigger, onEditExhibitSetting];
+      void [onEditBaseUpdateMode, onEditResolverAgent, onEditResolverModel, onEditLiveActionSame, onEditLiveActionAgent, onEditLiveActionModel, onEditProofScope, onEditCiDeferral, onEditProofSkipAutoClean, onEditSeparatePrBranch, onEditMatchPrBranchName, onEditAutoSubmitPrStack, onEditDualRootPr, onEditAutoFixPrErrors, onEditAutoFixPromptTemplate, onEditPrGuidance, onEditPrGuidancePaths, onEditDiscourageTests, onEditRebuildOnInherit, onEditRebuildOnTrigger, onEditExhibitSetting];
