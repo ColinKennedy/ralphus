@@ -724,16 +724,33 @@
         return `<div class="tri-triggers">${out.join("")}</div>`;
       }
       /**
+       * RAL-721: tooltip text saying who chose a cell's Triage type(s) and, for
+       * the Arbiter, its short reason. Empty for cells classified before this
+       * was recorded. The rationale is model output, so it is escaped.
+       * @param {string|null|undefined} source - "arbiter", "inline" or "fallback"
+       * @param {string|null|undefined} rationale
+       * @returns {string}
+       */
+      function triageDecisionTip(source, rationale) {
+        if (source === "inline") return "\nType set inline in the task file (triage_type).";
+        const why = rationale ? ` ${esc(rationale)}` : "";
+        if (source === "arbiter") return `\nChosen by the Arbiter.${why}`;
+        if (source === "fallback") return `\nThe Arbiter could not classify this cell.${why}`;
+        return "";
+      }
+      /**
        * A badge per triage type of one cell (it is pooled under each), or a
        * "type pending" badge while the Arbiter hasn't classified it yet.
        * @param {string[]} types
+       * @param {string|null|undefined} source - who chose the types (RAL-721)
+       * @param {string|null|undefined} rationale - the Arbiter's reason (RAL-721)
        * @returns {string}
        */
-      function triageTypeBadgesHtml(types) {
+      function triageTypeBadgesHtml(types, source, rationale) {
         if (!types.length) {
           return `<span class="badge tri-type" data-tip="The Arbiter hasn't classified this cell yet, so it isn't in any pool. It joins its pool(s) once classified and finished.">type pending</span>`;
         }
-        return types.map((t) => `<span class="badge tri-type" data-tip="This cell is pooled under '${esc(t)}'. A cell can belong to several types at once; draining one pool doesn't remove it from the others.">${esc(t)}</span>`).join("");
+        return types.map((t) => `<span class="badge tri-type" data-tip="This cell is pooled under '${esc(t)}'. A cell can belong to several types at once; draining one pool doesn't remove it from the others.${triageDecisionTip(source, rationale)}">${esc(t)}</span>`).join("");
       }
       /**
        * One in-flight or excluded cell row in the flow; click jumps to it on the Squads tab.
@@ -750,7 +767,7 @@
           + `<div class="tri-r-main"><div class="tri-r-name">${esc(c.task_name)}</div>`
           + `<div class="tri-r-sub mono">${esc(c.squad_id)} · ${esc(cell)}${c.squad_label ? ` · ${esc(c.squad_label)}` : ""}</div></div>`
           + `<div class="tri-r-right">${triageFocus.sub === null ? `<span class="tri-proj-label">${esc(c.project)}</span>` : ""}`
-          + `${triageTypeBadgesHtml(c.triage_types)}${badge}</div></div>`;
+          + `${triageTypeBadgesHtml(c.triage_types, c.triage_source, c.triage_rationale)}${badge}</div></div>`;
       }
       /**
        * One drained (Arbiter-created) review row; click opens it on the Reviews tab.

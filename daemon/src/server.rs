@@ -8289,7 +8289,14 @@ fn seed_materializing_cells(
                     context,
                 });
             } else {
-                let _ = store.set_cell_triage_types(squad_id, task_idx, idx, &inline_types);
+                let _ = store.set_cell_triage_decision(
+                    squad_id,
+                    task_idx,
+                    idx,
+                    &inline_types,
+                    crate::triage::TRIAGE_SOURCE_INLINE,
+                    "",
+                );
             }
             // RAL-346: seed this cell's subproject resolution from its own
             // manually-declared `CellDef.subprojects` when non-empty -- a

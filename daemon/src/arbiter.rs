@@ -462,9 +462,11 @@ fn classification_system_prompt(candidates: &[&TriageTypeView]) -> String {
         "You are the Arbiter, a router that classifies a unit of work against the following \
          named types based on its content. A unit of work may genuinely match more than one \
          type at once (e.g. both \"bug\" and \"investigation\") -- name every type that applies, \
-         at least one. Reply with ONLY a comma-separated list of the matching type name(s) and \
-         nothing else -- no punctuation beyond the commas, no explanation, no surrounding \
-         quotes.\n\n{list}"
+         at least one. Reply on exactly two lines. Line 1: ONLY a comma-separated list of the \
+         matching type name(s) -- no punctuation beyond the commas, no surrounding quotes. \
+         Line 2: \"REASON: \" followed by a very short reason for your choice, {max} characters \
+         or fewer.\n\n{list}",
+        max = MAX_RATIONALE_CHARS
     )
 }
 
@@ -478,7 +480,13 @@ fn parse_classification_reply<'a>(
     candidates: &[&'a TriageTypeView],
 ) -> Vec<&'a TriageTypeView> {
     let mut matched: Vec<&TriageTypeView> = Vec::new();
-    for piece in reply.split(',') {
+    // Only the first non-empty line carries types; the `REASON:` line (and
+    // anything after it) is never read as type names.
+    let type_line = reply
+        .lines()
+        .find(|l| !l.trim().is_empty())
+        .unwrap_or_default();
+    for piece in type_line.split(',') {
         let picked = piece
             .trim()
             .trim_matches(|c: char| c == '"' || c == '\'' || c == '.' || c.is_whitespace());
@@ -495,6 +503,36 @@ fn parse_classification_reply<'a>(
         }
     }
     matched
+}
+
+/// Longest rationale (in characters) the Arbiter's classification keeps.
+pub const MAX_RATIONALE_CHARS: usize = 80;
+
+/// The Arbiter's `REASON:` line from a classification reply, whitespace
+/// collapsed and clamped to [`MAX_RATIONALE_CHARS`] characters (char-boundary
+/// safe). Empty when the reply has none. The text is model output: it is
+/// stored and displayed as data only.
+fn parse_classification_rationale(reply: &str) -> String {
+    let Some(reason) = reply.lines().skip(1).find_map(|l| {
+        let l = l.trim_start();
+        let head = l.get(..7)?;
+        head.eq_ignore_ascii_case("reason:").then(|| &l[7..])
+    }) else {
+        return String::new();
+    };
+    let collapsed = reason.split_whitespace().collect::<Vec<_>>().join(" ");
+    collapsed.chars().take(MAX_RATIONALE_CHARS).collect()
+}
+
+/// One Arbiter classification outcome: the type names, who decided
+/// ([`crate::triage::TRIAGE_SOURCE_ARBITER`] or
+/// [`crate::triage::TRIAGE_SOURCE_FALLBACK`]) and a short rationale
+/// (a fixed `fallback: ...` reason when the Arbiter did not decide).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Classification {
+    pub types: Vec<String>,
+    pub source: &'static str,
+    pub rationale: String,
 }
 
 /// Classify `cell_context` (the cell's own prompt/description -- the primary
@@ -526,7 +564,7 @@ pub fn classify(
     squad_id: &str,
     cell_id: &str,
     cell_context: &str,
-) -> Vec<String> {
+) -> Classification {
     let guard = store.lock();
     let types = guard.list_triage_types().unwrap_or_default();
     let candidates: Vec<&TriageTypeView> = types
@@ -538,8 +576,9 @@ pub fn classify(
             &guard,
             squad_id,
             cell_id,
-            &[UNCLASSIFIED_TYPE.to_string()],
+            &fallback_types(),
             "no registered triage types",
+            "fallback: no registered triage types",
         );
     }
     if over_budget(&guard, arbiter) {
@@ -547,8 +586,9 @@ pub fn classify(
             &guard,
             squad_id,
             cell_id,
-            &[UNCLASSIFIED_TYPE.to_string()],
+            &fallback_types(),
             "Arbiter maximum_budget_usd cap already reached; classification skipped",
+            "fallback: over budget",
         );
     }
     let system = classification_system_prompt(&candidates);
@@ -575,8 +615,9 @@ pub fn classify(
                 &guard,
                 squad_id,
                 cell_id,
-                &[UNCLASSIFIED_TYPE.to_string()],
+                &fallback_types(),
                 &format!("classification call failed: {e}"),
+                "fallback: call failed",
             );
         }
     };
@@ -599,13 +640,19 @@ pub fn classify(
             &guard,
             squad_id,
             cell_id,
-            &[UNCLASSIFIED_TYPE.to_string()],
+            &fallback_types(),
             &format!("unrecognized classification reply {reply:?}"),
+            "fallback: unrecognized reply",
         );
     }
     let names: Vec<String> = matched.into_iter().map(|t| t.name.clone()).collect();
     let detail = format!("classified as [{}]", names.join(", "));
-    note_and_return(&guard, squad_id, cell_id, &names, &detail)
+    let rationale = parse_classification_rationale(&reply);
+    note_and_return(&guard, squad_id, cell_id, &names, &detail, &rationale)
+}
+
+fn fallback_types() -> Vec<String> {
+    vec![UNCLASSIFIED_TYPE.to_string()]
 }
 
 /// Build the subproject-inference system prompt listing every candidate
@@ -847,9 +894,15 @@ pub fn spawn_triage_followup(
     std::thread::spawn(move || {
         let arbiter = Arbiter::current();
         for p in &pending {
-            let types = classify(&store_handle, &arbiter, &squad_id, &p.cell_id, &p.context);
+            let Classification {
+                types,
+                source,
+                rationale,
+            } = classify(&store_handle, &arbiter, &squad_id, &p.cell_id, &p.context);
             let guard = store_handle.lock();
-            if let Err(e) = guard.set_cell_triage_types(&squad_id, p.task_idx, p.idx, &types) {
+            if let Err(e) = guard
+                .set_cell_triage_decision(&squad_id, p.task_idx, p.idx, &types, source, &rationale)
+            {
                 crate::cartographer::Note::new("arbiter")
                     .level(crate::logging::LogLevel::WARNING)
                     .squad(&squad_id)
@@ -947,19 +1000,39 @@ fn note_and_return(
     cell_id: &str,
     result: &[String],
     detail: &str,
-) -> Vec<String> {
+    rationale: &str,
+) -> Classification {
+    let source = if rationale.starts_with("fallback:") {
+        crate::triage::TRIAGE_SOURCE_FALLBACK
+    } else {
+        crate::triage::TRIAGE_SOURCE_ARBITER
+    };
+    let reason = if rationale.is_empty() {
+        String::new()
+    } else {
+        format!(" reason: {rationale}")
+    };
     crate::cartographer::Note::new("arbiter")
         .squad(squad_id)
         .cell(cell_id)
         .emit(
             store,
             format!(
-                "Arbiter classification -> [{}] ({detail})",
+                "Arbiter classification -> [{}] ({detail}; source: {source}{reason})",
                 result.join(", ")
             ),
-            serde_json::json!({ "result": result, "detail": detail }),
+            serde_json::json!({
+                "result": result,
+                "detail": detail,
+                "source": source,
+                "rationale": rationale,
+            }),
         );
-    result.to_vec()
+    Classification {
+        types: result.to_vec(),
+        source,
+        rationale: rationale.to_string(),
+    }
 }
 
 /// The `ralphus check health` Arbiter round-trip (RAL-318): a live
@@ -1543,6 +1616,65 @@ mod tests {
     }
 
     #[test]
+    fn parse_classification_reply_reads_only_the_first_line() {
+        let types = [ty("security", "Security", ""), ty("bug", "Bug", "")];
+        let candidates: Vec<&TriageTypeView> = types.iter().collect();
+        let reply = "security\nREASON: it is a bug, really";
+        let got = parse_classification_reply(reply, &candidates);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].name, "security");
+        assert!(parse_classification_reply("REASON: nope", &candidates).is_empty());
+    }
+
+    #[test]
+    fn rationale_is_parsed_missing_and_clamped() {
+        assert_eq!(
+            parse_classification_rationale("bug\nREASON:  UI   refresh  broken "),
+            "UI refresh broken"
+        );
+        assert_eq!(parse_classification_rationale("bug"), "");
+        assert_eq!(parse_classification_rationale("bug\nreason: ok"), "ok");
+        let long = format!("bug\nREASON: {}", "é".repeat(200));
+        let got = parse_classification_rationale(&long);
+        assert_eq!(got.chars().count(), MAX_RATIONALE_CHARS);
+    }
+
+    #[test]
+    fn note_and_return_records_rationale_in_cartographer_payload() {
+        let s = store();
+        let got = note_and_return(
+            &s,
+            "squad-1",
+            "cell-1",
+            &["bug".to_string()],
+            "classified as [bug]",
+            "UI refresh defect",
+        );
+        assert_eq!(got.source, crate::triage::TRIAGE_SOURCE_ARBITER);
+        assert_eq!(got.rationale, "UI refresh defect");
+        let page = s
+            .cartographer_query(&crate::cartographer::CartographerFilter {
+                source: Some("arbiter".to_string()),
+                squad_id: Some("squad-1".to_string()),
+                ..Default::default()
+            })
+            .unwrap();
+        let row = page.rows.first().expect("arbiter note");
+        assert!(row.message.contains("UI refresh defect"), "{}", row.message);
+        assert_eq!(row.payload["rationale"], "UI refresh defect");
+        assert_eq!(row.payload["source"], "arbiter");
+        let fb = note_and_return(
+            &s,
+            "squad-1",
+            "cell-1",
+            &fallback_types(),
+            "x",
+            "fallback: call failed",
+        );
+        assert_eq!(fb.source, crate::triage::TRIAGE_SOURCE_FALLBACK);
+    }
+
+    #[test]
     fn classify_falls_back_to_unclassified_with_no_registered_types() {
         let s = Arc::new(crate::store_lock::StoreMutex::new(store()));
         // A fresh store also seeds `DEFAULT_TRIAGE_TYPES` (RAL-318) alongside
@@ -1557,7 +1689,7 @@ mod tests {
             maximum_budget_usd: None,
         };
         assert_eq!(
-            classify(&s, &arbiter, "squad-1", "cell-1", "do some work"),
+            classify(&s, &arbiter, "squad-1", "cell-1", "do some work").types,
             vec![UNCLASSIFIED_TYPE.to_string()]
         );
     }
@@ -1577,7 +1709,7 @@ mod tests {
             .record_arbiter_cost("classification", 1, 1, 0.0001)
             .unwrap();
         assert_eq!(
-            classify(&s, &arbiter, "squad-1", "cell-1", "do some work"),
+            classify(&s, &arbiter, "squad-1", "cell-1", "do some work").types,
             vec![UNCLASSIFIED_TYPE.to_string()]
         );
     }
@@ -1594,7 +1726,7 @@ mod tests {
             maximum_budget_usd: None,
         };
         assert_eq!(
-            classify(&s, &arbiter, "squad-1", "cell-1", "do some work"),
+            classify(&s, &arbiter, "squad-1", "cell-1", "do some work").types,
             vec![UNCLASSIFIED_TYPE.to_string()]
         );
     }

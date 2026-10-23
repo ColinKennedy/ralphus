@@ -629,6 +629,15 @@ pub struct CellView {
     /// board show a "classifying" placeholder instead of nothing.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub triage_pending: bool,
+    /// RAL-721: who chose `triage_types` -- `arbiter`, `inline` (the task
+    /// file's `triage_type`) or `fallback` (the Arbiter could not classify).
+    /// Absent for cells classified before this was recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub triage_source: Option<String>,
+    /// RAL-721: the Arbiter's short reason (at most 80 characters) for
+    /// `triage_types`; absent when none was recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub triage_rationale: Option<String>,
     /// This cell's resolved monorepo subproject(s) (RAL-346), alphabetical,
     /// if any have been resolved -- empty when `Unresolved` (a monorepo
     /// cell the Arbiter hasn't matched yet, or found no match for) or
@@ -3205,6 +3214,18 @@ impl Store {
                 triage_type   TEXT NOT NULL,
                 created_at_ms INTEGER NOT NULL,
                 PRIMARY KEY (squad_id, task_idx, idx, triage_type)
+            );
+            -- RAL-721: who decided a cell's type(s) (`arbiter`, `inline`,
+            -- `fallback`) and the Arbiter's short reason. Absent for cells
+            -- classified before this table existed.
+            CREATE TABLE IF NOT EXISTS triage_cell_decisions (
+                squad_id      TEXT NOT NULL,
+                task_idx      INTEGER NOT NULL,
+                idx           INTEGER NOT NULL,
+                source        TEXT NOT NULL,
+                rationale     TEXT NOT NULL DEFAULT '',
+                created_at_ms INTEGER NOT NULL,
+                PRIMARY KEY (squad_id, task_idx, idx)
             );
             -- RAL-662: a cell that opted into Triage whose Arbiter
             -- classification has not been written yet. Set at submit time and
@@ -7183,6 +7204,7 @@ impl Store {
         db_profiles: &HashMap<String, crate::agent_profile_store::AgentProfileView>,
     ) -> Result<HashMap<i64, Vec<CellView>>> {
         let triage_pending = Self::triage_pending_cells(conn, squad_id)?;
+        let triage_decisions = Self::triage_decisions_by_cell(conn, squad_id)?;
         let mut stmt = conn.prepare_cached(
             "SELECT task_idx, idx, sid, name, cwd, agent, model, state, tokens_in, tokens_out, cost_usd, error, prompt, command, effective_system_prompt, depends_on, review_branch, agent_session_id, maximum_budget_usd, env_overrides, proof_env_overrides, started_at_ms, finished_at_ms, env_out_of_date, machine, maximum_context, auto_compact_threshold, cache_creation_tokens, cache_read_tokens, cost_is_estimated, maximum_tool_output_tokens, compaction_input_tokens, compaction_count, delayed_until_ms, completed_active_duration_ms, CASE WHEN state='running' THEN active_started_at_ms END, turns, waypoint_halted_at_ms, runner_stalled_at_ms, effort, temperature, init_commands, init_source, init_timeout_sec, init_state, init_duration_ms, init_exit_status, init_output, init_finished_at_ms, shell
              FROM cells WHERE squad_id=? ORDER BY task_idx, idx",
@@ -7199,6 +7221,14 @@ impl Store {
                     .get(&(task_idx, idx))
                     .cloned()
                     .unwrap_or_default();
+                let (triage_source, triage_rationale) = triage_decisions
+                    .get(&(task_idx, idx))
+                    .map_or((None, None), |(source, rationale)| {
+                        (
+                            Some(source.clone()),
+                            (!rationale.is_empty()).then(|| rationale.clone()),
+                        )
+                    });
                 let is_triage_pending =
                     triage_types.is_empty() && triage_pending.contains(&(task_idx, idx));
                 let (subprojects, subprojects_inferred) = subprojects_by_cell
@@ -7267,6 +7297,8 @@ impl Store {
                         reviews,
                         triage_types,
                         triage_pending: is_triage_pending,
+                        triage_source,
+                        triage_rationale,
                         subprojects,
                         subprojects_inferred,
                         agent_session_id: r.get::<_, Option<String>>(17)?,
