@@ -6457,23 +6457,20 @@ fn proof_execution_context(
 
 /// Longest prior `command` proof (in characters) quoted verbatim in a proof
 /// prompt; anything longer is cut and marked with [`COMMAND_CLIP_MARKER`].
-const PRIOR_PROOF_COMMAND_MAX_CHARS: usize = 150;
+const PROOF_COMMAND_MAX_CHARS: usize = 150;
 const COMMAND_CLIP_MARKER: &str = "… [clipped]";
 
 /// Collapse a command to one line and clip it to
-/// [`PRIOR_PROOF_COMMAND_MAX_CHARS`] characters (never splitting a character).
-fn clip_prior_command(command: &str) -> String {
+/// [`PROOF_COMMAND_MAX_CHARS`] characters (never splitting a character).
+fn clip_command(command: &str) -> String {
     let one_line = command
         .trim()
         .replace("\r\n", " ")
         .replace(['\n', '\r', '`'], " ");
-    if one_line.chars().count() <= PRIOR_PROOF_COMMAND_MAX_CHARS {
+    if one_line.chars().count() <= PROOF_COMMAND_MAX_CHARS {
         return one_line;
     }
-    let cut: String = one_line
-        .chars()
-        .take(PRIOR_PROOF_COMMAND_MAX_CHARS)
-        .collect();
+    let cut: String = one_line.chars().take(PROOF_COMMAND_MAX_CHARS).collect();
     format!("{}{COMMAND_CLIP_MARKER}", cut.trim_end())
 }
 
@@ -6489,7 +6486,7 @@ fn earlier_proofs_text(earlier: &[(String, &'static str, Option<String>)]) -> St
         .map(|(name, status, command)| match command {
             Some(command) => format!(
                 "- `{name}`: {status} — ran command: `{}`",
-                clip_prior_command(command)
+                clip_command(command)
             ),
             None => format!("- `{name}`: {status}"),
         })
@@ -6566,20 +6563,33 @@ fn proof_context_status(state: Option<&str>) -> &'static str {
 /// when there is nothing to mention, so a cell with no qualifying cell-scope
 /// proofs is unaffected.
 fn cell_proof_awareness_context(specs: &[crate::store::ProofSpecRow]) -> Option<String> {
-    let names: Vec<String> = specs
+    // `command` proofs show their (pre-expansion, clipped) command text; `prompt`
+    // proofs keep a name-only line because their spec is a free-text instruction,
+    // not something the agent could run.
+    let rows: Vec<String> = specs
         .iter()
         .enumerate()
         .filter(|(_, (_, _, kind, ..))| kind == "command" || kind == "prompt")
-        .map(|(position, (_, id, ..))| proof_context_name(id.as_deref(), position))
+        .map(|(position, (_, id, kind, spec, ..))| {
+            let name = proof_context_name(id.as_deref(), position);
+            if kind == "command" {
+                format!("- `{name}`: `{}`", clip_command(spec))
+            } else {
+                format!("- `{name}`: will check {name}-related work once this cell finishes")
+            }
+        })
         .collect();
-    if names.is_empty() {
+    if rows.is_empty() {
         return None;
     }
-    let rows = names
-        .iter()
-        .map(|name| format!("- `{name}`: will check {name}-related work once this cell finishes"))
-        .collect::<Vec<_>>()
-        .join("\n");
+    let has_commands = specs.iter().any(|(_, _, kind, ..)| kind == "command");
+    let rows = rows.join("\n");
+    let no_rerun = if has_commands {
+        " Do not run the proof commands listed above or similar ones (for example \
+         test suites): the proofs run them right after this cell finishes."
+    } else {
+        ""
+    };
     Some(format!(
         "This cell is followed by proof step(s) that will check your work once you \
          finish:\n{rows}\n\n\
@@ -6592,7 +6602,7 @@ fn cell_proof_awareness_context(specs: &[crate::store::ProofSpecRow]) -> Option<
          auto-formatters usually qualify — but skip anything you are not sure is \
          fast, or that you know is slow (such as a full test suite): you do not \
          need to cover ground the proof step(s) above already own, since they run \
-         right after you and will catch it."
+         right after you and will catch it.{no_rerun}"
     ))
 }
 
@@ -7558,15 +7568,15 @@ prompt = "anything"
 
     #[test]
     fn earlier_proofs_text_clips_long_commands_on_a_char_boundary() {
-        let long = "é".repeat(PRIOR_PROOF_COMMAND_MAX_CHARS + 40);
+        let long = "é".repeat(PROOF_COMMAND_MAX_CHARS + 40);
         let text = earlier_proofs_text(&[("t".to_string(), "PASS", Some(long))]);
         let expected = format!(
             "`{}{COMMAND_CLIP_MARKER}`",
-            "é".repeat(PRIOR_PROOF_COMMAND_MAX_CHARS)
+            "é".repeat(PROOF_COMMAND_MAX_CHARS)
         );
         assert!(text.contains(&expected));
-        let exact = "x".repeat(PRIOR_PROOF_COMMAND_MAX_CHARS);
-        assert_eq!(clip_prior_command(&exact), exact);
+        let exact = "x".repeat(PROOF_COMMAND_MAX_CHARS);
+        assert_eq!(clip_command(&exact), exact);
     }
 
     #[test]
@@ -11003,6 +11013,65 @@ prompt = "anything"
             cell_system_prompt
                 .contains("Do not treat running the proof step(s)' own commands as your task"),
             "{cell_system_prompt}"
+        );
+    }
+
+    fn proof_row(id: &str, kind: &str, spec: &str) -> crate::store::ProofSpecRow {
+        (
+            0,
+            Some(id.to_string()),
+            kind.to_string(),
+            spec.to_string(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+    }
+
+    #[test]
+    fn proof_awareness_shows_command_text_and_keeps_prompt_name_only() {
+        let rows = vec![
+            proof_row("fmt", "command", "cargo fmt --all -- --check"),
+            proof_row("review", "prompt", "look it over"),
+        ];
+        let text = cell_proof_awareness_context(&rows).unwrap();
+        assert!(
+            text.contains("- `fmt`: `cargo fmt --all -- --check`"),
+            "{text}"
+        );
+        assert!(
+            text.contains("- `review`: will check review-related work once this cell finishes"),
+            "{text}"
+        );
+        assert!(!text.contains("look it over"), "{text}");
+        assert!(
+            text.contains("Do not run the proof commands listed above or similar ones"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn proof_awareness_prompt_only_has_no_do_not_run_sentence() {
+        let text = cell_proof_awareness_context(&[proof_row("r", "prompt", "x")]).unwrap();
+        assert!(!text.contains("Do not run the proof commands"), "{text}");
+    }
+
+    #[test]
+    fn proof_awareness_clips_and_sanitizes_commands() {
+        let long = format!("cargo test {}", "é".repeat(PROOF_COMMAND_MAX_CHARS + 40));
+        let rows = vec![
+            proof_row("long", "command", &long),
+            proof_row("odd", "command", "echo `hi`\nsecond <<TOKEN>>"),
+        ];
+        let text = cell_proof_awareness_context(&rows).unwrap();
+        assert!(text.contains(COMMAND_CLIP_MARKER), "{text}");
+        assert!(
+            text.contains("- `odd`: `echo  hi  second <<TOKEN>>`"),
+            "{text}"
         );
     }
 
