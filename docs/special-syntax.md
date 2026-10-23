@@ -741,6 +741,38 @@ Rules and risks:
 - **Not to be confused** with `GuardianView.action_hints` in the code, which is
   the stored list of a review's declared `[[review.action]]` checks.
 
+### Configured system prompts (`[system_prompt]`, global config)
+
+House rules can be applied to every prompt cell from the **global** config
+(`$RALPHUS_CONFIG_HOME/config.toml`, else `~/.config/ralphus/config.toml`); a
+project `.ralphus.toml` and task files cannot set them, so no task-file field
+or validator rule exists for them.
+
+```toml
+[system_prompt]
+visible = "Follow our style guide."          # shown on the board
+hidden  = "Internal conduct rules."          # applied, never shown
+[system_prompt.agents]
+claude-code = "Be terse."                    # one backend or custom profile name
+```
+
+- **Order** (concatenated, in this order, ahead of ralphus's own fragments):
+  `hidden`, then `visible` (headed `## Global instructions`), then the
+  per-agent text (headed `## Instructions for <agent>`), then the cell's own
+  `system_prompt`. The cell's text never replaces the configured layers
+  (`system_prompt_position` only accepts `append`).
+- The per-agent entry is looked up by the cell's agent name (a custom profile
+  name), then by the backend it resolves to.
+- **Unsupported backends** (`ollama`, native): nothing is injected and nothing
+  is folded into the user prompt. The skip is logged by the scheduler and the
+  cell's System Prompt tab ends with a `Configured system prompts` notice.
+- The cell's System Prompt tab shows the effective prompt with `visible` and
+  per-agent text labelled by their headings. **`visible` is displayed to anyone
+  who can open that tab, so put nothing sensitive in it**; `hidden` is
+  delivered to the agent but never stored or displayed.
+- Applies to task prompt cells only; proof steps and review-side agents do not
+  receive these layers.
+
 ### Process-side sentinels (agent authors, not cell authors)
 
 Three sentinels exist for code that *hosts* a ralphus runner, not for task

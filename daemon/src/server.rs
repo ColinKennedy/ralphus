@@ -14024,9 +14024,13 @@ fn cell_system_prompt(daemon: &Daemon, id: &str, ti: &str, si: &str) -> Reply {
     let restart_note = guard
         .get_cell_dispatched_restart_note(id, task_idx, cell_idx)
         .unwrap_or(None);
+    let notice = guard
+        .get_cell_system_prompt_notice(id, task_idx, cell_idx)
+        .unwrap_or(None);
     system_prompt_reply(
         prompt,
         restart_note,
+        notice,
         "cell has no system prompt (a command cell, or one never dispatched)",
     )
 }
@@ -14079,6 +14083,7 @@ fn proof_system_prompt(
     system_prompt_reply(
         prompt,
         restart_note,
+        None,
         "proof step has no system prompt (a command step, or one never dispatched)",
     )
 }
@@ -14494,12 +14499,13 @@ fn guardian_manual_checks_system_prompt(daemon: &Daemon, id: &str) -> Reply {
 fn system_prompt_reply(
     prompt: Option<String>,
     restart_note: Option<String>,
+    notice: Option<String>,
     reason: &str,
 ) -> Reply {
     match prompt {
         Some(p) => json(
             200,
-            &serde_json::json!({"available": true, "system_prompt": p, "restart_note": restart_note}),
+            &serde_json::json!({"available": true, "system_prompt": p, "restart_note": restart_note, "notice": notice}),
         ),
         None => json(
             200,

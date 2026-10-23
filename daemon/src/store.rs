@@ -3805,6 +3805,9 @@ impl Store {
             // with. The live note is consumed once at dispatch, so the board's
             // Prompt tab reads this per-attempt copy instead.
             "ALTER TABLE cells ADD COLUMN dispatched_restart_note TEXT",
+            // Why configured system prompts were left out of a cell's
+            // dispatch (its backend has no system prompt); NULL otherwise.
+            "ALTER TABLE cells ADD COLUMN system_prompt_notice TEXT",
             "ALTER TABLE proofs ADD COLUMN dispatched_restart_note TEXT",
             // RAL-185: the resolved machine a cell/proof runs on. NULL means
             // the daemon's own host, which is what every pre-RAL-185 row is.
@@ -8706,6 +8709,40 @@ impl Store {
         self.conn.execute(
             "UPDATE cells SET effective_system_prompt=? WHERE squad_id=? AND task_idx=? AND idx=?",
             params![system_prompt, squad_id, task_idx, idx],
+        )?;
+        Ok(())
+    }
+
+    /// Why configured system prompts were not applied to the cell's latest
+    /// dispatch, if they were skipped.
+    pub fn get_cell_system_prompt_notice(
+        &self,
+        squad_id: &str,
+        task_idx: i64,
+        idx: i64,
+    ) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT system_prompt_notice FROM cells WHERE squad_id=? AND task_idx=? AND idx=?",
+                params![squad_id, task_idx, idx],
+                |r| r.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten())
+    }
+
+    /// Record (or clear, with `None`) the skipped-configured-prompt notice.
+    pub fn set_cell_system_prompt_notice(
+        &self,
+        squad_id: &str,
+        task_idx: i64,
+        idx: i64,
+        notice: Option<&str>,
+    ) -> Result<()> {
+        self.conn.execute(
+            "UPDATE cells SET system_prompt_notice=? WHERE squad_id=? AND task_idx=? AND idx=?",
+            params![notice, squad_id, task_idx, idx],
         )?;
         Ok(())
     }

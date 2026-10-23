@@ -4114,6 +4114,32 @@ fn run_cell_worker(
     }
     spec.agent = selection.backend.clone();
     spec.executable = selection.executable.clone();
+    // Configured system prompts (global, then per-agent) go around the cell's
+    // own. `shown_system_prompt` is the same text minus the hidden global
+    // layer, which is what the board's System Prompt tab stores and displays.
+    let mut shown_system_prompt = None;
+    let mut system_prompt_notice = None;
+    if spec.prompt.is_some() {
+        let layered = crate::runner::layer_configured_system_prompts(
+            &crate::config::load_system_prompt_config(),
+            &row.agent,
+            &selection.backend,
+            spec.system_prompt.as_deref(),
+        );
+        if layered.delivered.is_some() && spec.system_prompt_position.is_none() {
+            spec.system_prompt_position = Some("append".to_string());
+        }
+        if let Some(notice) = &layered.notice {
+            crate::rlog!(
+                INFO,
+                "ralphus [scheduler] cell {squad_id}/{}: {notice}",
+                row.cell_id,
+            );
+        }
+        spec.system_prompt = layered.delivered;
+        shown_system_prompt = Some(layered.shown);
+        system_prompt_notice = layered.notice;
+    }
     // A prompt cell on a provider machine asks that machine whether its agent
     // can start there (remembered per machine and agent while it passes), so
     // a missing agent fails the cell now with a remedy rather than mid-run.
@@ -4426,11 +4452,26 @@ fn run_cell_worker(
 
     {
         let guard = store.lock();
+        let effective_system_prompt = match shown_system_prompt {
+            Some(shown) => {
+                let delivered = std::mem::replace(&mut spec.system_prompt, shown);
+                let effective = spec.effective_system_prompt();
+                spec.system_prompt = delivered;
+                effective
+            }
+            None => spec.effective_system_prompt(),
+        };
         let _ = guard.set_cell_effective_system_prompt(
             squad_id,
             row.task_idx,
             row.idx,
-            spec.effective_system_prompt().as_deref(),
+            effective_system_prompt.as_deref(),
+        );
+        let _ = guard.set_cell_system_prompt_notice(
+            squad_id,
+            row.task_idx,
+            row.idx,
+            system_prompt_notice.as_deref(),
         );
         let _ = guard.set_cell_dispatched_restart_note(
             squad_id,

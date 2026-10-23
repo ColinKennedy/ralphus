@@ -232,6 +232,7 @@
        * @property {boolean} available
        * @property {string} [system_prompt]
        * @property {string|null} [restart_note] - The restart note (RAL-639) the latest attempt was dispatched with.
+       * @property {string|null} [notice] - Why configured system prompts were not applied to the latest dispatch, if they were skipped.
        * @property {string} [reason]
        */
       /**
