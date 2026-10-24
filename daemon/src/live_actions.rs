@@ -71,6 +71,17 @@ command the steps rely on is missing, or the configuration is wrong, that is \
 exactly what you are here to catch -- report it (and fix it if it is in this \
 repository).\n\
 \n\
+If this checkout contains `scripts/live-stack.sh` and the steps need a running \
+ralphus, start your own stack with `bash scripts/live-stack.sh start` and stop it \
+with `bash scripts/live-stack.sh stop` when done: it builds this checkout and runs \
+a daemon and board on free ports with their own database, and prints their URLs \
+and the CLI path. Use those instead of any step that runs `scripts/build-debug.sh` \
+or names ports 7890/7474, drive it with `<CLI> --daemon-url <DAEMON_URL>`, and \
+submit only to your stack, against a throwaway git project rather than this \
+repository. The ralphus daemon and board already running on 7890/7474 belong to \
+the machine's user and may be an older build than the one you are testing: never \
+start, stop or submit to them.\n\
+\n\
 Before you finish, stop every process you started -- and only those: stop each \
 by its own process id (or the terminal or job you started it in), never by \
 program name (no `taskkill /IM python.exe`, `pkill python` or similar), which \
@@ -109,7 +120,20 @@ as a real, visible window (never an offscreen or headless substitute unless the 
 steps ask for one), checked, then closed.\n\
 \n\
 This run is read-only: do not edit, stage or commit anything, and never push. \
-Setup and runtime failures are real findings: report them. Before you finish, \
+Setup and runtime failures are real findings: report them.\n\
+\n\
+If this checkout contains `scripts/live-stack.sh` and the steps need a running \
+ralphus, start your own stack with `bash scripts/live-stack.sh start` and stop it \
+with `bash scripts/live-stack.sh stop` when done: it builds this checkout and runs \
+a daemon and board on free ports with their own database, and prints their URLs \
+and the CLI path. Use those instead of any step that runs `scripts/build-debug.sh` \
+or names ports 7890/7474, drive it with `<CLI> --daemon-url <DAEMON_URL>`, and \
+submit only to your stack, against a throwaway git project rather than this \
+repository. The ralphus daemon and board already running on 7890/7474 belong to \
+the machine's user and may be an older build than the one you are testing: never \
+start, stop or submit to them.\n\
+\n\
+Before you finish, \
 stop every process you started -- and only those, each by its own process id, \
 never by program name (no `taskkill /IM python.exe`, `pkill python` or \
 similar).\n\
@@ -1858,6 +1882,18 @@ mod tests {
             allow_commits,
             exhibit_slots: Vec::new(),
             upstream_sha: None,
+        }
+    }
+
+    #[test]
+    fn both_system_prompts_point_the_agent_at_its_own_live_stack() {
+        for prompt in [
+            LIVE_ACTION_COMMIT_SYSTEM_PROMPT,
+            LIVE_ACTION_READ_ONLY_SYSTEM_PROMPT,
+        ] {
+            assert!(prompt.contains("bash scripts/live-stack.sh start"));
+            assert!(prompt.contains("bash scripts/live-stack.sh stop"));
+            assert!(prompt.contains("never start, stop or submit to them"));
         }
     }
 
