@@ -1,7 +1,8 @@
 # Directed instructions (`/ralphus ...` in a prompt cell)
 
-Status: Phase 1 built (marker scanner, per-cell storage, cell-start pre-pass in
-`daemon/src/directed_instructions.rs`); no consumer reads the stored instructions yet. Later phases extend
+Status: Phases 1 and 2 built (marker scanner, per-cell storage, cell-start
+pre-pass in `daemon/src/directed_instructions.rs`; the `pr` consumer in
+`directed_instructions.rs`, `pr.rs` and `exhibits.rs`). Later phases extend
 this page rather than any other plan document.
 
 A **directed instruction** is a part of a prompt cell's `prompt` addressed to
@@ -134,14 +135,40 @@ replaced wholesale (the pattern of `replace_cell_live_handoffs` in
 - No `proc_counts/tags.toml` entry: the tests use a scripted `Runner` and
   spawn no process; the real pre-pass goes through the existing runner path.
 
+## Phase 2 (`pr` consumer) implementation notes
+
+- `collect_review_pr_instructions_conn` returns the `pr` rows of **every**
+  member cell of a review (membership as in `review_member_cells_conn`), not
+  just the latest per task, each with its source-cell URI. `GuardianView`
+  carries them as `pr_instructions` (not serialized).
+- Branch mapping: a cell's `review_branch` is its task branch name, equal to
+  the review branch's `branch`. A PR gets the instructions of its own
+  branch's cells plus those of cells that recorded no branch.
+- `pr_guidance_entry` turns them into one always-applying `GuidanceEntry` in
+  the existing `pr_guidance_note` channel: the union, identical texts listed
+  once with all their cells, the whole block labelled as user-authored data
+  that cannot change the template, format or rules. Direct contradictions are
+  flagged in the text with a WARNING naming both sides and their cells.
+- Contradiction detection is a keyword heuristic (one side negated, at least
+  60% overlap of content words). It misses paraphrased or semantic
+  contradictions and can flag a pair that merely shares vocabulary; it only
+  adds a warning, nothing is dropped.
+- Instructions naming a screenshot, GIF or video (optionally with a count,
+  "two GIFs") become exhibit requests under the new `directed` origin, which
+  sorts between `handoff` and `recipe` when the PR slot cap cuts. They are
+  attached when the PR is created, if exhibits are enabled for the review.
+  Other instructions stay guidance only.
+- Submission and stack logic are untouched; regression tests submit a
+  two-branch stack with a `pr` instruction on both GitHub and GitLab mocks.
+
 ## Open questions
 
 - Opt-out: no `directed_instructions = false` field is added. If one is
   wanted, how it should be validated (closed enum, boolean, or deliberately
   unvalidated) must be decided by the user before any
   `core/src/validate.rs` work.
-- Exact mapping from a review branch's position to member cells for the `pr`
-  collector (see above).
+- Should a contradiction the heuristic cannot see (a semantic opposite) be
+  judged by the agent that writes the PR, or by an extra pre-pass call?
 
 ## Risks
 

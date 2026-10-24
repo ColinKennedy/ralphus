@@ -2729,7 +2729,70 @@ fn pr_guidance_note(
         Path::new(&guardian.git_root),
         &changed,
     ));
+    entries.extend(directed_pr_guidance(guardian, position));
     crate::pr_guidance::guidance_note(&entries, &changed)
+}
+
+/// The `pr` instructions cells addressed to this branch's PR, as one guidance
+/// entry that applies to every change.
+fn directed_pr_guidance(
+    guardian: &GuardianView,
+    position: i64,
+) -> Option<crate::pr_guidance::GuidanceEntry> {
+    let branch = guardian.branches.iter().find(|b| b.position == position)?;
+    let own = crate::directed_instructions::instructions_for_branch(
+        &guardian.pr_instructions,
+        &branch.branch,
+    );
+    crate::directed_instructions::pr_guidance_entry(&own)
+}
+
+/// Turn the `pr` directed instructions that name a screenshot, GIF or video
+/// into exhibit slots, when the review shows exhibits at all.
+fn apply_directed_exhibits(
+    store: &crate::store_lock::StoreHandle,
+    guardian: &GuardianView,
+    position: i64,
+    branch_id: &str,
+) {
+    if !crate::exhibit_settings::resolve(store, guardian).enabled {
+        return;
+    }
+    let Some(branch) = guardian.branches.iter().find(|b| b.position == position) else {
+        return;
+    };
+    let requests: Vec<crate::exhibits::InferredRequest> =
+        crate::directed_instructions::instructions_for_branch(
+            &guardian.pr_instructions,
+            &branch.branch,
+        )
+        .into_iter()
+        .flat_map(|i| crate::exhibits::directed_requests(&i.text, &i.source_cell))
+        .collect();
+    if requests.is_empty() {
+        return;
+    }
+    let guard = store.lock();
+    let attached = guard
+        .apply_branch_exhibits(
+            &guardian.id,
+            branch_id,
+            crate::exhibits::ExhibitOrigin::Directed,
+            &requests,
+        )
+        .unwrap_or(0);
+    crate::cartographer::Note::new("guardian")
+        .guardian(&guardian.id)
+        .scope("live_action")
+        .emit(
+            &guard,
+            "exhibit requests from directed instructions for PR",
+            serde_json::json!({
+                "branch_id": branch_id,
+                "requested": requests.len(),
+                "attached_now": attached,
+            }),
+        );
 }
 
 /// Turn the project's `.ralphus.toml` exhibit recipes that match this branch's
@@ -9504,6 +9567,7 @@ fn submit_stacked_branch_pr(
         Some(existing) => adopt(existing),
         None => {
             apply_exhibit_recipes(store, guardian, root, position, branch_id);
+            apply_directed_exhibits(store, guardian, position, branch_id);
             let exhibit_note = crate::exhibits::inference_prompt(store, guardian, branch_id);
             let (title, description, reviewer_relevant_prophecies, inferred_exhibits) =
                 resolve_title_description(
@@ -24404,6 +24468,7 @@ token_env = "RALPHUS_TEST_FORGE_TOKEN"
     /// bookkeeping, and that the stack still chains on both forges.
     fn submit_two_branch_stack_with_an_appraisal(
         forge: &str,
+        directed: bool,
     ) -> (
         Vec<serde_json::Value>,
         Vec<PullRequestView>,
@@ -24513,6 +24578,24 @@ token_env = "RALPHUS_TEST_FORGE_TOKEN"
                     rusqlite::params![gid],
                 )
                 .unwrap();
+            if directed {
+                s.replace_cell_directed_instructions(
+                    "squad-1",
+                    0,
+                    0,
+                    &crate::directed_instructions::CellDirectedInstructions {
+                        prompt_hash: "h".to_string(),
+                        work_prompt: "w".to_string(),
+                        status: crate::directed_instructions::STATUS_EXTRACTED.to_string(),
+                        instructions: vec![crate::directed_instructions::DirectedInstruction {
+                            target: "pr".to_string(),
+                            text: "make sure the PR has two GIFs".to_string(),
+                            source: crate::directed_instructions::SOURCE_MARKER.to_string(),
+                        }],
+                    },
+                )
+                .unwrap();
+            }
             s.record_appraisal(
                 "squad-1",
                 &crate::appraisal::proof_entity_uri("squad-1", 0, "cell", 0, 0),
@@ -24537,6 +24620,7 @@ token_env = "RALPHUS_TEST_FORGE_TOKEN"
         );
         let runner = NoopRunner;
         let guardian = store.lock().get_guardian(&gid).unwrap();
+        assert_eq!(guardian.pr_instructions.len(), usize::from(directed));
         let ordered_enabled: Vec<&BranchView> = guardian.branches.iter().collect();
         let mut alias_by_branch = HashMap::new();
         let mut prs = Vec::new();
@@ -24585,8 +24669,9 @@ token_env = "RALPHUS_TEST_FORGE_TOKEN"
         (posted, prs, tip_message, stored)
     }
 
-    fn assert_appraisal_lands_in_the_first_pr_and_the_stack_holds(forge: &str) {
-        let (posted, prs, tip_message, stored) = submit_two_branch_stack_with_an_appraisal(forge);
+    fn assert_appraisal_lands_in_the_first_pr_and_the_stack_holds(forge: &str, directed: bool) {
+        let (posted, prs, tip_message, stored) =
+            submit_two_branch_stack_with_an_appraisal(forge, directed);
         let body_key = if forge == "github" {
             "body"
         } else {
@@ -24631,12 +24716,48 @@ token_env = "RALPHUS_TEST_FORGE_TOKEN"
 
     #[test]
     fn appraisals_fold_into_the_first_github_pr_without_breaking_the_stack() {
-        assert_appraisal_lands_in_the_first_pr_and_the_stack_holds("github");
+        assert_appraisal_lands_in_the_first_pr_and_the_stack_holds("github", false);
     }
 
     #[test]
     fn appraisals_fold_into_the_first_gitlab_mr_without_breaking_the_stack() {
-        assert_appraisal_lands_in_the_first_pr_and_the_stack_holds("gitlab");
+        assert_appraisal_lands_in_the_first_pr_and_the_stack_holds("gitlab", false);
+    }
+
+    #[test]
+    fn a_review_whose_cells_carry_pr_instructions_still_stacks_its_github_prs() {
+        assert_appraisal_lands_in_the_first_pr_and_the_stack_holds("github", true);
+    }
+
+    #[test]
+    fn a_review_whose_cells_carry_pr_instructions_still_stacks_its_gitlab_mrs() {
+        assert_appraisal_lands_in_the_first_pr_and_the_stack_holds("gitlab", true);
+    }
+
+    #[test]
+    fn directed_pr_instructions_reach_the_guidance_of_the_branch_they_belong_to() {
+        let st = store();
+        let gid = st.create_guardian("demo", "main", "/repo").unwrap();
+        st.add_guardian_branch(&gid, "b1").unwrap();
+        st.add_guardian_branch(&gid, "b2").unwrap();
+        let mut view = st.get_guardian(&gid).unwrap();
+        let mk = |cell: &str, branch: Option<&str>, text: &str| {
+            crate::directed_instructions::PrInstruction {
+                source_cell: cell.to_string(),
+                branch: branch.map(str::to_string),
+                text: text.to_string(),
+            }
+        };
+        view.pr_instructions = vec![
+            mk("cell:s:0:0", Some("b1"), "mention the migration"),
+            mk("cell:s:1:0", Some("b2"), "mention the cache"),
+        ];
+        let first = directed_pr_guidance(&view, 0).expect("b1 has an instruction");
+        assert!(first.text.contains("mention the migration"));
+        assert!(first.text.contains("cell:s:0:0"));
+        assert!(!first.text.contains("mention the cache"));
+        let second = directed_pr_guidance(&view, 1).expect("b2 has an instruction");
+        assert!(second.text.contains("mention the cache"));
     }
 
     #[test]

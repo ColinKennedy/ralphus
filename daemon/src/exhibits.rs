@@ -43,6 +43,8 @@ pub use ralphus_core::exhibit_recipes::{CompareTarget, ExhibitKind};
 pub enum ExhibitOrigin {
     /// Written by the agent that made the change, in its live handoff.
     Handoff,
+    /// Asked for by a `/ralphus` directed instruction in a cell's prompt.
+    Directed,
     /// A configured `[[exhibit.recipe]]` matching the changed files.
     Recipe,
     /// Added by the AI exhibit check when the PR was written.
@@ -55,6 +57,7 @@ impl ExhibitOrigin {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Handoff => "handoff",
+            Self::Directed => "directed",
             Self::Recipe => "recipe",
             Self::Inferred => "inferred",
         }
@@ -62,6 +65,7 @@ impl ExhibitOrigin {
 
     fn parse(name: &str) -> Self {
         match name {
+            "directed" => Self::Directed,
             "recipe" => Self::Recipe,
             "inferred" => Self::Inferred,
             _ => Self::Handoff,
@@ -1357,6 +1361,72 @@ pub fn recipe_requests(
         })
         .collect();
     (requests, warnings)
+}
+
+/// The exhibit requests a `pr` directed instruction asks for: one per
+/// `screenshot` / `GIF` / `video` it names, repeated by a count word before
+/// it ("two GIFs"), at most [`MAX_PER_ACTION`] in all. Empty when it names
+/// none of them; the instruction then stays PR-description guidance only.
+#[must_use]
+pub fn directed_requests(instruction: &str, source_cell: &str) -> Vec<InferredRequest> {
+    let words: Vec<String> = instruction
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .map(str::to_lowercase)
+        .collect();
+    let count_word = |w: &str| -> Option<usize> {
+        match w {
+            "a" | "an" | "one" => Some(1),
+            "two" | "both" => Some(2),
+            "three" => Some(3),
+            "four" => Some(4),
+            digits => digits.parse().ok(),
+        }
+    };
+    let mut wanted: Vec<(ExhibitKind, usize)> = Vec::new();
+    for (i, word) in words.iter().enumerate() {
+        let kind = match word.trim_end_matches('s') {
+            "gif" => ExhibitKind::Gif,
+            "video" => ExhibitKind::Video,
+            "screenshot" => ExhibitKind::Screenshot,
+            _ => continue,
+        };
+        let count = i
+            .checked_sub(1)
+            .and_then(|j| count_word(&words[j]))
+            .unwrap_or(1)
+            .clamp(1, MAX_PER_ACTION);
+        match wanted.iter_mut().find(|(k, _)| *k == kind) {
+            Some((_, n)) => *n = (*n).max(count),
+            None => wanted.push((kind, count)),
+        }
+    }
+    let describe: String = instruction
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(DESCRIBE_MAX_CHARS - 12)
+        .collect();
+    let mut out = Vec::new();
+    for (kind, count) in wanted {
+        for n in 1..=count {
+            if out.len() >= MAX_PER_ACTION {
+                return out;
+            }
+            let text = if count > 1 {
+                format!("{describe} ({n} of {count})")
+            } else {
+                describe.clone()
+            };
+            out.push(InferredRequest {
+                owner: InferredOwner::New,
+                request: ExhibitRequest::single(kind, text),
+                why: Some(format!("directed instruction from {source_cell}")),
+            });
+        }
+    }
+    out
 }
 
 /// The PR writer's exhibit requests: every `EXHIBIT_REQUEST:` line before the
@@ -3563,5 +3633,24 @@ mod upstream_render_tests {
             assert_eq!(UpstreamState::parse(s.as_str()), Some(s));
         }
         assert_eq!(UpstreamState::parse("nope"), None);
+    }
+
+    #[test]
+    fn directed_instructions_route_media_words_to_requests() {
+        let got = directed_requests("make sure the PR has two GIFs", "cell:x");
+        assert_eq!(got.len(), 2);
+        assert!(
+            got.iter()
+                .all(|r| r.why.as_deref() == Some("directed instruction from cell:x"))
+        );
+        assert_eq!(directed_requests("add a screenshot", "c").len(), 1);
+        assert_eq!(directed_requests("a video walkthrough", "c").len(), 1);
+        assert!(directed_requests("explain the refactor", "c").is_empty());
+        assert!(directed_requests("ten gifs please", "c").len() <= MAX_PER_ACTION);
+    }
+
+    #[test]
+    fn directed_origin_has_its_own_name() {
+        assert_eq!(ExhibitOrigin::Directed.as_str(), "directed");
     }
 }
