@@ -5603,8 +5603,9 @@ cell-start pre-pass made of the cell's prompt (see
 cell); `work_prompt` is what the agent received. `extracted` is `true` only
 when a stored result matches the cell's current prompt, in which case `status`
 is `extracted`, `unchanged` or `fallback` and `instructions` is a list of
-`{target, text, source}` (`target` is `pr` or `live_action`, `source` is
-`marker` or `semantic`). Otherwise `extracted` is `false`, `work_prompt`
+`{target, text}` (`target` is `pr` or `live_action`; `text` is the
+`/ralphus` instruction as written, without the marker). Otherwise
+`extracted` is `false`, `work_prompt`
 equals `original`, and `stale` is `true` when a result exists for an earlier
 prompt. Read-only; shown by `ralphus cell show` (as `directed_instructions`)
 and in the board's cell pane.

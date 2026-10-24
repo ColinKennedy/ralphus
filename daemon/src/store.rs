@@ -2934,9 +2934,9 @@ impl Store {
                 PRIMARY KEY (squad_id, task_idx, cell_idx, ordinal)
             );
             -- Directed instructions (`crate::directed_instructions`): the
-            -- pre-pass result for a prompt cell whose prompt mentions ralphus.
-            -- `prompt_hash` keys the cache; the rows are the extracted
-            -- `{target, text}` instructions.
+            -- pre-pass result for a prompt cell whose prompt carries a
+            -- `/ralphus` marker. `prompt_hash` keys the cache; the rows are
+            -- the extracted `{target, text}` instructions.
             CREATE TABLE IF NOT EXISTS cell_directed_instructions (
                 squad_id      TEXT NOT NULL REFERENCES squads(id) ON DELETE CASCADE,
                 task_idx      INTEGER NOT NULL,
@@ -2954,7 +2954,6 @@ impl Store {
                 ordinal  INTEGER NOT NULL,
                 target   TEXT NOT NULL,
                 text     TEXT NOT NULL,
-                source   TEXT NOT NULL,
                 PRIMARY KEY (squad_id, task_idx, cell_idx, ordinal)
             );
             -- A review's live actions: its member cells' handoffs, deduplicated
@@ -5014,6 +5013,25 @@ impl Store {
                 .conn
                 .execute("ALTER TABLE guardians DROP COLUMN skip_auto_build", []);
             self.note_migration("RAL-609 drop guardians.skip_auto_build", drop);
+        }
+        // Directed instructions come only from the `/ralphus` marker, so the
+        // per-row `source` (marker vs. model-recognised) is retired. Guarded
+        // on the column existing so the DROP runs exactly once.
+        let has_directed_source = self
+            .conn
+            .prepare(
+                "SELECT 1 FROM pragma_table_info('cell_directed_instruction_rows') \
+                 WHERE name='source'",
+            )
+            .and_then(|mut s| s.query_row([], |_| Ok(())).optional())
+            .unwrap_or(None)
+            .is_some();
+        if has_directed_source {
+            let drop = self.conn.execute(
+                "ALTER TABLE cell_directed_instruction_rows DROP COLUMN source",
+                [],
+            );
+            self.note_migration("drop cell_directed_instruction_rows.source", drop);
         }
         // RAL-168: `verify_mid_resolution` is retired -- replaced outright by
         // `proof_scope`/`proof_skip_auto_clean` above, not mapped forward
