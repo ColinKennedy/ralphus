@@ -199,6 +199,8 @@ replaced wholesale (the pattern of `replace_cell_live_handoffs` in
   `core/src/validate.rs` work.
 - Should a contradiction the heuristic cannot see (a semantic opposite) be
   judged by the agent that writes the PR, or by an extra pre-pass call?
+- Exact mapping from a review branch's position to member cells for the `pr`
+  collector (see above).
 
 ## Risks
 
