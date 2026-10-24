@@ -1,10 +1,11 @@
 # Directed instructions (`/ralphus ...` in a prompt cell)
 
-Status: Phases 1 to 4 built (marker scanner, per-cell storage, cell-start
-pre-pass in `daemon/src/directed_instructions.rs`; the `pr` consumer in
-`directed_instructions.rs`, `pr.rs` and `exhibits.rs`; the `live_action`
-consumer in `live_actions.rs`). Later phases extend
-this page rather than any other plan document.
+Status: built. Marker scanner, per-cell storage and the cell-start pre-pass
+live in `daemon/src/directed_instructions.rs`; the `pr` consumer spans it,
+`pr.rs` and `exhibits.rs`; the `live_action` consumer is in `live_actions.rs`;
+the read surface is `cell show`, its endpoint and the board's cell pane. Open
+questions below stay open. Later phases extend this page rather than any other
+plan document.
 
 A **directed instruction** is a part of a prompt cell's `prompt` addressed to
 ralphus rather than to the cell's agent, e.g. `/ralphus make sure the PR has

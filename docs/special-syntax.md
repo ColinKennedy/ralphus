@@ -773,10 +773,10 @@ claude-code = "Be terse."                    # one backend or custom profile nam
 - Applies to task prompt cells only; proof steps and review-side agents do not
   receive these layers.
 
-### `/ralphus` directed-instruction marker (prompt cells; planned)
+### `/ralphus` directed-instruction marker (prompt cells)
 
-Not built yet -- this entry records the agreed grammar; the design and open
-questions are in [`directed-instructions.md`](directed-instructions.md). A
+Built; the design and open questions are in
+[`directed-instructions.md`](directed-instructions.md). A
 **directed instruction** is a part of a prompt cell's `prompt` addressed to
 ralphus rather than to the cell's agent. A one-shot pre-pass at cell start
 separates it from the **work prompt** (what the agent receives) and stores it
