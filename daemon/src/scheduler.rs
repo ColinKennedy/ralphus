@@ -4185,6 +4185,13 @@ fn run_cell_worker(
             ));
         }
     }
+    if spec.prompt.is_some() {
+        if let Some(work_prompt) =
+            crate::directed_instructions::apply_prepass(store, runner, &spec, squad_id, row)
+        {
+            spec.prompt = Some(work_prompt);
+        }
+    }
     spec.prompt = spec
         .prompt
         .map(|p| resolve_handoffs(&p, &plan.deps[i], &summaries));
