@@ -778,28 +778,33 @@ claude-code = "Be terse."                    # one backend or custom profile nam
 Built; the design and open questions are in
 [`directed-instructions.md`](directed-instructions.md). A
 **directed instruction** is a part of a prompt cell's `prompt` addressed to
-ralphus rather than to the cell's agent. A one-shot pre-pass at cell start
-separates it from the **work prompt** (what the agent receives) and stores it
-per cell. No task-file field is involved.
+ralphus rather than to the cell's agent, written after the `/ralphus` marker.
+A one-shot pre-pass at cell start separates it from the **work prompt** (what
+the agent receives) and stores it per cell. No task-file field is involved.
 
 - **Marker.** `/ralphus`, case-insensitive. It matches only at the start of a
   line or after whitespace, and only when followed by whitespace, end of
   text, or one of `:` `,` `.`. It never matches when followed by `/` or
   preceded by a non-space character, so `foo/bar/fizz/ralphus more` and
-  `bizz/ralphus/buzz blah` are ordinary text. A hand-written scanner reads
-  the marker (the `regex` crate has no lookahead); this part is
-  machine-parsed.
-- **Prefilter.** A prompt without the substring `ralphus` (any case) skips
-  the pre-pass entirely.
+  `bizz/ralphus/buzz blah` are ordinary text, and it is ignored inside fenced
+  code blocks. A hand-written scanner reads the marker (the `regex` crate has
+  no lookahead); this part is machine-parsed. **Only the marker makes an
+  instruction**: a prompt without one never reaches the pre-pass, and prose
+  such as "Ralphus, please ..." is ordinary text for the agent.
+- **Extent (model-judged, machine-cut).** An instruction starts at its marker
+  and ends, at the latest, at the end of its paragraph (a blank line, a
+  code-fence line, or the next marker). The pre-pass model decides where
+  inside that it ends and copies it; the daemon checks the copy against the
+  text at the marker and cuts exactly that span out, tidying only the
+  whitespace around the cut. The rest of the prompt reaches the agent as
+  written.
 - **Targets (closed registry).** `pr` (a GitHub PR or GitLab MR alike) and
   `live_action` (guidance attached to the cell's live handoff when it posts
-  one, dropped when it posts none; it never creates a live action). An
-  unknown target in the pre-pass output rejects the whole extraction and the
-  original prompt is used. `notify` is a reserved name with no behavior.
-- **Semantic fallback (not parsed).** The pre-pass model also recognises an
-  *addressed* "Ralphus, ..." / "also Ralphus, ...". That judgment is a prompt
-  convention: a bare mention of the project name is not an instruction.
-  Ambiguous text stays in the work prompt.
+  one, dropped when it posts none; it never creates a live action). A marked
+  instruction that fits neither stays in the work prompt. An unknown target,
+  or a copy that does not match the text at its marker, rejects the whole
+  extraction and the original prompt is used. `notify` is a reserved name
+  with no behavior.
 
 ### Process-side sentinels (agent authors, not cell authors)
 

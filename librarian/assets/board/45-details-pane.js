@@ -969,14 +969,10 @@ Saving restarts the proof step and the rest of its list; an unchanged value rest
         if (!view || !view.extracted || !view.instructions.length) return "";
         const rows = view.instructions.map((ins) => {
           const tip = ins.target === "pr"
-            ? "Goes to this cell's review: added to the PR/MR description guidance (and exhibit slots for screenshots, GIFs or videos)."
+            ? "Goes to this cell's review: added to the PR/MR description guidance, where the PR writer decides how to meet it (including asking for screenshots, GIFs or videos)."
             : "Attached as guidance to this cell's live-test handoff, if the cell proposes one; dropped otherwise.";
-          const srcTip = ins.source === "marker"
-            ? "Written with the /ralphus marker."
-            : "Recognised as addressed to ralphus by the pre-pass model, without the marker.";
           return `<div class="kv-row"><span class="k mono" data-tip="${esc(tip)}">${esc(ins.target)}</span>` +
-            `<span class="v" style="flex:1">${esc(ins.text)}</span>` +
-            `<span class="k" data-tip="${esc(srcTip)}">${esc(ins.source)}</span></div>`;
+            `<span class="v" style="flex:1">${esc(ins.text)}</span></div>`;
         }).join("");
         return `<h3 class="section" data-tip="Parts of the prompt addressed to ralphus (/ralphus ...) were moved out before the agent started. The prompt above is exactly what you wrote; the live view's Prompt tab shows what the agent received and can toggle between the two.">directed instructions</h3>` +
           rows;

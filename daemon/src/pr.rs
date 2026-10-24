@@ -2747,54 +2747,6 @@ fn directed_pr_guidance(
     crate::directed_instructions::pr_guidance_entry(&own)
 }
 
-/// Turn the `pr` directed instructions that name a screenshot, GIF or video
-/// into exhibit slots, when the review shows exhibits at all.
-fn apply_directed_exhibits(
-    store: &crate::store_lock::StoreHandle,
-    guardian: &GuardianView,
-    position: i64,
-    branch_id: &str,
-) {
-    if !crate::exhibit_settings::resolve(store, guardian).enabled {
-        return;
-    }
-    let Some(branch) = guardian.branches.iter().find(|b| b.position == position) else {
-        return;
-    };
-    let requests: Vec<crate::exhibits::InferredRequest> =
-        crate::directed_instructions::instructions_for_branch(
-            &guardian.pr_instructions,
-            &branch.branch,
-        )
-        .into_iter()
-        .flat_map(|i| crate::exhibits::directed_requests(&i.text, &i.source_cell))
-        .collect();
-    if requests.is_empty() {
-        return;
-    }
-    let guard = store.lock();
-    let attached = guard
-        .apply_branch_exhibits(
-            &guardian.id,
-            branch_id,
-            crate::exhibits::ExhibitOrigin::Directed,
-            &requests,
-        )
-        .unwrap_or(0);
-    crate::cartographer::Note::new("guardian")
-        .guardian(&guardian.id)
-        .scope("live_action")
-        .emit(
-            &guard,
-            "exhibit requests from directed instructions for PR",
-            serde_json::json!({
-                "branch_id": branch_id,
-                "requested": requests.len(),
-                "attached_now": attached,
-            }),
-        );
-}
-
 /// Turn the project's `.ralphus.toml` exhibit recipes that match this branch's
 /// changes into exhibit slots (or pending requests), when the review shows
 /// exhibits at all.
@@ -9567,7 +9519,6 @@ fn submit_stacked_branch_pr(
         Some(existing) => adopt(existing),
         None => {
             apply_exhibit_recipes(store, guardian, root, position, branch_id);
-            apply_directed_exhibits(store, guardian, position, branch_id);
             let exhibit_note = crate::exhibits::inference_prompt(store, guardian, branch_id);
             let (title, description, reviewer_relevant_prophecies, inferred_exhibits) =
                 resolve_title_description(
@@ -24590,7 +24541,6 @@ token_env = "RALPHUS_TEST_FORGE_TOKEN"
                         instructions: vec![crate::directed_instructions::DirectedInstruction {
                             target: "pr".to_string(),
                             text: "make sure the PR has two GIFs".to_string(),
-                            source: crate::directed_instructions::SOURCE_MARKER.to_string(),
                         }],
                     },
                 )

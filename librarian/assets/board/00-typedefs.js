@@ -196,11 +196,10 @@
        * @property {string|null} upstream
        */
       /**
-       * One instruction a prompt cell's text addressed to ralphus.
+       * One `/ralphus` instruction a prompt cell's text addressed to ralphus.
        * @typedef {object} DirectedInstructionRow
        * @property {string} target - `pr` or `live_action`.
-       * @property {string} text
-       * @property {string} source - `marker` or `semantic`.
+       * @property {string} text - The instruction as written, without the marker.
        */
       /**
        * `GET /api/squads/{id}/cells/{ti}/{si}/directed-instructions`.
@@ -459,7 +458,7 @@
        * @property {"gif"|"video"|"screenshot"|"terminal-text"} kind - What was asked for.
        * @property {string} describe - What to show for `kind`.
        * @property {{kind: "gif"|"video"|"screenshot"|"terminal-text", describe: string}[]} alternatives - Fallback kinds after `kind`, each with the description written for what that kind can show.
-       * @property {"handoff"|"directed"|"recipe"|"inferred"} origin - Who asked: the change's own agent, a /ralphus directed instruction, a config recipe, or the PR writer.
+       * @property {"handoff"|"recipe"|"inferred"} origin - Who asked: the change's own agent, a config recipe, or the PR writer.
        * @property {string|null} why - Why an inferred request was added.
        * @property {"gif"|"video"|"screenshot"|"terminal-text"|null} delivered_kind - What a run actually delivered, which can be lower in the preference order.
        * @property {string|null} url - The uploaded file's URL on the forge.

@@ -1,27 +1,28 @@
 # Directed instructions (`/ralphus ...` in a prompt cell)
 
 Status: built. Marker scanner, per-cell storage and the cell-start pre-pass
-live in `daemon/src/directed_instructions.rs`; the `pr` consumer spans it,
-`pr.rs` and `exhibits.rs`; the `live_action` consumer is in `live_actions.rs`;
+live in `daemon/src/directed_instructions.rs`; the `pr` consumer spans it
+and `pr.rs`; the `live_action` consumer is in `live_actions.rs`;
 the read surface is `cell show`, its endpoint and the board's cell pane. Open
 questions below stay open. Later phases extend this page rather than any other
 plan document.
 
-A **directed instruction** is a part of a prompt cell's `prompt` addressed to
-ralphus rather than to the cell's agent, e.g. `/ralphus make sure the PR has
-two GIFs` or `... also Ralphus, please test this against the dev server`.
+A **directed instruction** is a part of a prompt cell's `prompt` that starts
+with the `/ralphus` marker and is addressed to ralphus rather than to the
+cell's agent, e.g. `/ralphus make sure the PR has two GIFs`. Only the marker
+makes one: "Ralphus, please ..." without it is ordinary text for the agent.
 Vocabulary: [`glossary.md`](glossary.md); marker grammar:
 [`special-syntax.md`](special-syntax.md).
 
 ## Behaviour
 
-Before a prompt cell's agent starts, a one-shot pre-pass splits the prompt
-into:
+Before a prompt cell's agent starts, a one-shot pre-pass splits a prompt
+that carries the marker into:
 
 1. **original** -- exactly what the user wrote (the cell's stored `prompt`,
    never modified),
-2. **work prompt** -- the original minus the directed parts; this is what the
-   cell's agent receives,
+2. **work prompt** -- the original with the directed parts cut out; this is
+   what the cell's agent receives,
 3. **directed instructions** -- zero or more `{target, text}` rows stored
    durably per cell, travelling cell -> review -> PR description / live action.
 
@@ -32,18 +33,28 @@ added in Phase 0**, and no `core/src/validate.rs` change is made.
 
 - Runs **once, at cell start, as a preprocessor**, cached by the hash of the
   original prompt. No mid-run triggers; it never influences cell execution.
-- Marker and prefilter: see `special-syntax.md`. A prompt without the
-  substring `ralphus` (any case) skips the pre-pass, so most cells pay nothing.
+- Marker: see `special-syntax.md`. A prompt without a `/ralphus` marker skips
+  the pre-pass, so most cells pay nothing. There is no semantic detection.
+- **The model judges, the daemon cuts.** For each marker the scanner hands the
+  pre-pass an excerpt: from the marker to the end of its paragraph (cut short
+  by a code fence or the next marker). The model only answers where the
+  instruction ends inside that excerpt -- by copying it -- and which targets
+  it is for. The daemon checks the copy against the text at the marker
+  (whitespace runs and the marker's case may differ, nothing else) and removes
+  exactly that span with `remove_spans`: a whole paragraph goes with one
+  separator, whole lines with their line break, and a span inside a line
+  closes up around the space before it. Nothing else in the prompt changes;
+  the model never rewrites the work prompt.
 - Targets (closed registry):
   - `pr` -- GitHub PRs and GitLab MRs alike.
   - `live_action` -- additive guidance only: attached to the cell's live
     handoff if the cell posts one, dropped if it posts none. Never creates a
     live action.
-- A compound instruction may fan out to several targets. A single instruction
-  of uncertain target gets exactly one (the pre-pass picks); if truly unclear
-  it stays in the work prompt.
-- Any pre-pass failure or malformed or unknown-target output falls back to the
-  original prompt, recorded as an informational Cartographer row (not a
+- An instruction may be for several targets. One that fits no target stays
+  in the work prompt.
+- Any pre-pass failure, malformed or unknown-target output, a missing or
+  repeated excerpt, or a copy that is not the text at its marker falls back to
+  the original prompt, recorded as an informational Cartographer row (not a
   failure mailbox message). The pre-pass never fails the cell.
 - Out of scope: `proof` (must not be changeable this way), review ordering,
   `auto_action`, `later_cells`, and `notify` (needs mid-run triggers; only a
@@ -79,7 +90,8 @@ resolver agent (`guardian_merge::ResolvedResolverAgent`), the pre-pass spec
 takes the cell's own `selection.backend`, `selection.executable`, model and
 machine, so it runs on the cell's assigned agent. It sets
 `closing_turn_prompt: None` (no live-handoff question) and must not carry the
-cell's system prompt. Because it runs through the normal runner path, it is a
+cell's system prompt. Its prompt holds only the marked excerpts, never the
+rest of the task prompt. Because it runs through the normal runner path, it is a
 process-spawning behaviour and needs a `proc_counts/tags.toml` entry in
 Phase 1.
 
@@ -126,11 +138,14 @@ replaced wholesale (the pattern of `replace_cell_live_handoffs` in
 
 - Tables `cell_directed_instructions` (one row per cell: prompt hash, work
   prompt, status `extracted|unchanged|fallback`) and
-  `cell_directed_instruction_rows` (target, text, source `marker|semantic`).
-  A `fallback` result is cached too, so a retry is stable.
-- `source` is `marker` when the instruction text is contained in a paragraph
-  that `scan_markers` matched, otherwise `semantic` (the reply contract is
-  just `{work_prompt, instructions:[{target,text}]}`).
+  `cell_directed_instruction_rows` (target, text -- the instruction as
+  written, without the marker). A `fallback` result is cached too, so a retry
+  is stable.
+- The reply contract is `{instructions: [{excerpt, text, targets}]}`, exactly
+  one entry per excerpt: `text` is the copied instruction, `targets` a subset
+  of the registry (empty: the instruction stays in the work prompt). The work
+  prompt is never part of the reply; `parse_prepass_reply` builds it with
+  `remove_spans`.
 - The hook (`apply_prepass`) runs in `run_cell_worker` just before handoff
   resolution; the pre-pass call reuses the cell's own spec (agent, model,
   machine) with no system prompt or closing turn.
@@ -149,17 +164,14 @@ replaced wholesale (the pattern of `replace_cell_live_handoffs` in
 - `pr_guidance_entry` turns them into one always-applying `GuidanceEntry` in
   the existing `pr_guidance_note` channel: the union, identical texts listed
   once with all their cells, the whole block labelled as user-authored data
-  that cannot change the template, format or rules. Direct contradictions are
-  flagged in the text with a WARNING naming both sides and their cells.
-- Contradiction detection is a keyword heuristic (one side negated, at least
-  60% overlap of content words). It misses paraphrased or semantic
-  contradictions and can flag a pair that merely shares vocabulary; it only
-  adds a warning, nothing is dropped.
-- Instructions naming a screenshot, GIF or video (optionally with a count,
-  "two GIFs") become exhibit requests under the new `directed` origin, which
-  sorts between `handoff` and `recipe` when the PR slot cap cuts. They are
-  attached when the PR is created, if exhibits are enabled for the review.
-  Other instructions stay guidance only.
+  that cannot change the template, format or rules. The PR writer judges
+  conflicting instructions itself and names them under the reviewer notes;
+  no keyword heuristic decides that.
+- Nothing parses the instruction text. One that asks for a screenshot, GIF or
+  video reaches the PR writer as guidance next to its exhibit-request section
+  (`exhibits::inference_prompt`), and the PR writer asks for the exhibit
+  there. That needs exhibit inference on for the review (`infer`); with it
+  off, such an instruction is description guidance only.
 - Submission and stack logic are untouched; regression tests submit a
   two-branch stack with a `pr` instruction on both GitHub and GitLab mocks.
 
@@ -184,8 +196,8 @@ replaced wholesale (the pattern of `replace_cell_live_handoffs` in
   folded into `ralphus cell show` (`directed_instructions`), so the existing
   `cell show` MCP tool carries it and the CLI<->MCP parity test is unchanged;
   `scripts/check_endpoint_cli_parity.py` maps the endpoint to `cell show`.
-- The board's prompt-cell pane shows a "directed instructions" block (target,
-  text and source per row, each with a tooltip) below the prompt. The live
+- The board's prompt-cell pane shows a "directed instructions" block (target
+  and text per row, the target with a tooltip) below the prompt. The live
   view's Prompt tab shows the work prompt the agent received, with a
   "Sent to agent" / "As submitted" toggle to read the prompt as the user wrote
   it; the toggle appears only when instructions were extracted. The work
@@ -198,17 +210,17 @@ replaced wholesale (the pattern of `replace_cell_live_handoffs` in
   wanted, how it should be validated (closed enum, boolean, or deliberately
   unvalidated) must be decided by the user before any
   `core/src/validate.rs` work.
-- Should a contradiction the heuristic cannot see (a semantic opposite) be
-  judged by the agent that writes the PR, or by an extra pre-pass call?
 - Exact mapping from a review branch's position to member cells for the `pr`
   collector (see above).
 
 ## Risks
 
-- Misrouting is silent: the board display (Phase 4) is the mitigation, plus a
-  bias toward leaving ambiguous text in the work prompt.
-- A wrong strip makes the worker miss real instructions: keep the original,
-  fall back to it on any pre-pass error, cache by hash so a retry is stable.
-- Extra latency/cost per cell is bounded by the prefilter and the cache.
+- Misrouting is silent: the board display (Phase 4) is the mitigation, and
+  only text the user marked can be routed at all.
+- The model can end an instruction too early or too late inside its
+  paragraph; it cannot touch anything outside that paragraph, since the cut is
+  bounded by the excerpt and checked against the original text. On any
+  pre-pass error the original is used, cached by hash so a retry is stable.
+- Extra latency/cost per cell is bounded by the marker check and the cache.
 - Instruction text is untrusted input to the PR writer and live-action
   prompts: consuming prompts treat it as data.

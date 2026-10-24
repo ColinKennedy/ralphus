@@ -2214,7 +2214,6 @@ prompt = "second"
                     .map(|(t, x)| crate::directed_instructions::DirectedInstruction {
                         target: t.to_string(),
                         text: x.to_string(),
-                        source: crate::directed_instructions::SOURCE_MARKER.to_string(),
                     })
                     .collect(),
             }
