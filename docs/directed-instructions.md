@@ -161,6 +161,16 @@ replaced wholesale (the pattern of `replace_cell_live_handoffs` in
 - Submission and stack logic are untouched; regression tests submit a
   two-branch stack with a `pr` instruction on both GitHub and GitLab mocks.
 
+## Phase 3 (`live_action` consumer) implementation notes
+
+- `collect_review_handoffs_conn` fills `CollectedHandoff.guidance` with the
+  cell's `live_action` rows only when the cell stored tests; a cell with
+  `NothingToTest` or no marker contributes no guidance and no action.
+- Guidance is appended to the action prompt in code (`with_guidance`), after
+  any agent merge: each action gets the distinct notes of the handoffs merged
+  into it, in first-seen order, under a header that labels them as data. The
+  deduplicating agent never sees or rewrites guidance, so the merge is stable.
+
 ## Open questions
 
 - Opt-out: no `directed_instructions = false` field is added. If one is
