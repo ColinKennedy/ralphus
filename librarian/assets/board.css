@@ -96,7 +96,7 @@
       header { display: flex; align-items: center; justify-content: space-between;
         padding: 9px 16px; border-bottom: 1px solid var(--border); background: var(--panel); }
       .brand { display: flex; align-items: center; gap: 14px; font-weight: 600; }
-      .logo { color: var(--accent); letter-spacing: .5px; }
+      .logo { color: var(--done); letter-spacing: .5px; }
       .tabs { display: flex; gap: 4px; }
       .tab { background: none; border: none; color: var(--muted); font-weight: 500; padding: 6px 12px; border-radius: 6px; display: inline-block; line-height: normal; text-decoration: none; cursor: pointer; }
       .tab:hover, .tab.active { color: var(--text); background: var(--panel-2); }
