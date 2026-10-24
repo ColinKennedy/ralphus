@@ -946,15 +946,26 @@ Saving restarts the proof step and the rest of its list; an unchanged value rest
         } catch (_) { delete cellDirected[key]; }
       }
       /**
-       * The cell pane's "directed instructions" block: the instructions the
-       * cell's prompt addressed to ralphus with the target each went to, and
-       * the work prompt the agent received in place of the original. Empty
-       * when nothing was extracted.
+       * The prompt a cell's agent received: the pre-pass work prompt when
+       * instructions were extracted, otherwise the prompt as submitted.
+       * @param {CellView} s
        * @param {CellDirectedView|null|undefined} view
-       * @param {string} idBase
        * @returns {string}
        */
-      function directedInstructionsSection(view, idBase) {
+      function cellWorkPrompt(s, view) {
+        return view && view.extracted && view.instructions.length && view.work_prompt
+          ? view.work_prompt
+          : (s.prompt || "");
+      }
+      /**
+       * The cell pane's "directed instructions" block: the instructions the
+       * cell's prompt addressed to ralphus with the target each went to. The
+       * work prompt the agent received is on the live view's Prompt tab.
+       * Empty when nothing was extracted.
+       * @param {CellDirectedView|null|undefined} view
+       * @returns {string}
+       */
+      function directedInstructionsSection(view) {
         if (!view || !view.extracted || !view.instructions.length) return "";
         const rows = view.instructions.map((ins) => {
           const tip = ins.target === "pr"
@@ -967,10 +978,8 @@ Saving restarts the proof step and the rest of its list; an unchanged value rest
             `<span class="v" style="flex:1">${esc(ins.text)}</span>` +
             `<span class="k" data-tip="${esc(srcTip)}">${esc(ins.source)}</span></div>`;
         }).join("");
-        return `<h3 class="section" data-tip="Parts of the prompt addressed to ralphus (/ralphus ...) were moved out before the agent started. The prompt above is exactly what you wrote.">directed instructions</h3>` +
-          rows +
-          `<h3 class="section" data-tip="What the cell's agent received: the prompt above minus the directed instructions.">work prompt</h3>` +
-          promptBox(view.work_prompt || "—", idBase);
+        return `<h3 class="section" data-tip="Parts of the prompt addressed to ralphus (/ralphus ...) were moved out before the agent started. The prompt above is exactly what you wrote; the live view's Prompt tab shows what the agent received and can toggle between the two.">directed instructions</h3>` +
+          rows;
       }
 
       // CCTL-148: worktree (the cell's own cwd) and project are distinct —
@@ -1245,7 +1254,7 @@ Saving restarts the proof step and the rest of its list; an unchanged value rest
           ${maximumToolOutputTokensRow(s)}
           <h3 class="section">${s.command ? "command" : "prompt"}</h3>
           ${s.command ? cmdBox(s.command) : promptBox(s.prompt || "—", `prompt-box-${sel.taskIdx}-${sel.cellIdx}`)}
-          ${s.command ? "" : directedInstructionsSection(cellDirected[`${r.id}:${sel.taskIdx}:${sel.cellIdx}`], `work-prompt-box-${sel.taskIdx}-${sel.cellIdx}`)}
+          ${s.command ? "" : directedInstructionsSection(cellDirected[`${r.id}:${sel.taskIdx}:${sel.cellIdx}`])}
           ${s.command ? `<div class="kv-row" data-tip="The shell that runs this cell's command: the declared shell, else the configured default, else cmd on Windows / sh elsewhere."><span class="k">shell</span><span class="v mono">${esc(s.effective_shell || s.shell || "—")}${s.shell ? "" : " (default)"}</span></div>` : ""}
           ${systemPromptSection}
           ${initRow}
@@ -1264,7 +1273,8 @@ Saving restarts the proof step and the rest of its list; an unchanged value rest
               baseKey: key,
               title: `cell ${sel.taskIdx}.${sel.cellIdx} · ${s.agent || "command"}`,
               canThink: s.thinking_capable !== false,
-              promptText: (s.command || s.prompt || ""),
+              promptText: s.command || cellWorkPrompt(s, cellDirected[`${r.id}:${sel.taskIdx}:${sel.cellIdx}`]),
+              rawPromptText: s.command ? "" : (s.prompt || ""),
               promptHint: s.command ? "The command this cell runs." : "The instruction dispatched to this cell's agent.",
               withAttempts: true,
               currentMeta: s.state || "",

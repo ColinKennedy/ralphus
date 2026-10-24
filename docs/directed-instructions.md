@@ -184,9 +184,11 @@ replaced wholesale (the pattern of `replace_cell_live_handoffs` in
   `cell show` MCP tool carries it and the CLI<->MCP parity test is unchanged;
   `scripts/check_endpoint_cli_parity.py` maps the endpoint to `cell show`.
 - The board's prompt-cell pane shows a "directed instructions" block (target,
-  text and source per row, each with a tooltip) and the "work prompt" the
-  agent received, below the original prompt. Nothing is shown when no
-  instruction was extracted. Editing or overriding an extraction is a
+  text and source per row, each with a tooltip) below the prompt. The live
+  view's Prompt tab shows the work prompt the agent received, with a
+  "Sent to agent" / "As submitted" toggle to read the prompt as the user wrote
+  it; the toggle appears only when instructions were extracted. The work
+  prompt is the pre-pass result, before handoff placeholders are filled in. Editing or overriding an extraction is a
   follow-up.
 
 ## Open questions

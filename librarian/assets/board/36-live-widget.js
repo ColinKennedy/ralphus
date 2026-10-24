@@ -260,6 +260,19 @@
           <div class="hint">Read-only — nothing typed here reaches the agent. Every run's text is
           captured separately, so walking back survives a restart.</div>`;
       }
+      /** @type {{[scope: string]: boolean}} Scope -> the Prompt tab shows the prompt as submitted rather than the one the agent received. */
+      const livePromptRaw = {};
+      /**
+       * Flips a step's Prompt tab between the prompt the agent received and the
+       * prompt as the user submitted it.
+       * @param {string} scope - The widget's scope.
+       * @param {boolean} raw - True to show the prompt as submitted.
+       * @returns {void}
+       */
+      function setLivePromptRaw(scope, raw) {
+        livePromptRaw[scope] = raw;
+        repaintLive(scope);
+      }
       // RALPHUS-PROMPTBOX-SCROLL:BEGIN
       /** @type {{[scrollKey: string]: number}} Scroll offset of each live-view prompt box, surviving repaints. */
       const promptBoxScroll = {};
@@ -440,6 +453,7 @@
        * @param {boolean} o.canThink - Whether the Thinking toggle applies.
        * @param {string} o.promptText - The step's authored instruction or command, "" when there is none.
        * @param {string} o.promptHint - What that text is, for the Prompt tab's footnote.
+       * @param {string} [o.rawPromptText] - The prompt as the user submitted it, when `promptText` is the rewritten one the agent received; the Prompt tab then offers a toggle between the two.
        * @param {string} [o.noPromptText] - What the Prompt tab says when promptText is empty; a generic line when omitted.
        * @param {boolean} o.withAttempts - Whether earlier attempts can be read.
        * @param {string} o.currentMeta - Metadata line for the current run.
@@ -466,13 +480,24 @@
           pickerTip: "The run you are looking at. Step with the arrows to read an earlier attempt; each attempt's log was persisted separately.",
           noRunsText: "no runs yet",
           noRunsTip: "This step has not produced a run yet.",
-          promptView: () => (o.promptText
-            ? `${reviewPromptBox(`${o.baseKey}:prompt`, o.promptText)}
+          promptView: () => {
+            const toggle = o.rawPromptText && o.rawPromptText !== o.promptText;
+            const raw = toggle && livePromptRaw[o.baseKey] === true;
+            const scopeArg = esc(JSON.stringify(o.baseKey));
+            const toggleHtml = toggle
+              ? `<div class="btn-row">
+                  <button class="btn${raw ? "" : " primary"}" onclick="setLivePromptRaw(${scopeArg}, false)" data-tip="The prompt the agent received: the submitted prompt with the parts addressed to ralphus (/ralphus ...) moved out.\nIt is the pre-pass result before handoff placeholders and other context are filled in, so the agent's literal text can differ slightly.">Sent to agent</button>
+                  <button class="btn${raw ? " primary" : ""}" onclick="setLivePromptRaw(${scopeArg}, true)" data-tip="The prompt exactly as the user submitted it, including the parts addressed to ralphus.">As submitted</button>
+                </div>`
+              : "";
+            return o.promptText
+              ? `${toggleHtml}${reviewPromptBox(`${o.baseKey}:prompt${raw ? ":raw" : ""}`, raw ? o.rawPromptText || "" : o.promptText)}
               <div class="hint">${esc(o.promptHint)}</div>`
-            : `<div class="absent-run">
+              : `<div class="absent-run">
                 <div class="abody"><div class="at">No authored instruction</div>
                   <div class="as">${esc(o.noPromptText || "This step has no prompt or command text of its own to show.")}</div></div>
-              </div>`),
+              </div>`;
+          },
           terminalFoot: () => "",
           systemFoot: "",
         };
@@ -489,6 +514,7 @@
         delete liveStepRunsAt[baseKey];
         delete liveRunIdx[baseKey];
         delete liveSub[baseKey];
+        delete livePromptRaw[baseKey];
         delete liveWidgets[baseKey];
         // Earlier attempts opened through this step's widget are pinned keys of their own.
         for (const k of Object.keys(peekOpen)) {
