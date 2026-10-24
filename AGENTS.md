@@ -84,11 +84,15 @@ alternatives to reach for are in
   that way when you change review/PR/guardian code it covers; never the whole
   file mid-edit.
 - **Never launch a second daemon from inside a ralphus cell or
-  feedback pass** (dogfooding) — no `scripts/check-initialize-exercises.sh`, no
-  `ralphus initialize <exercise>`. Its startup reap can stop work belonging
-  to the host daemon, and the run is lost.
-  Read the code, verify with fmt/clippy/`--lib` tests, and report the exercise
-  as unverified. See [`.agent/agent-conduct.md`](.agent/agent-conduct.md).
+  feedback pass** (dogfooding) — no `scripts/build-debug.sh`, no
+  `scripts/check-initialize-exercises.sh`, no `ralphus initialize <exercise>`,
+  no hand-launched `ralphus-daemon serve`. **The exception is
+  `bash scripts/live-stack.sh start` / `stop` (Windows: `scripts\live-stack.cmd`):** a private stack on its own ports
+  and database, which is how a live action or live check gets a running
+  ralphus (point it at a throwaway project, never submit to the host daemon).
+  For the initialize exercises, read the code, verify with fmt/clippy/`--lib`
+  tests, and report the exercise as unverified. See
+  [`.agent/agent-conduct.md`](.agent/agent-conduct.md).
 - **tmux/psmux were removed because they spawned too many processes.** Cells
   run through the runner's direct path
   (`daemon/src/runner/direct.rs`: a plain child process plus a durable

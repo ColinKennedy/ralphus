@@ -10,7 +10,9 @@ the reasoning and the alternative to reach for instead.
 Do not run `scripts/build-debug.sh`, `ralphus-daemon serve`,
 `ralphus-librarian serve`, or anything else that starts or restarts those two
 processes unless the user asks for it in that turn. A persistent dev stack is
-normally already running.
+normally already running. (`scripts/live-stack.sh` starts a separate stack on
+its own ports and database for live-testing; see the next section. It never
+touches this one.)
 
 A failed `ralphus check health` or a connection-refused `curl` on
 `127.0.0.1:7890` is **not** sufficient evidence the daemon is down — transient
@@ -24,17 +26,33 @@ comes back (a validation message, a 4xx body), that is proof the daemon is
 reachable — don't let an earlier flaky probe override it. Plain git operations
 on worktrees are not "touching the daemon" and are fine.
 
-## Never launch a second daemon from inside a ralphus run
+## Never launch a second daemon from inside a ralphus run, except through `live-stack.sh`
 
-When ralphus itself is driving the work (a cell, a proof step, or a Guardian
-feedback/auto-fix pass developing ralphus), do not run anything that starts
-another daemon next to the host's: `scripts/check-initialize-exercises.sh`,
+When ralphus itself is driving the work (a cell, a proof step, a live action, or
+a Guardian feedback/auto-fix pass developing ralphus), do not run anything that
+starts another daemon next to the host's: `scripts/build-debug.sh` (it defaults
+to the host's ports 7890/7474), `scripts/check-initialize-exercises.sh`,
 `ralphus initialize <exercise>` (every guided exercise starts its own throwaway
-daemon), or a hand-launched `ralphus-daemon serve` on another port. A second
-daemon's startup reaps and restarts work that belongs to the host daemon, and
-the run driving the work can be lost.
+daemon), or a hand-launched `ralphus-daemon serve`. Those are unvetted for
+running beside a host stack from inside a run, and the run driving the work can
+be lost.
 
-Do this instead:
+**The one sanctioned way to get a running stack is
+`bash scripts/live-stack.sh start` (on Windows, `scripts\live-stack.cmd start`).** It builds this checkout, starts a daemon
+and board on free ports (never 7890/7474) with their own database, launches them
+detached, records their pids, and `bash scripts/live-stack.sh stop` kills exactly
+those pids. This is safe beside a host daemon because the daemon's startup
+recovery (`Store::recover_orphaned_squads`) only resets rows in its own database
+and runs after the port is bound, so a second daemon cannot touch the host's
+squads; there is no machine-wide, by-name process reap at startup. Drive the
+stack with `target/debug/ralphus --daemon-url <DAEMON_URL> ...`, and point it at
+a throwaway git project, not this repository: a fresh database reuses ids like
+`squad-000000000001`, which would collide with the host's branches and worktree
+folders in the same `.git`. Never submit to, restart, or stop the host's daemon;
+it may also be running an older build than the one under test, which is why a
+live check must run against its own stack.
+
+For everything `live-stack.sh` does not cover (the initialize exercises):
 
 - Reproduce by reading the code: the exercise source in
   `cli/src/commands/initialize/` and its fixtures say what it asserts.
