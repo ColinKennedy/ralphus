@@ -34,6 +34,7 @@ pub mod config;
 pub mod cpu_stall;
 pub mod daemon_health;
 pub mod delivery;
+pub mod directed_instructions;
 pub mod entity_uri;
 pub mod env_view;
 pub mod events;

@@ -1,6 +1,7 @@
 # Directed instructions (`/ralphus ...` in a prompt cell)
 
-Status: design only; nothing in this page is built yet. Later phases extend
+Status: Phase 1 built (marker scanner, per-cell storage, cell-start pre-pass in
+`daemon/src/directed_instructions.rs`); no consumer reads the stored instructions yet. Later phases extend
 this page rather than any other plan document.
 
 A **directed instruction** is a part of a prompt cell's `prompt` addressed to
@@ -117,6 +118,21 @@ original prompt misses on its own. **The prompt hash alone is enough; no
 explicit invalidation hook is added.** A stale row for an old hash is simply
 replaced wholesale (the pattern of `replace_cell_live_handoffs` in
 `live_actions.rs`) on the next pre-pass.
+
+## Phase 1 implementation notes
+
+- Tables `cell_directed_instructions` (one row per cell: prompt hash, work
+  prompt, status `extracted|unchanged|fallback`) and
+  `cell_directed_instruction_rows` (target, text, source `marker|semantic`).
+  A `fallback` result is cached too, so a retry is stable.
+- `source` is `marker` when the instruction text is contained in a paragraph
+  that `scan_markers` matched, otherwise `semantic` (the reply contract is
+  just `{work_prompt, instructions:[{target,text}]}`).
+- The hook (`apply_prepass`) runs in `run_cell_worker` just before handoff
+  resolution; the pre-pass call reuses the cell's own spec (agent, model,
+  machine) with no system prompt or closing turn.
+- No `proc_counts/tags.toml` entry: the tests use a scripted `Runner` and
+  spawn no process; the real pre-pass goes through the existing runner path.
 
 ## Open questions
 

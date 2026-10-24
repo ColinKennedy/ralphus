@@ -2933,6 +2933,30 @@ impl Store {
                 created_at_ms   INTEGER NOT NULL,
                 PRIMARY KEY (squad_id, task_idx, cell_idx, ordinal)
             );
+            -- Directed instructions (`crate::directed_instructions`): the
+            -- pre-pass result for a prompt cell whose prompt mentions ralphus.
+            -- `prompt_hash` keys the cache; the rows are the extracted
+            -- `{target, text}` instructions.
+            CREATE TABLE IF NOT EXISTS cell_directed_instructions (
+                squad_id      TEXT NOT NULL REFERENCES squads(id) ON DELETE CASCADE,
+                task_idx      INTEGER NOT NULL,
+                cell_idx      INTEGER NOT NULL,
+                prompt_hash   TEXT NOT NULL,
+                work_prompt   TEXT NOT NULL,
+                status        TEXT NOT NULL,
+                created_at_ms INTEGER NOT NULL,
+                PRIMARY KEY (squad_id, task_idx, cell_idx)
+            );
+            CREATE TABLE IF NOT EXISTS cell_directed_instruction_rows (
+                squad_id TEXT NOT NULL REFERENCES squads(id) ON DELETE CASCADE,
+                task_idx INTEGER NOT NULL,
+                cell_idx INTEGER NOT NULL,
+                ordinal  INTEGER NOT NULL,
+                target   TEXT NOT NULL,
+                text     TEXT NOT NULL,
+                source   TEXT NOT NULL,
+                PRIMARY KEY (squad_id, task_idx, cell_idx, ordinal)
+            );
             -- A review's live actions: its member cells' handoffs, deduplicated
             -- once and then fixed. `source_cells` is a JSON array of the cell
             -- URIs each action came from.
