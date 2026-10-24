@@ -773,6 +773,34 @@ claude-code = "Be terse."                    # one backend or custom profile nam
 - Applies to task prompt cells only; proof steps and review-side agents do not
   receive these layers.
 
+### `/ralphus` directed-instruction marker (prompt cells; planned)
+
+Not built yet -- this entry records the agreed grammar; the design and open
+questions are in [`directed-instructions.md`](directed-instructions.md). A
+**directed instruction** is a part of a prompt cell's `prompt` addressed to
+ralphus rather than to the cell's agent. A one-shot pre-pass at cell start
+separates it from the **work prompt** (what the agent receives) and stores it
+per cell. No task-file field is involved.
+
+- **Marker.** `/ralphus`, case-insensitive. It matches only at the start of a
+  line or after whitespace, and only when followed by whitespace, end of
+  text, or one of `:` `,` `.`. It never matches when followed by `/` or
+  preceded by a non-space character, so `foo/bar/fizz/ralphus more` and
+  `bizz/ralphus/buzz blah` are ordinary text. A hand-written scanner reads
+  the marker (the `regex` crate has no lookahead); this part is
+  machine-parsed.
+- **Prefilter.** A prompt without the substring `ralphus` (any case) skips
+  the pre-pass entirely.
+- **Targets (closed registry).** `pr` (a GitHub PR or GitLab MR alike) and
+  `live_action` (guidance attached to the cell's live handoff when it posts
+  one, dropped when it posts none; it never creates a live action). An
+  unknown target in the pre-pass output rejects the whole extraction and the
+  original prompt is used. `notify` is a reserved name with no behavior.
+- **Semantic fallback (not parsed).** The pre-pass model also recognises an
+  *addressed* "Ralphus, ..." / "also Ralphus, ...". That judgment is a prompt
+  convention: a bare mention of the project name is not an instruction.
+  Ambiguous text stays in the work prompt.
+
 ### Process-side sentinels (agent authors, not cell authors)
 
 Three sentinels exist for code that *hosts* a ralphus runner, not for task
