@@ -1,8 +1,9 @@
 # Directed instructions (`/ralphus ...` in a prompt cell)
 
-Status: Phases 1 and 2 built (marker scanner, per-cell storage, cell-start
+Status: Phases 1 to 3 built (marker scanner, per-cell storage, cell-start
 pre-pass in `daemon/src/directed_instructions.rs`; the `pr` consumer in
-`directed_instructions.rs`, `pr.rs` and `exhibits.rs`). Later phases extend
+`directed_instructions.rs`, `pr.rs` and `exhibits.rs`; the `live_action`
+consumer in `live_actions.rs`). Later phases extend
 this page rather than any other plan document.
 
 A **directed instruction** is a part of a prompt cell's `prompt` addressed to
@@ -179,6 +180,8 @@ replaced wholesale (the pattern of `replace_cell_live_handoffs` in
   `core/src/validate.rs` work.
 - Should a contradiction the heuristic cannot see (a semantic opposite) be
   judged by the agent that writes the PR, or by an extra pre-pass call?
+- Exact mapping from a review branch's position to member cells for the `pr`
+  collector (see above).
 
 ## Risks
 
