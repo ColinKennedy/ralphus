@@ -458,6 +458,19 @@ impl DaemonClient {
         ))
     }
 
+    /// One cell's original prompt, work prompt and the directed instructions
+    /// extracted from it.
+    pub fn cell_directed_instructions(
+        &self,
+        squad_id: &str,
+        task_idx: i64,
+        cell_idx: i64,
+    ) -> Result<Value, DaemonError> {
+        self.get(&format!(
+            "/api/squads/{squad_id}/cells/{task_idx}/{cell_idx}/directed-instructions"
+        ))
+    }
+
     /// One surface's resolved environment (RAL-324). `api_path` is the very
     /// path that surface's overrides are *set* on -- the daemon serves each
     /// read-only view as a `GET` twin of the matching `POST .../env` route --

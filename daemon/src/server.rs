@@ -1881,6 +1881,18 @@ fn route_for_user(
         ("GET", ["api", "squads", id, "cells", ti, si, "live-handoffs"]) => {
             cell_live_handoffs_view(daemon, id, ti, si)
         }
+        (
+            "GET",
+            [
+                "api",
+                "squads",
+                id,
+                "cells",
+                ti,
+                si,
+                "directed-instructions",
+            ],
+        ) => cell_directed_instructions_view(daemon, id, ti, si),
         // RAL-191: the per-step routes must precede the scope-wide ones, since
         // `["proof", "env"]` and `["proof", vi, "env"]` are otherwise
         // ambiguous to a reader (they are not to the matcher, which is
@@ -11721,6 +11733,28 @@ fn cell_live_handoffs_view(daemon: &Daemon, id: &str, ti: &str, si: &str) -> Rep
         crate::live_actions::cell_live_handoffs_conn(conn, id, task_idx, cell_idx)
     }) {
         Ok(handoffs) => json(200, &handoffs),
+        Err(e) => store_error(&e),
+    }
+}
+
+/// `GET /api/squads/{id}/cells/{ti}/{si}/directed-instructions`: the cell's
+/// original prompt, the work prompt its agent received and the instructions
+/// the cell-start pre-pass addressed to ralphus (`pr`, `live_action`).
+/// `extracted` is `false` (and the work prompt equals the original) when no
+/// pre-pass result is stored, e.g. the cell has not started or its prompt
+/// never mentioned ralphus.
+fn cell_directed_instructions_view(daemon: &Daemon, id: &str, ti: &str, si: &str) -> Reply {
+    let (task_idx, cell_idx) = match (parse_index(ti, "task index"), parse_index(si, "cell index"))
+    {
+        (Ok(t), Ok(c)) => (t, c),
+        (Err(reply), _) | (_, Err(reply)) => return reply,
+    };
+    match daemon.with_read_snapshot(|conn| {
+        crate::directed_instructions::cell_directed_instructions_view_conn(
+            conn, id, task_idx, cell_idx,
+        )
+    }) {
+        Ok(view) => json(200, &view),
         Err(e) => store_error(&e),
     }
 }

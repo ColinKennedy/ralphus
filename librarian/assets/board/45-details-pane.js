@@ -926,6 +926,62 @@ Saving restarts the proof step and the rest of its list; an unchanged value rest
           ${envSection}`;
       }
 
+      /**
+       * Lazily fetches and caches one cell's directed-instructions view, then
+       * re-renders the open cell pane.
+       * @param {string} squadId
+       * @param {number} taskIdx
+       * @param {number} cellIdx
+       * @returns {Promise<void>}
+       */
+      async function loadCellDirected(squadId, taskIdx, cellIdx) {
+        const key = `${squadId}:${taskIdx}:${cellIdx}`;
+        if (key in cellDirected) return;
+        cellDirected[key] = null; // mark loading so we don't refetch on every re-render
+        try {
+          const resp = await fetch(`/api/squads/${encodeURIComponent(squadId)}/cells/${taskIdx}/${cellIdx}/directed-instructions`);
+          if (!resp.ok) { delete cellDirected[key]; return; }
+          cellDirected[key] = await resp.json();
+          if (selectedSquadId === squadId && sel.kind === "cell") preserveUserState(document.getElementById("details"), renderDetails);
+        } catch (_) { delete cellDirected[key]; }
+      }
+      /**
+       * The prompt a cell's agent received: the pre-pass work prompt when
+       * instructions were extracted, otherwise the prompt as submitted.
+       * @param {CellView} s
+       * @param {CellDirectedView|null|undefined} view
+       * @returns {string}
+       */
+      function cellWorkPrompt(s, view) {
+        return view && view.extracted && view.instructions.length && view.work_prompt
+          ? view.work_prompt
+          : (s.prompt || "");
+      }
+      /**
+       * The cell pane's "directed instructions" block: the instructions the
+       * cell's prompt addressed to ralphus with the target each went to. The
+       * work prompt the agent received is on the live view's Prompt tab.
+       * Empty when nothing was extracted.
+       * @param {CellDirectedView|null|undefined} view
+       * @returns {string}
+       */
+      function directedInstructionsSection(view) {
+        if (!view || !view.extracted || !view.instructions.length) return "";
+        const rows = view.instructions.map((ins) => {
+          const tip = ins.target === "pr"
+            ? "Goes to this cell's review: added to the PR/MR description guidance (and exhibit slots for screenshots, GIFs or videos)."
+            : "Attached as guidance to this cell's live-test handoff, if the cell proposes one; dropped otherwise.";
+          const srcTip = ins.source === "marker"
+            ? "Written with the /ralphus marker."
+            : "Recognised as addressed to ralphus by the pre-pass model, without the marker.";
+          return `<div class="kv-row"><span class="k mono" data-tip="${esc(tip)}">${esc(ins.target)}</span>` +
+            `<span class="v" style="flex:1">${esc(ins.text)}</span>` +
+            `<span class="k" data-tip="${esc(srcTip)}">${esc(ins.source)}</span></div>`;
+        }).join("");
+        return `<h3 class="section" data-tip="Parts of the prompt addressed to ralphus (/ralphus ...) were moved out before the agent started. The prompt above is exactly what you wrote; the live view's Prompt tab shows what the agent received and can toggle between the two.">directed instructions</h3>` +
+          rows;
+      }
+
       // CCTL-148: worktree (the cell's own cwd) and project are distinct —
       // fetch this squad's per-cell project info lazily and cache it. RAL-396:
       // `project` is already resolved server-side to a registered project's
@@ -1122,6 +1178,7 @@ Saving restarts the proof step and the rest of its list; an unchanged value rest
        */
       function cellView(r, t, s) {
         if (!squadPaths[r.id]) loadSquadPaths(r.id);
+        if (!s.command) loadCellDirected(r.id, sel.taskIdx, sel.cellIdx);
         const paths = (squadPaths[r.id] || {})[`${sel.taskIdx}:${sel.cellIdx}`];
         const project = paths ? (paths.project || "— (not a git worktree)") : "…";
         const diffRow = cellDiffRow(cellDiffSummary(r.id, sel.taskIdx, sel.cellIdx,
@@ -1197,6 +1254,7 @@ Saving restarts the proof step and the rest of its list; an unchanged value rest
           ${maximumToolOutputTokensRow(s)}
           <h3 class="section">${s.command ? "command" : "prompt"}</h3>
           ${s.command ? cmdBox(s.command) : promptBox(s.prompt || "—", `prompt-box-${sel.taskIdx}-${sel.cellIdx}`)}
+          ${s.command ? "" : directedInstructionsSection(cellDirected[`${r.id}:${sel.taskIdx}:${sel.cellIdx}`])}
           ${s.command ? `<div class="kv-row" data-tip="The shell that runs this cell's command: the declared shell, else the configured default, else cmd on Windows / sh elsewhere."><span class="k">shell</span><span class="v mono">${esc(s.effective_shell || s.shell || "—")}${s.shell ? "" : " (default)"}</span></div>` : ""}
           ${systemPromptSection}
           ${initRow}
@@ -1215,7 +1273,8 @@ Saving restarts the proof step and the rest of its list; an unchanged value rest
               baseKey: key,
               title: `cell ${sel.taskIdx}.${sel.cellIdx} · ${s.agent || "command"}`,
               canThink: s.thinking_capable !== false,
-              promptText: (s.command || s.prompt || ""),
+              promptText: s.command || cellWorkPrompt(s, cellDirected[`${r.id}:${sel.taskIdx}:${sel.cellIdx}`]),
+              rawPromptText: s.command ? "" : (s.prompt || ""),
               promptHint: s.command ? "The command this cell runs." : "The instruction dispatched to this cell's agent.",
               withAttempts: true,
               currentMeta: s.state || "",

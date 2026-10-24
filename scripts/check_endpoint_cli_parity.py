@@ -228,6 +228,7 @@ ENDPOINT_TO_CLI: dict[str, list[str]] = {
     "GET /api/squads/{id}/cells/{ti}/{si}/proof/{vi}/env": ["proof env"],
     # live actions: a cell's RALPHUS_LIVE_ACTION handoffs are shown by `cell show`
     "GET /api/squads/{id}/cells/{ti}/{si}/live-handoffs": ["cell show"],
+    "GET /api/squads/{id}/cells/{ti}/{si}/directed-instructions": ["cell show"],
     "GET /api/guardians/{id}/live-actions": ["review live list"],
     "POST /api/guardians/{id}/live-actions/run": ["review live run"],
     "POST /api/guardians/{id}/live-runs/{run_id}/cancel": ["review live cancel"],

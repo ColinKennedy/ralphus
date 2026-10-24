@@ -1628,6 +1628,8 @@
       let squadPaths = {};
       /** @type {{[key: string]: {at: number, summary: CellDiffSummary|null}}} RAL-550: "squadId:ti:ci" -> last pushed worktree-diff summary and when it was fetched */
       let cellDiffs = {};
+      /** @type {{[key: string]: CellDirectedView|null}} "squadId:ti:ci" -> the cell's directed-instructions view; `null` while loading */
+      let cellDirected = {};
       /** @type {{[key: string]: boolean}} "gid:pos" -> bool, worktree cells dropdown open (RAL-71) */
       let worktreeMenuOpen = {};
       /** @type {{[key: string]: boolean}} peek key -> bool, live pane "Read-only terminal" boxes currently expanded (RAL-102) */
