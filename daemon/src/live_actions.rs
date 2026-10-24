@@ -2201,8 +2201,9 @@ prompt = "second"
 
     #[test]
     fn collected_guidance_needs_tests_and_the_live_action_target() {
-        let store = crate::store::Store::open_in_memory().unwrap();
-        let squad = "squad-guidance";
+        let mut store = crate::store::Store::open_in_memory().unwrap();
+        let squad = insert_squad(&mut store);
+        let squad = squad.as_str();
         let stored = |instructions: Vec<(&str, &str)>| {
             crate::directed_instructions::CellDirectedInstructions {
                 prompt_hash: "h".to_string(),
