@@ -23,7 +23,7 @@ bash scripts/build-debug.sh --daemon-port 7891 --librarian-port 7475 --db-path ~
 
 This is deliberately explicit, not auto-picked: if a script silently chose a port or DB path on `start`, a later `ralphus-daemon stop --port N` (a new shell, a different agent) would have no reliable way to know what to target. Passing a non-default `--daemon-port` without `--db-path` still gets automatic DB isolation (derived as `~/.ralphus/tasks-<port>.db`) — only the *default* port keeps using the plain `~/.ralphus/tasks.db` it always has, so existing setups are unaffected. Point the CLI or a browser at the second instance with `ralphus --daemon-url http://127.0.0.1:7891 ...` / `http://127.0.0.1:7475`, and stop it with `ralphus-daemon stop --port 7891` when done.
 
-**Live-testing a checkout — `bash scripts/live-stack.sh start|stop|env|plan [--name NAME]`.**
+**Live-testing a checkout — `bash scripts/live-stack.sh start|stop|env|plan [--name NAME]`** (on Windows, `scripts\live-stack.cmd` with the same arguments; the two share one `stack.env` format, so either can stop a stack the other started).
 The agent-safe version of the multi-instance recipe above: it builds the checkout
 it lives in, picks free ports from 17890/17474 (never 7890/7474), gives the stack
 its own DB under `~/.ralphus/live-stacks/<name>/`, launches the daemon and board

@@ -87,7 +87,7 @@ alternatives to reach for are in
   feedback pass** (dogfooding) — no `scripts/build-debug.sh`, no
   `scripts/check-initialize-exercises.sh`, no `ralphus initialize <exercise>`,
   no hand-launched `ralphus-daemon serve`. **The exception is
-  `bash scripts/live-stack.sh start` / `stop`:** a private stack on its own ports
+  `bash scripts/live-stack.sh start` / `stop` (Windows: `scripts\live-stack.cmd`):** a private stack on its own ports
   and database, which is how a live action or live check gets a running
   ralphus (point it at a throwaway project, never submit to the host daemon).
   For the initialize exercises, read the code, verify with fmt/clippy/`--lib`

@@ -38,7 +38,7 @@ running beside a host stack from inside a run, and the run driving the work can
 be lost.
 
 **The one sanctioned way to get a running stack is
-`bash scripts/live-stack.sh start`.** It builds this checkout, starts a daemon
+`bash scripts/live-stack.sh start` (on Windows, `scripts\live-stack.cmd start`).** It builds this checkout, starts a daemon
 and board on free ports (never 7890/7474) with their own database, launches them
 detached, records their pids, and `bash scripts/live-stack.sh stop` kills exactly
 those pids. This is safe beside a host daemon because the daemon's startup

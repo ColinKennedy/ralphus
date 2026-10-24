@@ -8,6 +8,9 @@
 # cell: the daemon's startup recovery only resets rows in its own database, and
 # it binds its port before doing so.
 #
+# On Windows use live-stack.cmd instead: it takes the same arguments and writes
+# the same stack.env, but does not depend on which `bash` is on PATH.
+#
 # Usage:
 #   live-stack.sh start [--name NAME]   build, start, print the URLs
 #   live-stack.sh stop  [--name NAME]   stop exactly the pids `start` recorded

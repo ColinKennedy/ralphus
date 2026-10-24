@@ -72,8 +72,9 @@ exactly what you are here to catch -- report it (and fix it if it is in this \
 repository).\n\
 \n\
 If this checkout contains `scripts/live-stack.sh` and the steps need a running \
-ralphus, start your own stack with `bash scripts/live-stack.sh start` and stop it \
-with `bash scripts/live-stack.sh stop` when done: it builds this checkout and runs \
+ralphus, start your own stack with `scripts\\live-stack.cmd start` on Windows (never \
+the `.sh`, whose `bash` there may not be Git Bash) or `bash scripts/live-stack.sh start` \
+elsewhere, and stop it with the same script's `stop` when done: it builds this checkout and runs \
 a daemon and board on free ports with their own database, and prints their URLs \
 and the CLI path. Use those instead of any step that runs `scripts/build-debug.sh` \
 or names ports 7890/7474, drive it with `<CLI> --daemon-url <DAEMON_URL>`, and \
@@ -123,8 +124,9 @@ This run is read-only: do not edit, stage or commit anything, and never push. \
 Setup and runtime failures are real findings: report them.\n\
 \n\
 If this checkout contains `scripts/live-stack.sh` and the steps need a running \
-ralphus, start your own stack with `bash scripts/live-stack.sh start` and stop it \
-with `bash scripts/live-stack.sh stop` when done: it builds this checkout and runs \
+ralphus, start your own stack with `scripts\\live-stack.cmd start` on Windows (never \
+the `.sh`, whose `bash` there may not be Git Bash) or `bash scripts/live-stack.sh start` \
+elsewhere, and stop it with the same script's `stop` when done: it builds this checkout and runs \
 a daemon and board on free ports with their own database, and prints their URLs \
 and the CLI path. Use those instead of any step that runs `scripts/build-debug.sh` \
 or names ports 7890/7474, drive it with `<CLI> --daemon-url <DAEMON_URL>`, and \
@@ -1891,8 +1893,8 @@ mod tests {
             LIVE_ACTION_COMMIT_SYSTEM_PROMPT,
             LIVE_ACTION_READ_ONLY_SYSTEM_PROMPT,
         ] {
+            assert!(prompt.contains("scripts\\live-stack.cmd start"));
             assert!(prompt.contains("bash scripts/live-stack.sh start"));
-            assert!(prompt.contains("bash scripts/live-stack.sh stop"));
             assert!(prompt.contains("never start, stop or submit to them"));
         }
     }
