@@ -702,6 +702,7 @@
                 : `<span class="cmd-status idle" data-tip="${esc(s.missing_reason ? `Not captured: ${s.missing_reason}` : "No run has captured this yet.")}">${s.missing_reason ? "missing" : "pending"}</span>`;
           const asked = s.origin === "inferred"
             ? `added by the PR writer${s.why ? `: ${s.why}` : ""}`
+            : s.origin === "directed" ? `from a /ralphus instruction${s.why ? `: ${s.why}` : ""}`
             : s.origin === "recipe" ? "from a .ralphus.toml recipe" : "asked for by the agent that made the change";
           const kind = s.delivered_kind && s.delivered_kind !== s.kind ? `${s.kind} → ${s.delivered_kind}` : s.kind;
           // The description written for the delivered kind; the primary's

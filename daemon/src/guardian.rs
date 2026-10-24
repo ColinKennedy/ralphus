@@ -1061,6 +1061,10 @@ pub struct GuardianView {
     /// `.ralphus.toml` entries and filters all of them by the PR's files
     /// (see [`crate::pr_guidance`]).
     pub effective_pr_guidance: Vec<crate::pr_guidance::GuidanceEntry>,
+    /// The `pr` directed instructions of every member cell, for the PR writer
+    /// to scope per branch (see [`crate::directed_instructions`]).
+    #[serde(skip)]
+    pub pr_instructions: Vec<crate::directed_instructions::PrInstruction>,
     /// Creation time (epoch ms).
     pub created_at_ms: i64,
     /// Shell check commands run in the review worktree before it is ready.
@@ -7380,6 +7384,8 @@ impl Store {
             &ctx.db_profiles,
         );
 
+        let pr_instructions =
+            crate::directed_instructions::collect_review_pr_instructions_conn(conn, &row.id)?;
         Ok(GuardianView {
             id: row.id,
             name: row.name,
@@ -7477,6 +7483,7 @@ impl Store {
             effective_live_actions,
             effective_refine_live_recipe,
             effective_pr_guidance,
+            pr_instructions,
             live_actions_auto_ran_at_ms: row.live_actions_auto_ran_at_ms,
             followup_enabled: row.followup_enabled,
             effective_followup_enabled,
