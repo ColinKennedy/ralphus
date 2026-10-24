@@ -1332,17 +1332,24 @@ Update the docs. /ralphus mention the docs change in the PR. Then bump the versi
         assert_eq!(got.instructions[0].text, "add two gifs to the PR");
     }
 
+    fn view_of(
+        store: &crate::store_lock::StoreHandle,
+        squad: &str,
+    ) -> CellDirectedInstructionsView {
+        let guard = store.lock();
+        cell_directed_instructions_view_conn(&guard.conn, squad, 0, 0).unwrap()
+    }
+
     #[test]
     fn view_serves_original_work_prompt_and_instructions() {
         let (store, squad) = store_with_prompt(PROMPT);
-        let before =
-            cell_directed_instructions_view_conn(&store.lock().conn, &squad, 0, 0).unwrap();
+        let before = view_of(&store, &squad);
         assert!(!before.extracted && !before.stale);
         assert_eq!(before.work_prompt.as_deref(), Some(PROMPT));
         assert!(before.instructions.is_empty());
 
         run_hook(&store, &squad, &ScriptedRunner::new(Ok(GOOD)));
-        let view = cell_directed_instructions_view_conn(&store.lock().conn, &squad, 0, 0).unwrap();
+        let view = view_of(&store, &squad);
         assert!(view.extracted && !view.stale);
         assert_eq!(view.original.as_deref(), Some(PROMPT));
         assert_eq!(view.work_prompt.as_deref(), Some("Build x"));
@@ -1357,7 +1364,7 @@ Update the docs. /ralphus mention the docs change in the PR. Then bump the versi
                 [&squad],
             )
             .unwrap();
-        let stale = cell_directed_instructions_view_conn(&store.lock().conn, &squad, 0, 0).unwrap();
+        let stale = view_of(&store, &squad);
         assert!(!stale.extracted && stale.stale);
         assert_eq!(stale.work_prompt.as_deref(), Some("edited"));
         assert!(stale.instructions.is_empty());
