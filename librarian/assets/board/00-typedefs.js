@@ -196,6 +196,23 @@
        * @property {string|null} upstream
        */
       /**
+       * One instruction a prompt cell's text addressed to ralphus.
+       * @typedef {object} DirectedInstructionRow
+       * @property {string} target - `pr` or `live_action`.
+       * @property {string} text
+       * @property {string} source - `marker` or `semantic`.
+       */
+      /**
+       * `GET /api/squads/{id}/cells/{ti}/{si}/directed-instructions`.
+       * @typedef {object} CellDirectedView
+       * @property {string|null} original
+       * @property {string|null} work_prompt
+       * @property {boolean} extracted
+       * @property {boolean} stale
+       * @property {string|null} status
+       * @property {DirectedInstructionRow[]} instructions
+       */
+      /**
        * RAL-550: the runner-pushed numstat summary of a cell's worktree
        * changes, from `GET /api/squads/{id}/diff?summary=1`.
        * @typedef {object} CellDiffSummary

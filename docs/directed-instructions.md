@@ -1,6 +1,6 @@
 # Directed instructions (`/ralphus ...` in a prompt cell)
 
-Status: Phases 1 to 3 built (marker scanner, per-cell storage, cell-start
+Status: Phases 1 to 4 built (marker scanner, per-cell storage, cell-start
 pre-pass in `daemon/src/directed_instructions.rs`; the `pr` consumer in
 `directed_instructions.rs`, `pr.rs` and `exhibits.rs`; the `live_action`
 consumer in `live_actions.rs`). Later phases extend
@@ -171,6 +171,23 @@ replaced wholesale (the pattern of `replace_cell_live_handoffs` in
   any agent merge: each action gets the distinct notes of the handoffs merged
   into it, in first-seen order, under a header that labels them as data. The
   deduplicating agent never sees or rewrites guidance, so the merge is stable.
+
+## Phase 4 (surfaces) implementation notes
+
+- `GET /api/squads/{id}/cells/{ti}/{si}/directed-instructions`
+  (`directed_instructions::cell_directed_instructions_view_conn`, read pool)
+  joins the cell's original prompt with its stored result. A result whose
+  prompt hash no longer matches the cell's prompt is reported `stale` and not
+  shown. Documented in `daemon-api.md`.
+- No new CLI leaf command or MCP tool: like the live handoffs, the view is
+  folded into `ralphus cell show` (`directed_instructions`), so the existing
+  `cell show` MCP tool carries it and the CLI<->MCP parity test is unchanged;
+  `scripts/check_endpoint_cli_parity.py` maps the endpoint to `cell show`.
+- The board's prompt-cell pane shows a "directed instructions" block (target,
+  text and source per row, each with a tooltip) and the "work prompt" the
+  agent received, below the original prompt. Nothing is shown when no
+  instruction was extracted. Editing or overriding an extraction is a
+  follow-up.
 
 ## Open questions
 

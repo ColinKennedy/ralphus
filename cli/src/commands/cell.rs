@@ -284,6 +284,13 @@ pub fn dispatch(cmd: CellCommand, opts: &GlobalOpts) -> i32 {
             {
                 cell["live_handoffs"] = handoffs;
             }
+            if let Ok(directed) = client.cell_directed_instructions(
+                &resolved.squad_id,
+                resolved.task_idx,
+                resolved.cell_idx,
+            ) {
+                cell["directed_instructions"] = directed;
+            }
             emit(opts, &cell, render_cell_detail);
             Ok(())
         }),
@@ -521,6 +528,7 @@ fn render_cell_detail(s: &Value) {
     for (vi, v) in s["proof"].as_array().into_iter().flatten().enumerate() {
         println!("  proof/{vi}  {}  {}", v["kind"], v["state"]);
     }
+    render_directed_instructions(&s["directed_instructions"]);
     let handoffs = &s["live_handoffs"];
     if handoffs["nothing_to_test"].as_bool() == Some(true) {
         println!("live handoffs: (nothing to test live)");
@@ -538,6 +546,30 @@ fn render_cell_detail(s: &Value) {
                 }
             }
         }
+    }
+}
+
+/// The instructions a cell's prompt addressed to ralphus, and the work prompt
+/// its agent received in their place.
+fn render_directed_instructions(directed: &Value) {
+    let instructions = directed["instructions"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    if instructions.is_empty() {
+        return;
+    }
+    println!("directed instructions:");
+    for (i, ins) in instructions.iter().enumerate() {
+        println!(
+            "  {i}. [{}] {}",
+            ins["target"].as_str().unwrap_or("?"),
+            ins["text"].as_str().unwrap_or_default()
+        );
+    }
+    println!("work prompt (what the agent received):");
+    for line in directed["work_prompt"].as_str().unwrap_or_default().lines() {
+        println!("  {line}");
     }
 }
 

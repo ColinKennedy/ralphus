@@ -7338,6 +7338,53 @@
         }
       }
     },
+    "/api/squads/{id}/cells/{ti}/{si}/directed-instructions": {
+      "get": {
+        "operationId": "getSquadsByIdCellsByTiBySiDirectedInstructions",
+        "summary": "Backs `ralphus cell show`.",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "ti",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "si",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/JsonValue"
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
     "/api/squads/{id}/cells/{ti}/{si}/pane": {
       "get": {
         "operationId": "getSquadsByIdCellsByTiBySiPane",

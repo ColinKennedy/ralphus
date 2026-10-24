@@ -398,6 +398,71 @@ pub fn cell_directed_instructions_conn(
     }))
 }
 
+/// What `GET .../cells/{ti}/{si}/directed-instructions` serves.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct CellDirectedInstructionsView {
+    /// The cell's prompt exactly as written (`None` for a command cell).
+    pub original: Option<String>,
+    /// The prompt the cell's agent receives: the stored work prompt when a
+    /// current result exists, otherwise the original.
+    pub work_prompt: Option<String>,
+    /// A pre-pass result exists for the cell's current prompt.
+    pub extracted: bool,
+    /// A result is stored but was computed from an earlier prompt; it is not
+    /// shown and the next cell start recomputes it.
+    pub stale: bool,
+    /// [`STATUS_EXTRACTED`], [`STATUS_UNCHANGED`] or [`STATUS_FALLBACK`];
+    /// `None` when no current result exists.
+    pub status: Option<String>,
+    /// The instructions of the current result, in pre-pass order.
+    pub instructions: Vec<DirectedInstruction>,
+}
+
+/// The cell's original prompt joined with its stored pre-pass result, for the
+/// read-only endpoint.
+///
+/// # Errors
+///
+/// On a database failure.
+pub fn cell_directed_instructions_view_conn(
+    conn: &rusqlite::Connection,
+    squad_id: &str,
+    task_idx: i64,
+    cell_idx: i64,
+) -> crate::store::Result<CellDirectedInstructionsView> {
+    let original: Option<String> = conn
+        .query_row(
+            "SELECT prompt FROM cells WHERE squad_id=? AND task_idx=? AND idx=?",
+            rusqlite::params![squad_id, task_idx, cell_idx],
+            |r| r.get(0),
+        )
+        .unwrap_or(None);
+    let stored = cell_directed_instructions_conn(conn, squad_id, task_idx, cell_idx)?;
+    let current = match (&stored, &original) {
+        (Some(s), Some(o)) if s.prompt_hash == prompt_hash(o) => stored.clone(),
+        _ => None,
+    };
+    let stale = stored.is_some() && current.is_none();
+    Ok(match current {
+        Some(c) => CellDirectedInstructionsView {
+            original,
+            work_prompt: Some(c.work_prompt),
+            extracted: true,
+            stale: false,
+            status: Some(c.status),
+            instructions: c.instructions,
+        },
+        None => CellDirectedInstructionsView {
+            work_prompt: original.clone(),
+            original,
+            extracted: false,
+            stale,
+            status: None,
+            instructions: Vec::new(),
+        },
+    })
+}
+
 /// The pre-pass spec: the cell's own agent, backend, model and machine, but
 /// no system prompt, closing turn or resumed session -- a prompt-only call.
 fn prepass_spec(template: &RunnerSpec, original: &str) -> RunnerSpec {
@@ -914,6 +979,37 @@ mod tests {
         assert_eq!(got.status, STATUS_EXTRACTED);
         assert_eq!(got.prompt_hash, prompt_hash(PROMPT));
         assert_eq!(got.instructions[0].source, SOURCE_MARKER);
+    }
+
+    #[test]
+    fn view_serves_original_work_prompt_and_instructions() {
+        let (store, squad) = store_with_prompt(PROMPT);
+        let before =
+            cell_directed_instructions_view_conn(&store.lock().conn, &squad, 0, 0).unwrap();
+        assert!(!before.extracted && !before.stale);
+        assert_eq!(before.work_prompt.as_deref(), Some(PROMPT));
+        assert!(before.instructions.is_empty());
+
+        run_hook(&store, &squad, &ScriptedRunner::new(Ok(GOOD)));
+        let view = cell_directed_instructions_view_conn(&store.lock().conn, &squad, 0, 0).unwrap();
+        assert!(view.extracted && !view.stale);
+        assert_eq!(view.original.as_deref(), Some(PROMPT));
+        assert_eq!(view.work_prompt.as_deref(), Some("Build x"));
+        assert_eq!(view.status.as_deref(), Some(STATUS_EXTRACTED));
+        assert_eq!(view.instructions[0].target, "pr");
+
+        store
+            .lock()
+            .conn
+            .execute(
+                "UPDATE cells SET prompt='edited' WHERE squad_id=? AND task_idx=0 AND idx=0",
+                [&squad],
+            )
+            .unwrap();
+        let stale = cell_directed_instructions_view_conn(&store.lock().conn, &squad, 0, 0).unwrap();
+        assert!(!stale.extracted && stale.stale);
+        assert_eq!(stale.work_prompt.as_deref(), Some("edited"));
+        assert!(stale.instructions.is_empty());
     }
 
     #[test]

@@ -5593,6 +5593,22 @@ at `GET /api/squads/{id}/cells/{ti}/{si}/live-handoffs` as
 actions are its member cells' handoffs -- the latest-finished cell of each task
 only -- deduplicated once by the review's resolver agent and then fixed.
 
+### Directed instructions
+
+`GET /api/squads/{id}/cells/{ti}/{si}/directed-instructions` serves what the
+cell-start pre-pass made of the cell's prompt (see
+[`directed-instructions.md`](directed-instructions.md)):
+`{original, work_prompt, extracted, stale, status, instructions}`.
+`original` is the cell's prompt exactly as written (`null` for a command
+cell); `work_prompt` is what the agent received. `extracted` is `true` only
+when a stored result matches the cell's current prompt, in which case `status`
+is `extracted`, `unchanged` or `fallback` and `instructions` is a list of
+`{target, text, source}` (`target` is `pr` or `live_action`, `source` is
+`marker` or `semantic`). Otherwise `extracted` is `false`, `work_prompt`
+equals `original`, and `stale` is `true` when a result exists for an earlier
+prompt. Read-only; shown by `ralphus cell show` (as `directed_instructions`)
+and in the board's cell pane.
+
 The handoff question a cell is asked in its closing turn also lists the review
 resolver agent's enabled, non-failing MCP servers and skills (names and
 descriptions; the review default agent when the squad has no review yet), so
